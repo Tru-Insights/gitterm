@@ -1,11 +1,13 @@
 [package]
-name = "cree8-claude-git-ide"
+name = "gitterm"
 version = "0.1.0"
 edition = "2021"
+description = "A Git status viewer with integrated terminal, built with Iced"
 
 [dependencies]
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "image"] }
 iced_term = { path = "../iced_term_fork" }
+muda = "0.17"
 git2 = "0.19"
 dirs = "5.0"
 serde = { version = "1.0", features = ["derive"] }

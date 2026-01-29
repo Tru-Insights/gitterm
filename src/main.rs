@@ -3,20 +3,418 @@ use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{button, column, container, row, scrollable, text, Column, Row};
 use iced::{color, Length, Size, Subscription, Task, Theme};
-use iced_term::TerminalView;
+use iced_term::{ColorPalette, TerminalView};
+use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+// Menu item IDs stored globally for event matching
+static MENU_IDS: OnceLock<MenuIds> = OnceLock::new();
+
+#[derive(Debug)]
+struct MenuIds {
+    increase_terminal_font: muda::MenuId,
+    decrease_terminal_font: muda::MenuId,
+    increase_ui_font: muda::MenuId,
+    decrease_ui_font: muda::MenuId,
+    toggle_theme: muda::MenuId,
+}
+
+fn setup_menu_bar() {
+    // Create native macOS menu bar
+    let menu = Menu::new();
+
+    // App menu (GitTerm)
+    let app_menu = Submenu::new("GitTerm", true);
+    app_menu
+        .append_items(&[
+            &PredefinedMenuItem::about(None, None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::services(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::hide(None),
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::quit(None),
+        ])
+        .unwrap();
+
+    // View menu (font size, theme)
+    let view_menu = Submenu::new("View", true);
+
+    // Terminal font submenu
+    let terminal_font_menu = Submenu::new("Terminal Font", true);
+    let increase_terminal_font = MenuItem::new(
+        "Increase",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META),
+            muda::accelerator::Code::Equal,
+        )),
+    );
+    let decrease_terminal_font = MenuItem::new(
+        "Decrease",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META),
+            muda::accelerator::Code::Minus,
+        )),
+    );
+    terminal_font_menu
+        .append_items(&[&increase_terminal_font, &decrease_terminal_font])
+        .unwrap();
+
+    // UI font submenu
+    let ui_font_menu = Submenu::new("Sidebar Font", true);
+    let increase_ui_font = MenuItem::new(
+        "Increase",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META | muda::accelerator::Modifiers::SHIFT),
+            muda::accelerator::Code::Equal,
+        )),
+    );
+    let decrease_ui_font = MenuItem::new(
+        "Decrease",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META | muda::accelerator::Modifiers::SHIFT),
+            muda::accelerator::Code::Minus,
+        )),
+    );
+    ui_font_menu
+        .append_items(&[&increase_ui_font, &decrease_ui_font])
+        .unwrap();
+
+    let toggle_theme = MenuItem::new(
+        "Toggle Light/Dark Theme",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META | muda::accelerator::Modifiers::SHIFT),
+            muda::accelerator::Code::KeyT,
+        )),
+    );
+
+    view_menu
+        .append_items(&[
+            &terminal_font_menu,
+            &ui_font_menu,
+            &PredefinedMenuItem::separator(),
+            &toggle_theme,
+        ])
+        .unwrap();
+
+    // Window menu
+    let window_menu = Submenu::new("Window", true);
+    window_menu
+        .append_items(&[
+            &PredefinedMenuItem::minimize(None),
+            &PredefinedMenuItem::maximize(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::fullscreen(None),
+        ])
+        .unwrap();
+
+    menu.append_items(&[&app_menu, &view_menu, &window_menu])
+        .unwrap();
+
+    // Store menu IDs for event handling
+    let _ = MENU_IDS.set(MenuIds {
+        increase_terminal_font: increase_terminal_font.id().clone(),
+        decrease_terminal_font: decrease_terminal_font.id().clone(),
+        increase_ui_font: increase_ui_font.id().clone(),
+        decrease_ui_font: decrease_ui_font.id().clone(),
+        toggle_theme: toggle_theme.id().clone(),
+    });
+
+    // Initialize menu for macOS - this must happen after NSApp exists
+    menu.init_for_nsapp();
+
+    // Leak the menu to keep it alive for the lifetime of the app
+    Box::leak(Box::new(menu));
+}
+
+// Persistent configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Config {
+    #[serde(default = "default_terminal_font")]
+    terminal_font_size: f32,
+    #[serde(default = "default_ui_font")]
+    ui_font_size: f32,
+    #[serde(default = "default_sidebar_width")]
+    sidebar_width: f32,
+    // Legacy field for migration
+    #[serde(default)]
+    font_size: Option<f32>,
+    theme: String,
+    #[serde(default)]
+    show_hidden: bool,
+}
+
+fn default_terminal_font() -> f32 { 14.0 }
+fn default_ui_font() -> f32 { 13.0 }
+fn default_sidebar_width() -> f32 { 280.0 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            terminal_font_size: 14.0,
+            ui_font_size: 13.0,
+            sidebar_width: 280.0,
+            font_size: None,
+            theme: "dark".to_string(),
+            show_hidden: false,
+        }
+    }
+}
+
+impl Config {
+    fn config_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".config").join("gitterm").join("config.json")
+    }
+
+    fn load() -> Self {
+        let path = Self::config_path();
+        if path.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(config) = serde_json::from_str(&contents) {
+                    return config;
+                }
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self) {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+// App theme (affects entire UI)
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum AppTheme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl AppTheme {
+    fn toggle(&self) -> Self {
+        match self {
+            AppTheme::Dark => AppTheme::Light,
+            AppTheme::Light => AppTheme::Dark,
+        }
+    }
+
+    // Terminal color palette
+    fn terminal_palette(&self) -> ColorPalette {
+        match self {
+            AppTheme::Dark => ColorPalette {
+                // Catppuccin Mocha
+                background: String::from("#1e1e2e"),
+                foreground: String::from("#cdd6f4"),
+                black: String::from("#45475a"),
+                red: String::from("#f38ba8"),
+                green: String::from("#a6e3a1"),
+                yellow: String::from("#f9e2af"),
+                blue: String::from("#89b4fa"),
+                magenta: String::from("#f5c2e7"),
+                cyan: String::from("#94e2d5"),
+                white: String::from("#bac2de"),
+                bright_black: String::from("#585b70"),
+                bright_red: String::from("#f38ba8"),
+                bright_green: String::from("#a6e3a1"),
+                bright_yellow: String::from("#f9e2af"),
+                bright_blue: String::from("#89b4fa"),
+                bright_magenta: String::from("#f5c2e7"),
+                bright_cyan: String::from("#94e2d5"),
+                bright_white: String::from("#a6adc8"),
+                bright_foreground: Some(String::from("#cdd6f4")),
+                dim_foreground: String::from("#7f849c"),
+                dim_black: String::from("#313244"),
+                dim_red: String::from("#a65d6d"),
+                dim_green: String::from("#6e9a6d"),
+                dim_yellow: String::from("#a69a74"),
+                dim_blue: String::from("#5d78a6"),
+                dim_magenta: String::from("#a6849c"),
+                dim_cyan: String::from("#649a92"),
+                dim_white: String::from("#7f849c"),
+            },
+            AppTheme::Light => ColorPalette {
+                // Catppuccin Latte
+                background: String::from("#eff1f5"),
+                foreground: String::from("#4c4f69"),
+                black: String::from("#5c5f77"),
+                red: String::from("#d20f39"),
+                green: String::from("#40a02b"),
+                yellow: String::from("#df8e1d"),
+                blue: String::from("#1e66f5"),
+                magenta: String::from("#ea76cb"),
+                cyan: String::from("#179299"),
+                white: String::from("#acb0be"),
+                bright_black: String::from("#6c6f85"),
+                bright_red: String::from("#d20f39"),
+                bright_green: String::from("#40a02b"),
+                bright_yellow: String::from("#df8e1d"),
+                bright_blue: String::from("#1e66f5"),
+                bright_magenta: String::from("#ea76cb"),
+                bright_cyan: String::from("#179299"),
+                bright_white: String::from("#bcc0cc"),
+                bright_foreground: Some(String::from("#4c4f69")),
+                dim_foreground: String::from("#6c6f85"),
+                dim_black: String::from("#4c4f69"),
+                dim_red: String::from("#a10c2d"),
+                dim_green: String::from("#338022"),
+                dim_yellow: String::from("#b27117"),
+                dim_blue: String::from("#1852c4"),
+                dim_magenta: String::from("#bb5ea2"),
+                dim_cyan: String::from("#12747a"),
+                dim_white: String::from("#8c8fa1"),
+            },
+        }
+    }
+
+    // UI Colors
+    fn bg_base(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x1e1e2e),
+            AppTheme::Light => color!(0xeff1f5),
+        }
+    }
+
+    fn bg_surface(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x181825),
+            AppTheme::Light => color!(0xe6e9ef),
+        }
+    }
+
+    fn bg_overlay(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x313244),
+            AppTheme::Light => color!(0xdce0e8),
+        }
+    }
+
+    fn text_primary(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0xcdd6f4),
+            AppTheme::Light => color!(0x4c4f69),
+        }
+    }
+
+    fn text_secondary(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x6c7086),
+            AppTheme::Light => color!(0x8c8fa1),
+        }
+    }
+
+    fn text_muted(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x45475a),
+            AppTheme::Light => color!(0xbcc0cc),
+        }
+    }
+
+    fn accent(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x89b4fa),
+            AppTheme::Light => color!(0x1e66f5),
+        }
+    }
+
+    fn border(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x45475a),
+            AppTheme::Light => color!(0xccd0da),
+        }
+    }
+
+    fn success(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0xa6e3a1),
+            AppTheme::Light => color!(0x40a02b),
+        }
+    }
+
+    fn warning(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0xf9e2af),
+            AppTheme::Light => color!(0xdf8e1d),
+        }
+    }
+
+    fn danger(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0xf38ba8),
+            AppTheme::Light => color!(0xd20f39),
+        }
+    }
+
+    fn diff_add_bg(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x1a3a1a),
+            AppTheme::Light => color!(0xd4f4d4),
+        }
+    }
+
+    fn diff_del_bg(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x3a1a1a),
+            AppTheme::Light => color!(0xf4d4d4),
+        }
+    }
+
+    fn diff_add_highlight(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x3a6b3a),
+            AppTheme::Light => color!(0x90d090),
+        }
+    }
+
+    fn diff_del_highlight(&self) -> iced::Color {
+        match self {
+            AppTheme::Dark => color!(0x8b3a3a),
+            AppTheme::Light => color!(0xd09090),
+        }
+    }
+}
+
 fn main() -> iced::Result {
+    // Load app icon from embedded PNG
+    let icon = iced::window::icon::from_file_data(include_bytes!("../assets/icon.png"), None).ok();
+
     iced::application(App::new, App::update, App::view)
         .title(App::title)
         .window_size(Size {
             width: 1400.0,
             height: 800.0,
         })
+        .window(iced::window::Settings {
+            icon,
+            ..Default::default()
+        })
         .subscription(App::subscription)
         .run()
+}
+
+// Sidebar mode toggle
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SidebarMode {
+    Git,
+    Files,
 }
 
 // Git file entry
@@ -25,6 +423,14 @@ struct FileEntry {
     path: String,
     status: String,
     is_staged: bool,
+}
+
+// File tree entry for explorer
+#[derive(Debug, Clone)]
+struct FileTreeEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
 }
 
 // Inline change for word-level diffs
@@ -79,6 +485,14 @@ struct TabState {
     created_at: Instant,
     // Terminal title (set by shell/programs via OSC escape codes)
     terminal_title: Option<String>,
+    // Sidebar mode (Git or Files)
+    sidebar_mode: SidebarMode,
+    // File explorer state
+    current_dir: PathBuf,
+    file_tree: Vec<FileTreeEntry>,
+    // File viewer state
+    viewing_file_path: Option<PathBuf>,
+    file_content: Vec<String>,
 }
 
 impl TabState {
@@ -87,6 +501,7 @@ impl TabState {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
+        let current_dir = repo_path.clone();
 
         Self {
             id,
@@ -104,6 +519,60 @@ impl TabState {
             file_index: -1,
             created_at: Instant::now(),
             terminal_title: None,
+            sidebar_mode: SidebarMode::Git,
+            current_dir,
+            file_tree: Vec::new(),
+            viewing_file_path: None,
+            file_content: Vec::new(),
+        }
+    }
+
+    fn fetch_file_tree(&mut self, show_hidden: bool) {
+        self.file_tree.clear();
+
+        if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
+            let mut dirs: Vec<FileTreeEntry> = Vec::new();
+            let mut files: Vec<FileTreeEntry> = Vec::new();
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                // Skip hidden files unless show_hidden is true
+                if !show_hidden && name.starts_with('.') {
+                    continue;
+                }
+                // Always skip node_modules and target
+                if name == "node_modules" || name == "target" {
+                    continue;
+                }
+
+                let is_dir = path.is_dir();
+                let entry = FileTreeEntry { name, path, is_dir };
+
+                if is_dir {
+                    dirs.push(entry);
+                } else {
+                    files.push(entry);
+                }
+            }
+
+            // Sort alphabetically
+            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+            // Dirs first, then files
+            self.file_tree.extend(dirs);
+            self.file_tree.extend(files);
+        }
+    }
+
+    fn load_file(&mut self, path: &PathBuf) {
+        self.file_content.clear();
+        self.viewing_file_path = Some(path.clone());
+
+        if let Ok(content) = std::fs::read_to_string(path) {
+            self.file_content = content.lines().map(|s| s.to_string()).collect();
         }
     }
 
@@ -393,6 +862,8 @@ fn status_char(status: Status, staged: bool) -> String {
 pub enum Event {
     Terminal(usize, iced_term::Event),
     Tick,
+    InitMenu,
+    CheckMenu,
     TabSelect(usize),
     TabClose(usize),
     OpenFolder,
@@ -401,6 +872,26 @@ pub enum Event {
     FileSelectByIndex(i32),
     ClearSelection,
     KeyPressed(Key, Modifiers),
+    // File explorer events
+    ToggleSidebarMode,
+    NavigateDir(PathBuf),
+    NavigateUp,
+    ViewFile(PathBuf),
+    CloseFileView,
+    // Theme
+    ToggleTheme,
+    // Font size - Terminal
+    IncreaseTerminalFont,
+    DecreaseTerminalFont,
+    // Font size - UI
+    IncreaseUiFont,
+    DecreaseUiFont,
+    // Hidden files
+    ToggleHidden,
+    // Divider dragging
+    DividerDragStart,
+    DividerDragEnd,
+    MouseMoved(f32, f32),
 }
 
 struct App {
@@ -408,24 +899,82 @@ struct App {
     tabs: Vec<TabState>,
     active_tab: usize,
     next_tab_id: usize,
+    theme: AppTheme,
+    terminal_font_size: f32,
+    ui_font_size: f32,
+    sidebar_width: f32,
+    dragging_divider: bool,
+    show_hidden: bool,
+}
+
+const MIN_FONT_SIZE: f32 = 10.0;
+const MAX_FONT_SIZE: f32 = 24.0;
+const FONT_SIZE_STEP: f32 = 1.0;
+
+impl App {
+    /// UI font size
+    fn ui_font(&self) -> f32 {
+        self.ui_font_size
+    }
+
+    /// Small UI font size (for hints, secondary text)
+    fn ui_font_small(&self) -> f32 {
+        self.ui_font_size - 1.0
+    }
+
+    fn save_config(&self) {
+        let config = Config {
+            terminal_font_size: self.terminal_font_size,
+            ui_font_size: self.ui_font_size,
+            sidebar_width: self.sidebar_width,
+            font_size: None,
+            theme: match self.theme {
+                AppTheme::Dark => "dark".to_string(),
+                AppTheme::Light => "light".to_string(),
+            },
+            show_hidden: self.show_hidden,
+        };
+        config.save();
+    }
 }
 
 impl App {
     fn new() -> (Self, Task<Event>) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = Config::load();
+
+        let theme = if config.theme == "light" {
+            AppTheme::Light
+        } else {
+            AppTheme::Dark
+        };
+
+        // Handle migration from old single font_size config
+        let (terminal_font, ui_font) = if let Some(old_size) = config.font_size {
+            (old_size, old_size - 1.0)
+        } else {
+            (config.terminal_font_size, config.ui_font_size)
+        };
 
         let mut app = Self {
-            title: String::from("Cree8 Claude Git IDE"),
+            title: String::from("GitTerm"),
             tabs: Vec::new(),
             active_tab: 0,
             next_tab_id: 0,
+            theme,
+            terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+            ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+            sidebar_width: config.sidebar_width.clamp(150.0, 600.0),
+            dragging_divider: false,
+            show_hidden: config.show_hidden,
         };
 
         if Repository::open(&cwd).is_ok() {
             app.add_tab(cwd);
         }
 
-        (app, Task::none())
+        // Return a task to initialize the menu bar after the app starts
+        (app, Task::done(Event::InitMenu))
     }
 
     fn add_tab(&mut self, repo_path: PathBuf) {
@@ -438,10 +987,17 @@ impl App {
         let term_settings = iced_term::settings::Settings {
             backend: iced_term::settings::BackendSettings {
                 program: shell,
+                args: vec!["-l".to_string()], // Login shell to source user's config
                 working_directory: Some(repo_path),
                 ..Default::default()
             },
-            ..Default::default()
+            theme: iced_term::settings::ThemeSettings::new(Box::new(
+                self.theme.terminal_palette(),
+            )),
+            font: iced_term::settings::FontSettings {
+                size: self.terminal_font_size,
+                ..Default::default()
+            },
         };
 
         if let Ok(terminal) = iced_term::Terminal::new(id as u64, term_settings) {
@@ -471,18 +1027,20 @@ impl App {
 
     fn subscription(&self) -> Subscription<Event> {
         let mut subs = vec![
-            iced::time::every(Duration::from_millis(2500)).map(|_| Event::Tick),
-            iced::event::listen_with(|event, _status, _id| {
-                if let iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key,
-                    modifiers,
-                    ..
-                }) = event
-                {
-                    Some(Event::KeyPressed(key, modifiers))
-                } else {
-                    None
+            iced::time::every(Duration::from_millis(5000)).map(|_| Event::Tick),
+            // Poll menu events frequently
+            iced::time::every(Duration::from_millis(50)).map(|_| Event::CheckMenu),
+            iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key, modifiers, ..
+                }) => Some(Event::KeyPressed(key, modifiers)),
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Event::MouseMoved(position.x, position.y))
                 }
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )) => Some(Event::DividerDragEnd),
+                _ => None,
             }),
         ];
 
@@ -516,10 +1074,33 @@ impl App {
                 }
             }
             Event::Tick => {
-                // Poll git status for active tab
+                // Poll git status only when viewing a diff (not the terminal)
                 if let Some(tab) = self.active_tab_mut() {
-                    if tab.last_poll.elapsed() >= Duration::from_millis(2500) {
+                    let viewing_diff = tab.selected_file.is_some();
+                    if viewing_diff && tab.last_poll.elapsed() >= Duration::from_millis(5000) {
                         tab.fetch_status();
+                    }
+                }
+            }
+            Event::InitMenu => {
+                // Initialize native macOS menu bar (must happen after NSApp exists)
+                setup_menu_bar();
+            }
+            Event::CheckMenu => {
+                // Poll for native menu events
+                if let Ok(event) = MenuEvent::receiver().try_recv() {
+                    if let Some(ids) = MENU_IDS.get() {
+                        if event.id == ids.increase_terminal_font {
+                            return self.update(Event::IncreaseTerminalFont);
+                        } else if event.id == ids.decrease_terminal_font {
+                            return self.update(Event::DecreaseTerminalFont);
+                        } else if event.id == ids.increase_ui_font {
+                            return self.update(Event::IncreaseUiFont);
+                        } else if event.id == ids.decrease_ui_font {
+                            return self.update(Event::DecreaseUiFont);
+                        } else if event.id == ids.toggle_theme {
+                            return self.update(Event::ToggleTheme);
+                        }
                     }
                 }
             }
@@ -556,6 +1137,9 @@ impl App {
             Event::FolderSelected(None) => {}
             Event::FileSelect(path, is_staged) => {
                 if let Some(tab) = self.active_tab_mut() {
+                    // Clear file viewer if open
+                    tab.viewing_file_path = None;
+                    tab.file_content.clear();
                     // Find the index of this file
                     let all_files = tab.all_files();
                     if let Some(idx) = all_files.iter().position(|f| f.path == path) {
@@ -568,6 +1152,10 @@ impl App {
             }
             Event::FileSelectByIndex(idx) => {
                 if let Some(tab) = self.active_tab_mut() {
+                    // Clear file viewer if open
+                    tab.viewing_file_path = None;
+                    tab.file_content.clear();
+
                     let total = tab.total_changes() as i32;
                     if total == 0 {
                         return Task::none();
@@ -596,6 +1184,13 @@ impl App {
             Event::KeyPressed(key, modifiers) => {
                 // Only handle keys when not viewing terminal (diff panel is visible)
                 if let Some(tab) = self.active_tab() {
+                    // Handle Escape in file viewer
+                    if tab.viewing_file_path.is_some() {
+                        if let Key::Named(key::Named::Escape) = key.as_ref() {
+                            return Task::done(Event::CloseFileView);
+                        }
+                    }
+
                     if tab.selected_file.is_some() {
                         // In diff view - handle navigation
                         match key.as_ref() {
@@ -623,9 +1218,22 @@ impl App {
                 }
 
                 // Tab switching with Cmd+1-9
+                // Terminal font: Cmd+Plus/Minus, UI font: Cmd+Shift+Plus/Minus
                 if modifiers.command() {
                     if let Key::Character(c) = key.as_ref() {
-                        if let Ok(num) = c.parse::<usize>() {
+                        if c == "=" || c == "+" {
+                            if modifiers.shift() {
+                                return Task::done(Event::IncreaseUiFont);
+                            } else {
+                                return Task::done(Event::IncreaseTerminalFont);
+                            }
+                        } else if c == "-" || c == "_" {
+                            if modifiers.shift() {
+                                return Task::done(Event::DecreaseUiFont);
+                            } else {
+                                return Task::done(Event::DecreaseTerminalFont);
+                            }
+                        } else if let Ok(num) = c.parse::<usize>() {
                             if num >= 1 && num <= 9 && num <= self.tabs.len() {
                                 return Task::done(Event::TabSelect(num - 1));
                             }
@@ -633,8 +1241,148 @@ impl App {
                     }
                 }
             }
+            Event::ToggleSidebarMode => {
+                let show_hidden = self.show_hidden;
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.sidebar_mode = match tab.sidebar_mode {
+                        SidebarMode::Git => {
+                            // Switching to Files mode - clear git selection
+                            tab.selected_file = None;
+                            tab.diff_lines.clear();
+                            tab.current_dir = tab.repo_path.clone();
+                            tab.fetch_file_tree(show_hidden);
+                            SidebarMode::Files
+                        }
+                        SidebarMode::Files => {
+                            // Switching to Git mode - clear file viewer and refresh status
+                            tab.viewing_file_path = None;
+                            tab.file_content.clear();
+                            tab.fetch_status();
+                            SidebarMode::Git
+                        }
+                    };
+                }
+            }
+            Event::NavigateDir(path) => {
+                let show_hidden = self.show_hidden;
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.current_dir = path;
+                    tab.fetch_file_tree(show_hidden);
+                }
+            }
+            Event::NavigateUp => {
+                let show_hidden = self.show_hidden;
+                if let Some(tab) = self.active_tab_mut() {
+                    if let Some(parent) = tab.current_dir.parent() {
+                        // Don't go above repo root
+                        if parent.starts_with(&tab.repo_path) || parent == tab.repo_path {
+                            tab.current_dir = parent.to_path_buf();
+                            tab.fetch_file_tree(show_hidden);
+                        }
+                    }
+                }
+            }
+            Event::ToggleHidden => {
+                self.show_hidden = !self.show_hidden;
+                self.save_config();
+                let show_hidden = self.show_hidden;
+                if let Some(tab) = self.active_tab_mut() {
+                    if tab.sidebar_mode == SidebarMode::Files {
+                        tab.fetch_file_tree(show_hidden);
+                    }
+                }
+            }
+            Event::DividerDragStart => {
+                self.dragging_divider = true;
+            }
+            Event::DividerDragEnd => {
+                if self.dragging_divider {
+                    self.dragging_divider = false;
+                    self.save_config();
+                }
+            }
+            Event::MouseMoved(x, _y) => {
+                if self.dragging_divider {
+                    // Clamp sidebar width between 150 and 600 pixels
+                    self.sidebar_width = x.clamp(150.0, 600.0);
+                }
+            }
+            Event::ViewFile(path) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    // Clear git selection if any
+                    tab.selected_file = None;
+                    tab.diff_lines.clear();
+                    tab.load_file(&path);
+                }
+            }
+            Event::CloseFileView => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.viewing_file_path = None;
+                    tab.file_content.clear();
+                }
+            }
+            Event::ToggleTheme => {
+                self.theme = self.theme.toggle();
+                self.save_config();
+                self.recreate_terminals();
+            }
+            Event::IncreaseTerminalFont => {
+                let new_size = (self.terminal_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE);
+                if new_size != self.terminal_font_size {
+                    self.terminal_font_size = new_size;
+                    self.save_config();
+                    self.recreate_terminals();
+                }
+            }
+            Event::DecreaseTerminalFont => {
+                let new_size = (self.terminal_font_size - FONT_SIZE_STEP).max(MIN_FONT_SIZE);
+                if new_size != self.terminal_font_size {
+                    self.terminal_font_size = new_size;
+                    self.save_config();
+                    self.recreate_terminals();
+                }
+            }
+            Event::IncreaseUiFont => {
+                let new_size = (self.ui_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE);
+                if new_size != self.ui_font_size {
+                    self.ui_font_size = new_size;
+                    self.save_config();
+                }
+            }
+            Event::DecreaseUiFont => {
+                let new_size = (self.ui_font_size - FONT_SIZE_STEP).max(MIN_FONT_SIZE);
+                if new_size != self.ui_font_size {
+                    self.ui_font_size = new_size;
+                    self.save_config();
+                }
+            }
         }
         Task::none()
+    }
+
+    fn recreate_terminals(&mut self) {
+        for tab in &mut self.tabs {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let term_settings = iced_term::settings::Settings {
+                backend: iced_term::settings::BackendSettings {
+                    program: shell,
+                    args: vec!["-l".to_string()], // Login shell to source user's config
+                    working_directory: Some(tab.repo_path.clone()),
+                    ..Default::default()
+                },
+                theme: iced_term::settings::ThemeSettings::new(Box::new(
+                    self.theme.terminal_palette(),
+                )),
+                font: iced_term::settings::FontSettings {
+                    size: self.terminal_font_size,
+                    ..Default::default()
+                },
+            };
+            if let Ok(terminal) = iced_term::Terminal::new(tab.id as u64, term_settings) {
+                tab.terminal = Some(terminal);
+                tab.created_at = Instant::now();
+            }
+        }
     }
 
     fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -649,7 +1397,8 @@ impl App {
     }
 
     fn view_tab_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let mut tabs_row = Row::new().spacing(2);
+        let theme = &self.theme;
+        let mut tabs_row = Row::new().spacing(4);
 
         for (idx, tab) in self.tabs.iter().enumerate() {
             let is_active = idx == self.active_tab;
@@ -691,7 +1440,7 @@ impl App {
                 .padding([6, 12])
                 .on_press(Event::TabSelect(idx));
 
-            let close_btn = button(text("x").size(13))
+            let close_btn = button(text("x").size(13).color(theme.text_secondary()))
                 .style(button::text)
                 .padding([6, 8])
                 .on_press(Event::TabClose(idx));
@@ -706,34 +1455,57 @@ impl App {
 
         tabs_row = tabs_row.push(add_btn);
 
-        container(tabs_row.padding(4))
-            .width(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(color!(0x1e1e2e).into()),
-                ..Default::default()
-            })
-            .into()
+        let bg = theme.bg_base();
+        container(tabs_row.padding(4).spacing(8).align_y(iced::Alignment::Center))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        })
+        .into()
     }
 
     fn view_content(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
         if let Some(tab) = self.tabs.get(self.active_tab) {
-            let file_list = self.view_file_list(tab);
+            let sidebar = self.view_sidebar(tab);
 
-            let main_panel = if tab.selected_file.is_some() {
+            let main_panel = if tab.viewing_file_path.is_some() {
+                self.view_file_content(tab)
+            } else if tab.selected_file.is_some() {
                 self.view_diff_panel(tab)
             } else {
                 self.view_terminal(tab)
             };
 
-            row![file_list, main_panel]
+            // Draggable divider
+            let divider_color = if self.dragging_divider {
+                theme.accent()
+            } else {
+                theme.border()
+            };
+            let divider = iced::widget::mouse_area(
+                container(iced::widget::Space::new())
+                    .width(Length::Fixed(4.0))
+                    .height(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(divider_color.into()),
+                        ..Default::default()
+                    }),
+            )
+            .on_press(Event::DividerDragStart)
+            .interaction(iced::mouse::Interaction::ResizingHorizontally);
+
+            row![sidebar, divider, main_panel]
                 .spacing(0)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
         } else {
+            let bg = theme.bg_base();
             container(
                 column![
-                    text("No repository open").size(16),
+                    text("No repository open").size(16).color(theme.text_primary()),
                     button(text("Open Folder").size(14))
                         .style(button::primary)
                         .padding([8, 16])
@@ -746,27 +1518,431 @@ impl App {
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
             .into()
         }
     }
 
-    fn view_file_list<'a>(
+    fn view_sidebar<'a>(
         &'a self,
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let mut content = Column::new().spacing(8).padding(12);
+        let theme = &self.theme;
+        let mut content = Column::new().spacing(0);
+
+        // Mode toggle buttons
+        let toggle = self.view_sidebar_toggle(tab);
+        content = content.push(toggle);
+
+        // Content based on mode
+        let mode_content: Element<'_, Event, Theme, iced::Renderer> = match tab.sidebar_mode {
+            SidebarMode::Git => self.view_git_list(tab),
+            SidebarMode::Files => self.view_file_tree(tab),
+        };
+
+        content = content.push(mode_content);
+
+        let bg = theme.bg_surface();
+        container(content)
+            .width(Length::Fixed(self.sidebar_width))
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_sidebar_toggle<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let git_style = if tab.sidebar_mode == SidebarMode::Git {
+            button::primary
+        } else {
+            button::secondary
+        };
+        let files_style = if tab.sidebar_mode == SidebarMode::Files {
+            button::primary
+        } else {
+            button::secondary
+        };
+
+        let changes = tab.total_changes();
+        let git_label = if changes > 0 {
+            format!("Git ({})", changes)
+        } else {
+            "Git".to_string()
+        };
+
+        let bg = theme.bg_base();
+        let font = self.ui_font();
+        container(
+            row![
+                button(text(git_label).size(font))
+                    .style(git_style)
+                    .padding([4, 12])
+                    .on_press(Event::ToggleSidebarMode),
+                button(text("Files").size(font))
+                    .style(files_style)
+                    .padding([4, 12])
+                    .on_press(Event::ToggleSidebarMode),
+            ]
+            .spacing(4),
+        )
+        .padding(8)
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    fn view_file_tree<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let mut content = Column::new().spacing(2).padding(8);
+
+        // Current path relative to repo
+        let rel_path = tab
+            .current_dir
+            .strip_prefix(&tab.repo_path)
+            .unwrap_or(&tab.current_dir);
+        let path_display = if rel_path.as_os_str().is_empty() {
+            format!("{}/", tab.repo_name)
+        } else {
+            format!("{}/{}/", tab.repo_name, rel_path.display())
+        };
+
+        // Path and hidden toggle
+        let hidden_label = if self.show_hidden { "Hide .*" } else { "Show .*" };
+        content = content.push(
+            row![
+                text(path_display)
+                    .size(font)
+                    .color(theme.accent()),
+                iced::widget::Space::new().width(Length::Fill),
+                button(text(hidden_label).size(font_small))
+                    .style(button::text)
+                    .padding([2, 6])
+                    .on_press(Event::ToggleHidden),
+            ]
+            .padding([4, 0])
+            .align_y(iced::Alignment::Center),
+        );
+
+        // Up button (if not at repo root)
+        if tab.current_dir != tab.repo_path {
+            let muted = theme.text_secondary();
+            content = content.push(
+                button(
+                    row![
+                        text("..").size(font).color(muted).width(Length::Fixed(20.0)),
+                        text("(parent)").size(font_small).color(muted),
+                    ]
+                    .spacing(8),
+                )
+                .style(button::text)
+                .padding([4, 8])
+                .on_press(Event::NavigateUp),
+            );
+        }
+
+        // File tree entries
+        for entry in &tab.file_tree {
+            let (icon, name_suffix, icon_color, name_color, bg_color) = if entry.is_dir {
+                // Folders: blue folder icon, trailing /, light background
+                (
+                    "📁",
+                    "/",
+                    theme.accent(),
+                    theme.accent(),
+                    Some(theme.bg_base()),
+                )
+            } else {
+                // Files: colored by extension
+                let ext = entry.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let file_color = match ext {
+                    "ts" | "tsx" => theme.accent(),
+                    "js" | "jsx" => theme.warning(),
+                    "md" => theme.success(),
+                    "json" => theme.warning(),
+                    "rs" => match self.theme {
+                        AppTheme::Dark => color!(0xfab387),
+                        AppTheme::Light => color!(0xfe640b),
+                    },
+                    "toml" | "yml" | "yaml" => match self.theme {
+                        AppTheme::Dark => color!(0x94e2d5),
+                        AppTheme::Light => color!(0x179299),
+                    },
+                    "css" | "scss" => match self.theme {
+                        AppTheme::Dark => color!(0xcba6f7),
+                        AppTheme::Light => color!(0x8839ef),
+                    },
+                    "html" => theme.danger(),
+                    _ => theme.text_secondary(),
+                };
+                ("  ", "", file_color, theme.text_primary(), None)
+            };
+
+            let entry_row = row![
+                text(icon).size(font).color(icon_color).width(Length::Fixed(24.0)),
+                text(format!("{}{}", entry.name, name_suffix)).size(font).color(name_color),
+            ]
+            .spacing(4);
+
+            let event = if entry.is_dir {
+                Event::NavigateDir(entry.path.clone())
+            } else {
+                Event::ViewFile(entry.path.clone())
+            };
+
+            let btn = button(entry_row)
+                .style(button::text)
+                .padding([4, 8])
+                .width(Length::Fill)
+                .on_press(event);
+
+            if let Some(bg) = bg_color {
+                content = content.push(
+                    container(btn)
+                        .width(Length::Fill)
+                        .style(move |_| container::Style {
+                            background: Some(bg.into()),
+                            ..Default::default()
+                        }),
+                );
+            } else {
+                content = content.push(btn);
+            }
+        }
+
+        if tab.file_tree.is_empty() {
+            content = content.push(
+                text("Empty directory")
+                    .size(font)
+                    .color(theme.text_secondary()),
+            );
+        }
+
+        scrollable(content)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_file_content<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let mut content = Column::new().spacing(0);
+
+        // Header with filename and close button
+        let file_name = tab
+            .viewing_file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let rel_path = tab
+            .viewing_file_path
+            .as_ref()
+            .and_then(|p| p.strip_prefix(&tab.repo_path).ok())
+            .map(|p| p.display().to_string())
+            .unwrap_or(file_name.clone());
+
+        let header_bg = theme.bg_overlay();
+        let header = row![
+            text(rel_path).size(font).color(theme.text_primary()),
+            iced::widget::Space::new().width(Length::Fill),
+            text("Esc: close").size(font_small).color(theme.text_secondary()),
+            iced::widget::Space::new().width(Length::Fixed(16.0)),
+            button(text("Close").size(font))
+                .style(button::secondary)
+                .padding([4, 8])
+                .on_press(Event::CloseFileView),
+        ]
+        .padding(8)
+        .spacing(8);
+
+        content = content.push(
+            container(header)
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(header_bg.into()),
+                    ..Default::default()
+                }),
+        );
+
+        // File content with line numbers
+        let mut file_column = Column::new().spacing(0);
+
+        let ext = tab
+            .viewing_file_path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        for (i, line) in tab.file_content.iter().enumerate() {
+            let line_num = format!("{:4}", i + 1);
+
+            // Simple syntax highlighting based on extension
+            let line_color = self.get_syntax_color(line, ext);
+
+            let line_row = row![
+                text(line_num)
+                    .size(font)
+                    .color(theme.text_muted())
+                    .font(iced::Font::MONOSPACE),
+                text(" ")
+                    .size(font)
+                    .font(iced::Font::MONOSPACE),
+                text(line)
+                    .size(font)
+                    .color(line_color)
+                    .font(iced::Font::MONOSPACE),
+            ]
+            .spacing(0);
+
+            file_column = file_column.push(
+                container(line_row)
+                    .width(Length::Fill)
+                    .padding([1, 4]),
+            );
+        }
+
+        if tab.file_content.is_empty() {
+            file_column = file_column.push(
+                text("(empty file)")
+                    .size(font)
+                    .color(theme.text_secondary()),
+            );
+        }
+
+        content = content.push(
+            scrollable(file_column.padding(8))
+                .height(Length::Fill)
+                .width(Length::Fill),
+        );
+
+        let bg = theme.bg_base();
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn get_syntax_color(&self, line: &str, ext: &str) -> iced::Color {
+        let theme = &self.theme;
+        let trimmed = line.trim();
+
+        // Theme-aware syntax colors
+        let comment = theme.text_secondary();
+        let keyword = match self.theme {
+            AppTheme::Dark => color!(0xcba6f7),
+            AppTheme::Light => color!(0x8839ef),
+        };
+        let declaration = theme.accent();
+        let function = theme.success();
+        let control = theme.warning();
+        let types = match self.theme {
+            AppTheme::Dark => color!(0xfab387),
+            AppTheme::Light => color!(0xfe640b),
+        };
+        let default = theme.text_primary();
+
+        match ext {
+            "ts" | "tsx" | "js" | "jsx" => {
+                if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
+                    comment
+                } else if trimmed.starts_with("import ") || trimmed.starts_with("export ") {
+                    keyword
+                } else if trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("var ") {
+                    declaration
+                } else if trimmed.starts_with("function ") || trimmed.starts_with("async ") || trimmed.contains("=>") {
+                    function
+                } else if trimmed.starts_with("return ") || trimmed.starts_with("if ") || trimmed.starts_with("else") {
+                    control
+                } else {
+                    default
+                }
+            }
+            "md" => {
+                if trimmed.starts_with('#') {
+                    declaration
+                } else if trimmed.starts_with('-') || trimmed.starts_with('*') || trimmed.starts_with(|c: char| c.is_numeric()) {
+                    function
+                } else if trimmed.starts_with('>') {
+                    comment
+                } else if trimmed.starts_with("```") {
+                    control
+                } else {
+                    default
+                }
+            }
+            "rs" => {
+                if trimmed.starts_with("//") {
+                    comment
+                } else if trimmed.starts_with("use ") || trimmed.starts_with("mod ") || trimmed.starts_with("pub ") {
+                    keyword
+                } else if trimmed.starts_with("fn ") || trimmed.starts_with("impl ") {
+                    function
+                } else if trimmed.starts_with("let ") || trimmed.starts_with("const ") {
+                    declaration
+                } else if trimmed.starts_with("struct ") || trimmed.starts_with("enum ") {
+                    types
+                } else {
+                    default
+                }
+            }
+            "json" => {
+                if trimmed.starts_with('"') && trimmed.contains(':') {
+                    declaration
+                } else {
+                    function
+                }
+            }
+            _ => default,
+        }
+    }
+
+    fn view_git_list<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let mut content = Column::new().spacing(8).padding(8);
 
         content = content.push(
             text(format!(" {}", tab.branch_name))
-                .size(14)
-                .color(color!(0x89b4fa)),
+                .size(self.ui_font())
+                .color(theme.accent()),
         );
 
         if !tab.staged.is_empty() {
             content = content.push(
                 text(format!("Staged ({})", tab.staged.len()))
-                    .size(12)
-                    .color(color!(0xa6e3a1)),
+                    .size(font)
+                    .color(theme.success()),
             );
             for file in &tab.staged {
                 content = content.push(self.view_file_item(file, tab));
@@ -776,8 +1952,8 @@ impl App {
         if !tab.unstaged.is_empty() {
             content = content.push(
                 text(format!("Unstaged ({})", tab.unstaged.len()))
-                    .size(12)
-                    .color(color!(0xf9e2af)),
+                    .size(font)
+                    .color(theme.warning()),
             );
             for file in &tab.unstaged {
                 content = content.push(self.view_file_item(file, tab));
@@ -787,8 +1963,8 @@ impl App {
         if !tab.untracked.is_empty() {
             content = content.push(
                 text(format!("Untracked ({})", tab.untracked.len()))
-                    .size(12)
-                    .color(color!(0x6c7086)),
+                    .size(font)
+                    .color(theme.text_secondary()),
             );
             for file in &tab.untracked {
                 content = content.push(self.view_file_item(file, tab));
@@ -796,16 +1972,12 @@ impl App {
         }
 
         if tab.staged.is_empty() && tab.unstaged.is_empty() && tab.untracked.is_empty() {
-            content = content.push(text("No changes").size(13).color(color!(0x6c7086)));
+            content = content.push(text("No changes").size(font).color(theme.text_secondary()));
         }
 
-        container(scrollable(content).height(Length::Fill))
-            .width(Length::Fixed(280.0))
+        scrollable(content)
             .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(color!(0x181825).into()),
-                ..Default::default()
-            })
+            .width(Length::Fill)
             .into()
     }
 
@@ -814,27 +1986,32 @@ impl App {
         file: &'a FileEntry,
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
         let status_color = match file.status.as_str() {
-            "A" => color!(0xa6e3a1),
-            "M" => color!(0xf9e2af),
-            "D" => color!(0xf38ba8),
-            "R" => color!(0x89b4fa),
-            _ => color!(0x6c7086),
+            "A" => theme.success(),
+            "M" => theme.warning(),
+            "D" => theme.danger(),
+            "R" => theme.accent(),
+            _ => theme.text_secondary(),
         };
 
         let is_selected = tab.selected_file.as_ref() == Some(&file.path);
         let text_color = if is_selected {
-            color!(0xffffff)
+            match self.theme {
+                AppTheme::Dark => color!(0xffffff),
+                AppTheme::Light => color!(0xffffff),
+            }
         } else {
-            color!(0xcdd6f4)
+            theme.text_primary()
         };
 
         let file_row = row![
             text(&file.status)
-                .size(12)
+                .size(font)
                 .color(status_color)
                 .width(Length::Fixed(20.0)),
-            text(&file.path).size(12).color(text_color),
+            text(&file.path).size(font).color(text_color),
         ]
         .spacing(8);
 
@@ -855,19 +2032,23 @@ impl App {
         &'a self,
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
         let mut content = Column::new().spacing(0);
 
         // Header
+        let header_bg = theme.bg_overlay();
         let header = row![
             text(tab.selected_file.as_deref().unwrap_or(""))
-                .size(13)
-                .color(color!(0xcdd6f4)),
+                .size(font)
+                .color(theme.text_primary()),
             iced::widget::Space::new().width(Length::Fill),
             text("j/k: navigate  Esc: back")
-                .size(11)
-                .color(color!(0x6c7086)),
+                .size(font_small)
+                .color(theme.text_secondary()),
             iced::widget::Space::new().width(Length::Fixed(16.0)),
-            button(text("Back to Terminal").size(12))
+            button(text("Back to Terminal").size(font))
                 .style(button::secondary)
                 .padding([4, 8])
                 .on_press(Event::ClearSelection),
@@ -876,8 +2057,8 @@ impl App {
         .spacing(8);
 
         content = content.push(
-            container(header).width(Length::Fill).style(|_| container::Style {
-                background: Some(color!(0x313244).into()),
+            container(header).width(Length::Fill).style(move |_| container::Style {
+                background: Some(header_bg.into()),
                 ..Default::default()
             }),
         );
@@ -887,7 +2068,7 @@ impl App {
 
         if tab.diff_lines.is_empty() {
             diff_column =
-                diff_column.push(text("No diff available").size(12).color(color!(0x6c7086)));
+                diff_column.push(text("No diff available").size(font).color(theme.text_secondary()));
         } else {
             for line in &tab.diff_lines {
                 diff_column = diff_column.push(self.view_diff_line(line));
@@ -900,22 +2081,25 @@ impl App {
                 .width(Length::Fill),
         );
 
+        let bg = theme.bg_base();
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(color!(0x1e1e2e).into()),
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
                 ..Default::default()
             })
             .into()
     }
 
     fn view_diff_line<'a>(&'a self, line: &'a DiffLine) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
         let (line_color, bg_color) = match line.line_type {
-            DiffLineType::Addition => (color!(0xa6e3a1), Some(color!(0x1a3a1a))),
-            DiffLineType::Deletion => (color!(0xf38ba8), Some(color!(0x3a1a1a))),
-            DiffLineType::Header => (color!(0x89b4fa), None),
-            DiffLineType::Context => (color!(0x6c7086), None),
+            DiffLineType::Addition => (theme.success(), Some(theme.diff_add_bg())),
+            DiffLineType::Deletion => (theme.danger(), Some(theme.diff_del_bg())),
+            DiffLineType::Header => (theme.accent(), None),
+            DiffLineType::Context => (theme.text_secondary(), None),
         };
 
         // Line numbers
@@ -943,16 +2127,16 @@ impl App {
                 for change in changes {
                     let (change_color, change_bg) = match (&line.line_type, &change.change_type) {
                         (DiffLineType::Deletion, ChangeType::Delete) => {
-                            (color!(0xffffff), Some(color!(0x8b3a3a)))
+                            (color!(0xffffff), Some(theme.diff_del_highlight()))
                         }
                         (DiffLineType::Addition, ChangeType::Insert) => {
-                            (color!(0xffffff), Some(color!(0x3a6b3a)))
+                            (color!(0xffffff), Some(theme.diff_add_highlight()))
                         }
                         _ => (line_color, None),
                     };
 
                     let change_text = text(&change.value)
-                        .size(12)
+                        .size(font)
                         .color(change_color)
                         .font(iced::Font::MONOSPACE);
 
@@ -970,26 +2154,27 @@ impl App {
                 content_row.into()
             } else {
                 text(&line.content)
-                    .size(12)
+                    .size(font)
                     .color(line_color)
                     .font(iced::Font::MONOSPACE)
                     .into()
             };
 
+        let line_num_color = theme.text_muted();
         let line_row = if line.line_type == DiffLineType::Header {
             row![content_element].spacing(0)
         } else {
             row![
                 text(old_num)
-                    .size(12)
-                    .color(color!(0x45475a))
+                    .size(font)
+                    .color(line_num_color)
                     .font(iced::Font::MONOSPACE),
                 text(new_num)
-                    .size(12)
-                    .color(color!(0x45475a))
+                    .size(font)
+                    .color(line_num_color)
                     .font(iced::Font::MONOSPACE),
                 text(prefix)
-                    .size(12)
+                    .size(font)
                     .color(line_color)
                     .font(iced::Font::MONOSPACE),
                 content_element,
@@ -1015,17 +2200,20 @@ impl App {
         &'a self,
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
         // Delay showing terminal for 500ms after tab creation to let layout settle
         let ready = tab.created_at.elapsed() > Duration::from_millis(500);
 
+        let bg = theme.bg_base();
         if let Some(term) = &tab.terminal {
             if ready {
                 let tab_id = tab.id;
                 container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .style(|_| container::Style {
-                        background: Some(color!(0x1e1e2e).into()),
+                    .padding(4)
+                    .style(move |_| container::Style {
+                        background: Some(bg.into()),
                         ..Default::default()
                     })
                     .into()
@@ -1034,14 +2222,14 @@ impl App {
                 container(text("").size(14))
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .style(|_| container::Style {
-                        background: Some(color!(0x1e1e2e).into()),
+                    .style(move |_| container::Style {
+                        background: Some(bg.into()),
                         ..Default::default()
                     })
                     .into()
             }
         } else {
-            container(text("Terminal unavailable").size(14))
+            container(text("Terminal unavailable").size(14).color(theme.text_secondary()))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .center_x(Length::Fill)
