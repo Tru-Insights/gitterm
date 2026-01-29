@@ -75,6 +75,10 @@ struct TabState {
     diff_lines: Vec<DiffLine>,
     // For keyboard navigation
     file_index: i32,
+    // Track when tab was created for delayed terminal display
+    created_at: Instant,
+    // Terminal title (set by shell/programs via OSC escape codes)
+    terminal_title: Option<String>,
 }
 
 impl TabState {
@@ -98,6 +102,8 @@ impl TabState {
             selected_is_staged: false,
             diff_lines: Vec::new(),
             file_index: -1,
+            created_at: Instant::now(),
+            terminal_title: None,
         }
     }
 
@@ -501,7 +507,8 @@ impl App {
                         match term.handle(iced_term::Command::ProxyToBackend(cmd)) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
-                                self.title = title;
+                                // Set tab-specific title
+                                tab.terminal_title = Some(title);
                             }
                             _ => {}
                         }
@@ -509,6 +516,7 @@ impl App {
                 }
             }
             Event::Tick => {
+                // Poll git status for active tab
                 if let Some(tab) = self.active_tab_mut() {
                     if tab.last_poll.elapsed() >= Duration::from_millis(2500) {
                         tab.fetch_status();
@@ -647,10 +655,31 @@ impl App {
             let is_active = idx == self.active_tab;
             let changes = tab.total_changes();
 
-            let tab_label = if changes > 0 {
-                format!("{} ({})", tab.repo_name, changes)
+            // Use terminal title if available, otherwise repo name
+            let base_title = tab
+                .terminal_title
+                .as_ref()
+                .map(|t| {
+                    // Truncate long titles
+                    if t.len() > 25 {
+                        format!("{}...", &t[..22])
+                    } else {
+                        t.clone()
+                    }
+                })
+                .unwrap_or_else(|| tab.repo_name.clone());
+
+            // Build tab label with shortcut
+            let shortcut = if idx < 9 {
+                format!("  \u{2318}{}", idx + 1)
             } else {
-                tab.repo_name.clone()
+                String::new()
+            };
+
+            let tab_label = if changes > 0 {
+                format!("{} ({}){}", base_title, changes, shortcut)
+            } else {
+                format!("{}{}", base_title, shortcut)
             };
 
             let tab_btn = button(text(tab_label).size(13))
@@ -986,16 +1015,31 @@ impl App {
         &'a self,
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
+        // Delay showing terminal for 500ms after tab creation to let layout settle
+        let ready = tab.created_at.elapsed() > Duration::from_millis(500);
+
         if let Some(term) = &tab.terminal {
-            let tab_id = tab.id;
-            container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_| container::Style {
-                    background: Some(color!(0x1e1e2e).into()),
-                    ..Default::default()
-                })
-                .into()
+            if ready {
+                let tab_id = tab.id;
+                container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_| container::Style {
+                        background: Some(color!(0x1e1e2e).into()),
+                        ..Default::default()
+                    })
+                    .into()
+            } else {
+                // Show loading state while terminal initializes
+                container(text("").size(14))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_| container::Style {
+                        background: Some(color!(0x1e1e2e).into()),
+                        ..Default::default()
+                    })
+                    .into()
+            }
         } else {
             container(text("Terminal unavailable").size(14))
                 .width(Length::Fill)
