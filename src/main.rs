@@ -1,9 +1,9 @@
 use git2::{DiffOptions, Repository, Status, StatusOptions};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
-use iced::widget::{button, column, container, row, scrollable, text, Column, Row};
+use iced::widget::{button, column, container, image, row, scrollable, text, text_input, Column, Row};
 use iced::{color, Length, Size, Subscription, Task, Theme};
-use iced_term::{ColorPalette, TerminalView};
+use iced_term::{ColorPalette, SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
@@ -147,6 +147,8 @@ struct Config {
     ui_font_size: f32,
     #[serde(default = "default_sidebar_width")]
     sidebar_width: f32,
+    #[serde(default = "default_scrollback_lines")]
+    scrollback_lines: usize,
     // Legacy field for migration
     #[serde(default)]
     font_size: Option<f32>,
@@ -158,6 +160,7 @@ struct Config {
 fn default_terminal_font() -> f32 { 14.0 }
 fn default_ui_font() -> f32 { 13.0 }
 fn default_sidebar_width() -> f32 { 280.0 }
+fn default_scrollback_lines() -> usize { 100_000 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -165,6 +168,7 @@ impl Default for Config {
             terminal_font_size: 14.0,
             ui_font_size: 13.0,
             sidebar_width: 280.0,
+            scrollback_lines: 100_000,
             font_size: None,
             theme: "dark".to_string(),
             show_hidden: false,
@@ -465,6 +469,15 @@ enum DiffLineType {
     Header,
 }
 
+// Search state for terminal scrollback
+#[derive(Debug, Clone, Default)]
+struct SearchState {
+    is_active: bool,
+    query: String,
+    matches: Vec<SearchMatch>,
+    current_match: usize,
+}
+
 // Tab state
 struct TabState {
     id: usize,
@@ -493,6 +506,9 @@ struct TabState {
     // File viewer state
     viewing_file_path: Option<PathBuf>,
     file_content: Vec<String>,
+    image_handle: Option<image::Handle>,
+    // Search state
+    search: SearchState,
 }
 
 impl TabState {
@@ -524,7 +540,73 @@ impl TabState {
             file_tree: Vec::new(),
             viewing_file_path: None,
             file_content: Vec::new(),
+            image_handle: None,
+            search: SearchState::default(),
         }
+    }
+
+    fn is_image_file(path: &PathBuf) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| matches!(ext.to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"))
+            .unwrap_or(false)
+    }
+
+    /// Try to extract a directory path from the terminal title.
+    /// Handles common shell title formats:
+    /// - "~/path" or "/absolute/path"
+    /// - "~/path (extra)" - path followed by parenthetical info
+    /// - "dirname — zsh" (starship style)
+    /// - "user@host:~/path" (standard zsh/bash)
+    fn extract_dir_from_title(title: &str) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+
+        // Helper to expand ~ and check if path exists
+        let try_path = |s: &str| -> Option<PathBuf> {
+            let s = s.trim();
+            let expanded = if s.starts_with("~/") {
+                format!("{}/{}", home, &s[2..])
+            } else if s == "~" {
+                home.clone()
+            } else if s.starts_with('/') {
+                s.to_string()
+            } else {
+                return None;
+            };
+            let path = PathBuf::from(&expanded);
+            if path.is_dir() { Some(path) } else { None }
+        };
+
+        // First: look for path at the start, ending at " (" which often indicates extra info
+        // e.g., "~/GitRepo/project (18) ⌘1" -> extract "~/GitRepo/project"
+        if let Some(paren_pos) = title.find(" (") {
+            let candidate = &title[..paren_pos];
+            if let Some(path) = try_path(candidate) {
+                return Some(path);
+            }
+        }
+
+        // Second: try the whole title as-is
+        if let Some(path) = try_path(title) {
+            return Some(path);
+        }
+
+        // Third: split by em-dash or colon (but NOT hyphen, as paths often have hyphens)
+        for sep in &['\u{2014}', ':'] { // em-dash, colon
+            for part in title.split(*sep) {
+                // Also try stripping at " (" within each part
+                let part = if let Some(pos) = part.find(" (") {
+                    &part[..pos]
+                } else {
+                    part
+                };
+                if let Some(path) = try_path(part) {
+                    return Some(path);
+                }
+            }
+        }
+
+        None
     }
 
     fn fetch_file_tree(&mut self, show_hidden: bool) {
@@ -569,9 +651,14 @@ impl TabState {
 
     fn load_file(&mut self, path: &PathBuf) {
         self.file_content.clear();
+        self.image_handle = None;
         self.viewing_file_path = Some(path.clone());
 
-        if let Ok(content) = std::fs::read_to_string(path) {
+        if Self::is_image_file(path) {
+            // Load as image
+            self.image_handle = Some(image::Handle::from_path(path));
+        } else if let Ok(content) = std::fs::read_to_string(path) {
+            // Load as text
             self.file_content = content.lines().map(|s| s.to_string()).collect();
         }
     }
@@ -892,6 +979,13 @@ pub enum Event {
     DividerDragStart,
     DividerDragEnd,
     MouseMoved(f32, f32),
+    // Search events
+    ToggleSearch,
+    SearchQueryChanged(String),
+    SearchExecute,
+    SearchNext,
+    SearchPrev,
+    SearchClose,
 }
 
 struct App {
@@ -903,6 +997,7 @@ struct App {
     terminal_font_size: f32,
     ui_font_size: f32,
     sidebar_width: f32,
+    scrollback_lines: usize,
     dragging_divider: bool,
     show_hidden: bool,
 }
@@ -927,6 +1022,7 @@ impl App {
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
             sidebar_width: self.sidebar_width,
+            scrollback_lines: self.scrollback_lines,
             font_size: None,
             theme: match self.theme {
                 AppTheme::Dark => "dark".to_string(),
@@ -965,13 +1061,16 @@ impl App {
             terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             sidebar_width: config.sidebar_width.clamp(150.0, 600.0),
+            scrollback_lines: config.scrollback_lines,
             dragging_divider: false,
             show_hidden: config.show_hidden,
         };
 
-        if Repository::open(&cwd).is_ok() {
-            app.add_tab(cwd);
-        }
+        // Open home directory by default
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or(cwd);
+        app.add_tab(home);
 
         // Return a task to initialize the menu bar after the app starts
         (app, Task::done(Event::InitMenu))
@@ -983,12 +1082,86 @@ impl App {
 
         let mut tab = TabState::new(id, repo_path.clone());
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        // Get shell - try SHELL env var, then check /etc/passwd, then fallback to /bin/zsh
+        let shell = std::env::var("SHELL").ok().or_else(|| {
+            // When running as app bundle, SHELL may not be set - check passwd
+            let user = std::env::var("USER").ok()?;
+            let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+            for line in passwd.lines() {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.first() == Some(&user.as_str()) {
+                    return parts.get(6).map(|s| s.to_string());
+                }
+            }
+            None
+        }).unwrap_or_else(|| "/bin/zsh".to_string());
+
+        // Build environment for PTY - app bundles have minimal env, so we need to set essentials
+        let mut env = std::collections::HashMap::new();
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+        env.insert("LANG".to_string(), std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()));
+        if let Ok(home) = std::env::var("HOME") {
+            env.insert("HOME".to_string(), home.clone());
+            env.insert("PATH".to_string(), format!("{}/.local/bin:{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", home, home));
+        }
+        if let Ok(user) = std::env::var("USER") {
+            env.insert("USER".to_string(), user.clone());
+            env.insert("LOGNAME".to_string(), user);
+        }
+        env.insert("SHELL".to_string(), shell.clone());
+
+        // Add precmd hook to set terminal title to current directory
+        // This enables the sidebar to sync with terminal directory changes
+        env.insert("GITTERM_PRECMD".to_string(), "1".to_string());
+
+        // Determine shell type for the right initialization
+        let is_zsh = shell.contains("zsh");
+        let is_bash = shell.contains("bash");
+
+        // Build args to inject precmd hook
+        let args = if is_zsh {
+            // For zsh: use ZDOTDIR to inject our precmd before user's config
+            // Create a custom .zshrc that sets up title reporting then sources user config
+            let home = std::env::var("HOME").unwrap_or_default();
+            let gitterm_dir = format!("{home}/.config/gitterm/zsh");
+            let gitterm_zshrc = format!("{gitterm_dir}/.zshrc");
+
+            // Ensure the directory exists
+            let _ = std::fs::create_dir_all(&gitterm_dir);
+            let zshrc_content = format!(
+                r#"# GitTerm shell integration - sets terminal title on directory change
+_gitterm_set_title() {{ print -Pn "\e]0;%~\a" }}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _gitterm_set_title
+add-zsh-hook chpwd _gitterm_set_title
+# Set title immediately
+_gitterm_set_title
+# Source user's normal config files
+[[ -f "{home}/.zshenv" ]] && source "{home}/.zshenv"
+[[ -f "{home}/.zprofile" ]] && source "{home}/.zprofile"
+[[ -f "{home}/.zshrc" ]] && source "{home}/.zshrc"
+"#
+            );
+            let _ = std::fs::write(&gitterm_zshrc, zshrc_content);
+
+            env.insert("ZDOTDIR".to_string(), gitterm_dir);
+            vec!["-l".to_string()]
+        } else if is_bash {
+            // For bash: use PROMPT_COMMAND
+            env.insert("PROMPT_COMMAND".to_string(), r#"printf "\e]0;%s\a" "$PWD""#.to_string());
+            vec!["-l".to_string()]
+        } else {
+            vec!["-l".to_string()]
+        };
+
         let term_settings = iced_term::settings::Settings {
             backend: iced_term::settings::BackendSettings {
                 program: shell,
-                args: vec!["-l".to_string()], // Login shell to source user's config
+                args,
                 working_directory: Some(repo_path),
+                scrollback_lines: self.scrollback_lines,
+                env,
                 ..Default::default()
             },
             theme: iced_term::settings::ThemeSettings::new(Box::new(
@@ -1066,7 +1239,32 @@ impl App {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 // Set tab-specific title
-                                tab.terminal_title = Some(title);
+                                tab.terminal_title = Some(title.clone());
+
+                                // Try to sync sidebar directory from terminal title
+                                if let Some(dir) = TabState::extract_dir_from_title(&title) {
+                                    if dir != tab.current_dir {
+                                        tab.current_dir = dir.clone();
+                                        // Always refresh file tree so it's ready when switching to Files mode
+                                        tab.fetch_file_tree(self.show_hidden);
+
+                                        // Check if we're in a different git repo and update git status
+                                        if let Ok(repo) = Repository::discover(&dir) {
+                                            if let Some(repo_root) = repo.workdir() {
+                                                let new_repo_path = repo_root.to_path_buf();
+                                                if new_repo_path != tab.repo_path {
+                                                    // Different repo - update repo_path and refresh
+                                                    tab.repo_path = new_repo_path;
+                                                    tab.repo_name = tab.repo_path
+                                                        .file_name()
+                                                        .map(|n| n.to_string_lossy().to_string())
+                                                        .unwrap_or_else(|| "repo".to_string());
+                                                    tab.fetch_status();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -1121,7 +1319,7 @@ impl App {
                 return Task::perform(
                     async {
                         let folder = rfd::AsyncFileDialog::new()
-                            .set_title("Select Git Repository")
+                            .set_title("Select Folder")
                             .pick_folder()
                             .await;
                         folder.map(|f| f.path().to_path_buf())
@@ -1130,9 +1328,8 @@ impl App {
                 );
             }
             Event::FolderSelected(Some(path)) => {
-                if Repository::open(&path).is_ok() {
-                    self.add_tab(path);
-                }
+                // Allow any folder, not just git repos
+                self.add_tab(path);
             }
             Event::FolderSelected(None) => {}
             Event::FileSelect(path, is_staged) => {
@@ -1140,6 +1337,7 @@ impl App {
                     // Clear file viewer if open
                     tab.viewing_file_path = None;
                     tab.file_content.clear();
+                    tab.image_handle = None;
                     // Find the index of this file
                     let all_files = tab.all_files();
                     if let Some(idx) = all_files.iter().position(|f| f.path == path) {
@@ -1155,6 +1353,7 @@ impl App {
                     // Clear file viewer if open
                     tab.viewing_file_path = None;
                     tab.file_content.clear();
+                    tab.image_handle = None;
 
                     let total = tab.total_changes() as i32;
                     if total == 0 {
@@ -1182,8 +1381,33 @@ impl App {
                 }
             }
             Event::KeyPressed(key, modifiers) => {
-                // Only handle keys when not viewing terminal (diff panel is visible)
+                // Handle search shortcuts first (Cmd+F, Cmd+G, Escape when search active)
                 if let Some(tab) = self.active_tab() {
+                    // Search shortcuts
+                    if modifiers.command() {
+                        if let Key::Character(c) = key.as_ref() {
+                            // Cmd+F - Toggle search
+                            if c == "f" {
+                                return Task::done(Event::ToggleSearch);
+                            }
+                            // Cmd+G / Cmd+Shift+G - Next/Prev match
+                            if c == "g" && tab.search.is_active {
+                                if modifiers.shift() {
+                                    return Task::done(Event::SearchPrev);
+                                } else {
+                                    return Task::done(Event::SearchNext);
+                                }
+                            }
+                        }
+                    }
+
+                    // Escape - Close search if active
+                    if tab.search.is_active {
+                        if let Key::Named(key::Named::Escape) = key.as_ref() {
+                            return Task::done(Event::SearchClose);
+                        }
+                    }
+
                     // Handle Escape in file viewer
                     if tab.viewing_file_path.is_some() {
                         if let Key::Named(key::Named::Escape) = key.as_ref() {
@@ -1247,9 +1471,9 @@ impl App {
                     tab.sidebar_mode = match tab.sidebar_mode {
                         SidebarMode::Git => {
                             // Switching to Files mode - clear git selection
+                            // Keep current_dir as-is (it tracks the terminal's directory)
                             tab.selected_file = None;
                             tab.diff_lines.clear();
-                            tab.current_dir = tab.repo_path.clone();
                             tab.fetch_file_tree(show_hidden);
                             SidebarMode::Files
                         }
@@ -1257,6 +1481,7 @@ impl App {
                             // Switching to Git mode - clear file viewer and refresh status
                             tab.viewing_file_path = None;
                             tab.file_content.clear();
+                            tab.image_handle = None;
                             tab.fetch_status();
                             SidebarMode::Git
                         }
@@ -1319,6 +1544,7 @@ impl App {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.viewing_file_path = None;
                     tab.file_content.clear();
+                    tab.image_handle = None;
                 }
             }
             Event::ToggleTheme => {
@@ -1356,18 +1582,151 @@ impl App {
                     self.save_config();
                 }
             }
+            // Search events
+            Event::ToggleSearch => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.search.is_active = !tab.search.is_active;
+                    if !tab.search.is_active {
+                        // Clear search state when closing
+                        tab.search.query.clear();
+                        tab.search.matches.clear();
+                        tab.search.current_match = 0;
+                    }
+                }
+            }
+            Event::SearchQueryChanged(query) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.search.query = query;
+                }
+            }
+            Event::SearchExecute => {
+                if let Some(tab) = self.active_tab_mut() {
+                    if let Some(term) = &mut tab.terminal {
+                        let matches = term.search_all(&tab.search.query);
+                        tab.search.matches = matches;
+                        tab.search.current_match = 0;
+
+                        // Scroll to first match if found
+                        if let Some(first_match) = tab.search.matches.first() {
+                            let line = first_match.start.line.0;
+                            term.scroll_to_line(line);
+                        }
+                    }
+                }
+            }
+            Event::SearchNext => {
+                if let Some(tab) = self.active_tab_mut() {
+                    if !tab.search.matches.is_empty() {
+                        tab.search.current_match = (tab.search.current_match + 1) % tab.search.matches.len();
+                        if let Some(term) = &mut tab.terminal {
+                            let current = &tab.search.matches[tab.search.current_match];
+                            term.scroll_to_line(current.start.line.0);
+                        }
+                    }
+                }
+            }
+            Event::SearchPrev => {
+                if let Some(tab) = self.active_tab_mut() {
+                    if !tab.search.matches.is_empty() {
+                        if tab.search.current_match == 0 {
+                            tab.search.current_match = tab.search.matches.len() - 1;
+                        } else {
+                            tab.search.current_match -= 1;
+                        }
+                        if let Some(term) = &mut tab.terminal {
+                            let current = &tab.search.matches[tab.search.current_match];
+                            term.scroll_to_line(current.start.line.0);
+                        }
+                    }
+                }
+            }
+            Event::SearchClose => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.search.is_active = false;
+                    tab.search.query.clear();
+                    tab.search.matches.clear();
+                    tab.search.current_match = 0;
+                }
+            }
         }
         Task::none()
     }
 
     fn recreate_terminals(&mut self) {
         for tab in &mut self.tabs {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            // Get shell - try SHELL env var, then check /etc/passwd, then fallback to /bin/zsh
+            let shell = std::env::var("SHELL").ok().or_else(|| {
+                let user = std::env::var("USER").ok()?;
+                let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+                for line in passwd.lines() {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    if parts.first() == Some(&user.as_str()) {
+                        return parts.get(6).map(|s| s.to_string());
+                    }
+                }
+                None
+            }).unwrap_or_else(|| "/bin/zsh".to_string());
+
+            // Build environment for PTY
+            let mut env = std::collections::HashMap::new();
+            env.insert("TERM".to_string(), "xterm-256color".to_string());
+            env.insert("COLORTERM".to_string(), "truecolor".to_string());
+            env.insert("LANG".to_string(), std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()));
+            if let Ok(home) = std::env::var("HOME") {
+                env.insert("HOME".to_string(), home.clone());
+                env.insert("PATH".to_string(), format!("{}/.local/bin:{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", home, home));
+            }
+            if let Ok(user) = std::env::var("USER") {
+                env.insert("USER".to_string(), user.clone());
+                env.insert("LOGNAME".to_string(), user);
+            }
+            env.insert("SHELL".to_string(), shell.clone());
+
+            // Add precmd hook to set terminal title to current directory
+            env.insert("GITTERM_PRECMD".to_string(), "1".to_string());
+
+            // Determine shell type for the right initialization
+            let is_zsh = shell.contains("zsh");
+            let is_bash = shell.contains("bash");
+
+            // Build args to inject precmd hook
+            let args = if is_zsh {
+                // For zsh: use ZDOTDIR to inject our precmd before user's config
+                let home = std::env::var("HOME").unwrap_or_default();
+                let gitterm_dir = format!("{home}/.config/gitterm/zsh");
+                let gitterm_zshrc = format!("{gitterm_dir}/.zshrc");
+
+                let _ = std::fs::create_dir_all(&gitterm_dir);
+                let zshrc_content = format!(
+                    r#"# GitTerm shell integration - sets terminal title on directory change
+_gitterm_set_title() {{ print -Pn "\e]0;%~\a" }}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _gitterm_set_title
+add-zsh-hook chpwd _gitterm_set_title
+_gitterm_set_title
+[[ -f "{home}/.zshenv" ]] && source "{home}/.zshenv"
+[[ -f "{home}/.zprofile" ]] && source "{home}/.zprofile"
+[[ -f "{home}/.zshrc" ]] && source "{home}/.zshrc"
+"#
+                );
+                let _ = std::fs::write(&gitterm_zshrc, zshrc_content);
+
+                env.insert("ZDOTDIR".to_string(), gitterm_dir);
+                vec!["-l".to_string()]
+            } else if is_bash {
+                env.insert("PROMPT_COMMAND".to_string(), r#"printf "\e]0;%s\a" "$PWD""#.to_string());
+                vec!["-l".to_string()]
+            } else {
+                vec!["-l".to_string()]
+            };
+
             let term_settings = iced_term::settings::Settings {
                 backend: iced_term::settings::BackendSettings {
                     program: shell,
-                    args: vec!["-l".to_string()], // Login shell to source user's config
+                    args,
                     working_directory: Some(tab.repo_path.clone()),
+                    scrollback_lines: self.scrollback_lines,
+                    env,
                     ..Default::default()
                 },
                 theme: iced_term::settings::ThemeSettings::new(Box::new(
@@ -1612,15 +1971,21 @@ impl App {
         let font_small = self.ui_font_small();
         let mut content = Column::new().spacing(2).padding(8);
 
-        // Current path relative to repo
-        let rel_path = tab
-            .current_dir
-            .strip_prefix(&tab.repo_path)
-            .unwrap_or(&tab.current_dir);
-        let path_display = if rel_path.as_os_str().is_empty() {
-            format!("{}/", tab.repo_name)
+        // Current path - show relative to repo if inside it, otherwise show with ~ for home
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path_display = if let Ok(rel_path) = tab.current_dir.strip_prefix(&tab.repo_path) {
+            // Inside repo - show repo_name/relative/path/
+            if rel_path.as_os_str().is_empty() {
+                format!("{}/", tab.repo_name)
+            } else {
+                format!("{}/{}/", tab.repo_name, rel_path.display())
+            }
+        } else if let Ok(rel_home) = tab.current_dir.strip_prefix(&home) {
+            // Outside repo but under home - show ~/path/
+            format!("~/{}/", rel_home.display())
         } else {
-            format!("{}/{}/", tab.repo_name, rel_path.display())
+            // Absolute path
+            format!("{}/", tab.current_dir.display())
         };
 
         // Path and hidden toggle
@@ -1787,57 +2152,75 @@ impl App {
                 }),
         );
 
-        // File content with line numbers
-        let mut file_column = Column::new().spacing(0);
+        // Check if we're viewing an image
+        if let Some(handle) = &tab.image_handle {
+            // Display image
+            let img = image(handle.clone())
+                .content_fit(iced::ContentFit::Contain);
 
-        let ext = tab
-            .viewing_file_path
-            .as_ref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-
-        for (i, line) in tab.file_content.iter().enumerate() {
-            let line_num = format!("{:4}", i + 1);
-
-            // Simple syntax highlighting based on extension
-            let line_color = self.get_syntax_color(line, ext);
-
-            let line_row = row![
-                text(line_num)
-                    .size(font)
-                    .color(theme.text_muted())
-                    .font(iced::Font::MONOSPACE),
-                text(" ")
-                    .size(font)
-                    .font(iced::Font::MONOSPACE),
-                text(line)
-                    .size(font)
-                    .color(line_color)
-                    .font(iced::Font::MONOSPACE),
-            ]
-            .spacing(0);
-
-            file_column = file_column.push(
-                container(line_row)
-                    .width(Length::Fill)
-                    .padding([1, 4]),
-            );
-        }
-
-        if tab.file_content.is_empty() {
-            file_column = file_column.push(
-                text("(empty file)")
-                    .size(font)
-                    .color(theme.text_secondary()),
-            );
-        }
-
-        content = content.push(
-            scrollable(file_column.padding(8))
+            content = content.push(
+                scrollable(
+                    container(img)
+                        .width(Length::Fill)
+                        .center_x(Length::Fill)
+                        .padding(16)
+                )
                 .height(Length::Fill)
                 .width(Length::Fill),
-        );
+            );
+        } else {
+            // File content with line numbers
+            let mut file_column = Column::new().spacing(0);
+
+            let ext = tab
+                .viewing_file_path
+                .as_ref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+
+            for (i, line) in tab.file_content.iter().enumerate() {
+                let line_num = format!("{:4}", i + 1);
+
+                // Simple syntax highlighting based on extension
+                let line_color = self.get_syntax_color(line, ext);
+
+                let line_row = row![
+                    text(line_num)
+                        .size(font)
+                        .color(theme.text_muted())
+                        .font(iced::Font::MONOSPACE),
+                    text(" ")
+                        .size(font)
+                        .font(iced::Font::MONOSPACE),
+                    text(line)
+                        .size(font)
+                        .color(line_color)
+                        .font(iced::Font::MONOSPACE),
+                ]
+                .spacing(0);
+
+                file_column = file_column.push(
+                    container(line_row)
+                        .width(Length::Fill)
+                        .padding([1, 4]),
+                );
+            }
+
+            if tab.file_content.is_empty() {
+                file_column = file_column.push(
+                    text("(empty file)")
+                        .size(font)
+                        .color(theme.text_secondary()),
+                );
+            }
+
+            content = content.push(
+                scrollable(file_column.padding(8))
+                    .height(Length::Fill)
+                    .width(Length::Fill),
+            );
+        }
 
         let bg = theme.bg_base();
         container(content)
@@ -1932,11 +2315,14 @@ impl App {
         let font = self.ui_font();
         let mut content = Column::new().spacing(8).padding(8);
 
-        content = content.push(
-            text(format!(" {}", tab.branch_name))
-                .size(self.ui_font())
-                .color(theme.accent()),
-        );
+        // Only show branch name if this is a git repo
+        if Repository::open(&tab.repo_path).is_ok() {
+            content = content.push(
+                text(format!(" {}", tab.branch_name))
+                    .size(self.ui_font())
+                    .color(theme.accent()),
+            );
+        }
 
         if !tab.staged.is_empty() {
             content = content.push(
@@ -1972,7 +2358,13 @@ impl App {
         }
 
         if tab.staged.is_empty() && tab.unstaged.is_empty() && tab.untracked.is_empty() {
-            content = content.push(text("No changes").size(font).color(theme.text_secondary()));
+            // Check if this is actually a git repo
+            let msg = if Repository::open(&tab.repo_path).is_ok() {
+                "No changes"
+            } else {
+                "Not a git repository"
+            };
+            content = content.push(text(msg).size(font).color(theme.text_secondary()));
         }
 
         scrollable(content)
@@ -2205,7 +2597,7 @@ impl App {
         let ready = tab.created_at.elapsed() > Duration::from_millis(500);
 
         let bg = theme.bg_base();
-        if let Some(term) = &tab.terminal {
+        let terminal_view: Element<'a, Event, Theme, iced::Renderer> = if let Some(term) = &tab.terminal {
             if ready {
                 let tab_id = tab.id;
                 container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
@@ -2235,6 +2627,86 @@ impl App {
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
                 .into()
+        };
+
+        // Stack search bar on top of terminal when active
+        if tab.search.is_active {
+            let search_bar = self.view_search_bar(tab);
+            column![search_bar, terminal_view]
+                .spacing(0)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            terminal_view
         }
+    }
+
+    fn view_search_bar<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        // Match count display
+        let match_display = if tab.search.matches.is_empty() {
+            if tab.search.query.is_empty() {
+                String::new()
+            } else {
+                "No matches".to_string()
+            }
+        } else {
+            format!("{}/{}", tab.search.current_match + 1, tab.search.matches.len())
+        };
+
+        let has_matches = !tab.search.matches.is_empty();
+
+        let search_input = text_input("Search...", &tab.search.query)
+            .on_input(Event::SearchQueryChanged)
+            .on_submit(Event::SearchExecute)
+            .size(font)
+            .width(Length::Fixed(200.0))
+            .padding([4, 8]);
+
+        let prev_btn = button(text("<").size(font))
+            .style(if has_matches { button::secondary } else { button::text })
+            .padding([4, 8])
+            .on_press_maybe(if has_matches { Some(Event::SearchPrev) } else { None });
+
+        let next_btn = button(text(">").size(font))
+            .style(if has_matches { button::secondary } else { button::text })
+            .padding([4, 8])
+            .on_press_maybe(if has_matches { Some(Event::SearchNext) } else { None });
+
+        let close_btn = button(text("x").size(font))
+            .style(button::text)
+            .padding([4, 8])
+            .on_press(Event::SearchClose);
+
+        let bar_bg = theme.bg_overlay();
+        container(
+            row![
+                search_input,
+                text(match_display).size(font_small).color(theme.text_secondary()),
+                prev_btn,
+                next_btn,
+                iced::widget::Space::new().width(Length::Fill),
+                text("Esc: close  Cmd+G: next  Cmd+Shift+G: prev")
+                    .size(font_small)
+                    .color(theme.text_muted()),
+                close_btn,
+            ]
+            .spacing(8)
+            .padding(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bar_bg.into()),
+            ..Default::default()
+        })
+        .into()
     }
 }
