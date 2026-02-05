@@ -146,6 +146,7 @@ fn setup_menu_bar() {
     });
 
     // Initialize menu for macOS - this must happen after NSApp exists
+    #[cfg(target_os = "macos")]
     menu.init_for_nsapp();
 
     // Leak the menu to keep it alive for the lifetime of the app
