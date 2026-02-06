@@ -1177,7 +1177,11 @@ impl App {
 
         let mut tab = TabState::new(id, repo_path.clone());
 
-        // Get shell - try SHELL env var, then check /etc/passwd, then fallback to /bin/zsh
+        // Get shell - platform-specific defaults
+        #[cfg(target_os = "windows")]
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string());
+
+        #[cfg(not(target_os = "windows"))]
         let shell = std::env::var("SHELL").ok().or_else(|| {
             // When running as app bundle, SHELL may not be set - check passwd
             let user = std::env::var("USER").ok()?;
@@ -1918,7 +1922,11 @@ _gitterm_set_title
 
     fn recreate_terminals(&mut self) {
         for tab in &mut self.tabs {
-            // Get shell - try SHELL env var, then check /etc/passwd, then fallback to /bin/zsh
+            // Get shell - platform-specific defaults
+            #[cfg(target_os = "windows")]
+            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string());
+
+            #[cfg(not(target_os = "windows"))]
             let shell = std::env::var("SHELL").ok().or_else(|| {
                 let user = std::env::var("USER").ok()?;
                 let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
