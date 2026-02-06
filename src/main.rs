@@ -1197,18 +1197,30 @@ impl App {
 
         // Build environment for PTY - app bundles have minimal env, so we need to set essentials
         let mut env = std::collections::HashMap::new();
-        env.insert("TERM".to_string(), "xterm-256color".to_string());
-        env.insert("COLORTERM".to_string(), "truecolor".to_string());
-        env.insert("LANG".to_string(), std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()));
-        if let Ok(home) = std::env::var("HOME") {
-            env.insert("HOME".to_string(), home.clone());
-            env.insert("PATH".to_string(), format!("{}/.local/bin:{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", home, home));
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            env.insert("TERM".to_string(), "xterm-256color".to_string());
+            env.insert("COLORTERM".to_string(), "truecolor".to_string());
+            env.insert("LANG".to_string(), std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()));
+            if let Ok(home) = std::env::var("HOME") {
+                env.insert("HOME".to_string(), home.clone());
+                env.insert("PATH".to_string(), format!("{}/.local/bin:{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", home, home));
+            }
+            if let Ok(user) = std::env::var("USER") {
+                env.insert("USER".to_string(), user.clone());
+                env.insert("LOGNAME".to_string(), user);
+            }
+            env.insert("SHELL".to_string(), shell.clone());
         }
-        if let Ok(user) = std::env::var("USER") {
-            env.insert("USER".to_string(), user.clone());
-            env.insert("LOGNAME".to_string(), user);
+
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows, inherit most environment variables from parent process
+            for (key, value) in std::env::vars() {
+                env.insert(key, value);
+            }
         }
-        env.insert("SHELL".to_string(), shell.clone());
 
         // Add precmd hook to set terminal title to current directory
         // This enables the sidebar to sync with terminal directory changes
@@ -1217,9 +1229,13 @@ impl App {
         // Determine shell type for the right initialization
         let is_zsh = shell.contains("zsh");
         let is_bash = shell.contains("bash");
+        let is_windows = cfg!(target_os = "windows");
 
         // Build args to inject precmd hook
-        let args = if is_zsh {
+        let args = if is_windows {
+            // Windows shells don't use login flag
+            vec![]
+        } else if is_zsh {
             // For zsh: use ZDOTDIR to inject our precmd before user's config
             // Create a custom .zshrc that sets up title reporting then sources user config
             let home = std::env::var("HOME").unwrap_or_default();
