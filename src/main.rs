@@ -2776,6 +2776,14 @@ _gitterm_set_title
                     // Update active workspace immediately (tab bar + console switch instantly)
                     self.active_workspace_idx = idx;
                     self.save_workspaces();
+
+                    // Set scrollable to starting position for the animation
+                    return iced::advanced::widget::operate(
+                        iced::advanced::widget::operation::scrollable::scroll_to(
+                            workspace_scrollable_id().into(),
+                            scrollable::AbsoluteOffset { x: Some(self.slide_start_offset), y: None },
+                        ),
+                    );
                 }
             }
             Event::SlideAnimationTick => {
@@ -2903,20 +2911,14 @@ _gitterm_set_title
                 self.active_workspace_idx = self.workspaces.len() - 1;
                 self.save_workspaces();
 
-                // Snap slide to new workspace (no animation)
+                // Snap slide state to new workspace position
+                // (no scroll_to needed — view renders active workspace directly when not animating)
                 let viewport_width = self.content_viewport_width();
                 let new_target = self.active_workspace_idx as f32 * viewport_width;
                 self.slide_offset = new_target;
                 self.slide_target = new_target;
                 self.slide_animating = false;
                 self.slide_start_time = None;
-
-                return iced::advanced::widget::operate(
-                    iced::advanced::widget::operation::scrollable::scroll_to(
-                        workspace_scrollable_id().into(),
-                        scrollable::AbsoluteOffset { x: Some(new_target), y: None },
-                    ),
-                );
             }
             Event::WorkspaceCreated(None) => {}
             // Console panel events
@@ -3695,6 +3697,19 @@ _gitterm_set_title
         let viewport_width = self.content_viewport_width();
         let active_idx = self.active_workspace_idx;
         let theme = &self.theme;
+
+        // When not animating or swiping, render active workspace directly
+        // (avoids scroll_to timing issues, especially after creating new workspaces)
+        let is_swiping = self.last_user_scroll.is_some();
+        if !self.slide_animating && !is_swiping {
+            if let Some(ws) = self.workspaces.get(active_idx) {
+                return container(self.view_workspace_content(ws))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .clip(true)
+                    .into();
+            }
+        }
 
         let mut panels = Row::new().spacing(0);
 
