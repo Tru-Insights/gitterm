@@ -1,0 +1,1340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitTerm — Niri-Inspired Spatial Workspaces</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+  :root {
+    /* Catppuccin Mocha */
+    --crust: #11111b;
+    --mantle: #181825;
+    --base: #1e1e2e;
+    --surface0: #313244;
+    --surface1: #45475a;
+    --surface2: #585b70;
+    --overlay0: #6c7086;
+    --overlay1: #7f849c;
+    --subtext0: #a6adc8;
+    --subtext1: #bac2de;
+    --text: #cdd6f4;
+    --lavender: #b4befe;
+    --blue: #89b4fa;
+    --sapphire: #74c7ec;
+    --green: #a6e3a1;
+    --yellow: #f9e2af;
+    --peach: #fab387;
+    --red: #f38ba8;
+    --mauve: #cba6f7;
+    --pink: #f5c2e7;
+    --flamingo: #f2cdcd;
+    --rosewater: #f5e0dc;
+    --teal: #94e2d5;
+    --sky: #89dceb;
+
+    --attention-glow: rgba(250, 179, 135, 0.35);
+    --attention-pulse: rgba(250, 179, 135, 0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--crust);
+    color: var(--text);
+    font-family: 'IBM Plex Sans', sans-serif;
+    height: 100vh;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  /* ═══════════════════════════════════════════
+     LAYOUT: The spatial workspace container
+     ═══════════════════════════════════════════ */
+
+  .app {
+    display: flex;
+    height: 100vh;
+    position: relative;
+  }
+
+  /* Left edge: workspace position indicator (replaces the rail) */
+  .workspace-spine {
+    width: 6px;
+    background: var(--mantle);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 0 0;
+    z-index: 100;
+    position: relative;
+  }
+
+  .spine-dot {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--surface1);
+    transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+    cursor: pointer;
+  }
+
+  .spine-dot.active {
+    height: 18px;
+    border-radius: 2px;
+    background: var(--lavender);
+  }
+
+  .spine-dot.attention {
+    background: var(--peach);
+    box-shadow: 0 0 8px var(--attention-glow);
+    animation: spine-pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes spine-pulse {
+    0%, 100% { box-shadow: 0 0 6px var(--attention-glow); }
+    50% { box-shadow: 0 0 14px var(--attention-glow), 0 0 4px var(--peach); }
+  }
+
+  /* The viewport — clips the scrolling strip */
+  .workspace-viewport {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* The infinite horizontal strip */
+  .workspace-strip {
+    display: flex;
+    height: 100%;
+    transition: transform 0.55s cubic-bezier(0.16, 1, 0.3, 1);
+    will-change: transform;
+  }
+
+  /* Each workspace panel takes full viewport width */
+  .workspace-panel {
+    min-width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+  }
+
+  /* ═══════════════════════════════════════════
+     WORKSPACE HEADER — the identity strip
+     ═══════════════════════════════════════════ */
+
+  .workspace-header {
+    display: flex;
+    align-items: center;
+    height: 40px;
+    background: var(--mantle);
+    border-bottom: 1px solid var(--surface0);
+    padding: 0 16px;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+
+  .ws-identity {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .ws-abbrev {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    padding: 3px 7px;
+    border-radius: 5px;
+    background: rgba(180, 190, 254, 0.1);
+    color: var(--lavender);
+    border: 1px solid rgba(180, 190, 254, 0.2);
+  }
+
+  .ws-abbrev[data-color="green"] {
+    background: rgba(166, 227, 161, 0.1);
+    color: var(--green);
+    border-color: rgba(166, 227, 161, 0.2);
+  }
+
+  .ws-abbrev[data-color="peach"] {
+    background: rgba(250, 179, 135, 0.1);
+    color: var(--peach);
+    border-color: rgba(250, 179, 135, 0.2);
+  }
+
+  .ws-abbrev[data-color="mauve"] {
+    background: rgba(203, 166, 247, 0.1);
+    color: var(--mauve);
+    border-color: rgba(203, 166, 247, 0.2);
+  }
+
+  .ws-name {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--subtext1);
+  }
+
+  .ws-dir {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--overlay0);
+    margin-left: 2px;
+  }
+
+  .ws-nav-hint {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .nav-arrow {
+    font-size: 14px;
+    color: var(--surface2);
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .nav-arrow:hover {
+    color: var(--subtext0);
+    background: var(--surface0);
+  }
+
+  .nav-arrow .peek-name {
+    font-size: 10px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--overlay0);
+  }
+
+  .nav-arrow.disabled {
+    opacity: 0.2;
+    pointer-events: none;
+  }
+
+  /* Tab bar within workspace */
+  .tab-bar {
+    display: flex;
+    align-items: center;
+    height: 34px;
+    background: var(--base);
+    border-bottom: 1px solid var(--surface0);
+    padding: 0 12px;
+    gap: 2px;
+  }
+
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--overlay1);
+    cursor: pointer;
+    transition: all 0.2s;
+    position: relative;
+  }
+
+  .tab:hover {
+    background: var(--surface0);
+    color: var(--subtext0);
+  }
+
+  .tab.active {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .tab .icon {
+    font-size: 10px;
+  }
+
+  .tab .icon.claude {
+    color: var(--peach);
+  }
+
+  .tab .icon.term {
+    color: var(--green);
+  }
+
+  .tab .shortcut {
+    font-size: 9px;
+    color: var(--surface2);
+    margin-left: 4px;
+  }
+
+  .tab.attention {
+    color: var(--peach);
+    background: var(--attention-pulse);
+    animation: tab-attention 2.5s ease-in-out infinite;
+  }
+
+  .tab.attention .icon {
+    color: var(--peach);
+  }
+
+  @keyframes tab-attention {
+    0%, 100% { background: rgba(250, 179, 135, 0.08); }
+    50% { background: rgba(250, 179, 135, 0.18); }
+  }
+
+  .tab-add {
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 14px;
+    color: var(--overlay0);
+    cursor: pointer;
+    transition: all 0.2s;
+    margin-left: 4px;
+  }
+
+  .tab-add:hover {
+    background: var(--surface0);
+    color: var(--subtext0);
+  }
+
+  /* ═══════════════════════════════════════════
+     WORKSPACE CONTENT: terminal + sidebar
+     ═══════════════════════════════════════════ */
+
+  .workspace-content {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .sidebar {
+    width: 260px;
+    background: var(--mantle);
+    border-right: 1px solid var(--surface0);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+  }
+
+  .sidebar-header {
+    display: flex;
+    align-items: center;
+    padding: 10px 14px;
+    gap: 8px;
+    border-bottom: 1px solid rgba(69, 71, 90, 0.5);
+  }
+
+  .sidebar-tab {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 4px 10px;
+    border-radius: 4px;
+    color: var(--overlay1);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .sidebar-tab.active {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .sidebar-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+  }
+
+  .git-section {
+    padding: 0 14px;
+    margin-bottom: 12px;
+  }
+
+  .git-section-title {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--overlay0);
+    padding: 4px 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .git-section-title .count {
+    font-size: 9px;
+    background: var(--surface0);
+    padding: 1px 5px;
+    border-radius: 8px;
+    color: var(--subtext0);
+  }
+
+  .git-file {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 8px;
+    margin: 1px 0;
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--subtext0);
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  .git-file:hover {
+    background: var(--surface0);
+  }
+
+  .git-file .status {
+    font-size: 9px;
+    font-weight: 600;
+    width: 14px;
+    text-align: center;
+  }
+
+  .git-file .status.modified { color: var(--yellow); }
+  .git-file .status.added { color: var(--green); }
+  .git-file .status.deleted { color: var(--red); }
+  .git-file .status.untracked { color: var(--overlay0); }
+
+  /* Terminal area */
+  .terminal-area {
+    flex: 1;
+    background: var(--base);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 12px 16px;
+    overflow-y: auto;
+    color: var(--subtext1);
+  }
+
+  .terminal-area .prompt {
+    color: var(--green);
+  }
+
+  .terminal-area .path {
+    color: var(--blue);
+  }
+
+  .terminal-area .command {
+    color: var(--text);
+  }
+
+  .terminal-area .output {
+    color: var(--overlay1);
+  }
+
+  .terminal-area .claude-header {
+    color: var(--peach);
+    font-weight: 600;
+  }
+
+  .terminal-area .claude-thinking {
+    color: var(--overlay0);
+    font-style: italic;
+  }
+
+  .terminal-area .cursor-block {
+    display: inline-block;
+    width: 8px;
+    height: 15px;
+    background: var(--text);
+    animation: blink 1s step-end infinite;
+    vertical-align: middle;
+    margin-left: 2px;
+  }
+
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+
+  .terminal-area .attention-prompt {
+    color: var(--peach);
+    border-left: 2px solid var(--peach);
+    padding-left: 8px;
+    margin: 8px 0;
+  }
+
+  /* ═══════════════════════════════════════════
+     CONSOLE PANEL
+     ═══════════════════════════════════════════ */
+
+  .console-panel {
+    height: 110px;
+    background: var(--mantle);
+    border-top: 1px solid var(--surface0);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+  }
+
+  .console-header {
+    display: flex;
+    align-items: center;
+    height: 30px;
+    padding: 0 14px;
+    gap: 10px;
+    border-bottom: 1px solid rgba(69, 71, 90, 0.4);
+    font-size: 11px;
+  }
+
+  .console-status {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 6px rgba(166, 227, 161, 0.4);
+  }
+
+  .console-status.error {
+    background: var(--red);
+    box-shadow: 0 0 6px rgba(243, 139, 168, 0.4);
+  }
+
+  .console-cmd {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--subtext0);
+  }
+
+  .console-uptime {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--overlay0);
+    margin-left: auto;
+  }
+
+  .console-actions {
+    display: flex;
+    gap: 4px;
+  }
+
+  .console-action {
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 12px;
+    color: var(--overlay0);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .console-action:hover {
+    background: var(--surface0);
+    color: var(--subtext0);
+  }
+
+  .console-output {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    line-height: 1.6;
+    color: var(--overlay1);
+  }
+
+  .console-output .timestamp {
+    color: var(--surface2);
+    margin-right: 8px;
+  }
+
+  .console-output .ok { color: var(--green); }
+  .console-output .warn { color: var(--yellow); }
+
+  /* ═══════════════════════════════════════════
+     OVERVIEW MODE — zoom out to see all
+     ═══════════════════════════════════════════ */
+
+  .overview-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(17, 17, 27, 0.92);
+    backdrop-filter: blur(20px);
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .overview-overlay.visible {
+    opacity: 1;
+    pointer-events: all;
+  }
+
+  .overview-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--overlay0);
+    margin-bottom: 32px;
+  }
+
+  .overview-grid {
+    display: flex;
+    gap: 24px;
+    align-items: flex-start;
+    padding: 0 48px;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .overview-card {
+    width: 320px;
+    min-width: 320px;
+    border-radius: 12px;
+    overflow: hidden;
+    background: var(--base);
+    border: 2px solid var(--surface0);
+    cursor: pointer;
+    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    position: relative;
+  }
+
+  .overview-card:hover {
+    transform: translateY(-4px);
+    border-color: var(--surface1);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+
+  .overview-card.active {
+    border-color: var(--lavender);
+    box-shadow: 0 0 0 1px var(--lavender), 0 12px 40px rgba(180, 190, 254, 0.15);
+  }
+
+  .overview-card.attention {
+    border-color: var(--peach);
+    box-shadow: 0 0 0 1px var(--peach), 0 0 30px var(--attention-glow);
+    animation: card-attention 2.5s ease-in-out infinite;
+  }
+
+  @keyframes card-attention {
+    0%, 100% { box-shadow: 0 0 0 1px var(--peach), 0 0 20px var(--attention-pulse); }
+    50% { box-shadow: 0 0 0 1px var(--peach), 0 0 40px var(--attention-glow); }
+  }
+
+  .overview-card-header {
+    display: flex;
+    align-items: center;
+    padding: 10px 14px;
+    gap: 10px;
+    background: var(--mantle);
+    border-bottom: 1px solid var(--surface0);
+  }
+
+  .overview-card-abbrev {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .overview-card-name {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--subtext1);
+  }
+
+  .overview-card-badge {
+    margin-left: auto;
+    font-size: 10px;
+    font-family: 'JetBrains Mono', monospace;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: rgba(250, 179, 135, 0.15);
+    color: var(--peach);
+  }
+
+  .overview-card-preview {
+    height: 180px;
+    padding: 10px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    line-height: 1.5;
+    color: var(--overlay0);
+    overflow: hidden;
+    position: relative;
+  }
+
+  .overview-card-preview::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 40px;
+    background: linear-gradient(transparent, var(--base));
+  }
+
+  .overview-card-footer {
+    display: flex;
+    align-items: center;
+    padding: 8px 14px;
+    gap: 8px;
+    border-top: 1px solid var(--surface0);
+    font-size: 10px;
+    color: var(--overlay0);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .overview-card-footer .status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+  }
+
+  .overview-shortcut {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--overlay0);
+    position: absolute;
+    top: -24px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface0);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  /* ═══════════════════════════════════════════
+     EDGE PEEK — ghost of adjacent workspaces
+     ═══════════════════════════════════════════ */
+
+  .edge-peek {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 48px;
+    z-index: 50;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.3s;
+  }
+
+  .edge-peek.left {
+    left: 0;
+    background: linear-gradient(90deg, rgba(17, 17, 27, 0.6), transparent);
+  }
+
+  .edge-peek.right {
+    right: 0;
+    background: linear-gradient(-90deg, rgba(17, 17, 27, 0.6), transparent);
+  }
+
+  .edge-peek:hover {
+    width: 64px;
+  }
+
+  .edge-peek .edge-label {
+    writing-mode: vertical-rl;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--overlay0);
+    letter-spacing: 0.1em;
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+
+  .edge-peek:hover .edge-label {
+    opacity: 1;
+  }
+
+  .edge-peek.attention .edge-label {
+    color: var(--peach);
+  }
+
+  /* ═══════════════════════════════════════════
+     TRANSITION INDICATOR
+     ═══════════════════════════════════════════ */
+
+  .transition-flash {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    z-index: 200;
+    opacity: 0;
+    transition: opacity 0.1s;
+    pointer-events: none;
+  }
+
+  .transition-flash.left {
+    left: 6px;
+  }
+
+  .transition-flash.right {
+    right: 0;
+  }
+
+  .transition-flash.show {
+    opacity: 1;
+    transition: opacity 0s;
+  }
+
+  /* ═══════════════════════════════════════════
+     INSTRUCTIONS PANEL
+     ═══════════════════════════════════════════ */
+
+  .instructions {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface0);
+    border: 1px solid var(--surface1);
+    border-radius: 10px;
+    padding: 12px 20px;
+    font-size: 12px;
+    color: var(--subtext0);
+    z-index: 500;
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+    transition: all 0.3s;
+  }
+
+  .instructions kbd {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    background: var(--surface1);
+    padding: 2px 6px;
+    border-radius: 3px;
+    color: var(--text);
+    border: 1px solid var(--surface2);
+  }
+
+  .instructions .sep {
+    width: 1px;
+    height: 16px;
+    background: var(--surface1);
+  }
+
+  /* Subtle attention shimmer on workspace header */
+  .workspace-header.attention {
+    border-bottom-color: rgba(250, 179, 135, 0.3);
+    background: linear-gradient(90deg, var(--mantle), rgba(250, 179, 135, 0.04), var(--mantle));
+    background-size: 200% 100%;
+    animation: header-shimmer 3s ease-in-out infinite;
+  }
+
+  @keyframes header-shimmer {
+    0%, 100% { background-position: 100% 0; }
+    50% { background-position: 0% 0; }
+  }
+</style>
+</head>
+<body>
+
+<div class="app" id="app">
+  <!-- Workspace spine: minimal position indicator -->
+  <div class="workspace-spine" id="spine"></div>
+
+  <!-- Viewport clips the strip -->
+  <div class="workspace-viewport" id="viewport">
+    <!-- The scrolling strip of workspace panels -->
+    <div class="workspace-strip" id="strip">
+
+      <!-- ═══ WORKSPACE 1: gitterm ═══ -->
+      <div class="workspace-panel" data-ws="0">
+        <div class="workspace-header">
+          <div class="ws-identity">
+            <span class="ws-abbrev" data-color="lavender">GT</span>
+            <span class="ws-name">gitterm</span>
+            <span class="ws-dir">~/GitRepo/gitterm-v2</span>
+          </div>
+          <div class="ws-nav-hint">
+            <span class="nav-arrow disabled">‹</span>
+            <span class="nav-arrow" onclick="goTo(1)"><span class="peek-name">FE</span> ›</span>
+          </div>
+        </div>
+        <div class="tab-bar">
+          <div class="tab active">
+            <span class="icon claude">✦</span>
+            Claude Code
+            <span class="shortcut">⌘1</span>
+          </div>
+          <div class="tab">
+            <span class="icon term">▶</span>
+            cargo test
+            <span class="shortcut">⌘2</span>
+          </div>
+          <span class="tab-add">+</span>
+        </div>
+        <div class="workspace-content">
+          <div class="sidebar">
+            <div class="sidebar-header">
+              <span class="sidebar-tab active">Git</span>
+              <span class="sidebar-tab">Files</span>
+            </div>
+            <div class="sidebar-content">
+              <div class="git-section">
+                <div class="git-section-title">Staged <span class="count">2</span></div>
+                <div class="git-file"><span class="status modified">M</span> src/main.rs</div>
+                <div class="git-file"><span class="status modified">M</span> Cargo.toml</div>
+              </div>
+              <div class="git-section">
+                <div class="git-section-title">Modified <span class="count">1</span></div>
+                <div class="git-file"><span class="status modified">M</span> Cargo.lock</div>
+              </div>
+              <div class="git-section">
+                <div class="git-section-title">Untracked <span class="count">2</span></div>
+                <div class="git-file"><span class="status untracked">?</span> design/niri-mockup.html</div>
+                <div class="git-file"><span class="status untracked">?</span> CLAUDE.md</div>
+              </div>
+            </div>
+          </div>
+          <div class="terminal-area">
+            <div><span class="prompt">❯</span> <span class="path">~/GitRepo/gitterm-v2</span> <span class="command">claude</span></div>
+            <br>
+            <div class="claude-header">╭─ Claude Code ──────────────────────────────────────╮</div>
+            <div class="claude-thinking">  Reading src/main.rs...</div>
+            <div class="claude-thinking">  Analyzing workspace system architecture...</div>
+            <br>
+            <div class="output">  I've analyzed the workspace system. Phase 1 is complete with the</div>
+            <div class="output">  rail UI, workspace switching (Ctrl+1-9), and persistence.</div>
+            <br>
+            <div class="output">  Ready to implement Phase 2: Attention System. This adds:</div>
+            <div class="output">  - needs_attention flag on TabState</div>
+            <div class="output">  - * detection in terminal titles</div>
+            <div class="output">  - Amber tab/workspace styling</div>
+            <div class="output">  - Ctrl+` jump-to-attention shortcut</div>
+            <br>
+            <div><span class="prompt">❯</span> <span class="cursor-block"></span></div>
+          </div>
+        </div>
+        <div class="console-panel">
+          <div class="console-header">
+            <span class="console-status"></span>
+            <span class="console-cmd">cargo run</span>
+            <span class="console-uptime">↑ 14m</span>
+            <div class="console-actions">
+              <span class="console-action">⌀</span>
+              <span class="console-action">↻</span>
+              <span class="console-action">■</span>
+            </div>
+          </div>
+          <div class="console-output">
+            <div><span class="timestamp">14:22:01</span> <span class="ok">Compiling</span> gitterm v0.1.0</div>
+            <div><span class="timestamp">14:22:03</span> <span class="ok">Finished</span> dev [unoptimized] in 2.1s</div>
+            <div><span class="timestamp">14:22:04</span> Running `target/debug/gitterm`</div>
+          </div>
+        </div>
+
+        <!-- Edge peeks -->
+        <div class="edge-peek right" onclick="goTo(1)">
+          <span class="edge-label">FE</span>
+        </div>
+      </div>
+
+      <!-- ═══ WORKSPACE 2: frontend (ATTENTION!) ═══ -->
+      <div class="workspace-panel" data-ws="1">
+        <div class="workspace-header attention">
+          <div class="ws-identity">
+            <span class="ws-abbrev" data-color="green">FE</span>
+            <span class="ws-name">frontend</span>
+            <span class="ws-dir">~/GitRepo/cree8-frontend</span>
+          </div>
+          <div class="ws-nav-hint">
+            <span class="nav-arrow" onclick="goTo(0)">‹ <span class="peek-name">GT</span></span>
+            <span class="nav-arrow" onclick="goTo(2)"><span class="peek-name">API</span> ›</span>
+          </div>
+        </div>
+        <div class="tab-bar">
+          <div class="tab active attention">
+            <span class="icon claude">✦</span>
+            * Claude Code
+            <span class="shortcut">⌘1</span>
+          </div>
+          <span class="tab-add">+</span>
+        </div>
+        <div class="workspace-content">
+          <div class="sidebar">
+            <div class="sidebar-header">
+              <span class="sidebar-tab active">Git</span>
+              <span class="sidebar-tab">Files</span>
+            </div>
+            <div class="sidebar-content">
+              <div class="git-section">
+                <div class="git-section-title">Staged <span class="count">4</span></div>
+                <div class="git-file"><span class="status added">A</span> src/components/Auth.tsx</div>
+                <div class="git-file"><span class="status modified">M</span> src/lib/api.ts</div>
+                <div class="git-file"><span class="status modified">M</span> src/hooks/useAuth.ts</div>
+                <div class="git-file"><span class="status added">A</span> src/types/auth.ts</div>
+              </div>
+              <div class="git-section">
+                <div class="git-section-title">Modified <span class="count">1</span></div>
+                <div class="git-file"><span class="status modified">M</span> package.json</div>
+              </div>
+            </div>
+          </div>
+          <div class="terminal-area">
+            <div><span class="prompt">❯</span> <span class="path">~/GitRepo/cree8-frontend</span> <span class="command">claude</span></div>
+            <br>
+            <div class="claude-header">╭─ Claude Code ──────────────────────────────────────╮</div>
+            <div class="output">  I've implemented the OAuth flow with PKCE. The changes include:</div>
+            <div class="output">  - New Auth.tsx component with login/callback handling</div>
+            <div class="output">  - Updated api.ts with token refresh interceptor</div>
+            <div class="output">  - useAuth hook for session management</div>
+            <br>
+            <div class="attention-prompt">
+              Do you want me to also add the logout flow and<br>
+              session timeout handling?<br>
+              <br>
+              <span style="color: var(--overlay0);">(y/n/or describe what you'd like)</span>
+            </div>
+            <br>
+            <div><span class="prompt" style="color: var(--peach);">❯</span> <span class="cursor-block" style="background: var(--peach);"></span></div>
+          </div>
+        </div>
+        <div class="console-panel">
+          <div class="console-header">
+            <span class="console-status"></span>
+            <span class="console-cmd">npm run dev</span>
+            <span class="console-uptime">↑ 2h 14m</span>
+            <div class="console-actions">
+              <span class="console-action">⌀</span>
+              <span class="console-action">↻</span>
+              <span class="console-action">■</span>
+            </div>
+          </div>
+          <div class="console-output">
+            <div><span class="timestamp">12:08:31</span> <span class="ok">ready</span> in 340ms</div>
+            <div><span class="timestamp">12:08:31</span> Local: http://localhost:5173/</div>
+            <div><span class="timestamp">14:36:02</span> <span class="warn">hmr</span> updated Auth.tsx</div>
+          </div>
+        </div>
+
+        <!-- Edge peeks -->
+        <div class="edge-peek left" onclick="goTo(0)">
+          <span class="edge-label">GT</span>
+        </div>
+        <div class="edge-peek right" onclick="goTo(2)">
+          <span class="edge-label">API</span>
+        </div>
+      </div>
+
+      <!-- ═══ WORKSPACE 3: api ═══ -->
+      <div class="workspace-panel" data-ws="2">
+        <div class="workspace-header">
+          <div class="ws-identity">
+            <span class="ws-abbrev" data-color="peach">API</span>
+            <span class="ws-name">api-server</span>
+            <span class="ws-dir">~/GitRepo/cree8-api</span>
+          </div>
+          <div class="ws-nav-hint">
+            <span class="nav-arrow" onclick="goTo(1)">‹ <span class="peek-name">FE</span></span>
+            <span class="nav-arrow" onclick="goTo(3)"><span class="peek-name">INF</span> ›</span>
+          </div>
+        </div>
+        <div class="tab-bar">
+          <div class="tab active">
+            <span class="icon claude">✦</span>
+            Claude Code
+            <span class="shortcut">⌘1</span>
+          </div>
+          <span class="tab-add">+</span>
+        </div>
+        <div class="workspace-content">
+          <div class="sidebar">
+            <div class="sidebar-header">
+              <span class="sidebar-tab active">Git</span>
+              <span class="sidebar-tab">Files</span>
+            </div>
+            <div class="sidebar-content">
+              <div class="git-section">
+                <div class="git-section-title">Modified <span class="count">3</span></div>
+                <div class="git-file"><span class="status modified">M</span> src/routes/auth.rs</div>
+                <div class="git-file"><span class="status modified">M</span> src/middleware/jwt.rs</div>
+                <div class="git-file"><span class="status modified">M</span> src/models/session.rs</div>
+              </div>
+            </div>
+          </div>
+          <div class="terminal-area">
+            <div><span class="prompt">❯</span> <span class="path">~/GitRepo/cree8-api</span> <span class="command">claude</span></div>
+            <br>
+            <div class="claude-header">╭─ Claude Code ──────────────────────────────────────╮</div>
+            <div class="claude-thinking">  Running cargo test --lib auth::tests...</div>
+            <div class="claude-thinking">  ████████████████████████░░░░░░  78% (14/18 tests)</div>
+            <br>
+          </div>
+        </div>
+        <div class="console-panel">
+          <div class="console-header">
+            <span class="console-status"></span>
+            <span class="console-cmd">cargo watch -x run</span>
+            <span class="console-uptime">↑ 47m</span>
+            <div class="console-actions">
+              <span class="console-action">⌀</span>
+              <span class="console-action">↻</span>
+              <span class="console-action">■</span>
+            </div>
+          </div>
+          <div class="console-output">
+            <div><span class="timestamp">13:49:12</span> <span class="ok">Listening</span> on 0.0.0.0:8080</div>
+            <div><span class="timestamp">14:35:44</span> <span class="ok">Recompiled</span> in 1.8s</div>
+          </div>
+        </div>
+
+        <!-- Edge peeks -->
+        <div class="edge-peek left" onclick="goTo(1)">
+          <span class="edge-label attention">FE</span>
+        </div>
+        <div class="edge-peek right" onclick="goTo(3)">
+          <span class="edge-label">INF</span>
+        </div>
+      </div>
+
+      <!-- ═══ WORKSPACE 4: infra ═══ -->
+      <div class="workspace-panel" data-ws="3">
+        <div class="workspace-header">
+          <div class="ws-identity">
+            <span class="ws-abbrev" data-color="mauve">INF</span>
+            <span class="ws-name">infra</span>
+            <span class="ws-dir">~/GitRepo/cree8-infra</span>
+          </div>
+          <div class="ws-nav-hint">
+            <span class="nav-arrow" onclick="goTo(2)">‹ <span class="peek-name">API</span></span>
+            <span class="nav-arrow disabled">›</span>
+          </div>
+        </div>
+        <div class="tab-bar">
+          <div class="tab active">
+            <span class="icon claude">✦</span>
+            Claude Code
+            <span class="shortcut">⌘1</span>
+          </div>
+          <span class="tab-add">+</span>
+        </div>
+        <div class="workspace-content">
+          <div class="sidebar">
+            <div class="sidebar-header">
+              <span class="sidebar-tab active">Git</span>
+              <span class="sidebar-tab">Files</span>
+            </div>
+            <div class="sidebar-content">
+              <div class="git-section">
+                <div class="git-section-title">Clean</div>
+                <div style="padding: 8px 8px; font-size: 11px; color: var(--overlay0);">Working tree clean</div>
+              </div>
+            </div>
+          </div>
+          <div class="terminal-area">
+            <div><span class="prompt">❯</span> <span class="path">~/GitRepo/cree8-infra</span> <span class="command">claude</span></div>
+            <br>
+            <div class="claude-header">╭─ Claude Code ──────────────────────────────────────╮</div>
+            <div class="output">  Infrastructure is all up to date. The Terraform plan</div>
+            <div class="output">  shows no changes needed.</div>
+            <br>
+            <div><span class="prompt">❯</span> <span class="cursor-block"></span></div>
+          </div>
+        </div>
+        <div class="console-panel">
+          <div class="console-header">
+            <span class="console-status" style="background: var(--overlay0); box-shadow: none;"></span>
+            <span class="console-cmd" style="color: var(--overlay0);">No run command</span>
+            <span class="console-uptime"></span>
+          </div>
+          <div class="console-output">
+            <div style="color: var(--surface2); padding: 8px 0;">Configure a run command for this workspace...</div>
+          </div>
+        </div>
+
+        <!-- Edge peeks -->
+        <div class="edge-peek left" onclick="goTo(2)">
+          <span class="edge-label">API</span>
+        </div>
+      </div>
+
+    </div><!-- /strip -->
+
+    <!-- Transition flash lines -->
+    <div class="transition-flash left" id="flash-left"></div>
+    <div class="transition-flash right" id="flash-right"></div>
+  </div><!-- /viewport -->
+</div>
+
+<!-- Overview overlay -->
+<div class="overview-overlay" id="overview">
+  <div class="overview-title">Workspaces</div>
+  <div class="overview-grid" id="overviewGrid"></div>
+</div>
+
+<!-- Instructions -->
+<div class="instructions" id="instructions">
+  <span><kbd>Ctrl+1-4</kbd> switch workspace</span>
+  <span class="sep"></span>
+  <span><kbd>←</kbd> <kbd>→</kbd> scroll</span>
+  <span class="sep"></span>
+  <span><kbd>Ctrl+`</kbd> jump to attention</span>
+  <span class="sep"></span>
+  <span><kbd>Space</kbd> overview</span>
+</div>
+
+<script>
+  const strip = document.getElementById('strip');
+  const spine = document.getElementById('spine');
+  const overview = document.getElementById('overview');
+  const overviewGrid = document.getElementById('overviewGrid');
+  const flashLeft = document.getElementById('flash-left');
+  const flashRight = document.getElementById('flash-right');
+
+  const WORKSPACES = [
+    { abbrev: 'GT', name: 'gitterm', color: '#b4befe', attention: false },
+    { abbrev: 'FE', name: 'frontend', color: '#a6e3a1', attention: true },
+    { abbrev: 'API', name: 'api-server', color: '#fab387', attention: false },
+    { abbrev: 'INF', name: 'infra', color: '#cba6f7', attention: false },
+  ];
+
+  let currentWs = 0;
+  let overviewVisible = false;
+
+  function buildSpine() {
+    spine.innerHTML = '';
+    WORKSPACES.forEach((ws, i) => {
+      const dot = document.createElement('div');
+      dot.className = 'spine-dot' + (i === currentWs ? ' active' : '') + (ws.attention && i !== currentWs ? ' attention' : '');
+      dot.style.setProperty('background', i === currentWs ? ws.color : '');
+      dot.onclick = () => goTo(i);
+      spine.appendChild(dot);
+    });
+  }
+
+  function goTo(idx) {
+    if (idx < 0 || idx >= WORKSPACES.length || idx === currentWs) return;
+
+    const direction = idx > currentWs ? 'right' : 'left';
+    const flash = direction === 'right' ? flashRight : flashLeft;
+    const ws = WORKSPACES[idx];
+
+    // Flash the edge with workspace color
+    flash.style.background = ws.color;
+    flash.classList.add('show');
+    setTimeout(() => flash.classList.remove('show'), 300);
+
+    currentWs = idx;
+    strip.style.transform = `translateX(-${currentWs * 100}%)`;
+    buildSpine();
+
+    if (overviewVisible) closeOverview();
+  }
+
+  function toggleOverview() {
+    if (overviewVisible) {
+      closeOverview();
+    } else {
+      openOverview();
+    }
+  }
+
+  function openOverview() {
+    overviewVisible = true;
+
+    // Build cards
+    overviewGrid.innerHTML = '';
+    WORKSPACES.forEach((ws, i) => {
+      const panels = document.querySelectorAll('.workspace-panel');
+      const terminalContent = panels[i]?.querySelector('.terminal-area')?.innerText.substring(0, 300) || '';
+
+      const card = document.createElement('div');
+      card.className = 'overview-card' + (i === currentWs ? ' active' : '') + (ws.attention ? ' attention' : '');
+      card.innerHTML = `
+        <div class="overview-shortcut">Ctrl+${i + 1}</div>
+        <div class="overview-card-header">
+          <span class="overview-card-abbrev" style="background: ${ws.color}22; color: ${ws.color}; border: 1px solid ${ws.color}44;">${ws.abbrev}</span>
+          <span class="overview-card-name">${ws.name}</span>
+          ${ws.attention ? '<span class="overview-card-badge">needs input</span>' : ''}
+        </div>
+        <div class="overview-card-preview">${terminalContent.replace(/\n/g, '<br>')}</div>
+        <div class="overview-card-footer">
+          <span class="status-dot" style="background: ${ws.attention ? '#fab387' : '#a6e3a1'}"></span>
+          ${ws.attention ? 'waiting for input' : 'running'}
+        </div>
+      `;
+      card.onclick = () => goTo(i);
+      overviewGrid.appendChild(card);
+    });
+
+    overview.classList.add('visible');
+  }
+
+  function closeOverview() {
+    overviewVisible = false;
+    overview.classList.remove('visible');
+  }
+
+  function jumpToAttention() {
+    // Find next workspace needing attention (round-robin from current)
+    for (let offset = 1; offset <= WORKSPACES.length; offset++) {
+      const idx = (currentWs + offset) % WORKSPACES.length;
+      if (WORKSPACES[idx].attention) {
+        goTo(idx);
+        return;
+      }
+    }
+  }
+
+  // Keyboard handling
+  document.addEventListener('keydown', (e) => {
+    if (e.key === ' ') {
+      e.preventDefault();
+      toggleOverview();
+      return;
+    }
+
+    if (e.key === 'Escape' && overviewVisible) {
+      closeOverview();
+      return;
+    }
+
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      goTo(currentWs - 1);
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      goTo(currentWs + 1);
+    }
+
+    // Ctrl+number for workspace switching
+    if (e.ctrlKey && !e.metaKey) {
+      const num = parseInt(e.key);
+      if (num >= 1 && num <= WORKSPACES.length) {
+        e.preventDefault();
+        goTo(num - 1);
+      }
+      // Ctrl+` jump to attention
+      if (e.key === '`') {
+        e.preventDefault();
+        jumpToAttention();
+      }
+    }
+  });
+
+  // Init
+  buildSpine();
+</script>
+
+</body>
+</html>

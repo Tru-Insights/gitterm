@@ -1,0 +1,1396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitTerm Workspace Design Mockup</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+  :root {
+    /* Catppuccin Mocha */
+    --crust: #11111b;
+    --mantle: #181825;
+    --base: #1e1e2e;
+    --surface0: #313244;
+    --surface1: #45475a;
+    --surface2: #585b70;
+    --overlay0: #6c7086;
+    --overlay1: #7f849c;
+    --subtext0: #a6adc8;
+    --subtext1: #bac2de;
+    --text: #cdd6f4;
+    --lavender: #b4befe;
+    --blue: #89b4fa;
+    --sapphire: #74c7ec;
+    --green: #a6e3a1;
+    --yellow: #f9e2af;
+    --peach: #fab387;
+    --red: #f38ba8;
+    --mauve: #cba6f7;
+    --pink: #f5c2e7;
+    --flamingo: #f2cdcd;
+    --rosewater: #f5e0dc;
+
+    /* Attention colors */
+    --attention-urgent: #fab387;
+    --attention-urgent-bg: rgba(250, 179, 135, 0.12);
+    --attention-urgent-border: rgba(250, 179, 135, 0.4);
+    --attention-info: #89b4fa;
+    --attention-info-bg: rgba(137, 180, 250, 0.08);
+
+    /* Process status */
+    --process-ok: #a6e3a1;
+    --process-ok-bg: rgba(166, 227, 161, 0.06);
+    --process-error: #f38ba8;
+    --process-error-bg: rgba(243, 139, 168, 0.08);
+    --process-warn: #f9e2af;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+    background: #0a0a12;
+    color: var(--text);
+    min-height: 100vh;
+    padding: 40px;
+  }
+
+  h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--subtext0);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  h2 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--overlay1);
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin: 48px 0 20px 0;
+  }
+
+  .description {
+    font-size: 13px;
+    color: var(--subtext0);
+    margin-bottom: 32px;
+    line-height: 1.6;
+    max-width: 700px;
+  }
+
+  /* ===== MOCKUP FRAME ===== */
+  .mockup-frame {
+    background: var(--crust);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.03);
+    margin: 24px 0;
+  }
+
+  .mockup-titlebar {
+    background: var(--crust);
+    height: 28px;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 8px;
+  }
+
+  .titlebar-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+  }
+  .titlebar-dot.red { background: #ff5f57; }
+  .titlebar-dot.yellow { background: #febc2e; }
+  .titlebar-dot.green { background: #28c840; }
+
+  .mockup-body {
+    display: flex;
+    flex-direction: column;
+    height: 600px;
+  }
+
+  .mockup-body-inner {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* ===== WORKSPACE RAIL ===== */
+  .workspace-rail {
+    width: 48px;
+    background: var(--crust);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 8px 0;
+    gap: 4px;
+    border-right: 1px solid rgba(255,255,255,0.04);
+    flex-shrink: 0;
+  }
+
+  .workspace-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    position: relative;
+    transition: all 0.15s ease;
+    border: none;
+    color: var(--overlay1);
+    background: transparent;
+  }
+
+  .workspace-btn:hover {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .workspace-btn.active {
+    background: var(--surface0);
+    color: var(--text);
+    box-shadow: inset 3px 0 0 var(--lavender);
+  }
+
+  /* Attention badge on workspace */
+  .workspace-btn .attention-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    min-width: 16px;
+    height: 16px;
+    border-radius: 8px;
+    background: var(--attention-urgent);
+    color: var(--crust);
+    font-size: 9px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px;
+    animation: badge-pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes badge-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+
+  .workspace-btn .ws-shortcut {
+    position: absolute;
+    bottom: -2px;
+    right: 1px;
+    font-size: 8px;
+    color: var(--overlay0);
+    font-weight: 400;
+  }
+
+  .workspace-add {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    color: var(--overlay0);
+    cursor: pointer;
+    border: 1px dashed var(--surface1);
+    background: transparent;
+    margin-top: 4px;
+  }
+
+  .workspace-add:hover {
+    border-color: var(--overlay0);
+    color: var(--subtext0);
+    background: rgba(255,255,255,0.02);
+  }
+
+  .ws-divider {
+    width: 24px;
+    height: 1px;
+    background: var(--surface0);
+    margin: 4px 0;
+  }
+
+  /* ===== MAIN AREA ===== */
+  .main-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  /* ===== TAB BAR ===== */
+  .tab-bar {
+    background: var(--mantle);
+    display: flex;
+    align-items: center;
+    padding: 0 4px;
+    height: 40px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    overflow: hidden;
+    position: relative;
+  }
+
+  .tab-bar-scroll {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex: 1;
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding: 4px 0;
+  }
+  .tab-bar-scroll::-webkit-scrollbar { display: none; }
+
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--subtext0);
+    background: transparent;
+    border: none;
+    position: relative;
+    flex-shrink: 0;
+    transition: all 0.1s ease;
+  }
+
+  .tab:hover {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .tab.active {
+    background: var(--base);
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  .tab .tab-indicator {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .tab .tab-indicator.running {
+    background: var(--green);
+    opacity: 0.6;
+  }
+
+  .tab .tab-indicator.attention {
+    background: var(--attention-urgent);
+    animation: dot-pulse 1.5s ease-in-out infinite;
+    box-shadow: 0 0 6px rgba(250, 179, 135, 0.4);
+  }
+
+  .tab .tab-indicator.idle {
+    background: var(--surface2);
+  }
+
+  @keyframes dot-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.85); }
+  }
+
+  .tab .tab-changes {
+    font-size: 10px;
+    color: var(--yellow);
+    font-weight: 600;
+  }
+
+  .tab .tab-shortcut {
+    font-size: 10px;
+    color: var(--overlay0);
+    margin-left: 2px;
+  }
+
+  .tab .tab-close {
+    font-size: 11px;
+    color: var(--overlay0);
+    cursor: pointer;
+    padding: 0 2px;
+    border-radius: 3px;
+    opacity: 0;
+    transition: opacity 0.1s;
+    border: none;
+    background: transparent;
+  }
+
+  .tab:hover .tab-close { opacity: 1; }
+  .tab .tab-close:hover {
+    background: var(--surface1);
+    color: var(--red);
+  }
+
+  /* Attention tab */
+  .tab.attention {
+    background: var(--attention-urgent-bg);
+    color: var(--attention-urgent);
+    border: 1px solid var(--attention-urgent-border);
+    font-weight: 500;
+  }
+
+  .tab.attention.active {
+    background: rgba(250, 179, 135, 0.15);
+  }
+
+  .tab-add {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    color: var(--overlay0);
+    cursor: pointer;
+    flex-shrink: 0;
+    border: none;
+    background: transparent;
+    margin-left: 2px;
+  }
+
+  .tab-add:hover {
+    background: var(--surface0);
+    color: var(--subtext0);
+  }
+
+  /* Tab overflow indicator */
+  .tab-overflow {
+    display: flex;
+    align-items: center;
+    padding: 4px 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--overlay1);
+    cursor: pointer;
+    flex-shrink: 0;
+    border-radius: 6px;
+    border: none;
+    background: transparent;
+  }
+
+  .tab-overflow:hover {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .tab-overflow .overflow-attention {
+    color: var(--attention-urgent);
+  }
+
+  /* ===== CONTENT AREA ===== */
+  .content-area {
+    flex: 1;
+    display: flex;
+    background: var(--base);
+    min-height: 0;
+  }
+
+  .sidebar {
+    width: 260px;
+    background: var(--mantle);
+    border-right: 1px solid rgba(255,255,255,0.04);
+    padding: 8px;
+    overflow-y: auto;
+  }
+
+  .sidebar-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    margin-bottom: 4px;
+  }
+
+  .sidebar-toggle {
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: var(--overlay1);
+  }
+
+  .sidebar-toggle.active {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .git-file {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--subtext0);
+    cursor: pointer;
+  }
+
+  .git-file:hover { background: var(--surface0); }
+
+  .git-badge {
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .git-badge.modified { background: rgba(249, 226, 175, 0.15); color: var(--yellow); }
+  .git-badge.added { background: rgba(166, 227, 161, 0.15); color: var(--green); }
+  .git-badge.deleted { background: rgba(243, 139, 168, 0.15); color: var(--red); }
+
+  .terminal-area {
+    flex: 1;
+    background: var(--base);
+    padding: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--subtext1);
+    overflow: hidden;
+  }
+
+  .terminal-line { padding: 1px 0; }
+  .terminal-line .prompt { color: var(--green); }
+  .terminal-line .cmd { color: var(--text); }
+  .terminal-line .dim { color: var(--overlay1); }
+  .terminal-line .highlight { color: var(--blue); }
+  .terminal-line .warn { color: var(--yellow); }
+  .terminal-line .err { color: var(--red); }
+
+  /* ===== PROCESS CONSOLE PANEL ===== */
+  .process-panel {
+    border-top: 1px solid var(--surface0);
+    background: var(--mantle);
+    flex-shrink: 0;
+  }
+
+  .process-header {
+    display: flex;
+    align-items: center;
+    height: 32px;
+    padding: 0 12px;
+    gap: 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .process-header:hover {
+    background: rgba(255,255,255,0.02);
+  }
+
+  .process-chevron {
+    font-size: 10px;
+    color: var(--overlay0);
+    transition: transform 0.15s;
+  }
+
+  .process-chevron.expanded {
+    transform: rotate(180deg);
+  }
+
+  .process-status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .process-status-dot.running {
+    background: var(--process-ok);
+    box-shadow: 0 0 4px rgba(166, 227, 161, 0.3);
+  }
+
+  .process-status-dot.error {
+    background: var(--process-error);
+    box-shadow: 0 0 4px rgba(243, 139, 168, 0.3);
+    animation: dot-pulse 1.5s ease-in-out infinite;
+  }
+
+  .process-status-dot.stopped {
+    background: var(--surface2);
+  }
+
+  .process-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--subtext1);
+  }
+
+  .process-cmd {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--overlay1);
+    flex: 1;
+  }
+
+  .process-uptime {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--overlay0);
+  }
+
+  .process-controls {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .process-ctrl-btn {
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: var(--overlay1);
+  }
+
+  .process-ctrl-btn:hover {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .process-ctrl-btn.stop:hover {
+    background: rgba(243, 139, 168, 0.15);
+    color: var(--red);
+  }
+
+  .process-ctrl-btn.play:hover {
+    background: rgba(166, 227, 161, 0.15);
+    color: var(--green);
+  }
+
+  .process-output {
+    padding: 6px 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--overlay1);
+    max-height: 120px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--surface1) transparent;
+  }
+
+  .process-output::-webkit-scrollbar { width: 4px; }
+  .process-output::-webkit-scrollbar-track { background: transparent; }
+  .process-output::-webkit-scrollbar-thumb { background: var(--surface1); border-radius: 2px; }
+
+  .process-output .line { padding: 1px 0; }
+  .process-output .timestamp {
+    color: var(--surface2);
+    margin-right: 8px;
+  }
+  .process-output .ok { color: var(--green); }
+  .process-output .info { color: var(--blue); }
+  .process-output .warn { color: var(--yellow); }
+  .process-output .err { color: var(--red); }
+  .process-output .dim { color: var(--overlay0); }
+
+  /* ===== ANNOTATIONS ===== */
+  .annotation-section {
+    margin-top: 48px;
+    padding: 24px;
+    background: var(--mantle);
+    border-radius: 12px;
+    border: 1px solid var(--surface0);
+  }
+
+  .annotation-section h3 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--lavender);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+
+  .annotation-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  .annotation-card {
+    padding: 16px;
+    background: var(--base);
+    border-radius: 8px;
+    border: 1px solid var(--surface0);
+  }
+
+  .annotation-card h4 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+
+  .annotation-card p {
+    font-size: 12px;
+    color: var(--subtext0);
+    line-height: 1.5;
+  }
+
+  .annotation-card code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    background: var(--surface0);
+    padding: 2px 6px;
+    border-radius: 3px;
+    color: var(--peach);
+  }
+
+  .key {
+    display: inline-block;
+    padding: 2px 6px;
+    background: var(--surface0);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--subtext1);
+    border: 1px solid var(--surface1);
+  }
+
+  /* ===== STATE COMPARISON ===== */
+  .states-row {
+    display: flex;
+    gap: 24px;
+    margin: 24px 0;
+  }
+
+  .state-card {
+    flex: 1;
+    background: var(--mantle);
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--surface0);
+  }
+
+  .state-label {
+    padding: 8px 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--overlay1);
+    background: var(--crust);
+    border-bottom: 1px solid var(--surface0);
+  }
+
+  .state-content {
+    padding: 12px;
+  }
+
+  .demo-tabs {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
+  /* Workspace tooltip */
+  .workspace-btn .ws-tooltip {
+    display: none;
+    position: absolute;
+    left: calc(100% + 8px);
+    top: 50%;
+    transform: translateY(-50%);
+    background: var(--surface0);
+    border: 1px solid var(--surface1);
+    border-radius: 6px;
+    padding: 6px 10px;
+    white-space: nowrap;
+    font-size: 11px;
+    color: var(--text);
+    z-index: 10;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+
+  .workspace-btn:hover .ws-tooltip {
+    display: block;
+  }
+
+  .ws-tooltip-name { font-weight: 600; }
+  .ws-tooltip-detail { color: var(--subtext0); font-size: 10px; margin-top: 2px; }
+  .ws-tooltip-shortcut { color: var(--overlay1); font-size: 10px; margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--surface1); }
+
+  /* Resize handle */
+  .resize-handle {
+    height: 3px;
+    background: transparent;
+    cursor: ns-resize;
+    position: relative;
+  }
+  .resize-handle::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 32px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--surface1);
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .resize-handle:hover::after { opacity: 1; }
+</style>
+</head>
+<body>
+
+<h1>GitTerm — Workspace + Console Panel</h1>
+<p class="description">
+  Design mockup for workspace management, attention indicators, tab overflow,
+  and the always-visible process console panel. Catppuccin Mocha palette,
+  achievable with Iced layout primitives.
+</p>
+
+<!-- ===== MAIN MOCKUP: FULL LAYOUT WITH CONSOLE ===== -->
+<h2>Full Layout — Console Running</h2>
+<p class="description">
+  The process console sits below the terminal, always visible. It shows output from the workspace's
+  configured run command. No tab wasted. You see build errors instantly regardless of which tab you're in.
+</p>
+
+<div class="mockup-frame">
+  <div class="mockup-titlebar">
+    <span class="titlebar-dot red"></span>
+    <span class="titlebar-dot yellow"></span>
+    <span class="titlebar-dot green"></span>
+  </div>
+  <div class="mockup-body">
+    <div class="mockup-body-inner">
+      <!-- Workspace Rail -->
+      <div class="workspace-rail">
+        <button class="workspace-btn active" style="color: var(--lavender);">
+          GT
+          <span class="ws-shortcut">⌃1</span>
+          <div class="ws-tooltip">
+            <div class="ws-tooltip-name">gitterm</div>
+            <div class="ws-tooltip-detail">2 tabs · master · cargo run</div>
+            <div class="ws-tooltip-shortcut">⌃1 to switch</div>
+          </div>
+        </button>
+        <button class="workspace-btn" style="color: var(--green);">
+          FE
+          <span class="attention-badge">2</span>
+          <span class="ws-shortcut">⌃2</span>
+          <div class="ws-tooltip">
+            <div class="ws-tooltip-name">frontend-app</div>
+            <div class="ws-tooltip-detail">3 tabs · feature/auth · npm run dev</div>
+            <div class="ws-tooltip-shortcut">⌃2 to switch · 2 need attention</div>
+          </div>
+        </button>
+        <button class="workspace-btn" style="color: var(--peach);">
+          AP
+          <span class="attention-badge">1</span>
+          <span class="ws-shortcut">⌃3</span>
+          <div class="ws-tooltip">
+            <div class="ws-tooltip-name">api-service</div>
+            <div class="ws-tooltip-detail">2 tabs · main · cargo run</div>
+            <div class="ws-tooltip-shortcut">⌃3 to switch · 1 needs attention</div>
+          </div>
+        </button>
+
+        <div class="ws-divider"></div>
+
+        <button class="workspace-add" title="New workspace">+</button>
+      </div>
+
+      <!-- Main Area -->
+      <div class="main-area">
+        <!-- Tab Bar -->
+        <div class="tab-bar">
+          <div class="tab-bar-scroll">
+            <button class="tab">
+              <span class="tab-indicator idle"></span>
+              git
+              <span class="tab-shortcut">⌘1</span>
+              <span class="tab-close">×</span>
+            </button>
+            <button class="tab attention active" style="background: rgba(250,179,135,0.15);">
+              <span class="tab-indicator attention"></span>
+              claude code
+              <span class="tab-changes">4</span>
+              <span class="tab-shortcut">⌘2</span>
+              <span class="tab-close">×</span>
+            </button>
+          </div>
+          <button class="tab-add">+</button>
+        </div>
+
+        <!-- Content -->
+        <div class="content-area">
+          <div class="sidebar">
+            <div class="sidebar-header">
+              <button class="sidebar-toggle active">Git</button>
+              <button class="sidebar-toggle">Files</button>
+            </div>
+            <div class="git-file">
+              <span class="git-badge modified">M</span>
+              src/main.rs
+            </div>
+            <div class="git-file">
+              <span class="git-badge modified">M</span>
+              src/workspace.rs
+            </div>
+            <div class="git-file">
+              <span class="git-badge added">A</span>
+              src/console.rs
+            </div>
+            <div class="git-file">
+              <span class="git-badge added">A</span>
+              src/attention.rs
+            </div>
+          </div>
+          <div class="terminal-area">
+            <div class="terminal-line"><span class="dim">╭─ Claude Code is waiting for input ────────────╮</span></div>
+            <div class="terminal-line"><span class="dim">│</span></div>
+            <div class="terminal-line"><span class="dim">│</span> <span class="highlight">Modified 4 files:</span></div>
+            <div class="terminal-line"><span class="dim">│</span>   src/main.rs <span class="warn">(+142 -38)</span></div>
+            <div class="terminal-line"><span class="dim">│</span>   src/workspace.rs <span class="ok">(new)</span></div>
+            <div class="terminal-line"><span class="dim">│</span>   src/console.rs <span class="ok">(new)</span></div>
+            <div class="terminal-line"><span class="dim">│</span>   src/attention.rs <span class="ok">(new)</span></div>
+            <div class="terminal-line"><span class="dim">│</span></div>
+            <div class="terminal-line"><span class="dim">│</span> <span class="text" style="color: var(--text);">Do you want me to proceed with the</span></div>
+            <div class="terminal-line"><span class="dim">│</span> <span class="text" style="color: var(--text);">workspace config persistence?</span></div>
+            <div class="terminal-line"><span class="dim">│</span></div>
+            <div class="terminal-line"><span class="dim">╰────────────────────────────────────────────────╯</span></div>
+            <div class="terminal-line"><span class="prompt">❯</span> <span class="prompt">█</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Process Console Panel -->
+    <div class="process-panel">
+      <div class="resize-handle"></div>
+      <div class="process-header">
+        <span class="process-chevron expanded">▼</span>
+        <span class="process-status-dot running"></span>
+        <span class="process-name">cargo run</span>
+        <span class="process-cmd">— target/debug/gitterm</span>
+        <span class="process-uptime">↑ 2h 14m</span>
+        <div class="process-controls">
+          <button class="process-ctrl-btn" title="Clear output">⌀</button>
+          <button class="process-ctrl-btn" title="Restart process">↻</button>
+          <button class="process-ctrl-btn stop" title="Stop process">■</button>
+        </div>
+      </div>
+      <div class="process-output">
+        <div class="line"><span class="timestamp">14:22:01</span> <span class="dim">Compiling gitterm v0.1.0</span></div>
+        <div class="line"><span class="timestamp">14:22:03</span> <span class="ok">Finished</span> <span class="dim">dev [unoptimized + debuginfo] in 2.1s</span></div>
+        <div class="line"><span class="timestamp">14:22:03</span> <span class="info">Running</span> <span class="dim">`target/debug/gitterm`</span></div>
+        <div class="line"><span class="timestamp">14:22:04</span> <span class="dim">Server listening on</span> <span class="info">http://localhost:3030</span></div>
+        <div class="line"><span class="timestamp">14:22:04</span> <span class="dim">Git polling started for /Users/t/GitRepo/gitterm</span></div>
+        <div class="line"><span class="timestamp">14:23:15</span> <span class="dim">GET</span> /tab/0 <span class="ok">200</span> <span class="dim">3ms</span></div>
+        <div class="line"><span class="timestamp">14:24:02</span> <span class="dim">GET</span> /file/0 <span class="ok">200</span> <span class="dim">1ms</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== CONSOLE STATES ===== -->
+<h2>Console Panel States</h2>
+<p class="description">
+  The console panel adapts to show what matters. Three states: healthy, error, and collapsed.
+  The panel persists across tab switches — it belongs to the workspace, not the tab.
+</p>
+
+<div class="states-row">
+  <div class="state-card">
+    <div class="state-label" style="color: var(--green);">Healthy — Process Running</div>
+    <div class="state-content" style="padding: 0;">
+      <div class="process-header">
+        <span class="process-chevron expanded">▼</span>
+        <span class="process-status-dot running"></span>
+        <span class="process-name">npm run dev</span>
+        <span class="process-cmd">— vite</span>
+        <span class="process-uptime">↑ 45m</span>
+        <div class="process-controls">
+          <button class="process-ctrl-btn">⌀</button>
+          <button class="process-ctrl-btn">↻</button>
+          <button class="process-ctrl-btn stop">■</button>
+        </div>
+      </div>
+      <div class="process-output" style="max-height: 80px;">
+        <div class="line"><span class="timestamp">14:05:12</span> <span class="info">VITE v5.4.0</span> ready in <span class="ok">312ms</span></div>
+        <div class="line"><span class="timestamp">14:05:12</span> <span class="dim">→ Local:</span> <span class="info">http://localhost:5173/</span></div>
+        <div class="line"><span class="timestamp">14:12:44</span> <span class="dim">hmr update</span> /src/App.tsx <span class="dim">4ms</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="state-card">
+    <div class="state-label" style="color: var(--red);">Error — Process Crashed</div>
+    <div class="state-content" style="padding: 0;">
+      <div class="process-header" style="background: var(--process-error-bg);">
+        <span class="process-chevron expanded">▼</span>
+        <span class="process-status-dot error"></span>
+        <span class="process-name" style="color: var(--red);">cargo run</span>
+        <span class="process-cmd" style="color: var(--red);">— exited 101</span>
+        <span class="process-uptime" style="color: var(--overlay0);">died 30s ago</span>
+        <div class="process-controls">
+          <button class="process-ctrl-btn play" title="Restart">▶</button>
+        </div>
+      </div>
+      <div class="process-output" style="max-height: 80px;">
+        <div class="line"><span class="timestamp">14:31:02</span> <span class="err">error[E0308]</span>: mismatched types</div>
+        <div class="line"><span class="timestamp">14:31:02</span> <span class="dim">  --> src/main.rs:142:5</span></div>
+        <div class="line"><span class="timestamp">14:31:02</span> <span class="err">error:</span> could not compile `gitterm`</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="states-row">
+  <div class="state-card">
+    <div class="state-label">Collapsed — Just the Status Bar</div>
+    <div class="state-content" style="padding: 0;">
+      <div class="process-header">
+        <span class="process-chevron">▶</span>
+        <span class="process-status-dot running"></span>
+        <span class="process-name">cargo run</span>
+        <span class="process-cmd">— target/debug/gitterm</span>
+        <span class="process-uptime">↑ 2h 14m</span>
+        <div class="process-controls">
+          <button class="process-ctrl-btn stop">■</button>
+        </div>
+      </div>
+    </div>
+    <div style="padding: 8px 12px;">
+      <p style="font-size: 11px; color: var(--overlay1); line-height: 1.5;">
+        Collapsed mode: just 32px tall. Shows status dot + name + uptime.
+        Click to expand, or it auto-expands when an error is detected.
+        <span class="key">⌘J</span> toggles expand/collapse.
+      </p>
+    </div>
+  </div>
+
+  <div class="state-card">
+    <div class="state-label">No Process Configured</div>
+    <div class="state-content" style="padding: 0;">
+      <div class="process-header" style="justify-content: center;">
+        <span class="process-status-dot stopped"></span>
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--overlay0);">
+          No run command configured
+        </span>
+        <button class="process-ctrl-btn play" style="margin-left: 8px;" title="Configure">⚙</button>
+      </div>
+    </div>
+    <div style="padding: 8px 12px;">
+      <p style="font-size: 11px; color: var(--overlay1); line-height: 1.5;">
+        When no run command is set, the panel shows a minimal prompt.
+        GitTerm auto-detects common patterns (package.json → npm run dev,
+        Cargo.toml → cargo run) and suggests them.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ===== TAB COUNT COMPARISON ===== -->
+<h2>Before & After — Tab Reduction</h2>
+<p class="description">
+  The console panel reclaims a tab per workspace. With 3 workspaces, that's 3 fewer tabs to manage.
+</p>
+
+<div class="states-row">
+  <div class="state-card">
+    <div class="state-label" style="color: var(--red);">Before — Dev server wastes a tab</div>
+    <div class="state-content">
+      <div class="demo-tabs">
+        <button class="tab active">
+          <span class="tab-indicator running"></span>
+          dev server
+          <span class="tab-shortcut">⌘1</span>
+        </button>
+        <button class="tab">
+          <span class="tab-indicator idle"></span>
+          git
+          <span class="tab-shortcut">⌘2</span>
+        </button>
+        <button class="tab attention">
+          <span class="tab-indicator attention"></span>
+          claude code
+          <span class="tab-shortcut">⌘3</span>
+        </button>
+      </div>
+      <p style="font-size: 11px; color: var(--overlay1); margin-top: 10px; line-height: 1.5;">
+        3 tabs. Dev server tab is rarely interactive — you just glance at it for errors.
+        But it takes the same space as your active Claude Code session.
+      </p>
+    </div>
+  </div>
+
+  <div class="state-card">
+    <div class="state-label" style="color: var(--green);">After — Console frees a tab</div>
+    <div class="state-content">
+      <div class="demo-tabs">
+        <button class="tab">
+          <span class="tab-indicator idle"></span>
+          git
+          <span class="tab-shortcut">⌘1</span>
+        </button>
+        <button class="tab attention active" style="background: rgba(250,179,135,0.15);">
+          <span class="tab-indicator attention"></span>
+          claude code
+          <span class="tab-shortcut">⌘2</span>
+        </button>
+      </div>
+      <div style="margin-top: 8px; padding: 4px 8px; background: var(--process-ok-bg); border-radius: 4px; display: flex; align-items: center; gap: 6px;">
+        <span class="process-status-dot running" style="width: 5px; height: 5px;"></span>
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--overlay1);">cargo run — ↑ 2h 14m</span>
+      </div>
+      <p style="font-size: 11px; color: var(--overlay1); margin-top: 10px; line-height: 1.5;">
+        2 tabs. Dev server lives in the console panel below. Always visible,
+        never in the way. Tab bar is cleaner, <span class="key">⌘1</span> and <span class="key">⌘2</span> go
+        directly to what you actually interact with.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ===== TAB ATTENTION STATES ===== -->
+<h2>Tab Attention States</h2>
+<p class="description">
+  Three distinct tab states make scanning instant — you never need to read tab titles to find what needs you.
+</p>
+
+<div class="states-row">
+  <div class="state-card">
+    <div class="state-label">Idle — Nothing Happening</div>
+    <div class="state-content">
+      <div class="demo-tabs">
+        <button class="tab">
+          <span class="tab-indicator idle"></span>
+          git
+          <span class="tab-shortcut">⌘1</span>
+        </button>
+      </div>
+      <p style="font-size: 11px; color: var(--overlay1); margin-top: 10px; line-height: 1.5;">
+        Subdued dot. Tab is inactive, no process running. Minimal visual weight.
+      </p>
+    </div>
+  </div>
+
+  <div class="state-card">
+    <div class="state-label">Running — Process Active</div>
+    <div class="state-content">
+      <div class="demo-tabs">
+        <button class="tab">
+          <span class="tab-indicator running"></span>
+          claude code
+          <span class="tab-shortcut">⌘2</span>
+        </button>
+      </div>
+      <p style="font-size: 11px; color: var(--overlay1); margin-top: 10px; line-height: 1.5;">
+        Green dot. Something is actively running (Claude Code working, build, etc). Informational.
+      </p>
+    </div>
+  </div>
+</div>
+
+<div class="states-row">
+  <div class="state-card">
+    <div class="state-label" style="color: var(--attention-urgent);">Needs Attention — Action Required</div>
+    <div class="state-content">
+      <div class="demo-tabs">
+        <button class="tab attention">
+          <span class="tab-indicator attention"></span>
+          claude code
+          <span class="tab-changes">4</span>
+          <span class="tab-shortcut">⌘2</span>
+        </button>
+      </div>
+      <p style="font-size: 11px; color: var(--overlay1); margin-top: 10px; line-height: 1.5;">
+        Pulsing amber dot + amber background + amber border. Impossible to miss.
+        Triggered when terminal title contains <code style="font-family: 'JetBrains Mono'; font-size: 10px; background: var(--surface0); padding: 1px 4px; border-radius: 2px; color: var(--peach);">*</code>.
+      </p>
+    </div>
+  </div>
+
+  <div class="state-card">
+    <div class="state-label">Active — Currently Selected</div>
+    <div class="state-content">
+      <div class="demo-tabs">
+        <button class="tab active">
+          <span class="tab-indicator running"></span>
+          git
+          <span class="tab-shortcut">⌘1</span>
+        </button>
+        <button class="tab attention active" style="background: rgba(250,179,135,0.15);">
+          <span class="tab-indicator attention"></span>
+          claude code
+          <span class="tab-changes">4</span>
+          <span class="tab-shortcut">⌘2</span>
+        </button>
+      </div>
+      <p style="font-size: 11px; color: var(--overlay1); margin-top: 10px; line-height: 1.5;">
+        Active tabs get a brighter background. Attention stays amber-tinted even when active.
+        Clears after you interact with the terminal.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ===== TAB OVERFLOW ===== -->
+<h2>Tab Overflow Handling</h2>
+
+<div class="mockup-frame" style="max-width: 700px;">
+  <div class="mockup-titlebar">
+    <span class="titlebar-dot red"></span>
+    <span class="titlebar-dot yellow"></span>
+    <span class="titlebar-dot green"></span>
+  </div>
+  <div style="display: flex;">
+    <div class="workspace-rail" style="padding: 6px 0;">
+      <button class="workspace-btn active" style="color: var(--green); width: 32px; height: 32px; font-size: 11px;">FE</button>
+    </div>
+    <div style="flex: 1;">
+      <div class="tab-bar">
+        <div class="tab-bar-scroll">
+          <button class="tab active">
+            <span class="tab-indicator idle"></span>
+            git
+            <span class="tab-shortcut">⌘1</span>
+          </button>
+          <button class="tab attention">
+            <span class="tab-indicator attention"></span>
+            claude code
+            <span class="tab-changes">2</span>
+            <span class="tab-shortcut">⌘2</span>
+          </button>
+          <button class="tab">
+            <span class="tab-indicator running"></span>
+            tests
+            <span class="tab-shortcut">⌘3</span>
+          </button>
+        </div>
+        <button class="tab-overflow">
+          +2 more <span class="overflow-attention" style="margin-left: 4px;">● 1</span>
+        </button>
+        <button class="tab-add">+</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== WORKSPACE RAIL STATES ===== -->
+<h2>Workspace Rail — Attention Bubbles Up</h2>
+
+<div class="states-row">
+  <div class="state-card">
+    <div class="state-label">All Clear</div>
+    <div class="state-content" style="display: flex; gap: 8px; align-items: center;">
+      <button class="workspace-btn" style="color: var(--lavender); position: relative; background: var(--surface0); box-shadow: inset 3px 0 0 var(--lavender);">GT</button>
+      <button class="workspace-btn" style="color: var(--green);">FE</button>
+      <button class="workspace-btn" style="color: var(--peach);">AP</button>
+      <p style="font-size: 11px; color: var(--overlay1); margin-left: 12px; line-height: 1.5;">
+        No badges. Active workspace (GT) has left accent bar.
+      </p>
+    </div>
+  </div>
+
+  <div class="state-card">
+    <div class="state-label" style="color: var(--attention-urgent);">Attention Needed</div>
+    <div class="state-content" style="display: flex; gap: 8px; align-items: center;">
+      <button class="workspace-btn" style="color: var(--lavender); position: relative; background: var(--surface0); box-shadow: inset 3px 0 0 var(--lavender);">GT</button>
+      <button class="workspace-btn" style="color: var(--green); position: relative;">
+        FE
+        <span class="attention-badge">2</span>
+      </button>
+      <button class="workspace-btn" style="color: var(--peach); position: relative;">
+        AP
+        <span class="attention-badge">1</span>
+      </button>
+      <p style="font-size: 11px; color: var(--overlay1); margin-left: 12px; line-height: 1.5;">
+        Pulsing badges. "FE has 2 tabs waiting, AP has 1." Triage without switching.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ===== KEYBOARD SHORTCUTS ===== -->
+<h2>Keyboard Shortcuts</h2>
+
+<div class="annotation-section">
+  <h3>Navigation Model</h3>
+  <div class="annotation-grid">
+    <div class="annotation-card">
+      <h4>Workspace Switching</h4>
+      <p>
+        <span class="key">⌃1</span> <span class="key">⌃2</span> <span class="key">⌃3</span> — Switch workspace<br><br>
+        <span class="key">⌃Tab</span> — Next workspace<br><br>
+        <span class="key">⌃⇧Tab</span> — Previous workspace
+      </p>
+    </div>
+    <div class="annotation-card">
+      <h4>Tab Switching</h4>
+      <p>
+        <span class="key">⌘1</span> <span class="key">⌘2</span> <span class="key">⌘3</span> — Switch tab (existing)<br><br>
+        <span class="key">⌘⇧]</span> — Next tab<br><br>
+        <span class="key">⌘⇧[</span> — Previous tab
+      </p>
+    </div>
+    <div class="annotation-card">
+      <h4>Attention Navigation</h4>
+      <p>
+        <span class="key">⌃`</span> — Jump to next attention tab (across all workspaces)<br><br>
+        The killer shortcut. Cycles round-robin through every tab waiting for input.
+      </p>
+    </div>
+    <div class="annotation-card">
+      <h4>Console Panel</h4>
+      <p>
+        <span class="key">⌘J</span> — Toggle console expand/collapse<br><br>
+        <span class="key">⌘⇧R</span> — Restart the process<br><br>
+        Console auto-expands on error, auto-collapses on successful restart.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ===== WORKSPACE CONFIG ===== -->
+<h2>Workspace Configuration</h2>
+
+<div class="annotation-section">
+  <h3>How It's Stored</h3>
+  <div class="annotation-grid">
+    <div class="annotation-card">
+      <h4>workspaces.json</h4>
+      <p>
+        <code>~/.config/gitterm/workspaces.json</code><br><br>
+        Each workspace stores: name, root directory, color, run command, and tab directories.
+        Terminal state isn't saved — just enough to recreate the workspace on next launch.
+      </p>
+<pre style="font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--subtext0); background: var(--surface0); padding: 10px; border-radius: 4px; margin-top: 8px; line-height: 1.6; overflow-x: auto;">
+{
+  "workspaces": [
+    {
+      "name": "gitterm",
+      "abbrev": "GT",
+      "dir": "/Users/t/GitRepo/gitterm",
+      "color": "lavender",
+      "run": "cargo run",
+      "tabs": [
+        { "dir": "/Users/t/GitRepo/gitterm" },
+        { "dir": "/Users/t/GitRepo/gitterm" }
+      ]
+    }
+  ],
+  "active_workspace": 0
+}</pre>
+    </div>
+    <div class="annotation-card">
+      <h4>Auto-Detection</h4>
+      <p>
+        When creating a workspace, GitTerm scans the root directory:<br><br>
+        <code>package.json</code> with "dev" script → <code>npm run dev</code><br>
+        <code>package.json</code> with "start" → <code>npm start</code><br>
+        <code>Cargo.toml</code> → <code>cargo run</code><br>
+        <code>docker-compose.yml</code> → <code>docker compose up</code><br>
+        <code>Makefile</code> → suggest manual config<br><br>
+        User can always override. The detected command is shown as a suggestion when creating the workspace.
+      </p>
+    </div>
+    <div class="annotation-card">
+      <h4>Process Lifecycle</h4>
+      <p>
+        Process starts automatically when workspace is activated (configurable).<br><br>
+        On workspace switch: process keeps running in background. Console shows the active workspace's process.<br><br>
+        On quit: all processes are gracefully terminated (SIGTERM → SIGKILL after 5s).<br><br>
+        On relaunch: processes restart automatically for each workspace.
+      </p>
+    </div>
+    <div class="annotation-card">
+      <h4>Console Output Buffer</h4>
+      <p>
+        Keeps last 1000 lines per process (configurable).<br><br>
+        Output is timestamped for context when scrolling back.<br><br>
+        Stderr lines highlighted in <span style="color: var(--red);">red</span>. Errors detected by exit code or stderr patterns trigger the error state + auto-expand.
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ===== IMPLEMENTATION ===== -->
+<h2>Implementation in Iced</h2>
+
+<div class="annotation-section">
+  <h3>Architecture</h3>
+  <div class="annotation-grid">
+    <div class="annotation-card">
+      <h4>Layout Structure</h4>
+      <p>
+        Outer: <code>Row[workspace_rail, Column[tab_bar, content_area, console_panel]]</code><br><br>
+        Console panel: <code>Column[process_header, Scrollable(process_output)]</code><br><br>
+        Resizable via a drag handle between content and console (store height in config).
+      </p>
+    </div>
+    <div class="annotation-card">
+      <h4>Process Management</h4>
+      <p>
+        Each workspace has an optional <code>ProcessState</code>:<br>
+        — <code>Command</code> (what to run)<br>
+        — <code>Child</code> (the running process handle)<br>
+        — <code>Vec&lt;OutputLine&gt;</code> (buffered output)<br>
+        — <code>Status</code> (Running/Stopped/Error)<br><br>
+        Use <code>tokio::process::Command</code> with piped stdout/stderr.
+        A <code>Subscription</code> reads output lines and dispatches events.
+      </p>
+    </div>
+    <div class="annotation-card">
+      <h4>Workspace Switching</h4>
+      <p>
+        On switch: swap <code>active_workspace</code> index. All workspaces stay in memory with their tabs and process state.<br><br>
+        Terminal widgets for inactive workspaces are hidden but not destroyed — instant switching with no reload.
+      </p>
+    </div>
+    <div class="annotation-card">
+      <h4>Error → Attention Integration</h4>
+      <p>
+        If a workspace's process crashes while you're in a different workspace, the workspace badge gets a <span style="color: var(--red);">red</span> indicator (separate from the amber "needs input" badge).<br><br>
+        Two badge colors: <span style="color: var(--attention-urgent);">●</span> amber = CC needs input, <span style="color: var(--red);">●</span> red = process crashed.
+      </p>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

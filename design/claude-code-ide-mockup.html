@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitTerm — Claude Code IDE</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+  :root {
+    /* Catppuccin Mocha */
+    --crust: #11111b;
+    --mantle: #181825;
+    --base: #1e1e2e;
+    --surface0: #313244;
+    --surface1: #45475a;
+    --surface2: #585b70;
+    --overlay0: #6c7086;
+    --overlay1: #7f849c;
+    --overlay2: #9399b2;
+    --subtext0: #a6adc8;
+    --subtext1: #bac2de;
+    --text: #cdd6f4;
+
+    --lavender: #b4befe;
+    --blue: #89b4fa;
+    --sapphire: #74c7ec;
+    --sky: #89dceb;
+    --teal: #94e2d5;
+    --green: #a6e3a1;
+    --yellow: #f9e2af;
+    --peach: #fab387;
+    --maroon: #eba0ac;
+    --red: #f38ba8;
+    --mauve: #cba6f7;
+    --pink: #f5c2e7;
+    --flamingo: #f2cdcd;
+    --rosewater: #f5e0dc;
+
+    --rail-width: 52px;
+    --sidebar-width: 280px;
+    --console-height: 140px;
+    --tab-bar-height: 38px;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-ui: 'DM Sans', system-ui, sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-ui);
+    background: var(--base);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    user-select: none;
+  }
+
+  /* ═══════════════════════════════════════════
+     WORKSPACE RAIL — Project Station Selector
+     ═══════════════════════════════════════════ */
+  .workspace-rail {
+    width: var(--rail-width);
+    height: 100vh;
+    background: var(--crust);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 8px 0;
+    gap: 4px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--surface0);
+  }
+
+  .ws-btn {
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    position: relative;
+    transition: all 0.15s ease;
+    border: 1.5px solid transparent;
+  }
+
+  .ws-btn:hover {
+    background: var(--surface0);
+  }
+
+  .ws-btn.active {
+    border-color: color-mix(in srgb, var(--ws-color) 40%, transparent);
+    background: color-mix(in srgb, var(--ws-color) 12%, transparent);
+  }
+
+  .ws-btn.active .ws-abbrev {
+    color: var(--ws-color);
+  }
+
+  .ws-btn .ws-abbrev {
+    color: var(--overlay1);
+    transition: color 0.15s ease;
+  }
+
+  .ws-btn:hover .ws-abbrev {
+    color: var(--text);
+  }
+
+  /* Active indicator — left bar */
+  .ws-btn.active::before {
+    content: '';
+    position: absolute;
+    left: -9px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 3px;
+    height: 20px;
+    background: var(--ws-color);
+    border-radius: 0 2px 2px 0;
+  }
+
+  /* Attention badge */
+  .ws-badge {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    width: 14px;
+    height: 14px;
+    background: var(--yellow);
+    border: 2px solid var(--crust);
+    border-radius: 50%;
+    font-size: 8px;
+    font-weight: 700;
+    color: var(--crust);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: pulse-badge 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse-badge {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+
+  .ws-divider {
+    width: 24px;
+    height: 1px;
+    background: var(--surface0);
+    margin: 4px 0;
+  }
+
+  .ws-spacer { flex: 1; }
+
+  .ws-add {
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    border: 1.5px dashed var(--surface1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--overlay0);
+    font-size: 18px;
+    font-weight: 300;
+    transition: all 0.15s ease;
+    margin-bottom: 4px;
+  }
+
+  .ws-add:hover {
+    border-color: var(--overlay1);
+    color: var(--text);
+    background: var(--surface0);
+  }
+
+  /* Keyboard hint below workspace buttons */
+  .ws-hint {
+    font-family: var(--font-mono);
+    font-size: 8px;
+    color: var(--surface2);
+    margin-top: -2px;
+  }
+
+  /* ═══════════════════════════════════════════
+     MAIN CONTENT AREA
+     ═══════════════════════════════════════════ */
+  .main-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  /* ═══════════════════════════════════════════
+     TAB BAR — Minimal for single-tab workflow
+     ═══════════════════════════════════════════ */
+  .tab-bar {
+    height: var(--tab-bar-height);
+    background: var(--mantle);
+    display: flex;
+    align-items: center;
+    padding: 0 8px;
+    gap: 2px;
+    border-bottom: 1px solid var(--surface0);
+    flex-shrink: 0;
+  }
+
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 14px;
+    height: 30px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.12s ease;
+    position: relative;
+  }
+
+  .tab.active {
+    background: var(--base);
+    color: var(--text);
+  }
+
+  .tab:not(.active) {
+    color: var(--overlay1);
+  }
+
+  .tab:not(.active):hover {
+    background: var(--surface0);
+    color: var(--subtext1);
+  }
+
+  .tab-icon {
+    width: 14px;
+    height: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  /* Claude Code icon — the sparkle */
+  .tab-icon.claude {
+    color: var(--peach);
+    font-size: 12px;
+  }
+
+  .tab-icon.terminal {
+    color: var(--green);
+    font-size: 11px;
+  }
+
+  .tab-close {
+    opacity: 0;
+    color: var(--overlay0);
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.1s ease;
+    line-height: 1;
+  }
+
+  .tab:hover .tab-close,
+  .tab.active .tab-close {
+    opacity: 1;
+  }
+
+  .tab-close:hover {
+    color: var(--red);
+  }
+
+  .tab-shortcut {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--surface2);
+    margin-left: 2px;
+  }
+
+  .tab-add {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--overlay0);
+    font-size: 16px;
+    transition: all 0.12s ease;
+  }
+
+  .tab-add:hover {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .tab-bar-spacer { flex: 1; }
+
+  .tab-bar-info {
+    font-size: 11px;
+    color: var(--overlay0);
+    font-family: var(--font-mono);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding-right: 8px;
+  }
+
+  .tab-bar-info .workspace-name {
+    color: var(--lavender);
+    font-weight: 500;
+  }
+
+  /* ═══════════════════════════════════════════
+     CONTENT — Sidebar + Terminal
+     ═══════════════════════════════════════════ */
+  .content-area {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
+  /* ═══════════════════════════════════════════
+     SIDEBAR — Smart Git/Files Panel
+     ═══════════════════════════════════════════ */
+  .sidebar {
+    width: var(--sidebar-width);
+    background: var(--mantle);
+    border-right: 1px solid var(--surface0);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+
+  .sidebar-toggle {
+    display: flex;
+    padding: 8px 10px;
+    gap: 4px;
+    background: var(--crust);
+    border-bottom: 1px solid var(--surface0);
+  }
+
+  .sidebar-toggle-btn {
+    padding: 4px 12px;
+    border-radius: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.12s ease;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .sidebar-toggle-btn.active {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .sidebar-toggle-btn:not(.active) {
+    color: var(--overlay1);
+  }
+
+  .sidebar-toggle-btn:not(.active):hover {
+    color: var(--subtext0);
+  }
+
+  .badge-count {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 8px;
+    font-weight: 700;
+  }
+
+  .badge-count.changes {
+    background: color-mix(in srgb, var(--yellow) 20%, transparent);
+    color: var(--yellow);
+  }
+
+  .sidebar-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+  }
+
+  .sidebar-content::-webkit-scrollbar {
+    width: 4px;
+  }
+  .sidebar-content::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .sidebar-content::-webkit-scrollbar-thumb {
+    background: var(--surface1);
+    border-radius: 2px;
+  }
+
+  .sidebar-section {
+    margin-bottom: 12px;
+  }
+
+  .sidebar-section-title {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--overlay0);
+    padding: 4px 8px 6px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .section-count {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--overlay0);
+    font-weight: 500;
+  }
+
+  .branch-display {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    background: var(--base);
+    border-radius: 6px;
+    font-size: 12px;
+  }
+
+  .branch-icon {
+    color: var(--mauve);
+    font-size: 13px;
+  }
+
+  .branch-name {
+    color: var(--mauve);
+    font-family: var(--font-mono);
+    font-weight: 500;
+    font-size: 12px;
+  }
+
+  .file-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background 0.1s ease;
+    font-size: 12px;
+  }
+
+  .file-item:hover {
+    background: var(--surface0);
+  }
+
+  .file-item.selected {
+    background: color-mix(in srgb, var(--blue) 15%, transparent);
+  }
+
+  .file-status {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    width: 14px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+
+  .file-status.added { color: var(--green); }
+  .file-status.modified { color: var(--yellow); }
+  .file-status.deleted { color: var(--red); }
+  .file-status.untracked { color: var(--overlay1); }
+
+  .file-name {
+    color: var(--subtext1);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .file-item.selected .file-name {
+    color: var(--text);
+  }
+
+  /* ═══════════════════════════════════════════
+     DIVIDER — Resizable handle
+     ═══════════════════════════════════════════ */
+  .divider {
+    width: 4px;
+    background: transparent;
+    cursor: col-resize;
+    position: relative;
+    flex-shrink: 0;
+    transition: background 0.15s ease;
+  }
+
+  .divider:hover,
+  .divider.dragging {
+    background: var(--blue);
+  }
+
+  /* ═══════════════════════════════════════════
+     TERMINAL — The Hero
+     ═══════════════════════════════════════════ */
+  .terminal-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: var(--base);
+  }
+
+  .terminal-content {
+    flex: 1;
+    padding: 8px 12px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.5;
+    overflow-y: auto;
+    color: var(--text);
+  }
+
+  .terminal-content::-webkit-scrollbar { width: 6px; }
+  .terminal-content::-webkit-scrollbar-track { background: transparent; }
+  .terminal-content::-webkit-scrollbar-thumb { background: var(--surface1); border-radius: 3px; }
+
+  /* Terminal text styling */
+  .t-prompt {
+    color: var(--green);
+    font-weight: 500;
+  }
+  .t-path {
+    color: var(--blue);
+  }
+  .t-cmd {
+    color: var(--text);
+  }
+  .t-output {
+    color: var(--subtext0);
+  }
+  .t-dim {
+    color: var(--overlay0);
+  }
+  .t-success {
+    color: var(--green);
+  }
+  .t-warning {
+    color: var(--yellow);
+  }
+  .t-error {
+    color: var(--red);
+  }
+  .t-accent {
+    color: var(--mauve);
+  }
+  .t-blue {
+    color: var(--blue);
+  }
+  .t-peach {
+    color: var(--peach);
+  }
+  .t-teal {
+    color: var(--teal);
+  }
+
+  /* Claude Code specific styling */
+  .cc-thinking {
+    color: var(--overlay1);
+    font-style: italic;
+  }
+
+  .cc-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    margin: 4px 0;
+  }
+
+  .cc-sparkle {
+    color: var(--peach);
+    font-size: 14px;
+  }
+
+  .cc-label {
+    color: var(--peach);
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 0.3px;
+  }
+
+  .cc-block {
+    margin: 4px 0;
+    padding: 8px 12px;
+    background: var(--mantle);
+    border-radius: 6px;
+    border-left: 2px solid var(--surface1);
+  }
+
+  .cc-block.tool {
+    border-left-color: var(--blue);
+  }
+
+  .cc-block.result {
+    border-left-color: var(--green);
+  }
+
+  .cc-tool-name {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--blue);
+    margin-bottom: 4px;
+  }
+
+  .cc-result-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--green);
+    margin-bottom: 4px;
+  }
+
+  .cc-file-path {
+    color: var(--sapphire);
+    font-size: 11px;
+  }
+
+  .cc-waiting {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 0;
+    margin-top: 4px;
+  }
+
+  .cc-cursor {
+    display: inline-block;
+    width: 8px;
+    height: 16px;
+    background: var(--peach);
+    border-radius: 1px;
+    animation: blink-cursor 1s step-end infinite;
+  }
+
+  @keyframes blink-cursor {
+    50% { opacity: 0; }
+  }
+
+  .cc-input-hint {
+    font-size: 11px;
+    color: var(--overlay1);
+  }
+
+  /* ═══════════════════════════════════════════
+     CONSOLE PANEL — Dev Server Monitor
+     ═══════════════════════════════════════════ */
+  .console-panel {
+    height: var(--console-height);
+    background: var(--crust);
+    border-top: 1px solid var(--surface0);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+  }
+
+  .console-header {
+    height: 32px;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 10px;
+    background: var(--mantle);
+    border-bottom: 1px solid var(--surface0);
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+
+  .console-chevron {
+    font-size: 10px;
+    color: var(--overlay0);
+    transition: transform 0.15s ease;
+  }
+
+  .console-chevron.collapsed {
+    transform: rotate(-90deg);
+  }
+
+  .console-status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .console-status-dot.running {
+    background: var(--green);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--green) 50%, transparent);
+  }
+
+  .console-status-dot.error {
+    background: var(--red);
+    animation: pulse-dot 1.5s ease-in-out infinite;
+  }
+
+  .console-status-dot.stopped {
+    background: var(--overlay0);
+  }
+
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; box-shadow: 0 0 6px color-mix(in srgb, var(--red) 50%, transparent); }
+    50% { opacity: 0.5; box-shadow: none; }
+  }
+
+  .console-cmd {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--subtext1);
+  }
+
+  .console-detail {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--overlay0);
+  }
+
+  .console-spacer { flex: 1; }
+
+  .console-uptime {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--overlay0);
+  }
+
+  .console-btn {
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--overlay1);
+    font-size: 11px;
+    transition: all 0.1s ease;
+  }
+
+  .console-btn:hover {
+    background: var(--surface0);
+    color: var(--text);
+  }
+
+  .console-output {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--subtext0);
+  }
+
+  .console-output::-webkit-scrollbar { width: 4px; }
+  .console-output::-webkit-scrollbar-track { background: transparent; }
+  .console-output::-webkit-scrollbar-thumb { background: var(--surface1); border-radius: 2px; }
+
+  .console-line {
+    display: flex;
+    gap: 12px;
+  }
+
+  .console-time {
+    color: var(--surface2);
+    flex-shrink: 0;
+    font-size: 10px;
+  }
+
+  .console-text { color: var(--subtext0); }
+  .console-text.success { color: var(--green); }
+  .console-text.warn { color: var(--yellow); }
+  .console-text.err { color: var(--red); }
+  .console-text.info { color: var(--blue); }
+
+  /* ═══════════════════════════════════════════
+     RESIZE HANDLE between content & console
+     ═══════════════════════════════════════════ */
+  .h-divider {
+    height: 3px;
+    background: transparent;
+    cursor: row-resize;
+    transition: background 0.15s ease;
+    flex-shrink: 0;
+  }
+
+  .h-divider:hover {
+    background: var(--blue);
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════ WORKSPACE RAIL ═══════════════════ -->
+<div class="workspace-rail">
+  <!-- Active workspace: gitterm-v2 -->
+  <div class="ws-btn active" style="--ws-color: var(--lavender)">
+    <span class="ws-abbrev">GT</span>
+  </div>
+  <div class="ws-hint">^1</div>
+
+  <!-- Workspace 2: frontend app (has attention badge) -->
+  <div class="ws-btn" style="--ws-color: var(--green)">
+    <span class="ws-abbrev">FE</span>
+    <div class="ws-badge">1</div>
+  </div>
+  <div class="ws-hint">^2</div>
+
+  <!-- Workspace 3: API -->
+  <div class="ws-btn" style="--ws-color: var(--peach)">
+    <span class="ws-abbrev">AP</span>
+  </div>
+  <div class="ws-hint">^3</div>
+
+  <div class="ws-divider"></div>
+
+  <div class="ws-spacer"></div>
+
+  <!-- Add workspace -->
+  <div class="ws-add">+</div>
+</div>
+
+<!-- ═══════════════════ MAIN AREA ═══════════════════ -->
+<div class="main-area">
+
+  <!-- TAB BAR -->
+  <div class="tab-bar">
+    <div class="tab active">
+      <div class="tab-icon claude">&#10022;</div>
+      <span>Claude Code</span>
+      <span class="tab-shortcut">&#8984;1</span>
+      <span class="tab-close">&times;</span>
+    </div>
+    <div class="tab">
+      <div class="tab-icon terminal">&#9654;</div>
+      <span>zsh</span>
+      <span class="tab-shortcut">&#8984;2</span>
+      <span class="tab-close">&times;</span>
+    </div>
+    <div class="tab-add">+</div>
+    <div class="tab-bar-spacer"></div>
+    <div class="tab-bar-info">
+      <span class="workspace-name">gitterm-v2</span>
+      <span>master</span>
+    </div>
+  </div>
+
+  <!-- CONTENT: Sidebar + Terminal -->
+  <div class="content-area">
+
+    <!-- SIDEBAR -->
+    <div class="sidebar">
+      <div class="sidebar-toggle">
+        <div class="sidebar-toggle-btn active">
+          Git
+          <span class="badge-count changes">4</span>
+        </div>
+        <div class="sidebar-toggle-btn">Files</div>
+      </div>
+
+      <div class="sidebar-content">
+        <!-- Branch -->
+        <div class="branch-display">
+          <span class="branch-icon">&#9670;</span>
+          <span class="branch-name">master</span>
+        </div>
+
+        <!-- Staged -->
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">
+            Staged
+            <span class="section-count" style="color: var(--green);">1</span>
+          </div>
+          <div class="file-item">
+            <span class="file-status added">A</span>
+            <span class="file-name">CLAUDE.md</span>
+          </div>
+        </div>
+
+        <!-- Unstaged -->
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">
+            Unstaged
+            <span class="section-count" style="color: var(--yellow);">1</span>
+          </div>
+          <div class="file-item selected">
+            <span class="file-status modified">M</span>
+            <span class="file-name">src/main.rs</span>
+          </div>
+        </div>
+
+        <!-- Untracked -->
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">
+            Untracked
+            <span class="section-count">2</span>
+          </div>
+          <div class="file-item">
+            <span class="file-status untracked">?</span>
+            <span class="file-name">design/claude-code-ide-mockup.html</span>
+          </div>
+          <div class="file-item">
+            <span class="file-status untracked">?</span>
+            <span class="file-name">design/WORKSPACE_DESIGN.md</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DIVIDER -->
+    <div class="divider"></div>
+
+    <!-- TERMINAL (Claude Code session) -->
+    <div class="terminal-area">
+      <div class="terminal-content">
+        <!-- Claude Code session output -->
+        <div style="margin-bottom: 8px;">
+          <span class="t-dim">$ </span><span class="t-cmd">claude</span>
+        </div>
+
+        <div class="cc-header">
+          <span class="cc-sparkle">&#10022;</span>
+          <span class="cc-label">Claude Code</span>
+          <span class="t-dim" style="font-size: 11px;">v1.0.35 &middot; claude-opus-4-6</span>
+        </div>
+
+        <div style="margin: 8px 0;">
+          <span class="t-output">Implement the workspace system Phase 1 from the design doc</span>
+        </div>
+
+        <div class="cc-block tool">
+          <div class="cc-tool-name">Read</div>
+          <div class="cc-file-path">src/main.rs</div>
+        </div>
+
+        <div class="cc-block tool">
+          <div class="cc-tool-name">Read</div>
+          <div class="cc-file-path">design/WORKSPACE_DESIGN.md</div>
+        </div>
+
+        <div style="margin: 8px 0;">
+          <span class="t-output">I'll implement the workspace system in steps. First, adding the new types...</span>
+        </div>
+
+        <div class="cc-block tool">
+          <div class="cc-tool-name">Edit</div>
+          <div class="cc-file-path">src/main.rs <span class="t-dim">&mdash; Adding WorkspaceColor, Workspace, WorkspacesFile</span></div>
+        </div>
+
+        <div class="cc-block result">
+          <div class="cc-result-label">Result</div>
+          <div class="t-success">&#10003; File updated successfully</div>
+        </div>
+
+        <div class="cc-block tool">
+          <div class="cc-tool-name">Edit</div>
+          <div class="cc-file-path">src/main.rs <span class="t-dim">&mdash; Refactoring App struct: tabs &rarr; workspaces</span></div>
+        </div>
+
+        <div class="cc-block result">
+          <div class="cc-result-label">Result</div>
+          <div class="t-success">&#10003; File updated successfully</div>
+        </div>
+
+        <div class="cc-block tool">
+          <div class="cc-tool-name">Bash</div>
+          <div><span class="t-dim">cargo build 2>&1</span></div>
+        </div>
+
+        <div class="cc-block result">
+          <div class="cc-result-label">Result</div>
+          <div class="t-success">&#10003; Compiled successfully (1 warning)</div>
+        </div>
+
+        <div style="margin: 8px 0;">
+          <span class="t-output">Phase 1 is complete. The workspace system is now functional with:</span>
+          <div style="margin: 4px 0 4px 16px; line-height: 1.7;">
+            <span class="t-teal">&#8226;</span> <span class="t-output">Workspace rail with colored project buttons</span><br>
+            <span class="t-teal">&#8226;</span> <span class="t-output">Ctrl+1-9 workspace switching</span><br>
+            <span class="t-teal">&#8226;</span> <span class="t-output">Persistence via workspaces.json</span><br>
+            <span class="t-teal">&#8226;</span> <span class="t-output">Folder picker for new workspaces</span>
+          </div>
+        </div>
+
+        <!-- Waiting for input -->
+        <div class="cc-waiting">
+          <span class="cc-sparkle">&#10022;</span>
+          <span class="cc-cursor"></span>
+          <span class="cc-input-hint">Waiting for input...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HORIZONTAL RESIZE HANDLE -->
+  <div class="h-divider"></div>
+
+  <!-- CONSOLE PANEL -->
+  <div class="console-panel">
+    <div class="console-header">
+      <span class="console-chevron">&#9660;</span>
+      <span class="console-status-dot running"></span>
+      <span class="console-cmd">cargo run</span>
+      <span class="console-detail">&mdash; target/debug/gitterm</span>
+      <span class="console-spacer"></span>
+      <span class="console-uptime">&uarr; 14m</span>
+      <div class="console-btn" title="Clear">&#8960;</div>
+      <div class="console-btn" title="Restart">&#8635;</div>
+      <div class="console-btn" title="Stop">&#9632;</div>
+    </div>
+    <div class="console-output">
+      <div class="console-line">
+        <span class="console-time">14:22:01</span>
+        <span class="console-text">Compiling gitterm v0.1.0 (/Users/t/GitRepo/gitterm-v2)</span>
+      </div>
+      <div class="console-line">
+        <span class="console-time">14:22:18</span>
+        <span class="console-text success">Finished `dev` profile in 17.98s</span>
+      </div>
+      <div class="console-line">
+        <span class="console-time">14:22:19</span>
+        <span class="console-text">Running `target/debug/gitterm`</span>
+      </div>
+      <div class="console-line">
+        <span class="console-time">14:22:19</span>
+        <span class="console-text info">&#127760; Log server started at http://localhost:3030</span>
+      </div>
+      <div class="console-line">
+        <span class="console-time">14:22:20</span>
+        <span class="console-text warn">warning: field `tab_id` is never read (log_server.rs:17)</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
