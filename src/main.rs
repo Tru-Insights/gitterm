@@ -1617,6 +1617,12 @@ fn workspace_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("ws-slide")
 }
 
+fn tab_scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("tab-bar-scroll")
+}
+
+const ESTIMATED_TAB_WIDTH: f32 = 200.0;
+
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 24.0;
 const FONT_SIZE_STEP: f32 = 1.0;
@@ -1630,6 +1636,19 @@ impl App {
     /// Small UI font size (for hints, secondary text)
     fn ui_font_small(&self) -> f32 {
         self.ui_font_size - 1.0
+    }
+
+    fn scroll_to_active_tab(&self) -> Task<Event> {
+        let active_tab = self.active_workspace()
+            .map(|ws| ws.active_tab)
+            .unwrap_or(0);
+        let target_x = (active_tab as f32 * ESTIMATED_TAB_WIDTH).max(0.0);
+        iced::advanced::widget::operate(
+            iced::advanced::widget::operation::scrollable::scroll_to(
+                tab_scrollable_id().into(),
+                scrollable::AbsoluteOffset { x: Some(target_x), y: None },
+            ),
+        )
     }
 
     fn save_config(&self) {
@@ -2254,6 +2273,7 @@ _gitterm_set_title
                         ws.active_tab = idx;
                     }
                 }
+                return self.scroll_to_active_tab();
             }
             Event::TabClose(idx) => {
                 // Hide WebView when closing tabs
@@ -2267,6 +2287,7 @@ _gitterm_set_title
                     }
                 }
                 self.save_workspaces();
+                return self.scroll_to_active_tab();
             }
             Event::OpenFolder => {
                 return Task::perform(
@@ -2284,6 +2305,7 @@ _gitterm_set_title
                 // Allow any folder, not just git repos
                 self.add_tab(path);
                 self.save_workspaces();
+                return self.scroll_to_active_tab();
             }
             Event::FolderSelected(None) => {}
             Event::FileSelect(path, is_staged) => {
@@ -3130,7 +3152,7 @@ _gitterm_set_title
                                 }
                                 self.workspaces[ws_idx].active_tab = tab_idx;
                                 self.save_workspaces();
-                                return Task::none();
+                                return self.scroll_to_active_tab();
                             }
                             tab_idx += 1;
                             continue;
@@ -3603,6 +3625,8 @@ _gitterm_set_title
 
     fn view_tab_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
+
+        // === Left section: scrollable tabs ===
         let mut tabs_row = Row::new().spacing(2);
 
         // Left edge peek indicator
@@ -3783,12 +3807,46 @@ _gitterm_set_title
             .on_press(Event::OpenFolder);
         tabs_row = tabs_row.push(add_btn);
 
-        // Right side: spacer + workspace name + branch + add workspace + peek
-        tabs_row = tabs_row.push(iced::widget::Space::new().width(Length::Fill));
+        // Wrap tabs in a horizontal scrollable
+        let scrollable_tabs = scrollable(
+            tabs_row
+                .padding([4, 8])
+                .align_y(iced::Alignment::Center),
+        )
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(0).scroller_width(0),
+        ))
+        .id(tab_scrollable_id())
+        .width(Length::Fill)
+        .style(|_theme, _status| {
+            let transparent_rail = scrollable::Rail {
+                background: None,
+                border: iced::Border::default(),
+                scroller: scrollable::Scroller {
+                    background: iced::Color::TRANSPARENT.into(),
+                    border: iced::Border::default(),
+                },
+            };
+            scrollable::Style {
+                container: container::Style::default(),
+                vertical_rail: transparent_rail,
+                horizontal_rail: transparent_rail,
+                gap: None,
+                auto_scroll: scrollable::AutoScroll {
+                    background: iced::Color::TRANSPARENT.into(),
+                    border: iced::Border::default(),
+                    shadow: iced::Shadow::default(),
+                    icon: iced::Color::TRANSPARENT,
+                },
+            }
+        });
+
+        // === Right section: fixed workspace metadata ===
+        let mut metadata_row = Row::new().spacing(4);
 
         if let Some(ws) = self.active_workspace() {
             let ws_color = ws.color.color(theme);
-            tabs_row = tabs_row.push(
+            metadata_row = metadata_row.push(
                 text(&ws.name)
                     .size(12)
                     .color(ws_color)
@@ -3815,12 +3873,12 @@ _gitterm_set_title
                     })
                     .padding([2, 4])
                     .on_press(Event::WorkspaceClose(ws_idx));
-                tabs_row = tabs_row.push(close_ws_btn);
+                metadata_row = metadata_row.push(close_ws_btn);
             }
 
             if let Some(tab) = self.active_tab() {
-                tabs_row = tabs_row.push(
-                    text(format!("  \u{e0a0} {}", tab.branch_name))
+                metadata_row = metadata_row.push(
+                    text(format!(" \u{e0a0} {}", tab.branch_name))
                         .size(12)
                         .color(theme.overlay0())
                         .font(iced::Font::with_name("Menlo")),
@@ -3845,22 +3903,29 @@ _gitterm_set_title
                 })
                 .padding([4, 6])
                 .on_press(Event::WorkspaceSelect(self.active_workspace_idx + 1));
-                tabs_row = tabs_row.push(peek_btn);
+                metadata_row = metadata_row.push(peek_btn);
             }
         }
 
+        // === Combine: scrollable tabs (fill) + fixed metadata (shrink) ===
         let bg = theme.bg_crust();
         let border_color = theme.surface0();
-        let tab_container = container(
-            tabs_row
-                .padding([4, 8])
-                .align_y(iced::Alignment::Center),
-        )
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(bg.into()),
-            ..Default::default()
-        });
+
+        let combined_row = Row::new()
+            .push(scrollable_tabs)
+            .push(
+                metadata_row
+                    .padding([4, 8])
+                    .align_y(iced::Alignment::Center),
+            )
+            .align_y(iced::Alignment::Center);
+
+        let tab_container = container(combined_row)
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            });
 
         // Bottom border as separator
         let separator = container(iced::widget::Space::new().height(0))
