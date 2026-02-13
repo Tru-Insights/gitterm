@@ -1,7 +1,7 @@
 use git2::{DiffOptions, Repository, Status, StatusOptions};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
-use iced::widget::{button, column, container, image, row, scrollable, text, text_input, Column, Row};
+use iced::widget::{button, column, container, image, row, scrollable, text, text_input, Column, Row, Stack};
 use iced::{color, Length, Size, Subscription, Task, Theme};
 use iced_term::{ColorPalette, SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -1674,6 +1674,8 @@ pub enum Event {
     BottomTerminalEvent(usize, iced_term::Event),
     // Modifier tracking
     ModifiersChanged(Modifiers),
+    // Help modal
+    ToggleHelp,
 }
 
 struct App {
@@ -1709,6 +1711,8 @@ struct App {
     attention_pulse_bright: bool,
     // Track modifier state for filtering terminal writes
     current_modifiers: Modifiers,
+    // Help modal
+    show_help: bool,
 }
 
 const SPINE_WIDTH: f32 = 16.0;
@@ -1912,6 +1916,7 @@ impl App {
             edge_peek_right: false,
             attention_pulse_bright: false,
             current_modifiers: Modifiers::empty(),
+            show_help: false,
         };
 
         // Try to restore workspaces from saved config
@@ -2307,6 +2312,14 @@ fi
                         }
                     }
                 }
+                // Suppress Alt+/ (help modal shortcut) — macOS sends ÷ (0xC3 0xB7)
+                if self.current_modifiers.alt() {
+                    if let iced_term::backend::Command::Write(ref data) = cmd {
+                        if data == &[0xC3, 0xB7] || data == b"/" {
+                            return Task::none();
+                        }
+                    }
+                }
                 if let Some(tab) = self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()).find(|t| t.id == tab_id) {
                     // Clear attention on user keyboard input (Write), not on process output (ProcessAlacrittyEvent)
                     if matches!(&cmd, iced_term::backend::Command::Write(_)) && tab.needs_attention {
@@ -2542,6 +2555,14 @@ fi
                         }
                     }
                 }
+                // Suppress Alt+/ (help modal shortcut)
+                if self.current_modifiers.alt() {
+                    if let iced_term::backend::Command::Write(ref data) = cmd {
+                        if data == &[0xC3, 0xB7] || data == b"/" {
+                            return Task::none();
+                        }
+                    }
+                }
                 if let Some(bt) = self.workspaces.iter_mut()
                     .flat_map(|ws| ws.bottom_terminals.iter_mut())
                     .find(|bt| bt.id == id)
@@ -2634,6 +2655,31 @@ fi
             }
             Event::KeyPressed(key, modifiers) => {
                 self.current_modifiers = modifiers;
+
+                // Help modal: Escape or Cmd+/ closes, all other keys consumed while open
+                if self.show_help {
+                    match key.as_ref() {
+                        Key::Named(key::Named::Escape) => {
+                            self.show_help = false;
+                            return Task::none();
+                        }
+                        Key::Character(c) if c == "/" && modifiers.alt() => {
+                            self.show_help = false;
+                            return Task::none();
+                        }
+                        _ => return Task::none(),
+                    }
+                }
+
+                // Option+/ (Alt+/) toggles help modal
+                if modifiers.alt() && !modifiers.command() {
+                    if let Key::Character(c) = key.as_ref() {
+                        if c == "/" || c == "÷" {
+                            return Task::done(Event::ToggleHelp);
+                        }
+                    }
+                }
+
                 // Escape cancels console command editing
                 if self.editing_console_command.is_some() {
                     if let Key::Named(key::Named::Escape) = key.as_ref() {
@@ -2728,9 +2774,9 @@ fi
                     }
                 }
 
-                // Cmd+Shift+C — resume Claude Code session
-                // Cmd+Shift+T — new plain terminal tab (folder picker)
-                if modifiers.command() && modifiers.shift() {
+                // Option+Shift+C — resume Claude Code session
+                // Option+Shift+T — new plain terminal tab (folder picker)
+                if modifiers.alt() && modifiers.shift() {
                     if let Key::Character(c) = key.as_ref() {
                         if c == "c" || c == "C" {
                             return Task::done(Event::ResumeClaudeTab);
@@ -3410,6 +3456,9 @@ fi
             Event::ModifiersChanged(modifiers) => {
                 self.current_modifiers = modifiers;
             }
+            Event::ToggleHelp => {
+                self.show_help = !self.show_help;
+            }
             Event::AttentionPulseTick => {
                 self.attention_pulse_bright = !self.attention_pulse_bright;
             }
@@ -3557,11 +3606,131 @@ fi
         let workspace_bar = self.view_workspace_bar();
         main_col = main_col.push(workspace_bar);
 
-        row![spine, main_col]
-            .spacing(0)
-            .width(Length::Fill)
-            .height(Length::Fill)
+        let main_view: Element<'_, Event, Theme, iced::Renderer> =
+            row![spine, main_col]
+                .spacing(0)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+
+        if self.show_help {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_help_modal())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            main_view
+        }
+    }
+
+    fn view_help_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let accent = theme.accent();
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let bg_surface = theme.bg_surface();
+        let border_color = theme.border();
+        let bg_crust = theme.bg_crust();
+
+        let mono = iced::Font::with_name("Menlo");
+
+        // Helper to build a shortcut row
+        let shortcut_row = |key_str: &'static str, desc_str: &'static str| -> Element<'_, Event, Theme, iced::Renderer> {
+            row![
+                container(text(key_str).size(13).color(text_primary).font(mono))
+                    .width(Length::Fixed(180.0)),
+                text(desc_str).size(13).color(text_secondary),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center)
             .into()
+        };
+
+        let section_header = |title: &'static str| -> Element<'_, Event, Theme, iced::Renderer> {
+            container(text(title).size(12).color(accent).font(mono))
+                .padding(iced::Padding { top: 8.0, right: 0.0, bottom: 4.0, left: 0.0 })
+                .into()
+        };
+
+        let mut content_col = Column::new().spacing(2).padding([24, 32]);
+
+        // Title
+        content_col = content_col.push(
+            container(text("Keyboard Shortcuts").size(18).color(text_primary))
+                .padding(iced::Padding { top: 0.0, right: 0.0, bottom: 12.0, left: 0.0 }),
+        );
+
+        // Navigation
+        content_col = content_col.push(section_header("Navigation"));
+        content_col = content_col.push(shortcut_row("Ctrl + 1-9", "Switch workspace"));
+        content_col = content_col.push(shortcut_row("Cmd + 1-9", "Switch tab"));
+        content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to attention tab"));
+
+        // Tabs
+        content_col = content_col.push(section_header("Tabs"));
+        content_col = content_col.push(shortcut_row("+ button", "New Claude tab"));
+        content_col = content_col.push(shortcut_row("Option + Shift + C", "Resume Claude session"));
+        content_col = content_col.push(shortcut_row("Option + Shift + T", "New terminal (folder)"));
+
+        // Console
+        content_col = content_col.push(section_header("Console"));
+        content_col = content_col.push(shortcut_row("Cmd + J", "Toggle bottom panel"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + R", "Restart console"));
+
+        // Terminal
+        content_col = content_col.push(section_header("Terminal"));
+        content_col = content_col.push(shortcut_row("Cmd + K", "Clear terminal"));
+        content_col = content_col.push(shortcut_row("Cmd + F", "Find in terminal"));
+        content_col = content_col.push(shortcut_row("Cmd + G", "Next match"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + G", "Previous match"));
+
+        // Font Size
+        content_col = content_col.push(section_header("Font Size"));
+        content_col = content_col.push(shortcut_row("Cmd + =", "Increase terminal font"));
+        content_col = content_col.push(shortcut_row("Cmd + -", "Decrease terminal font"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + =", "Increase UI font"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + -", "Decrease UI font"));
+
+        // Theme
+        content_col = content_col.push(section_header("Theme"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + T", "Toggle light/dark"));
+
+        // Footer
+        content_col = content_col.push(
+            container(text("Press Option+/ or Esc to close").size(12).color(text_muted))
+                .padding(iced::Padding { top: 12.0, right: 0.0, bottom: 0.0, left: 0.0 }),
+        );
+
+        // Card
+        let card = container(content_col)
+            .max_width(460)
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+
+        // Backdrop — semi-transparent overlay with centered card
+        let backdrop_color = iced::Color { a: 0.8, ..bg_crust };
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop_color.into()),
+            ..Default::default()
+        })
+        .into()
     }
 
     fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -3761,7 +3930,33 @@ fi
                 ..Default::default()
             });
 
-        let bar_container = container(scrollable_bar)
+        // Help button (?) pinned to the right
+        let help_color = theme.overlay0();
+        let help_hover = theme.overlay1();
+        let help_btn = button(
+            text("?").size(11).color(help_color).font(iced::Font::with_name("Menlo")),
+        )
+        .style(move |_theme, status| {
+            let tc = if matches!(status, button::Status::Hovered) {
+                help_hover
+            } else {
+                help_color
+            };
+            button::Style {
+                background: Some(iced::Color::TRANSPARENT.into()),
+                text_color: tc,
+                ..Default::default()
+            }
+        })
+        .padding([6, 10])
+        .on_press(Event::ToggleHelp);
+
+        let bar_inner = row![scrollable_bar, help_btn]
+            .spacing(0)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill);
+
+        let bar_container = container(bar_inner)
             .width(Length::Fill)
             .style(move |_| container::Style {
                 background: Some(bg.into()),
