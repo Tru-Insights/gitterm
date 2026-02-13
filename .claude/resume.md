@@ -1,32 +1,33 @@
 # Resume: gitterm-v2
 
-**Last checkpoint:** 2026-02-12 evening
+**Last checkpoint:** 2026-02-13 22:15
 
 ## You Were Just Working On
-Implemented the **Attention System** (Phase 2) and tested it interactively. All features working — ready to commit.
+Implemented the Bottom Panel Tab System — transforming the console-only bottom panel into a tabbed panel that supports both Console and real iced_term Terminal tabs (VS Code pattern).
 
-**Just did:** Fixed Ctrl+1-9 and Ctrl+` writing stray characters into the terminal by adding modifier tracking and write suppression in the BackendCall handler.
+**Just did:** Completed full implementation, verified clean `cargo build` with no new warnings, ran agent verification of all 16 components.
 
-**Immediate next step:** Commit all changes (attention system, Noop binding, write suppression, color dedup, CLAUDECODE env fix). Then move on to Phase 3 (Tab Overflow) or Phase 4 (Console Panel) from `design/WORKSPACE_DESIGN.md`.
+**Immediate next step:** Run `cargo run` to manually verify: console tab works as before, "+" adds terminal tabs, terminals are functional, close button works, theme toggle recreates bottom terminals, quit/relaunch restores bottom terminals from workspaces.json.
 
 ## Completed This Session
-- **Attention system (Phase 2):** Full implementation — `needs_attention` field on TabState, detection via terminal title `*` prefix, auto-clear on user input
-- **Pulsing animation:** 500ms subscription timer, `attention_pulse_bright` toggle on App, conditional subscription (only active when attention exists)
-- **Tab bar indicators:** Pulsing amber `●` icon, stripped `*` prefix from title, amber-tinted background with border for attention tabs
-- **Workspace bar indicators:** Pulsing amber dot for workspaces with attention, amber badge showing attention count, red `!` badge for console errors
-- **Spine indicators:** Larger dots (6x6) for workspaces with attention/error, pulsing amber or red color
-- **Ctrl+` shortcut:** Round-robin jump to next attention tab across all workspaces, with slide animation
-- **iced_term `Noop` binding:** Added new `BindingAction::Noop` variant to iced_term_fork to suppress terminal character output for app shortcuts
-- **Write suppression:** Modifier tracking via `ModifiersChanged` events + BackendCall filtering to prevent Ctrl+1-9 and Ctrl+` from typing into terminal
-- **Workspace color dedup:** `WorkspaceColor::next_available()` picks first unused color instead of `from_index(len)`
-- **CLAUDECODE env fix:** Clear `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` env vars in PTY setup so Claude Code can launch inside GitTerm terminals
+- Added `BottomPanelTab` enum, `BottomTerminal` struct, `BottomTerminalConfig` for persistence
+- Extended `Workspace` with `bottom_terminals: Vec<BottomTerminal>` and `active_bottom_tab: BottomPanelTab`
+- Added 4 new events: `BottomTabSelect`, `BottomTerminalAdd`, `BottomTerminalClose`, `BottomTerminalEvent`
+- Extracted `build_terminal_settings()` and `standard_noop_bindings()` helpers from duplicated code in `create_tab()`/`recreate_terminals()`
+- Added `create_bottom_terminal()` method using shared helpers
+- Refactored `recreate_terminals()` to use helpers and handle bottom terminals
+- Replaced `view_console_panel()`/`view_console_header()` with `view_bottom_panel()`/`view_bottom_tab_bar()`
+- Tab bar: Console tab (status dot), terminal tabs (close button, title), "+" button, contextual console controls on right
+- Added bottom terminal subscriptions in `subscription()`
+- Added persistence: `WorkspaceConfig.bottom_terminals` with `#[serde(default)]` for backward compat
+- Workspace restore creates bottom terminals from saved config
+- Clean compile, only pre-existing `tab_id` dead code warning
 
 ## Key Files
-- `src/main.rs` — All app changes (attention fields, events, detection, UI indicators, write suppression)
-- `../iced_term_fork/src/bindings.rs` — Added `Noop` variant to `BindingAction` enum
-- `../iced_term_fork/src/view.rs` — Added `Noop` handler (returns None, no character written)
-- `design/WORKSPACE_DESIGN.md` — Full design spec for all phases
+- `src/main.rs` — Single-file app, all changes here (~5900 lines)
+- `~/.config/gitterm/workspaces.json` — Workspace persistence (now includes bottom_terminals)
+- `../iced_term_fork/` — Terminal widget dependency
 
 ## Blockers/Issues
-- None — all features working and tested
-- Pre-existing warnings only: `tab_id` dead code in log_server.rs, `_viewport` in iced_term view.rs
+- Not yet manually tested (needs `cargo run` verification)
+- Changes are uncommitted

@@ -244,11 +244,15 @@ struct WorkspaceConfig {
     tabs: Vec<WorkspaceTabConfig>,
     #[serde(default)]
     run_command: Option<String>,
+    #[serde(default)]
+    bottom_terminals: Vec<BottomTerminalConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceTabConfig {
     dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_command: Option<String>,
 }
 
 impl WorkspacesFile {
@@ -996,6 +1000,8 @@ struct TabState {
     search: SearchState,
     // Attention: true when terminal title starts with "*" (e.g. Claude Code waiting for input)
     needs_attention: bool,
+    // Optional command to run after shell init (e.g. "claude" for Claude Code tabs)
+    startup_command: Option<String>,
 }
 
 impl TabState {
@@ -1031,6 +1037,7 @@ impl TabState {
             webview_content: None,
             search: SearchState::default(),
             needs_attention: false,
+            startup_command: None,
         }
     }
 
@@ -1467,6 +1474,25 @@ impl WorkspaceColor {
     }
 }
 
+// Bottom panel tab types
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BottomPanelTab {
+    Console,
+    Terminal(usize), // index into bottom_terminals vec
+}
+
+struct BottomTerminal {
+    id: usize,
+    terminal: Option<iced_term::Terminal>,
+    title: Option<String>,
+    cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BottomTerminalConfig {
+    dir: String,
+}
+
 // Workspace groups tabs by project
 struct Workspace {
     name: String,
@@ -1476,6 +1502,8 @@ struct Workspace {
     tabs: Vec<TabState>,
     active_tab: usize,
     console: ConsoleState,
+    bottom_terminals: Vec<BottomTerminal>,
+    active_bottom_tab: BottomPanelTab,
 }
 
 impl Workspace {
@@ -1491,6 +1519,8 @@ impl Workspace {
             tabs: Vec::new(),
             active_tab: 0,
             console,
+            bottom_terminals: Vec::new(),
+            active_bottom_tab: BottomPanelTab::Console,
         }
     }
 
@@ -1634,6 +1664,13 @@ pub enum Event {
     // Attention system events
     AttentionPulseTick,
     AttentionJumpNext,
+    // Claude tab
+    NewClaudeTab,
+    // Bottom panel tabs
+    BottomTabSelect(BottomPanelTab),
+    BottomTerminalAdd,
+    BottomTerminalClose(usize),
+    BottomTerminalEvent(usize, iced_term::Event),
     // Modifier tracking
     ModifiersChanged(Modifiers),
 }
@@ -1761,9 +1798,15 @@ impl App {
                     tabs: ws.tabs.iter().map(|tab| {
                         WorkspaceTabConfig {
                             dir: tab.current_dir.to_string_lossy().to_string(),
+                            startup_command: tab.startup_command.clone(),
                         }
                     }).collect(),
                     run_command: ws.console.run_command.clone(),
+                    bottom_terminals: ws.bottom_terminals.iter().map(|bt| {
+                        BottomTerminalConfig {
+                            dir: bt.cwd.to_string_lossy().to_string(),
+                        }
+                    }).collect(),
                 }
             }).collect(),
             active_workspace: self.active_workspace_idx,
@@ -1898,8 +1941,14 @@ impl App {
                 } else {
                     for tab_config in &ws_config.tabs {
                         let tab_dir = PathBuf::from(&tab_config.dir);
-                        app.add_tab_to_workspace(&mut workspace, tab_dir);
+                        app.add_tab_to_workspace_with_command(&mut workspace, tab_dir, tab_config.startup_command.clone());
                     }
+                }
+
+                // Restore bottom panel terminals
+                for bt_config in &ws_config.bottom_terminals {
+                    let bt = app.create_bottom_terminal(PathBuf::from(&bt_config.dir));
+                    workspace.bottom_terminals.push(bt);
                 }
 
                 app.workspaces.push(workspace);
@@ -1930,32 +1979,47 @@ impl App {
     }
 
     fn add_tab_to_workspace(&mut self, workspace: &mut Workspace, repo_path: PathBuf) {
-        let tab = self.create_tab(repo_path);
+        let tab = self.create_tab(repo_path, None);
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+    }
+
+    fn add_tab_to_workspace_with_command(&mut self, workspace: &mut Workspace, repo_path: PathBuf, startup_command: Option<String>) {
+        let tab = self.create_tab(repo_path, startup_command);
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
     }
 
     fn add_tab(&mut self, repo_path: PathBuf) {
-        let tab = self.create_tab(repo_path);
+        let tab = self.create_tab(repo_path, None);
         if let Some(ws) = self.active_workspace_mut() {
             ws.tabs.push(tab);
             ws.active_tab = ws.tabs.len() - 1;
         }
     }
 
-    fn create_tab(&mut self, repo_path: PathBuf) -> TabState {
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
+    fn add_tab_with_command(&mut self, repo_path: PathBuf, startup_command: Option<String>) {
+        let tab = self.create_tab(repo_path, startup_command);
+        if let Some(ws) = self.active_workspace_mut() {
+            ws.tabs.push(tab);
+            ws.active_tab = ws.tabs.len() - 1;
+        }
+    }
 
-        let mut tab = TabState::new(id, repo_path.clone());
-
-        // Get shell - platform-specific defaults
+    /// Build terminal settings for a given working directory and optional startup command.
+    /// Extracted so create_tab, create_bottom_terminal, and recreate_terminals can share this logic.
+    fn build_terminal_settings(
+        cwd: &std::path::Path,
+        startup_command: Option<&str>,
+        scrollback_lines: usize,
+        theme: &AppTheme,
+        terminal_font_size: f32,
+    ) -> iced_term::settings::Settings {
         #[cfg(target_os = "windows")]
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string());
 
         #[cfg(not(target_os = "windows"))]
         let shell = std::env::var("SHELL").ok().or_else(|| {
-            // When running as app bundle, SHELL may not be set - check passwd
             let user = std::env::var("USER").ok()?;
             let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
             for line in passwd.lines() {
@@ -1967,7 +2031,6 @@ impl App {
             None
         }).unwrap_or_else(|| "/bin/zsh".to_string());
 
-        // Build environment for PTY - app bundles have minimal env, so we need to set essentials
         let mut env = std::collections::HashMap::new();
 
         #[cfg(not(target_os = "windows"))]
@@ -1988,37 +2051,31 @@ impl App {
 
         #[cfg(target_os = "windows")]
         {
-            // On Windows, inherit most environment variables from parent process
             for (key, value) in std::env::vars() {
                 env.insert(key, value);
             }
         }
 
-        // Add precmd hook to set terminal title to current directory
-        // This enables the sidebar to sync with terminal directory changes
         env.insert("GITTERM_PRECMD".to_string(), "1".to_string());
 
-        // Clear Claude Code env vars so terminals aren't detected as nested sessions
+        if let Some(cmd) = startup_command {
+            env.insert("GITTERM_STARTUP_CMD".to_string(), cmd.to_string());
+        }
+
         env.insert("CLAUDECODE".to_string(), String::new());
         env.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), String::new());
 
-        // Determine shell type for the right initialization
         let is_zsh = shell.contains("zsh");
         let is_bash = shell.contains("bash");
         let is_windows = cfg!(target_os = "windows");
 
-        // Build args to inject precmd hook
         let args = if is_windows {
-            // Windows shells don't use login flag
             vec![]
         } else if is_zsh {
-            // For zsh: use ZDOTDIR to inject our precmd before user's config
-            // Create a custom .zshrc that sets up title reporting then sources user config
             let home = std::env::var("HOME").unwrap_or_default();
             let gitterm_dir = format!("{home}/.config/gitterm/zsh");
             let gitterm_zshrc = format!("{gitterm_dir}/.zshrc");
 
-            // Ensure the directory exists
             let _ = std::fs::create_dir_all(&gitterm_dir);
             let zshrc_content = format!(
                 r#"# GitTerm shell integration - sets terminal title on directory change
@@ -2026,12 +2083,16 @@ _gitterm_set_title() {{ print -Pn "\e]0;%~\a" }}
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _gitterm_set_title
 add-zsh-hook chpwd _gitterm_set_title
-# Set title immediately
 _gitterm_set_title
-# Source user's normal config files
 [[ -f "{home}/.zshenv" ]] && source "{home}/.zshenv"
 [[ -f "{home}/.zprofile" ]] && source "{home}/.zprofile"
 [[ -f "{home}/.zshrc" ]] && source "{home}/.zshrc"
+if [[ -n "$GITTERM_STARTUP_CMD" ]]; then
+    _gitterm_cmd="$GITTERM_STARTUP_CMD"
+    unset GITTERM_STARTUP_CMD
+    eval "$_gitterm_cmd"
+    unset _gitterm_cmd
+fi
 "#
             );
             let _ = std::fs::write(&gitterm_zshrc, zshrc_content);
@@ -2039,64 +2100,88 @@ _gitterm_set_title
             env.insert("ZDOTDIR".to_string(), gitterm_dir);
             vec!["-l".to_string()]
         } else if is_bash {
-            // For bash: use PROMPT_COMMAND
-            env.insert("PROMPT_COMMAND".to_string(), r#"printf "\e]0;%s\a" "$PWD""#.to_string());
+            let prompt_cmd = r#"printf "\e]0;%s\a" "$PWD"; if [[ -n "$GITTERM_STARTUP_CMD" ]]; then _c="$GITTERM_STARTUP_CMD"; unset GITTERM_STARTUP_CMD; eval "$_c"; unset _c; fi"#;
+            env.insert("PROMPT_COMMAND".to_string(), prompt_cmd.to_string());
             vec!["-l".to_string()]
         } else {
             vec!["-l".to_string()]
         };
 
-        let term_settings = iced_term::settings::Settings {
+        iced_term::settings::Settings {
             backend: iced_term::settings::BackendSettings {
                 program: shell,
                 args,
-                working_directory: Some(repo_path),
-                scrollback_lines: self.scrollback_lines,
+                working_directory: Some(cwd.to_path_buf()),
+                scrollback_lines,
                 env,
                 ..Default::default()
             },
             theme: iced_term::settings::ThemeSettings::new(Box::new(
-                self.theme.terminal_palette(),
+                theme.terminal_palette(),
             )),
             font: iced_term::settings::FontSettings {
-                size: self.terminal_font_size,
+                size: terminal_font_size,
                 ..Default::default()
             },
-        };
+        }
+    }
 
-        if let Ok(mut terminal) = iced_term::Terminal::new(id as u64, term_settings) {
-            // Register Noop bindings for keys we handle as app shortcuts
-            // so the terminal doesn't type characters for them
-            let mut noop_bindings = vec![
-                // Ctrl+` — AttentionJumpNext
-                (
-                    iced_term::bindings::Binding {
-                        target: iced_term::bindings::InputKind::Char("`".to_string()),
-                        modifiers: Modifiers::CTRL,
-                        terminal_mode_include: iced_term::TermMode::empty(),
-                        terminal_mode_exclude: iced_term::TermMode::empty(),
-                    },
-                    iced_term::bindings::BindingAction::Noop,
-                ),
-            ];
-            // Ctrl+1-9 — workspace switching
-            for n in 1..=9u8 {
-                noop_bindings.push((
-                    iced_term::bindings::Binding {
-                        target: iced_term::bindings::InputKind::Char(n.to_string()),
-                        modifiers: Modifiers::CTRL,
-                        terminal_mode_include: iced_term::TermMode::empty(),
-                        terminal_mode_exclude: iced_term::TermMode::empty(),
-                    },
-                    iced_term::bindings::BindingAction::Noop,
-                ));
-            }
-            terminal.handle(iced_term::Command::AddBindings(noop_bindings));
+    /// Standard noop bindings for keys we handle as app shortcuts.
+    fn standard_noop_bindings() -> Vec<(iced_term::bindings::KeyboardBinding, iced_term::bindings::BindingAction)> {
+        use iced_term::bindings::{BindingAction, InputKind, KeyboardBinding as Binding};
+        let mut bindings = vec![
+            (Binding { target: InputKind::Char("`".to_string()), modifiers: Modifiers::CTRL, terminal_mode_include: iced_term::TermMode::empty(), terminal_mode_exclude: iced_term::TermMode::empty() }, BindingAction::Noop),
+            (Binding { target: InputKind::Char("c".to_string()), modifiers: Modifiers::CTRL | Modifiers::SHIFT, terminal_mode_include: iced_term::TermMode::empty(), terminal_mode_exclude: iced_term::TermMode::empty() }, BindingAction::Noop),
+            (Binding { target: InputKind::Char("C".to_string()), modifiers: Modifiers::CTRL | Modifiers::SHIFT, terminal_mode_include: iced_term::TermMode::empty(), terminal_mode_exclude: iced_term::TermMode::empty() }, BindingAction::Noop),
+        ];
+        for n in 1..=9u8 {
+            bindings.push((
+                Binding { target: InputKind::Char(n.to_string()), modifiers: Modifiers::CTRL, terminal_mode_include: iced_term::TermMode::empty(), terminal_mode_exclude: iced_term::TermMode::empty() },
+                BindingAction::Noop,
+            ));
+        }
+        bindings
+    }
+
+    fn create_tab(&mut self, repo_path: PathBuf, startup_command: Option<String>) -> TabState {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+
+        let mut tab = TabState::new(id, repo_path.clone());
+        tab.startup_command = startup_command.clone();
+
+        let settings = Self::build_terminal_settings(
+            &repo_path,
+            startup_command.as_deref(),
+            self.scrollback_lines,
+            &self.theme,
+            self.terminal_font_size,
+        );
+
+        if let Ok(mut terminal) = iced_term::Terminal::new(id as u64, settings) {
+            terminal.handle(iced_term::Command::AddBindings(Self::standard_noop_bindings()));
             tab.terminal = Some(terminal);
         }
 
         tab.fetch_status();
         tab
+    }
+
+    fn create_bottom_terminal(&mut self, cwd: PathBuf) -> BottomTerminal {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let settings = Self::build_terminal_settings(
+            &cwd,
+            None,
+            self.scrollback_lines,
+            &self.theme,
+            self.terminal_font_size,
+        );
+        let terminal = iced_term::Terminal::new(id as u64, settings).ok().map(|mut t| {
+            t.handle(iced_term::Command::AddBindings(Self::standard_noop_bindings()));
+            t
+        });
+        BottomTerminal { id, terminal, title: None, cwd }
     }
 
     /// Width of the content area (window width minus spine)
@@ -2187,6 +2272,16 @@ _gitterm_set_title
                         term.subscription()
                             .with(tab.id)
                             .map(|(tab_id, e)| Event::Terminal(tab_id, e)),
+                    );
+                }
+            }
+            // Bottom panel terminal subscriptions
+            for bt in &ws.bottom_terminals {
+                if let Some(term) = &bt.terminal {
+                    subs.push(
+                        term.subscription()
+                            .with(bt.id)
+                            .map(|(id, e)| Event::BottomTerminalEvent(id, e)),
                     );
                 }
             }
@@ -2370,6 +2465,88 @@ _gitterm_set_title
                 self.save_workspaces();
                 return self.scroll_to_active_tab();
             }
+            Event::NewClaudeTab => {
+                // Create a new tab that auto-launches Claude Code
+                if let Some(ws) = self.active_workspace() {
+                    let dir = ws.active_tab()
+                        .map(|t| t.current_dir.clone())
+                        .unwrap_or_else(|| ws.dir.clone());
+                    self.add_tab_with_command(dir, Some("claude".to_string()));
+                    self.save_workspaces();
+                    return self.scroll_to_active_tab();
+                }
+            }
+            Event::BottomTabSelect(tab) => {
+                if let Some(ws) = self.active_workspace_mut() {
+                    ws.active_bottom_tab = tab;
+                }
+            }
+            Event::BottomTerminalAdd => {
+                let dir = self.active_workspace()
+                    .map(|ws| ws.active_tab()
+                        .map(|t| t.current_dir.clone())
+                        .unwrap_or_else(|| ws.dir.clone()))
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let bt = self.create_bottom_terminal(dir);
+                let bt_idx = if let Some(ws) = self.active_workspace_mut() {
+                    ws.bottom_terminals.push(bt);
+                    let idx = ws.bottom_terminals.len() - 1;
+                    ws.active_bottom_tab = BottomPanelTab::Terminal(idx);
+                    Some(idx)
+                } else {
+                    None
+                };
+                if bt_idx.is_some() {
+                    self.console_expanded = true;
+                    self.save_workspaces();
+                    self.save_config();
+                }
+            }
+            Event::BottomTerminalClose(idx) => {
+                if let Some(ws) = self.active_workspace_mut() {
+                    if idx < ws.bottom_terminals.len() {
+                        ws.bottom_terminals.remove(idx);
+                        // Fix active tab reference
+                        match ws.active_bottom_tab {
+                            BottomPanelTab::Terminal(active_idx) if active_idx == idx => {
+                                ws.active_bottom_tab = BottomPanelTab::Console;
+                            }
+                            BottomPanelTab::Terminal(active_idx) if active_idx > idx => {
+                                ws.active_bottom_tab = BottomPanelTab::Terminal(active_idx - 1);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                self.save_workspaces();
+            }
+            Event::BottomTerminalEvent(id, iced_term::Event::BackendCall(_, cmd)) => {
+                // Suppress terminal writes for keys we handle as app shortcuts
+                if self.current_modifiers.control() && !self.current_modifiers.command() {
+                    if let iced_term::backend::Command::Write(ref data) = cmd {
+                        if data.len() == 1 {
+                            let b = data[0];
+                            if (b'1'..=b'9').contains(&b) || b == b'`' {
+                                return Task::none();
+                            }
+                        }
+                    }
+                }
+                if let Some(bt) = self.workspaces.iter_mut()
+                    .flat_map(|ws| ws.bottom_terminals.iter_mut())
+                    .find(|bt| bt.id == id)
+                {
+                    if let Some(term) = &mut bt.terminal {
+                        match term.handle(iced_term::Command::ProxyToBackend(cmd)) {
+                            iced_term::actions::Action::Shutdown => {}
+                            iced_term::actions::Action::ChangeTitle(title) => {
+                                bt.title = Some(title);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             Event::OpenFolder => {
                 return Task::perform(
                     async {
@@ -2533,10 +2710,14 @@ _gitterm_set_title
                 }
 
                 // Ctrl+backtick — jump to next attention tab
+                // Ctrl+Shift+C — new Claude Code tab
                 if modifiers.control() && !modifiers.command() {
                     if let Key::Character(c) = key.as_ref() {
                         if c == "`" {
                             return Task::done(Event::AttentionJumpNext);
+                        }
+                        if (c == "c" || c == "C") && modifiers.shift() {
+                            return Task::done(Event::NewClaudeTab);
                         }
                     }
                 }
@@ -3281,113 +3462,40 @@ _gitterm_set_title
     }
 
     fn recreate_terminals(&mut self) {
+        // Pre-compute settings params to avoid borrow conflict with iter_mut
+        let scrollback = self.scrollback_lines;
+        let theme = self.theme;
+        let font_size = self.terminal_font_size;
+
         for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
-            // Get shell - platform-specific defaults
-            #[cfg(target_os = "windows")]
-            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string());
-
-            #[cfg(not(target_os = "windows"))]
-            let shell = std::env::var("SHELL").ok().or_else(|| {
-                let user = std::env::var("USER").ok()?;
-                let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-                for line in passwd.lines() {
-                    let parts: Vec<&str> = line.split(':').collect();
-                    if parts.first() == Some(&user.as_str()) {
-                        return parts.get(6).map(|s| s.to_string());
-                    }
-                }
-                None
-            }).unwrap_or_else(|| "/bin/zsh".to_string());
-
-            // Build environment for PTY
-            let mut env = std::collections::HashMap::new();
-
-            #[cfg(not(target_os = "windows"))]
-            {
-                env.insert("TERM".to_string(), "xterm-256color".to_string());
-                env.insert("COLORTERM".to_string(), "truecolor".to_string());
-                env.insert("LANG".to_string(), std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()));
-                if let Ok(home) = std::env::var("HOME") {
-                    env.insert("HOME".to_string(), home.clone());
-                    env.insert("PATH".to_string(), format!("{}/.local/bin:{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", home, home));
-                }
-                if let Ok(user) = std::env::var("USER") {
-                    env.insert("USER".to_string(), user.clone());
-                    env.insert("LOGNAME".to_string(), user);
-                }
-                env.insert("SHELL".to_string(), shell.clone());
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // On Windows, inherit most environment variables from parent process
-                for (key, value) in std::env::vars() {
-                    env.insert(key, value);
-                }
-            }
-
-            // Add precmd hook to set terminal title to current directory
-            env.insert("GITTERM_PRECMD".to_string(), "1".to_string());
-
-            // Determine shell type for the right initialization
-            let is_zsh = shell.contains("zsh");
-            let is_bash = shell.contains("bash");
-            let is_windows = cfg!(target_os = "windows");
-
-            // Build args to inject precmd hook
-            let args = if is_windows {
-                // Windows shells don't use login flag
-                vec![]
-            } else if is_zsh {
-                // For zsh: use ZDOTDIR to inject our precmd before user's config
-                let home = std::env::var("HOME").unwrap_or_default();
-                let gitterm_dir = format!("{home}/.config/gitterm/zsh");
-                let gitterm_zshrc = format!("{gitterm_dir}/.zshrc");
-
-                let _ = std::fs::create_dir_all(&gitterm_dir);
-                let zshrc_content = format!(
-                    r#"# GitTerm shell integration - sets terminal title on directory change
-_gitterm_set_title() {{ print -Pn "\e]0;%~\a" }}
-autoload -Uz add-zsh-hook
-add-zsh-hook precmd _gitterm_set_title
-add-zsh-hook chpwd _gitterm_set_title
-_gitterm_set_title
-[[ -f "{home}/.zshenv" ]] && source "{home}/.zshenv"
-[[ -f "{home}/.zprofile" ]] && source "{home}/.zprofile"
-[[ -f "{home}/.zshrc" ]] && source "{home}/.zshrc"
-"#
-                );
-                let _ = std::fs::write(&gitterm_zshrc, zshrc_content);
-
-                env.insert("ZDOTDIR".to_string(), gitterm_dir);
-                vec!["-l".to_string()]
-            } else if is_bash {
-                env.insert("PROMPT_COMMAND".to_string(), r#"printf "\e]0;%s\a" "$PWD""#.to_string());
-                vec!["-l".to_string()]
-            } else {
-                vec!["-l".to_string()]
-            };
-
-            let term_settings = iced_term::settings::Settings {
-                backend: iced_term::settings::BackendSettings {
-                    program: shell,
-                    args,
-                    working_directory: Some(tab.repo_path.clone()),
-                    scrollback_lines: self.scrollback_lines,
-                    env,
-                    ..Default::default()
-                },
-                theme: iced_term::settings::ThemeSettings::new(Box::new(
-                    self.theme.terminal_palette(),
-                )),
-                font: iced_term::settings::FontSettings {
-                    size: self.terminal_font_size,
-                    ..Default::default()
-                },
-            };
-            if let Ok(terminal) = iced_term::Terminal::new(tab.id as u64, term_settings) {
+            let settings = Self::build_terminal_settings(
+                &tab.repo_path,
+                None,
+                scrollback,
+                &theme,
+                font_size,
+            );
+            if let Ok(mut terminal) = iced_term::Terminal::new(tab.id as u64, settings) {
+                terminal.handle(iced_term::Command::AddBindings(Self::standard_noop_bindings()));
                 tab.terminal = Some(terminal);
                 tab.created_at = Instant::now();
+            }
+        }
+
+        // Recreate bottom panel terminals
+        for ws in self.workspaces.iter_mut() {
+            for bt in ws.bottom_terminals.iter_mut() {
+                let settings = Self::build_terminal_settings(
+                    &bt.cwd,
+                    None,
+                    scrollback,
+                    &theme,
+                    font_size,
+                );
+                bt.terminal = iced_term::Terminal::new(bt.id as u64, settings).ok().map(|mut t| {
+                    t.handle(iced_term::Command::AddBindings(Self::standard_noop_bindings()));
+                    t
+                });
             }
         }
     }
@@ -3396,7 +3504,7 @@ _gitterm_set_title
         let spine = self.view_spine();
         let tab_bar = self.view_tab_bar();
         let content = self.view_workspace_slide();
-        let console_panel = self.view_console_panel();
+        let console_panel = self.view_bottom_panel();
 
         let mut main_col = Column::new().spacing(0).width(Length::Fill).height(Length::Fill);
         main_col = main_col.push(tab_bar);
@@ -5350,7 +5458,7 @@ _gitterm_set_title
         }
     }
 
-    fn view_console_panel(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+    fn view_bottom_panel(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let ws = match self.active_workspace() {
             Some(ws) => ws,
@@ -5359,13 +5467,14 @@ _gitterm_set_title
             }
         };
         let console = &ws.console;
+        let active_bottom_tab = ws.active_bottom_tab;
 
-        let header = self.view_console_header(console);
+        // --- Tab bar ---
+        let tab_bar = self.view_bottom_tab_bar(ws, console);
 
         if !self.console_expanded {
-            // Collapsed: just the header bar
             let border_color = theme.surface0();
-            return container(header)
+            return container(tab_bar)
                 .width(Length::Fill)
                 .height(Length::Fixed(CONSOLE_HEADER_HEIGHT))
                 .style(move |_| container::Style {
@@ -5380,12 +5489,40 @@ _gitterm_set_title
                 .into();
         }
 
-        // Expanded: header + output area
-        let output = self.view_console_output(console);
+        // --- Content area ---
+        let content: Element<'_, Event, Theme, iced::Renderer> = match active_bottom_tab {
+            BottomPanelTab::Console => self.view_console_output(console),
+            BottomPanelTab::Terminal(idx) => {
+                if let Some(bt) = ws.bottom_terminals.get(idx) {
+                    if let Some(term) = &bt.terminal {
+                        let bt_id = bt.id;
+                        container(
+                            TerminalView::show(term)
+                                .map(move |e| Event::BottomTerminalEvent(bt_id, e)),
+                        )
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .padding([2, 0])
+                        .into()
+                    } else {
+                        let text_color = theme.text_secondary();
+                        container(text("Terminal unavailable").size(14).color(text_color))
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .center_x(Length::Fill)
+                            .center_y(Length::Fill)
+                            .into()
+                    }
+                } else {
+                    // Invalid index — fall back to console
+                    self.view_console_output(console)
+                }
+            }
+        };
 
         let bg = theme.bg_crust();
         container(
-            column![header, output]
+            column![tab_bar, content]
                 .spacing(0)
                 .width(Length::Fill)
                 .height(Length::Fill),
@@ -5399,8 +5536,9 @@ _gitterm_set_title
         .into()
     }
 
-    fn view_console_header<'a>(&'a self, console: &'a ConsoleState) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_bottom_tab_bar<'a>(&'a self, ws: &'a Workspace, console: &'a ConsoleState) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
+        let active_tab = ws.active_bottom_tab;
 
         // Chevron button (toggle expand/collapse)
         let chevron = if self.console_expanded { "\u{25BC}" } else { "\u{25B6}" };
@@ -5415,62 +5553,230 @@ _gitterm_set_title
         .padding([4, 6])
         .on_press(Event::ConsoleToggle);
 
-        // Status dot
+        // --- Console tab button ---
+        let console_is_active = active_tab == BottomPanelTab::Console;
         let dot_color = match console.status {
             ConsoleStatus::Running => theme.success(),
             ConsoleStatus::Error => theme.danger(),
             ConsoleStatus::Stopped | ConsoleStatus::NoneConfigured => theme.overlay0(),
         };
         let status_dot = container(iced::widget::Space::new())
-            .width(Length::Fixed(8.0))
-            .height(Length::Fixed(8.0))
+            .width(Length::Fixed(6.0))
+            .height(Length::Fixed(6.0))
             .style(move |_| container::Style {
                 background: Some(dot_color.into()),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    ..Default::default()
-                },
+                border: iced::Border { radius: 3.0.into(), ..Default::default() },
                 ..Default::default()
             });
 
-        // Process name — click to edit, or show text input when editing
-        let name_element: Element<'a, Event, Theme, iced::Renderer> = if let Some(edit_val) = &self.editing_console_command {
-            let input_bg = theme.bg_base();
-            let input_border = theme.accent();
-            text_input("e.g. cargo run, bun run dev", edit_val)
-                .on_input(Event::ConsoleCommandChanged)
-                .on_submit(Event::ConsoleCommandSubmit)
-                .size(12)
-                .width(Length::Fixed(220.0))
-                .padding([3, 6])
-                .style(move |_theme, _status| text_input::Style {
-                    background: input_bg.into(),
-                    border: iced::Border {
-                        width: 1.0,
-                        color: input_border,
-                        radius: 3.0.into(),
-                    },
-                    icon: iced::Color::TRANSPARENT,
-                    placeholder: theme.overlay0(),
-                    value: theme.text_primary(),
-                    selection: theme.accent(),
-                })
-                .into()
-        } else {
-            let process_name = console.run_command.as_deref().unwrap_or("Click to set command");
-            let name_color = if console.run_command.is_some() {
-                theme.text_primary()
+        let console_label_color = if console_is_active { theme.text_primary() } else { theme.overlay1() };
+        let console_tab_bg = if console_is_active { theme.bg_overlay() } else { iced::Color::TRANSPARENT };
+        let console_hover_bg = theme.surface0();
+        let console_active_accent = if console_is_active { theme.accent() } else { iced::Color::TRANSPARENT };
+
+        let console_tab_btn = button(
+            row![
+                status_dot,
+                text("Console").size(12).color(console_label_color).font(iced::Font::with_name("Menlo"))
+            ].spacing(5).align_y(iced::Alignment::Center)
+        )
+        .style(move |_theme, status| {
+            let bg = if matches!(status, button::Status::Hovered) && !console_is_active {
+                console_hover_bg
             } else {
-                theme.overlay0()
+                console_tab_bg
             };
-            let hover_bg = theme.surface0();
-            button(
-                text(process_name)
-                    .size(12)
-                    .color(name_color)
-                    .font(iced::Font::with_name("Menlo"))
+            button::Style {
+                background: Some(bg.into()),
+                border: iced::Border {
+                    width: if console_is_active { 0.0 } else { 0.0 },
+                    color: iced::Color::TRANSPARENT,
+                    radius: 3.0.into(),
+                },
+                text_color: console_label_color,
+                ..Default::default()
+            }
+        })
+        .padding([4, 10])
+        .on_press(Event::BottomTabSelect(BottomPanelTab::Console));
+
+        // Underline for console tab when active
+        let console_tab_with_underline: Element<'a, Event, Theme, iced::Renderer> = column![
+            console_tab_btn,
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fixed(2.0))
+                .style(move |_| container::Style {
+                    background: Some(console_active_accent.into()),
+                    ..Default::default()
+                })
+        ].spacing(0).into();
+
+        // --- Terminal tab buttons ---
+        let mut tab_buttons: Vec<Element<'a, Event, Theme, iced::Renderer>> = Vec::new();
+        for (idx, bt) in ws.bottom_terminals.iter().enumerate() {
+            let is_active = active_tab == BottomPanelTab::Terminal(idx);
+            let label: String = bt.title.clone().unwrap_or_else(|| format!("Terminal {}", idx + 1));
+            let label_color = if is_active { theme.text_primary() } else { theme.overlay1() };
+            let tab_bg = if is_active { theme.bg_overlay() } else { iced::Color::TRANSPARENT };
+            let tab_hover_bg = theme.surface0();
+            let active_accent = if is_active { theme.accent() } else { iced::Color::TRANSPARENT };
+
+            let close_color = theme.overlay0();
+            let close_hover = theme.text_primary();
+            let close_btn = button(text("\u{00D7}").size(12).color(close_color))
+                .style(move |_theme, status| {
+                    let c = if matches!(status, button::Status::Hovered) { close_hover } else { close_color };
+                    button::Style {
+                        background: Some(iced::Color::TRANSPARENT.into()),
+                        text_color: c,
+                        ..Default::default()
+                    }
+                })
+                .padding([0, 2])
+                .on_press(Event::BottomTerminalClose(idx));
+
+            let tab_btn = button(
+                row![
+                    text(">_").size(10).color(label_color).font(iced::Font::with_name("Menlo")),
+                    text(label).size(12).color(label_color).font(iced::Font::with_name("Menlo")),
+                ].spacing(4).align_y(iced::Alignment::Center)
             )
             .style(move |_theme, status| {
+                let bg = if matches!(status, button::Status::Hovered) && !is_active {
+                    tab_hover_bg
+                } else {
+                    tab_bg
+                };
+                button::Style {
+                    background: Some(bg.into()),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        ..Default::default()
+                    },
+                    text_color: label_color,
+                    ..Default::default()
+                }
+            })
+            .padding([4, 8])
+            .on_press(Event::BottomTabSelect(BottomPanelTab::Terminal(idx)));
+
+            let tab_with_close: Element<'a, Event, Theme, iced::Renderer> = column![
+                row![tab_btn, close_btn].spacing(0).align_y(iced::Alignment::Center),
+                container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fixed(2.0))
+                    .style(move |_| container::Style {
+                        background: Some(active_accent.into()),
+                        ..Default::default()
+                    })
+            ].spacing(0).into();
+
+            tab_buttons.push(tab_with_close);
+        }
+
+        // "+" button to add terminal
+        let plus_color = theme.overlay1();
+        let plus_hover_bg = theme.surface0();
+        let plus_btn = button(text("+").size(14).color(plus_color))
+            .style(move |_theme, status| {
+                let bg = if matches!(status, button::Status::Hovered) {
+                    plus_hover_bg
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                button::Style {
+                    background: Some(bg.into()),
+                    border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                    text_color: plus_color,
+                    ..Default::default()
+                }
+            })
+            .padding([2, 8])
+            .on_press(Event::BottomTerminalAdd);
+
+        // Spacer
+        let spacer = iced::widget::Space::new().width(Length::Fill);
+
+        // --- Contextual controls (right side, only when Console tab is active) ---
+        let mut header_row = Row::new()
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+            .padding([0, 8])
+            .push(chevron_btn)
+            .push(console_tab_with_underline);
+
+        for tb in tab_buttons {
+            header_row = header_row.push(tb);
+        }
+        header_row = header_row.push(plus_btn).push(spacer);
+
+        // Console-specific controls on the right
+        if console_is_active {
+            // Process name — click to edit, or show text input when editing
+            let name_element: Element<'a, Event, Theme, iced::Renderer> = if let Some(edit_val) = &self.editing_console_command {
+                let input_bg = theme.bg_base();
+                let input_border = theme.accent();
+                text_input("e.g. cargo run, bun run dev", edit_val)
+                    .on_input(Event::ConsoleCommandChanged)
+                    .on_submit(Event::ConsoleCommandSubmit)
+                    .size(12)
+                    .width(Length::Fixed(220.0))
+                    .padding([3, 6])
+                    .style(move |_theme, _status| text_input::Style {
+                        background: input_bg.into(),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: input_border,
+                            radius: 3.0.into(),
+                        },
+                        icon: iced::Color::TRANSPARENT,
+                        placeholder: theme.overlay0(),
+                        value: theme.text_primary(),
+                        selection: theme.accent(),
+                    })
+                    .into()
+            } else {
+                let process_name = console.run_command.as_deref().unwrap_or("Click to set command");
+                let name_color = if console.run_command.is_some() {
+                    theme.text_primary()
+                } else {
+                    theme.overlay0()
+                };
+                let hover_bg = theme.surface0();
+                button(
+                    text(process_name)
+                        .size(12)
+                        .color(name_color)
+                        .font(iced::Font::with_name("Menlo"))
+                )
+                .style(move |_theme, status| {
+                    let bg = if matches!(status, button::Status::Hovered) {
+                        hover_bg
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    button::Style {
+                        background: Some(bg.into()),
+                        border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                        text_color: name_color,
+                        ..Default::default()
+                    }
+                })
+                .padding([2, 4])
+                .on_press(Event::ConsoleCommandEditStart)
+                .into()
+            };
+
+            let uptime = console.uptime_string();
+            let uptime_label = text(uptime)
+                .size(11)
+                .color(theme.overlay0())
+                .font(iced::Font::with_name("Menlo"));
+
+            let btn_color = theme.overlay1();
+            let hover_bg = theme.surface0();
+            let action_btn_style = move |_theme: &Theme, status: button::Status| {
                 let bg = if matches!(status, button::Status::Hovered) {
                     hover_bg
                 } else {
@@ -5478,142 +5784,93 @@ _gitterm_set_title
                 };
                 button::Style {
                     background: Some(bg.into()),
-                    border: iced::Border { radius: 3.0.into(), ..Default::default() },
-                    text_color: name_color,
+                    border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                    text_color: btn_color,
                     ..Default::default()
                 }
-            })
-            .padding([2, 4])
-            .on_press(Event::ConsoleCommandEditStart)
-            .into()
-        };
-
-        // Uptime
-        let uptime = console.uptime_string();
-        let uptime_label = text(uptime)
-            .size(11)
-            .color(theme.overlay0())
-            .font(iced::Font::with_name("Menlo"));
-
-        // Spacer
-        let spacer = iced::widget::Space::new().width(Length::Fill);
-
-        // Action buttons
-        let btn_color = theme.overlay1();
-        let hover_bg = theme.surface0();
-
-        let action_btn_style = move |_theme: &Theme, status: button::Status| {
-            let bg = if matches!(status, button::Status::Hovered) {
-                hover_bg
-            } else {
-                iced::Color::TRANSPARENT
             };
-            button::Style {
-                background: Some(bg.into()),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    ..Default::default()
-                },
-                text_color: btn_color,
-                ..Default::default()
+
+            let browser_btn: Option<Element<'a, Event, Theme, iced::Renderer>> = if console.detected_url.is_some() {
+                let link_color = theme.accent();
+                let hover_bg_browser = theme.surface0();
+                Some(button(text("\u{1F517}").size(12).color(link_color))
+                    .style(move |_theme, status| {
+                        let bg = if matches!(status, button::Status::Hovered) {
+                            hover_bg_browser
+                        } else {
+                            iced::Color::TRANSPARENT
+                        };
+                        button::Style {
+                            background: Some(bg.into()),
+                            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                            text_color: link_color,
+                            ..Default::default()
+                        }
+                    })
+                    .padding([2, 6])
+                    .on_press(Event::ConsoleOpenBrowser)
+                    .into())
+            } else {
+                None
+            };
+
+            let clear_btn = button(text("\u{2300}").size(12).color(btn_color))
+                .style(action_btn_style)
+                .padding([2, 6])
+                .on_press(Event::ConsoleClearOutput);
+
+            let restart_btn = button(text("\u{21BB}").size(12).color(btn_color))
+                .style(action_btn_style)
+                .padding([2, 6])
+                .on_press(Event::ConsoleRestart);
+
+            let stop_start_btn = if console.is_running() {
+                let stop_color = theme.danger();
+                button(text("\u{25A0}").size(12).color(stop_color))
+                    .style(move |_theme, status| {
+                        let bg = if matches!(status, button::Status::Hovered) {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        };
+                        button::Style {
+                            background: Some(bg.into()),
+                            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                            text_color: stop_color,
+                            ..Default::default()
+                        }
+                    })
+                    .padding([2, 6])
+                    .on_press(Event::ConsoleStop)
+            } else {
+                let start_color = theme.success();
+                button(text("\u{25B6}").size(12).color(start_color))
+                    .style(move |_theme, status| {
+                        let bg = if matches!(status, button::Status::Hovered) {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        };
+                        button::Style {
+                            background: Some(bg.into()),
+                            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                            text_color: start_color,
+                            ..Default::default()
+                        }
+                    })
+                    .padding([2, 6])
+                    .on_press_maybe(if console.run_command.is_some() { Some(Event::ConsoleStart) } else { None })
+            };
+
+            header_row = header_row.push(name_element).push(uptime_label);
+            if let Some(btn) = browser_btn {
+                header_row = header_row.push(btn);
             }
-        };
-
-        // Open in browser button (only visible when a URL is detected)
-        let browser_btn: Option<Element<'a, Event, Theme, iced::Renderer>> = if console.detected_url.is_some() {
-            let link_color = theme.accent();
-            let hover_bg_browser = theme.surface0();
-            Some(button(text("\u{1F517}").size(12).color(link_color))
-                .style(move |_theme, status| {
-                    let bg = if matches!(status, button::Status::Hovered) {
-                        hover_bg_browser
-                    } else {
-                        iced::Color::TRANSPARENT
-                    };
-                    button::Style {
-                        background: Some(bg.into()),
-                        border: iced::Border { radius: 4.0.into(), ..Default::default() },
-                        text_color: link_color,
-                        ..Default::default()
-                    }
-                })
-                .padding([2, 6])
-                .on_press(Event::ConsoleOpenBrowser)
-                .into())
-        } else {
-            None
-        };
-
-        // Clear button
-        let clear_btn = button(text("\u{2300}").size(12).color(btn_color))
-            .style(action_btn_style)
-            .padding([2, 6])
-            .on_press(Event::ConsoleClearOutput);
-
-        // Restart button
-        let restart_btn = button(text("\u{21BB}").size(12).color(btn_color))
-            .style(action_btn_style)
-            .padding([2, 6])
-            .on_press(Event::ConsoleRestart);
-
-        // Stop/Start button
-        let stop_start_btn = if console.is_running() {
-            let stop_color = theme.danger();
-            button(text("\u{25A0}").size(12).color(stop_color))
-                .style(move |_theme, status| {
-                    let bg = if matches!(status, button::Status::Hovered) {
-                        hover_bg
-                    } else {
-                        iced::Color::TRANSPARENT
-                    };
-                    button::Style {
-                        background: Some(bg.into()),
-                        border: iced::Border { radius: 4.0.into(), ..Default::default() },
-                        text_color: stop_color,
-                        ..Default::default()
-                    }
-                })
-                .padding([2, 6])
-                .on_press(Event::ConsoleStop)
-        } else {
-            let start_color = theme.success();
-            button(text("\u{25B6}").size(12).color(start_color))
-                .style(move |_theme, status| {
-                    let bg = if matches!(status, button::Status::Hovered) {
-                        hover_bg
-                    } else {
-                        iced::Color::TRANSPARENT
-                    };
-                    button::Style {
-                        background: Some(bg.into()),
-                        border: iced::Border { radius: 4.0.into(), ..Default::default() },
-                        text_color: start_color,
-                        ..Default::default()
-                    }
-                })
-                .padding([2, 6])
-                .on_press_maybe(if console.run_command.is_some() { Some(Event::ConsoleStart) } else { None })
-        };
+            header_row = header_row.push(clear_btn).push(restart_btn).push(stop_start_btn);
+        }
 
         let header_bg = theme.bg_surface();
         let top_border = theme.surface0();
-
-        let mut header_row = Row::new()
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .padding([0, 8])
-            .push(chevron_btn)
-            .push(status_dot)
-            .push(name_element)
-            .push(uptime_label)
-            .push(spacer);
-        if let Some(btn) = browser_btn {
-            header_row = header_row.push(btn);
-        }
-        header_row = header_row
-            .push(clear_btn)
-            .push(restart_btn)
-            .push(stop_start_btn);
 
         container(header_row)
         .width(Length::Fill)
