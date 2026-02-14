@@ -2571,10 +2571,9 @@ fi
                 }
             }
             Event::Tick => {
-                // Poll git status only when viewing a diff (not the terminal)
+                // Poll git status every 5 seconds for the active tab
                 if let Some(tab) = self.active_tab_mut() {
-                    let viewing_diff = tab.selected_file.is_some();
-                    if viewing_diff && tab.last_poll.elapsed() >= Duration::from_millis(5000) {
+                    if tab.last_poll.elapsed() >= Duration::from_millis(5000) {
                         tab.fetch_status();
                     }
                 }
