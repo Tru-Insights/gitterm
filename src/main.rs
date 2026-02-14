@@ -7,6 +7,7 @@ use iced_term::{ColorPalette, SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -545,9 +546,10 @@ fn main() -> iced::Result {
 
 // Sidebar mode toggle
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum SidebarMode {
+pub enum SidebarMode {
     Git,
     Files,
+    Claude,
 }
 
 // Git file entry
@@ -564,6 +566,47 @@ struct FileTreeEntry {
     name: String,
     path: PathBuf,
     is_dir: bool,
+}
+
+// Claude config scope
+#[derive(Debug, Clone, PartialEq)]
+enum ConfigScope {
+    User,
+    Project,
+}
+
+// Claude config item (skill, plugin, server, hook, or setting)
+#[derive(Debug, Clone)]
+struct ClaudeConfigItem {
+    name: String,
+    file_path: PathBuf,
+    scope: ConfigScope,
+}
+
+// Claude sidebar config tree
+#[derive(Debug, Clone)]
+struct ClaudeConfig {
+    skills: Vec<ClaudeConfigItem>,
+    plugins: Vec<ClaudeConfigItem>,
+    mcp_servers: Vec<ClaudeConfigItem>,
+    hooks: Vec<ClaudeConfigItem>,
+    settings: Vec<ClaudeConfigItem>,
+    expanded: HashSet<String>,
+    selected_item: Option<(String, usize)>,
+}
+
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self {
+            skills: Vec::new(),
+            plugins: Vec::new(),
+            mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            settings: Vec::new(),
+            expanded: HashSet::new(),
+            selected_item: None,
+        }
+    }
 }
 
 // Inline change for word-level diffs
@@ -1003,6 +1046,8 @@ struct TabState {
     needs_attention: bool,
     // Optional command to run after shell init (e.g. "claude" for Claude Code tabs)
     startup_command: Option<String>,
+    // Claude config tree view
+    claude_config: ClaudeConfig,
 }
 
 impl TabState {
@@ -1039,6 +1084,7 @@ impl TabState {
             search: SearchState::default(),
             needs_attention: false,
             startup_command: None,
+            claude_config: ClaudeConfig::default(),
         }
     }
 
@@ -1246,6 +1292,159 @@ impl TabState {
             }
         }
         self.last_poll = Instant::now();
+    }
+
+    fn fetch_claude_config(&mut self) {
+        let home = dirs::home_dir().unwrap_or_default();
+        let claude_home = home.join(".claude");
+        let workspace_dir = &self.repo_path;
+
+        self.claude_config.skills.clear();
+        self.claude_config.plugins.clear();
+        self.claude_config.mcp_servers.clear();
+        self.claude_config.hooks.clear();
+        self.claude_config.settings.clear();
+
+        // --- Skills ---
+        // User global skills
+        let user_commands_dir = claude_home.join("commands");
+        let mut skill_names: HashSet<String> = HashSet::new();
+
+        // Project skills first (they override user skills with same name)
+        let project_commands_dir = workspace_dir.join(".claude").join("commands");
+        if let Ok(entries) = std::fs::read_dir(&project_commands_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    skill_names.insert(name.clone());
+                    self.claude_config.skills.push(ClaudeConfigItem {
+                        name,
+                        file_path: path,
+                        scope: ConfigScope::Project,
+                    });
+                }
+            }
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&user_commands_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    if !skill_names.contains(&name) {
+                        self.claude_config.skills.push(ClaudeConfigItem {
+                            name,
+                            file_path: path,
+                            scope: ConfigScope::User,
+                        });
+                    }
+                }
+            }
+        }
+        self.claude_config.skills.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+        // --- Read settings.json ---
+        let settings_path = claude_home.join("settings.json");
+        let settings_json: Option<serde_json::Value> = std::fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+
+        // --- Plugins ---
+        if let Some(ref settings) = settings_json {
+            if let Some(plugins) = settings.get("enabledPlugins").and_then(|v| v.as_object()) {
+                for key in plugins.keys() {
+                    self.claude_config.plugins.push(ClaudeConfigItem {
+                        name: key.clone(),
+                        file_path: settings_path.clone(),
+                        scope: ConfigScope::User,
+                    });
+                }
+            }
+        }
+        self.claude_config.plugins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+        // --- MCP Servers ---
+        // Project .mcp.json
+        let project_mcp = workspace_dir.join(".mcp.json");
+        if let Ok(content) = std::fs::read_to_string(&project_mcp) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(servers) = json.get("mcpServers").and_then(|v| v.as_object()) {
+                    for key in servers.keys() {
+                        self.claude_config.mcp_servers.push(ClaudeConfigItem {
+                            name: key.clone(),
+                            file_path: project_mcp.clone(),
+                            scope: ConfigScope::Project,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Global ~/.claude/.mcp.json
+        let global_mcp = claude_home.join(".mcp.json");
+        if let Ok(content) = std::fs::read_to_string(&global_mcp) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(servers) = json.get("mcpServers").and_then(|v| v.as_object()) {
+                    for key in servers.keys() {
+                        self.claude_config.mcp_servers.push(ClaudeConfigItem {
+                            name: key.clone(),
+                            file_path: global_mcp.clone(),
+                            scope: ConfigScope::User,
+                        });
+                    }
+                }
+            }
+        }
+        self.claude_config.mcp_servers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+        // --- Hooks ---
+        if let Some(ref settings) = settings_json {
+            if let Some(hooks) = settings.get("hooks").and_then(|v| v.as_object()) {
+                for key in hooks.keys() {
+                    self.claude_config.hooks.push(ClaudeConfigItem {
+                        name: key.clone(),
+                        file_path: settings_path.clone(),
+                        scope: ConfigScope::User,
+                    });
+                }
+            }
+        }
+        self.claude_config.hooks.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+        // --- Settings ---
+        // User settings (top-level keys, excluding plugins/hooks which have their own sections)
+        if let Some(ref settings) = settings_json {
+            if let Some(obj) = settings.as_object() {
+                let excluded = ["enabledPlugins", "hooks"];
+                for key in obj.keys() {
+                    if !excluded.contains(&key.as_str()) {
+                        self.claude_config.settings.push(ClaudeConfigItem {
+                            name: key.clone(),
+                            file_path: settings_path.clone(),
+                            scope: ConfigScope::User,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Project settings
+        let project_settings_path = workspace_dir.join(".claude").join("settings.local.json");
+        if let Ok(content) = std::fs::read_to_string(&project_settings_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(obj) = json.as_object() {
+                    for key in obj.keys() {
+                        self.claude_config.settings.push(ClaudeConfigItem {
+                            name: key.clone(),
+                            file_path: project_settings_path.clone(),
+                            scope: ConfigScope::Project,
+                        });
+                    }
+                }
+            }
+        }
+        self.claude_config.settings.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     }
 
     fn fetch_diff(&mut self, file_path: &str, staged: bool) {
@@ -1605,7 +1804,7 @@ pub enum Event {
     ClearSelection,
     KeyPressed(Key, Modifiers),
     // File explorer events
-    ToggleSidebarMode,
+    SetSidebarMode(SidebarMode),
     NavigateDir(PathBuf),
     NavigateUp,
     ViewFile(PathBuf),
@@ -1668,6 +1867,9 @@ pub enum Event {
     // Claude tab
     NewClaudeTab,
     ResumeClaudeTab,
+    // Claude sidebar events
+    ToggleClaudeSection(String),
+    ClaudeItemSelect(String, usize),
     // Bottom panel tabs
     BottomTabSelect(BottomPanelTab),
     BottomTerminalAdd,
@@ -2828,31 +3030,66 @@ fi
                     }
                 }
             }
-            Event::ToggleSidebarMode => {
+            Event::SetSidebarMode(mode) => {
                 // Hide WebView when switching modes
                 webview::set_visible(false);
 
                 let show_hidden = self.show_hidden;
                 if let Some(tab) = self.active_tab_mut() {
-                    tab.sidebar_mode = match tab.sidebar_mode {
-                        SidebarMode::Git => {
-                            // Switching to Files mode - clear git selection
-                            // Keep current_dir as-is (it tracks the terminal's directory)
-                            tab.selected_file = None;
-                            tab.diff_lines.clear();
-                            tab.fetch_file_tree(show_hidden);
-                            SidebarMode::Files
+                    if tab.sidebar_mode != mode {
+                        match mode {
+                            SidebarMode::Git => {
+                                // Switching to Git mode - clear file viewer and refresh status
+                                tab.viewing_file_path = None;
+                                tab.file_content.clear();
+                                tab.image_handle = None;
+                                tab.webview_content = None;
+                                tab.fetch_status();
+                            }
+                            SidebarMode::Files => {
+                                // Switching to Files mode - clear git selection
+                                tab.selected_file = None;
+                                tab.diff_lines.clear();
+                                tab.fetch_file_tree(show_hidden);
+                            }
+                            SidebarMode::Claude => {
+                                // Switching to Claude mode - clear file viewer and git selection
+                                tab.viewing_file_path = None;
+                                tab.file_content.clear();
+                                tab.image_handle = None;
+                                tab.webview_content = None;
+                                tab.selected_file = None;
+                                tab.diff_lines.clear();
+                                tab.fetch_claude_config();
+                            }
                         }
-                        SidebarMode::Files => {
-                            // Switching to Git mode - clear file viewer and refresh status
-                            tab.viewing_file_path = None;
-                            tab.file_content.clear();
-                            tab.image_handle = None;
-                            tab.webview_content = None;
-                            tab.fetch_status();
-                            SidebarMode::Git
-                        }
+                        tab.sidebar_mode = mode;
+                    }
+                }
+            }
+            Event::ToggleClaudeSection(section) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    if tab.claude_config.expanded.contains(&section) {
+                        tab.claude_config.expanded.remove(&section);
+                    } else {
+                        tab.claude_config.expanded.insert(section);
+                    }
+                }
+            }
+            Event::ClaudeItemSelect(section, idx) => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.claude_config.selected_item = Some((section.clone(), idx));
+                    let file_path = match section.as_str() {
+                        "skills" => tab.claude_config.skills.get(idx).map(|i| i.file_path.clone()),
+                        "plugins" => tab.claude_config.plugins.get(idx).map(|i| i.file_path.clone()),
+                        "mcp_servers" => tab.claude_config.mcp_servers.get(idx).map(|i| i.file_path.clone()),
+                        "hooks" => tab.claude_config.hooks.get(idx).map(|i| i.file_path.clone()),
+                        "settings" => tab.claude_config.settings.get(idx).map(|i| i.file_path.clone()),
+                        _ => None,
                     };
+                    if let Some(path) = file_path {
+                        return Task::done(Event::ViewFile(path));
+                    }
                 }
             }
             Event::NavigateDir(path) => {
@@ -2952,27 +3189,9 @@ fi
                     tab.load_file(&path, is_dark_theme);
                 }
 
-                // Create/update WebView for markdown files
-                if is_markdown {
-                    if let Some(tab) = self.active_tab() {
-                        if let Some(html) = tab.webview_content.clone() {
-                            let bounds = self.calculate_webview_bounds();
-                            // Store the content, then get window access to create WebView
-                            webview::set_pending_content(html, bounds);
-                            return iced::window::oldest().then(move |opt_id| {
-                                if let Some(id) = opt_id {
-                                    iced::window::run(id, move |window| {
-                                        if let Err(e) = webview::try_create_with_window(window) {
-                                            eprintln!("WebView error: {}", e);
-                                        }
-                                    })
-                                    .discard()
-                                } else {
-                                    Task::none()
-                                }
-                            });
-                        }
-                    }
+                // Markdown uses Iced-native renderer inline; WebView only for "View in Browser"
+                if is_markdown && webview::is_active() {
+                    webview::set_visible(false);
                 }
             }
             Event::CloseFileView => {
@@ -3229,6 +3448,13 @@ fi
                     // Update active workspace immediately (tab bar + console switch instantly)
                     self.active_workspace_idx = idx;
                     self.save_workspaces();
+
+                    // Refresh claude config if active tab is in Claude mode
+                    if let Some(tab) = self.active_tab_mut() {
+                        if tab.sidebar_mode == SidebarMode::Claude {
+                            tab.fetch_claude_config();
+                        }
+                    }
 
                     // Set scrollable to starting position for the animation
                     let slide_task = iced::advanced::widget::operate(
@@ -3519,18 +3745,19 @@ fi
 
     /// Calculate WebView bounds based on current layout
     fn calculate_webview_bounds(&self) -> (f32, f32, f32, f32) {
-        let tab_bar_height = 40.0;
-        let header_height = 45.0;
+        let tab_bar_height = 33.0; // tabs row (~24px buttons + 8px padding) + 1px separator
+        let header_height = 45.0;  // file viewer header
+        let workspace_bar_height = 28.0; // bottom workspace bar + 1px border
         let x = SPINE_WIDTH + self.sidebar_width + 4.0; // rail + sidebar + divider
         let y = tab_bar_height + header_height;
         let width = (self.window_size.0 - x).max(100.0);
-        // Subtract console panel height
+        // Subtract console panel height + workspace bar
         let console_h = if self.console_expanded {
             self.console_height + CONSOLE_DIVIDER_HEIGHT
         } else {
             CONSOLE_HEADER_HEIGHT
         };
-        let height = (self.window_size.1 - y - console_h).max(100.0);
+        let height = (self.window_size.1 - y - console_h - workspace_bar_height).max(100.0);
         (x, y, width, height)
     }
 
@@ -4540,6 +4767,7 @@ fi
         let mode_content: Element<'_, Event, Theme, iced::Renderer> = match tab.sidebar_mode {
             SidebarMode::Git => self.view_git_list(tab),
             SidebarMode::Files => self.view_file_tree(tab),
+            SidebarMode::Claude => self.view_claude_sidebar(tab),
         };
 
         content = content.push(mode_content);
@@ -4555,6 +4783,46 @@ fi
             .into()
     }
 
+    fn view_sidebar_tab<'a>(
+        &'a self,
+        label: Element<'a, Event, Theme, iced::Renderer>,
+        is_active: bool,
+        on_press: Event,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let text_color = if is_active { theme.text_primary() } else { theme.overlay1() };
+        let underline_color = if is_active { theme.accent() } else { iced::Color::TRANSPARENT };
+        let hover_bg = theme.surface0();
+
+        let tab_btn = button(label)
+            .style(move |_theme, status| {
+                let bg = if matches!(status, button::Status::Hovered) {
+                    Some(hover_bg.into())
+                } else {
+                    Some(iced::Color::TRANSPARENT.into())
+                };
+                button::Style {
+                    background: bg,
+                    border: iced::Border::default(),
+                    text_color,
+                    ..Default::default()
+                }
+            })
+            .padding([4, 10])
+            .width(Length::Fill)
+            .on_press(on_press);
+
+        let underline = container(iced::widget::Space::new())
+            .width(Length::Fill)
+            .height(Length::Fixed(2.0))
+            .style(move |_| container::Style {
+                background: Some(underline_color.into()),
+                ..Default::default()
+            });
+
+        column![tab_btn, underline].spacing(0).width(Length::FillPortion(1)).into()
+    }
+
     fn view_sidebar_toggle<'a>(
         &'a self,
         tab: &'a TabState,
@@ -4565,94 +4833,54 @@ fi
 
         let git_active = tab.sidebar_mode == SidebarMode::Git;
         let files_active = tab.sidebar_mode == SidebarMode::Files;
-        let surface0 = theme.surface0();
+        let claude_active = tab.sidebar_mode == SidebarMode::Claude;
 
-        // Git button with optional badge
-        let git_text_color = if git_active {
-            theme.text_primary()
-        } else {
-            theme.overlay1()
-        };
-
-        let mut git_content: Row<'_, Event, Theme, iced::Renderer> =
+        // Git tab label with optional badge
+        let git_text_color = if git_active { theme.text_primary() } else { theme.overlay1() };
+        let mut git_label: Row<'_, Event, Theme, iced::Renderer> =
             Row::new().spacing(4).align_y(iced::Alignment::Center);
-        git_content = git_content.push(text("Git").size(font).color(git_text_color));
+        git_label = git_label.push(text("Git").size(font).color(git_text_color));
 
         if changes > 0 {
-            let badge_bg = iced::Color {
-                a: 0.2,
-                ..theme.warning()
-            };
+            let badge_bg = iced::Color { a: 0.2, ..theme.warning() };
             let warning_color = theme.warning();
             let badge = container(text(format!("{}", changes)).size(10).color(warning_color))
                 .padding([1, 6])
                 .style(move |_| container::Style {
                     background: Some(badge_bg.into()),
-                    border: iced::Border {
-                        radius: 8.0.into(),
-                        ..Default::default()
-                    },
+                    border: iced::Border { radius: 8.0.into(), ..Default::default() },
                     ..Default::default()
                 });
-            git_content = git_content.push(badge);
+            git_label = git_label.push(badge);
         }
 
-        let git_btn = button(git_content)
-            .style(move |_theme, status| {
-                let bg = if git_active {
-                    Some(surface0.into())
-                } else if matches!(status, button::Status::Hovered) {
-                    Some(surface0.into())
-                } else {
-                    Some(iced::Color::TRANSPARENT.into())
-                };
-                button::Style {
-                    background: bg,
-                    border: iced::Border {
-                        radius: 6.0.into(),
-                        ..Default::default()
-                    },
-                    text_color: git_text_color,
-                    ..Default::default()
-                }
-            })
-            .padding([4, 12])
-            .on_press(Event::ToggleSidebarMode);
+        let git_tab = self.view_sidebar_tab(
+            git_label.into(),
+            git_active,
+            Event::SetSidebarMode(SidebarMode::Git),
+        );
 
-        // Files button
-        let files_text_color = if files_active {
-            theme.text_primary()
-        } else {
-            theme.overlay1()
-        };
+        // Files tab
+        let files_text_color = if files_active { theme.text_primary() } else { theme.overlay1() };
+        let files_tab = self.view_sidebar_tab(
+            text("Files").size(font).color(files_text_color).into(),
+            files_active,
+            Event::SetSidebarMode(SidebarMode::Files),
+        );
 
-        let files_btn = button(text("Files").size(font).color(files_text_color))
-            .style(move |_theme, status| {
-                let bg = if files_active {
-                    Some(surface0.into())
-                } else if matches!(status, button::Status::Hovered) {
-                    Some(surface0.into())
-                } else {
-                    Some(iced::Color::TRANSPARENT.into())
-                };
-                button::Style {
-                    background: bg,
-                    border: iced::Border {
-                        radius: 6.0.into(),
-                        ..Default::default()
-                    },
-                    text_color: files_text_color,
-                    ..Default::default()
-                }
-            })
-            .padding([4, 12])
-            .on_press(Event::ToggleSidebarMode);
+        // Claude tab
+        let claude_text_color = if claude_active { theme.text_primary() } else { theme.overlay1() };
+        let claude_tab = self.view_sidebar_tab(
+            text("Claude").size(font).color(claude_text_color).into(),
+            claude_active,
+            Event::SetSidebarMode(SidebarMode::Claude),
+        );
 
         let bg = theme.bg_crust();
         let border_color = theme.surface0();
 
-        let toggle_row = container(row![git_btn, files_btn].spacing(4))
-            .padding(8)
+        let tab_row = container(row![git_tab, files_tab, claude_tab].spacing(0))
+            .padding([4, 4])
             .width(Length::Fill)
             .style(move |_| container::Style {
                 background: Some(bg.into()),
@@ -4667,7 +4895,7 @@ fi
                 ..Default::default()
             });
 
-        column![toggle_row, separator].into()
+        column![tab_row, separator].into()
     }
 
     fn view_file_tree<'a>(
@@ -4813,6 +5041,222 @@ fi
             .into()
     }
 
+    fn view_claude_sidebar<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let config = &tab.claude_config;
+
+        let mut content = Column::new().spacing(0);
+
+        // Skills section
+        content = content.push(self.view_claude_section(
+            "Skills", "skills", &config.skills, config.expanded.contains("skills"),
+            theme.success(), &config.selected_item,
+        ));
+
+        // Plugins section
+        content = content.push(self.view_claude_section(
+            "Plugins", "plugins", &config.plugins, config.expanded.contains("plugins"),
+            theme.accent(), &config.selected_item,
+        ));
+
+        // MCP Servers section
+        content = content.push(self.view_claude_section(
+            "MCP Servers", "mcp_servers", &config.mcp_servers, config.expanded.contains("mcp_servers"),
+            theme.peach(), &config.selected_item,
+        ));
+
+        // Hooks section
+        content = content.push(self.view_claude_section(
+            "Hooks", "hooks", &config.hooks, config.expanded.contains("hooks"),
+            theme.mauve(), &config.selected_item,
+        ));
+
+        // Settings section
+        content = content.push(self.view_claude_section(
+            "Settings", "settings", &config.settings, config.expanded.contains("settings"),
+            theme.overlay1(), &config.selected_item,
+        ));
+
+        scrollable(content)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_claude_section<'a>(
+        &'a self,
+        label: &'a str,
+        key: &'a str,
+        items: &'a [ClaudeConfigItem],
+        expanded: bool,
+        dot_color: iced::Color,
+        selected: &Option<(String, usize)>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let hover_bg = theme.surface0();
+
+        let chevron = if expanded { "\u{25BC}" } else { "\u{25B6}" };
+        let count_text = format!("{}", items.len());
+
+        // Count badge
+        let badge_bg = iced::Color { a: 0.15, ..theme.text_muted() };
+        let muted = theme.text_muted();
+        let badge = container(text(count_text).size(font_small).color(muted))
+            .padding([1, 6])
+            .style(move |_| container::Style {
+                background: Some(badge_bg.into()),
+                border: iced::Border { radius: 8.0.into(), ..Default::default() },
+                ..Default::default()
+            });
+
+        let header_row = row![
+            text(chevron).size(font_small).color(theme.text_secondary()),
+            iced::widget::Space::new().width(Length::Fixed(6.0)),
+            text(label).size(font).color(theme.text_primary()),
+            iced::widget::Space::new().width(Length::Fill),
+            badge,
+        ]
+        .align_y(iced::Alignment::Center)
+        .padding([6, 10]);
+
+        let header_btn = button(header_row)
+            .style(move |_theme, status| {
+                let bg = if matches!(status, button::Status::Hovered) {
+                    Some(hover_bg.into())
+                } else {
+                    Some(iced::Color::TRANSPARENT.into())
+                };
+                button::Style {
+                    background: bg,
+                    border: iced::Border::default(),
+                    text_color: iced::Color::WHITE,
+                    ..Default::default()
+                }
+            })
+            .padding(0)
+            .width(Length::Fill)
+            .on_press(Event::ToggleClaudeSection(key.to_string()));
+
+        let mut section = Column::new().spacing(0);
+        section = section.push(header_btn);
+
+        if expanded {
+            for (idx, item) in items.iter().enumerate() {
+                let is_selected = selected
+                    .as_ref()
+                    .map(|(s, i)| s == key && *i == idx)
+                    .unwrap_or(false);
+                section = section.push(self.view_claude_item(key, idx, item, dot_color, is_selected));
+            }
+
+            if items.is_empty() {
+                let empty_row = container(
+                    text("None found").size(font_small).color(theme.text_muted()),
+                )
+                .padding(iced::Padding { top: 4.0, right: 10.0, bottom: 4.0, left: 28.0 });
+                section = section.push(empty_row);
+            }
+        }
+
+        section.into()
+    }
+
+    fn view_claude_item<'a>(
+        &'a self,
+        section_key: &'a str,
+        idx: usize,
+        item: &'a ClaudeConfigItem,
+        dot_color: iced::Color,
+        is_selected: bool,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        let selected_bg = if is_selected {
+            theme.surface0()
+        } else {
+            iced::Color::TRANSPARENT
+        };
+        let accent = theme.accent();
+        let left_border_color = if is_selected { accent } else { iced::Color::TRANSPARENT };
+        let hover_bg = theme.surface0();
+
+        // Scope badge text
+        let scope_str = match item.scope {
+            ConfigScope::User => "USR",
+            ConfigScope::Project => "PRJ",
+        };
+
+        let scope_bg = iced::Color { a: 0.12, ..theme.text_muted() };
+        let scope_text_color = theme.text_muted();
+        let scope_badge = container(text(scope_str).size(font_small - 1.0).color(scope_text_color))
+            .padding([1, 4])
+            .style(move |_| container::Style {
+                background: Some(scope_bg.into()),
+                border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                ..Default::default()
+            });
+
+        // Dot
+        let dot = container(iced::widget::Space::new())
+            .width(Length::Fixed(6.0))
+            .height(Length::Fixed(6.0))
+            .style(move |_| container::Style {
+                background: Some(dot_color.into()),
+                border: iced::Border { radius: 3.0.into(), ..Default::default() },
+                ..Default::default()
+            });
+
+        let item_row = row![
+            dot,
+            iced::widget::Space::new().width(Length::Fixed(8.0)),
+            text(&item.name).size(font).color(theme.text_primary()),
+            iced::widget::Space::new().width(Length::Fill),
+            scope_badge,
+        ]
+        .align_y(iced::Alignment::Center)
+        .padding(iced::Padding { top: 4.0, right: 10.0, bottom: 4.0, left: 24.0 });
+
+        let item_btn = button(item_row)
+            .style(move |_theme, status| {
+                let bg = if is_selected {
+                    Some(selected_bg.into())
+                } else if matches!(status, button::Status::Hovered) {
+                    Some(hover_bg.into())
+                } else {
+                    Some(iced::Color::TRANSPARENT.into())
+                };
+                button::Style {
+                    background: bg,
+                    border: iced::Border::default(),
+                    text_color: iced::Color::WHITE,
+                    ..Default::default()
+                }
+            })
+            .padding(0)
+            .width(Length::Fill)
+            .on_press(Event::ClaudeItemSelect(section_key.to_string(), idx));
+
+        // Wrap with left accent border when selected
+        let left_border = container(iced::widget::Space::new())
+            .width(Length::Fixed(2.0))
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(left_border_color.into()),
+                ..Default::default()
+            });
+
+        row![left_border, item_btn]
+            .height(Length::Shrink)
+            .into()
+    }
+
     fn view_file_content<'a>(
         &'a self,
         tab: &'a TabState,
@@ -4910,20 +5354,8 @@ fi
                 .height(Length::Fill)
                 .width(Length::Fill),
             );
-        } else if is_markdown && webview::is_active() {
-            // WebView is rendering markdown - show placeholder
-            let bg = theme.bg_base();
-            content = content.push(
-                container(iced::widget::Space::new())
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(bg.into()),
-                        ..Default::default()
-                    }),
-            );
         } else if is_markdown {
-            // Fallback: Render markdown with Iced-native formatting (WebView not ready)
+            // Render markdown with Iced-native formatting
             content = content.push(self.view_markdown_content(tab));
         } else {
             // File content with line numbers

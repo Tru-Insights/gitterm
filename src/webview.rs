@@ -14,6 +14,7 @@ thread_local! {
 
 /// Wrapper that holds a raw window handle and implements HasWindowHandle
 /// This allows us to work with trait objects from Iced
+#[allow(dead_code)]
 struct WindowHandleWrapper<'a> {
     handle: WindowHandle<'a>,
 }
@@ -28,6 +29,7 @@ impl<'a> HasWindowHandle for WindowHandleWrapper<'a> {
 }
 
 /// Store HTML content to be rendered when we get window access
+#[allow(dead_code)]
 pub fn set_pending_content(html: String, bounds: (f32, f32, f32, f32)) {
     PENDING_HTML.with(|p| {
         *p.borrow_mut() = Some((html, bounds));
@@ -36,6 +38,7 @@ pub fn set_pending_content(html: String, bounds: (f32, f32, f32, f32)) {
 
 /// Try to create WebView with pending content using the given window
 /// This should be called from the main thread with window access
+#[allow(dead_code)]
 pub fn try_create_with_window(window: &dyn HasWindowHandle) -> Result<(), String> {
     let pending = PENDING_HTML.with(|p| p.borrow_mut().take());
 

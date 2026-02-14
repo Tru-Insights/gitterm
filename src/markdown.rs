@@ -167,7 +167,7 @@ fn build_html_document(
             color: {text_primary};
             background-color: {bg_base};
             margin: 0;
-            padding: 16px 24px;
+            padding: 8px 24px 16px 24px;
             max-width: 100%;
             overflow-x: hidden;
         }}
@@ -178,6 +178,10 @@ fn build_html_document(
             margin-bottom: 16px;
             font-weight: 600;
             line-height: 1.25;
+        }}
+
+        body > *:first-child {{
+            margin-top: 0;
         }}
 
         h1 {{
