@@ -1920,6 +1920,8 @@ struct App {
     current_modifiers: Modifiers,
     // Help modal
     show_help: bool,
+    // Track whether the bottom panel terminal has focus (vs main tab terminal)
+    bottom_panel_focused: bool,
 }
 
 const SPINE_WIDTH: f32 = 16.0;
@@ -1956,6 +1958,32 @@ impl App {
     /// Small UI font size (for hints, secondary text)
     fn ui_font_small(&self) -> f32 {
         self.ui_font_size - 1.0
+    }
+
+    /// Focus the active main tab terminal (unfocusing bottom panel terminal)
+    fn focus_main_terminal(&mut self) -> Task<Event> {
+        self.bottom_panel_focused = false;
+        if let Some(ws) = self.active_workspace() {
+            if let Some(tab) = ws.active_tab() {
+                if let Some(term) = &tab.terminal {
+                    return TerminalView::focus(term.widget_id().clone());
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Focus a bottom panel terminal (unfocusing main tab terminal)
+    fn focus_bottom_terminal(&mut self, idx: usize) -> Task<Event> {
+        self.bottom_panel_focused = true;
+        if let Some(ws) = self.active_workspace() {
+            if let Some(bt) = ws.bottom_terminals.get(idx) {
+                if let Some(term) = &bt.terminal {
+                    return TerminalView::focus(term.widget_id().clone());
+                }
+            }
+        }
+        Task::none()
     }
 
     fn scroll_to_active_tab(&self) -> Task<Event> {
@@ -2125,6 +2153,7 @@ impl App {
             attention_pulse_bright: false,
             current_modifiers: Modifiers::empty(),
             show_help: false,
+            bottom_panel_focused: false,
         };
 
         // Try to restore workspaces from saved config
@@ -2505,6 +2534,10 @@ fi
     fn update(&mut self, event: Event) -> Task<Event> {
         match event {
             Event::Terminal(tab_id, iced_term::Event::BackendCall(_, cmd)) => {
+                // Main terminal received input — it has focus
+                if matches!(&cmd, iced_term::backend::Command::Write(_)) {
+                    self.bottom_panel_focused = false;
+                }
                 // Don't forward keyboard input to terminal while editing console command
                 if self.editing_console_command.is_some() {
                     return Task::none();
@@ -2723,6 +2756,11 @@ fi
                 if let Some(ws) = self.active_workspace_mut() {
                     ws.active_bottom_tab = tab;
                 }
+                // Focus the appropriate terminal
+                return match tab {
+                    BottomPanelTab::Terminal(idx) => self.focus_bottom_terminal(idx),
+                    BottomPanelTab::Console => self.focus_main_terminal(),
+                };
             }
             Event::BottomTerminalAdd => {
                 let dir = self.active_workspace()
@@ -2739,13 +2777,17 @@ fi
                 } else {
                     None
                 };
-                if bt_idx.is_some() {
+                if let Some(idx) = bt_idx {
                     self.console_expanded = true;
                     self.save_workspaces();
                     self.save_config();
+                    return self.focus_bottom_terminal(idx);
                 }
             }
             Event::BottomTerminalClose(idx) => {
+                let was_active_terminal = self.active_workspace()
+                    .map(|ws| matches!(ws.active_bottom_tab, BottomPanelTab::Terminal(i) if i == idx))
+                    .unwrap_or(false);
                 if let Some(ws) = self.active_workspace_mut() {
                     if idx < ws.bottom_terminals.len() {
                         ws.bottom_terminals.remove(idx);
@@ -2762,8 +2804,16 @@ fi
                     }
                 }
                 self.save_workspaces();
+                // If we closed the active bottom terminal, refocus main terminal
+                if was_active_terminal && self.bottom_panel_focused {
+                    return self.focus_main_terminal();
+                }
             }
             Event::BottomTerminalEvent(id, iced_term::Event::BackendCall(_, cmd)) => {
+                // Bottom terminal received input — it has focus
+                if matches!(&cmd, iced_term::backend::Command::Write(_)) {
+                    self.bottom_panel_focused = true;
+                }
                 // Suppress terminal writes for keys we handle as app shortcuts
                 if self.current_modifiers.control() && !self.current_modifiers.command() {
                     if let iced_term::backend::Command::Write(ref data) = cmd {
@@ -3649,6 +3699,10 @@ fi
                 if webview::is_active() {
                     let bounds = self.calculate_webview_bounds();
                     webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+                }
+                // When collapsing console while bottom terminal is focused, refocus main terminal
+                if !self.console_expanded && self.bottom_panel_focused {
+                    return self.focus_main_terminal();
                 }
             }
             Event::ConsoleStart => {
