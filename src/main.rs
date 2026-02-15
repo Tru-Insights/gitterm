@@ -691,6 +691,9 @@ struct ConsoleState {
     child_killer: Option<tokio::sync::oneshot::Sender<()>>,
     detected_url: Option<String>,
     editor_content: text_editor::Content,
+    editor_dirty: bool,
+    search_query: String,
+    search_visible: bool,
 }
 
 impl ConsoleState {
@@ -711,6 +714,9 @@ impl ConsoleState {
             child_killer: None,
             detected_url: None,
             editor_content: text_editor::Content::new(),
+            editor_dirty: false,
+            search_query: String::new(),
+            search_visible: false,
         }
     }
 
@@ -725,39 +731,45 @@ impl ConsoleState {
         let timestamp = now.format("%H:%M:%S").to_string();
         self.output_lines.push(ConsoleOutputLine {
             timestamp: timestamp.clone(),
-            content: content.clone(),
+            content,
             is_stderr,
         });
         // Cap output buffer
         if self.output_lines.len() > MAX_CONSOLE_LINES {
             let drain_count = self.output_lines.len() - MAX_CONSOLE_LINES;
             self.output_lines.drain(..drain_count);
-            self.rebuild_editor_content();
-        } else {
-            // Append new line to editor content
-            let line = format!("{} {}", timestamp, content);
-            if self.output_lines.len() > 1 {
-                // Move cursor to end and insert newline + text
-                self.editor_content.perform(text_editor::Action::Move(iced::widget::text_editor::Motion::DocumentEnd));
-                self.editor_content.perform(text_editor::Action::Edit(iced::widget::text_editor::Edit::Enter));
-                for ch in line.chars() {
-                    self.editor_content.perform(text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(ch)));
-                }
-            } else {
-                // First line
-                for ch in line.chars() {
-                    self.editor_content.perform(text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(ch)));
-                }
-            }
         }
+        self.editor_dirty = true;
+    }
+
+    /// Rebuild editor content from output_lines if dirty. Called once per drain batch.
+    fn rebuild_if_dirty(&mut self) {
+        if !self.editor_dirty {
+            return;
+        }
+        self.editor_dirty = false;
+        self.rebuild_editor_content();
     }
 
     fn rebuild_editor_content(&mut self) {
+        let query = self.search_query.to_lowercase();
+        let filtering = self.search_visible && !query.is_empty();
         let full_text: String = self.output_lines.iter()
+            .filter(|l| !filtering || l.content.to_lowercase().contains(&query) || l.timestamp.contains(&query))
             .map(|l| format!("{} {}", l.timestamp, l.content))
             .collect::<Vec<_>>()
             .join("\n");
         self.editor_content = text_editor::Content::with_text(&full_text);
+    }
+
+    fn matching_line_count(&self) -> usize {
+        let query = self.search_query.to_lowercase();
+        if query.is_empty() {
+            return 0;
+        }
+        self.output_lines.iter()
+            .filter(|l| l.content.to_lowercase().contains(&query) || l.timestamp.contains(&query))
+            .count()
     }
 
     /// Strip ANSI escape sequences from a string.
@@ -820,6 +832,9 @@ impl ConsoleState {
     fn clear_output(&mut self) {
         self.output_lines.clear();
         self.editor_content = text_editor::Content::new();
+        self.editor_dirty = false;
+        self.search_query.clear();
+        self.search_visible = false;
     }
 
     fn uptime_string(&self) -> String {
@@ -1909,6 +1924,10 @@ pub enum Event {
     BottomTerminalEvent(usize, iced_term::Event),
     // Console editor (selectable output)
     ConsoleEditorAction(text_editor::Action),
+    // Console search
+    ConsoleSearchToggle,
+    ConsoleSearchChanged(String),
+    ConsoleSearchClose,
     // Modifier tracking
     ModifiersChanged(Modifiers),
     // Help modal
@@ -2701,7 +2720,7 @@ fi
                                 Err(_) => break,
                             }
                             count += 1;
-                            if count >= 200 { break; }
+                            if count >= 50 { break; }
                         }
                         for msg in messages {
                             match msg {
@@ -2716,6 +2735,8 @@ fi
                                 }
                             }
                         }
+                        // Rebuild editor content once for the entire batch
+                        ws.console.rebuild_if_dirty();
                         if let Some(code) = exited_info {
                             ws.console.exit_code = code;
                             ws.console.stopped_at = Some(std::time::Instant::now());
@@ -3019,6 +3040,26 @@ fi
                         // Cmd+Shift+W - Close current workspace
                         if (c == "w" || c == "W") && modifiers.shift() {
                             return Task::done(Event::WorkspaceClose(self.active_workspace_idx));
+                        }
+                    }
+                }
+
+                // Console search shortcuts (Cmd+F when console active, Escape to close)
+                if self.console_expanded {
+                    if let Some(ws) = self.active_workspace() {
+                        if ws.active_bottom_tab == BottomPanelTab::Console {
+                            if modifiers.command() {
+                                if let Key::Character(c) = key.as_ref() {
+                                    if c == "f" {
+                                        return Task::done(Event::ConsoleSearchToggle);
+                                    }
+                                }
+                            }
+                            if ws.console.search_visible {
+                                if let Key::Named(key::Named::Escape) = key.as_ref() {
+                                    return Task::done(Event::ConsoleSearchClose);
+                                }
+                            }
                         }
                     }
                 }
@@ -3783,6 +3824,28 @@ fi
                     if let Some(ws) = self.active_workspace_mut() {
                         ws.console.editor_content.perform(action);
                     }
+                }
+            }
+            Event::ConsoleSearchToggle => {
+                if let Some(ws) = self.active_workspace_mut() {
+                    ws.console.search_visible = !ws.console.search_visible;
+                    if !ws.console.search_visible {
+                        ws.console.search_query.clear();
+                        ws.console.rebuild_editor_content();
+                    }
+                }
+            }
+            Event::ConsoleSearchChanged(query) => {
+                if let Some(ws) = self.active_workspace_mut() {
+                    ws.console.search_query = query;
+                    ws.console.rebuild_editor_content();
+                }
+            }
+            Event::ConsoleSearchClose => {
+                if let Some(ws) = self.active_workspace_mut() {
+                    ws.console.search_visible = false;
+                    ws.console.search_query.clear();
+                    ws.console.rebuild_editor_content();
                 }
             }
             Event::ConsoleClearOutput => {
@@ -7096,11 +7159,17 @@ fi
                     .on_press_maybe(if console.run_command.is_some() { Some(Event::ConsoleStart) } else { None })
             };
 
+            let search_icon_color = if console.search_visible { theme.accent() } else { btn_color };
+            let search_btn = button(text("\u{2315}").size(12).color(search_icon_color))
+                .style(action_btn_style)
+                .padding([2, 6])
+                .on_press(Event::ConsoleSearchToggle);
+
             header_row = header_row.push(name_element).push(uptime_label);
             if let Some(btn) = browser_btn {
                 header_row = header_row.push(btn);
             }
-            header_row = header_row.push(clear_btn).push(restart_btn).push(stop_start_btn);
+            header_row = header_row.push(search_btn).push(clear_btn).push(restart_btn).push(stop_start_btn);
         }
 
         let header_bg = theme.bg_surface();
@@ -7138,7 +7207,7 @@ fi
             let bg = theme.bg_crust();
             return container(
                 text(hint)
-                    .size(12)
+                    .size(13)
                     .color(theme.overlay0())
                     .font(iced::Font::with_name("Menlo")),
             )
@@ -7157,11 +7226,11 @@ fi
         let text_color = theme.text_secondary();
         let selection_color = theme.surface2();
 
-        container(
+        let editor: Element<'_, Event, Theme, iced::Renderer> = container(
             text_editor(&console.editor_content)
                 .on_action(Event::ConsoleEditorAction)
                 .font(iced::Font::with_name("Menlo"))
-                .size(11)
+                .size(13)
                 .padding([4, 8])
                 .style(move |_theme, _status| text_editor::Style {
                     background: bg.into(),
@@ -7174,6 +7243,88 @@ fi
         )
         .width(Length::Fill)
         .height(Length::Fill)
+        .into();
+
+        if console.search_visible {
+            let search_bar = self.view_console_search_bar(console);
+            column![search_bar, editor]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            editor
+        }
+    }
+
+    fn view_console_search_bar<'a>(&'a self, console: &'a ConsoleState) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+
+        let match_display = if console.search_query.is_empty() {
+            String::new()
+        } else {
+            let count = console.matching_line_count();
+            if count == 0 {
+                "No matches".to_string()
+            } else {
+                format!("{} matching lines", count)
+            }
+        };
+
+        let search_input = text_input("Filter output...", &console.search_query)
+            .on_input(Event::ConsoleSearchChanged)
+            .size(font)
+            .width(Length::Fixed(200.0))
+            .padding([4, 8]);
+
+        let match_text_color = if !console.search_query.is_empty() && console.matching_line_count() == 0 {
+            theme.danger()
+        } else {
+            theme.overlay1()
+        };
+
+        let match_label = text(match_display)
+            .size(font)
+            .color(match_text_color);
+
+        let close_color = theme.overlay1();
+        let hover_bg = theme.surface0();
+        let close_btn = button(text("\u{2715}").size(12).color(close_color))
+            .style(move |_theme, status| {
+                let bg = if matches!(status, button::Status::Hovered) {
+                    hover_bg
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                button::Style {
+                    background: Some(bg.into()),
+                    border: iced::Border { radius: 4.0.into(), ..Default::default() },
+                    text_color: close_color,
+                    ..Default::default()
+                }
+            })
+            .padding([2, 6])
+            .on_press(Event::ConsoleSearchClose);
+
+        let bar_bg = theme.bg_surface();
+        let border_color = theme.surface0();
+
+        container(
+            row![search_input, match_label, close_btn]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .padding([4, 8]),
+        )
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bar_bg.into()),
+            border: iced::Border {
+                width: 1.0,
+                color: border_color,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        })
         .into()
     }
 
