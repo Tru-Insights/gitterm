@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitTerm — Claude Sidebar Tab</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Anybody:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ctp-rosewater: #f5e0dc;
+    --ctp-flamingo: #f2cdcd;
+    --ctp-pink: #f5c2e7;
+    --ctp-mauve: #cba6f7;
+    --ctp-red: #f38ba8;
+    --ctp-maroon: #eba0ac;
+    --ctp-peach: #fab387;
+    --ctp-yellow: #f9e2af;
+    --ctp-green: #a6e3a1;
+    --ctp-teal: #94e2d5;
+    --ctp-sky: #89dceb;
+    --ctp-sapphire: #74c7ec;
+    --ctp-blue: #89b4fa;
+    --ctp-lavender: #b4befe;
+    --ctp-text: #cdd6f4;
+    --ctp-subtext1: #bac2de;
+    --ctp-subtext0: #a6adc8;
+    --ctp-overlay2: #9399b2;
+    --ctp-overlay1: #7f849c;
+    --ctp-overlay0: #6c7086;
+    --ctp-surface2: #585b70;
+    --ctp-surface1: #45475a;
+    --ctp-surface0: #313244;
+    --ctp-base: #1e1e2e;
+    --ctp-mantle: #181825;
+    --ctp-crust: #11111b;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'JetBrains Mono', monospace;
+    background: var(--ctp-crust);
+    color: var(--ctp-text);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .shell {
+    display: flex;
+    height: 100vh;
+  }
+
+  /* ═══════════════════════════════════════════
+     Workspace Rail
+     ═══════════════════════════════════════════ */
+  .rail {
+    width: 48px;
+    min-width: 48px;
+    background: var(--ctp-crust);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 8px 0;
+    gap: 4px;
+    border-right: 1px solid var(--ctp-surface0);
+  }
+
+  .ws-btn {
+    width: 36px; height: 36px;
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 600;
+    cursor: pointer; border: none;
+    font-family: inherit;
+  }
+  .ws-btn.active { background: var(--ctp-mauve); color: var(--ctp-crust); }
+  .ws-btn:not(.active) { background: var(--ctp-surface0); color: var(--ctp-overlay1); }
+  .ws-btn.add { background: transparent; color: var(--ctp-overlay0); border: 1px dashed var(--ctp-surface1); font-size: 16px; font-weight: 300; }
+
+  /* ═══════════════════════════════════════════
+     Sidebar
+     ═══════════════════════════════════════════ */
+  .sidebar {
+    width: 260px;
+    min-width: 260px;
+    background: var(--ctp-mantle);
+    border-right: 1px solid var(--ctp-surface0);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Sidebar tab bar */
+  .sidebar-tabs {
+    display: flex;
+    align-items: center;
+    height: 32px;
+    padding: 0 6px;
+    gap: 1px;
+    border-bottom: 1px solid var(--ctp-surface0);
+    background: var(--ctp-crust);
+    flex-shrink: 0;
+  }
+
+  .sidebar-tab {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 10px;
+    height: 24px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--ctp-overlay1);
+    cursor: pointer;
+    transition: all 0.1s ease;
+    position: relative;
+    white-space: nowrap;
+    user-select: none;
+  }
+  .sidebar-tab:hover { color: var(--ctp-subtext0); background: var(--ctp-surface0); }
+  .sidebar-tab.active { color: var(--ctp-text); }
+  .sidebar-tab.active::after {
+    content: '';
+    position: absolute;
+    bottom: -5px;
+    left: 4px; right: 4px;
+    height: 2px;
+    background: var(--ctp-mauve);
+    border-radius: 1px;
+  }
+
+  .sidebar-tab .tab-icon {
+    font-size: 12px;
+    opacity: 0.7;
+  }
+  .sidebar-tab.active .tab-icon { opacity: 1; }
+
+  /* Sidebar content area */
+  .sidebar-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+
+  /* ═══════════════════════════════════════════
+     Tree Sections & Items
+     ═══════════════════════════════════════════ */
+  .tree-section {
+    margin-bottom: 2px;
+  }
+
+  .tree-section-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.08s;
+  }
+  .tree-section-header:hover { background: var(--ctp-surface0); }
+
+  .tree-chevron {
+    font-size: 8px;
+    color: var(--ctp-overlay0);
+    width: 10px;
+    text-align: center;
+    transition: transform 0.12s ease;
+  }
+  .tree-chevron.open { transform: rotate(90deg); }
+
+  .tree-section-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--ctp-subtext0);
+    flex: 1;
+  }
+
+  .tree-section-count {
+    font-size: 9px;
+    color: var(--ctp-overlay0);
+    background: var(--ctp-surface0);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .tree-section-body {
+    /* shown by default */
+  }
+
+  .tree-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 12px 4px 28px;
+    font-size: 11px;
+    color: var(--ctp-overlay1);
+    cursor: pointer;
+    transition: all 0.06s;
+    border-left: 2px solid transparent;
+  }
+  .tree-item:hover {
+    color: var(--ctp-subtext0);
+    background: rgba(205, 214, 244, 0.03);
+  }
+  .tree-item.active {
+    color: var(--ctp-text);
+    background: var(--ctp-surface0);
+    border-left-color: var(--ctp-mauve);
+  }
+
+  .tree-item .ti-dot {
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .tree-item .ti-name {
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .tree-item .ti-scope {
+    font-size: 8px;
+    color: var(--ctp-overlay0);
+    padding: 0px 4px;
+    border-radius: 2px;
+    background: var(--ctp-surface0);
+    flex-shrink: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+  }
+  .tree-item.active .ti-scope { background: var(--ctp-surface1); }
+
+  /* ═══════════════════════════════════════════
+     Main Area
+     ═══════════════════════════════════════════ */
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .tab-bar {
+    display: flex;
+    align-items: center;
+    height: 36px;
+    background: var(--ctp-mantle);
+    border-bottom: 1px solid var(--ctp-surface0);
+    padding: 0 8px;
+    gap: 2px;
+  }
+
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 12px;
+    height: 28px;
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--ctp-overlay1);
+    cursor: pointer;
+    transition: all 0.12s ease;
+    white-space: nowrap;
+  }
+  .tab:hover { background: var(--ctp-surface0); color: var(--ctp-subtext0); }
+  .tab.active { background: var(--ctp-surface0); color: var(--ctp-text); }
+  .tab .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .tab .dot.green { background: var(--ctp-green); }
+  .tab .dot.peach { background: var(--ctp-peach); }
+
+  /* Terminal viewport */
+  .viewport {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .terminal {
+    flex: 1;
+    background: var(--ctp-base);
+    padding: 12px 16px;
+    font-size: 13px;
+    line-height: 1.6;
+    overflow: auto;
+  }
+  .terminal .prompt { color: var(--ctp-green); }
+  .terminal .cmd { color: var(--ctp-text); }
+  .terminal .out { color: var(--ctp-subtext0); }
+  .terminal .cursor-block {
+    display: inline-block;
+    width: 8px; height: 16px;
+    background: var(--ctp-text);
+    animation: blink 1s step-end infinite;
+    vertical-align: text-bottom;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* File viewer (replaces terminal when viewing a file) */
+  .file-viewer {
+    flex: 1;
+    background: var(--ctp-base);
+    overflow: auto;
+    display: none;
+    flex-direction: column;
+  }
+  .file-viewer.visible { display: flex; }
+  .terminal.hidden { display: none; }
+
+  .file-viewer-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--ctp-surface0);
+    background: var(--ctp-mantle);
+    flex-shrink: 0;
+  }
+
+  .file-viewer-path {
+    font-size: 11px;
+    color: var(--ctp-overlay1);
+    flex: 1;
+  }
+
+  .file-viewer-path .filename {
+    color: var(--ctp-text);
+    font-weight: 500;
+  }
+
+  .file-viewer-close {
+    width: 20px; height: 20px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 3px;
+    font-size: 13px;
+    color: var(--ctp-overlay0);
+    cursor: pointer;
+    background: transparent;
+    border: none;
+    font-family: inherit;
+    transition: all 0.1s;
+  }
+  .file-viewer-close:hover { background: var(--ctp-surface0); color: var(--ctp-text); }
+
+  .file-viewer-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 24px;
+    line-height: 1.65;
+  }
+
+  .file-viewer-body h1 {
+    font-family: 'Anybody', sans-serif;
+    font-size: 18px;
+    font-weight: 900;
+    color: var(--ctp-text);
+    margin-bottom: 12px;
+    letter-spacing: -0.3px;
+  }
+
+  .file-viewer-body h2 {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--ctp-subtext1);
+    margin-top: 20px;
+    margin-bottom: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--ctp-surface0);
+  }
+
+  .file-viewer-body h3 {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ctp-subtext0);
+    margin-top: 14px;
+    margin-bottom: 6px;
+  }
+
+  .file-viewer-body p {
+    font-size: 12px;
+    color: var(--ctp-subtext0);
+    margin-bottom: 8px;
+  }
+
+  .file-viewer-body ul, .file-viewer-body ol {
+    font-size: 12px;
+    color: var(--ctp-subtext0);
+    padding-left: 20px;
+    margin-bottom: 8px;
+  }
+
+  .file-viewer-body li { margin-bottom: 3px; }
+  .file-viewer-body li strong { color: var(--ctp-subtext1); }
+
+  .file-viewer-body code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    background: var(--ctp-surface0);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--ctp-mauve);
+  }
+
+  .file-viewer-body pre {
+    background: var(--ctp-mantle);
+    border: 1px solid var(--ctp-surface0);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 8px 0 12px;
+    overflow-x: auto;
+  }
+
+  .file-viewer-body pre code {
+    background: none;
+    padding: 0;
+    font-size: 11px;
+    color: var(--ctp-text);
+    line-height: 1.5;
+  }
+
+  /* KV grid for plugins/settings */
+  .detail-kv {
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    gap: 6px 12px;
+    font-size: 12px;
+    margin-bottom: 12px;
+  }
+  .detail-kv-label { color: var(--ctp-overlay1); text-align: right; font-weight: 500; }
+  .detail-kv-value { color: var(--ctp-text); word-break: break-all; }
+  .detail-kv-value.muted { color: var(--ctp-subtext0); }
+
+  /* Hook action blocks */
+  .hook-action-block {
+    background: var(--ctp-mantle);
+    border: 1px solid var(--ctp-surface0);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+  }
+  .hook-action-type {
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+  }
+  .hook-action-content {
+    font-size: 11px;
+    color: var(--ctp-subtext0);
+    line-height: 1.5;
+    word-break: break-all;
+  }
+
+  /* Bottom Panel */
+  .bottom-panel {
+    height: 140px;
+    min-height: 140px;
+    border-top: 1px solid var(--ctp-surface0);
+    display: flex;
+    flex-direction: column;
+    background: var(--ctp-mantle);
+  }
+
+  .bottom-tabs {
+    display: flex;
+    align-items: center;
+    height: 30px;
+    padding: 0 8px;
+    gap: 2px;
+    border-bottom: 1px solid var(--ctp-surface0);
+    background: var(--ctp-crust);
+  }
+
+  .btab {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 10px;
+    height: 22px;
+    border-radius: 3px;
+    font-size: 11px;
+    color: var(--ctp-overlay1);
+    cursor: pointer;
+    position: relative;
+    white-space: nowrap;
+  }
+  .btab:hover { color: var(--ctp-subtext0); }
+  .btab.active { color: var(--ctp-text); }
+  .btab.active::after {
+    content: '';
+    position: absolute;
+    bottom: -5px;
+    left: 4px; right: 4px;
+    height: 2px;
+    background: var(--ctp-mauve);
+    border-radius: 1px;
+  }
+  .btab .sdot { width: 5px; height: 5px; border-radius: 50%; }
+
+  .bottom-content {
+    flex: 1;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--ctp-overlay0);
+    overflow: auto;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--ctp-surface1); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--ctp-surface2); }
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <!-- Workspace Rail -->
+  <div class="rail">
+    <button class="ws-btn active">GT</button>
+    <button class="ws-btn" style="background: rgba(137,180,250,0.15); color: var(--ctp-blue);">CS</button>
+    <button class="ws-btn add">+</button>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-tabs">
+      <div class="sidebar-tab" onclick="switchSidebarTab('git')">
+        <span class="tab-icon">⑂</span>Git
+      </div>
+      <div class="sidebar-tab" onclick="switchSidebarTab('files')">
+        <span class="tab-icon">◫</span>Files
+      </div>
+      <div class="sidebar-tab active" onclick="switchSidebarTab('claude')">
+        <span class="tab-icon">◆</span>Claude
+      </div>
+    </div>
+
+    <div class="sidebar-content" id="sidebar-claude">
+
+      <!-- Skills -->
+      <div class="tree-section">
+        <div class="tree-section-header" onclick="toggleSection(this)">
+          <span class="tree-chevron open">▶</span>
+          <span class="tree-section-label">Skills</span>
+          <span class="tree-section-count">16</span>
+        </div>
+        <div class="tree-section-body">
+          <div class="tree-item active" onclick="showFile(this, 'commit')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/commit</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'pr')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/pr</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'work')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/work</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'done')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/done</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'resume')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/resume</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'build')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/build</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'test')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/test</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'lint')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/lint</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'standup')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/standup</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'today')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/today</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'log')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/log</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'done-report')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/done-report</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'capture-work')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/capture-work</span>
+            <span class="ti-scope">usr</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'frontend-design')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/frontend-design</span>
+            <span class="ti-scope">plg</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'stt-setup')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/claude-stt:setup</span>
+            <span class="ti-scope">plg</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'stt-status')">
+            <span class="ti-dot" style="background: var(--ctp-green);"></span>
+            <span class="ti-name">/claude-stt:status</span>
+            <span class="ti-scope">plg</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Plugins -->
+      <div class="tree-section">
+        <div class="tree-section-header" onclick="toggleSection(this)">
+          <span class="tree-chevron open">▶</span>
+          <span class="tree-section-label">Plugins</span>
+          <span class="tree-section-count">4</span>
+        </div>
+        <div class="tree-section-body">
+          <div class="tree-item" onclick="showFile(this, 'plugin-rust')">
+            <span class="ti-dot" style="background: var(--ctp-blue);"></span>
+            <span class="ti-name">rust-analyzer-lsp</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'plugin-frontend')">
+            <span class="ti-dot" style="background: var(--ctp-blue);"></span>
+            <span class="ti-name">frontend-design</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'plugin-stt')">
+            <span class="ti-dot" style="background: var(--ctp-blue);"></span>
+            <span class="ti-name">claude-stt</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'plugin-swift')">
+            <span class="ti-dot" style="background: var(--ctp-blue);"></span>
+            <span class="ti-name">swift-lsp</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- MCPs -->
+      <div class="tree-section">
+        <div class="tree-section-header" onclick="toggleSection(this)">
+          <span class="tree-chevron open">▶</span>
+          <span class="tree-section-label">MCP Servers</span>
+          <span class="tree-section-count">1</span>
+        </div>
+        <div class="tree-section-body">
+          <div class="tree-item" onclick="showFile(this, 'mcp-pencil')">
+            <span class="ti-dot" style="background: var(--ctp-peach);"></span>
+            <span class="ti-name">pencil</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hooks -->
+      <div class="tree-section">
+        <div class="tree-section-header" onclick="toggleSection(this)">
+          <span class="tree-chevron open">▶</span>
+          <span class="tree-section-label">Hooks</span>
+          <span class="tree-section-count">3</span>
+        </div>
+        <div class="tree-section-body">
+          <div class="tree-item" onclick="showFile(this, 'hook-precompact')">
+            <span class="ti-dot" style="background: var(--ctp-pink);"></span>
+            <span class="ti-name">PreCompact</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'hook-stop')">
+            <span class="ti-dot" style="background: var(--ctp-pink);"></span>
+            <span class="ti-name">Stop</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'hook-notification')">
+            <span class="ti-dot" style="background: var(--ctp-pink);"></span>
+            <span class="ti-name">Notification</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings -->
+      <div class="tree-section">
+        <div class="tree-section-header" onclick="toggleSection(this)">
+          <span class="tree-chevron open">▶</span>
+          <span class="tree-section-label">Settings</span>
+          <span class="tree-section-count">3</span>
+        </div>
+        <div class="tree-section-body">
+          <div class="tree-item" onclick="showFile(this, 'setting-effort')">
+            <span class="ti-dot" style="background: var(--ctp-lavender);"></span>
+            <span class="ti-name">effortLevel</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'setting-statusline')">
+            <span class="ti-dot" style="background: var(--ctp-lavender);"></span>
+            <span class="ti-name">statusLine</span>
+          </div>
+          <div class="tree-item" onclick="showFile(this, 'setting-permissions')">
+            <span class="ti-dot" style="background: var(--ctp-lavender);"></span>
+            <span class="ti-name">permissions</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="tab-bar">
+      <div class="tab active"><div class="dot peach"></div>Claude</div>
+      <div class="tab"><div class="dot green"></div>Terminal 1</div>
+      <div class="tab"><div class="dot green"></div>Terminal 2</div>
+    </div>
+
+    <div class="viewport">
+      <!-- Terminal (hidden when viewing a file) -->
+      <div class="terminal" id="terminal">
+        <span class="prompt">~/GitRepo/gitterm-v2</span> <span class="cmd">$ cargo build</span><br>
+        <span class="out">   Compiling gitterm v0.1.0</span><br>
+        <span class="out">    Finished dev [unoptimized + debuginfo] target(s) in 34.64s</span><br>
+        <br>
+        <span class="prompt">~/GitRepo/gitterm-v2</span> <span class="cmd">$ git status</span><br>
+        <span class="out">On branch master</span><br>
+        <span class="out">Your branch is up to date with 'origin/master'.</span><br>
+        <span class="out">nothing to commit, working tree clean</span><br>
+        <br>
+        <span class="prompt">~/GitRepo/gitterm-v2</span> <span class="cmd">$</span> <span class="cursor-block"></span>
+      </div>
+
+      <!-- File viewer (shown when clicking a tree item) -->
+      <div class="file-viewer visible" id="file-viewer">
+        <div class="file-viewer-header">
+          <span class="file-viewer-path">~/.claude/commands/<span class="filename">commit.md</span></span>
+          <button class="file-viewer-close" onclick="closeFileViewer()" title="Close">×</button>
+        </div>
+        <div class="file-viewer-body" id="file-viewer-body">
+          <!-- Default: /commit content -->
+          <h1>Commit and Log to Linear</h1>
+          <p>Commit changes and associate with a Linear issue.</p>
+
+          <h2>Workflow</h2>
+
+          <h3>1. Review Changes</h3>
+          <ul>
+            <li>Run <code>git status</code> to see what's changed</li>
+            <li>Run <code>git diff --staged</code> and <code>git diff</code> to review the changes</li>
+          </ul>
+
+          <h3>2. Ask Which Linear Issue (Before Committing)</h3>
+          <ul>
+            <li>Fetch in-progress issues: <code>linear issue list --team FUL --state started --sort priority --limit 10</code></li>
+            <li>Use AskUserQuestion to present options:
+              <ul>
+                <li><strong>First option: "Create new issue"</strong> — for new work not yet tracked</li>
+                <li>List each in-progress issue (format: "FUL-XXXX: Title")</li>
+                <li><strong>Last option: "Skip - just commit"</strong> — for trivial changes</li>
+              </ul>
+            </li>
+            <li>If "Create new issue" selected, ask for the issue title</li>
+          </ul>
+
+          <h3>3. Create New Issue (if selected)</h3>
+          <ul>
+            <li>Create the issue BEFORE committing:</li>
+          </ul>
+          <pre><code>linear issue create --team FUL --title "TITLE" \
+  --start --assignee self --no-interactive</code></pre>
+          <ul>
+            <li>Parse the issue ID from the output (e.g., "FUL-1489")</li>
+            <li>The <code>--start</code> flag sets state to "In Progress"</li>
+          </ul>
+
+          <h3>4. Commit</h3>
+          <ul>
+            <li>Stage the appropriate files (prefer specific files over <code>git add -A</code>)</li>
+            <li>Create a commit with the Linear issue ID prefixed:
+              <ul>
+                <li>Format: <code>FUL-XXXX: Clear, concise message</code></li>
+              </ul>
+            </li>
+            <li>Get the new commit SHA from <code>git rev-parse HEAD</code></li>
+          </ul>
+
+          <h3>5. Log Commit to Linear Issue</h3>
+          <ul>
+            <li>Format commit link: <code>[short-sha](https://github.com/ORG/REPO/commit/full-sha)</code></li>
+            <li>Fetch current issue description and append under a "## Commits" section</li>
+            <li>Update: <code>linear issue update FUL-XXXX --description "..."</code></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Bottom Panel -->
+      <div class="bottom-panel">
+        <div class="bottom-tabs">
+          <div class="btab active"><span class="sdot" style="background: var(--ctp-green);"></span>Console</div>
+          <div class="btab"><span class="sdot" style="background: var(--ctp-blue);"></span>Terminal</div>
+        </div>
+        <div class="bottom-content">$ cargo build — exited 0</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function toggleSection(header) {
+  const chevron = header.querySelector('.tree-chevron');
+  const body = header.nextElementSibling;
+  if (chevron.classList.contains('open')) {
+    chevron.classList.remove('open');
+    body.style.display = 'none';
+  } else {
+    chevron.classList.add('open');
+    body.style.display = '';
+  }
+}
+
+function switchSidebarTab(tab) {
+  document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.remove('active'));
+  event.target.closest('.sidebar-tab').classList.add('active');
+}
+
+const files = {
+  'commit': { path: '~/.claude/commands/', name: 'commit.md', body: document.getElementById('file-viewer-body').innerHTML },
+  'pr': { path: '~/.claude/commands/', name: 'pr.md', body: `<h1>Create Pull Request</h1>
+<p>Create a pull request for the current branch.</p>
+<h2>Instructions</h2>
+<ol>
+  <li>Check git status and ensure all changes are committed</li>
+  <li>Push the branch to origin if needed</li>
+  <li>Create a PR using <code>gh pr create</code> with:
+    <ul>
+      <li>A clear, concise title</li>
+      <li>A summary of changes in the description</li>
+      <li>Link any related issues</li>
+    </ul>
+  </li>
+</ol>` },
+  'work': { path: '~/.claude/commands/', name: 'work.md', body: `<h1>/work — Start Working on Something</h1>
+<p>Create a Linear issue and update daily note to show what you're working on.</p>
+<h2>Usage</h2>
+<ul>
+  <li><code>/work &lt;description&gt;</code> — Create issue and start working</li>
+  <li><code>/work status</code> — Show current Linear issues</li>
+  <li><code>/work list</code> — List recent issues</li>
+</ul>
+<h2>Instructions</h2>
+<h3>For <code>/work &lt;description&gt;</code>:</h3>
+<ol>
+  <li><strong>Create Linear Issue</strong><br>
+    Run: <code>linear issue create --team CRE --title "&lt;description&gt;" --assignee self --state "In Progress" --no-interactive</code></li>
+  <li><strong>Create Branch</strong> (if in a git repo)</li>
+  <li><strong>Update Daily Note</strong> at <code>~/Brain/Daily Standup/YYYY-MM-DD.md</code></li>
+</ol>` },
+  'done': { path: '~/.claude/commands/', name: 'done.md', body: `<h1>/done — Session Checkpoint</h1>
+<p>Log a session checkpoint to Obsidian AND create a resume file for automatic pickup after <code>/clear</code>.</p>
+<h2>Instructions</h2>
+<h3>Step 1: Generate checkpoint content</h3>
+<p>Create a checkpoint with this structure:</p>
+<pre><code># Resume: project-name
+
+**Last checkpoint:** YYYY-MM-DD HH:MM
+
+## You Were Just Working On
+[1-2 sentences about current task]
+
+**Just did:** [The last action taken]
+**Immediate next step:** [Exact action to continue]
+
+## Completed This Session
+- [4-8 bullet points of ALL work completed]</code></pre>
+<h3>Step 2: Write resume file</h3>
+<p>Write to <code>.claude/resume.md</code> in the project root.</p>
+<h3>Step 3: Append to daily log</h3>
+<p>Append to <code>~/Brain/Session Logs/YYYY-MM-DD.md</code></p>` },
+  'resume': { path: '~/.claude/commands/', name: 'resume.md', body: `<h1>/resume — Load Last Checkpoint</h1><p>Read <code>.claude/resume.md</code> and continue from the last session checkpoint.</p>` },
+  'build': { path: '~/.claude/commands/', name: 'build.md', body: `<h1>/build</h1><p>Run the build with <code>npm run build</code>. If there are any TypeScript errors or build failures, analyze them and fix the issues.</p>` },
+  'test': { path: '~/.claude/commands/', name: 'test.md', body: `<h1>/test</h1><p>Run the test suite with <code>npm run test:run</code>. If any tests fail, analyze the failures and fix them.</p>` },
+  'lint': { path: '~/.claude/commands/', name: 'lint.md', body: `<h1>/lint</h1><p>Run the linter with <code>npm run lint</code>. Fix any errors or warnings, then run again to verify.</p>` },
+  'standup': { path: '~/.claude/commands/', name: 'standup.md', body: `<h1>/standup — Daily Standup</h1><p>Generate daily standup notes from recent git activity and Linear issues.</p>` },
+  'today': { path: '~/.claude/commands/', name: 'today.md', body: `<h1>/today</h1><p>Manage today's daily note at <code>~/Brain/Daily Standup/YYYY-MM-DD.md</code></p>` },
+  'log': { path: '~/.claude/commands/', name: 'log.md', body: `<h1>/log — Log Work to Linear</h1><p>Log work progress to Linear issue descriptions for tracking.</p>` },
+  'done-report': { path: '~/.claude/commands/', name: 'done-report.md', body: `<h1>/done-report — Work Summary</h1><p>Generate a daily or weekly done report from git activity, Linear issues, and session logs.</p>` },
+  'capture-work': { path: '~/.claude/commands/', name: 'capture-work.md', body: `<h1>/capture-work</h1><p>Audit recent git commits and ensure they're all logged to their respective Linear issues.</p>` },
+  'frontend-design': { path: 'frontend-design@claude-code-plugins/', name: 'frontend-design/SKILL.md', body: `<h1>/frontend-design</h1>
+<p>Create distinctive, production-grade frontend interfaces with high design quality.</p>
+<h2>Capabilities</h2>
+<ul>
+  <li>Build web components, pages, or applications</li>
+  <li>Distinctive typography and color choices</li>
+  <li>Motion and micro-interactions</li>
+  <li>Production-grade HTML/CSS/JS or React</li>
+</ul>` },
+  'stt-setup': { path: 'claude-stt@jarrodwatts/', name: 'skills/setup.md', body: `<h1>/claude-stt:setup</h1><p>Set up claude-stt — check environment, install dependencies, configure hotkey.</p>` },
+  'stt-status': { path: 'claude-stt@jarrodwatts/', name: 'skills/status.md', body: `<h1>/claude-stt:status</h1><p>Show daemon status and environment readiness.</p>` },
+  'plugin-rust': { path: '~/.claude/plugins/', name: 'rust-analyzer-lsp@claude-plugins-official', body: `<h1>rust-analyzer-lsp</h1>
+<div class="detail-kv">
+  <span class="detail-kv-label">Source</span><span class="detail-kv-value">claude-plugins-official</span>
+  <span class="detail-kv-label">Version</span><span class="detail-kv-value">1.0.0</span>
+  <span class="detail-kv-label">Status</span><span class="detail-kv-value" style="color: var(--ctp-green);">enabled</span>
+</div>
+<p>Provides Rust language server integration for Claude Code via rust-analyzer.</p>` },
+  'plugin-frontend': { path: '~/.claude/plugins/', name: 'frontend-design@claude-code-plugins', body: `<h1>frontend-design</h1>
+<div class="detail-kv">
+  <span class="detail-kv-label">Source</span><span class="detail-kv-value">claude-code-plugins</span>
+  <span class="detail-kv-label">Version</span><span class="detail-kv-value">1.0.0</span>
+  <span class="detail-kv-label">Status</span><span class="detail-kv-value" style="color: var(--ctp-green);">enabled</span>
+  <span class="detail-kv-label">Skills</span><span class="detail-kv-value">/frontend-design</span>
+</div>
+<p>Provides the /frontend-design skill for building distinctive frontend interfaces.</p>` },
+  'plugin-stt': { path: '~/.claude/plugins/', name: 'claude-stt@jarrodwatts-claude-stt', body: `<h1>claude-stt</h1>
+<div class="detail-kv">
+  <span class="detail-kv-label">Source</span><span class="detail-kv-value">jarrodwatts-claude-stt</span>
+  <span class="detail-kv-label">Version</span><span class="detail-kv-value">0.1.0</span>
+  <span class="detail-kv-label">Status</span><span class="detail-kv-value" style="color: var(--ctp-green);">enabled</span>
+  <span class="detail-kv-label">Skills</span><span class="detail-kv-value">/claude-stt:setup, :status, :config, :start, :stop</span>
+</div>
+<p>Speech-to-text input. Hold a hotkey, speak, and your speech is transcribed as input to Claude.</p>` },
+  'plugin-swift': { path: '~/.claude/plugins/', name: 'swift-lsp@claude-plugins-official', body: `<h1>swift-lsp</h1>
+<div class="detail-kv">
+  <span class="detail-kv-label">Source</span><span class="detail-kv-value">claude-plugins-official</span>
+  <span class="detail-kv-label">Version</span><span class="detail-kv-value">1.0.0</span>
+  <span class="detail-kv-label">Status</span><span class="detail-kv-value" style="color: var(--ctp-green);">enabled</span>
+</div>
+<p>Swift language server integration via SourceKit-LSP.</p>` },
+  'mcp-pencil': { path: '', name: 'pencil (via plugin)', body: `<h1>pencil — MCP Server</h1>
+<div class="detail-kv">
+  <span class="detail-kv-label">Transport</span><span class="detail-kv-value">stdio</span>
+  <span class="detail-kv-label">Permission</span><span class="detail-kv-value">mcp__pencil (allowed)</span>
+</div>
+<h2>Available Tools</h2>
+<ul>
+  <li><code>get_editor_state</code> — Get current canvas and selection</li>
+  <li><code>open_document</code> — Open or create .pen files</li>
+  <li><code>batch_get</code> — Search and read nodes</li>
+  <li><code>batch_design</code> — Insert/update/delete operations</li>
+  <li><code>get_screenshot</code> — Screenshot a node</li>
+  <li><code>get_guidelines</code> — Design guidelines</li>
+  <li><code>get_style_guide</code> — Style inspiration</li>
+  <li><code>get_variables</code> / <code>set_variables</code> — Theme variables</li>
+  <li><code>snapshot_layout</code> — Check layout structure</li>
+  <li><code>find_empty_space_on_canvas</code> — Find placement space</li>
+</ul>` },
+  'hook-precompact': { path: '~/.claude/', name: 'settings.json → hooks.PreCompact', body: `<h1>PreCompact Hook</h1>
+<p>Triggered when context is about to be compacted.</p>
+<div class="hook-action-block">
+  <div class="hook-action-type" style="color: var(--ctp-teal);">command</div>
+  <div class="hook-action-content"><code>~/.claude/hooks/capture-session-summary.sh</code><br>Outputs project name, timestamp, and log file path.</div>
+</div>
+<div class="hook-action-block">
+  <div class="hook-action-type" style="color: var(--ctp-mauve);">prompt</div>
+  <div class="hook-action-content">Instructs Claude to generate a session summary and append to <code>~/Brain/Session Logs/YYYY-MM-DD.md</code>.</div>
+</div>` },
+  'hook-stop': { path: '~/.claude/', name: 'settings.json → hooks.Stop', body: `<h1>Stop Hook</h1>
+<p>Triggered when Claude finishes a response.</p>
+<div class="hook-action-block">
+  <div class="hook-action-type" style="color: var(--ctp-teal);">command</div>
+  <div class="hook-action-content"><code>afplay -v 0.3 /System/Library/Sounds/Bottle.aiff</code><br>Notification sound on completion.</div>
+</div>` },
+  'hook-notification': { path: '~/.claude/', name: 'settings.json → hooks.Notification', body: `<h1>Notification Hook</h1>
+<p>Triggered on permission prompts.</p>
+<div class="hook-action-block">
+  <div class="hook-action-type" style="color: var(--ctp-teal);">command</div>
+  <div class="hook-action-content"><code>afplay -v 0.3 /System/Library/Sounds/Blow.aiff</code><br>Alert sound when Claude needs input.</div>
+</div>
+<div class="detail-kv" style="margin-top: 12px;">
+  <span class="detail-kv-label">Matcher</span><span class="detail-kv-value"><code>permission_prompt</code></span>
+</div>` },
+  'setting-effort': { path: '~/.claude/', name: 'settings.json → effortLevel', body: `<h1>effortLevel</h1>
+<div class="detail-kv">
+  <span class="detail-kv-label">Value</span><span class="detail-kv-value">medium</span>
+  <span class="detail-kv-label">Options</span><span class="detail-kv-value muted">low · medium · high</span>
+</div>
+<p>Controls reasoning effort. Higher = more thorough but slower.</p>` },
+  'setting-statusline': { path: '~/.claude/', name: 'settings.json → statusLine', body: `<h1>statusLine</h1>
+<div class="detail-kv">
+  <span class="detail-kv-label">Type</span><span class="detail-kv-value">command</span>
+  <span class="detail-kv-label">Command</span><span class="detail-kv-value"><code>~/.claude/statusline.sh</code></span>
+</div>
+<p>Shell script that generates the Claude Code status line content.</p>` },
+  'setting-permissions': { path: '~/.claude/', name: 'settings.json → permissions', body: `<h1>permissions</h1>
+<h2>Allow List</h2>
+<ul><li><code>mcp__pencil</code> — All Pencil MCP tools auto-approved</li></ul>
+<p>Tools on the allow list skip the permission prompt.</p>` },
+};
+
+function showFile(el, id) {
+  const f = files[id];
+  if (!f) return;
+
+  document.querySelectorAll('.tree-item').forEach(i => i.classList.remove('active'));
+  el.classList.add('active');
+
+  document.getElementById('terminal').classList.add('hidden');
+  const viewer = document.getElementById('file-viewer');
+  viewer.classList.add('visible');
+  viewer.querySelector('.file-viewer-path').innerHTML = f.path + '<span class="filename">' + f.name + '</span>';
+  document.getElementById('file-viewer-body').innerHTML = f.body;
+}
+
+function closeFileViewer() {
+  document.getElementById('file-viewer').classList.remove('visible');
+  document.getElementById('terminal').classList.remove('hidden');
+  document.querySelectorAll('.tree-item').forEach(i => i.classList.remove('active'));
+}
+</script>
+
+</body>
+</html>
