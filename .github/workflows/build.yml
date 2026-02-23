@@ -2,11 +2,8 @@ name: Build
 
 on:
   push:
-    branches: [ master, main ]
     tags:
       - 'v*'
-  pull_request:
-    branches: [ master, main ]
   workflow_dispatch:
 
 env:
@@ -65,7 +62,7 @@ jobs:
       run: |
         cd ..
         if [ ! -d "iced_term_fork" ]; then
-          git clone https://github.com/traceyt-cree8/iced_term.git iced_term_fork
+          git clone https://github.com/Tru-Insights/iced_term.git iced_term_fork
         fi
 
     - name: Install Rust
