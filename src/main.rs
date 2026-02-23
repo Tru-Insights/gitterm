@@ -5156,11 +5156,10 @@ fi
                 self.current_modifiers = modifiers;
 
                 // Tab picker: Escape closes
-                if self.tab_picker_visible {
-                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
-                        self.tab_picker_visible = false;
-                        return Task::none();
-                    }
+                if self.tab_picker_visible && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    self.tab_picker_visible = false;
+                    return Task::none();
                 }
 
                 // Help modal: Escape or Cmd+/ closes, all other keys consumed while open
@@ -5274,7 +5273,7 @@ fi
                         }
                     }
 
-                    if tab.selected_file.is_some() {
+                    if let Some(selected) = &tab.selected_file {
                         // In diff view - handle navigation
                         match key.as_ref() {
                             Key::Named(key::Named::Escape) => {
@@ -5297,8 +5296,7 @@ fi
                             }
                             Key::Character("e") => {
                                 // Open selected file in $EDITOR
-                                let full_path =
-                                    tab.repo_path.join(tab.selected_file.as_ref().unwrap());
+                                let full_path = tab.repo_path.join(selected);
                                 return Task::done(Event::EditFile(full_path));
                             }
                             _ => {}
