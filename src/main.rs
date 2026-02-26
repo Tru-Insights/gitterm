@@ -213,6 +213,51 @@ struct Config {
     #[cfg(feature = "stt")]
     #[serde(default)]
     stt_model_path: Option<String>,
+    #[serde(default = "default_agent_presets")]
+    agent_presets: Vec<AgentPreset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentPreset {
+    name: String,
+    command: String,
+    /// Command to resume the last session (e.g. "claude --resume", "codex resume")
+    #[serde(default)]
+    resume_command: Option<String>,
+    #[serde(default)]
+    icon: String,
+    #[serde(default = "default_agent_color")]
+    color: WorkspaceColor,
+}
+
+fn default_agent_color() -> WorkspaceColor {
+    WorkspaceColor::Lavender
+}
+
+fn default_agent_presets() -> Vec<AgentPreset> {
+    vec![
+        AgentPreset {
+            name: "Claude Code".to_string(),
+            command: "claude".to_string(),
+            resume_command: Some("claude --resume".to_string()),
+            icon: "\u{276f}".to_string(),
+            color: WorkspaceColor::Peach,
+        },
+        AgentPreset {
+            name: "Codex".to_string(),
+            command: "codex".to_string(),
+            resume_command: Some("codex resume".to_string()),
+            icon: "\u{2261}".to_string(),
+            color: WorkspaceColor::Green,
+        },
+        AgentPreset {
+            name: "Gemini".to_string(),
+            command: "gemini".to_string(),
+            resume_command: Some("gemini --resume".to_string()),
+            icon: "G".to_string(),
+            color: WorkspaceColor::Blue,
+        },
+    ]
 }
 
 fn default_terminal_font() -> f32 {
@@ -258,6 +303,7 @@ impl Default for Config {
             stt_enabled: true,
             #[cfg(feature = "stt")]
             stt_model_path: None,
+            agent_presets: default_agent_presets(),
         }
     }
 }
@@ -3154,11 +3200,10 @@ pub enum Event {
     // Attention system events
     AttentionPulseTick,
     AttentionJumpNext,
-    // Claude tab
-    NewClaudeTab,
-    ResumeClaudeTab,
-    // Codex tab
-    NewCodexTab,
+    // Launch agent preset by index
+    LaunchAgentPreset(usize),
+    // Resume agent preset session by index
+    ResumeAgentPreset(usize),
     // Plain terminal tab (no startup command)
     NewPlainTab,
     // Tab picker popup
@@ -3244,6 +3289,8 @@ struct App {
     show_help: bool,
     // Tab picker popup (Option+click on "+")
     tab_picker_visible: bool,
+    // Configured agent presets
+    agent_presets: Vec<AgentPreset>,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
     bottom_panel_focused: bool,
     workspaces_dirty: bool,
@@ -3549,6 +3596,7 @@ impl App {
             stt_enabled: self.stt_enabled,
             #[cfg(feature = "stt")]
             stt_model_path: None,
+            agent_presets: self.agent_presets.clone(),
         };
         config.save();
     }
@@ -3958,6 +4006,7 @@ impl App {
             current_modifiers: Modifiers::empty(),
             show_help: false,
             tab_picker_visible: false,
+            agent_presets: config.agent_presets.clone(),
             bottom_panel_focused: false,
             workspaces_dirty: false,
             next_workspace_save_at: None,
@@ -4763,19 +4812,19 @@ fi
                 self.mark_log_server_dirty();
                 return self.scroll_to_active_tab();
             }
-            Event::NewClaudeTab => {
+            Event::LaunchAgentPreset(idx) => {
                 // Option+click on "+" shows tab picker (but not if picker is already open)
                 if self.current_modifiers.alt() && !self.tab_picker_visible {
                     self.tab_picker_visible = true;
                 } else {
-                    // Create a new tab that auto-launches Claude Code
                     self.tab_picker_visible = false;
+                    let command = self.agent_presets.get(idx).map(|p| p.command.clone());
                     if let Some(ws) = self.active_workspace() {
                         let dir = ws
                             .active_tab()
                             .map(|t| t.current_dir.clone())
                             .unwrap_or_else(|| ws.dir.clone());
-                        self.add_tab_with_command(dir, Some("claude".to_string()));
+                        self.add_tab_with_command(dir, command);
                         self.mark_workspaces_dirty();
                         self.mark_log_server_dirty();
                         if let Some((tab_id, repo_path)) = {
@@ -4795,41 +4844,17 @@ fi
                     }
                 }
             }
-            Event::ResumeClaudeTab => {
-                // Create a new tab that resumes the last Claude Code session
-                if let Some(ws) = self.active_workspace() {
-                    let dir = ws
-                        .active_tab()
-                        .map(|t| t.current_dir.clone())
-                        .unwrap_or_else(|| ws.dir.clone());
-                    self.add_tab_with_command(dir, Some("claude --resume".to_string()));
-                    self.mark_workspaces_dirty();
-                    self.mark_log_server_dirty();
-                    if let Some((tab_id, repo_path)) = {
-                        if let Some(tab) = self.active_tab_mut() {
-                            tab.git_status_loading = true;
-                            Some((tab.id, tab.repo_path.clone()))
-                        } else {
-                            None
-                        }
-                    } {
-                        return Task::batch([
-                            self.scroll_to_active_tab(),
-                            Self::request_git_status(tab_id, repo_path),
-                        ]);
-                    }
-                    return self.scroll_to_active_tab();
-                }
-            }
-            Event::NewCodexTab => {
-                // Create a new tab that auto-launches Codex
+            Event::ResumeAgentPreset(idx) => {
                 self.tab_picker_visible = false;
+                let command = self.agent_presets.get(idx).and_then(|p| {
+                    p.resume_command.clone().or_else(|| Some(p.command.clone()))
+                });
                 if let Some(ws) = self.active_workspace() {
                     let dir = ws
                         .active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
-                    self.add_tab_with_command(dir, Some("codex resume".to_string()));
+                    self.add_tab_with_command(dir, command);
                     self.mark_workspaces_dirty();
                     self.mark_log_server_dirty();
                     if let Some((tab_id, repo_path)) = {
@@ -5325,19 +5350,18 @@ fi
                     }
                 }
 
-                // Option+Shift+C — resume Claude Code session
                 // Option+Shift+T — new plain terminal tab (folder picker)
-                // Option+Shift+X — new Codex tab
+                // Option+Shift+1..N — launch agent preset by index
                 if modifiers.alt() && modifiers.shift() {
                     if let Key::Character(c) = key.as_ref() {
-                        if c == "c" || c == "C" {
-                            return Task::done(Event::ResumeClaudeTab);
-                        }
                         if c == "t" || c == "T" {
                             return Task::done(Event::OpenFolder);
                         }
-                        if c == "x" || c == "X" {
-                            return Task::done(Event::NewCodexTab);
+                        // Option+Shift+1 through 9 launches agent preset by index
+                        if let Ok(num) = c.parse::<usize>() {
+                            if num >= 1 && num <= self.agent_presets.len() {
+                                return Task::done(Event::LaunchAgentPreset(num - 1));
+                            }
                         }
                     }
                 }
@@ -6969,57 +6993,86 @@ fi
         let hover_bg = theme.surface0();
         let mono = iced::Font::with_name("Menlo");
 
-        let picker_row = |label: &'static str,
-                          desc: &'static str,
-                          icon: &'static str,
-                          event: Event|
-         -> Element<'_, Event, Theme, iced::Renderer> {
-            let hover = hover_bg;
-            button(
-                row![
-                    text(icon)
-                        .size(14)
-                        .color(text_secondary)
-                        .font(mono)
-                        .width(Length::Fixed(24.0)),
-                    column![
-                        text(label).size(13).color(text_primary),
-                        text(desc).size(11).color(text_secondary),
+        let picker_row =
+            |label: String,
+             desc: String,
+             icon: String,
+             accent: iced::Color,
+             event: Event|
+             -> Element<'_, Event, Theme, iced::Renderer> {
+                let hover = hover_bg;
+                button(
+                    row![
+                        text(icon)
+                            .size(14)
+                            .color(accent)
+                            .font(mono)
+                            .width(Length::Fixed(24.0)),
+                        column![
+                            text(label).size(13).color(text_primary),
+                            text(desc).size(11).color(text_secondary),
+                        ]
+                        .spacing(1)
                     ]
-                    .spacing(1)
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center)
-                .padding([6, 10]),
-            )
-            .style(move |_theme, status| {
-                let bg_color = if matches!(status, button::Status::Hovered) {
-                    Some(hover.into())
-                } else {
-                    None
-                };
-                button::Style {
-                    background: bg_color,
-                    text_color: text_primary,
-                    border: iced::Border::default(),
-                    ..Default::default()
-                }
-            })
-            .padding(0)
-            .width(Length::Fill)
-            .on_press(event)
-            .into()
-        };
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center)
+                    .padding([6, 10]),
+                )
+                .style(move |_theme, status| {
+                    let bg_color = if matches!(status, button::Status::Hovered) {
+                        Some(hover.into())
+                    } else {
+                        None
+                    };
+                    button::Style {
+                        background: bg_color,
+                        text_color: text_primary,
+                        border: iced::Border::default(),
+                        ..Default::default()
+                    }
+                })
+                .padding(0)
+                .width(Length::Fill)
+                .on_press(event)
+                .into()
+            };
 
-        let picker_menu = container(
-            column![
-                picker_row("Claude Code", "claude", "\u{276f}", Event::NewClaudeTab),
-                picker_row("Codex", "codex resume", "\u{2261}", Event::NewCodexTab),
-                picker_row("Terminal", "Plain shell", "\u{25b8}", Event::NewPlainTab),
-            ]
-            .spacing(0)
-            .width(Length::Fixed(200.0)),
-        )
+        let mut items = Column::new().spacing(0).width(Length::Fixed(240.0));
+        for (idx, preset) in self.agent_presets.iter().enumerate() {
+            let icon = if preset.icon.is_empty() {
+                preset.name.chars().next().unwrap_or('?').to_string()
+            } else {
+                preset.icon.clone()
+            };
+            let accent = preset.color.color(theme);
+            items = items.push(picker_row(
+                preset.name.clone(),
+                preset.command.clone(),
+                icon.clone(),
+                accent,
+                Event::LaunchAgentPreset(idx),
+            ));
+            // Add resume row if the preset has a resume command
+            if let Some(resume_cmd) = &preset.resume_command {
+                items = items.push(picker_row(
+                    format!("{} (resume)", preset.name),
+                    resume_cmd.clone(),
+                    "\u{21ba}".to_string(), // ↺ symbol
+                    accent,
+                    Event::ResumeAgentPreset(idx),
+                ));
+            }
+        }
+        // Always add plain terminal at the bottom
+        items = items.push(picker_row(
+            "Terminal".to_string(),
+            "Plain shell".to_string(),
+            "\u{25b8}".to_string(),
+            text_secondary,
+            Event::NewPlainTab,
+        ));
+
+        let picker_menu = container(items)
         .style(move |_| container::Style {
             background: Some(bg.into()),
             border: iced::Border {
@@ -7774,7 +7827,11 @@ fi
                 }
             })
             .padding([4, 8])
-            .on_press(Event::NewClaudeTab);
+            .on_press(if self.agent_presets.is_empty() {
+                Event::NewPlainTab
+            } else {
+                Event::LaunchAgentPreset(0)
+            });
         tabs_row = tabs_row.push(add_btn);
 
         // Wrap tabs in a horizontal scrollable
