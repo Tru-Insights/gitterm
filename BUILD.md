@@ -17,6 +17,56 @@ This creates `target/GitTerm.app` which you can:
 - Copy to Applications: `cp -r target/GitTerm.app /Applications/`
 - Or open directly: `open target/GitTerm.app`
 
+## Linux (Local Build)
+
+### Prerequisites
+
+Install system dependencies (Ubuntu/Debian):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential pkg-config cmake \
+  libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+  libssl-dev libasound2-dev libclang-dev \
+  libglib2.0-dev libgtk-3-dev libpango1.0-dev \
+  libatk1.0-dev libgdk-pixbuf2.0-dev
+```
+
+For Fedora/RHEL:
+
+```bash
+sudo dnf install -y \
+  gcc pkg-config cmake openssl-devel \
+  libxcb-devel libxkbcommon-devel alsa-lib-devel clang-devel \
+  gtk3-devel pango-devel atk-devel gdk-pixbuf2-devel
+```
+
+Install Rust if you haven't already:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### Clone & Build
+
+GitTerm depends on a custom `iced_term` fork that needs to be cloned alongside it:
+
+```bash
+git clone https://github.com/Tru-Insights/gitterm.git
+git clone https://github.com/Tru-Insights/iced_term.git iced_term_fork
+cd gitterm
+cargo build --release
+```
+
+Binary at: `target/release/gitterm`
+
+### Running
+
+```bash
+./target/release/gitterm
+```
+
 ## Cross-Platform Builds (GitHub Actions)
 
 ### Prerequisites
@@ -113,8 +163,9 @@ GitHub Actions will automatically build for all platforms on:
 - Rust toolchain with MSVC or GNU target
 
 ### Linux (if building locally)
-- Build essentials
-- libxcb, libxkbcommon, pkg-config
+- Build essentials, pkg-config, cmake
+- libxcb (shape, xfixes), libxkbcommon, libssl, libasound2, libclang
+- GTK3, Pango, ATK, GDK-Pixbuf (for file dialogs)
 - Rust toolchain
 
 ## Notes
