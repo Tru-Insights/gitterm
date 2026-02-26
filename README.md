@@ -61,11 +61,27 @@ GitTerm's integrated terminal works with your existing shell configuration. For 
 [Starship](https://starship.rs) is a fast, customizable prompt that shows git branch, package versions, language runtimes, cloud context, and more.
 
 ```bash
-# Install
+# macOS
 brew install starship
 
-# Add to ~/.zshrc (or ~/.bashrc)
-eval "$(starship init zsh)"
+# Linux
+curl -sS https://starship.rs/install.sh | sh
+
+# Windows
+winget install starship
+```
+
+Add to your shell config:
+
+```bash
+# ~/.zshrc or ~/.bashrc
+eval "$(starship init zsh)"    # zsh
+eval "$(starship init bash)"   # bash
+```
+
+```powershell
+# PowerShell profile (~\Documents\PowerShell\Microsoft.PowerShell_profile.ps1)
+Invoke-Expression (&starship init powershell)
 ```
 
 ### Agent Presets
