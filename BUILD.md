@@ -30,7 +30,8 @@ sudo apt-get install -y \
   libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
   libssl-dev libasound2-dev libclang-dev \
   libglib2.0-dev libgtk-3-dev libpango1.0-dev \
-  libatk1.0-dev libgdk-pixbuf2.0-dev
+  libatk1.0-dev libgdk-pixbuf2.0-dev \
+  libsoup-3.0-dev libwebkit2gtk-4.1-dev libxdo-dev
 ```
 
 For Fedora/RHEL:
@@ -164,8 +165,9 @@ GitHub Actions will automatically build for all platforms on:
 
 ### Linux (if building locally)
 - Build essentials, pkg-config, cmake
-- libxcb (shape, xfixes), libxkbcommon, libssl, libasound2, libclang
+- libxcb (shape, xfixes), libxkbcommon, libssl, libasound2, libclang, libxdo
 - GTK3, Pango, ATK, GDK-Pixbuf (for file dialogs)
+- libsoup-3.0, libwebkit2gtk-4.1 (for webview)
 - Rust toolchain
 
 ## Notes
