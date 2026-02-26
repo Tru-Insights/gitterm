@@ -45,9 +45,44 @@ open target/GitTerm.app
 - `Cmd+F` - Search terminal output
 - `Cmd+G` / `Cmd+Shift+G` - Next/previous search match
 - `Cmd+1-9` - Switch tabs
+- `Ctrl+1-9` - Switch workspaces
 - `Cmd++/-` - Increase/decrease terminal font
 - `Cmd+Shift++/-` - Increase/decrease UI font
+- `Option+Shift+1-9` - Launch agent preset by index
+- `Option+Shift+T` - Open folder picker
 - `j/k` - Navigate files (when viewing diff)
+
+## Recommended Shell Setup
+
+GitTerm's integrated terminal works with your existing shell configuration. For the best experience, we recommend:
+
+### Starship Prompt
+
+[Starship](https://starship.rs) is a fast, customizable prompt that shows git branch, package versions, language runtimes, cloud context, and more.
+
+```bash
+# Install
+brew install starship
+
+# Add to ~/.zshrc (or ~/.bashrc)
+eval "$(starship init zsh)"
+```
+
+### Agent Presets
+
+GitTerm ships with configurable AI coding agent presets. Option+click the `+` tab button to pick from your configured agents, or click `+` to launch the default. Presets are stored in `~/.config/gitterm/config.json`:
+
+```json
+{
+  "agent_presets": [
+    { "name": "Claude Code", "command": "claude", "resume_command": "claude --resume", "icon": "❯", "color": "peach" },
+    { "name": "Codex", "command": "codex", "resume_command": "codex resume", "icon": "≡", "color": "green" },
+    { "name": "Gemini", "command": "gemini", "resume_command": "gemini --resume", "icon": "G", "color": "blue" }
+  ]
+}
+```
+
+Available colors: `lavender`, `blue`, `green`, `peach`, `pink`, `yellow`, `red`, `teal`
 
 ## Building for Other Platforms
 
