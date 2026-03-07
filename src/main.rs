@@ -2907,6 +2907,13 @@ pub enum Event {
     WorkspaceClose(usize),
     WorkspaceCreate,
     WorkspaceCreated(Option<PathBuf>),
+    WorkspaceSettingsOpen(usize),
+    WorkspaceSettingsClose,
+    WorkspaceSettingsNewKeyChanged(String),
+    WorkspaceSettingsNewValueChanged(String),
+    WorkspaceSettingsEnvAdd,
+    WorkspaceSettingsEnvRemove(String),
+    WorkspaceSettingsColorChange(WorkspaceColor),
     // Slide animation events
     SlideAnimationTick,
     // Edge peek events
@@ -3022,6 +3029,11 @@ struct App {
     current_modifiers: Modifiers,
     // Help modal
     show_help: bool,
+    // Workspace settings modal
+    workspace_settings_open: bool,
+    workspace_settings_idx: usize,
+    workspace_settings_new_key: String,
+    workspace_settings_new_value: String,
     // Tab picker popup (Option+click on "+")
     tab_picker_visible: bool,
     // Configured agent presets
@@ -3773,6 +3785,10 @@ impl App {
             attention_pulse_bright: false,
             current_modifiers: Modifiers::empty(),
             show_help: false,
+            workspace_settings_open: false,
+            workspace_settings_idx: 0,
+            workspace_settings_new_key: String::new(),
+            workspace_settings_new_value: String::new(),
             tab_picker_visible: false,
             agent_presets: config.agent_presets.clone(),
             quick_commands: config.quick_commands.clone(),
@@ -5114,6 +5130,13 @@ fi
             }
             Event::KeyPressed(key, modifiers) => {
                 self.current_modifiers = modifiers;
+
+                // Workspace settings: Escape closes
+                if self.workspace_settings_open && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    self.workspace_settings_open = false;
+                    return Task::none();
+                }
 
                 // Tab picker: Escape closes
                 if self.tab_picker_visible && matches!(key.as_ref(), Key::Named(key::Named::Escape))
@@ -6583,6 +6606,51 @@ fi
                 }
             }
             Event::WorkspaceCreated(None) => {}
+            Event::WorkspaceSettingsOpen(idx) => {
+                self.workspace_settings_open = true;
+                self.workspace_settings_idx = idx;
+                self.workspace_settings_new_key = String::new();
+                self.workspace_settings_new_value = String::new();
+            }
+            Event::WorkspaceSettingsClose => {
+                self.workspace_settings_open = false;
+            }
+            Event::WorkspaceSettingsNewKeyChanged(s) => {
+                self.workspace_settings_new_key = s;
+            }
+            Event::WorkspaceSettingsNewValueChanged(s) => {
+                self.workspace_settings_new_value = s;
+            }
+            Event::WorkspaceSettingsEnvAdd => {
+                let key = self.workspace_settings_new_key.trim().to_string();
+                let val = self.workspace_settings_new_value.trim().to_string();
+                if !key.is_empty() {
+                    let idx = self.workspace_settings_idx;
+                    if let Some(ws) = self.workspaces.get_mut(idx) {
+                        ws.env.insert(key, val);
+                    }
+                    self.workspace_settings_new_key = String::new();
+                    self.workspace_settings_new_value = String::new();
+                    self.workspaces_dirty = true;
+                    self.next_workspace_save_at = Some(Instant::now());
+                }
+            }
+            Event::WorkspaceSettingsEnvRemove(key) => {
+                let idx = self.workspace_settings_idx;
+                if let Some(ws) = self.workspaces.get_mut(idx) {
+                    ws.env.remove(&key);
+                }
+                self.workspaces_dirty = true;
+                self.next_workspace_save_at = Some(Instant::now());
+            }
+            Event::WorkspaceSettingsColorChange(color) => {
+                let idx = self.workspace_settings_idx;
+                if let Some(ws) = self.workspaces.get_mut(idx) {
+                    ws.color = color;
+                }
+                self.workspaces_dirty = true;
+                self.next_workspace_save_at = Some(Instant::now());
+            }
             // Console panel events
             Event::ConsoleToggle => {
                 self.console_expanded = !self.console_expanded;
@@ -6921,6 +6989,13 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        } else if self.workspace_settings_open {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_workspace_settings_modal())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else if self.tab_picker_visible {
             Stack::new()
                 .push(main_view)
@@ -7204,6 +7279,239 @@ fi
         .into()
     }
 
+    fn view_workspace_settings_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let bg_surface = theme.bg_surface();
+        let bg_base = theme.bg_base();
+        let border_color = theme.border();
+        let bg_crust = theme.bg_crust();
+        let accent = theme.accent();
+        let danger = theme.danger();
+        let mono = iced::Font::with_name("Menlo");
+
+        let idx = self.workspace_settings_idx;
+        let ws = match self.workspaces.get(idx) {
+            Some(w) => w,
+            None => {
+                return container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+            }
+        };
+
+        // --- Title ---
+        let title = text(format!("Workspace: {}", ws.name))
+            .size(16)
+            .color(text_primary);
+
+        // --- Color swatches ---
+        let mut color_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        color_row = color_row.push(
+            text("Color:").size(12).color(text_secondary).font(mono),
+        );
+        for c in WorkspaceColor::ALL {
+            let swatch_color = c.color(theme);
+            let is_selected = ws.color == c;
+            let border_width = if is_selected { 2.0 } else { 0.0 };
+            let border_c = if is_selected { accent } else { iced::Color::TRANSPARENT };
+            color_row = color_row.push(
+                button(iced::widget::Space::new())
+                    .width(Length::Fixed(18.0))
+                    .height(Length::Fixed(18.0))
+                    .style(move |_, _| button::Style {
+                        background: Some(swatch_color.into()),
+                        border: iced::Border {
+                            color: border_c,
+                            width: border_width,
+                            radius: 9.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .on_press(Event::WorkspaceSettingsColorChange(c)),
+            );
+        }
+
+        // --- Env vars table ---
+        let section_label = text("Environment Variables")
+            .size(12)
+            .color(accent)
+            .font(mono);
+
+        let mut env_col = Column::new().spacing(4);
+
+        // Header row
+        env_col = env_col.push(
+            row![
+                container(text("KEY").size(11).color(text_muted).font(mono))
+                    .width(Length::Fixed(180.0)),
+                text("VALUE").size(11).color(text_muted).font(mono),
+            ]
+            .spacing(8),
+        );
+
+        // Existing entries (sorted for stable display)
+        let mut env_entries: Vec<(&String, &String)> = ws.env.iter().collect();
+        env_entries.sort_by_key(|(k, _)| k.as_str());
+
+        for (key, val) in env_entries {
+            let k = key.clone();
+            let remove_btn = button(
+                text("✕").size(10).color(danger).font(mono),
+            )
+            .style(move |_, _| button::Style {
+                background: Some(iced::Color::TRANSPARENT.into()),
+                ..Default::default()
+            })
+            .padding([1, 4])
+            .on_press(Event::WorkspaceSettingsEnvRemove(k));
+
+            env_col = env_col.push(
+                row![
+                    container(
+                        text(key.as_str()).size(12).color(text_primary).font(mono)
+                    )
+                    .width(Length::Fixed(180.0)),
+                    text(val.as_str()).size(12).color(text_secondary).font(mono),
+                    iced::widget::Space::new().width(Length::Fill),
+                    remove_btn,
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+
+        // Add new row
+        let input_style = move |_theme: &Theme, _status: text_input::Status| text_input::Style {
+            background: bg_base.into(),
+            border: iced::Border {
+                width: 1.0,
+                color: border_color,
+                radius: 3.0.into(),
+            },
+            icon: iced::Color::TRANSPARENT,
+            placeholder: theme.overlay0(),
+            value: text_primary,
+            selection: accent,
+        };
+
+        let key_input = text_input("KEY", &self.workspace_settings_new_key)
+            .on_input(Event::WorkspaceSettingsNewKeyChanged)
+            .on_submit(Event::WorkspaceSettingsEnvAdd)
+            .size(12)
+            .width(Length::Fixed(174.0))
+            .padding([4, 6])
+            .style(input_style);
+
+        let val_input = text_input("VALUE", &self.workspace_settings_new_value)
+            .on_input(Event::WorkspaceSettingsNewValueChanged)
+            .on_submit(Event::WorkspaceSettingsEnvAdd)
+            .size(12)
+            .width(Length::Fixed(200.0))
+            .padding([4, 6])
+            .style(input_style);
+
+        let add_btn = button(
+            text("Add").size(12).color(accent).font(mono),
+        )
+        .style(move |_, status| button::Style {
+            background: Some(
+                if matches!(status, button::Status::Hovered) {
+                    theme.surface0()
+                } else {
+                    iced::Color::TRANSPARENT
+                }
+                .into(),
+            ),
+            border: iced::Border {
+                color: accent,
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..Default::default()
+        })
+        .padding([4, 10])
+        .on_press(Event::WorkspaceSettingsEnvAdd);
+
+        env_col = env_col.push(
+            row![key_input, val_input, add_btn]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+        );
+
+        // --- Close button ---
+        let close_btn = button(
+            text("Close").size(12).color(text_secondary).font(mono),
+        )
+        .style(move |_, status| button::Style {
+            background: Some(
+                if matches!(status, button::Status::Hovered) {
+                    bg_surface
+                } else {
+                    iced::Color::TRANSPARENT
+                }
+                .into(),
+            ),
+            border: iced::Border {
+                color: border_color,
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..Default::default()
+        })
+        .padding([4, 14])
+        .on_press(Event::WorkspaceSettingsClose);
+
+        let note = text("Changes apply to new terminal sessions")
+            .size(11)
+            .color(text_muted);
+
+        // --- Compose card ---
+        let card_content = column![
+            title,
+            container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
+            color_row,
+            container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
+            section_label,
+            container(iced::widget::Space::new()).height(Length::Fixed(6.0)),
+            scrollable(env_col).height(Length::Fixed(200.0)),
+            container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
+            row![note, iced::widget::Space::new().width(Length::Fill), close_btn]
+                .align_y(iced::Alignment::Center),
+        ]
+        .padding([24, 28])
+        .spacing(0);
+
+        let card = container(card_content)
+            .max_width(560)
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+
+        let backdrop_color = iced::Color { a: 0.8, ..bg_crust };
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop_color.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
     fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mut bar_row = Row::new().spacing(0).align_y(iced::Alignment::Center);
@@ -7257,6 +7565,31 @@ fi
                 .font(iced::Font::with_name("Menlo"));
 
             let mut btn_content = row![dot, label].spacing(6).align_y(iced::Alignment::Center);
+
+            // Gear icon button for active workspace settings
+            if is_active {
+                let gear_color = theme.overlay0();
+                let gear_hover = theme.text_secondary();
+                let gear_btn = button(
+                    text("⚙")
+                        .size(10)
+                        .color(gear_color)
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .style(move |_theme, status| button::Style {
+                    background: Some(iced::Color::TRANSPARENT.into()),
+                    text_color: if matches!(status, button::Status::Hovered) {
+                        gear_hover
+                    } else {
+                        gear_color
+                    },
+                    border: iced::Border::default(),
+                    ..Default::default()
+                })
+                .padding([0, 4])
+                .on_press(Event::WorkspaceSettingsOpen(idx));
+                btn_content = btn_content.push(gear_btn);
+            }
 
             // Attention/error badge
             if has_error {
