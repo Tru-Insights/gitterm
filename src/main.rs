@@ -1526,7 +1526,7 @@ impl ConsoleState {
         self.status == ConsoleStatus::Running
     }
 
-    fn spawn_process(&mut self, dir: &Path) {
+    fn spawn_process_with_env(&mut self, dir: &Path, extra_env: &[(String, String)]) {
         let cmd_str = match &self.run_command {
             Some(cmd) => cmd.clone(),
             None => return,
@@ -1544,6 +1544,7 @@ impl ConsoleState {
         self.stopped_at = None;
 
         let dir = dir.to_path_buf();
+        let extra_env = extra_env.to_vec();
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1562,6 +1563,10 @@ impl ConsoleState {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+
+            for (key, value) in &extra_env {
+                cmd.env(key, value);
+            }
 
             // Spawn in its own process group so we can kill the entire tree
             #[cfg(unix)]
@@ -3906,7 +3911,7 @@ impl App {
     }
 
     fn add_tab_to_workspace(&mut self, workspace: &mut Workspace, repo_path: PathBuf) {
-        let tab = self.create_tab(repo_path, None);
+        let tab = self.create_tab_for_workspace(repo_path, None, Some(&workspace.name.clone()));
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
     }
@@ -3918,7 +3923,7 @@ impl App {
         current_dir: Option<PathBuf>,
         startup_command: Option<String>,
     ) {
-        let mut tab = self.create_tab(repo_path.clone(), startup_command);
+        let mut tab = self.create_tab_for_workspace(repo_path.clone(), startup_command, Some(&workspace.name.clone()));
         if let Some(dir) = current_dir {
             tab.current_dir = dir;
         } else {
@@ -4102,9 +4107,23 @@ fi
     }
 
     fn create_tab(&mut self, repo_path: PathBuf, startup_command: Option<String>) -> TabState {
-        // Collect workspace env vars to inject into the terminal session
-        let extra_env: Vec<(String, String)> = self.active_workspace()
-            .map(|ws| ws.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        self.create_tab_for_workspace(repo_path, startup_command, None)
+    }
+
+    fn create_tab_for_workspace(&mut self, repo_path: PathBuf, startup_command: Option<String>, workspace_name: Option<&str>) -> TabState {
+        // Read env fresh from the global workspaces.json. Caller passes the workspace name
+        // explicitly so this works correctly during init (before active_workspace is set).
+        let ws_name = workspace_name
+            .map(|s| s.to_string())
+            .or_else(|| self.active_workspace().map(|ws| ws.name.clone()));
+        let global_ws_path = config::global_config_dir().join("workspaces.json");
+        let extra_env: Vec<(String, String)> = ws_name
+            .and_then(|name| {
+                std::fs::read_to_string(&global_ws_path).ok()
+                    .and_then(|s| serde_json::from_str::<WorkspacesFile>(&s).ok())
+                    .and_then(|f| f.workspaces.into_iter().find(|w| w.name == name))
+            })
+            .map(|cfg| cfg.env.into_iter().collect())
             .unwrap_or_default();
         let extra_env_refs: Vec<(&str, &str)> = extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
@@ -4134,6 +4153,18 @@ fi
     }
 
     fn create_bottom_terminal(&mut self, cwd: PathBuf) -> BottomTerminal {
+        let ws_name = self.active_workspace().map(|ws| ws.name.clone());
+        let global_ws_path = config::global_config_dir().join("workspaces.json");
+        let extra_env: Vec<(String, String)> = ws_name
+            .and_then(|name| {
+                std::fs::read_to_string(&global_ws_path).ok()
+                    .and_then(|s| serde_json::from_str::<WorkspacesFile>(&s).ok())
+                    .and_then(|f| f.workspaces.into_iter().find(|w| w.name == name))
+            })
+            .map(|cfg| cfg.env.into_iter().collect())
+            .unwrap_or_default();
+        let extra_env_refs: Vec<(&str, &str)> = extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let settings = Self::build_terminal_settings(
@@ -4142,7 +4173,7 @@ fi
             self.scrollback_lines,
             &self.theme,
             self.terminal_font_size,
-            &[],
+            &extra_env_refs,
         );
         let terminal = iced_term::Terminal::new(id as u64, settings)
             .ok()
@@ -6574,7 +6605,8 @@ fi
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
                     ws.console.detected_url = None;
-                    ws.console.spawn_process(&dir);
+                    let env: Vec<(String, String)> = ws.env.iter().map(|(k,v)| (k.clone(), v.clone())).collect();
+                    ws.console.spawn_process_with_env(&dir, &env);
                 }
                 self.console_expanded = true;
             }
@@ -6592,7 +6624,8 @@ fi
                         .active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
-                    ws.console.spawn_process(&dir);
+                    let env: Vec<(String, String)> = ws.env.iter().map(|(k,v)| (k.clone(), v.clone())).collect();
+                    ws.console.spawn_process_with_env(&dir, &env);
                 }
                 self.console_expanded = true;
             }
