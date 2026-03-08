@@ -3,3 +3,10 @@
 .claude/settings.local.json
 .claude/.claude/
 test-refresh.txt
+
+AppleDump.rtf
+CHECKPOINT.md
+FREEZE_ANALYSIS.md
+MULTI_INSTANCE.md
+test_multi_instance.sh
+.pi/

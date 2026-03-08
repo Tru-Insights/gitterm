@@ -344,7 +344,7 @@ pub struct BottomTerminalConfig {
 
 impl WorkspacesFile {
     pub fn file_path() -> PathBuf {
-        instance_config_dir().join("workspaces.json")
+        global_config_dir().join("workspaces.json")
     }
 
     pub fn load() -> Option<Self> {

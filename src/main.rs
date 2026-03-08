@@ -2914,6 +2914,7 @@ pub enum Event {
     WorkspaceSettingsEnvAdd,
     WorkspaceSettingsEnvRemove(String),
     WorkspaceSettingsColorChange(WorkspaceColor),
+    WorkspaceSettingsApplyProfile(String),
     // Slide animation events
     SlideAnimationTick,
     // Edge peek events
@@ -3386,6 +3387,21 @@ impl App {
             active_workspace: self.active_workspace_idx,
         };
         ws_file.save();
+    }
+
+    /// Load workspace profiles from ~/.config/gitterm/profiles.json
+    /// Returns a map of profile_name -> env vars
+    fn load_profiles() -> Option<HashMap<String, HashMap<String, String>>> {
+        let path = config::global_config_dir().join("profiles.json");
+        let contents = std::fs::read_to_string(&path).ok()?;
+        #[derive(serde::Deserialize)]
+        struct Profile {
+            #[allow(dead_code)]
+            description: Option<String>,
+            env: HashMap<String, String>,
+        }
+        let profiles: HashMap<String, Profile> = serde_json::from_str(&contents).ok()?;
+        Some(profiles.into_iter().map(|(name, p)| (name, p.env)).collect())
     }
 
     fn mark_workspaces_dirty(&mut self) {
@@ -4388,7 +4404,6 @@ fi
                     }
                 }
                 let mut pending_task: Option<Task<Event>> = None;
-                let mut workspace_dirty = false;
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
@@ -4413,7 +4428,6 @@ fi
                                 if let Some(dir) = TabState::extract_dir_from_title(&title) {
                                     if dir != tab.current_dir {
                                         tab.current_dir = dir.clone();
-                                        workspace_dirty = true;
                                         pending_task = Some(Self::request_file_tree(
                                             tab.id,
                                             dir.clone(),
@@ -4445,9 +4459,6 @@ fi
                             _ => {}
                         }
                     }
-                }
-                if workspace_dirty {
-                    self.mark_workspaces_dirty();
                 }
                 self.mark_log_server_dirty();
                 if let Some(task) = pending_task {
@@ -6651,6 +6662,18 @@ fi
                 self.workspaces_dirty = true;
                 self.next_workspace_save_at = Some(Instant::now());
             }
+            Event::WorkspaceSettingsApplyProfile(profile_name) => {
+                let idx = self.workspace_settings_idx;
+                if let Some(ws) = self.workspaces.get_mut(idx) {
+                    if let Some(profiles) = Self::load_profiles() {
+                        if let Some(profile) = profiles.get(&profile_name) {
+                            ws.env = profile.clone();
+                        }
+                    }
+                }
+                self.workspaces_dirty = true;
+                self.next_workspace_save_at = Some(Instant::now());
+            }
             // Console panel events
             Event::ConsoleToggle => {
                 self.console_expanded = !self.console_expanded;
@@ -7335,6 +7358,72 @@ fi
             );
         }
 
+        // --- Profile selector ---
+        let profiles = Self::load_profiles();
+        let mut profile_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        profile_row = profile_row.push(
+            text("Profile:").size(12).color(text_secondary).font(mono),
+        );
+
+        if let Some(ref profiles) = profiles {
+            // Detect which profile is currently active (all keys match)
+            let current_profile = profiles.iter().find_map(|(name, env)| {
+                if !env.is_empty() && env.iter().all(|(k, v)| ws.env.get(k) == Some(v)) {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            });
+
+            let mut profile_names: Vec<&String> = profiles.keys().collect();
+            profile_names.sort();
+
+            for name in profile_names {
+                let is_active = current_profile == Some(name.as_str());
+                let name_label = name.clone();
+                let name_event = name.clone();
+                let btn_accent = accent;
+                let btn_border = if is_active { accent } else { border_color };
+                let btn_bg = if is_active { accent } else { iced::Color::TRANSPARENT };
+                let btn_text_color = if is_active { bg_base } else { text_primary };
+
+                profile_row = profile_row.push(
+                    button(
+                        text(name_label).size(11).color(btn_text_color).font(mono),
+                    )
+                    .style(move |_, status| button::Style {
+                        background: Some(
+                            if is_active {
+                                btn_bg
+                            } else if matches!(status, button::Status::Hovered) {
+                                btn_accent
+                            } else {
+                                btn_bg
+                            }
+                            .into(),
+                        ),
+                        text_color: if !is_active && matches!(status, button::Status::Hovered) {
+                            bg_base
+                        } else {
+                            btn_text_color
+                        },
+                        border: iced::Border {
+                            color: btn_border,
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .padding([3, 10])
+                    .on_press(Event::WorkspaceSettingsApplyProfile(name_event)),
+                );
+            }
+        } else {
+            profile_row = profile_row.push(
+                text("No profiles.json found").size(11).color(text_muted).font(mono),
+            );
+        }
+
         // --- Env vars table ---
         let section_label = text("Environment Variables")
             .size(12)
@@ -7474,6 +7563,8 @@ fi
             title,
             container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
             color_row,
+            container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
+            profile_row,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             section_label,
             container(iced::widget::Space::new()).height(Length::Fixed(6.0)),
