@@ -81,6 +81,7 @@ fn start_freeze_watchdog() {
             let mut last_beat = 0u64;
             let mut stall_start: Option<std::time::Instant> = None;
             let mut backtrace_sent = false;
+            let mut log_count = 0u32;
             loop {
                 std::thread::sleep(Duration::from_millis(500));
                 let current = MAIN_THREAD_HEARTBEAT.load(std::sync::atomic::Ordering::Relaxed);
@@ -89,10 +90,15 @@ fn start_freeze_watchdog() {
                     if stall_start.is_none() {
                         stall_start = Some(std::time::Instant::now());
                         backtrace_sent = false;
+                        log_count = 0;
                     }
                     let elapsed = stall_start.unwrap().elapsed();
-                    if elapsed.as_secs() >= 2 {
-                        let event_name = MAIN_THREAD_LAST_EVENT.lock()
+
+                    // Log the first few stall messages, then go quiet
+                    if elapsed.as_secs() >= 2 && log_count < 10 {
+                        log_count += 1;
+                        let event_name = MAIN_THREAD_LAST_EVENT
+                            .lock()
                             .ok()
                             .and_then(|g| g.clone())
                             .unwrap_or_else(|| "unknown".to_string());
@@ -101,19 +107,39 @@ fn start_freeze_watchdog() {
                             elapsed.as_secs_f64(),
                             event_name
                         );
+                    }
 
-                        // Send SIGUSR1 to main thread once at 5s to capture backtrace
-                        #[cfg(unix)]
-                        if elapsed.as_secs() >= 5 && !backtrace_sent {
-                            backtrace_sent = true;
-                            let tid = MAIN_THREAD_ID.load(std::sync::atomic::Ordering::Relaxed);
-                            if tid != 0 {
-                                eprintln!("[FREEZE-WATCHDOG] Sending SIGUSR1 to main thread for backtrace...");
-                                unsafe {
-                                    libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1);
-                                }
+                    // Send SIGUSR1 at 5s to capture backtrace (once)
+                    #[cfg(unix)]
+                    if elapsed.as_secs() >= 5 && !backtrace_sent {
+                        backtrace_sent = true;
+                        let tid = MAIN_THREAD_ID.load(std::sync::atomic::Ordering::Relaxed);
+                        if tid != 0 {
+                            eprintln!(
+                                "\n[FREEZE-WATCHDOG] ========================================"
+                            );
+                            eprintln!("[FREEZE-WATCHDOG] Capturing backtrace via SIGUSR1...");
+                            eprintln!(
+                                "[FREEZE-WATCHDOG] ========================================\n"
+                            );
+                            unsafe {
+                                libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1);
                             }
+                            // Give the signal handler time to print before any more logs
+                            std::thread::sleep(Duration::from_secs(2));
                         }
+                    }
+
+                    // After 10 logs, only log every 60s
+                    if log_count >= 10 {
+                        let secs = elapsed.as_secs();
+                        if secs % 60 == 0 {
+                            eprintln!(
+                                "[FREEZE-WATCHDOG] Still stalled after {}m. Force quit to restart.",
+                                secs / 60
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(1500));
                     }
                 } else {
                     if let Some(start) = stall_start.take() {
@@ -3330,6 +3356,7 @@ impl App {
     }
 
     fn save_config(&self) {
+        let started = Instant::now();
         let config = Config {
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
@@ -3352,6 +3379,10 @@ impl App {
             quick_commands: self.quick_commands.clone(),
         };
         config.save();
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(25) {
+            freeze_debug!("save_config took {}ms", elapsed.as_millis());
+        }
     }
 
     fn save_workspaces(&self) {
@@ -3413,6 +3444,24 @@ impl App {
         self.workspaces_dirty = true;
         self.next_workspace_save_at =
             Some(Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS));
+    }
+
+    fn handle_terminal_backend_command(
+        term: &mut iced_term::Terminal,
+        cmd: iced_term::backend::Command,
+        context: &str,
+    ) -> iced_term::actions::Action {
+        let started = Instant::now();
+        let action = term.handle(iced_term::Command::ProxyToBackend(cmd));
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(25) {
+            freeze_debug!(
+                "terminal.handle in {} took {}ms",
+                context,
+                elapsed.as_millis(),
+            );
+        }
+        action
     }
 
     fn start_log_server(&self) {
@@ -4456,7 +4505,11 @@ fi
                         }
                     }
                     if let Some(term) = &mut tab.terminal {
-                        match term.handle(iced_term::Command::ProxyToBackend(cmd)) {
+                        match Self::handle_terminal_backend_command(
+                            term,
+                            cmd,
+                            "main_terminal_event",
+                        ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 // Set tab-specific title
@@ -4580,20 +4633,28 @@ fi
 
                 // Poll for native menu events
                 if let Ok(event) = MenuEvent::receiver().try_recv() {
+                    freeze_debug!("native menu event received: {:?}", event.id);
                     if let Some(ids) = MENU_IDS.get() {
                         if event.id == ids.increase_terminal_font {
+                            freeze_debug!("dispatching native menu: increase_terminal_font");
                             return self.update(Event::IncreaseTerminalFont);
                         } else if event.id == ids.decrease_terminal_font {
+                            freeze_debug!("dispatching native menu: decrease_terminal_font");
                             return self.update(Event::DecreaseTerminalFont);
                         } else if event.id == ids.increase_ui_font {
+                            freeze_debug!("dispatching native menu: increase_ui_font");
                             return self.update(Event::IncreaseUiFont);
                         } else if event.id == ids.decrease_ui_font {
+                            freeze_debug!("dispatching native menu: decrease_ui_font");
                             return self.update(Event::DecreaseUiFont);
                         } else if event.id == ids.toggle_theme {
+                            freeze_debug!("dispatching native menu: toggle_theme");
                             return self.update(Event::ToggleTheme);
                         } else if event.id == ids.toggle_log_server {
+                            freeze_debug!("dispatching native menu: toggle_log_server");
                             return self.update(Event::ToggleLogServer);
                         } else if event.id == ids.clear_terminal {
+                            freeze_debug!("dispatching native menu: clear_terminal");
                             return self.update(Event::ClearTerminal);
                         }
                     }
@@ -4876,9 +4937,11 @@ fi
                         if let BottomPanelTab::Terminal(bt_idx) = ws.active_bottom_tab {
                             if let Some(bt) = ws.bottom_terminals.get_mut(bt_idx) {
                                 if let Some(term) = &mut bt.terminal {
-                                    term.handle(iced_term::Command::ProxyToBackend(
+                                    Self::handle_terminal_backend_command(
+                                        term,
                                         iced_term::backend::Command::Write(cmd_bytes),
-                                    ));
+                                        "run_quick_command_bottom_terminal",
+                                    );
                                 }
                             }
                         }
@@ -5038,7 +5101,11 @@ fi
                     .find(|bt| bt.id == id)
                 {
                     if let Some(term) = &mut bt.terminal {
-                        match term.handle(iced_term::Command::ProxyToBackend(cmd)) {
+                        match Self::handle_terminal_backend_command(
+                            term,
+                            cmd,
+                            "bottom_terminal_event",
+                        ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 bt.title = Some(title);
@@ -5848,9 +5915,11 @@ fi
                 if let Some(tab) = self.active_tab_mut() {
                     if let Some(term) = &mut tab.terminal {
                         // Send the clear command to the terminal
-                        term.handle(iced_term::Command::ProxyToBackend(
+                        Self::handle_terminal_backend_command(
+                            term,
                             iced_term::backend::Command::Write(b"clear\n".to_vec()),
-                        ));
+                            "clear_terminal",
+                        );
                     }
                 }
             }
@@ -6477,9 +6546,11 @@ fi
                     // Inject transcribed text into the active tab's terminal
                     if let Some(tab) = self.active_tab_mut() {
                         if let Some(term) = &mut tab.terminal {
-                            term.handle(iced_term::Command::ProxyToBackend(
+                            Self::handle_terminal_backend_command(
+                                term,
                                 iced_term::backend::Command::Write(text.into_bytes()),
-                            ));
+                                "stt_transcript_inject",
+                            );
                         }
                     }
                 }
@@ -7003,10 +7074,13 @@ fi
     }
 
     fn recreate_terminals(&mut self) {
+        let started = Instant::now();
         // Pre-compute settings params to avoid borrow conflict with iter_mut
         let scrollback = self.scrollback_lines;
         let theme = self.theme;
         let font_size = self.terminal_font_size;
+        let mut recreated_main = 0usize;
+        let mut recreated_bottom = 0usize;
 
         for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
             let settings = Self::build_terminal_settings(
@@ -7023,6 +7097,7 @@ fi
                 ));
                 tab.terminal = Some(terminal);
                 tab.created_at = Instant::now();
+                recreated_main += 1;
             }
         }
 
@@ -7043,9 +7118,20 @@ fi
                         t.handle(iced_term::Command::AddBindings(
                             Self::standard_noop_bindings(),
                         ));
+                        recreated_bottom += 1;
                         t
                     });
             }
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(25) {
+            freeze_debug!(
+                "recreate_terminals took {}ms (main={}, bottom={})",
+                elapsed.as_millis(),
+                recreated_main,
+                recreated_bottom
+            );
         }
     }
 
