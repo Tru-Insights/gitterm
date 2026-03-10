@@ -4546,6 +4546,30 @@ fi
                                     }
                                 }
                             }
+                            iced_term::actions::Action::ClipboardStore(text) => {
+                                // OSC 52: program requested clipboard write
+                                pending_task = Some(iced::clipboard::write(text));
+                            }
+                            iced_term::actions::Action::ClipboardLoad(formatter) => {
+                                // OSC 52: program requested clipboard read.
+                                // Read clipboard, format the response, write back to PTY.
+                                let tid = tab_id;
+                                pending_task = Some(
+                                    iced::clipboard::read().map(move |content| {
+                                        let text = content.unwrap_or_default();
+                                        let response = formatter(&text);
+                                        Event::Terminal(
+                                            tid,
+                                            iced_term::Event::BackendCall(
+                                                tid as u64,
+                                                iced_term::backend::Command::Write(
+                                                    response.into_bytes(),
+                                                ),
+                                            ),
+                                        )
+                                    }),
+                                );
+                            }
                             _ => {}
                         }
                     }
@@ -5109,6 +5133,25 @@ fi
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 bt.title = Some(title);
+                            }
+                            iced_term::actions::Action::ClipboardStore(text) => {
+                                return iced::clipboard::write(text);
+                            }
+                            iced_term::actions::Action::ClipboardLoad(formatter) => {
+                                let tid = id;
+                                return iced::clipboard::read().map(move |content| {
+                                    let text = content.unwrap_or_default();
+                                    let response = formatter(&text);
+                                    Event::BottomTerminalEvent(
+                                        tid,
+                                        iced_term::Event::BackendCall(
+                                            tid as u64,
+                                            iced_term::backend::Command::Write(
+                                                response.into_bytes(),
+                                            ),
+                                        ),
+                                    )
+                                });
                             }
                             _ => {}
                         }
