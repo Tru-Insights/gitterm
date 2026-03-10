@@ -2902,6 +2902,7 @@ pub enum Event {
     // Window events
     WindowResized(f32, f32),
     WindowCloseRequested,
+    WindowFocused,
     // Workspace events
     WorkspaceSelect(usize),
     WorkspaceClose(usize),
@@ -4286,6 +4287,9 @@ fi
                 iced::Event::Window(iced::window::Event::CloseRequested) => {
                     Some(Event::WindowCloseRequested)
                 }
+                iced::Event::Window(iced::window::Event::Focused) => {
+                    Some(Event::WindowFocused)
+                }
                 _ => None,
             }),
         ];
@@ -4411,9 +4415,15 @@ fi
                     .find(|t| t.id == tab_id)
                 {
                     // Clear attention on user keyboard input (Write), not on process output (ProcessAlacrittyEvent)
-                    if matches!(&cmd, iced_term::backend::Command::Write(_)) && tab.needs_attention
-                    {
-                        tab.needs_attention = false;
+                    if matches!(&cmd, iced_term::backend::Command::Write(_)) {
+                        if tab.needs_attention {
+                            tab.needs_attention = false;
+                        }
+                        // Reset git poll to fast when user is actively typing
+                        if tab.git_poll_interval_ms > GIT_POLL_FAST_INTERVAL_MS {
+                            tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+                            tab.git_unchanged_streak = 0;
+                        }
                     }
                     if let Some(term) = &mut tab.terminal {
                         match term.handle(iced_term::Command::ProxyToBackend(cmd)) {
@@ -5964,6 +5974,28 @@ fi
                         iced::exit()
                     }
                 });
+            }
+            Event::WindowFocused => {
+                // Detect wake from sleep: if the last heartbeat was long ago,
+                // the system likely slept. Reset git polling and trigger refresh.
+                static LAST_FOCUS: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+                let was_sleeping = if let Ok(mut last) = LAST_FOCUS.lock() {
+                    let sleeping = last.map(|t| t.elapsed() > Duration::from_secs(300)).unwrap_or(false);
+                    *last = Some(std::time::Instant::now());
+                    sleeping
+                } else {
+                    false
+                };
+
+                if was_sleeping {
+                    freeze_debug!("WAKE RECOVERY: Window focused after sleep, refreshing state");
+                    // Reset git polling for active tab so it refreshes quickly
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+                        tab.git_unchanged_streak = 0;
+                        tab.last_poll = Instant::now() - Duration::from_secs(60);
+                    }
+                }
             }
             Event::WindowResized(width, height) => {
                 self.window_size = (width, height);
