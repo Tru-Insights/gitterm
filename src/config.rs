@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,8 +10,7 @@ static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 pub fn instance_id() -> &'static str {
     INSTANCE_ID.get_or_init(|| {
         // Allow override via environment variable for testing
-        std::env::var("GITTERM_INSTANCE_ID")
-            .unwrap_or_else(|_| std::process::id().to_string())
+        std::env::var("GITTERM_INSTANCE_ID").unwrap_or_else(|_| std::process::id().to_string())
     })
 }
 
@@ -36,7 +34,7 @@ pub fn print_instance_info() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_instance_id_generation() {
         let id = instance_id();
@@ -44,8 +42,8 @@ mod tests {
         // Should be consistent across calls
         assert_eq!(instance_id(), id);
     }
-    
-    #[test] 
+
+    #[test]
     fn test_instance_config_dir() {
         let dir = instance_config_dir();
         assert!(dir.to_string_lossy().contains("instance-"));
@@ -58,7 +56,11 @@ pub fn cleanup_instance_config() {
     let instance_dir = instance_config_dir();
     if instance_dir.exists() && instance_dir.to_string_lossy().contains(instance_id()) {
         let _ = std::fs::remove_dir_all(&instance_dir);
-        eprintln!("GitTerm instance {} cleaned up config: {}", instance_id(), instance_dir.display());
+        eprintln!(
+            "GitTerm instance {} cleaned up config: {}",
+            instance_id(),
+            instance_dir.display()
+        );
     }
 }
 

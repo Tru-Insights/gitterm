@@ -3,9 +3,9 @@ use crate::excalidraw;
 use crate::markdown;
 use crate::{
     add_word_diffs_to_lines, build_syntax_highlight_lines, format_bytes, read_text_preview,
-    DiffLine, DiffLineType, DiffSnapshot, FileEntry, FileLoadSnapshot,
-    FileSyntaxSnapshot, FileTreeEntry, FileTreeSnapshot, FileVersionSignature, GitStatusSnapshot,
-    TabState, LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES, MAX_FULL_TEXT_LOAD_BYTES,
+    DiffLine, DiffLineType, DiffSnapshot, FileEntry, FileLoadSnapshot, FileSyntaxSnapshot,
+    FileTreeEntry, FileTreeSnapshot, FileVersionSignature, GitStatusSnapshot, TabState,
+    LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES, MAX_FULL_TEXT_LOAD_BYTES,
     MAX_INLINE_WEBVIEW_BYTES,
 };
 use git2::{DiffOptions, Repository, Status, StatusOptions};
@@ -24,7 +24,7 @@ const MAX_UNTRACKED_DIFF_PREVIEW_LINES: usize = 3000;
 
 pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatusSnapshot {
     let started = Instant::now();
-    
+
     let mut snapshot = GitStatusSnapshot {
         tab_id,
         repo_name: repo_path
@@ -65,9 +65,9 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
         }
         Err(_) => return snapshot,
     };
-    
+
     snapshot.is_git_repo = true;
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         if line.starts_with("# branch.head ") {
@@ -80,16 +80,19 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
             // Changed entries: "1 XY sub mH mI mW hH hI path"
             // or rename:       "2 XY sub mH mI mW hH hI X### path\torigPath"
             let bytes = line.as_bytes();
-            if bytes.len() < 5 { continue; }
+            if bytes.len() < 5 {
+                continue;
+            }
             let index_status = bytes[2];
             let worktree_status = bytes[3];
-            
+
             // Path is the last space-separated field (field 9 for type 1, field 10 for type 2)
             // For type 1: split by space, take index 8+
             // For type 2: split by tab first to handle renames, then space
             let path = if line.starts_with("2 ") {
                 // Rename: "2 XY ... X### path\torigPath"
-                line.split('\t').next()
+                line.split('\t')
+                    .next()
                     .and_then(|before_tab| before_tab.rsplitn(2, ' ').next())
                     .unwrap_or("")
                     .to_string()
@@ -112,33 +115,47 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
                     continue;
                 }
             };
-            
-            if path.is_empty() { continue; }
-            
+
+            if path.is_empty() {
+                continue;
+            }
+
             // Staged changes (index column)
             match index_status {
                 b'A' => snapshot.staged.push(FileEntry {
-                    path: path.clone(), status: "A".to_string(), is_staged: true,
+                    path: path.clone(),
+                    status: "A".to_string(),
+                    is_staged: true,
                 }),
                 b'M' => snapshot.staged.push(FileEntry {
-                    path: path.clone(), status: "M".to_string(), is_staged: true,
+                    path: path.clone(),
+                    status: "M".to_string(),
+                    is_staged: true,
                 }),
                 b'D' => snapshot.staged.push(FileEntry {
-                    path: path.clone(), status: "D".to_string(), is_staged: true,
+                    path: path.clone(),
+                    status: "D".to_string(),
+                    is_staged: true,
                 }),
                 b'R' => snapshot.staged.push(FileEntry {
-                    path: path.clone(), status: "R".to_string(), is_staged: true,
+                    path: path.clone(),
+                    status: "R".to_string(),
+                    is_staged: true,
                 }),
                 _ => {}
             }
-            
+
             // Unstaged changes (worktree column)
             match worktree_status {
                 b'M' => snapshot.unstaged.push(FileEntry {
-                    path: path.clone(), status: "M".to_string(), is_staged: false,
+                    path: path.clone(),
+                    status: "M".to_string(),
+                    is_staged: false,
                 }),
                 b'D' => snapshot.unstaged.push(FileEntry {
-                    path: path.clone(), status: "D".to_string(), is_staged: false,
+                    path: path.clone(),
+                    status: "D".to_string(),
+                    is_staged: false,
                 }),
                 _ => {}
             }
@@ -146,12 +163,14 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
             // Untracked: "? path"
             let path = line[2..].to_string();
             snapshot.untracked.push(FileEntry {
-                path, status: "?".to_string(), is_staged: false,
+                path,
+                status: "?".to_string(),
+                is_staged: false,
             });
         }
         // Skip "u " (unmerged) and other header lines for now
     }
-    
+
     // Self-heal repo path: check if .git exists at repo_path, otherwise discover root
     if !repo_path.join(".git").exists() {
         if let Ok(toplevel_output) = std::process::Command::new("git")
@@ -160,11 +179,14 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
             .output()
         {
             if toplevel_output.status.success() {
-                let root = String::from_utf8_lossy(&toplevel_output.stdout).trim().to_string();
+                let root = String::from_utf8_lossy(&toplevel_output.stdout)
+                    .trim()
+                    .to_string();
                 let root_path = PathBuf::from(root);
                 if root_path != repo_path {
                     snapshot.repo_path = root_path;
-                    snapshot.repo_name = snapshot.repo_path
+                    snapshot.repo_name = snapshot
+                        .repo_path
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "repo".to_string());
@@ -182,19 +204,24 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
         snapshot.staged.len() + snapshot.unstaged.len() + snapshot.untracked.len(),
         elapsed.as_millis()
     );
-    
+
     if elapsed > std::time::Duration::from_millis(200) {
-        eprintln!("[FREEZE-DEBUG] Git status took {}ms for {} on thread '{}'", 
-                 elapsed.as_millis(), 
-                 repo_path.display(),
-                 std::thread::current().name().unwrap_or("unnamed"));
+        eprintln!(
+            "[FREEZE-DEBUG] Git status took {}ms for {} on thread '{}'",
+            elapsed.as_millis(),
+            repo_path.display(),
+            std::thread::current().name().unwrap_or("unnamed")
+        );
     }
 
     snapshot
 }
 
 /// Fallback git status collection using the git2 library, used when the `git` CLI is not found.
-fn collect_git_status_git2(mut snapshot: GitStatusSnapshot, repo_path: &std::path::Path) -> GitStatusSnapshot {
+fn collect_git_status_git2(
+    mut snapshot: GitStatusSnapshot,
+    repo_path: &std::path::Path,
+) -> GitStatusSnapshot {
     use crate::status_char;
     let Ok(repo) = Repository::open(repo_path).or_else(|_| Repository::discover(repo_path)) else {
         return snapshot;
@@ -222,7 +249,12 @@ fn collect_git_status_git2(mut snapshot: GitStatusSnapshot, repo_path: &std::pat
             let path = entry.path().unwrap_or("").to_string();
             let status = entry.status();
 
-            if status.intersects(Status::INDEX_NEW | Status::INDEX_MODIFIED | Status::INDEX_DELETED | Status::INDEX_RENAMED) {
+            if status.intersects(
+                Status::INDEX_NEW
+                    | Status::INDEX_MODIFIED
+                    | Status::INDEX_DELETED
+                    | Status::INDEX_RENAMED,
+            ) {
                 snapshot.staged.push(FileEntry {
                     path: path.clone(),
                     status: status_char(status, true),

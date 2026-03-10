@@ -53,17 +53,17 @@ fn find_available_port() -> Option<u16> {
         .parse::<u32>()
         .unwrap_or(0)
         .rem_euclid(100) as u16; // Limit to 100 to avoid going too high
-    
+
     let base_port = 3030 + (instance_id * 10);
     let port_range = base_port..(base_port + 10);
-    
+
     // Try instance-specific range first
     for port in port_range {
         if port < 65535 && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return Some(port);
         }
     }
-    
+
     // Fallback: let OS assign a port
     std::net::TcpListener::bind("127.0.0.1:0")
         .ok()

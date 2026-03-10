@@ -107,7 +107,10 @@ impl AgentCapture {
     }
 
     pub fn total_files(&self) -> usize {
-        self.files.read.len() + self.files.modified.len() + self.files.created.len() + self.files.deleted.len()
+        self.files.read.len()
+            + self.files.modified.len()
+            + self.files.created.len()
+            + self.files.deleted.len()
     }
 
     pub fn primary_model(&self) -> Option<(&String, &ModelUsage)> {
@@ -160,7 +163,8 @@ impl AgentCapture {
     }
 
     pub fn commit_message_short(&self) -> Option<&str> {
-        self.message.as_deref()
+        self.message
+            .as_deref()
             .filter(|m| !m.is_empty())
             .map(|m| m.lines().next().unwrap_or(m))
     }
@@ -198,7 +202,11 @@ impl AgentCapture {
             parts.join(" ")
         } else {
             let f = self.total_files();
-            if f > 0 { format!("{}f", f) } else { String::new() }
+            if f > 0 {
+                format!("{}f", f)
+            } else {
+                String::new()
+            }
         }
     }
 }
@@ -208,7 +216,6 @@ pub struct AgentActivity {
     pub captures: Vec<AgentCapture>,
     pub total_cost: f64,
     pub total_commits: usize,
-
 }
 
 impl AgentActivity {
@@ -222,16 +229,17 @@ impl AgentActivity {
 
     pub fn load_from_repo(repo_path: &Path) -> Result<Self, String> {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let captures_base = Path::new(&home).join(".config").join("gitterm").join("captures");
-        
+        let captures_base = Path::new(&home)
+            .join(".config")
+            .join("gitterm")
+            .join("captures");
+
         let repo_name = repo_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
-        
-        let log_path = captures_base
-            .join(repo_name)
-            .join("log.jsonl");
+
+        let log_path = captures_base.join(repo_name).join("log.jsonl");
 
         if !log_path.exists() {
             return Ok(Self::new());
@@ -245,7 +253,7 @@ impl AgentActivity {
             if line.trim().is_empty() {
                 continue;
             }
-            
+
             match serde_json::from_str::<AgentCapture>(line) {
                 Ok(capture) => captures.push(capture),
                 Err(e) => eprintln!("Failed to parse capture line: {}", e),
@@ -271,21 +279,24 @@ impl AgentActivity {
     /// Fill in missing commit messages from git log (batch lookup)
     fn enrich_commit_messages(captures: &mut [AgentCapture], repo_path: &Path) {
         // Collect hashes that need messages
-        let needs_message: Vec<usize> = captures.iter().enumerate()
+        let needs_message: Vec<usize> = captures
+            .iter()
+            .enumerate()
             .filter(|(_, c)| c.message.as_ref().map_or(true, |m| m.is_empty()))
             .map(|(i, _)| i)
             .collect();
-        
+
         if needs_message.is_empty() {
             return;
         }
 
         // Batch: ask git for all commit messages at once using --stdin
-        // Format: one hash per line, get back "hash subject" 
-        let hashes: Vec<&str> = needs_message.iter()
+        // Format: one hash per line, get back "hash subject"
+        let hashes: Vec<&str> = needs_message
+            .iter()
             .map(|&i| captures[i].commit_hash.as_str())
             .collect();
-        
+
         // Use git log with format to get hash + subject for each
         if let Ok(output) = std::process::Command::new("git")
             .args(["log", "--format=%h %s", "--no-walk"])
@@ -295,8 +306,9 @@ impl AgentActivity {
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut message_map: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-                
+                let mut message_map: std::collections::HashMap<&str, &str> =
+                    std::collections::HashMap::new();
+
                 for line in stdout.lines() {
                     if let Some(space_pos) = line.find(' ') {
                         let hash = &line[..space_pos];
@@ -304,7 +316,7 @@ impl AgentActivity {
                         message_map.insert(hash, msg);
                     }
                 }
-                
+
                 // Apply messages back to captures
                 for &idx in &needs_message {
                     let short_hash = captures[idx].short_hash();
@@ -321,10 +333,11 @@ impl AgentActivity {
         &self.captures[..end]
     }
 
-
-
     pub fn live_capture_count(&self) -> usize {
-        self.captures.iter().filter(|c| !c.is_reconstructed()).count()
+        self.captures
+            .iter()
+            .filter(|c| !c.is_reconstructed())
+            .count()
     }
 
     pub fn format_total_cost(&self) -> String {
@@ -344,10 +357,7 @@ pub enum ConversationEntry {
     /// User prompt text
     User { text: String },
     /// Assistant text response (may be partial — one per text block)
-    Assistant {
-        text: String,
-        model: String,
-    },
+    Assistant { text: String, model: String },
     /// Assistant called a tool
     ToolCall {
         tool: String,
@@ -356,7 +366,7 @@ pub enum ConversationEntry {
     /// Tool result
     ToolResult {
         tool: String,
-        output: String,    // truncated
+        output: String, // truncated
         is_error: bool,
     },
     /// Compaction summary (context was compressed)
@@ -376,10 +386,12 @@ impl Conversation {
     pub fn load_for_capture(capture: &AgentCapture) -> Self {
         let session_ref = match &capture.session_ref {
             Some(r) => r,
-            None => return Self {
-                entries: Vec::new(),
-                error: Some("No session reference (git-only commit)".to_string()),
-            },
+            None => {
+                return Self {
+                    entries: Vec::new(),
+                    error: Some("No session reference (git-only commit)".to_string()),
+                }
+            }
         };
 
         let session_path = Path::new(&session_ref.file);
@@ -392,28 +404,32 @@ impl Conversation {
 
         let content = match fs::read_to_string(session_path) {
             Ok(c) => c,
-            Err(e) => return Self {
-                entries: Vec::new(),
-                error: Some(format!("Failed to read session: {}", e)),
-            },
+            Err(e) => {
+                return Self {
+                    entries: Vec::new(),
+                    error: Some(format!("Failed to read session: {}", e)),
+                }
+            }
         };
 
         let start_id = &session_ref.entry_range[0];
         let end_id = &session_ref.entry_range[1];
-        
+
         let mut entries = Vec::new();
         let mut in_range = start_id.is_empty();
 
         for line in content.lines() {
-            if line.trim().is_empty() { continue; }
-            
+            if line.trim().is_empty() {
+                continue;
+            }
+
             let parsed: Value = match serde_json::from_str(line) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
 
             let entry_id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            
+
             if !in_range {
                 if entry_id == start_id {
                     in_range = true;
@@ -436,17 +452,26 @@ impl Conversation {
                                 }
                             }
                             "assistant" => {
-                                let model = msg.get("model")
+                                let model = msg
+                                    .get("model")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
 
-                                if let Some(content) = msg.get("content").and_then(|v| v.as_array()) {
+                                if let Some(content) = msg.get("content").and_then(|v| v.as_array())
+                                {
                                     for block in content {
-                                        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                        let block_type = block
+                                            .get("type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
                                         match block_type {
                                             "text" => {
-                                                let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                let text = block
+                                                    .get("text")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
                                                 if !text.trim().is_empty() {
                                                     entries.push(ConversationEntry::Assistant {
                                                         text,
@@ -455,16 +480,31 @@ impl Conversation {
                                                 }
                                             }
                                             "thinking" => {
-                                                let text = block.get("thinking").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                let text = block
+                                                    .get("thinking")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
                                                 if !text.trim().is_empty() {
-                                                    entries.push(ConversationEntry::Thinking { text });
+                                                    entries
+                                                        .push(ConversationEntry::Thinking { text });
                                                 }
                                             }
                                             "toolCall" => {
-                                                let tool = block.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                                                let args = block.get("arguments").cloned().unwrap_or(Value::Null);
+                                                let tool = block
+                                                    .get("name")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("?")
+                                                    .to_string();
+                                                let args = block
+                                                    .get("arguments")
+                                                    .cloned()
+                                                    .unwrap_or(Value::Null);
                                                 let summary = summarize_tool_call(&tool, &args);
-                                                entries.push(ConversationEntry::ToolCall { tool, summary });
+                                                entries.push(ConversationEntry::ToolCall {
+                                                    tool,
+                                                    summary,
+                                                });
                                             }
                                             _ => {}
                                         }
@@ -472,11 +512,15 @@ impl Conversation {
                                 }
                             }
                             "toolResult" => {
-                                let tool = msg.get("toolName")
+                                let tool = msg
+                                    .get("toolName")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("?")
                                     .to_string();
-                                let is_error = msg.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let is_error = msg
+                                    .get("isError")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
                                 let output = extract_text_content(msg);
                                 // Truncate long output for display
                                 let output = if output.len() > 500 {
@@ -484,14 +528,19 @@ impl Conversation {
                                 } else {
                                     output
                                 };
-                                entries.push(ConversationEntry::ToolResult { tool, output, is_error });
+                                entries.push(ConversationEntry::ToolResult {
+                                    tool,
+                                    output,
+                                    is_error,
+                                });
                             }
                             _ => {}
                         }
                     }
                 }
                 "compaction" => {
-                    let summary = parsed.get("summary")
+                    let summary = parsed
+                        .get("summary")
                         .and_then(|v| v.as_str())
                         .unwrap_or("(context compacted)")
                         .to_string();
@@ -505,7 +554,10 @@ impl Conversation {
             }
         }
 
-        Self { entries, error: None }
+        Self {
+            entries,
+            error: None,
+        }
     }
 }
 
@@ -516,7 +568,8 @@ fn extract_text_content(msg: &Value) -> String {
             return s.to_string();
         }
         if let Some(arr) = content.as_array() {
-            let texts: Vec<&str> = arr.iter()
+            let texts: Vec<&str> = arr
+                .iter()
                 .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
                 .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
                 .collect();
