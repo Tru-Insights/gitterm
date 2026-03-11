@@ -161,19 +161,70 @@ fn start_freeze_watchdog() {
 /// Signal handler: prints backtrace when SIGUSR1 is received on the main thread.
 /// This runs IN the frozen main thread's context, so the backtrace shows exactly
 /// where it's stuck.
+///
+/// IMPORTANT: This handler must be async-signal-safe. No heap allocation allowed!
+/// `std::backtrace::Backtrace` and `format!()` allocate, so if the signal arrives
+/// while the thread is inside malloc, it would deadlock/crash with
+/// "BUG IN LIBMALLOC: ulock_wait failure".
+///
+/// Instead we use `libc::backtrace()` to capture raw frame pointers into a
+/// stack-allocated buffer, then write hex addresses to stderr with `libc::write()`.
+/// The addresses can be symbolicated later with:
+///   atos -o target/release/gitterm -l 0x<load_addr> <addr1> <addr2> ...
 #[cfg(unix)]
 extern "C" fn freeze_backtrace_handler(_sig: libc::c_int) {
-    // Signal handlers must be async-signal-safe. write() to stderr is safe.
-    // std::backtrace::Backtrace is NOT signal-safe, but for debugging a freeze
-    // it's acceptable — the thread is already stuck.
-    let bt = std::backtrace::Backtrace::force_capture();
-    let msg = format!(
-        "\n[FREEZE-WATCHDOG] === MAIN THREAD BACKTRACE ===\n{}\n[FREEZE-WATCHDOG] === END BACKTRACE ===\n",
-        bt
-    );
-    // Use raw write to avoid any locking in eprintln
     unsafe {
-        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        // All buffers on the stack — zero heap allocation
+        let mut frames: [*mut libc::c_void; 128] = [std::ptr::null_mut(); 128];
+        let n = libc::backtrace(frames.as_mut_ptr(), 128);
+
+        let header = b"\n[FREEZE-WATCHDOG] === MAIN THREAD BACKTRACE (raw frames) ===\n";
+        libc::write(2, header.as_ptr() as *const libc::c_void, header.len());
+
+        // Write each frame address as hex, one per line
+        // Format: "  [NN] 0xHHHHHHHHHHHHHHHH\n"
+        let hex_chars = b"0123456789abcdef";
+        for i in 0..n as usize {
+            let addr = frames[i] as usize;
+            // Build line in stack buffer: "  [NN] 0x________________\n"
+            let mut line: [u8; 32] = [b' '; 32];
+            // Frame index
+            line[2] = b'[';
+            if i >= 100 {
+                line[3] = hex_chars[(i / 100) % 10];
+                line[4] = hex_chars[(i / 10) % 10];
+                line[5] = hex_chars[i % 10];
+                line[6] = b']';
+                line[7] = b' ';
+                line[8] = b'0';
+                line[9] = b'x';
+            } else if i >= 10 {
+                line[3] = hex_chars[(i / 10) % 10];
+                line[4] = hex_chars[i % 10];
+                line[5] = b']';
+                line[6] = b' ';
+                line[7] = b'0';
+                line[8] = b'x';
+            } else {
+                line[3] = hex_chars[i % 10];
+                line[4] = b']';
+                line[5] = b' ';
+                line[6] = b'0';
+                line[7] = b'x';
+            }
+            // Write 16 hex digits for the address (always 64-bit)
+            let hex_start = if i >= 100 { 10 } else if i >= 10 { 9 } else { 8 };
+            for digit in 0..16 {
+                let nibble = (addr >> (60 - digit * 4)) & 0xf;
+                line[hex_start + digit] = hex_chars[nibble];
+            }
+            let line_len = hex_start + 16;
+            line[line_len] = b'\n';
+            libc::write(2, line.as_ptr() as *const libc::c_void, line_len + 1);
+        }
+
+        let footer = b"[FREEZE-WATCHDOG] === END BACKTRACE ===\n\n";
+        libc::write(2, footer.as_ptr() as *const libc::c_void, footer.len());
     }
 }
 
