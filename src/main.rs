@@ -2928,6 +2928,7 @@ pub enum Event {
     WindowResized(f32, f32),
     WindowCloseRequested,
     WindowFocused,
+    WindowUnfocused,
     // Workspace events
     WorkspaceSelect(usize),
     WorkspaceClose(usize),
@@ -3069,6 +3070,8 @@ struct App {
     quick_commands: Vec<QuickCommand>,
     // Quick commands picker visibility
     quick_commands_visible: bool,
+    // Track whether the window has focus (skip terminal processing when unfocused)
+    window_focused: bool,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
     bottom_panel_focused: bool,
     workspaces_dirty: bool,
@@ -3450,9 +3453,16 @@ impl App {
         term: &mut iced_term::Terminal,
         cmd: iced_term::backend::Command,
         context: &str,
+        window_focused: bool,
     ) -> iced_term::actions::Action {
         let started = Instant::now();
-        let action = term.handle(iced_term::Command::ProxyToBackend(cmd));
+        let action = if window_focused {
+            term.handle(iced_term::Command::ProxyToBackend(cmd))
+        } else {
+            // Skip expensive sync/redraw when window is not visible.
+            // Avoids font cache cold-start stalls during sleep/wake cycles.
+            term.handle_no_redraw(iced_term::Command::ProxyToBackend(cmd))
+        };
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(25) {
             freeze_debug!(
@@ -3866,6 +3876,7 @@ impl App {
             agent_presets: config.agent_presets.clone(),
             quick_commands: config.quick_commands.clone(),
             quick_commands_visible: false,
+            window_focused: true,
             bottom_panel_focused: false,
             workspaces_dirty: false,
             next_workspace_save_at: None,
@@ -4361,6 +4372,7 @@ fi
                     Some(Event::WindowCloseRequested)
                 }
                 iced::Event::Window(iced::window::Event::Focused) => Some(Event::WindowFocused),
+                iced::Event::Window(iced::window::Event::Unfocused) => Some(Event::WindowUnfocused),
                 _ => None,
             }),
         ];
@@ -4450,6 +4462,7 @@ fi
                 }
             }
             Event::Terminal(tab_id, iced_term::Event::BackendCall(_, cmd)) => {
+                let focused = self.window_focused;
                 // Main terminal received input — it has focus
                 if matches!(&cmd, iced_term::backend::Command::Write(_)) {
                     self.bottom_panel_focused = false;
@@ -4509,6 +4522,7 @@ fi
                             term,
                             cmd,
                             "main_terminal_event",
+                            focused,
                         ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
@@ -4965,6 +4979,7 @@ fi
                                         term,
                                         iced_term::backend::Command::Write(cmd_bytes),
                                         "run_quick_command_bottom_terminal",
+                                        true, // user-initiated, always redraw
                                     );
                                 }
                             }
@@ -5095,6 +5110,7 @@ fi
                 }
             }
             Event::BottomTerminalEvent(id, iced_term::Event::BackendCall(_, cmd)) => {
+                let focused = self.window_focused;
                 // Bottom terminal received input — it has focus
                 if matches!(&cmd, iced_term::backend::Command::Write(_)) {
                     self.bottom_panel_focused = true;
@@ -5129,6 +5145,7 @@ fi
                             term,
                             cmd,
                             "bottom_terminal_event",
+                            focused,
                         ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
@@ -5962,6 +5979,7 @@ fi
                             term,
                             iced_term::backend::Command::Write(b"clear\n".to_vec()),
                             "clear_terminal",
+                            true, // user-initiated, always redraw
                         );
                     }
                 }
@@ -6130,7 +6148,28 @@ fi
                     }
                 });
             }
+            Event::WindowUnfocused => {
+                self.window_focused = false;
+            }
             Event::WindowFocused => {
+                self.window_focused = true;
+
+                // Sync all terminals that may have been updated while unfocused
+                for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
+                    if let Some(term) = &mut tab.terminal {
+                        term.sync_and_redraw();
+                    }
+                }
+                for bt in self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.bottom_terminals.iter_mut())
+                {
+                    if let Some(term) = &mut bt.terminal {
+                        term.sync_and_redraw();
+                    }
+                }
+
                 // Detect wake from sleep: if the last heartbeat was long ago,
                 // the system likely slept. Reset git polling and trigger refresh.
                 static LAST_FOCUS: std::sync::Mutex<Option<std::time::Instant>> =
@@ -6593,6 +6632,7 @@ fi
                                 term,
                                 iced_term::backend::Command::Write(text.into_bytes()),
                                 "stt_transcript_inject",
+                                true, // user-initiated, always redraw
                             );
                         }
                     }
