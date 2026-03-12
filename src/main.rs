@@ -268,7 +268,7 @@ macro_rules! freeze_time {
         let _start = std::time::Instant::now();
         let result = $block;
         let _elapsed = _start.elapsed();
-        if _elapsed > Duration::from_millis(50) {
+        if _elapsed > Duration::from_millis(100) {
             freeze_debug!("{} took {}ms", $label, _elapsed.as_millis());
         }
         result
@@ -3434,7 +3434,7 @@ impl App {
         };
         config.save();
         let elapsed = started.elapsed();
-        if elapsed > Duration::from_millis(25) {
+        if elapsed > Duration::from_millis(100) {
             freeze_debug!("save_config took {}ms", elapsed.as_millis());
         }
     }
@@ -3515,7 +3515,7 @@ impl App {
             term.handle_no_redraw(iced_term::Command::ProxyToBackend(cmd))
         };
         let elapsed = started.elapsed();
-        if elapsed > Duration::from_millis(25) {
+        if elapsed > Duration::from_millis(100) {
             freeze_debug!(
                 "terminal.handle in {} took {}ms",
                 context,
