@@ -328,6 +328,14 @@ pub struct WorkspaceConfig {
     /// "env": { "LINEAR_WORKSPACE": "truinsights", "LINEAR_TEAM": "TRU", "GH_TOKEN": "..." }
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Whether this workspace is currently open. Closed workspaces are kept in
+    /// workspaces.json so their env vars and settings are preserved for reopening.
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

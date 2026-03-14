@@ -3125,6 +3125,9 @@ struct App {
     window_focused: bool,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
     bottom_panel_focused: bool,
+    /// Configs for workspaces that were closed but whose settings (env, color, etc.)
+    /// should be preserved in workspaces.json for reopening later.
+    closed_workspace_configs: Vec<WorkspaceConfig>,
     workspaces_dirty: bool,
     next_workspace_save_at: Option<Instant>,
     log_server_dirty: bool,
@@ -3440,35 +3443,48 @@ impl App {
     }
 
     fn save_workspaces(&self) {
+        // Active workspaces from runtime state
+        let mut configs: Vec<WorkspaceConfig> = self
+            .workspaces
+            .iter()
+            .map(|ws| WorkspaceConfig {
+                name: ws.name.clone(),
+                abbrev: ws.abbrev.clone(),
+                dir: ws.dir.to_string_lossy().to_string(),
+                color: ws.color,
+                tabs: ws
+                    .tabs
+                    .iter()
+                    .map(|tab| WorkspaceTabConfig {
+                        dir: tab.current_dir.to_string_lossy().to_string(),
+                        repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
+                        startup_command: tab.startup_command.clone(),
+                    })
+                    .collect(),
+                run_command: ws.console.run_command.clone(),
+                bottom_terminals: ws
+                    .bottom_terminals
+                    .iter()
+                    .map(|bt| BottomTerminalConfig {
+                        dir: bt.cwd.to_string_lossy().to_string(),
+                    })
+                    .collect(),
+                env: ws.env.clone(),
+                active: true,
+            })
+            .collect();
+
+        // Append closed workspace configs so their env/settings survive
+        // (skip any whose dir matches an active workspace — it was reopened)
+        for closed in &self.closed_workspace_configs {
+            let already_active = configs.iter().any(|c| c.dir == closed.dir);
+            if !already_active {
+                configs.push(closed.clone());
+            }
+        }
+
         let ws_file = WorkspacesFile {
-            workspaces: self
-                .workspaces
-                .iter()
-                .map(|ws| WorkspaceConfig {
-                    name: ws.name.clone(),
-                    abbrev: ws.abbrev.clone(),
-                    dir: ws.dir.to_string_lossy().to_string(),
-                    color: ws.color,
-                    tabs: ws
-                        .tabs
-                        .iter()
-                        .map(|tab| WorkspaceTabConfig {
-                            dir: tab.current_dir.to_string_lossy().to_string(),
-                            repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
-                            startup_command: tab.startup_command.clone(),
-                        })
-                        .collect(),
-                    run_command: ws.console.run_command.clone(),
-                    bottom_terminals: ws
-                        .bottom_terminals
-                        .iter()
-                        .map(|bt| BottomTerminalConfig {
-                            dir: bt.cwd.to_string_lossy().to_string(),
-                        })
-                        .collect(),
-                    env: ws.env.clone(),
-                })
-                .collect(),
+            workspaces: configs,
             active_workspace: self.active_workspace_idx,
         };
         ws_file.save();
@@ -3929,6 +3945,7 @@ impl App {
             quick_commands_visible: false,
             window_focused: true,
             bottom_panel_focused: false,
+            closed_workspace_configs: Vec::new(),
             workspaces_dirty: false,
             next_workspace_save_at: None,
             log_server_dirty: log_server_enabled,
@@ -3957,6 +3974,12 @@ impl App {
         // Try to restore workspaces from saved config
         if let Some(ws_file) = WorkspacesFile::load() {
             for ws_config in &ws_file.workspaces {
+                // Keep closed workspaces in memory so their env/color/settings
+                // are preserved in workspaces.json and restored on reopen.
+                if !ws_config.active {
+                    app.closed_workspace_configs.push(ws_config.clone());
+                    continue;
+                }
                 let dir = PathBuf::from(&ws_config.dir);
                 let home = std::env::var("HOME").unwrap_or_default();
                 // If workspace dir is $HOME, name the workspace after its first tab's repo instead
@@ -6820,6 +6843,20 @@ fi
             Event::WorkspaceClose(idx) => {
                 webview::set_visible(false);
                 if idx < self.workspaces.len() && self.workspaces.len() > 1 {
+                    // Stash the workspace config (env, color, etc.) before removing,
+                    // so it's preserved in workspaces.json for reopening later.
+                    let ws = &self.workspaces[idx];
+                    self.closed_workspace_configs.push(WorkspaceConfig {
+                        name: ws.name.clone(),
+                        abbrev: ws.abbrev.clone(),
+                        dir: ws.dir.to_string_lossy().to_string(),
+                        color: ws.color,
+                        tabs: Vec::new(), // Don't preserve tabs for closed workspaces
+                        run_command: ws.console.run_command.clone(),
+                        bottom_terminals: Vec::new(),
+                        env: ws.env.clone(),
+                        active: false,
+                    });
                     // Kill console process before removing workspace
                     self.workspaces[idx].console.kill_process();
                     self.workspaces.remove(idx);
@@ -6861,14 +6898,38 @@ fi
                 );
             }
             Event::WorkspaceCreated(Some(path)) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Workspace".to_string());
-                let used_colors: Vec<WorkspaceColor> =
-                    self.workspaces.iter().map(|ws| ws.color).collect();
-                let color = WorkspaceColor::next_available(&used_colors);
+                let dir_str = path.to_string_lossy().to_string();
+
+                // Check if there's a closed workspace config for this directory
+                // and restore its settings (env, color, name, etc.)
+                let saved = self
+                    .closed_workspace_configs
+                    .iter()
+                    .position(|c| c.dir == dir_str)
+                    .map(|i| self.closed_workspace_configs.remove(i));
+
+                let name = saved
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| {
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Workspace".to_string())
+                    });
+                let color = saved.as_ref().map(|c| c.color).unwrap_or_else(|| {
+                    let used_colors: Vec<WorkspaceColor> =
+                        self.workspaces.iter().map(|ws| ws.color).collect();
+                    WorkspaceColor::next_available(&used_colors)
+                });
                 let mut workspace = Workspace::new(name, path.clone(), color);
+                if let Some(ref cfg) = saved {
+                    workspace.abbrev = cfg.abbrev.clone();
+                    workspace.env = cfg.env.clone();
+                    if let Some(cmd) = &cfg.run_command {
+                        workspace.console.run_command = Some(cmd.clone());
+                        workspace.console.status = ConsoleStatus::Stopped;
+                    }
+                }
                 self.add_tab_to_workspace_with_command(
                     &mut workspace,
                     path,
