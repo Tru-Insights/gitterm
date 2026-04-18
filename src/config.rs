@@ -260,7 +260,7 @@ impl Default for Config {
             terminal_font_size: 14.0,
             ui_font_size: 13.0,
             sidebar_width: 280.0,
-            scrollback_lines: 100_000,
+            scrollback_lines: 30_000,
             font_size: None,
             theme: "dark".to_string(),
             show_hidden: false,
