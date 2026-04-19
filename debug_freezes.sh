@@ -13,7 +13,7 @@ echo
 export GITTERM_DEBUG_FREEZES=1
 
 echo "Building GitTerm with debug logging..."
-if cargo build --release; then
+if cargo build --release --features stt; then
     echo "Build successful!"
     echo
     echo "Running GitTerm with freeze debugging enabled..."
