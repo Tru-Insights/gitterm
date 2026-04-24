@@ -2224,7 +2224,8 @@ impl TabState {
 
             // Get file statuses
             let mut opts = StatusOptions::new();
-            opts.include_untracked(true)
+            opts.no_refresh(true)
+                .include_untracked(true)
                 .recurse_untracked_dirs(true)
                 .include_ignored(false);
 

@@ -236,7 +236,8 @@ fn collect_git_status_git2(
     }
 
     let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
+    opts.no_refresh(true)
+        .include_untracked(true)
         .recurse_untracked_dirs(false)
         .include_ignored(false)
         .exclude_submodules(true)
@@ -359,8 +360,15 @@ pub(crate) fn collect_diff(
         return snapshot;
     };
 
+    // Use no_refresh + pathspec so status doesn't rewrite .git/index.lock
+    // (would contend with concurrent git commands) and only inspects this file.
+    let mut untracked_opts = StatusOptions::new();
+    untracked_opts
+        .no_refresh(true)
+        .include_untracked(true)
+        .pathspec(&file_path);
     let is_untracked = repo
-        .statuses(None)
+        .statuses(Some(&mut untracked_opts))
         .ok()
         .map(|statuses| {
             statuses.iter().any(|e| {
