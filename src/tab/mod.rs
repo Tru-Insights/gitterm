@@ -1,20 +1,31 @@
 //! Tab content kinds.
 //!
-//! Today there is one variant: `Terminal` (with an optional file viewer overlay). Step 2
-//! (TRU-29) will add an `Agent` variant for Claude Code / pi-backed conversational tabs.
+//! Today there are two variants: `Terminal` (with an optional file viewer overlay)
+//! and `Agent` (Claude Code or pi-backed conversational tab — data shape only at
+//! this step; subprocess plumbing lands in Step 3).
 //!
 //! `TabState` itself lives in `main.rs` because it's tightly coupled to many in-binary
 //! helpers (file load, syntax highlight, git status, claude config). Only the tab-kind
 //! data structures live here.
+
+mod agent;
+
+// Re-exports. Some are used immediately (config persistence, TabKind variants); others
+// (AgentEvent, AgentSessionState, AgentBackend) are surfaced now so the type lives in
+// crate::tab::*, but won't be referenced from main.rs until Steps 3 and 4 wire them up.
+#[allow(unused_imports)]
+pub(crate) use agent::{
+    AgentBackend, AgentBackendConfig, AgentEvent, AgentSession, AgentSessionState,
+};
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use iced::widget::image;
 
-use crate::agent;
 use crate::FileVersionSignature;
 use crate::SyntaxHighlightLine;
+use crate::agent as agent_log;
 
 /// File viewer state attached to a Terminal tab while the user is viewing a file.
 /// Closing the file (Back / Close button) drops this back to None and reveals the terminal.
@@ -82,17 +93,21 @@ impl TerminalTab {
     }
 }
 
-/// Tab content kind. Today there is only `Terminal`; Step 2 (TRU-29) adds `Agent`.
+/// Tab content kind. Terminal tabs run a shell (with an optional file viewer overlay);
+/// Agent tabs host a Claude Code or pi conversation in a wry webview.
 pub(crate) enum TabKind {
     Terminal(TerminalTab),
+    Agent(AgentSession),
 }
 
 /// Cross-cutting agent-activity sidebar state. Lives on every tab regardless of kind because
 /// any tab can have its sidebar set to `SidebarMode::Agent` and view captures from this repo.
+/// Note: this is the *captured-log viewer* (reads on-disk JSONL captures) — it predates
+/// the live agent tab kind in `TabKind::Agent` and is separate state.
 #[derive(Default)]
 pub(crate) struct AgentActivityState {
-    pub(crate) activity: Option<agent::AgentActivity>,
+    pub(crate) activity: Option<agent_log::AgentActivity>,
     pub(crate) loading: bool,
     pub(crate) selected_capture_idx: Option<usize>,
-    pub(crate) conversation: Option<agent::Conversation>,
+    pub(crate) conversation: Option<agent_log::Conversation>,
 }

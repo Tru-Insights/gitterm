@@ -38,7 +38,9 @@ mod events;
 mod tab;
 mod theme;
 
-use tab::{AgentActivityState, FileViewerOverlay, TabKind, TerminalTab};
+use tab::{
+    AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
+};
 
 // Start with just config for now to avoid conflicts
 use config::{
@@ -1890,23 +1892,30 @@ impl TabState {
     }
 
     // ---- Tab-kind accessors -------------------------------------------------
+    //
+    // Agent tabs don't have a terminal, terminal title, startup command, or file
+    // viewer overlay — these accessors all return None / no-op for that variant.
+    // The Agent variant has its own state in `AgentSession`; see `agent_session()`.
 
     /// The terminal widget if this is a terminal tab and a terminal has been spawned.
     fn terminal(&self) -> Option<&iced_term::Terminal> {
         match &self.kind {
             TabKind::Terminal(tt) => tt.terminal.as_ref(),
+            TabKind::Agent(_) => None,
         }
     }
 
     fn terminal_mut(&mut self) -> Option<&mut iced_term::Terminal> {
         match &mut self.kind {
             TabKind::Terminal(tt) => tt.terminal.as_mut(),
+            TabKind::Agent(_) => None,
         }
     }
 
     fn set_terminal(&mut self, terminal: iced_term::Terminal) {
         match &mut self.kind {
             TabKind::Terminal(tt) => tt.terminal = Some(terminal),
+            TabKind::Agent(_) => {}
         }
     }
 
@@ -1914,12 +1923,14 @@ impl TabState {
     fn terminal_title(&self) -> Option<&str> {
         match &self.kind {
             TabKind::Terminal(tt) => tt.terminal_title.as_deref(),
+            TabKind::Agent(_) => None,
         }
     }
 
     fn set_terminal_title(&mut self, title: Option<String>) {
         match &mut self.kind {
             TabKind::Terminal(tt) => tt.terminal_title = title,
+            TabKind::Agent(_) => {}
         }
     }
 
@@ -1927,12 +1938,14 @@ impl TabState {
     fn startup_command(&self) -> Option<&str> {
         match &self.kind {
             TabKind::Terminal(tt) => tt.startup_command.as_deref(),
+            TabKind::Agent(_) => None,
         }
     }
 
     fn set_startup_command(&mut self, cmd: Option<String>) {
         match &mut self.kind {
             TabKind::Terminal(tt) => tt.startup_command = cmd,
+            TabKind::Agent(_) => {}
         }
     }
 
@@ -1940,12 +1953,14 @@ impl TabState {
     fn file_viewer(&self) -> Option<&FileViewerOverlay> {
         match &self.kind {
             TabKind::Terminal(tt) => tt.file_viewer.as_ref(),
+            TabKind::Agent(_) => None,
         }
     }
 
     fn file_viewer_mut(&mut self) -> Option<&mut FileViewerOverlay> {
         match &mut self.kind {
             TabKind::Terminal(tt) => tt.file_viewer.as_mut(),
+            TabKind::Agent(_) => None,
         }
     }
 
@@ -1954,20 +1969,23 @@ impl TabState {
         self.file_viewer().map(|fv| fv.path.as_path())
     }
 
-    /// Open (or replace) a file viewer overlay on this tab. The caller is responsible
+    /// Open (or replace) a file viewer overlay on this tab. Returns `None` for
+    /// agent tabs (which don't host file viewers in v1). The caller is responsible
     /// for kicking off the actual file load — this just clears prior overlay state.
-    fn open_file_viewer(&mut self, path: PathBuf) -> &mut FileViewerOverlay {
+    fn open_file_viewer(&mut self, path: PathBuf) -> Option<&mut FileViewerOverlay> {
         match &mut self.kind {
             TabKind::Terminal(tt) => {
                 tt.file_viewer = Some(FileViewerOverlay::for_path(path));
-                tt.file_viewer.as_mut().expect("just inserted")
+                Some(tt.file_viewer.as_mut().expect("just inserted"))
             }
+            TabKind::Agent(_) => None,
         }
     }
 
     fn close_file_viewer(&mut self) {
         match &mut self.kind {
             TabKind::Terminal(tt) => tt.file_viewer = None,
+            TabKind::Agent(_) => {}
         }
     }
 
@@ -1977,6 +1995,7 @@ impl TabState {
                 .last_view_request_path
                 .as_deref()
                 .zip(tt.last_view_request_at),
+            TabKind::Agent(_) => None,
         }
     }
 
@@ -1986,6 +2005,24 @@ impl TabState {
                 tt.last_view_request_path = path;
                 tt.last_view_request_at = at;
             }
+            TabKind::Agent(_) => {}
+        }
+    }
+
+    /// The agent session for an agent tab, if this is one.
+    #[allow(dead_code)] // Used in Step 3+
+    fn agent_session(&self) -> Option<&AgentSession> {
+        match &self.kind {
+            TabKind::Terminal(_) => None,
+            TabKind::Agent(s) => Some(s),
+        }
+    }
+
+    #[allow(dead_code)] // Used in Step 3+
+    fn agent_session_mut(&mut self) -> Option<&mut AgentSession> {
+        match &mut self.kind {
+            TabKind::Terminal(_) => None,
+            TabKind::Agent(s) => Some(s),
         }
     }
 
@@ -2117,7 +2154,10 @@ impl TabState {
     #[allow(dead_code)]
     fn load_file(&mut self, path: &PathBuf, is_dark_theme: bool) {
         // Reset / open the overlay so subsequent writes target a fresh state.
-        let fv = self.open_file_viewer(path.clone());
+        // No-op for agent tabs (which don't host file viewers in v1).
+        let Some(fv) = self.open_file_viewer(path.clone()) else {
+            return;
+        };
 
         let file_size = freeze_time!("file metadata check", {
             std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0)
@@ -3502,6 +3542,11 @@ impl App {
                         dir: tab.current_dir.to_string_lossy().to_string(),
                         repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
                         startup_command: tab.startup_command().map(String::from),
+                        tab_kind: match &tab.kind {
+                            TabKind::Terminal(_) => None, // omitted for backward compat
+                            TabKind::Agent(_) => Some("agent".to_string()),
+                        },
+                        agent_config: tab.agent_session().map(|s| s.config.clone()),
                     })
                     .collect(),
                 run_command: ws.console.run_command.clone(),
@@ -4066,12 +4111,52 @@ impl App {
                         } else {
                             repo_dir.clone()
                         };
-                        app.add_tab_to_workspace_with_command(
-                            &mut workspace,
-                            repo_dir,
-                            Some(current_dir),
-                            tab_config.startup_command.clone(),
-                        );
+                        match (
+                            tab_config.tab_kind.as_deref(),
+                            tab_config.agent_config.as_ref(),
+                        ) {
+                            (Some("agent"), Some(agent_config)) => {
+                                app.add_agent_tab_to_workspace(
+                                    &mut workspace,
+                                    repo_dir,
+                                    Some(current_dir),
+                                    agent_config.clone(),
+                                );
+                            }
+                            (Some("agent"), None) => {
+                                eprintln!(
+                                    "WARN: tab_kind=\"agent\" without agent_config; falling back to terminal tab for {}",
+                                    repo_dir.display()
+                                );
+                                app.add_tab_to_workspace_with_command(
+                                    &mut workspace,
+                                    repo_dir,
+                                    Some(current_dir),
+                                    tab_config.startup_command.clone(),
+                                );
+                            }
+                            (Some(other), _) if other != "terminal" => {
+                                eprintln!(
+                                    "WARN: unknown tab_kind={:?}; falling back to terminal tab for {}",
+                                    other,
+                                    repo_dir.display()
+                                );
+                                app.add_tab_to_workspace_with_command(
+                                    &mut workspace,
+                                    repo_dir,
+                                    Some(current_dir),
+                                    tab_config.startup_command.clone(),
+                                );
+                            }
+                            _ => {
+                                app.add_tab_to_workspace_with_command(
+                                    &mut workspace,
+                                    repo_dir,
+                                    Some(current_dir),
+                                    tab_config.startup_command.clone(),
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -4145,6 +4230,29 @@ impl App {
             startup_command,
             Some(&workspace.name.clone()),
         );
+        if let Some(dir) = current_dir {
+            tab.current_dir = dir;
+        } else {
+            tab.current_dir = repo_path;
+        }
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+    }
+
+    /// Construct an agent tab (no terminal, no shell). The subprocess for the
+    /// configured backend is not started here — Step 3 (TRU-29) will spawn it
+    /// when the user submits the first prompt.
+    fn add_agent_tab_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        repo_path: PathBuf,
+        current_dir: Option<PathBuf>,
+        config: AgentBackendConfig,
+    ) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let mut tab = TabState::new(id, repo_path.clone());
+        tab.kind = TabKind::Agent(AgentSession::new(config));
         if let Some(dir) = current_dir {
             tab.current_dir = dir;
         } else {
@@ -5942,9 +6050,11 @@ fi
                     tab.diff_syntax_notice = None;
                     {
                         // Open / replace the file viewer overlay; resets all overlay state.
-                        let fv = tab.open_file_viewer(path.clone());
-                        fv.load_in_progress = true;
-                        fv.load_started_at = Some(Instant::now());
+                        // No-op on agent tabs (which don't host file viewers in v1).
+                        if let Some(fv) = tab.open_file_viewer(path.clone()) {
+                            fv.load_in_progress = true;
+                            fv.load_started_at = Some(Instant::now());
+                        }
                     }
                     tab.set_last_view_request(Some(path.clone()), Some(Instant::now()));
                     request = Some((tab.id, path));

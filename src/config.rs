@@ -345,6 +345,15 @@ pub struct WorkspaceTabConfig {
     pub repo_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_command: Option<String>,
+    /// Tab kind discriminator. `None` or `Some("terminal")` means a terminal tab
+    /// (the implicit default — older `workspaces.json` files predate this field).
+    /// `Some("agent")` means a Claude Code / pi agent tab; see `agent_config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_kind: Option<String>,
+    /// Backend config for `tab_kind: "agent"`. Required when `tab_kind == Some("agent")`;
+    /// ignored otherwise. Schema: `{"backend": "pi"|"claude", ...backend-specific fields}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_config: Option<crate::tab::AgentBackendConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
