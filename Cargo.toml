@@ -18,6 +18,7 @@ rfd = "0.15"
 similar = "2.6"
 warp = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "process", "io-util", "macros"] }
+tokio-stream = "0.1"
 chrono = "0.4"
 libc = "0.2"
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }

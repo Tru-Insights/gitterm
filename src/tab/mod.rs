@@ -10,12 +10,13 @@
 
 mod agent;
 
-// Re-exports. Some are used immediately (config persistence, TabKind variants); others
-// (AgentEvent, AgentSessionState, AgentBackend) are surfaced now so the type lives in
-// crate::tab::*, but won't be referenced from main.rs until Steps 3 and 4 wire them up.
+// Re-exports. Step 3 of TRU-29 added the subprocess manager (`spawn_agent_task` and
+// `AgentTaskHandle`); Step 4 will wire the chat UI to the IPC handler and consume the
+// AgentEvent variants in earnest.
 #[allow(unused_imports)]
 pub(crate) use agent::{
-    AgentBackend, AgentBackendConfig, AgentEvent, AgentSession, AgentSessionState,
+    AgentBackend, AgentBackendConfig, AgentEvent, AgentInput, AgentSession, AgentSessionState,
+    AgentTaskHandle, spawn_agent_task,
 };
 
 use std::path::PathBuf;

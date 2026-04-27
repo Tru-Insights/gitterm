@@ -3112,6 +3112,19 @@ pub enum Event {
     LaunchAgentPreset(usize),
     // Resume agent preset session by index
     ResumeAgentPreset(usize),
+    // Live agent tab (TabKind::Agent) — Step 3 of TRU-29.
+    /// User submitted a prompt for the agent tab with this id.
+    AgentSubmitPrompt(usize, String),
+    /// User clicked the stop button on the agent tab with this id.
+    AgentStopRequested(usize),
+    /// One streaming event from the agent subprocess (Step 4 will refine the
+    /// payload once the parser lands; today every line arrives as `Other`).
+    AgentEventReceived(usize, tab::AgentEvent),
+    /// Step 3-only debug entry point: spawn an in-memory agent tab in the
+    /// active workspace, submit a hardcoded prompt, log events to stderr.
+    /// Bound to a hidden keyboard shortcut for verifying the subprocess
+    /// pipeline. Removed before Step 4 lands.
+    DebugSpawnAgentTab,
     // Quick commands (run in bottom terminal)
     RunQuickCommand(usize),
     ShowQuickCommands,
@@ -5158,6 +5171,139 @@ fi
                     return self.scroll_to_active_tab();
                 }
             }
+            Event::AgentSubmitPrompt(tab_id, prompt) => {
+                // Find the tab. If it's an Agent tab, ensure a subprocess
+                // manager is spawned (lazy on first prompt) and forward the
+                // prompt. The first spawn returns a Task that bridges the
+                // event channel into AgentEventReceived events for this tab.
+                let mut bridge: Option<tokio::sync::mpsc::UnboundedReceiver<tab::AgentEvent>> =
+                    None;
+                'outer_submit: for ws in &mut self.workspaces {
+                    for t in &mut ws.tabs {
+                        if t.id != tab_id {
+                            continue;
+                        }
+                        let repo_path = t.repo_path.clone();
+                        let Some(session) = t.agent_session_mut() else {
+                            eprintln!(
+                                "AgentSubmitPrompt: tab {} is not an agent tab",
+                                tab_id
+                            );
+                            return Task::none();
+                        };
+                        if session.task_handle.is_none() {
+                            let handle =
+                                tab::spawn_agent_task(session.config.clone(), repo_path);
+                            // Take the receiver up-front so this turn can wire
+                            // it into a Task::run; it lives for the tab's lifetime.
+                            bridge = handle.take_event_receiver();
+                            session.task_handle = Some(handle);
+                        }
+                        if let Some(handle) = session.task_handle.as_ref() {
+                            if let Err(e) = handle.submit_prompt(prompt.clone()) {
+                                eprintln!("AgentSubmitPrompt failed: {}", e);
+                            } else {
+                                session.state = tab::AgentSessionState::Streaming;
+                            }
+                        }
+                        break 'outer_submit;
+                    }
+                }
+                if let Some(rx) = bridge {
+                    use tokio_stream::wrappers::UnboundedReceiverStream;
+                    let stream = UnboundedReceiverStream::new(rx);
+                    return Task::run(stream, move |ev| {
+                        Event::AgentEventReceived(tab_id, ev)
+                    });
+                }
+                return Task::none();
+            }
+            Event::AgentStopRequested(tab_id) => {
+                for ws in &mut self.workspaces {
+                    for t in &mut ws.tabs {
+                        if t.id == tab_id {
+                            if let Some(session) = t.agent_session_mut() {
+                                if let Some(handle) = session.task_handle.as_ref() {
+                                    handle.request_stop();
+                                }
+                                session.state = tab::AgentSessionState::Stopped;
+                            }
+                            return Task::none();
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Event::AgentEventReceived(tab_id, ev) => {
+                // Step 3 just appends to the conversation buffer and logs to
+                // stderr for the debug-spawn flow. Step 4 will push live to
+                // the webview when the tab is the active one.
+                eprintln!("[agent tab={}] event: {:?}", tab_id, ev);
+                for ws in &mut self.workspaces {
+                    for t in &mut ws.tabs {
+                        if t.id == tab_id {
+                            if let Some(session) = t.agent_session_mut() {
+                                // Heuristic state transition until Step 4 lands a
+                                // proper parser: a `done`/`stopped` sentinel flips
+                                // back to Idle; everything else implies Streaming.
+                                if let tab::AgentEvent::Other(value) = &ev {
+                                    if let Some(t) = value.get("type").and_then(|v| v.as_str()) {
+                                        if t == "done" {
+                                            session.state = tab::AgentSessionState::Idle;
+                                        } else if t == "stopped" {
+                                            session.state = tab::AgentSessionState::Stopped;
+                                        }
+                                    }
+                                }
+                                session.conversation.push(ev);
+                            }
+                            return Task::none();
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Event::DebugSpawnAgentTab => {
+                // Step 3-only: spawn a pi-backed agent tab in the active workspace
+                // and submit a hardcoded prompt so we can verify the subprocess
+                // pipeline end-to-end. Removed before Step 4 lands.
+                let model = std::env::var("PI_MODEL")
+                    .unwrap_or_else(|_| "openai-codex/gpt-5.4".to_string());
+                let session_path = format!(
+                    "/tmp/gitterm-agent-debug-{}.jsonl",
+                    std::process::id()
+                );
+                let config = tab::AgentBackendConfig::Pi {
+                    model,
+                    session_path: Some(session_path),
+                    thinking: None,
+                };
+                let (repo_path, current_dir) = match self.active_workspace() {
+                    Some(ws) => {
+                        let cd = ws
+                            .active_tab()
+                            .map(|t| t.current_dir.clone())
+                            .unwrap_or_else(|| ws.dir.clone());
+                        (ws.dir.clone(), Some(cd))
+                    }
+                    None => return Task::none(),
+                };
+
+                let id = self.next_tab_id;
+                self.next_tab_id += 1;
+                if let Some(ws) = self.active_workspace_mut() {
+                    let mut tab = TabState::new(id, repo_path.clone());
+                    tab.kind = TabKind::Agent(AgentSession::new(config));
+                    tab.current_dir = current_dir.unwrap_or(repo_path);
+                    ws.tabs.push(tab);
+                    ws.active_tab = ws.tabs.len() - 1;
+                }
+                eprintln!("[debug] spawned agent tab id={}", id);
+                return Task::done(Event::AgentSubmitPrompt(
+                    id,
+                    "say hi in five words".to_string(),
+                ));
+            }
             Event::ShowQuickCommands => {
                 if !self.quick_commands.is_empty() {
                     self.quick_commands_visible = true;
@@ -5585,6 +5731,11 @@ fi
                 // Console shortcuts (Cmd+J, Cmd+Shift+R) - before search shortcuts
                 if modifiers.command() {
                     if let Key::Character(c) = key.as_ref() {
+                        // TRU-29 Step 3 debug entry: Cmd+Shift+G spawns an agent tab
+                        // and submits a hardcoded prompt. Removed before Step 4 ships.
+                        if (c == "g" || c == "G") && modifiers.shift() {
+                            return Task::done(Event::DebugSpawnAgentTab);
+                        }
                         // Cmd+B - Toggle sidebar
                         if c == "b" && !modifiers.shift() {
                             return Task::done(Event::ToggleSidebar);
