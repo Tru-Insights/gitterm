@@ -1800,11 +1800,92 @@ fn detect_run_command(dir: &PathBuf) -> Option<String> {
 }
 
 // Tab state
+// File viewer state attached to a Terminal tab while the user is viewing a file.
+// Closing the file (Back / Close button) drops this back to None and reveals the terminal.
+struct FileViewerOverlay {
+    path: PathBuf,
+    file_content: String,
+    image_handle: Option<image::Handle>,
+    // Rendered HTML for markdown / excalidraw / .html files (driven through the wry webview).
+    webview_content: Option<String>,
+    // Optional notice shown in the viewer (e.g. large-file preview mode).
+    preview_notice: Option<String>,
+    syntax_highlight_lines: Option<Vec<SyntaxHighlightLine>>,
+    syntax_highlight_notice: Option<String>,
+    syntax_highlight_in_progress: bool,
+    syntax_highlight_requested_lines: usize,
+    loaded_signature: Option<FileVersionSignature>,
+    load_in_progress: bool,
+    load_started_at: Option<Instant>,
+}
+
+impl FileViewerOverlay {
+    fn for_path(path: PathBuf) -> Self {
+        Self {
+            path,
+            file_content: String::new(),
+            image_handle: None,
+            webview_content: None,
+            preview_notice: None,
+            syntax_highlight_lines: None,
+            syntax_highlight_notice: None,
+            syntax_highlight_in_progress: false,
+            syntax_highlight_requested_lines: 0,
+            loaded_signature: None,
+            load_in_progress: false,
+            load_started_at: None,
+        }
+    }
+}
+
+// Per-terminal-tab state. A terminal tab can optionally have a file viewer overlay
+// open on top of its terminal (modal-style); closing the overlay restores the terminal view.
+struct TerminalTab {
+    terminal: Option<iced_term::Terminal>,
+    // Terminal title (set by shell/programs via OSC escape codes).
+    terminal_title: Option<String>,
+    // Optional command to run after shell init (e.g. "claude" for Claude Code tabs).
+    startup_command: Option<String>,
+    // Modal file viewer overlay sitting on top of the terminal.
+    file_viewer: Option<FileViewerOverlay>,
+    // Debounce: most-recent ViewFile request this tab received, to suppress double-clicks.
+    last_view_request_path: Option<PathBuf>,
+    last_view_request_at: Option<Instant>,
+}
+
+impl TerminalTab {
+    fn new() -> Self {
+        Self {
+            terminal: None,
+            terminal_title: None,
+            startup_command: None,
+            file_viewer: None,
+            last_view_request_path: None,
+            last_view_request_at: None,
+        }
+    }
+}
+
+// Tab content kind. Today there is only Terminal; Step 2 (TRU-29) adds Agent.
+enum TabKind {
+    Terminal(TerminalTab),
+}
+
+// Cross-cutting agent-activity sidebar state. Lives on every tab regardless of kind because
+// any tab can have its sidebar set to SidebarMode::Agent and view captures from this repo.
+#[derive(Default)]
+struct AgentActivityState {
+    activity: Option<agent::AgentActivity>,
+    loading: bool,
+    selected_capture_idx: Option<usize>,
+    conversation: Option<agent::Conversation>,
+}
+
 struct TabState {
     id: usize,
     repo_path: PathBuf,
     repo_name: String,
-    terminal: Option<iced_term::Terminal>,
+    kind: TabKind,
     staged: Vec<FileEntry>,
     unstaged: Vec<FileEntry>,
     untracked: Vec<FileEntry>,
@@ -1825,48 +1906,19 @@ struct TabState {
     file_index: i32,
     // Track when tab was created for delayed terminal display
     created_at: Instant,
-    // Terminal title (set by shell/programs via OSC escape codes)
-    terminal_title: Option<String>,
     // Sidebar mode (Git or Files)
     sidebar_mode: SidebarMode,
     // File explorer state
     current_dir: PathBuf,
     file_tree: Vec<FileTreeEntry>,
-    // File viewer state
-    viewing_file_path: Option<PathBuf>,
-    file_content: String,
-    image_handle: Option<image::Handle>,
-    // Markdown WebView content (rendered HTML)
-    webview_content: Option<String>,
-    // Optional notice shown in the file viewer (e.g. large-file preview mode)
-    file_preview_notice: Option<String>,
-    // Cached syntax-highlighted lines for plain-text/code files.
-    syntax_highlight_lines: Option<Vec<SyntaxHighlightLine>>,
-    // Optional notice for partial/disabled syntax highlighting.
-    syntax_highlight_notice: Option<String>,
-    // True while async syntax highlighting is in-flight for the current file.
-    syntax_highlight_in_progress: bool,
-    // Highest line count requested so far for lazy syntax highlighting.
-    syntax_highlight_requested_lines: usize,
-    loaded_file_signature: Option<FileVersionSignature>,
-    file_load_in_progress: bool,
-    file_load_started_at: Option<Instant>,
-    last_view_file_request_path: Option<PathBuf>,
-    last_view_file_request_at: Option<Instant>,
     // Search state
     search: SearchState,
     // Attention: true when terminal title starts with "*" (e.g. Claude Code waiting for input)
     needs_attention: bool,
-    // Optional command to run after shell init (e.g. "claude" for Claude Code tabs)
-    startup_command: Option<String>,
     // Claude config tree view
     claude_config: ClaudeConfig,
-    // Agent activity tracking
-    agent_activity: Option<agent::AgentActivity>,
-    agent_activity_loading: bool,
-    // Agent conversation viewer
-    selected_capture_idx: Option<usize>,
-    agent_conversation: Option<agent::Conversation>,
+    // Agent activity sidebar state (shared across tab kinds — see AgentActivityState).
+    agent_sidebar: AgentActivityState,
     is_git_repo: bool,
 }
 
@@ -1883,7 +1935,7 @@ impl TabState {
             id,
             repo_path,
             repo_name,
-            terminal: None,
+            kind: TabKind::Terminal(TerminalTab::new()),
             staged: Vec::new(),
             unstaged: Vec::new(),
             untracked: Vec::new(),
@@ -1902,33 +1954,114 @@ impl TabState {
             diff_syntax_notice: None,
             file_index: -1,
             created_at: Instant::now(),
-            terminal_title: None,
             sidebar_mode: SidebarMode::Git,
             current_dir,
             file_tree: Vec::new(),
-            viewing_file_path: None,
-            file_content: String::new(),
-            image_handle: None,
-            webview_content: None,
-            file_preview_notice: None,
-            syntax_highlight_lines: None,
-            syntax_highlight_notice: None,
-            syntax_highlight_in_progress: false,
-            syntax_highlight_requested_lines: 0,
-            loaded_file_signature: None,
-            file_load_in_progress: false,
-            file_load_started_at: None,
-            last_view_file_request_path: None,
-            last_view_file_request_at: None,
             search: SearchState::default(),
             needs_attention: false,
-            startup_command: None,
             claude_config: ClaudeConfig::default(),
-            agent_activity: None,
-            agent_activity_loading: false,
-            selected_capture_idx: None,
-            agent_conversation: None,
+            agent_sidebar: AgentActivityState::default(),
             is_git_repo,
+        }
+    }
+
+    // ---- Tab-kind accessors -------------------------------------------------
+
+    /// The terminal widget if this is a terminal tab and a terminal has been spawned.
+    fn terminal(&self) -> Option<&iced_term::Terminal> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt.terminal.as_ref(),
+        }
+    }
+
+    fn terminal_mut(&mut self) -> Option<&mut iced_term::Terminal> {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.terminal.as_mut(),
+        }
+    }
+
+    fn set_terminal(&mut self, terminal: iced_term::Terminal) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.terminal = Some(terminal),
+        }
+    }
+
+    /// Title set by the shell via OSC escape codes — terminal tabs only.
+    fn terminal_title(&self) -> Option<&str> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt.terminal_title.as_deref(),
+        }
+    }
+
+    fn set_terminal_title(&mut self, title: Option<String>) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.terminal_title = title,
+        }
+    }
+
+    /// The startup command requested when this tab was created (e.g. "claude").
+    fn startup_command(&self) -> Option<&str> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt.startup_command.as_deref(),
+        }
+    }
+
+    fn set_startup_command(&mut self, cmd: Option<String>) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.startup_command = cmd,
+        }
+    }
+
+    /// File viewer overlay (modal-style on top of a terminal tab) if one is open.
+    fn file_viewer(&self) -> Option<&FileViewerOverlay> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt.file_viewer.as_ref(),
+        }
+    }
+
+    fn file_viewer_mut(&mut self) -> Option<&mut FileViewerOverlay> {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.file_viewer.as_mut(),
+        }
+    }
+
+    /// Path of the file currently shown in the file viewer overlay, if any.
+    fn viewing_file_path(&self) -> Option<&Path> {
+        self.file_viewer().map(|fv| fv.path.as_path())
+    }
+
+    /// Open (or replace) a file viewer overlay on this tab. The caller is responsible
+    /// for kicking off the actual file load — this just clears prior overlay state.
+    fn open_file_viewer(&mut self, path: PathBuf) -> &mut FileViewerOverlay {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => {
+                tt.file_viewer = Some(FileViewerOverlay::for_path(path));
+                tt.file_viewer.as_mut().expect("just inserted")
+            }
+        }
+    }
+
+    fn close_file_viewer(&mut self) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.file_viewer = None,
+        }
+    }
+
+    fn last_view_request(&self) -> Option<(&Path, Instant)> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt
+                .last_view_request_path
+                .as_deref()
+                .zip(tt.last_view_request_at),
+        }
+    }
+
+    fn set_last_view_request(&mut self, path: Option<PathBuf>, at: Option<Instant>) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => {
+                tt.last_view_request_path = path;
+                tt.last_view_request_at = at;
+            }
         }
     }
 
@@ -2059,15 +2192,8 @@ impl TabState {
 
     #[allow(dead_code)]
     fn load_file(&mut self, path: &PathBuf, is_dark_theme: bool) {
-        self.file_content.clear();
-        self.image_handle = None;
-        self.webview_content = None;
-        self.file_preview_notice = None;
-        self.syntax_highlight_lines = None;
-        self.syntax_highlight_notice = None;
-        self.syntax_highlight_in_progress = false;
-        self.syntax_highlight_requested_lines = 0;
-        self.viewing_file_path = Some(path.clone());
+        // Reset / open the overlay so subsequent writes target a fresh state.
+        let fv = self.open_file_viewer(path.clone());
 
         let file_size = freeze_time!("file metadata check", {
             std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0)
@@ -2086,7 +2212,7 @@ impl TabState {
         // Refuse to load extremely large files synchronously
         if file_size > 50_000_000 {
             // 50MB
-            self.file_preview_notice = Some(format!(
+            fv.preview_notice = Some(format!(
                 "File too large ({}) for inline preview. Click \"View in Browser\" to open externally.",
                 format_bytes(file_size)
             ));
@@ -2096,7 +2222,7 @@ impl TabState {
         #[cfg(feature = "excalidraw")]
         if excalidraw::is_excalidraw_file(path) {
             if file_size > MAX_INLINE_WEBVIEW_BYTES {
-                self.file_preview_notice = Some(format!(
+                fv.preview_notice = Some(format!(
                     "Inline preview skipped for large Excalidraw file ({}). Click \"View in Browser\".",
                     format_bytes(file_size)
                 ));
@@ -2107,7 +2233,7 @@ impl TabState {
             if let Ok(content) = content_result {
                 if excalidraw::validate_excalidraw(&content) {
                     let html = excalidraw::render_excalidraw_html(&content, is_dark_theme);
-                    self.webview_content = Some(html);
+                    fv.webview_content = Some(html);
                 }
             }
             return;
@@ -2115,7 +2241,7 @@ impl TabState {
 
         if Self::is_markdown_file(path) {
             if file_size > MAX_INLINE_WEBVIEW_BYTES {
-                self.file_preview_notice = Some(format!(
+                fv.preview_notice = Some(format!(
                     "Inline preview skipped for large Markdown file ({}). Click \"View in Browser\".",
                     format_bytes(file_size)
                 ));
@@ -2126,11 +2252,11 @@ impl TabState {
                 freeze_time!("markdown file read", { std::fs::read_to_string(path) });
             if let Ok(content) = content_result {
                 let html = markdown::render_markdown_to_html(&content, is_dark_theme);
-                self.webview_content = Some(html);
+                fv.webview_content = Some(html);
             }
         } else if Self::is_html_file(path) {
             if file_size > MAX_INLINE_WEBVIEW_BYTES {
-                self.file_preview_notice = Some(format!(
+                fv.preview_notice = Some(format!(
                     "Inline preview skipped for large HTML file ({}). Click \"View in Browser\".",
                     format_bytes(file_size)
                 ));
@@ -2138,20 +2264,20 @@ impl TabState {
             }
             let content_result = freeze_time!("HTML file read", { std::fs::read_to_string(path) });
             if let Ok(content) = content_result {
-                self.webview_content = Some(content);
+                fv.webview_content = Some(content);
             }
         } else if Self::is_image_file(path) {
             // Load as image
-            self.image_handle = Some(image::Handle::from_path(path));
+            fv.image_handle = Some(image::Handle::from_path(path));
         } else if file_size > MAX_FULL_TEXT_LOAD_BYTES {
             if let Ok(preview) =
                 read_text_preview(path, LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES)
             {
-                self.file_content = preview;
+                fv.file_content = preview;
             } else if let Ok(content) = std::fs::read_to_string(path) {
-                self.file_content = content;
+                fv.file_content = content;
             }
-            self.file_preview_notice = Some(format!(
+            fv.preview_notice = Some(format!(
                 "Large file ({}): showing first {} lines (~{} KB).",
                 format_bytes(file_size),
                 LARGE_TEXT_PREVIEW_LINES,
@@ -2166,14 +2292,14 @@ impl TabState {
                 });
                 match preview_result {
                     Ok(preview) => {
-                        self.file_content = preview;
-                        self.file_preview_notice = Some(format!(
+                        fv.file_content = preview;
+                        fv.preview_notice = Some(format!(
                             "Large file ({}): showing preview only. Click \"View in Browser\" for full content.",
                             format_bytes(file_size)
                         ));
                     }
                     Err(_) => {
-                        self.file_preview_notice = Some(format!(
+                        fv.preview_notice = Some(format!(
                             "Could not load file preview ({})",
                             format_bytes(file_size)
                         ));
@@ -2184,19 +2310,19 @@ impl TabState {
                     freeze_time!("text file read", { std::fs::read_to_string(path) });
                 if let Ok(content) = content_result {
                     // Load as text
-                    self.file_content = content;
+                    fv.file_content = content;
                 }
             }
         }
 
-        if self.webview_content.is_none()
-            && self.image_handle.is_none()
-            && !self.file_content.is_empty()
+        if fv.webview_content.is_none()
+            && fv.image_handle.is_none()
+            && !fv.file_content.is_empty()
         {
             let (lines, notice) =
-                build_syntax_highlight_lines(path, &self.file_content, is_dark_theme);
-            self.syntax_highlight_lines = lines;
-            self.syntax_highlight_notice = notice;
+                build_syntax_highlight_lines(path, &fv.file_content, is_dark_theme);
+            fv.syntax_highlight_lines = lines;
+            fv.syntax_highlight_notice = notice;
         }
     }
 
@@ -2275,7 +2401,7 @@ impl TabState {
     }
 
     fn fetch_agent_activity(&mut self) -> Task<Event> {
-        self.agent_activity_loading = true;
+        self.agent_sidebar.loading = true;
         let tab_id = self.id;
         let repo_path = self.repo_path.clone();
         Task::perform(
@@ -3281,24 +3407,15 @@ impl App {
     }
 
     fn tab_uses_inline_webview(tab: &TabState) -> bool {
-        let is_markdown_webview = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| TabState::is_markdown_file(p))
-            .unwrap_or(false)
-            && tab.webview_content.is_some();
-        let is_html = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| TabState::is_html_file(p))
-            .unwrap_or(false);
+        let Some(fv) = tab.file_viewer() else {
+            return false;
+        };
+        let is_markdown_webview =
+            TabState::is_markdown_file(&fv.path) && fv.webview_content.is_some();
+        let is_html = TabState::is_html_file(&fv.path);
 
         #[cfg(feature = "excalidraw")]
-        let is_excalidraw = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| excalidraw::is_excalidraw_file(p))
-            .unwrap_or(false);
+        let is_excalidraw = excalidraw::is_excalidraw_file(&fv.path);
         #[cfg(not(feature = "excalidraw"))]
         let is_excalidraw = false;
 
@@ -3308,7 +3425,7 @@ impl App {
     fn active_inline_webview_html(&self) -> Option<String> {
         self.active_tab().and_then(|tab| {
             if Self::tab_uses_inline_webview(tab) {
-                tab.webview_content.clone()
+                tab.file_viewer().and_then(|fv| fv.webview_content.clone())
             } else {
                 None
             }
@@ -3339,14 +3456,15 @@ impl App {
 
             for tab in &ws.tabs {
                 tab_count += 1;
-                if tab.viewing_file_path.is_some() {
+                if let Some(fv) = tab.file_viewer() {
                     viewing_files += 1;
+                    if fv.preview_notice.is_some() {
+                        preview_notice_count += 1;
+                    }
+                    file_content_bytes += fv.file_content.len();
+                    webview_html_bytes +=
+                        fv.webview_content.as_ref().map(|s| s.len()).unwrap_or(0);
                 }
-                if tab.file_preview_notice.is_some() {
-                    preview_notice_count += 1;
-                }
-                file_content_bytes += tab.file_content.len();
-                webview_html_bytes += tab.webview_content.as_ref().map(|s| s.len()).unwrap_or(0);
             }
         }
 
@@ -3369,7 +3487,7 @@ impl App {
         self.bottom_panel_focused = false;
         if let Some(ws) = self.active_workspace() {
             if let Some(tab) = ws.active_tab() {
-                if let Some(term) = &tab.terminal {
+                if let Some(term) = tab.terminal() {
                     return TerminalView::focus(term.widget_id().clone());
                 }
             }
@@ -3459,7 +3577,7 @@ impl App {
                     .map(|tab| WorkspaceTabConfig {
                         dir: tab.current_dir.to_string_lossy().to_string(),
                         repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
-                        startup_command: tab.startup_command.clone(),
+                        startup_command: tab.startup_command().map(String::from),
                     })
                     .collect(),
                 run_command: ws.console.run_command.clone(),
@@ -3631,7 +3749,7 @@ impl App {
         for tab in self.workspaces.iter().flat_map(|ws| ws.tabs.iter()) {
             tab.id.hash(&mut snapshot_hasher);
 
-            if let Some(term) = &tab.terminal {
+            if let Some(term) = tab.terminal() {
                 // Check time budget before expensive get_all_text()
                 if started.elapsed().as_millis() > LOG_SYNC_BUDGET_MS {
                     budget_exceeded = true;
@@ -3654,15 +3772,15 @@ impl App {
             }
 
             // If tab is viewing a file, add it to file snapshots
-            if let Some(file_path) = &tab.viewing_file_path {
-                if !tab.file_content.is_empty() {
+            if let Some(fv) = tab.file_viewer() {
+                if !fv.file_content.is_empty() {
                     true.hash(&mut snapshot_hasher);
-                    file_bytes += tab.file_content.len();
-                    file_path.to_string_lossy().hash(&mut snapshot_hasher);
-                    tab.file_content.hash(&mut snapshot_hasher);
+                    file_bytes += fv.file_content.len();
+                    fv.path.to_string_lossy().hash(&mut snapshot_hasher);
+                    fv.file_content.hash(&mut snapshot_hasher);
                     let snapshot = log_server::FileSnapshot {
-                        file_path: file_path.to_string_lossy().to_string(),
-                        content: tab.file_content.clone(),
+                        file_path: fv.path.to_string_lossy().to_string(),
+                        content: fv.file_content.clone(),
                     };
                     file_snapshots.insert(tab.id, snapshot);
                 } else {
@@ -4319,7 +4437,7 @@ fi
         self.next_tab_id += 1;
 
         let mut tab = TabState::new(id, repo_path.clone());
-        tab.startup_command = startup_command.clone();
+        tab.set_startup_command(startup_command.clone());
 
         let settings = Self::build_terminal_settings(
             &repo_path,
@@ -4334,7 +4452,7 @@ fi
             terminal.handle(iced_term::Command::AddBindings(
                 Self::standard_noop_bindings(),
             ));
-            tab.terminal = Some(terminal);
+            tab.set_terminal(terminal);
         }
 
         tab
@@ -4475,14 +4593,17 @@ fi
             .workspaces
             .iter()
             .flat_map(|ws| ws.tabs.iter())
-            .any(|tab| tab.file_load_in_progress || tab.diff_load_in_progress);
+            .any(|tab| {
+                tab.file_viewer().map(|fv| fv.load_in_progress).unwrap_or(false)
+                    || tab.diff_load_in_progress
+            });
         if loading_in_progress {
             subs.push(iced::time::every(Duration::from_millis(50)).map(|_| Event::LoadingUiTick));
         }
 
         for ws in &self.workspaces {
             for tab in &ws.tabs {
-                if let Some(term) = &tab.terminal {
+                if let Some(term) = tab.terminal() {
                     subs.push(
                         term.subscription()
                             .with(tab.id)
@@ -4592,7 +4713,7 @@ fi
                             tab.git_unchanged_streak = 0;
                         }
                     }
-                    if let Some(term) = &mut tab.terminal {
+                    if let Some(term) = tab.terminal_mut() {
                         match Self::handle_terminal_backend_command(
                             term,
                             cmd,
@@ -4602,7 +4723,7 @@ fi
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 // Set tab-specific title
-                                tab.terminal_title = Some(title.clone());
+                                tab.set_terminal_title(Some(title.clone()));
                                 // Detect attention: Claude Code sets "✳" (U+2733) prefix when waiting for input
                                 tab.needs_attention = title.starts_with('✳');
 
@@ -4877,12 +4998,12 @@ fi
                 'outer_activity: for ws in &mut self.workspaces {
                     for tab in &mut ws.tabs {
                         if tab.id == tab_id {
-                            tab.agent_activity_loading = false;
+                            tab.agent_sidebar.loading = false;
                             match result {
-                                Ok(activity) => tab.agent_activity = Some(activity),
+                                Ok(activity) => tab.agent_sidebar.activity = Some(activity),
                                 Err(e) => {
                                     eprintln!("Failed to load agent activity: {}", e);
-                                    tab.agent_activity = Some(agent::AgentActivity::new());
+                                    tab.agent_sidebar.activity = Some(agent::AgentActivity::new());
                                 }
                             }
                             break 'outer_activity;
@@ -4895,7 +5016,7 @@ fi
                 'outer_conv: for ws in &mut self.workspaces {
                     for tab in &mut ws.tabs {
                         if tab.id == tab_id {
-                            tab.agent_conversation = Some(conversation);
+                            tab.agent_sidebar.conversation = Some(conversation);
                             break 'outer_conv;
                         }
                     }
@@ -4904,15 +5025,15 @@ fi
             }
             Event::SelectAgentCapture(idx) => {
                 if let Some(tab) = self.active_tab_mut() {
-                    if tab.selected_capture_idx == Some(idx) {
+                    if tab.agent_sidebar.selected_capture_idx == Some(idx) {
                         // Deselect if clicking the same one
-                        tab.selected_capture_idx = None;
-                        tab.agent_conversation = None;
+                        tab.agent_sidebar.selected_capture_idx = None;
+                        tab.agent_sidebar.conversation = None;
                     } else {
-                        tab.selected_capture_idx = Some(idx);
-                        tab.agent_conversation = None; // Clear while loading
+                        tab.agent_sidebar.selected_capture_idx = Some(idx);
+                        tab.agent_sidebar.conversation = None; // Clear while loading
                                                        // Load conversation async
-                        if let Some(activity) = &tab.agent_activity {
+                        if let Some(activity) = &tab.agent_sidebar.activity {
                             if let Some(capture) = activity.captures.get(idx) {
                                 let capture = capture.clone();
                                 let tab_id = tab.id;
@@ -5297,17 +5418,7 @@ fi
                     }
 
                     // Clear file viewer if open
-                    tab.viewing_file_path = None;
-                    tab.file_content.clear();
-                    tab.image_handle = None;
-                    tab.webview_content = None;
-                    tab.file_preview_notice = None;
-                    tab.syntax_highlight_lines = None;
-                    tab.syntax_highlight_notice = None;
-                    tab.syntax_highlight_in_progress = false;
-                    tab.syntax_highlight_requested_lines = 0;
-                    tab.file_load_in_progress = false;
-                    tab.file_load_started_at = None;
+                    tab.close_file_viewer();
                     // Find the index of this file
                     let all_files = tab.all_files();
                     if let Some(idx) = all_files.iter().position(|f| f.path == path) {
@@ -5332,17 +5443,7 @@ fi
 
                 if let Some(tab) = self.active_tab_mut() {
                     // Clear file viewer if open
-                    tab.viewing_file_path = None;
-                    tab.file_content.clear();
-                    tab.image_handle = None;
-                    tab.webview_content = None;
-                    tab.file_preview_notice = None;
-                    tab.syntax_highlight_lines = None;
-                    tab.syntax_highlight_notice = None;
-                    tab.syntax_highlight_in_progress = false;
-                    tab.syntax_highlight_requested_lines = 0;
-                    tab.file_load_in_progress = false;
-                    tab.file_load_started_at = None;
+                    tab.close_file_viewer();
 
                     let total = tab.total_changes() as i32;
                     if total == 0 {
@@ -5523,7 +5624,7 @@ fi
                     }
 
                     // Handle Escape in file viewer
-                    if tab.viewing_file_path.is_some() {
+                    if tab.viewing_file_path().is_some() {
                         if let Key::Named(key::Named::Escape) = key.as_ref() {
                             return Task::done(Event::CloseFileView);
                         }
@@ -5655,19 +5756,9 @@ fi
                         match mode {
                             SidebarMode::Git => {
                                 // Switching to Git mode - clear file viewer and refresh status
-                                tab.selected_capture_idx = None;
-                                tab.agent_conversation = None;
-                                tab.viewing_file_path = None;
-                                tab.file_content.clear();
-                                tab.image_handle = None;
-                                tab.webview_content = None;
-                                tab.file_preview_notice = None;
-                                tab.syntax_highlight_lines = None;
-                                tab.syntax_highlight_notice = None;
-                                tab.syntax_highlight_in_progress = false;
-                                tab.syntax_highlight_requested_lines = 0;
-                                tab.file_load_in_progress = false;
-                                tab.file_load_started_at = None;
+                                tab.agent_sidebar.selected_capture_idx = None;
+                                tab.agent_sidebar.conversation = None;
+                                tab.close_file_viewer();
                                 tab.diff_load_in_progress = false;
                                 tab.diff_load_started_at = None;
                                 tab.last_poll = Instant::now();
@@ -5680,8 +5771,8 @@ fi
                             }
                             SidebarMode::Files => {
                                 // Switching to Files mode - clear git selection
-                                tab.selected_capture_idx = None;
-                                tab.agent_conversation = None;
+                                tab.agent_sidebar.selected_capture_idx = None;
+                                tab.agent_sidebar.conversation = None;
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
                                 tab.diff_load_in_progress = false;
@@ -5699,19 +5790,9 @@ fi
                             }
                             SidebarMode::Claude => {
                                 // Switching to Claude mode - clear file viewer and git selection
-                                tab.selected_capture_idx = None;
-                                tab.agent_conversation = None;
-                                tab.viewing_file_path = None;
-                                tab.file_content.clear();
-                                tab.image_handle = None;
-                                tab.webview_content = None;
-                                tab.file_preview_notice = None;
-                                tab.syntax_highlight_lines = None;
-                                tab.syntax_highlight_notice = None;
-                                tab.syntax_highlight_in_progress = false;
-                                tab.syntax_highlight_requested_lines = 0;
-                                tab.file_load_in_progress = false;
-                                tab.file_load_started_at = None;
+                                tab.agent_sidebar.selected_capture_idx = None;
+                                tab.agent_sidebar.conversation = None;
+                                tab.close_file_viewer();
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
                                 tab.diff_load_in_progress = false;
@@ -5722,17 +5803,7 @@ fi
                             }
                             SidebarMode::Agent => {
                                 // Switching to Agent mode - clear file viewer and git selection
-                                tab.viewing_file_path = None;
-                                tab.file_content.clear();
-                                tab.image_handle = None;
-                                tab.webview_content = None;
-                                tab.file_preview_notice = None;
-                                tab.syntax_highlight_lines = None;
-                                tab.syntax_highlight_notice = None;
-                                tab.syntax_highlight_in_progress = false;
-                                tab.syntax_highlight_requested_lines = 0;
-                                tab.file_load_in_progress = false;
-                                tab.file_load_started_at = None;
+                                tab.close_file_viewer();
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
                                 tab.diff_load_in_progress = false;
@@ -5907,20 +5978,28 @@ fi
 
                 if let Some(tab) = self.active_tab_mut() {
                     let requested_signature = file_version_signature(&path);
-                    if tab.last_view_file_request_path.as_ref() == Some(&path)
+                    if tab.last_view_request().map(|(p, _)| p) == Some(path.as_path())
                         && tab
-                            .last_view_file_request_at
-                            .is_some_and(|t| t.elapsed() < Duration::from_millis(350))
+                            .last_view_request()
+                            .map(|(_, t)| t.elapsed() < Duration::from_millis(350))
+                            .unwrap_or(false)
                     {
                         return Task::none();
                     }
-                    if tab.viewing_file_path.as_ref() == Some(&path) && tab.file_load_in_progress {
+                    let same_path = tab.viewing_file_path() == Some(path.as_path());
+                    let load_in_progress = tab
+                        .file_viewer()
+                        .map(|fv| fv.load_in_progress)
+                        .unwrap_or(false);
+                    let loaded_signature =
+                        tab.file_viewer().and_then(|fv| fv.loaded_signature);
+                    if same_path && load_in_progress {
                         return Task::none();
                     }
-                    if tab.viewing_file_path.as_ref() == Some(&path)
-                        && !tab.file_load_in_progress
+                    if same_path
+                        && !load_in_progress
                         && requested_signature.is_some()
-                        && tab.loaded_file_signature == requested_signature
+                        && loaded_signature == requested_signature
                     {
                         perf_log!(
                             "file_load skip_unchanged tab={} path={}",
@@ -5937,19 +6016,13 @@ fi
                     tab.diff_load_started_at = None;
                     tab.diff_syntax_lines = None;
                     tab.diff_syntax_notice = None;
-                    tab.viewing_file_path = Some(path.clone());
-                    tab.file_content.clear();
-                    tab.image_handle = None;
-                    tab.webview_content = None;
-                    tab.file_preview_notice = None;
-                    tab.syntax_highlight_lines = None;
-                    tab.syntax_highlight_notice = None;
-                    tab.syntax_highlight_in_progress = false;
-                    tab.syntax_highlight_requested_lines = 0;
-                    tab.file_load_in_progress = true;
-                    tab.file_load_started_at = Some(Instant::now());
-                    tab.last_view_file_request_path = Some(path.clone());
-                    tab.last_view_file_request_at = Some(Instant::now());
+                    {
+                        // Open / replace the file viewer overlay; resets all overlay state.
+                        let fv = tab.open_file_viewer(path.clone());
+                        fv.load_in_progress = true;
+                        fv.load_started_at = Some(Instant::now());
+                    }
+                    tab.set_last_view_request(Some(path.clone()), Some(Instant::now()));
                     request = Some((tab.id, path));
                 }
                 if let Some((tab_id, file_path)) = request {
@@ -5964,31 +6037,27 @@ fi
                 webview::set_visible(false);
 
                 if let Some(tab) = self.active_tab_mut() {
-                    tab.viewing_file_path = None;
-                    tab.file_content.clear();
-                    tab.image_handle = None;
-                    tab.webview_content = None;
-                    tab.file_preview_notice = None;
-                    tab.syntax_highlight_lines = None;
-                    tab.syntax_highlight_notice = None;
-                    tab.syntax_highlight_in_progress = false;
-                    tab.syntax_highlight_requested_lines = 0;
-                    tab.file_load_in_progress = false;
-                    tab.file_load_started_at = None;
+                    tab.close_file_viewer();
                 }
                 self.mark_log_server_dirty();
             }
             Event::CopyFileContent => {
                 if let Some(tab) = self.active_tab() {
-                    if !tab.file_content.is_empty() {
-                        return iced::clipboard::write(tab.file_content.clone());
+                    if let Some(fv) = tab.file_viewer() {
+                        if !fv.file_content.is_empty() {
+                            return iced::clipboard::write(fv.file_content.clone());
+                        }
                     }
                 }
             }
             Event::OpenFileInBrowser => {
                 self.mark_log_server_dirty();
                 if let Some(tab) = self.active_tab() {
-                    if tab.viewing_file_path.is_some() && !tab.file_content.is_empty() {
+                    if tab
+                        .file_viewer()
+                        .map(|fv| !fv.file_content.is_empty())
+                        .unwrap_or(false)
+                    {
                         if let Some(base_url) = self.log_server_state.base_url() {
                             let url = format!("{}/file/{}", base_url, tab.id);
                             let _ = std::process::Command::new("open").arg(&url).spawn();
@@ -6017,10 +6086,12 @@ fi
                             is_dark,
                         );
                     }
-                    if let Some(path) = tab.viewing_file_path.clone() {
+                    if let Some(path) = tab.viewing_file_path().map(|p| p.to_path_buf()) {
                         if !TabState::is_image_file(&path) {
-                            tab.file_load_in_progress = true;
-                            tab.file_load_started_at = Some(Instant::now());
+                            if let Some(fv) = tab.file_viewer_mut() {
+                                fv.load_in_progress = true;
+                                fv.load_started_at = Some(Instant::now());
+                            }
                             return Self::request_file_load(tab.id, path, is_dark);
                         }
                     }
@@ -6048,7 +6119,7 @@ fi
             }
             Event::ClearTerminal => {
                 if let Some(tab) = self.active_tab_mut() {
-                    if let Some(term) = &mut tab.terminal {
+                    if let Some(term) = tab.terminal_mut() {
                         // Send the clear command to the terminal
                         Self::handle_terminal_backend_command(
                             term,
@@ -6092,15 +6163,20 @@ fi
             }
             Event::SearchExecute => {
                 if let Some(tab) = self.active_tab_mut() {
-                    if let Some(term) = &mut tab.terminal {
-                        let matches = term.search_all(&tab.search.query);
+                    let query = tab.search.query.clone();
+                    let matches = tab
+                        .terminal_mut()
+                        .map(|term| term.search_all(&query));
+                    if let Some(matches) = matches {
                         tab.search.matches = matches;
                         tab.search.current_match = 0;
 
                         // Scroll to first match if found
-                        if let Some(first_match) = tab.search.matches.first() {
-                            let line = first_match.start.line.0;
-                            term.scroll_to_line(line);
+                        let first_line = tab.search.matches.first().map(|m| m.start.line.0);
+                        if let Some(line) = first_line {
+                            if let Some(term) = tab.terminal_mut() {
+                                term.scroll_to_line(line);
+                            }
                         }
                     }
                 }
@@ -6110,9 +6186,9 @@ fi
                     if !tab.search.matches.is_empty() {
                         tab.search.current_match =
                             (tab.search.current_match + 1) % tab.search.matches.len();
-                        if let Some(term) = &mut tab.terminal {
-                            let current = &tab.search.matches[tab.search.current_match];
-                            term.scroll_to_line(current.start.line.0);
+                        let line = tab.search.matches[tab.search.current_match].start.line.0;
+                        if let Some(term) = tab.terminal_mut() {
+                            term.scroll_to_line(line);
                         }
                     }
                 }
@@ -6125,9 +6201,9 @@ fi
                         } else {
                             tab.search.current_match -= 1;
                         }
-                        if let Some(term) = &mut tab.terminal {
-                            let current = &tab.search.matches[tab.search.current_match];
-                            term.scroll_to_line(current.start.line.0);
+                        let line = tab.search.matches[tab.search.current_match].start.line.0;
+                        if let Some(term) = tab.terminal_mut() {
+                            term.scroll_to_line(line);
                         }
                     }
                 }
@@ -6143,7 +6219,7 @@ fi
             Event::OpenMarkdownInBrowser => {
                 // Write HTML to temp file and open in browser
                 if let Some(tab) = self.active_tab() {
-                    let html_to_open = tab.webview_content.clone();
+                    let html_to_open = tab.file_viewer().and_then(|fv| fv.webview_content.clone());
 
                     if html_to_open.is_none() {
                         // TODO: This should be async! Reading files synchronously on main thread
@@ -6154,8 +6230,7 @@ fi
                     if let Some(html) = &html_to_open {
                         let temp_dir = std::env::temp_dir();
                         let file_name = tab
-                            .viewing_file_path
-                            .as_ref()
+                            .viewing_file_path()
                             .and_then(|p| p.file_stem())
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| "preview".to_string());
@@ -6181,7 +6256,7 @@ fi
                                     .spawn();
                             }
                         }
-                    } else if let Some(path) = tab.viewing_file_path.as_ref() {
+                    } else if let Some(path) = tab.viewing_file_path() {
                         #[cfg(target_os = "macos")]
                         {
                             let _ = std::process::Command::new("open").arg(path).spawn();
@@ -6231,7 +6306,7 @@ fi
 
                 // Sync all terminals that may have been updated while unfocused
                 for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
-                    if let Some(term) = &mut tab.terminal {
+                    if let Some(term) = tab.terminal_mut() {
                         term.sync_and_redraw();
                     }
                 }
@@ -6405,47 +6480,37 @@ fi
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == snapshot.tab_id)
                 {
-                    if tab.viewing_file_path.as_ref() == Some(&snapshot.path) {
+                    if tab.viewing_file_path() == Some(snapshot.path.as_path()) {
                         let loaded_path = snapshot.path.clone();
                         let loaded_signature = snapshot.file_signature;
-                        tab.file_load_in_progress = false;
-                        tab.file_content = snapshot.file_content;
-                        tab.webview_content = snapshot.webview_content;
-                        tab.file_preview_notice = snapshot.file_preview_notice;
-                        tab.syntax_highlight_lines = snapshot.syntax_highlight_lines;
-                        tab.syntax_highlight_notice = snapshot.syntax_highlight_notice;
-                        tab.syntax_highlight_in_progress = false;
-                        tab.syntax_highlight_requested_lines = tab
+                        let tab_id = tab.id;
+                        let fv = tab.file_viewer_mut().expect("path matched just above");
+                        fv.load_in_progress = false;
+                        fv.file_content = snapshot.file_content;
+                        fv.webview_content = snapshot.webview_content;
+                        fv.preview_notice = snapshot.file_preview_notice;
+                        fv.syntax_highlight_lines = snapshot.syntax_highlight_lines;
+                        fv.syntax_highlight_notice = snapshot.syntax_highlight_notice;
+                        fv.syntax_highlight_in_progress = false;
+                        fv.syntax_highlight_requested_lines = fv
                             .syntax_highlight_lines
                             .as_ref()
                             .map(|lines| lines.len())
                             .unwrap_or(0);
-                        tab.loaded_file_signature = loaded_signature;
-                        tab.image_handle =
+                        fv.loaded_signature = loaded_signature;
+                        fv.image_handle =
                             snapshot.image_path.as_ref().map(image::Handle::from_path);
 
                         #[cfg(feature = "excalidraw")]
-                        let is_excalidraw = tab
-                            .viewing_file_path
-                            .as_ref()
-                            .map(|p| excalidraw::is_excalidraw_file(p))
-                            .unwrap_or(false);
+                        let is_excalidraw = excalidraw::is_excalidraw_file(&fv.path);
                         #[cfg(not(feature = "excalidraw"))]
                         let is_excalidraw = false;
 
-                        let is_markdown_webview = tab
-                            .viewing_file_path
-                            .as_ref()
-                            .map(|p| TabState::is_markdown_file(p))
-                            .unwrap_or(false)
-                            && tab.webview_content.is_some();
-                        let is_html_webview = tab
-                            .viewing_file_path
-                            .as_ref()
-                            .map(|p| TabState::is_html_file(p))
-                            .unwrap_or(false);
+                        let is_markdown_webview =
+                            TabState::is_markdown_file(&fv.path) && fv.webview_content.is_some();
+                        let is_html_webview = TabState::is_html_file(&fv.path);
 
-                        if let Some(html) = &tab.webview_content {
+                        if let Some(html) = &fv.webview_content {
                             if is_excalidraw || is_markdown_webview || is_html_webview {
                                 inline_webview_html = Some(html.clone());
                             } else {
@@ -6461,29 +6526,30 @@ fi
                         #[cfg(not(feature = "excalidraw"))]
                         let is_excalidraw_file = false;
 
-                        let is_text_syntax_candidate = tab.webview_content.is_none()
-                            && tab.image_handle.is_none()
-                            && !tab.file_content.is_empty()
+                        let is_text_syntax_candidate = fv.webview_content.is_none()
+                            && fv.image_handle.is_none()
+                            && !fv.file_content.is_empty()
                             && !TabState::is_markdown_file(&loaded_path)
                             && !TabState::is_html_file(&loaded_path)
                             && !is_excalidraw_file;
                         let mut waiting_for_initial_syntax = false;
 
                         if is_text_syntax_candidate {
-                            let total_lines = tab
+                            let total_lines = fv
                                 .file_content
                                 .lines()
                                 .count()
                                 .min(MAX_FILE_VIEW_RENDER_LINES);
                             let requested_lines = FILE_SYNTAX_INITIAL_LINES.min(total_lines);
                             if requested_lines > 0 {
-                                tab.syntax_highlight_in_progress = true;
-                                tab.syntax_highlight_requested_lines = requested_lines;
+                                fv.syntax_highlight_in_progress = true;
+                                fv.syntax_highlight_requested_lines = requested_lines;
                                 waiting_for_initial_syntax = true;
+                                let file_content_clone = fv.file_content.clone();
                                 syntax_request = Some((
-                                    tab.id,
+                                    tab_id,
                                     loaded_path,
-                                    tab.file_content.clone(),
+                                    file_content_clone,
                                     loaded_signature,
                                     requested_lines,
                                 ));
@@ -6491,7 +6557,9 @@ fi
                         }
 
                         if !waiting_for_initial_syntax {
-                            tab.file_load_started_at = None;
+                            if let Some(fv) = tab.file_viewer_mut() {
+                                fv.load_started_at = None;
+                            }
                         }
                     }
                 }
@@ -6529,21 +6597,24 @@ fi
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == tab_id)
                 {
-                    if tab.file_load_in_progress
-                        || tab.syntax_highlight_in_progress
-                        || tab.webview_content.is_some()
-                        || tab.image_handle.is_some()
-                        || tab.file_content.is_empty()
+                    let Some(fv) = tab.file_viewer() else {
+                        return Task::none();
+                    };
+                    if fv.load_in_progress
+                        || fv.syntax_highlight_in_progress
+                        || fv.webview_content.is_some()
+                        || fv.image_handle.is_some()
+                        || fv.file_content.is_empty()
                     {
                         return Task::none();
                     }
 
-                    let current_lines = tab
+                    let current_lines = fv
                         .syntax_highlight_lines
                         .as_ref()
                         .map(|lines| lines.len())
                         .unwrap_or(0);
-                    let total_lines = tab
+                    let total_lines = fv
                         .file_content
                         .lines()
                         .count()
@@ -6559,23 +6630,26 @@ fi
                         .min(total_lines);
 
                     if requested_lines <= current_lines
-                        || requested_lines <= tab.syntax_highlight_requested_lines
+                        || requested_lines <= fv.syntax_highlight_requested_lines
                     {
                         return Task::none();
                     }
 
-                    tab.syntax_highlight_in_progress = true;
-                    tab.syntax_highlight_requested_lines = requested_lines;
-                    let Some(view_path) = tab.viewing_file_path.clone() else {
-                        tab.syntax_highlight_in_progress = false;
-                        return Task::none();
-                    };
+                    let view_path = fv.path.clone();
+                    let file_content = fv.file_content.clone();
+                    let loaded_signature = fv.loaded_signature;
+                    let tab_id = tab.id;
+                    let fv_mut = tab
+                        .file_viewer_mut()
+                        .expect("file_viewer was Some just above");
+                    fv_mut.syntax_highlight_in_progress = true;
+                    fv_mut.syntax_highlight_requested_lines = requested_lines;
                     return Self::request_file_syntax_highlight(
-                        tab.id,
+                        tab_id,
                         view_path,
-                        tab.file_content.clone(),
+                        file_content,
                         is_dark_theme,
-                        tab.loaded_file_signature,
+                        loaded_signature,
                         requested_lines,
                     );
                 }
@@ -6587,21 +6661,22 @@ fi
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == snapshot.tab_id)
                 {
-                    if tab.viewing_file_path.as_ref() == Some(&snapshot.path)
-                        && tab.loaded_file_signature == snapshot.file_signature
-                    {
-                        tab.syntax_highlight_in_progress = false;
-                        tab.file_load_started_at = None;
-                        tab.syntax_highlight_requested_lines =
-                            tab.syntax_highlight_requested_lines.max(
-                                snapshot
-                                    .syntax_highlight_lines
-                                    .as_ref()
-                                    .map(|lines| lines.len())
-                                    .unwrap_or(0),
-                            );
-                        tab.syntax_highlight_lines = snapshot.syntax_highlight_lines;
-                        tab.syntax_highlight_notice = snapshot.syntax_highlight_notice;
+                    if let Some(fv) = tab.file_viewer_mut() {
+                        if fv.path == snapshot.path && fv.loaded_signature == snapshot.file_signature
+                        {
+                            fv.syntax_highlight_in_progress = false;
+                            fv.load_started_at = None;
+                            fv.syntax_highlight_requested_lines =
+                                fv.syntax_highlight_requested_lines.max(
+                                    snapshot
+                                        .syntax_highlight_lines
+                                        .as_ref()
+                                        .map(|lines| lines.len())
+                                        .unwrap_or(0),
+                                );
+                            fv.syntax_highlight_lines = snapshot.syntax_highlight_lines;
+                            fv.syntax_highlight_notice = snapshot.syntax_highlight_notice;
+                        }
                     }
                 }
             }
@@ -6702,7 +6777,7 @@ fi
                 if !text.is_empty() {
                     // Inject transcribed text into the active tab's terminal
                     if let Some(tab) = self.active_tab_mut() {
-                        if let Some(term) = &mut tab.terminal {
+                        if let Some(term) = tab.terminal_mut() {
                             Self::handle_terminal_backend_command(
                                 term,
                                 iced_term::backend::Command::Write(text.into_bytes()),
@@ -7291,7 +7366,7 @@ fi
                 terminal.handle(iced_term::Command::AddBindings(
                     Self::standard_noop_bindings(),
                 ));
-                tab.terminal = Some(terminal);
+                tab.set_terminal(terminal);
                 tab.created_at = Instant::now();
                 recreated_main += 1;
             }
@@ -8404,8 +8479,7 @@ fi
 
             // Determine if this is a Claude Code tab
             let is_claude = tab
-                .terminal_title
-                .as_ref()
+                .terminal_title()
                 .map(|t| t.to_lowercase().contains("claude"))
                 .unwrap_or(false);
 
@@ -8426,13 +8500,12 @@ fi
             // Tab label - strip leading "*" when attention (redundant with visual indicator),
             // shorten path-like titles to last component, truncate at 20 chars
             let base_title = tab
-                .terminal_title
-                .as_ref()
+                .terminal_title()
                 .map(|t| {
                     let display = if has_attention {
                         t.trim_start_matches('*').trim_start()
                     } else {
-                        t.as_str()
+                        t
                     };
                     // Path-like titles (e.g. from Codex) — extract last component
                     let display = if display.starts_with('/') || display.starts_with('~') {
@@ -8741,11 +8814,11 @@ fi
         let theme = &self.theme;
         if let Some(tab) = ws.active_tab() {
             let main_panel =
-                if tab.selected_capture_idx.is_some() && tab.sidebar_mode == SidebarMode::Agent {
+                if tab.agent_sidebar.selected_capture_idx.is_some() && tab.sidebar_mode == SidebarMode::Agent {
                     freeze_time!("view_agent_conversation", {
                         self.view_agent_conversation(tab)
                     })
-                } else if tab.viewing_file_path.is_some() {
+                } else if tab.viewing_file_path().is_some() {
                     freeze_time!("view_file_content", { self.view_file_content(tab) })
                 } else if tab.selected_file.is_some() {
                     freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
@@ -9290,9 +9363,8 @@ fi
         for entry in &tab.file_tree {
             let is_selected_file = !entry.is_dir
                 && tab
-                    .viewing_file_path
-                    .as_ref()
-                    .is_some_and(|selected| selected == &entry.path);
+                    .viewing_file_path()
+                    .is_some_and(|selected| selected == entry.path.as_path());
             let (icon, name_suffix, icon_color, name_color, bg_color) = if entry.is_dir {
                 // Folders: blue folder icon, trailing /, light background
                 (
@@ -9420,7 +9492,7 @@ fi
         let font = self.ui_font();
         let font_small = self.ui_font_small();
 
-        if tab.agent_activity_loading {
+        if tab.agent_sidebar.loading {
             let spinner = container(
                 text("Loading agent activity...")
                     .size(font_small)
@@ -9432,7 +9504,7 @@ fi
             return spinner.into();
         }
 
-        let activity = match &tab.agent_activity {
+        let activity = match &tab.agent_sidebar.activity {
             Some(activity) => activity,
             None => {
                 let no_data = container(
@@ -9580,7 +9652,7 @@ fi
         } else {
             // Show recent captures
             let recent_captures = activity.recent_captures(50);
-            let selected_idx = tab.selected_capture_idx;
+            let selected_idx = tab.agent_sidebar.selected_capture_idx;
 
             for (idx, capture) in recent_captures.iter().enumerate() {
                 let is_selected = selected_idx == Some(idx);
@@ -9778,7 +9850,7 @@ fi
         let font_small = self.ui_font_small();
         let font_tiny = font_small * 0.9;
 
-        let conversation = match &tab.agent_conversation {
+        let conversation = match &tab.agent_sidebar.conversation {
             Some(c) => c,
             None => {
                 return container(
@@ -9795,8 +9867,9 @@ fi
 
         // Get capture info for the header
         let capture = tab
+            .agent_sidebar
             .selected_capture_idx
-            .and_then(|idx| tab.agent_activity.as_ref()?.captures.get(idx));
+            .and_then(|idx| tab.agent_sidebar.activity.as_ref()?.captures.get(idx));
 
         let mut content = Column::new().spacing(0);
 
@@ -10332,42 +10405,38 @@ fi
         let font_small = self.ui_font_small();
         let mut content = Column::new().spacing(0);
 
+        let Some(fv) = tab.file_viewer() else {
+            return container(text("(no file)").size(font).color(theme.text_secondary()))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into();
+        };
+
         // Header with filename and close button
-        let file_name = tab
-            .viewing_file_path
-            .as_ref()
-            .and_then(|p| p.file_name())
+        let file_name = fv
+            .path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let rel_path = tab
-            .viewing_file_path
-            .as_ref()
-            .and_then(|p| p.strip_prefix(&tab.repo_path).ok())
+        let rel_path = fv
+            .path
+            .strip_prefix(&tab.repo_path)
+            .ok()
             .map(|p| p.display().to_string())
             .unwrap_or(file_name.clone());
 
         // Determine file viewer mode by extension/state.
-        let is_markdown = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| TabState::is_markdown_file(p))
-            .unwrap_or(false);
-        let is_html = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| TabState::is_html_file(p))
-            .unwrap_or(false);
+        let is_markdown = TabState::is_markdown_file(&fv.path);
+        let is_html = TabState::is_html_file(&fv.path);
         #[cfg(feature = "excalidraw")]
-        let is_excalidraw = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| excalidraw::is_excalidraw_file(p))
-            .unwrap_or(false);
+        let is_excalidraw = excalidraw::is_excalidraw_file(&fv.path);
         #[cfg(not(feature = "excalidraw"))]
         let is_excalidraw = false;
         let has_inline_webview =
-            tab.webview_content.is_some() && (is_markdown || is_html || is_excalidraw);
+            fv.webview_content.is_some() && (is_markdown || is_html || is_excalidraw);
 
         let header_bg = theme.bg_overlay();
         let ghost = self.ghost_button_style();
@@ -10448,7 +10517,7 @@ fi
             );
         }
 
-        if let Some(notice) = &tab.file_preview_notice {
+        if let Some(notice) = &fv.preview_notice {
             let notice_bg = theme.bg_overlay();
             let notice_border = theme.surface0();
             content = content.push(
@@ -10467,7 +10536,7 @@ fi
             );
         }
 
-        if let Some(notice) = &tab.syntax_highlight_notice {
+        if let Some(notice) = &fv.syntax_highlight_notice {
             let notice_bg = theme.bg_overlay();
             let notice_border = theme.surface0();
             content = content.push(
@@ -10485,21 +10554,21 @@ fi
                     }),
             );
         }
-        let waiting_for_file_load = tab.file_load_in_progress
-            && tab.file_content.is_empty()
-            && tab.image_handle.is_none()
-            && tab.webview_content.is_none();
-        let waiting_for_initial_syntax = tab.syntax_highlight_in_progress
-            && tab.syntax_highlight_lines.is_none()
-            && !tab.file_content.is_empty()
-            && tab.webview_content.is_none()
-            && tab.image_handle.is_none();
+        let waiting_for_file_load = fv.load_in_progress
+            && fv.file_content.is_empty()
+            && fv.image_handle.is_none()
+            && fv.webview_content.is_none();
+        let waiting_for_initial_syntax = fv.syntax_highlight_in_progress
+            && fv.syntax_highlight_lines.is_none()
+            && !fv.file_content.is_empty()
+            && fv.webview_content.is_none()
+            && fv.image_handle.is_none();
         let show_file_loading_message = waiting_for_file_load
-            && tab.file_load_started_at.is_some_and(|started| {
+            && fv.load_started_at.is_some_and(|started| {
                 started.elapsed() >= Duration::from_millis(LOADING_INDICATOR_DELAY_MS)
             });
         let show_initial_syntax_message = waiting_for_initial_syntax
-            && tab.file_load_started_at.is_some_and(|started| {
+            && fv.load_started_at.is_some_and(|started| {
                 started.elapsed() >= Duration::from_millis(LOADING_INDICATOR_DELAY_MS)
             });
 
@@ -10538,7 +10607,7 @@ fi
             } else {
                 content = content.push(iced::widget::Space::new().height(Length::Fill));
             }
-        } else if let Some(handle) = &tab.image_handle {
+        } else if let Some(handle) = &fv.image_handle {
             // Display image
             let img = image(handle.clone()).content_fit(iced::ContentFit::Contain);
 
@@ -10555,12 +10624,12 @@ fi
         } else if has_inline_webview {
             // Excalidraw, Mermaid-markdown, and HTML render inline via WebView.
             content = content.push(iced::widget::Space::new().height(Length::Fill));
-        } else if is_markdown && tab.file_preview_notice.is_none() && !tab.file_content.is_empty() {
+        } else if is_markdown && fv.preview_notice.is_none() && !fv.file_content.is_empty() {
             // Fallback markdown rendering when HTML preview is unavailable.
             content = content.push(self.view_markdown_content(tab));
         } else if is_markdown || is_html || is_excalidraw {
-            let msg = tab
-                .file_preview_notice
+            let msg = fv
+                .preview_notice
                 .as_deref()
                 .unwrap_or("Inline preview unavailable for this file. Click \"View in Browser\".");
             content = content.push(
@@ -10576,8 +10645,8 @@ fi
             let render_started_at = Instant::now();
             let mut file_column = Column::new().spacing(0);
             let mono = iced::Font::MONOSPACE;
-            let has_syntax_lines = tab.syntax_highlight_lines.is_some();
-            let total_line_count = tab.file_content.lines().count();
+            let has_syntax_lines = fv.syntax_highlight_lines.is_some();
+            let total_line_count = fv.file_content.lines().count();
             let render_line_limit = if has_syntax_lines {
                 MAX_FILE_VIEW_RENDER_LINES_WITH_SYNTAX
             } else {
@@ -10613,12 +10682,12 @@ fi
                 );
             }
 
-            for (i, line) in tab.file_content.lines().take(render_line_count).enumerate() {
+            for (i, line) in fv.file_content.lines().take(render_line_count).enumerate() {
                 let line_num = format!("{:4}", i + 1);
                 let shown_line = if line.is_empty() { " " } else { line };
 
                 let line_body: Element<'_, Event, Theme, iced::Renderer> =
-                    if let Some(highlighted_line) = tab
+                    if let Some(highlighted_line) = fv
                         .syntax_highlight_lines
                         .as_ref()
                         .and_then(|lines| lines.get(i))
@@ -10678,7 +10747,7 @@ fi
                 );
             }
 
-            if tab.file_content.is_empty() {
+            if fv.file_content.is_empty() {
                 file_column = file_column.push(
                     text("(empty file)")
                         .size(font)
@@ -10687,7 +10756,7 @@ fi
             }
 
             maybe_log_file_view_build(
-                tab.viewing_file_path.as_deref(),
+                Some(fv.path.as_path()),
                 total_line_count,
                 render_line_count,
                 has_syntax_lines,
@@ -10725,6 +10794,10 @@ fi
         let font = self.ui_font();
         let mut content = Column::new().spacing(8).padding(16);
 
+        let Some(fv) = tab.file_viewer() else {
+            return content.into();
+        };
+
         let mut in_code_block = false;
         let mut in_mermaid_block = false;
         let mut code_block_content: Vec<String> = Vec::new();
@@ -10732,7 +10805,7 @@ fi
         let mut table_rows: Vec<Vec<String>> = Vec::new();
         let mut table_has_header = false;
 
-        for line in tab.file_content.lines() {
+        for line in fv.file_content.lines() {
             let trimmed = line.trim();
 
             // Table row accumulation — detect end of table and render
@@ -11734,7 +11807,7 @@ fi
 
         let bg = theme.bg_base();
         let terminal_view: Element<'a, Event, Theme, iced::Renderer> =
-            if let Some(term) = &tab.terminal {
+            if let Some(term) = tab.terminal() {
                 let tab_id = tab.id;
                 let term_container =
                     container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
