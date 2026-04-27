@@ -35,7 +35,10 @@ mod webview;
 mod agent;
 mod config;
 mod events;
+mod tab;
 mod theme;
+
+use tab::{AgentActivityState, FileViewerOverlay, TabKind, TerminalTab};
 
 // Start with just config for now to avoid conflicts
 use config::{
@@ -618,7 +621,7 @@ struct SyntaxHighlightSegment {
 }
 
 #[derive(Debug, Clone)]
-struct SyntaxHighlightLine {
+pub(crate) struct SyntaxHighlightLine {
     segments: Vec<SyntaxHighlightSegment>,
 }
 
@@ -1799,88 +1802,9 @@ fn detect_run_command(dir: &PathBuf) -> Option<String> {
     None
 }
 
-// Tab state
-// File viewer state attached to a Terminal tab while the user is viewing a file.
-// Closing the file (Back / Close button) drops this back to None and reveals the terminal.
-struct FileViewerOverlay {
-    path: PathBuf,
-    file_content: String,
-    image_handle: Option<image::Handle>,
-    // Rendered HTML for markdown / excalidraw / .html files (driven through the wry webview).
-    webview_content: Option<String>,
-    // Optional notice shown in the viewer (e.g. large-file preview mode).
-    preview_notice: Option<String>,
-    syntax_highlight_lines: Option<Vec<SyntaxHighlightLine>>,
-    syntax_highlight_notice: Option<String>,
-    syntax_highlight_in_progress: bool,
-    syntax_highlight_requested_lines: usize,
-    loaded_signature: Option<FileVersionSignature>,
-    load_in_progress: bool,
-    load_started_at: Option<Instant>,
-}
-
-impl FileViewerOverlay {
-    fn for_path(path: PathBuf) -> Self {
-        Self {
-            path,
-            file_content: String::new(),
-            image_handle: None,
-            webview_content: None,
-            preview_notice: None,
-            syntax_highlight_lines: None,
-            syntax_highlight_notice: None,
-            syntax_highlight_in_progress: false,
-            syntax_highlight_requested_lines: 0,
-            loaded_signature: None,
-            load_in_progress: false,
-            load_started_at: None,
-        }
-    }
-}
-
-// Per-terminal-tab state. A terminal tab can optionally have a file viewer overlay
-// open on top of its terminal (modal-style); closing the overlay restores the terminal view.
-struct TerminalTab {
-    terminal: Option<iced_term::Terminal>,
-    // Terminal title (set by shell/programs via OSC escape codes).
-    terminal_title: Option<String>,
-    // Optional command to run after shell init (e.g. "claude" for Claude Code tabs).
-    startup_command: Option<String>,
-    // Modal file viewer overlay sitting on top of the terminal.
-    file_viewer: Option<FileViewerOverlay>,
-    // Debounce: most-recent ViewFile request this tab received, to suppress double-clicks.
-    last_view_request_path: Option<PathBuf>,
-    last_view_request_at: Option<Instant>,
-}
-
-impl TerminalTab {
-    fn new() -> Self {
-        Self {
-            terminal: None,
-            terminal_title: None,
-            startup_command: None,
-            file_viewer: None,
-            last_view_request_path: None,
-            last_view_request_at: None,
-        }
-    }
-}
-
-// Tab content kind. Today there is only Terminal; Step 2 (TRU-29) adds Agent.
-enum TabKind {
-    Terminal(TerminalTab),
-}
-
-// Cross-cutting agent-activity sidebar state. Lives on every tab regardless of kind because
-// any tab can have its sidebar set to SidebarMode::Agent and view captures from this repo.
-#[derive(Default)]
-struct AgentActivityState {
-    activity: Option<agent::AgentActivity>,
-    loading: bool,
-    selected_capture_idx: Option<usize>,
-    conversation: Option<agent::Conversation>,
-}
-
+// Tab state. Tab-kind data structures live in `src/tab/mod.rs`; the heavy `impl TabState`
+// methods (load_file, fetch_status, fetch_diff, fetch_claude_config, fetch_agent_activity, etc.)
+// stay here because they reference too many in-binary helpers, constants, and macros.
 struct TabState {
     id: usize,
     repo_path: PathBuf,
