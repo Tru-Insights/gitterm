@@ -4560,7 +4560,20 @@ impl App {
         let is_windows = cfg!(target_os = "windows");
 
         let args = if is_windows {
-            vec![]
+            if let Some(cmd) = startup_command {
+                let lower = shell.to_lowercase();
+                if lower.contains("powershell") || lower.contains("pwsh") {
+                    vec![
+                        "-NoExit".to_string(),
+                        "-Command".to_string(),
+                        cmd.to_string(),
+                    ]
+                } else {
+                    vec!["/K".to_string(), cmd.to_string()]
+                }
+            } else {
+                vec![]
+            }
         } else if is_zsh {
             let home = std::env::var("HOME").unwrap_or_default();
             let gitterm_dir = format!("{home}/.config/gitterm/zsh");
