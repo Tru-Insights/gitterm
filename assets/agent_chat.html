@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>gitterm agent chat</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #1e1e2e;
+    --bg-alt: #181825;
+    --bg-block: #313244;
+    --bg-input: #181825;
+    --fg: #cdd6f4;
+    --fg-muted: #7f849c;
+    --accent: #89b4fa;
+    --border: #585b70;
+    --user: #a6e3a1;
+    --result: #94e2d5;
+    --tool: #fab387;
+    --err: #f38ba8;
+    --thinking: #7f849c;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    font-size: 14px;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    padding: 10px;
+    gap: 8px;
+  }
+  #status {
+    font-size: 11px;
+    color: var(--fg-muted);
+    padding: 0 4px;
+    user-select: none;
+  }
+  #status.streaming { color: var(--accent); }
+  #status.errored { color: var(--err); }
+  #status.stopped { color: var(--err); }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    background: var(--bg-alt);
+    border-radius: 8px;
+    padding: 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  #messages::-webkit-scrollbar { width: 10px; }
+  #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  .block {
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    border-left: 3px solid var(--border);
+    background: var(--bg-block);
+  }
+  .block .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+    opacity: 0.85;
+  }
+  .block pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+  }
+  .block.user { border-color: var(--user); }
+  .block.user .label { color: var(--user); }
+  .block.text { border-color: var(--accent); }
+  .block.text .label { color: var(--accent); }
+  .block.thinking {
+    border-color: var(--thinking);
+    background: transparent;
+    color: var(--thinking);
+    font-style: italic;
+  }
+  .block.thinking .label { color: var(--thinking); }
+  .block.tool { border-color: var(--tool); }
+  .block.tool .label { color: var(--tool); }
+  .block.tool_result { border-color: var(--result); }
+  .block.tool_result .label { color: var(--result); }
+  .block.error { border-color: var(--err); }
+  .block.error .label { color: var(--err); }
+  .block.system {
+    border-color: var(--fg-muted);
+    background: transparent;
+    color: var(--fg-muted);
+    font-size: 11px;
+  }
+  .block.system .label { display: none; }
+  #composer {
+    display: flex;
+    gap: 6px;
+    align-items: flex-end;
+  }
+  #prompt {
+    flex: 1;
+    min-height: 36px;
+    max-height: 200px;
+    padding: 8px 10px;
+    background: var(--bg-input);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    resize: vertical;
+  }
+  #prompt:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  button {
+    padding: 8px 14px;
+    background: var(--bg-block);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  button:hover { background: var(--border); }
+  button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  button.primary:hover { filter: brightness(1.1); }
+  button.danger { background: var(--err); color: var(--bg); border-color: var(--err); }
+  button.danger:hover { filter: brightness(1.1); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+</style>
+</head>
+<body>
+  <div id="status">Idle</div>
+  <div id="messages"></div>
+  <div id="composer">
+    <textarea id="prompt" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+    <button id="submit" class="primary">Send</button>
+    <button id="stop" class="danger" disabled>Stop</button>
+  </div>
+<script>
+  // The Rust side calls window.__setTabId(N) when an agent tab is activated.
+  // Every IPC message we post back includes this id so the dispatcher in
+  // Rust can route the prompt/stop to the correct tab.
+  window.__currentTabId = null;
+  window.__setTabId = function(id) { window.__currentTabId = id; };
+
+  const messagesEl = document.getElementById('messages');
+  const statusEl = document.getElementById('status');
+  const promptEl = document.getElementById('prompt');
+  const submitBtn = document.getElementById('submit');
+  const stopBtn = document.getElementById('stop');
+
+  function setStatus(state) {
+    statusEl.className = state;
+    statusEl.textContent = ({
+      idle: 'Idle',
+      streaming: 'Streaming…',
+      stopped: 'Stopped',
+      errored: 'Error',
+    }[state]) || state;
+    submitBtn.disabled = state === 'streaming';
+    stopBtn.disabled = state !== 'streaming';
+  }
+
+  function addBlock(kind, label, body) {
+    const block = document.createElement('div');
+    block.className = 'block ' + kind;
+    if (kind !== 'system' && label) {
+      const lab = document.createElement('div');
+      lab.className = 'label';
+      lab.textContent = label;
+      block.appendChild(lab);
+    }
+    const pre = document.createElement('pre');
+    pre.textContent = body;
+    block.appendChild(pre);
+    messagesEl.appendChild(block);
+    // Stick to bottom unless the user has scrolled up.
+    const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+    if (nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  // Reset the conversation surface (called by Rust on tab activation before replay).
+  window.__resetConversation = function() {
+    messagesEl.innerHTML = '';
+    setStatus('idle');
+  };
+
+  // Single-event injection point. Rust calls this with each AgentEvent::Other payload
+  // (the inner serde_json::Value). The shape is whatever pi/claude wrote on stdout —
+  // we branch on `type` and render minimally. Step 9 will polish (markdown, tool
+  // collapse, syntax highlighting, etc.).
+  window.__appendEvent = function(event) {
+    if (!event || typeof event !== 'object') return;
+    const t = event.type;
+    if (t === 'user_prompt') {
+      addBlock('user', 'User', event.text || '');
+      setStatus('streaming');
+    } else if (t === 'session' || t === 'agent_start' || t === 'turn_start') {
+      // Quiet system events — show nothing for now.
+    } else if (t === 'turn_end') {
+      const msg = event.message;
+      if (msg && Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === 'thinking' && block.thinking) {
+            addBlock('thinking', 'Thinking', block.thinking);
+          } else if (block.type === 'text' && block.text) {
+            addBlock('text', 'Assistant', block.text);
+          } else if (block.type === 'toolCall' || block.type === 'tool_use') {
+            const name = block.name || 'tool';
+            const args = block.arguments
+              ? JSON.stringify(block.arguments, null, 2)
+              : '';
+            addBlock('tool', `Tool · ${name}`, args);
+          }
+        }
+      }
+      if (Array.isArray(event.toolResults)) {
+        for (const r of event.toolResults) {
+          const out = typeof r === 'string' ? r : JSON.stringify(r, null, 2);
+          addBlock('tool_result', 'Tool result', out);
+        }
+      }
+    } else if (t === 'done') {
+      setStatus('idle');
+    } else if (t === 'stopped') {
+      setStatus('stopped');
+    } else if (t === 'error') {
+      addBlock('error', 'Error', event.message || JSON.stringify(event));
+      setStatus('errored');
+    } else {
+      // Unknown event — show a one-line system note for debugging until Step 4
+      // ships a typed parser.
+      addBlock('system', '', '· ' + (t || 'unknown event'));
+    }
+  };
+
+  function postIpc(payload) {
+    if (!window.ipc || typeof window.ipc.postMessage !== 'function') return;
+    window.ipc.postMessage(JSON.stringify({ ...payload, tabId: window.__currentTabId }));
+  }
+
+  function submitPrompt() {
+    const text = promptEl.value.trim();
+    if (!text) return;
+    postIpc({ type: 'submit', text });
+    promptEl.value = '';
+    promptEl.style.height = 'auto';
+  }
+
+  submitBtn.addEventListener('click', submitPrompt);
+  stopBtn.addEventListener('click', () => postIpc({ type: 'stop' }));
+
+  promptEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submitPrompt();
+    }
+  });
+
+  // Auto-grow textarea up to max-height.
+  promptEl.addEventListener('input', () => {
+    promptEl.style.height = 'auto';
+    promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + 'px';
+  });
+
+  setStatus('idle');
+</script>
+</body>
+</html>
