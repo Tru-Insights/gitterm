@@ -60,6 +60,135 @@ static MAIN_THREAD_LAST_EVENT: std::sync::Mutex<Option<String>> = std::sync::Mut
 // Store main thread ID so watchdog can signal it for backtrace
 static MAIN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ---- Agent webview IPC bridge (Step 4 of TRU-29) -------------------------
+//
+// The agent chat webview posts JSON messages back to Rust via wry's
+// `with_ipc_handler`. The handler is set once at webview construction (wry
+// has no API to swap it later), so it's stateless: it pushes parsed messages
+// onto a global mpsc, and an Iced subscription drains the mpsc into typed
+// `Event::AgentWebviewIpc` variants for the update loop to handle.
+//
+// Multi-tab routing: the JS side stamps every postMessage with the active
+// tab's id (set by Rust via evaluate_script on tab activation). The
+// dispatcher in update() reads tabId from the message and routes the prompt
+// or stop signal to the right tab.
+#[derive(Debug, Clone)]
+pub enum AgentIpcMessage {
+    Submit { tab_id: usize, text: String },
+    Stop { tab_id: usize },
+}
+
+static AGENT_IPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<AgentIpcMessage>> =
+    OnceLock::new();
+static AGENT_IPC_RX: OnceLock<
+    Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AgentIpcMessage>>>,
+> = OnceLock::new();
+
+fn init_agent_ipc_channel() {
+    AGENT_IPC_TX.get_or_init(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentIpcMessage>();
+        let _ = AGENT_IPC_RX.set(Mutex::new(Some(rx)));
+        tx
+    });
+}
+
+/// Iced subscription that drains the global IPC mpsc into typed events.
+/// Built once on first poll (function pointer, no captures); the receiver is
+/// taken out of `AGENT_IPC_RX` at that point and lives inside the stream
+/// for the rest of the process. Subsequent rebuilds (which happen if the
+/// subscription's identity hash changes) would receive an empty stream —
+/// but the identity here is stable (no `with(...)` value), so we get exactly
+/// one runner.
+fn agent_ipc_stream() -> impl iced::futures::Stream<Item = Event> + Send + 'static {
+    use iced::futures::StreamExt;
+    let rx = AGENT_IPC_RX
+        .get()
+        .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
+    let stream: tokio_stream::wrappers::UnboundedReceiverStream<AgentIpcMessage> = match rx {
+        Some(rx) => tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        None => {
+            // Channel already drained or not initialized — produce an empty
+            // stream by closing a fresh channel immediately.
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentIpcMessage>();
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+        }
+    };
+    stream.map(Event::AgentWebviewIpc)
+}
+
+/// Embedded HTML scaffold for the agent chat surface (Step 4 of TRU-29).
+const AGENT_CHAT_HTML: &str = include_str!("../assets/agent_chat.html");
+
+/// Push one `AgentEvent` into the live webview via `window.__appendEvent(...)`.
+/// Caller is responsible for ensuring the agent webview is the active one;
+/// this is a no-op if no webview exists.
+fn push_agent_event_to_webview(ev: &tab::AgentEvent) {
+    let payload = match ev {
+        tab::AgentEvent::Other(value) => value.clone(),
+        // Other typed variants don't currently fire (Step 3 emits only
+        // `Other`). When the typed parser lands these will be serialized
+        // into a richer JS-side shape.
+        _ => return,
+    };
+    let payload_json = serde_json::to_string(&payload)
+        .unwrap_or_else(|_| "null".to_string());
+    webview::evaluate_script(&format!("window.__appendEvent({})", payload_json));
+}
+
+/// Set the active tab id on the JS side. The webview tags every IPC message
+/// with this id so the Rust dispatcher can route the prompt/stop to the
+/// correct tab (multiple agent tabs may share the singleton webview, swapping
+/// in and out via tab activation).
+fn set_agent_webview_tab_id(tab_id: usize) {
+    webview::evaluate_script(&format!("window.__setTabId({})", tab_id));
+}
+
+/// Reset the chat surface: clears all rendered messages and sets status to Idle.
+fn reset_agent_webview() {
+    webview::evaluate_script("window.__resetConversation()");
+}
+
+/// Build the IPC handler closure to install at agent-webview creation. Parses
+/// each `window.ipc.postMessage(...)` body and forwards as a typed message
+/// into the global IPC channel for the Iced subscription to pick up.
+fn agent_ipc_handler() -> webview::IpcHandler {
+    Box::new(|body: String| {
+        let Some(tx) = AGENT_IPC_TX.get() else {
+            eprintln!("[agent-ipc] tx not initialized; dropping {}", body);
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+            eprintln!("[agent-ipc] non-JSON body: {}", body);
+            return;
+        };
+        let tab_id = value
+            .get("tabId")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(tab_id) = tab_id else {
+            eprintln!("[agent-ipc] missing tabId in {}", body);
+            return;
+        };
+        let msg = match kind {
+            "submit" => {
+                let text = value
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                AgentIpcMessage::Submit { tab_id, text }
+            }
+            "stop" => AgentIpcMessage::Stop { tab_id },
+            _ => {
+                eprintln!("[agent-ipc] unknown type {:?}", kind);
+                return;
+            }
+        };
+        let _ = tx.send(msg);
+    })
+}
+
 fn start_freeze_watchdog() {
     if !freeze_debug_enabled() {
         return;
@@ -437,8 +566,8 @@ fn setup_menu_bar() {
 
 #[cfg(feature = "stt")]
 fn stt_model_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("gitterm")
         .join("models")
@@ -582,6 +711,11 @@ fn main() -> iced::Result {
 
     // Start freeze detection watchdog
     start_freeze_watchdog();
+
+    // Initialize the global agent-webview IPC channel before any webview can
+    // post messages into it. The receiver is parked for the subscription to
+    // take on first build.
+    init_agent_ipc_channel();
 
     // Load app icon from embedded PNG
     let icon = iced::window::icon::from_file_data(include_bytes!("../assets/icon.png"), None).ok();
@@ -3123,8 +3257,12 @@ pub enum Event {
     /// Step 3-only debug entry point: spawn an in-memory agent tab in the
     /// active workspace, submit a hardcoded prompt, log events to stderr.
     /// Bound to a hidden keyboard shortcut for verifying the subprocess
-    /// pipeline. Removed before Step 4 lands.
+    /// pipeline. Step 4 keeps it as the temporary launcher for an agent tab
+    /// (replaced by a real launcher UI in Step 5).
     DebugSpawnAgentTab,
+    /// One IPC message from the agent webview, drained from the global
+    /// `AGENT_IPC_RX` channel by the subscription bridge.
+    AgentWebviewIpc(AgentIpcMessage),
     // Quick commands (run in bottom terminal)
     RunQuickCommand(usize),
     ShowQuickCommands,
@@ -3255,6 +3393,26 @@ struct App {
     stt_sample_rate: u32,
     #[cfg(feature = "stt")]
     stt_transcribing: bool,
+    /// What kind of content the singleton webview is currently hosting. Used
+    /// to decide whether a tab activation can keep / update the webview in
+    /// place or has to destroy + recreate it (the IPC handler is set at
+    /// construction and can't be swapped, so Static<->Agent transitions need
+    /// a recreate).
+    webview_kind: WebviewKind,
+    /// The agent tab id whose state the webview is currently mirroring (if
+    /// `webview_kind == Agent`). Used to detect tab-switch-to-different-agent
+    /// transitions which need a buffer replay.
+    webview_agent_tab_id: Option<usize>,
+}
+
+/// What kind of content the singleton wry webview is currently hosting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebviewKind {
+    None,
+    /// Markdown / Excalidraw / HTML file viewer — no IPC handler.
+    Static,
+    /// Agent chat — installed once with an IPC handler at construction.
+    Agent,
 }
 
 const SPINE_WIDTH: f32 = 16.0;
@@ -3623,6 +3781,25 @@ impl App {
         context: &str,
         window_focused: bool,
     ) -> iced_term::actions::Action {
+        // Stamp the watchdog with the specific backend-command kind. The
+        // generic dispatcher heartbeat skips `Event::Terminal` (it fires at
+        // PTY-tick rate), so without this tag a freeze inside `term.handle`
+        // would surface as "Last event: CheckMenu-done" — useless. With this,
+        // a watchdog dump names the exact sub-path (Backend:Write,
+        // Backend:Resize, Backend:ProcessAlacrittyEvent, …) so we know
+        // whether we're parked in PTY write, term-lock contention, etc.
+        let cmd_name = match &cmd {
+            iced_term::backend::Command::Write(_) => "Write",
+            iced_term::backend::Command::Scroll(_) => "Scroll",
+            iced_term::backend::Command::Resize(..) => "Resize",
+            iced_term::backend::Command::SelectStart(..) => "SelectStart",
+            iced_term::backend::Command::SelectUpdate(_) => "SelectUpdate",
+            iced_term::backend::Command::ClearSelection => "ClearSelection",
+            iced_term::backend::Command::ProcessLink(..) => "ProcessLink",
+            iced_term::backend::Command::MouseReport(..) => "MouseReport",
+            iced_term::backend::Command::ProcessAlacrittyEvent(_) => "ProcessAlacrittyEvent",
+        };
+        heartbeat(&format!("Backend:{}:{}", cmd_name, context));
         let started = Instant::now();
         let action = if window_focused {
             term.handle(iced_term::Command::ProxyToBackend(cmd))
@@ -3634,11 +3811,15 @@ impl App {
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(100) {
             freeze_debug!(
-                "terminal.handle in {} took {}ms",
+                "terminal.handle in {} took {}ms (cmd={})",
                 context,
                 elapsed.as_millis(),
+                cmd_name,
             );
         }
+        // Mark survival so the watchdog can distinguish "froze in handle"
+        // from "froze somewhere downstream that consumed the Action".
+        heartbeat(&format!("Backend:{}:{}-done", cmd_name, context));
         action
     }
 
@@ -4070,6 +4251,8 @@ impl App {
             stt_sample_rate: 48000,
             #[cfg(feature = "stt")]
             stt_transcribing: false,
+            webview_kind: WebviewKind::None,
+            webview_agent_tab_id: None,
         };
 
         // Try to restore workspaces from saved config
@@ -4220,6 +4403,17 @@ impl App {
             }
         } {
             startup_tasks.push(Self::request_git_status(tab_id, repo_path));
+        }
+
+        // If the active tab on startup is an agent tab (restored from
+        // workspaces.json), dispatch its activation so the webview gets
+        // built — TabSelect doesn't fire automatically on restore.
+        let active_agent_tab_id = app
+            .active_tab()
+            .filter(|t| matches!(t.kind, TabKind::Agent(_)))
+            .map(|t| t.id);
+        if let Some(tab_id) = active_agent_tab_id {
+            startup_tasks.push(app.show_agent_webview(tab_id));
         }
 
         (app, Task::batch(startup_tasks))
@@ -4586,6 +4780,10 @@ fi
 
     fn subscription(&self) -> Subscription<Event> {
         let mut subs = vec![
+            // Agent webview IPC bridge — drains the global mpsc into events.
+            // Built once via a fn pointer; re-runs are guarded by the
+            // identity hash of `Subscription::run`'s function-pointer arg.
+            Subscription::run(agent_ipc_stream),
             iced::time::every(Duration::from_millis(5000)).map(|_| Event::Tick),
             // Poll menu events frequently
             iced::time::every(Duration::from_millis(MENU_POLL_INTERVAL_MS))
@@ -5016,16 +5214,28 @@ fi
                     }
                 }
                 let scroll_task = self.scroll_to_active_tab();
+                // Agent tab takes priority over the static-webview path because
+                // its webview is the tab's primary surface, not a modal overlay.
+                let active_agent_tab_id = self
+                    .active_tab()
+                    .filter(|t| matches!(t.kind, TabKind::Agent(_)))
+                    .map(|t| t.id);
+                if let Some(tab_id) = active_agent_tab_id {
+                    return Task::batch([scroll_task, self.show_agent_webview(tab_id)]);
+                }
                 if let Some(html) = self.active_inline_webview_html() {
                     let bounds = self.calculate_webview_bounds();
-                    return Task::batch([scroll_task, Self::show_webview(html, bounds)]);
+                    return Task::batch([scroll_task, self.show_webview(html, bounds)]);
                 }
-                webview::set_visible(false);
+                // No webview kind is active for this tab. Hide whatever is
+                // there but don't change webview_kind — the static webview
+                // can be reused for the next markdown/file viewer.
+                self.hide_webview_for_non_agent();
                 return scroll_task;
             }
             Event::TabClose(idx) => {
                 // Hide WebView when closing tabs
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
                 if let Some(ws) = self.active_workspace_mut() {
                     if idx < ws.tabs.len() && ws.tabs.len() > 1 {
                         ws.tabs.remove(idx);
@@ -5171,6 +5381,19 @@ fi
                     return self.scroll_to_active_tab();
                 }
             }
+            Event::AgentWebviewIpc(msg) => {
+                // The IPC bridge already tagged each message with a tab_id
+                // (from window.__currentTabId in the JS). Translate into the
+                // existing AgentSubmitPrompt / AgentStopRequested handlers.
+                return match msg {
+                    AgentIpcMessage::Submit { tab_id, text } => {
+                        Task::done(Event::AgentSubmitPrompt(tab_id, text))
+                    }
+                    AgentIpcMessage::Stop { tab_id } => {
+                        Task::done(Event::AgentStopRequested(tab_id))
+                    }
+                };
+            }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
                 // Find the tab. If it's an Agent tab, ensure a subprocess
                 // manager is spawned (lazy on first prompt) and forward the
@@ -5178,6 +5401,13 @@ fi
                 // event channel into AgentEventReceived events for this tab.
                 let mut bridge: Option<tokio::sync::mpsc::UnboundedReceiver<tab::AgentEvent>> =
                     None;
+                // Synthetic event so the user sees their own prompt rendered
+                // immediately (the agent stream takes a few hundred ms before
+                // the first system event arrives).
+                let echo = tab::AgentEvent::Other(serde_json::json!({
+                    "type": "user_prompt",
+                    "text": prompt,
+                }));
                 'outer_submit: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id != tab_id {
@@ -5206,8 +5436,16 @@ fi
                                 session.state = tab::AgentSessionState::Streaming;
                             }
                         }
+                        session.conversation.push(echo.clone());
                         break 'outer_submit;
                     }
+                }
+                // Also push the echo into the webview if this tab is the one
+                // currently rendered there.
+                if self.webview_kind == WebviewKind::Agent
+                    && self.webview_agent_tab_id == Some(tab_id)
+                {
+                    push_agent_event_to_webview(&echo);
                 }
                 if let Some(rx) = bridge {
                     use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -5235,17 +5473,17 @@ fi
                 return Task::none();
             }
             Event::AgentEventReceived(tab_id, ev) => {
-                // Step 3 just appends to the conversation buffer and logs to
-                // stderr for the debug-spawn flow. Step 4 will push live to
-                // the webview when the tab is the active one.
-                eprintln!("[agent tab={}] event: {:?}", tab_id, ev);
+                // Append to the conversation buffer; if this tab's webview is
+                // currently visible, also push the event live for rendering.
+                let is_active_in_webview = self.webview_kind == WebviewKind::Agent
+                    && self.webview_agent_tab_id == Some(tab_id);
                 for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
                             if let Some(session) = t.agent_session_mut() {
-                                // Heuristic state transition until Step 4 lands a
-                                // proper parser: a `done`/`stopped` sentinel flips
-                                // back to Idle; everything else implies Streaming.
+                                // Heuristic state transition until typed parser
+                                // lands (Step 9): `done`/`stopped` sentinels
+                                // flip back to Idle/Stopped.
                                 if let tab::AgentEvent::Other(value) = &ev {
                                     if let Some(t) = value.get("type").and_then(|v| v.as_str()) {
                                         if t == "done" {
@@ -5254,6 +5492,9 @@ fi
                                             session.state = tab::AgentSessionState::Stopped;
                                         }
                                     }
+                                }
+                                if is_active_in_webview {
+                                    push_agent_event_to_webview(&ev);
                                 }
                                 session.conversation.push(ev);
                             }
@@ -5276,7 +5517,7 @@ fi
                 let config = tab::AgentBackendConfig::Pi {
                     model,
                     session_path: Some(session_path),
-                    thinking: None,
+                    thinking: Some(true),
                 };
                 let (repo_path, current_dir) = match self.active_workspace() {
                     Some(ws) => {
@@ -5299,10 +5540,10 @@ fi
                     ws.active_tab = ws.tabs.len() - 1;
                 }
                 eprintln!("[debug] spawned agent tab id={}", id);
-                return Task::done(Event::AgentSubmitPrompt(
-                    id,
-                    "say hi in five words".to_string(),
-                ));
+                // Surface the agent webview for the brand-new tab. The user
+                // can type prompts directly into it; no hardcoded prompt now.
+                let scroll_task = self.scroll_to_active_tab();
+                return Task::batch([scroll_task, self.show_agent_webview(id)]);
             }
             Event::ShowQuickCommands => {
                 if !self.quick_commands.is_empty() {
@@ -5584,7 +5825,7 @@ fi
             Event::FolderSelected(None) => {}
             Event::FileSelect(path, is_staged) => {
                 // Hide WebView when switching to git diff view
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
                 let is_dark_theme = self.theme == AppTheme::Dark;
 
                 if let Some(tab) = self.active_tab_mut() {
@@ -5616,7 +5857,7 @@ fi
             }
             Event::FileSelectByIndex(idx) => {
                 // Hide WebView when switching to git diff view
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
                 let is_dark_theme = self.theme == AppTheme::Dark;
 
                 if let Some(tab) = self.active_tab_mut() {
@@ -5931,8 +6172,9 @@ fi
                 if self.sidebar_collapsed {
                     self.sidebar_collapsed = false;
                 }
-                // Hide WebView when switching modes
-                webview::set_visible(false);
+                // Hide WebView when switching modes (but keep agent webview alive
+                // — it's the agent tab's primary content, not a modal overlay).
+                self.hide_webview_for_non_agent();
 
                 if let Some(tab) = self.active_tab_mut() {
                     if tab.sidebar_mode != mode {
@@ -6156,7 +6398,7 @@ fi
 
                 // Hide WebView if switching to non-webview file
                 if !has_webview_content && webview::is_active() {
-                    webview::set_visible(false);
+                    self.hide_webview_for_non_agent();
                 }
 
                 if let Some(tab) = self.active_tab_mut() {
@@ -6219,7 +6461,7 @@ fi
             }
             Event::CloseFileView => {
                 // Hide WebView
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
 
                 if let Some(tab) = self.active_tab_mut() {
                     tab.close_file_viewer();
@@ -6750,14 +6992,14 @@ fi
                 }
 
                 if hide_webview {
-                    webview::set_visible(false);
+                    self.hide_webview_for_non_agent();
                 }
 
                 // Show inline WebView after mutable borrow is released
                 if let Some(html) = inline_webview_html {
                     let bounds = self.calculate_webview_bounds();
                     self.mark_log_server_dirty();
-                    return Self::show_webview(html, bounds);
+                    return self.show_webview(html, bounds);
                 }
 
                 self.mark_log_server_dirty();
@@ -7017,10 +7259,10 @@ fi
                         return Task::batch([
                             slide_task,
                             bar_task,
-                            Self::show_webview(html, bounds),
+                            self.show_webview(html, bounds),
                         ]);
                     }
-                    webview::set_visible(false);
+                    self.hide_webview_for_non_agent();
                     return Task::batch([slide_task, bar_task]);
                 }
             }
@@ -7095,14 +7337,14 @@ fi
                         if nearest != self.active_workspace_idx {
                             self.active_workspace_idx = nearest;
                             self.mark_workspaces_dirty();
-                            webview::set_visible(false);
+                            self.hide_webview_for_non_agent();
                             self.editing_console_command = None;
                         }
                     }
                 }
             }
             Event::WorkspaceClose(idx) => {
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
                 if idx < self.workspaces.len() && self.workspaces.len() > 1 {
                     // Stash the workspace config (env, color, etc.) before removing,
                     // so it's preserved in workspaces.json for reopening later.
@@ -7463,6 +7705,21 @@ fi
         Task::none()
     }
 
+    /// Hide the singleton webview unless it's the agent webview for the
+    /// currently active tab — in which case it's the tab's primary content
+    /// and should stay visible. Replaces unconditional `webview::set_visible(false)`
+    /// calls scattered across handlers that predate the agent tab kind.
+    fn hide_webview_for_non_agent(&self) {
+        let active_is_agent_tab_with_active_webview = self
+            .active_tab()
+            .map(|t| matches!(t.kind, TabKind::Agent(_)))
+            .unwrap_or(false)
+            && self.webview_kind == WebviewKind::Agent;
+        if !active_is_agent_tab_with_active_webview {
+            webview::set_visible(false);
+        }
+    }
+
     /// Calculate WebView bounds based on current layout
     fn calculate_webview_bounds(&self) -> (f32, f32, f32, f32) {
         let tab_bar_height = 33.0; // top tab strip
@@ -7490,9 +7747,11 @@ fi
         (x, y, width, height)
     }
 
-    /// Create or update the embedded WebView with HTML content.
-    /// Uses iced::window::run to get the window handle for wry.
-    fn show_webview(html: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
+    /// Create or update the embedded WebView with static HTML content
+    /// (markdown, excalidraw, html file viewer). If the webview is currently
+    /// hosting agent chat, we destroy + recreate it (the chat IPC handler
+    /// can't be swapped post-construction).
+    fn show_webview(&mut self, html: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
         perf_log!(
             "webview mode={} html_bytes={} bounds=({}, {}, {}, {})",
             if webview::is_active() {
@@ -7506,15 +7765,24 @@ fi
             bounds.2,
             bounds.3
         );
+        // If the active webview is the agent chat, tear it down so we don't
+        // try to render markdown into the chat scaffold (or vice-versa).
+        if self.webview_kind == WebviewKind::Agent {
+            webview::destroy();
+            self.webview_kind = WebviewKind::None;
+            self.webview_agent_tab_id = None;
+        }
         // Reuse the existing WebView when possible to avoid expensive recreation churn.
         if webview::is_active() {
             webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
             webview::update_content(&html);
             webview::set_visible(true);
+            self.webview_kind = WebviewKind::Static;
             return Task::none();
         }
 
         webview::set_pending_content(html, bounds);
+        self.webview_kind = WebviewKind::Static;
         iced::window::oldest().then(|opt_id| {
             if let Some(id) = opt_id {
                 iced::window::run(id, |window| {
@@ -7524,6 +7792,111 @@ fi
                 })
                 .discard()
             } else {
+                Task::none()
+            }
+        })
+    }
+
+    /// Show the agent chat webview for `tab_id`. If the webview is currently
+    /// hosting static content (markdown / excalidraw), destroy + recreate it
+    /// with the chat HTML and IPC handler. If it's already an agent webview
+    /// for a different tab, just clear and replay this tab's buffer.
+    fn show_agent_webview(&mut self, tab_id: usize) -> Task<Event> {
+        let bounds = self.calculate_webview_bounds();
+
+        // Find the conversation buffer to replay.
+        let conversation: Vec<tab::AgentEvent> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.agent_session())
+            .map(|s| s.conversation.clone())
+            .unwrap_or_default();
+
+        // Reconcile bookkeeping with the actual webview state. If we think we
+        // have an Agent webview but `is_active()` says no, the previous
+        // construction must have failed silently (or been destroyed by a
+        // sibling code path). Fall through to the recreate branch below.
+        let webview_alive = webview::is_active();
+        let same_tab_fast_path = self.webview_kind == WebviewKind::Agent
+            && self.webview_agent_tab_id == Some(tab_id)
+            && webview_alive;
+        let other_agent_tab_path = self.webview_kind == WebviewKind::Agent
+            && self.webview_agent_tab_id != Some(tab_id)
+            && webview_alive;
+
+        eprintln!(
+            "[agent-webview] show tab={} kind={:?} alive={} same={} other={} bounds=({},{},{},{}) buf_len={}",
+            tab_id,
+            self.webview_kind,
+            webview_alive,
+            same_tab_fast_path,
+            other_agent_tab_path,
+            bounds.0,
+            bounds.1,
+            bounds.2,
+            bounds.3,
+            conversation.len()
+        );
+
+        if same_tab_fast_path {
+            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+            webview::set_visible(true);
+            return Task::none();
+        }
+
+        if other_agent_tab_path {
+            // Different agent tab on the live agent webview — reset surface
+            // and replay this tab's events. No recreate needed (the IPC
+            // handler routes by tabId, set per activation).
+            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+            webview::set_visible(true);
+            reset_agent_webview();
+            set_agent_webview_tab_id(tab_id);
+            for ev in &conversation {
+                push_agent_event_to_webview(ev);
+            }
+            self.webview_agent_tab_id = Some(tab_id);
+            return Task::none();
+        }
+
+        // No agent webview alive — destroy whatever's there and recreate.
+        if webview_alive {
+            eprintln!("[agent-webview] destroying existing kind={:?}", self.webview_kind);
+            webview::destroy();
+        }
+        webview::set_pending_content_with_ipc(
+            AGENT_CHAT_HTML.to_string(),
+            bounds,
+            Some(agent_ipc_handler()),
+        );
+        self.webview_kind = WebviewKind::Agent;
+        self.webview_agent_tab_id = Some(tab_id);
+
+        // After construction, set the tab id on the JS side and replay buffered
+        // events. Both happen via evaluate_script after `try_create_with_window`
+        // runs. Using Arc because Task::then's closure is FnMut, so the Vec
+        // can't be moved out of the captured environment on each call.
+        let conversation = std::sync::Arc::new(conversation);
+        iced::window::oldest().then(move |opt_id| {
+            let conversation = std::sync::Arc::clone(&conversation);
+            if let Some(id) = opt_id {
+                iced::window::run(id, move |window| {
+                    eprintln!("[agent-webview] try_create_with_window for tab={}", tab_id);
+                    if let Err(e) = webview::try_create_with_window(window) {
+                        eprintln!("[agent-webview] create FAILED for tab={}: {}", tab_id, e);
+                        return;
+                    }
+                    eprintln!("[agent-webview] create OK for tab={}, replaying {} events", tab_id, conversation.len());
+                    set_agent_webview_tab_id(tab_id);
+                    for ev in conversation.iter() {
+                        push_agent_event_to_webview(ev);
+                    }
+                })
+                .discard()
+            } else {
+                eprintln!("[agent-webview] no window available; skipping create");
                 Task::none()
             }
         })
@@ -8998,18 +9371,25 @@ fi
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         if let Some(tab) = ws.active_tab() {
-            let main_panel =
-                if tab.agent_sidebar.selected_capture_idx.is_some() && tab.sidebar_mode == SidebarMode::Agent {
-                    freeze_time!("view_agent_conversation", {
-                        self.view_agent_conversation(tab)
-                    })
-                } else if tab.viewing_file_path().is_some() {
-                    freeze_time!("view_file_content", { self.view_file_content(tab) })
-                } else if tab.selected_file.is_some() {
-                    freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
-                } else {
-                    freeze_time!("view_terminal", { self.view_terminal(tab) })
-                };
+            let main_panel = if matches!(tab.kind, TabKind::Agent(_)) {
+                // Agent tabs render the chat UI in the wry webview which is
+                // positioned by `calculate_webview_bounds` and managed via
+                // `show_agent_webview`. The Iced view here is just an empty
+                // background that lets the webview occupy the same area.
+                freeze_time!("view_agent_tab", { self.view_agent_tab(tab) })
+            } else if tab.agent_sidebar.selected_capture_idx.is_some()
+                && tab.sidebar_mode == SidebarMode::Agent
+            {
+                freeze_time!("view_agent_conversation", {
+                    self.view_agent_conversation(tab)
+                })
+            } else if tab.viewing_file_path().is_some() {
+                freeze_time!("view_file_content", { self.view_file_content(tab) })
+            } else if tab.selected_file.is_some() {
+                freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
+            } else {
+                freeze_time!("view_terminal", { self.view_terminal(tab) })
+            };
 
             if self.sidebar_collapsed {
                 let icon_rail = self.view_sidebar_rail(tab);
@@ -11985,6 +12365,32 @@ fi
         } else {
             line_container.into()
         }
+    }
+
+    /// Background placeholder for an agent tab. The wry webview is positioned
+    /// by `calculate_webview_bounds` and overlays this area; the placeholder is
+    /// only visible briefly during webview construction or as a fallback if
+    /// the webview fails to attach.
+    fn view_agent_tab<'a>(
+        &'a self,
+        _tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let bg = theme.bg_base();
+        container(
+            text("Loading agent…")
+                .size(13)
+                .color(theme.text_secondary()),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        })
+        .into()
     }
 
     fn view_terminal<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {

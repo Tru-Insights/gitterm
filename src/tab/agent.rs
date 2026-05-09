@@ -312,19 +312,26 @@ async fn run_turn(
                         // lands in Step 4, alongside the chat UI that consumes them.
                         let value = serde_json::from_str::<serde_json::Value>(&line)
                             .unwrap_or_else(|_| serde_json::Value::String(line));
-                        // Drop high-volume per-token streaming events. pi emits one
-                        // `message_update` per token (with the full partial state
-                        // attached, hundreds of KB each), and forwarding all of them
-                        // saturates Iced's internal event channel — caused the
-                        // SendError { Disconnected } panic during Step 3 testing.
-                        // Step 4's parser will produce typed delta variants that
-                        // can stream safely; until then, drop them on the floor.
-                        let is_token_update = value
+                        // Drop high-volume / low-value events at the source. The
+                        // tool-call info we want is in `turn_end.message.content`,
+                        // which already renders. Filtering here keeps Iced's
+                        // event channel from saturating (caused a panic in Step 3
+                        // testing) and keeps the conversation buffer compact.
+                        let drop = value
                             .get("type")
                             .and_then(|v| v.as_str())
-                            .map(|t| matches!(t, "message_update" | "message_start" | "message_end"))
+                            .map(|t| {
+                                matches!(
+                                    t,
+                                    "message_update"
+                                        | "message_start"
+                                        | "message_end"
+                                        | "tool_execution_start"
+                                        | "tool_execution_end"
+                                )
+                            })
                             .unwrap_or(false);
-                        if is_token_update {
+                        if drop {
                             continue;
                         }
                         if event_tx.send(AgentEvent::Other(value)).is_err() {

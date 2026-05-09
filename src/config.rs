@@ -16,8 +16,10 @@ pub fn instance_id() -> &'static str {
 
 /// Get the shared (non-instance-specific) config directory
 pub fn global_config_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config").join("gitterm")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("gitterm")
 }
 
 /// Get the base config directory for this instance
