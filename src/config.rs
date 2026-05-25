@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,18 +10,21 @@ static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 pub fn instance_id() -> &'static str {
     INSTANCE_ID.get_or_init(|| {
         // Allow override via environment variable for testing
-        std::env::var("GITTERM_INSTANCE_ID")
-            .unwrap_or_else(|_| std::process::id().to_string())
+        std::env::var("GITTERM_INSTANCE_ID").unwrap_or_else(|_| std::process::id().to_string())
     })
+}
+
+/// Get the shared (non-instance-specific) config directory
+pub fn global_config_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("gitterm")
 }
 
 /// Get the base config directory for this instance
 pub fn instance_config_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".config")
-        .join("gitterm")
-        .join(format!("instance-{}", instance_id()))
+    global_config_dir().join(format!("instance-{}", instance_id()))
 }
 
 /// Print instance info on startup
@@ -34,7 +36,7 @@ pub fn print_instance_info() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_instance_id_generation() {
         let id = instance_id();
@@ -42,8 +44,8 @@ mod tests {
         // Should be consistent across calls
         assert_eq!(instance_id(), id);
     }
-    
-    #[test] 
+
+    #[test]
     fn test_instance_config_dir() {
         let dir = instance_config_dir();
         assert!(dir.to_string_lossy().contains("instance-"));
@@ -56,7 +58,11 @@ pub fn cleanup_instance_config() {
     let instance_dir = instance_config_dir();
     if instance_dir.exists() && instance_dir.to_string_lossy().contains(instance_id()) {
         let _ = std::fs::remove_dir_all(&instance_dir);
-        eprintln!("GitTerm instance {} cleaned up config: {}", instance_id(), instance_dir.display());
+        eprintln!(
+            "GitTerm instance {} cleaned up config: {}",
+            instance_id(),
+            instance_dir.display()
+        );
     }
 }
 
@@ -123,7 +129,7 @@ fn default_console_expanded() -> bool {
 }
 
 fn default_log_server_enabled() -> bool {
-    false
+    true
 }
 
 #[cfg(feature = "stt")]
@@ -256,13 +262,13 @@ impl Default for Config {
             terminal_font_size: 14.0,
             ui_font_size: 13.0,
             sidebar_width: 280.0,
-            scrollback_lines: 100_000,
+            scrollback_lines: 30_000,
             font_size: None,
             theme: "dark".to_string(),
             show_hidden: false,
             console_height: 200.0,
             console_expanded: true,
-            log_server_enabled: false,
+            log_server_enabled: true,
             #[cfg(feature = "stt")]
             stt_enabled: true,
             #[cfg(feature = "stt")]
@@ -324,6 +330,14 @@ pub struct WorkspaceConfig {
     /// "env": { "LINEAR_WORKSPACE": "truinsights", "LINEAR_TEAM": "TRU", "GH_TOKEN": "..." }
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Whether this workspace is currently open. Closed workspaces are kept in
+    /// workspaces.json so their env vars and settings are preserved for reopening.
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +347,15 @@ pub struct WorkspaceTabConfig {
     pub repo_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_command: Option<String>,
+    /// Tab kind discriminator. `None` or `Some("terminal")` means a terminal tab
+    /// (the implicit default — older `workspaces.json` files predate this field).
+    /// `Some("agent")` means a Claude Code / pi agent tab; see `agent_config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_kind: Option<String>,
+    /// Backend config for `tab_kind: "agent"`. Required when `tab_kind == Some("agent")`;
+    /// ignored otherwise. Schema: `{"backend": "pi"|"claude", ...backend-specific fields}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_config: Option<crate::tab::AgentBackendConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,7 +365,7 @@ pub struct BottomTerminalConfig {
 
 impl WorkspacesFile {
     pub fn file_path() -> PathBuf {
-        instance_config_dir().join("workspaces.json")
+        global_config_dir().join("workspaces.json")
     }
 
     pub fn load() -> Option<Self> {

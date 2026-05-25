@@ -1,0 +1,1291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>pi-harness webview spike</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/diff@5.1.0/dist/diff.min.js"></script>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #1e1e2e;
+    --bg-alt: #181825;
+    --bg-block: #313244;
+    --bg-code: #11111b;
+    --fg: #cdd6f4;
+    --fg-muted: #7f849c;
+    --accent: #89b4fa;
+    --border: #585b70;
+    --user: #a6e3a1;
+    --result: #94e2d5;
+    --tool: #fab387;
+    --err: #f38ba8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    font-size: 14px;
+    background: var(--bg);
+    color: var(--fg);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    background: var(--bg-alt);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  #messages::-webkit-scrollbar { width: 10px; }
+  #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  .block {
+    margin-bottom: 8px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border-left: 3px solid var(--border);
+    background: var(--bg-block);
+  }
+  .block pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: inherit; }
+  .block.user { border-color: var(--user); }
+  .block.user .label { color: var(--user); }
+  .block.thinking { border-color: var(--fg-muted); background: transparent; color: var(--fg-muted); font-style: italic; }
+  .block.thinking .label { color: var(--fg-muted); }
+  .block.text { border-color: var(--accent); }
+  .block.text .label { color: var(--accent); }
+  .block.tool_use { border-color: var(--tool); }
+  .block.tool_use .label { color: var(--tool); }
+  /* Collapsed tool_use pair: args pre hidden, label row shows summary. */
+  .block.tool_use.collapsed {
+    padding-top: 6px;
+    padding-bottom: 6px;
+    cursor: pointer;
+    transition: background 0.12s ease;
+  }
+  .block.tool_use.collapsed:hover { background: var(--bg-alt); }
+  .block.tool_use.collapsed pre { display: none; }
+  .block.tool_use.collapsed .label { margin-bottom: 0; }
+  /* Paired tool_result block hidden when its tool_use is collapsed. */
+  .block.collapsed-hidden { display: none; }
+  /* Summary badge visible only in the collapsed state. */
+  .tool-collapsed-summary {
+    color: var(--fg-muted);
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+    font-size: 11px;
+  }
+  .block.tool_use:not(.collapsed) .tool-collapsed-summary { display: none; }
+
+  /* Diff view for Edit/Write tool args. Replaces the raw-JSON pre body. */
+  .diff-view {
+    margin: 0;
+    padding: 0;
+    white-space: normal;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+  .diff-file {
+    color: var(--fg);
+    font-weight: 600;
+    padding: 2px 8px 6px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+  }
+  .diff-line {
+    padding: 1px 8px 1px 22px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    position: relative;
+  }
+  .diff-line::before {
+    position: absolute;
+    left: 8px;
+    width: 10px;
+    color: inherit;
+    opacity: 0.7;
+  }
+  .diff-added {
+    background: rgba(166, 227, 161, 0.12);
+    color: #a6e3a1;
+  }
+  .diff-added::before { content: '+'; }
+  .diff-removed {
+    background: rgba(243, 139, 168, 0.12);
+    color: #f38ba8;
+  }
+  .diff-removed::before { content: '-'; }
+  .diff-context {
+    color: var(--fg-muted);
+  }
+  .diff-context::before { content: ' '; }
+  .diff-hunk-separator {
+    padding: 4px 8px;
+    color: var(--fg-muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    text-align: center;
+    opacity: 0.5;
+    letter-spacing: 2px;
+  }
+  .block.system { border-color: var(--border); background: transparent; color: var(--fg-muted); font-size: 12px; }
+  .block.system .label { color: var(--fg-muted); }
+  .block.result { border-color: var(--result); }
+  .block.result .label { color: var(--result); }
+  .block.err { border-color: var(--err); }
+  .block.err .label { color: var(--err); }
+
+  /* Markdown-rendered prose inside text blocks. Sans-serif body, monospace
+     for inline and fenced code. */
+  .block.text .body {
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--fg);
+  }
+  .block.text .body > *:first-child { margin-top: 0; }
+  .block.text .body > *:last-child { margin-bottom: 0; }
+  .block.text .body p { margin: 0.5em 0; }
+  .block.text .body h1,
+  .block.text .body h2,
+  .block.text .body h3,
+  .block.text .body h4 {
+    margin: 0.9em 0 0.4em;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+  .block.text .body h1 { font-size: 1.4em; color: var(--tool); }
+  .block.text .body h2 { font-size: 1.22em; color: var(--tool); }
+  .block.text .body h3 { font-size: 1.08em; color: var(--tool); }
+  .block.text .body h4 { font-size: 1em; color: var(--fg-muted); }
+  .block.text .body ul,
+  .block.text .body ol { margin: 0.4em 0; padding-left: 1.6em; }
+  .block.text .body li { margin: 0.18em 0; }
+  .block.text .body code {
+    background: var(--bg-code);
+    color: var(--user); /* green inline-code pills; matches pi's terminal vocabulary */
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.92em;
+  }
+  .block.text .body pre {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    margin: 0.6em 0;
+    white-space: pre;
+  }
+  .block.text .body pre code {
+    background: transparent;
+    color: unset;          /* defer to highlight.js theme colors inside fences */
+    padding: 0;
+    border-radius: 0;
+    font-size: 0.9em;
+    line-height: 1.5;
+  }
+  .block.text .body a { color: var(--accent); text-decoration: none; }
+  .block.text .body a:hover { text-decoration: underline; }
+  .block.text .body strong { font-weight: 600; }
+  .block.text .body em { font-style: italic; }
+  .block.text .body blockquote {
+    border-left: 3px solid var(--border);
+    margin: 0.6em 0;
+    padding: 0 0.9em;
+    color: var(--fg-muted);
+  }
+  .block.text .body hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 1em 0;
+  }
+  .block.text .body table {
+    border-collapse: collapse;
+    margin: 0.5em 0;
+  }
+  .block.text .body th,
+  .block.text .body td {
+    border: 1px solid var(--border);
+    padding: 4px 8px;
+  }
+  .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+  .label .count-hint { color: var(--fg-muted); text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 11px; }
+  .block-toggle {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-muted);
+    padding: 1px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 10px;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+  .block-toggle:hover { border-color: var(--accent); color: var(--fg); }
+  .composer { display: flex; flex-direction: column; gap: 8px; position: relative; }
+
+  /* @-mention file picker — anchored above the textarea. */
+  .file-popup {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    right: 0;
+    margin-bottom: 6px;
+    background: var(--bg-block);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    max-height: 220px;
+    overflow-y: auto;
+    padding: 4px;
+    display: none;
+    z-index: 10;
+    box-shadow: 0 -4px 16px rgba(0,0,0,0.35);
+  }
+  .file-popup.visible { display: block; }
+  .file-popup-item {
+    padding: 4px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .file-popup-item.selected { background: var(--accent); color: var(--bg); }
+  .file-popup-item:hover { background: var(--bg-alt); }
+  .file-popup-item.selected:hover { background: var(--accent); }
+  .file-popup-empty { padding: 6px 10px; color: var(--fg-muted); font-size: 12px; }
+  #input {
+    width: 100%;
+    min-height: 80px;
+    padding: 12px;
+    background: var(--bg-block);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 14px;
+    resize: vertical;
+    outline: none;
+  }
+  #input:focus { border-color: var(--accent); }
+  .controls { display: flex; align-items: center; justify-content: space-between; }
+  .hint { color: var(--fg-muted); font-size: 12px; }
+  #submit {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.12s ease;
+  }
+  #submit:hover { filter: brightness(1.1); }
+  #submit:disabled { background: var(--border); color: var(--fg-muted); cursor: not-allowed; }
+  #submit.stop { background: var(--err); }
+  #submit.stop:hover { filter: brightness(1.08); }
+  .activity {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: var(--bg-block);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--fg-muted);
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .activity.visible { display: flex; }
+  .activity-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 1.4s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  .activity.done .activity-dot {
+    animation: none;
+    background: var(--result);
+    opacity: 0.6;
+  }
+  .activity.done .activity-label { color: var(--fg-muted); }
+  .activity.stopped .activity-dot {
+    animation: none;
+    background: var(--fg-muted);
+    opacity: 0.6;
+  }
+  .activity.stopped .activity-label { color: var(--fg-muted); }
+  .activity-label { color: var(--fg); font-weight: 600; }
+  .activity-meta { color: var(--fg-muted); }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; transform: scale(0.85); }
+    50% { opacity: 1; transform: scale(1); }
+  }
+</style>
+</head>
+<body>
+  <div id="messages">
+    <div class="block system"><div class="label">spike</div><pre>pi-harness webview spike ready. Type a prompt and hit Cmd+Enter.</pre></div>
+  </div>
+  <div id="activity" class="activity">
+    <span class="activity-dot"></span>
+    <span class="activity-label">Working</span>
+    <span class="activity-meta"></span>
+  </div>
+  <div class="composer">
+    <div id="file-popup" class="file-popup"></div>
+    <textarea id="input" placeholder="Ask something... (type @ to mention a file)" autofocus></textarea>
+    <div class="controls">
+      <span class="hint">Enter to send · Shift+Enter for newline</span>
+      <button id="submit">Send</button>
+    </div>
+  </div>
+
+<script>
+(function () {
+  const messagesEl = document.getElementById('messages');
+  const inputEl = document.getElementById('input');
+  const submitEl = document.getElementById('submit');
+  const activityEl = document.getElementById('activity');
+  const activityLabelEl = activityEl.querySelector('.activity-label');
+  const activityMetaEl = activityEl.querySelector('.activity-meta');
+
+  const activity = {
+    startMs: 0,
+    tokens: 0,
+    label: 'Working',
+    timer: null,
+    frozenMs: null,   // non-null means turn is done; use this as the elapsed value
+    costUsd: null,    // filled in on result
+  };
+
+  function fmtDur(ms) {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
+
+  function paintActivity() {
+    const elapsed = activity.frozenMs != null
+      ? activity.frozenMs
+      : Date.now() - activity.startMs;
+    activityLabelEl.textContent = activity.label;
+    const parts = [fmtDur(elapsed)];
+    if (activity.tokens > 0) parts.push('↓ ' + activity.tokens + ' tokens');
+    if (activity.costUsd != null) parts.push('$' + activity.costUsd.toFixed(4));
+    activityMetaEl.textContent = parts.join(' · ');
+  }
+
+  function startActivity(label) {
+    activity.startMs = Date.now();
+    activity.tokens = 0;
+    activity.frozenMs = null;
+    activity.costUsd = null;
+    activity.label = label || 'Starting';
+    activityEl.classList.add('visible');
+    activityEl.classList.remove('done');
+    activityEl.classList.remove('stopped');
+    paintActivity();
+    if (activity.timer) clearInterval(activity.timer);
+    activity.timer = setInterval(paintActivity, 500);
+  }
+
+  // Turn finished cleanly — freeze the bar at its final values and stop
+  // ticking. Bar stays visible until the next submit.
+  function finishActivity(finalDurationMs, finalTokens, finalCost) {
+    if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
+    if (typeof finalDurationMs === 'number') activity.frozenMs = finalDurationMs;
+    if (typeof finalTokens === 'number' && finalTokens > activity.tokens) activity.tokens = finalTokens;
+    if (typeof finalCost === 'number') activity.costUsd = finalCost;
+    activity.label = 'Done';
+    activityEl.classList.add('done');
+    paintActivity();
+  }
+
+  // Hard clear — only for error paths / process death with no result.
+  function stopActivity() {
+    if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
+    activityEl.classList.remove('visible');
+    activityEl.classList.remove('done');
+    activity.frozenMs = null;
+    activity.costUsd = null;
+  }
+
+  function setActivity(label) {
+    if (activity.frozenMs != null) return; // don't overwrite frozen Done state
+    activity.label = label;
+    paintActivity();
+  }
+
+  // Sticky scroll, state-based: track whether auto-follow is enabled via a
+  // scroll listener. The moment the user scrolls UP (away from bottom), we
+  // turn it off. When they scroll back to near-bottom, we turn it back on.
+  // This is the only reliable approach under fast streaming — per-mutation
+  // distance checks can't escape the threshold because programmatic follows
+  // reset scroll faster than the user can accumulate wheel motion.
+  const STICKY_THRESHOLD_PX = 40;
+  let autoFollowing = true;
+  let prevScrollTop = 0;
+  messagesEl.addEventListener('scroll', () => {
+    const top = messagesEl.scrollTop;
+    const maxTop = messagesEl.scrollHeight - messagesEl.clientHeight;
+    const nearBottom = (maxTop - top) < STICKY_THRESHOLD_PX;
+    // `prev - 2`: small dead-zone so sub-pixel scroll events don't flip state.
+    if (top < prevScrollTop - 2) {
+      // User scrolled up.
+      autoFollowing = false;
+    } else if (nearBottom) {
+      // At / near bottom — resume auto-follow.
+      autoFollowing = true;
+    }
+    prevScrollTop = top;
+  });
+
+  function followBottom() {
+    if (!autoFollowing) return;
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  // Tool results are often large (test runs, bash output, file reads). We
+  // collapse long ones with a preview + expand toggle. Short ones render
+  // as normal system/err blocks.
+  //
+  // Head vs tail default depends on tool character:
+  //   bash / shell: summary / errors appear at the END — show tail
+  //   everything else (Read, Grep, Glob, LS, Edit, Write, ...): the
+  //     interesting content is at the BEGINNING — show head
+  const TOOL_RESULT_COLLAPSE_THRESHOLD = 30;
+  const TOOL_RESULT_PREVIEW_LINES = 20;
+  const TAIL_TOOLS = new Set(['bash', 'shell', 'sh']);
+
+  function renderToolResult(isErr, content, toolName) {
+    const text = typeof content === 'string' ? content : '';
+    const lines = text.split('\n');
+    const total = lines.length;
+    const kind = isErr ? 'err' : 'system';
+    const label = isErr ? 'tool_result (error)' : 'tool_result';
+
+    if (total <= TOOL_RESULT_COLLAPSE_THRESHOLD) {
+      // Short — render like any other block, no affordance needed.
+      const b = appendBlock(kind, label, text);
+      return b.el;
+    }
+
+    const name = (toolName || '').toLowerCase();
+    const tailPreferred = TAIL_TOOLS.has(name);
+    const hiddenCount = total - TOOL_RESULT_PREVIEW_LINES;
+    const preview = tailPreferred
+      ? lines.slice(-TOOL_RESULT_PREVIEW_LINES).join('\n')
+      : lines.slice(0, TOOL_RESULT_PREVIEW_LINES).join('\n');
+    const hiddenDirection = tailPreferred ? 'above' : 'below';
+    const collapseText = '▾ expand (' + hiddenCount + ' more ' + hiddenDirection + ')';
+
+    const div = document.createElement('div');
+    div.className = 'block ' + kind;
+
+    const labelEl = document.createElement('div');
+    labelEl.className = 'label';
+    const labelText = document.createElement('span');
+    labelText.textContent = label;
+    labelEl.appendChild(labelText);
+    const countHint = document.createElement('span');
+    countHint.className = 'count-hint';
+    countHint.textContent = total + ' lines';
+    labelEl.appendChild(countHint);
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'block-toggle';
+    toggleBtn.textContent = collapseText;
+    labelEl.appendChild(toggleBtn);
+    div.appendChild(labelEl);
+
+    const pre = document.createElement('pre');
+    pre.textContent = preview;
+    div.appendChild(pre);
+
+    let expanded = false;
+    toggleBtn.addEventListener('click', () => {
+      // Preserve scroll anchoring: keep the user's view stable when toggling.
+      const anchorBefore = div.getBoundingClientRect().top;
+      expanded = !expanded;
+      if (expanded) {
+        pre.textContent = text;
+        toggleBtn.textContent = '▴ collapse';
+      } else {
+        pre.textContent = preview;
+        toggleBtn.textContent = collapseText;
+      }
+      const anchorAfter = div.getBoundingClientRect().top;
+      messagesEl.scrollTop += (anchorAfter - anchorBefore);
+    });
+
+    messagesEl.appendChild(div);
+    followBottom();
+    return div;
+  }
+
+  // Append a fresh block. Returns { el, preEl } for later in-place updates.
+  function appendBlock(kind, label, content) {
+    const div = document.createElement('div');
+    div.className = 'block ' + kind;
+    const labelEl = document.createElement('div');
+    labelEl.className = 'label';
+    labelEl.textContent = label;
+    div.appendChild(labelEl);
+    const pre = document.createElement('pre');
+    pre.textContent = content || '';
+    div.appendChild(pre);
+    messagesEl.appendChild(div);
+    followBottom();
+    return { el: div, preEl: pre, labelEl };
+  }
+
+  // `busy` tracks whether a turn is currently streaming. The submit button
+  // is dual-mode: click = submit when idle, click = stop when streaming.
+  let busy = false;
+  function setBusy(isBusy) {
+    busy = isBusy;
+    if (isBusy) {
+      submitEl.textContent = 'Stop';
+      submitEl.classList.add('stop');
+    } else {
+      submitEl.textContent = 'Send';
+      submitEl.classList.remove('stop');
+    }
+  }
+
+  // Per-assistant-message state. Reset on every assistant message_start.
+  // contentIndex -> { el, preEl, kind, toolName, jsonBuffer }
+  let activeBlocks = {};
+  // Usage snapshot from the most recent message_update / message_end.
+  // pi does not emit a separate "result" event, so we take the final stats
+  // from the last message and present them on stream-done.
+  let latestUsage = null;   // { outputTokens, totalCost }
+  // "Current" tool pair — the most recently started tool_use and its
+  // (eventually linked) tool_result block. When a new tool_use starts or
+  // when a final text block begins, this pair collapses. Reset on submit.
+  let currentToolPair = null;
+
+  function makeToolPair(toolUseEl, labelEl, toolName, argsAccessor) {
+    const pair = {
+      toolUseEl,
+      labelEl,
+      toolName,
+      argsAccessor,      // () => string — returns accumulated JSON args
+      resultEl: null,
+      resultLineCount: null,
+      isCollapsed: false,
+      summaryEl: null,
+    };
+    toolUseEl.addEventListener('click', () => {
+      if (pair.isCollapsed) expandToolPair(pair);
+      else collapseToolPair(pair);
+    });
+    return pair;
+  }
+
+  function buildToolSummary(pair) {
+    const argText = pair.argsAccessor ? (pair.argsAccessor() || '') : '';
+    const name = (pair.toolName || '').toLowerCase();
+    let argSummary = '';
+    try {
+      const args = JSON.parse(argText);
+      if (name === 'read' || name === 'edit' || name === 'write' || name === 'ls') {
+        argSummary = args.path || '';
+      } else if (name === 'bash' || name === 'shell' || name === 'sh') {
+        argSummary = args.command || '';
+      } else if (name === 'grep' || name === 'glob') {
+        argSummary = args.pattern || args.path || '';
+      } else if (args.path) {
+        argSummary = args.path;
+      } else {
+        const firstStr = Object.values(args).find(v => typeof v === 'string');
+        if (firstStr) argSummary = firstStr;
+      }
+    } catch (_) { /* args not yet complete JSON */ }
+    const parts = [];
+    if (argSummary) {
+      parts.push(argSummary.length > 70 ? argSummary.slice(0, 67) + '…' : argSummary);
+    }
+    if (typeof pair.resultLineCount === 'number') {
+      parts.push(pair.resultLineCount + ' lines');
+    }
+    return parts.join(' · ');
+  }
+
+  function collapseToolPair(pair) {
+    if (!pair || pair.isCollapsed) return;
+    pair.isCollapsed = true;
+    pair.toolUseEl.classList.add('collapsed');
+    if (!pair.summaryEl) {
+      const s = document.createElement('span');
+      s.className = 'tool-collapsed-summary';
+      pair.labelEl.appendChild(s);
+      pair.summaryEl = s;
+    }
+    pair.summaryEl.textContent = buildToolSummary(pair);
+    if (pair.resultEl) pair.resultEl.classList.add('collapsed-hidden');
+  }
+
+  // Auto-collapse respects a policy: Edit/Write pairs carry high-value diff
+  // content that the user actively wants to see, so skip them. All other
+  // tools (Read, Bash, Grep, etc.) do collapse to keep the transcript clean.
+  // User can still click any block to manually toggle.
+  function autoCollapseToolPair(pair) {
+    if (!pair) return;
+    const name = (pair.toolName || '').toLowerCase();
+    if (name === 'edit' || name === 'write') return;
+    collapseToolPair(pair);
+  }
+
+  function expandToolPair(pair) {
+    if (!pair || !pair.isCollapsed) return;
+    pair.isCollapsed = false;
+    pair.toolUseEl.classList.remove('collapsed');
+    if (pair.resultEl) pair.resultEl.classList.remove('collapsed-hidden');
+    // CSS hides the summary span when not collapsed; keep its text so the
+    // next collapse doesn't need to rebuild.
+  }
+
+  function ensureBlockDom(block) {
+    if (block.el) return;
+    if (block.kind === 'text') {
+      // Markdown-rendered prose: use a div.body (sans-serif, flow layout).
+      const div = document.createElement('div');
+      div.className = 'block text';
+      const labelEl = document.createElement('div');
+      labelEl.className = 'label';
+      labelEl.textContent = 'assistant';
+      div.appendChild(labelEl);
+      const body = document.createElement('div');
+      body.className = 'body';
+      div.appendChild(body);
+      messagesEl.appendChild(div);
+      block.el = div;
+      block.preEl = body; // reuse the field name; for text blocks it's a div.body
+      followBottom();
+      return;
+    }
+    // thinking / tool_use / anything else: plain <pre> block via appendBlock.
+    let domKind = block.kind;
+    let label;
+    if (block.kind === 'thinking') label = 'thinking';
+    else label = block.kind;
+    const b = appendBlock(domKind, label, '');
+    block.el = b.el;
+    block.preEl = b.preEl;
+  }
+
+  // Safe markdown → HTML rendering. marked.parse is synchronous; if the
+  // library failed to load (CDN unreachable) we fall back to escaped text.
+  function renderMarkdown(src) {
+    if (typeof marked !== 'undefined' && marked.parse) {
+      try {
+        return marked.parse(src, { breaks: true, gfm: true });
+      } catch (e) {
+        return escapeHtml(src);
+      }
+    }
+    return escapeHtml(src);
+  }
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  // Diff view for Edit / Write tool args. Supports two arg shapes:
+  //   pi:     { path, edits: [{oldText, newText}, ...] }  (array of hunks)
+  //   Claude: { file_path, old_string, new_string }       (single hunk)
+  // For Write: render the new content as all-additions. Returns a DOM node
+  // the caller can drop into the tool_use block's pre.
+  function renderEditDiff(args) {
+    const filePath = args.path || args.file_path || '';
+
+    // Normalize into an array of hunks regardless of provider shape.
+    let hunks = [];
+    if (Array.isArray(args.edits)) {
+      hunks = args.edits.map(e => ({
+        oldText: typeof e.oldText === 'string' ? e.oldText : (typeof e.old_string === 'string' ? e.old_string : ''),
+        newText: typeof e.newText === 'string' ? e.newText : (typeof e.new_string === 'string' ? e.new_string : ''),
+      }));
+    } else if (typeof args.old_string === 'string' || typeof args.new_string === 'string') {
+      hunks = [{
+        oldText: typeof args.old_string === 'string' ? args.old_string : '',
+        newText: typeof args.new_string === 'string' ? args.new_string : '',
+      }];
+    }
+
+    const container = document.createElement('div');
+    container.className = 'diff-view';
+
+    if (filePath) {
+      const fileEl = document.createElement('div');
+      fileEl.className = 'diff-file';
+      const suffix = hunks.length > 1 ? '  (' + hunks.length + ' edits)' : '';
+      fileEl.textContent = filePath + suffix;
+      container.appendChild(fileEl);
+    }
+
+    hunks.forEach((hunk, i) => {
+      if (i > 0) {
+        const sep = document.createElement('div');
+        sep.className = 'diff-hunk-separator';
+        sep.textContent = '────';
+        container.appendChild(sep);
+      }
+      renderDiffHunk(container, hunk.oldText, hunk.newText);
+    });
+    return container;
+  }
+
+  function renderDiffHunk(container, oldStr, newStr) {
+    if (typeof Diff !== 'undefined' && Diff.diffLines) {
+      const changes = Diff.diffLines(oldStr, newStr);
+      for (const change of changes) {
+        const cls = change.added ? 'diff-added'
+                  : change.removed ? 'diff-removed'
+                  : 'diff-context';
+        const lines = change.value.split('\n');
+        if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+        for (const line of lines) {
+          const lineEl = document.createElement('div');
+          lineEl.className = 'diff-line ' + cls;
+          lineEl.textContent = line;
+          container.appendChild(lineEl);
+        }
+      }
+    } else {
+      // Fallback: no LCS lib — show removals then additions.
+      for (const line of oldStr.split('\n')) {
+        const lineEl = document.createElement('div');
+        lineEl.className = 'diff-line diff-removed';
+        lineEl.textContent = line;
+        container.appendChild(lineEl);
+      }
+      for (const line of newStr.split('\n')) {
+        const lineEl = document.createElement('div');
+        lineEl.className = 'diff-line diff-added';
+        lineEl.textContent = line;
+        container.appendChild(lineEl);
+      }
+    }
+  }
+
+  function renderWriteDiff(args) {
+    const filePath = args.file_path || args.path || '';
+    const content = typeof args.content === 'string' ? args.content : '';
+    const container = document.createElement('div');
+    container.className = 'diff-view';
+    if (filePath) {
+      const fileEl = document.createElement('div');
+      fileEl.className = 'diff-file';
+      fileEl.textContent = filePath + '  (new file)';
+      container.appendChild(fileEl);
+    }
+    const lines = content.split('\n');
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    for (const line of lines) {
+      const lineEl = document.createElement('div');
+      lineEl.className = 'diff-line diff-added';
+      lineEl.textContent = line;
+      container.appendChild(lineEl);
+    }
+    return container;
+  }
+
+  // Run highlight.js over any `<pre><code>` fences rendered by marked. Re-called
+  // on every text_delta because innerHTML is rebuilt each time; each pass gets
+  // a fresh, unhighlighted set of elements.
+  function highlightCodeBlocks(rootEl) {
+    if (typeof hljs === 'undefined') return;
+    rootEl.querySelectorAll('pre code').forEach(el => {
+      try {
+        // hljs marks elements with data-highlighted="yes" to avoid re-work;
+        // we want to re-highlight because the text may have grown.
+        delete el.dataset.highlighted;
+        el.removeAttribute('data-highlighted');
+        hljs.highlightElement(el);
+      } catch (_) { /* ignore */ }
+    });
+  }
+
+  function updateUsageFromMessage(msg) {
+    if (!msg || !msg.usage) return;
+    const u = msg.usage;
+    const out = typeof u.output === 'number' ? u.output : u.totalTokens;
+    const cost = u.cost && typeof u.cost.total === 'number' ? u.cost.total : null;
+    latestUsage = { outputTokens: out, totalCost: cost };
+    if (typeof out === 'number' && out > activity.tokens) {
+      activity.tokens = out;
+      if (cost != null) activity.costUsd = cost;
+      paintActivity();
+    }
+  }
+
+  // Dispatch a pi `assistantMessageEvent` — the streaming delta payload
+  // nested inside every `message_update` event. pi emits:
+  //   thinking_start / thinking_delta / thinking_end
+  //   text_start     / text_delta     / text_end
+  //   toolcall_start / toolcall_delta / toolcall_end
+  // toolcall_delta carries a plain-string chunk of partial JSON in `delta`.
+  // Tool name lives at `partial.content[idx].name` on toolcall_start (where
+  // the content block type is "toolCall").
+  function onAssistantEvent(ev) {
+    const t = ev.type;
+    const idx = ev.contentIndex;
+
+    if (t === 'thinking_start' || t === 'text_start' || t === 'toolcall_start') {
+      const kind = t === 'thinking_start' ? 'thinking'
+                 : t === 'text_start'     ? 'text'
+                 : 'tool_use'; // internal kind; maps to CSS .block.tool_use
+      let toolName = null;
+      const partial = ev.partial;
+      if (kind === 'tool_use' && partial && partial.content) {
+        const blk = partial.content[idx];
+        if (blk && blk.name) toolName = blk.name;
+      }
+      activeBlocks[idx] = {
+        kind, toolName,
+        jsonBuffer: '',
+        el: null, preEl: null,
+      };
+      if (kind === 'tool_use') {
+        const b = appendBlock('tool_use', 'tool: ' + (toolName || '?'), '');
+        activeBlocks[idx].el = b.el;
+        activeBlocks[idx].preEl = b.preEl;
+        setActivity('Calling ' + (toolName || 'tool'));
+        // Auto-collapse the previous tool pair when a new tool starts,
+        // except for Edit/Write which stay expanded so the diff is visible.
+        if (currentToolPair) autoCollapseToolPair(currentToolPair);
+        currentToolPair = makeToolPair(
+          b.el, b.labelEl, toolName,
+          () => (activeBlocks[idx] && activeBlocks[idx].jsonBuffer) || ''
+        );
+      } else if (kind === 'text') {
+        setActivity('Responding');
+        // Final answer is starting — collapse the most recent tool pair so
+        // the chat isn't dominated by tool cards (except Edit/Write which
+        // always stay expanded).
+        if (currentToolPair) {
+          autoCollapseToolPair(currentToolPair);
+          currentToolPair = null;
+        }
+      } else if (kind === 'thinking') {
+        setActivity('Thinking');
+      }
+      return;
+    }
+
+    if (t === 'thinking_delta') {
+      const block = activeBlocks[idx];
+      if (!block) return;
+      const text = typeof ev.delta === 'string' ? ev.delta : '';
+      if (text) {
+        ensureBlockDom(block);
+        block.preEl.textContent += text;
+        followBottom();
+      }
+      return;
+    }
+
+    if (t === 'text_delta') {
+      const block = activeBlocks[idx];
+      if (!block) return;
+      const text = typeof ev.delta === 'string' ? ev.delta : '';
+      if (text) {
+        ensureBlockDom(block);
+        block.rawText = (block.rawText || '') + text;
+        // Re-render the full accumulated text as markdown on every delta.
+        // Keeps streaming visual updates; accepts that text selection inside
+        // this block is lost during streaming (selection survives after the
+        // turn is done and no more deltas arrive).
+        block.preEl.innerHTML = renderMarkdown(block.rawText);
+        highlightCodeBlocks(block.preEl);
+        followBottom();
+      }
+      return;
+    }
+
+    if (t === 'toolcall_delta') {
+      const block = activeBlocks[idx];
+      if (!block) return;
+      const chunk = typeof ev.delta === 'string' ? ev.delta : '';
+      if (chunk) {
+        block.jsonBuffer += chunk;
+        if (block.preEl) {
+          block.preEl.textContent = block.jsonBuffer;
+          followBottom();
+        }
+      }
+      return;
+    }
+
+    // *_end finalizes a block. For toolcall, pretty-print the completed JSON
+    // args — except for Edit/Write, which we render as an inline diff for a
+    // dramatically more useful read.
+    if (t === 'thinking_end' || t === 'text_end' || t === 'toolcall_end') {
+      const block = activeBlocks[idx];
+      if (!block) return;
+      if (block.kind === 'tool_use' && block.preEl) {
+        let finalInput = null;
+        const partial = ev.partial;
+        if (partial && partial.content) {
+          const blk = partial.content[idx];
+          if (blk && (blk.arguments || blk.input)) finalInput = blk.arguments || blk.input;
+        }
+        if (finalInput == null && block.jsonBuffer) {
+          try { finalInput = JSON.parse(block.jsonBuffer); } catch (_) {}
+        }
+        if (finalInput != null) {
+          const name = (block.toolName || '').toLowerCase();
+          const isEdit = (name === 'edit') && (
+            Array.isArray(finalInput.edits) ||
+            typeof finalInput.old_string === 'string' ||
+            typeof finalInput.new_string === 'string'
+          );
+          const isWrite = (name === 'write') &&
+            typeof finalInput.content === 'string';
+          if (isEdit) {
+            block.preEl.textContent = '';
+            block.preEl.appendChild(renderEditDiff(finalInput));
+          } else if (isWrite) {
+            block.preEl.textContent = '';
+            block.preEl.appendChild(renderWriteDiff(finalInput));
+          } else {
+            block.preEl.textContent = JSON.stringify(finalInput, null, 2);
+          }
+        }
+        setActivity('Running ' + (block.toolName || 'tool'));
+      }
+      return;
+    }
+
+    // Other assistantMessageEvent types ignored for spike.
+  }
+
+  window.__appendEventLine = function (jsonLine) {
+    let event;
+    try { event = JSON.parse(jsonLine); }
+    catch (e) { appendBlock('err', 'parse error', e.message + '\n' + jsonLine); return; }
+
+    // Log every event for debugging (open DevTools: right-click → Inspect).
+    try {
+      const t = event.type;
+      if (t === 'message_update') {
+        const ae = event.assistantMessageEvent || {};
+        console.log('[message_update]', ae.type, 'idx=' + ae.contentIndex);
+      } else {
+        console.log('[' + (event.type || '?') + ']', event);
+      }
+    } catch (_) {}
+
+    const t = event.type;
+
+    // Lifecycle preamble — silent.
+    if (t === 'session' || t === 'agent_start' || t === 'turn_start' ||
+        t === 'agent_end' || t === 'turn_end') return;
+
+    // pi emits UI-protocol requests (notify, setTitle, setStatus). Ignored
+    // in the spike; for v1 we might surface `notify` as small toasts.
+    if (t === 'extension_ui_request') return;
+
+    if (t === 'message_start') {
+      const msg = event.message || {};
+      const role = msg.role;
+      // Suppress user echo (we already appended the user block on submit)
+      // and internal custom messages (memory/checkpoint) that are not meant
+      // to be displayed.
+      if (role === 'user') return;
+      if (role === 'custom' && msg.display === false) return;
+
+      if (role === 'assistant') {
+        // Fresh assistant message — reset per-message block tracking.
+        activeBlocks = {};
+        setActivity('Thinking');
+      } else if (role === 'custom' && msg.display !== false) {
+        // Displayed custom messages: render inline as system.
+        const label = (msg.customType ? 'custom:' + msg.customType : 'custom');
+        const body = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content, null, 2);
+        appendBlock('system', label, body);
+      }
+      return;
+    }
+
+    if (t === 'message_end') {
+      const msg = event.message || {};
+      if (msg.role === 'assistant') {
+        updateUsageFromMessage(msg);
+      }
+      // pi emits tool results as a dedicated `toolResult` role message.
+      // Content is an array of {type: 'text', text: ...} items. isError is
+      // a top-level bool on the message itself, toolName identifies the
+      // originating tool so we can pick sensible preview defaults.
+      if (msg.role === 'toolResult') {
+        const isErr = msg.isError === true;
+        let body = '';
+        if (Array.isArray(msg.content)) {
+          body = msg.content
+            .map(c => (typeof c.text === 'string' ? c.text : JSON.stringify(c)))
+            .join('\n');
+        } else if (typeof msg.content === 'string') {
+          body = msg.content;
+        } else if (msg.content != null) {
+          body = JSON.stringify(msg.content, null, 2);
+        }
+        const resultEl = renderToolResult(isErr, body, msg.toolName);
+        // Link the result to the current tool pair so they collapse together.
+        if (currentToolPair && resultEl) {
+          currentToolPair.resultEl = resultEl;
+          currentToolPair.resultLineCount = body.split('\n').length;
+          if (currentToolPair.isCollapsed && currentToolPair.summaryEl) {
+            currentToolPair.summaryEl.textContent = buildToolSummary(currentToolPair);
+          }
+        }
+        setActivity('Thinking');
+      }
+      return;
+    }
+
+    if (t === 'message_update') {
+      const ae = event.assistantMessageEvent;
+      if (ae) onAssistantEvent(ae);
+      // Usage snapshot lives on the accompanying message payload.
+      if (event.message) updateUsageFromMessage(event.message);
+      return;
+    }
+
+    // Unknown — silent.
+  };
+
+  window.__streamDone = function () {
+    setBusy(false);
+    // pi has no discrete "result" event. Synthesize a finish from the last
+    // seen usage snapshot so the activity bar freezes with real totals.
+    if (activity.frozenMs == null) {
+      if (latestUsage && typeof latestUsage.outputTokens === 'number') {
+        const elapsed = Date.now() - activity.startMs;
+        finishActivity(elapsed, latestUsage.outputTokens, latestUsage.totalCost);
+      } else {
+        stopActivity();
+      }
+    }
+    latestUsage = null;
+  };
+
+  // User-initiated stop. Not an error — a deliberate interruption.
+  // Freeze the activity bar with "Stopped" label and whatever usage we
+  // captured before the kill.
+  window.__streamStopped = function () {
+    setBusy(false);
+    if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
+    activity.frozenMs = Date.now() - activity.startMs;
+    if (latestUsage && typeof latestUsage.outputTokens === 'number') {
+      activity.tokens = latestUsage.outputTokens;
+      if (typeof latestUsage.totalCost === 'number') activity.costUsd = latestUsage.totalCost;
+    }
+    activity.label = 'Stopped';
+    activityEl.classList.remove('done');
+    activityEl.classList.add('stopped');
+    paintActivity();
+    latestUsage = null;
+  };
+
+  window.__streamError = function (msg) {
+    appendBlock('err', 'error', msg);
+    setBusy(false);
+    stopActivity();
+    latestUsage = null;
+  };
+
+  function submit() {
+    const text = inputEl.value;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    appendBlock('user', 'you', trimmed);
+    inputEl.value = '';
+    setBusy(true);
+    startActivity('Starting');
+    // Fresh turn — previous turn's tool pairs stay in whatever state the
+    // user left them, but this turn tracks a new "current" pair.
+    currentToolPair = null;
+    window.ipc.postMessage(JSON.stringify({ type: 'submit', text: trimmed }));
+  }
+
+  function requestStop() {
+    // Fire once. Rust kills the subprocess; the usual __streamDone /
+    // __streamError handlers will bring the UI back to idle.
+    setActivity('Stopping');
+    window.ipc.postMessage(JSON.stringify({ type: 'stop' }));
+  }
+
+  // @-mention popup state.
+  const filePopupEl = document.getElementById('file-popup');
+  const popup = {
+    open: false,
+    anchor: -1,       // cursor index of the '@' character that opened the popup
+    filter: '',
+    items: [],
+    selectedIdx: 0,
+    maxItems: 30,
+  };
+
+  function openPopup(anchor) {
+    popup.open = true;
+    popup.anchor = anchor;
+    popup.filter = '';
+    popup.selectedIdx = 0;
+    refreshPopup();
+    filePopupEl.classList.add('visible');
+  }
+
+  function closePopup() {
+    popup.open = false;
+    filePopupEl.classList.remove('visible');
+  }
+
+  function refreshPopup() {
+    const files = window.__files || [];
+    const filter = popup.filter.toLowerCase();
+    popup.items = filter
+      ? files.filter(f => f.toLowerCase().includes(filter)).slice(0, popup.maxItems)
+      : files.slice(0, popup.maxItems);
+    if (popup.selectedIdx >= popup.items.length) {
+      popup.selectedIdx = Math.max(0, popup.items.length - 1);
+    }
+    filePopupEl.innerHTML = '';
+    if (popup.items.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'file-popup-empty';
+      empty.textContent = (window.__files && window.__files.length === 0)
+        ? 'No files found (not a git repo?)'
+        : (popup.filter ? 'No matches' : 'Loading…');
+      filePopupEl.appendChild(empty);
+      return;
+    }
+    popup.items.forEach((file, i) => {
+      const item = document.createElement('div');
+      item.className = 'file-popup-item' + (i === popup.selectedIdx ? ' selected' : '');
+      item.textContent = file;
+      item.addEventListener('mousedown', (e) => {
+        // mousedown (not click) so the textarea doesn't lose focus first.
+        e.preventDefault();
+        selectPopupItem(i);
+      });
+      filePopupEl.appendChild(item);
+    });
+    // Scroll the selected item into view.
+    const sel = filePopupEl.querySelector('.selected');
+    if (sel) sel.scrollIntoView({ block: 'nearest' });
+  }
+
+  function selectPopupItem(idx) {
+    if (idx < 0 || idx >= popup.items.length) return;
+    const file = popup.items[idx];
+    const val = inputEl.value;
+    const before = val.slice(0, popup.anchor);
+    const cursor = inputEl.selectionStart;
+    const after = val.slice(cursor);
+    const inserted = '@' + file + ' ';
+    inputEl.value = before + inserted + after;
+    const newCursor = before.length + inserted.length;
+    inputEl.setSelectionRange(newCursor, newCursor);
+    closePopup();
+    inputEl.focus();
+  }
+
+  // Dual-mode button: click submits while idle, stops while busy.
+  submitEl.addEventListener('click', () => {
+    if (busy) requestStop();
+    else submit();
+  });
+
+  // Consolidated keydown: popup navigation wins while open; otherwise
+  // standard submit handling. Enter submits (no modifier); Shift+Enter
+  // inserts a newline.
+  inputEl.addEventListener('keydown', (e) => {
+    if (popup.open) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        popup.selectedIdx = Math.min(popup.items.length - 1, popup.selectedIdx + 1);
+        refreshPopup();
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        popup.selectedIdx = Math.max(0, popup.selectedIdx - 1);
+        refreshPopup();
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        selectPopupItem(popup.selectedIdx);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closePopup();
+        return;
+      }
+    }
+    if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      e.preventDefault();
+      if (!busy) submit();
+    }
+  });
+
+  // Track typing for popup open/filter/close. Runs after the character has
+  // landed in the textarea.
+  inputEl.addEventListener('input', () => {
+    const val = inputEl.value;
+    const cursor = inputEl.selectionStart;
+    if (popup.open) {
+      if (cursor <= popup.anchor) { closePopup(); return; }
+      const between = val.slice(popup.anchor + 1, cursor);
+      if (/\s/.test(between)) { closePopup(); return; }
+      popup.filter = between;
+      refreshPopup();
+      return;
+    }
+    // Detect freshly-typed '@' at a word boundary (start of line or after
+    // whitespace). Without this guard, every bare '@' in an email address
+    // mid-typing would trigger the popup.
+    const lastChar = val.slice(cursor - 1, cursor);
+    if (lastChar === '@') {
+      const prevChar = cursor >= 2 ? val.slice(cursor - 2, cursor - 1) : '';
+      if (cursor === 1 || /\s/.test(prevChar)) {
+        openPopup(cursor - 1);
+      }
+    }
+  });
+
+  // Close popup if textarea loses focus (click elsewhere, etc).
+  inputEl.addEventListener('blur', () => {
+    // mousedown on popup items prevents blur; other blurs genuinely leave.
+    setTimeout(() => { if (popup.open) closePopup(); }, 100);
+  });
+})();
+</script>
+</body>
+</html>

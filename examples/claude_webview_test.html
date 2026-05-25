@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Claude webview spike</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #1e1e2e;
+    --bg-alt: #181825;
+    --bg-block: #313244;
+    --fg: #cdd6f4;
+    --fg-muted: #7f849c;
+    --accent: #89b4fa;
+    --border: #585b70;
+    --user: #a6e3a1;
+    --result: #94e2d5;
+    --tool: #fab387;
+    --err: #f38ba8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    font-size: 14px;
+    background: var(--bg);
+    color: var(--fg);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    background: var(--bg-alt);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  #messages::-webkit-scrollbar { width: 10px; }
+  #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  .block {
+    margin-bottom: 8px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border-left: 3px solid var(--border);
+    background: var(--bg-block);
+  }
+  .block pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: inherit; }
+  .block.user { border-color: var(--user); }
+  .block.user .label { color: var(--user); }
+  .block.thinking { border-color: var(--fg-muted); background: transparent; color: var(--fg-muted); font-style: italic; }
+  .block.thinking .label { color: var(--fg-muted); }
+  .block.text { border-color: var(--accent); }
+  .block.text .label { color: var(--accent); }
+  .block.tool_use { border-color: var(--tool); }
+  .block.tool_use .label { color: var(--tool); }
+  .block.system { border-color: var(--border); background: transparent; color: var(--fg-muted); font-size: 12px; }
+  .block.system .label { color: var(--fg-muted); }
+  .block.result { border-color: var(--result); }
+  .block.result .label { color: var(--result); }
+  .block.err { border-color: var(--err); }
+  .block.err .label { color: var(--err); }
+  .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 600; }
+  .composer { display: flex; flex-direction: column; gap: 8px; }
+  #input {
+    width: 100%;
+    min-height: 80px;
+    padding: 12px;
+    background: var(--bg-block);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 14px;
+    resize: vertical;
+    outline: none;
+  }
+  #input:focus { border-color: var(--accent); }
+  .controls { display: flex; align-items: center; justify-content: space-between; }
+  .hint { color: var(--fg-muted); font-size: 12px; }
+  #submit {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  #submit:hover { filter: brightness(1.1); }
+  #submit:disabled { background: var(--border); color: var(--fg-muted); cursor: not-allowed; }
+  .activity {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: var(--bg-block);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--fg-muted);
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .activity.visible { display: flex; }
+  .activity-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 1.4s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  .activity.done .activity-dot {
+    animation: none;
+    background: var(--result);
+    opacity: 0.6;
+  }
+  .activity.done .activity-label { color: var(--fg-muted); }
+  .activity-label { color: var(--fg); font-weight: 600; }
+  .activity-meta { color: var(--fg-muted); }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; transform: scale(0.85); }
+    50% { opacity: 1; transform: scale(1); }
+  }
+</style>
+</head>
+<body>
+  <div id="messages">
+    <div class="block system"><div class="label">spike</div><pre>Claude webview spike ready. Type a prompt and hit Cmd+Enter.</pre></div>
+  </div>
+  <div id="activity" class="activity">
+    <span class="activity-dot"></span>
+    <span class="activity-label">Working</span>
+    <span class="activity-meta"></span>
+  </div>
+  <div class="composer">
+    <textarea id="input" placeholder="Ask something..." autofocus></textarea>
+    <div class="controls">
+      <span class="hint">Cmd+Enter to send</span>
+      <button id="submit">Send</button>
+    </div>
+  </div>
+
+<script>
+(function () {
+  const messagesEl = document.getElementById('messages');
+  const inputEl = document.getElementById('input');
+  const submitEl = document.getElementById('submit');
+  const activityEl = document.getElementById('activity');
+  const activityLabelEl = activityEl.querySelector('.activity-label');
+  const activityMetaEl = activityEl.querySelector('.activity-meta');
+
+  const activity = {
+    startMs: 0,
+    tokens: 0,
+    label: 'Working',
+    timer: null,
+    frozenMs: null,   // non-null means turn is done; use this as the elapsed value
+    costUsd: null,    // filled in on result
+  };
+
+  function fmtDur(ms) {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
+
+  function paintActivity() {
+    const elapsed = activity.frozenMs != null
+      ? activity.frozenMs
+      : Date.now() - activity.startMs;
+    activityLabelEl.textContent = activity.label;
+    const parts = [fmtDur(elapsed)];
+    if (activity.tokens > 0) parts.push('↓ ' + activity.tokens + ' tokens');
+    if (activity.costUsd != null) parts.push('$' + activity.costUsd.toFixed(4));
+    activityMetaEl.textContent = parts.join(' · ');
+  }
+
+  function startActivity(label) {
+    activity.startMs = Date.now();
+    activity.tokens = 0;
+    activity.frozenMs = null;
+    activity.costUsd = null;
+    activity.label = label || 'Starting';
+    activityEl.classList.add('visible');
+    activityEl.classList.remove('done');
+    paintActivity();
+    if (activity.timer) clearInterval(activity.timer);
+    activity.timer = setInterval(paintActivity, 500);
+  }
+
+  // Turn finished cleanly — freeze the bar at its final values and stop
+  // ticking. Bar stays visible until the next submit.
+  function finishActivity(finalDurationMs, finalTokens, finalCost) {
+    if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
+    if (typeof finalDurationMs === 'number') activity.frozenMs = finalDurationMs;
+    if (typeof finalTokens === 'number' && finalTokens > activity.tokens) activity.tokens = finalTokens;
+    if (typeof finalCost === 'number') activity.costUsd = finalCost;
+    activity.label = 'Done';
+    activityEl.classList.add('done');
+    paintActivity();
+  }
+
+  // Hard clear — only for error paths / process death with no result.
+  function stopActivity() {
+    if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
+    activityEl.classList.remove('visible');
+    activityEl.classList.remove('done');
+    activity.frozenMs = null;
+    activity.costUsd = null;
+  }
+
+  function setActivity(label) {
+    if (activity.frozenMs != null) return; // don't overwrite frozen Done state
+    activity.label = label;
+    paintActivity();
+  }
+
+  // Append a fresh block. Returns { el, preEl } for later in-place updates.
+  function appendBlock(kind, label, content) {
+    const div = document.createElement('div');
+    div.className = 'block ' + kind;
+    const labelEl = document.createElement('div');
+    labelEl.className = 'label';
+    labelEl.textContent = label;
+    div.appendChild(labelEl);
+    const pre = document.createElement('pre');
+    pre.textContent = content || '';
+    div.appendChild(pre);
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return { el: div, preEl: pre, labelEl };
+  }
+
+  function scrollToBottom() {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function setBusy(busy) {
+    submitEl.disabled = busy;
+    submitEl.textContent = busy ? 'Streaming…' : 'Send';
+  }
+
+  // Per-message state. Reset on every `message_start` stream_event.
+  // index -> { el, preEl, kind, toolName, jsonBuffer }
+  let activeBlocks = {};
+
+  function onStreamEvent(se) {
+    const ev = se.event;
+    if (!ev) return;
+    const t = ev.type;
+
+    if (t === 'message_start') {
+      activeBlocks = {};
+      // A new assistant message is starting. If we're not rendering anything
+      // visible yet, the model is probably thinking silently.
+      setActivity('Thinking');
+      return;
+    }
+
+    if (t === 'message_delta') {
+      // Usage info updates arrive here; use it to advance the token counter.
+      const out = ev.usage && ev.usage.output_tokens;
+      if (typeof out === 'number' && out > activity.tokens) {
+        activity.tokens = out;
+        paintActivity();
+      }
+      return;
+    }
+
+    if (t === 'content_block_start') {
+      const idx = ev.index;
+      const cb = ev.content_block || {};
+      const kind = cb.type || 'unknown';
+      activeBlocks[idx] = {
+        kind,
+        toolName: cb.name || null,
+        jsonBuffer: '',
+        el: null,
+        preEl: null,
+      };
+      if (kind === 'tool_use') {
+        const b = appendBlock('tool_use', 'tool: ' + (cb.name || '?'), '');
+        activeBlocks[idx].el = b.el;
+        activeBlocks[idx].preEl = b.preEl;
+        setActivity('Calling ' + (cb.name || 'tool'));
+      } else if (kind === 'text') {
+        setActivity('Responding');
+      } else if (kind === 'thinking' || kind === 'redacted_thinking') {
+        setActivity('Thinking');
+      }
+      return;
+    }
+
+    function ensureBlockDom(block) {
+      if (block.el) return;
+      let domKind, label;
+      if (block.kind === 'thinking') { domKind = 'thinking'; label = 'thinking'; }
+      else if (block.kind === 'text') { domKind = 'text'; label = 'claude'; }
+      else { domKind = block.kind; label = block.kind; }
+      const b = appendBlock(domKind, label, '');
+      block.el = b.el;
+      block.preEl = b.preEl;
+    }
+
+    if (t === 'content_block_delta') {
+      const idx = ev.index;
+      const block = activeBlocks[idx];
+      if (!block) return;
+      const delta = ev.delta || {};
+      if (delta.type === 'text_delta') {
+        const text = delta.text || '';
+        if (text) {
+          ensureBlockDom(block);
+          block.preEl.textContent += text;
+          scrollToBottom();
+        }
+      } else if (delta.type === 'thinking_delta') {
+        const text = delta.thinking || '';
+        if (text) {
+          ensureBlockDom(block);
+          block.preEl.textContent += text;
+          scrollToBottom();
+        }
+      } else if (delta.type === 'input_json_delta') {
+        block.jsonBuffer += delta.partial_json || '';
+        // tool_use blocks have DOM eagerly; live-update the buffer view.
+        if (block.preEl) {
+          block.preEl.textContent = block.jsonBuffer;
+          scrollToBottom();
+        }
+      }
+      // signature_delta / anything else: ignore
+      return;
+    }
+
+    if (t === 'content_block_stop') {
+      const idx = ev.index;
+      const block = activeBlocks[idx];
+      if (!block) return;
+      if (block.kind === 'tool_use' && block.preEl && block.jsonBuffer) {
+        try {
+          const obj = JSON.parse(block.jsonBuffer);
+          block.preEl.textContent = JSON.stringify(obj, null, 2);
+        } catch (e) { /* leave raw */ }
+        // After args are locked in, the tool is about to execute.
+        setActivity('Running ' + (block.toolName || 'tool'));
+      }
+      return;
+    }
+
+    // message_delta, message_stop: ignore (nothing to render)
+  }
+
+  window.__appendEventLine = function (jsonLine) {
+    let event;
+    try { event = JSON.parse(jsonLine); }
+    catch (e) { appendBlock('err', 'parse error', e.message + '\n' + jsonLine); return; }
+
+    // DEBUG: log every event for silent-thinking investigation.
+    // Open DevTools on the spike window (right-click → Inspect, or look
+    // into how to pop it via wry), then reproduce the scenario.
+    try {
+      const t = event.type;
+      if (t === 'stream_event') {
+        const et = event.event && event.event.type;
+        const dt = event.event && event.event.delta && event.event.delta.type;
+        const cbt = event.event && event.event.content_block && event.event.content_block.type;
+        console.log('[stream_event]', et, cbt || '', dt || '', event.event);
+      } else {
+        console.log('[' + t + (event.subtype ? '/' + event.subtype : '') + ']', event);
+      }
+    } catch (e) { console.log('[log err]', e, event); }
+
+    const t = event.type;
+    if (t === 'stream_event') {
+      onStreamEvent(event);
+    } else if (t === 'assistant') {
+      // With --include-partial-messages, content is fully rendered via stream_event
+      // deltas. Suppress assistant events to avoid duplicates.
+    } else if (t === 'user') {
+      // tool_result comes back as user messages. Pull out just the result
+      // content — the JSON wrapper is noise.
+      const content = (event.message && event.message.content) || [];
+      for (const item of content) {
+        if (item.type === 'tool_result') {
+          const isErr = item.is_error === true;
+          const label = isErr ? 'tool_result (error)' : 'tool_result';
+          let body = '';
+          if (typeof item.content === 'string') {
+            body = item.content;
+          } else if (Array.isArray(item.content)) {
+            body = item.content.map(c => c.text || JSON.stringify(c)).join('\n');
+          } else if (item.content != null) {
+            body = JSON.stringify(item.content, null, 2);
+          }
+          appendBlock(isErr ? 'err' : 'system', label, body);
+        }
+      }
+      // Once a tool result has landed, the model will think about what to do next.
+      setActivity('Thinking');
+    } else if (t === 'system') {
+      const sub = event.subtype || '';
+      // System events are noisy; suppress all but init
+      if (sub === 'init') {
+        appendBlock('system', 'system:init', 'model=' + (event.model || '?'));
+      }
+    } else if (t === 'result') {
+      const cost = (event.total_cost_usd || 0).toFixed(4);
+      const dur = event.duration_ms || 0;
+      appendBlock('result', 'result', 'stop=' + (event.stop_reason || '?') + ' duration=' + dur + 'ms cost=$' + cost);
+      const outTokens = event.usage && event.usage.output_tokens;
+      finishActivity(dur, outTokens, event.total_cost_usd);
+    } else if (t === 'rate_limit_event') {
+      // Ignore
+    }
+    // Anything else: silent
+  };
+
+  window.__claudeDone = function () {
+    setBusy(false);
+    // If result already fired, activity is in frozen "Done" state — keep it.
+    // Only clean up if we got here without a proper finish (error path).
+    if (activity.frozenMs == null) stopActivity();
+  };
+
+  window.__claudeError = function (msg) {
+    appendBlock('err', 'error', msg);
+    setBusy(false);
+    stopActivity();
+  };
+
+  function submit() {
+    const text = inputEl.value;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    appendBlock('user', 'you', trimmed);
+    inputEl.value = '';
+    setBusy(true);
+    startActivity('Starting');
+    window.ipc.postMessage(JSON.stringify({ type: 'submit', text: trimmed }));
+  }
+
+  submitEl.addEventListener('click', submit);
+  inputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      submit();
+    }
+  });
+})();
+</script>
+</body>
+</html>

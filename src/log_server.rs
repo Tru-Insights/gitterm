@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use warp::Filter;
@@ -25,6 +26,11 @@ pub struct ServerState {
     pub files: Arc<RwLock<HashMap<usize, FileSnapshot>>>,
     pub shutdown: Arc<tokio::sync::Notify>,
     pub bound_port: Arc<std::sync::Mutex<Option<u16>>>,
+    /// Absolute path to the active workspace's `.plans/` directory, pushed by
+    /// the app whenever the active workspace changes. `None` means no
+    /// workspace is selected or its directory is unknown — in that case the
+    /// plans viewer shows an empty list rather than guessing.
+    pub plans_dir: Arc<std::sync::RwLock<Option<PathBuf>>>,
 }
 
 impl ServerState {
@@ -34,6 +40,7 @@ impl ServerState {
             files: Arc::new(RwLock::new(HashMap::new())),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             bound_port: Arc::new(std::sync::Mutex::new(None)),
+            plans_dir: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -53,17 +60,17 @@ fn find_available_port() -> Option<u16> {
         .parse::<u32>()
         .unwrap_or(0)
         .rem_euclid(100) as u16; // Limit to 100 to avoid going too high
-    
+
     let base_port = 3030 + (instance_id * 10);
     let port_range = base_port..(base_port + 10);
-    
+
     // Try instance-specific range first
     for port in port_range {
         if port < 65535 && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return Some(port);
         }
     }
-    
+
     // Fallback: let OS assign a port
     std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
@@ -74,6 +81,7 @@ fn find_available_port() -> Option<u16> {
 pub async fn start_server(state: ServerState) {
     let shutdown = state.shutdown.clone();
     let bound_port = state.bound_port.clone();
+    let plans_state = state.clone();
     let state_filter = warp::any().map(move || state.clone());
 
     // Route: GET / - List all tabs
@@ -91,7 +99,10 @@ pub async fn start_server(state: ServerState) {
         .and(state_filter.clone())
         .and_then(handle_file);
 
-    let routes = index.or(tab).or(file);
+    let routes = index
+        .or(tab)
+        .or(file)
+        .or(crate::plans_viewer::routes(plans_state));
 
     let Some(port) = find_available_port() else {
         eprintln!("Log server disabled: unable to bind any localhost port");

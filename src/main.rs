@@ -28,6 +28,7 @@ use syntect::util::LinesWithEndings;
 mod excalidraw;
 mod log_server;
 mod markdown;
+mod plans_viewer;
 mod services;
 mod webview;
 
@@ -35,11 +36,18 @@ mod webview;
 mod agent;
 mod config;
 mod events;
+mod tab;
 mod theme;
 
+use tab::{
+    AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
+};
 
 // Start with just config for now to avoid conflicts
-use config::{Config, WorkspaceColor, AgentPreset, QuickCommand, WorkspacesFile, WorkspaceConfig, WorkspaceTabConfig, BottomTerminalConfig};
+use config::{
+    AgentPreset, BottomTerminalConfig, Config, QuickCommand, WorkspaceColor, WorkspaceConfig,
+    WorkspaceTabConfig, WorkspacesFile,
+};
 use events::SidebarMode;
 use theme::AppTheme;
 
@@ -53,29 +61,161 @@ static MAIN_THREAD_LAST_EVENT: std::sync::Mutex<Option<String>> = std::sync::Mut
 // Store main thread ID so watchdog can signal it for backtrace
 static MAIN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ---- Agent webview IPC bridge (Step 4 of TRU-29) -------------------------
+//
+// The agent chat webview posts JSON messages back to Rust via wry's
+// `with_ipc_handler`. The handler is set once at webview construction (wry
+// has no API to swap it later), so it's stateless: it pushes parsed messages
+// onto a global mpsc, and an Iced subscription drains the mpsc into typed
+// `Event::AgentWebviewIpc` variants for the update loop to handle.
+//
+// Multi-tab routing: the JS side stamps every postMessage with the active
+// tab's id (set by Rust via evaluate_script on tab activation). The
+// dispatcher in update() reads tabId from the message and routes the prompt
+// or stop signal to the right tab.
+#[derive(Debug, Clone)]
+pub enum AgentIpcMessage {
+    Submit { tab_id: usize, text: String },
+    Stop { tab_id: usize },
+}
+
+static AGENT_IPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<AgentIpcMessage>> =
+    OnceLock::new();
+static AGENT_IPC_RX: OnceLock<
+    Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AgentIpcMessage>>>,
+> = OnceLock::new();
+
+fn init_agent_ipc_channel() {
+    AGENT_IPC_TX.get_or_init(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentIpcMessage>();
+        let _ = AGENT_IPC_RX.set(Mutex::new(Some(rx)));
+        tx
+    });
+}
+
+/// Iced subscription that drains the global IPC mpsc into typed events.
+/// Built once on first poll (function pointer, no captures); the receiver is
+/// taken out of `AGENT_IPC_RX` at that point and lives inside the stream
+/// for the rest of the process. Subsequent rebuilds (which happen if the
+/// subscription's identity hash changes) would receive an empty stream —
+/// but the identity here is stable (no `with(...)` value), so we get exactly
+/// one runner.
+fn agent_ipc_stream() -> impl iced::futures::Stream<Item = Event> + Send + 'static {
+    use iced::futures::StreamExt;
+    let rx = AGENT_IPC_RX
+        .get()
+        .and_then(|m| m.lock().ok().and_then(|mut g| g.take()));
+    let stream: tokio_stream::wrappers::UnboundedReceiverStream<AgentIpcMessage> = match rx {
+        Some(rx) => tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        None => {
+            // Channel already drained or not initialized — produce an empty
+            // stream by closing a fresh channel immediately.
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentIpcMessage>();
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+        }
+    };
+    stream.map(Event::AgentWebviewIpc)
+}
+
+/// Embedded HTML scaffold for the agent chat surface (Step 4 of TRU-29).
+const AGENT_CHAT_HTML: &str = include_str!("../assets/agent_chat.html");
+
+/// Push one `AgentEvent` into the live webview via `window.__appendEvent(...)`.
+/// Caller is responsible for ensuring the agent webview is the active one;
+/// this is a no-op if no webview exists.
+fn push_agent_event_to_webview(ev: &tab::AgentEvent) {
+    let payload = match ev {
+        tab::AgentEvent::Other(value) => value.clone(),
+        // Other typed variants don't currently fire (Step 3 emits only
+        // `Other`). When the typed parser lands these will be serialized
+        // into a richer JS-side shape.
+        _ => return,
+    };
+    let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string());
+    webview::evaluate_script(&format!("window.__appendEvent({})", payload_json));
+}
+
+/// Set the active tab id on the JS side. The webview tags every IPC message
+/// with this id so the Rust dispatcher can route the prompt/stop to the
+/// correct tab (multiple agent tabs may share the singleton webview, swapping
+/// in and out via tab activation).
+fn set_agent_webview_tab_id(tab_id: usize) {
+    webview::evaluate_script(&format!("window.__setTabId({})", tab_id));
+}
+
+/// Reset the chat surface: clears all rendered messages and sets status to Idle.
+fn reset_agent_webview() {
+    webview::evaluate_script("window.__resetConversation()");
+}
+
+/// Build the IPC handler closure to install at agent-webview creation. Parses
+/// each `window.ipc.postMessage(...)` body and forwards as a typed message
+/// into the global IPC channel for the Iced subscription to pick up.
+fn agent_ipc_handler() -> webview::IpcHandler {
+    Box::new(|body: String| {
+        let Some(tx) = AGENT_IPC_TX.get() else {
+            eprintln!("[agent-ipc] tx not initialized; dropping {}", body);
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+            eprintln!("[agent-ipc] non-JSON body: {}", body);
+            return;
+        };
+        let tab_id = value
+            .get("tabId")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(tab_id) = tab_id else {
+            eprintln!("[agent-ipc] missing tabId in {}", body);
+            return;
+        };
+        let msg = match kind {
+            "submit" => {
+                let text = value
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                AgentIpcMessage::Submit { tab_id, text }
+            }
+            "stop" => AgentIpcMessage::Stop { tab_id },
+            _ => {
+                eprintln!("[agent-ipc] unknown type {:?}", kind);
+                return;
+            }
+        };
+        let _ = tx.send(msg);
+    })
+}
+
 fn start_freeze_watchdog() {
     if !freeze_debug_enabled() {
         return;
     }
-    
+
     // Store main thread's pthread ID for signaling
     #[cfg(unix)]
     {
         let tid = unsafe { libc::pthread_self() } as u64;
         MAIN_THREAD_ID.store(tid, std::sync::atomic::Ordering::Relaxed);
-        
+
         // Install SIGUSR1 handler that prints backtrace
         unsafe {
-            libc::signal(libc::SIGUSR1, freeze_backtrace_handler as libc::sighandler_t);
+            libc::signal(
+                libc::SIGUSR1,
+                freeze_backtrace_handler as *const () as libc::sighandler_t,
+            );
         }
     }
-    
+
     std::thread::Builder::new()
         .name("freeze-watchdog".to_string())
         .spawn(|| {
             let mut last_beat = 0u64;
             let mut stall_start: Option<std::time::Instant> = None;
             let mut backtrace_sent = false;
+            let mut log_count = 0u32;
             loop {
                 std::thread::sleep(Duration::from_millis(500));
                 let current = MAIN_THREAD_HEARTBEAT.load(std::sync::atomic::Ordering::Relaxed);
@@ -84,10 +224,15 @@ fn start_freeze_watchdog() {
                     if stall_start.is_none() {
                         stall_start = Some(std::time::Instant::now());
                         backtrace_sent = false;
+                        log_count = 0;
                     }
                     let elapsed = stall_start.unwrap().elapsed();
-                    if elapsed.as_secs() >= 2 {
-                        let event_name = MAIN_THREAD_LAST_EVENT.lock()
+
+                    // Log the first few stall messages, then go quiet
+                    if elapsed.as_secs() >= 2 && log_count < 10 {
+                        log_count += 1;
+                        let event_name = MAIN_THREAD_LAST_EVENT
+                            .lock()
                             .ok()
                             .and_then(|g| g.clone())
                             .unwrap_or_else(|| "unknown".to_string());
@@ -96,19 +241,39 @@ fn start_freeze_watchdog() {
                             elapsed.as_secs_f64(),
                             event_name
                         );
-                        
-                        // Send SIGUSR1 to main thread once at 5s to capture backtrace
-                        #[cfg(unix)]
-                        if elapsed.as_secs() >= 5 && !backtrace_sent {
-                            backtrace_sent = true;
-                            let tid = MAIN_THREAD_ID.load(std::sync::atomic::Ordering::Relaxed);
-                            if tid != 0 {
-                                eprintln!("[FREEZE-WATCHDOG] Sending SIGUSR1 to main thread for backtrace...");
-                                unsafe {
-                                    libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1);
-                                }
+                    }
+
+                    // Send SIGUSR1 at 5s to capture backtrace (once)
+                    #[cfg(unix)]
+                    if elapsed.as_secs() >= 5 && !backtrace_sent {
+                        backtrace_sent = true;
+                        let tid = MAIN_THREAD_ID.load(std::sync::atomic::Ordering::Relaxed);
+                        if tid != 0 {
+                            eprintln!(
+                                "\n[FREEZE-WATCHDOG] ========================================"
+                            );
+                            eprintln!("[FREEZE-WATCHDOG] Capturing backtrace via SIGUSR1...");
+                            eprintln!(
+                                "[FREEZE-WATCHDOG] ========================================\n"
+                            );
+                            unsafe {
+                                libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1);
                             }
+                            // Give the signal handler time to print before any more logs
+                            std::thread::sleep(Duration::from_secs(2));
                         }
+                    }
+
+                    // After 10 logs, only log every 60s
+                    if log_count >= 10 {
+                        let secs = elapsed.as_secs();
+                        if secs.is_multiple_of(60) {
+                            eprintln!(
+                                "[FREEZE-WATCHDOG] Still stalled after {}m. Force quit to restart.",
+                                secs / 60
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(1500));
                     }
                 } else {
                     if let Some(start) = stall_start.take() {
@@ -130,19 +295,76 @@ fn start_freeze_watchdog() {
 /// Signal handler: prints backtrace when SIGUSR1 is received on the main thread.
 /// This runs IN the frozen main thread's context, so the backtrace shows exactly
 /// where it's stuck.
+///
+/// IMPORTANT: This handler must be async-signal-safe. No heap allocation allowed!
+/// `std::backtrace::Backtrace` and `format!()` allocate, so if the signal arrives
+/// while the thread is inside malloc, it would deadlock/crash with
+/// "BUG IN LIBMALLOC: ulock_wait failure".
+///
+/// Instead we use `libc::backtrace()` to capture raw frame pointers into a
+/// stack-allocated buffer, then write hex addresses to stderr with `libc::write()`.
+/// The addresses can be symbolicated later with:
+///   atos -o target/release/gitterm -l 0x<load_addr> <addr1> <addr2> ...
 #[cfg(unix)]
 extern "C" fn freeze_backtrace_handler(_sig: libc::c_int) {
-    // Signal handlers must be async-signal-safe. write() to stderr is safe.
-    // std::backtrace::Backtrace is NOT signal-safe, but for debugging a freeze
-    // it's acceptable — the thread is already stuck.
-    let bt = std::backtrace::Backtrace::force_capture();
-    let msg = format!(
-        "\n[FREEZE-WATCHDOG] === MAIN THREAD BACKTRACE ===\n{}\n[FREEZE-WATCHDOG] === END BACKTRACE ===\n",
-        bt
-    );
-    // Use raw write to avoid any locking in eprintln
     unsafe {
-        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        // All buffers on the stack — zero heap allocation
+        let mut frames: [*mut libc::c_void; 128] = [std::ptr::null_mut(); 128];
+        let n = libc::backtrace(frames.as_mut_ptr(), 128);
+
+        let header = b"\n[FREEZE-WATCHDOG] === MAIN THREAD BACKTRACE (raw frames) ===\n";
+        libc::write(2, header.as_ptr() as *const libc::c_void, header.len());
+
+        // Write each frame address as hex, one per line
+        // Format: "  [NN] 0xHHHHHHHHHHHHHHHH\n"
+        let hex_chars = b"0123456789abcdef";
+        for i in 0..n as usize {
+            let addr = frames[i] as usize;
+            // Build line in stack buffer: "  [NN] 0x________________\n"
+            let mut line: [u8; 32] = [b' '; 32];
+            // Frame index
+            line[2] = b'[';
+            if i >= 100 {
+                line[3] = hex_chars[(i / 100) % 10];
+                line[4] = hex_chars[(i / 10) % 10];
+                line[5] = hex_chars[i % 10];
+                line[6] = b']';
+                line[7] = b' ';
+                line[8] = b'0';
+                line[9] = b'x';
+            } else if i >= 10 {
+                line[3] = hex_chars[(i / 10) % 10];
+                line[4] = hex_chars[i % 10];
+                line[5] = b']';
+                line[6] = b' ';
+                line[7] = b'0';
+                line[8] = b'x';
+            } else {
+                line[3] = hex_chars[i % 10];
+                line[4] = b']';
+                line[5] = b' ';
+                line[6] = b'0';
+                line[7] = b'x';
+            }
+            // Write 16 hex digits for the address (always 64-bit)
+            let hex_start = if i >= 100 {
+                10
+            } else if i >= 10 {
+                9
+            } else {
+                8
+            };
+            for digit in 0..16 {
+                let nibble = (addr >> (60 - digit * 4)) & 0xf;
+                line[hex_start + digit] = hex_chars[nibble];
+            }
+            let line_len = hex_start + 16;
+            line[line_len] = b'\n';
+            libc::write(2, line.as_ptr() as *const libc::c_void, line_len + 1);
+        }
+
+        let footer = b"[FREEZE-WATCHDOG] === END BACKTRACE ===\n\n";
+        libc::write(2, footer.as_ptr() as *const libc::c_void, footer.len());
     }
 }
 
@@ -168,8 +390,25 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Percent-encode RFC 3986 reserved characters in a query-string value.
+/// Used for `?plan=<name>` so plan filenames with spaces or punctuation
+/// round-trip cleanly into the viewer's URL.
+fn urlencoding_simple(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 fn freeze_debug_enabled() -> bool {
-    FREEZE_DEBUG.load(std::sync::atomic::Ordering::Relaxed) || std::env::var("GITTERM_DEBUG_FREEZES").is_ok()
+    FREEZE_DEBUG.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("GITTERM_DEBUG_FREEZES").is_ok()
 }
 
 macro_rules! freeze_debug {
@@ -185,7 +424,7 @@ macro_rules! freeze_time {
         let _start = std::time::Instant::now();
         let result = $block;
         let _elapsed = _start.elapsed();
-        if _elapsed > Duration::from_millis(50) {
+        if _elapsed > Duration::from_millis(100) {
             freeze_debug!("{} took {}ms", $label, _elapsed.as_millis());
         }
         result
@@ -204,6 +443,7 @@ struct MenuIds {
     toggle_theme: muda::MenuId,
     toggle_log_server: muda::MenuId,
     clear_terminal: muda::MenuId,
+    open_plans_viewer: muda::MenuId,
 }
 
 fn setup_menu_bar() {
@@ -301,6 +541,14 @@ fn setup_menu_bar() {
             muda::accelerator::Code::KeyL,
         )),
     );
+    let open_plans_viewer = MenuItem::new(
+        "Plans Viewer",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META | muda::accelerator::Modifiers::SHIFT),
+            muda::accelerator::Code::KeyP,
+        )),
+    );
 
     view_menu
         .append_items(&[
@@ -309,6 +557,8 @@ fn setup_menu_bar() {
             &PredefinedMenuItem::separator(),
             &toggle_theme,
             &toggle_log_server,
+            &PredefinedMenuItem::separator(),
+            &open_plans_viewer,
         ])
         .unwrap();
 
@@ -335,6 +585,7 @@ fn setup_menu_bar() {
         toggle_theme: toggle_theme.id().clone(),
         toggle_log_server: toggle_log_server.id().clone(),
         clear_terminal: clear_terminal.id().clone(),
+        open_plans_viewer: open_plans_viewer.id().clone(),
     });
 
     // Initialize menu for macOS - this must happen after NSApp exists
@@ -345,17 +596,12 @@ fn setup_menu_bar() {
     Box::leak(Box::new(menu));
 }
 
-
-
-
-
-
 // === Speech-to-Text helpers ===
 
 #[cfg(feature = "stt")]
 fn stt_model_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("gitterm")
         .join("models")
@@ -496,10 +742,15 @@ fn stt_transcribe(
 fn main() -> iced::Result {
     // Print instance information for multi-instance support
     config::print_instance_info();
-    
+
     // Start freeze detection watchdog
     start_freeze_watchdog();
-    
+
+    // Initialize the global agent-webview IPC channel before any webview can
+    // post messages into it. The receiver is parked for the subscription to
+    // take on first build.
+    init_agent_ipc_channel();
+
     // Load app icon from embedded PNG
     let icon = iced::window::icon::from_file_data(include_bytes!("../assets/icon.png"), None).ok();
 
@@ -516,8 +767,6 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .run()
 }
-
-
 
 // Git file entry
 #[derive(Debug, Clone)]
@@ -542,7 +791,7 @@ struct SyntaxHighlightSegment {
 }
 
 #[derive(Debug, Clone)]
-struct SyntaxHighlightLine {
+pub(crate) struct SyntaxHighlightLine {
     segments: Vec<SyntaxHighlightSegment>,
 }
 
@@ -1526,7 +1775,7 @@ impl ConsoleState {
         self.status == ConsoleStatus::Running
     }
 
-    fn spawn_process(&mut self, dir: &Path) {
+    fn spawn_process_with_env(&mut self, dir: &Path, extra_env: &[(String, String)]) {
         let cmd_str = match &self.run_command {
             Some(cmd) => cmd.clone(),
             None => return,
@@ -1544,6 +1793,7 @@ impl ConsoleState {
         self.stopped_at = None;
 
         let dir = dir.to_path_buf();
+        let extra_env = extra_env.to_vec();
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1562,6 +1812,10 @@ impl ConsoleState {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+
+            for (key, value) in &extra_env {
+                cmd.env(key, value);
+            }
 
             // Spawn in its own process group so we can kill the entire tree
             #[cfg(unix)]
@@ -1718,12 +1972,14 @@ fn detect_run_command(dir: &PathBuf) -> Option<String> {
     None
 }
 
-// Tab state
+// Tab state. Tab-kind data structures live in `src/tab/mod.rs`; the heavy `impl TabState`
+// methods (load_file, fetch_status, fetch_diff, fetch_claude_config, fetch_agent_activity, etc.)
+// stay here because they reference too many in-binary helpers, constants, and macros.
 struct TabState {
     id: usize,
     repo_path: PathBuf,
     repo_name: String,
-    terminal: Option<iced_term::Terminal>,
+    kind: TabKind,
     staged: Vec<FileEntry>,
     unstaged: Vec<FileEntry>,
     untracked: Vec<FileEntry>,
@@ -1744,48 +2000,19 @@ struct TabState {
     file_index: i32,
     // Track when tab was created for delayed terminal display
     created_at: Instant,
-    // Terminal title (set by shell/programs via OSC escape codes)
-    terminal_title: Option<String>,
     // Sidebar mode (Git or Files)
     sidebar_mode: SidebarMode,
     // File explorer state
     current_dir: PathBuf,
     file_tree: Vec<FileTreeEntry>,
-    // File viewer state
-    viewing_file_path: Option<PathBuf>,
-    file_content: String,
-    image_handle: Option<image::Handle>,
-    // Markdown WebView content (rendered HTML)
-    webview_content: Option<String>,
-    // Optional notice shown in the file viewer (e.g. large-file preview mode)
-    file_preview_notice: Option<String>,
-    // Cached syntax-highlighted lines for plain-text/code files.
-    syntax_highlight_lines: Option<Vec<SyntaxHighlightLine>>,
-    // Optional notice for partial/disabled syntax highlighting.
-    syntax_highlight_notice: Option<String>,
-    // True while async syntax highlighting is in-flight for the current file.
-    syntax_highlight_in_progress: bool,
-    // Highest line count requested so far for lazy syntax highlighting.
-    syntax_highlight_requested_lines: usize,
-    loaded_file_signature: Option<FileVersionSignature>,
-    file_load_in_progress: bool,
-    file_load_started_at: Option<Instant>,
-    last_view_file_request_path: Option<PathBuf>,
-    last_view_file_request_at: Option<Instant>,
     // Search state
     search: SearchState,
     // Attention: true when terminal title starts with "*" (e.g. Claude Code waiting for input)
     needs_attention: bool,
-    // Optional command to run after shell init (e.g. "claude" for Claude Code tabs)
-    startup_command: Option<String>,
     // Claude config tree view
     claude_config: ClaudeConfig,
-    // Agent activity tracking
-    agent_activity: Option<agent::AgentActivity>,
-    agent_activity_loading: bool,
-    // Agent conversation viewer
-    selected_capture_idx: Option<usize>,
-    agent_conversation: Option<agent::Conversation>,
+    // Agent activity sidebar state (shared across tab kinds — see AgentActivityState).
+    agent_sidebar: AgentActivityState,
     is_git_repo: bool,
 }
 
@@ -1802,7 +2029,7 @@ impl TabState {
             id,
             repo_path,
             repo_name,
-            terminal: None,
+            kind: TabKind::Terminal(TerminalTab::new()),
             staged: Vec::new(),
             unstaged: Vec::new(),
             untracked: Vec::new(),
@@ -1821,33 +2048,149 @@ impl TabState {
             diff_syntax_notice: None,
             file_index: -1,
             created_at: Instant::now(),
-            terminal_title: None,
             sidebar_mode: SidebarMode::Git,
             current_dir,
             file_tree: Vec::new(),
-            viewing_file_path: None,
-            file_content: String::new(),
-            image_handle: None,
-            webview_content: None,
-            file_preview_notice: None,
-            syntax_highlight_lines: None,
-            syntax_highlight_notice: None,
-            syntax_highlight_in_progress: false,
-            syntax_highlight_requested_lines: 0,
-            loaded_file_signature: None,
-            file_load_in_progress: false,
-            file_load_started_at: None,
-            last_view_file_request_path: None,
-            last_view_file_request_at: None,
             search: SearchState::default(),
             needs_attention: false,
-            startup_command: None,
             claude_config: ClaudeConfig::default(),
-            agent_activity: None,
-            agent_activity_loading: false,
-            selected_capture_idx: None,
-            agent_conversation: None,
+            agent_sidebar: AgentActivityState::default(),
             is_git_repo,
+        }
+    }
+
+    // ---- Tab-kind accessors -------------------------------------------------
+    //
+    // Agent tabs don't have a terminal, terminal title, startup command, or file
+    // viewer overlay — these accessors all return None / no-op for that variant.
+    // The Agent variant has its own state in `AgentSession`; see `agent_session()`.
+
+    /// The terminal widget if this is a terminal tab and a terminal has been spawned.
+    fn terminal(&self) -> Option<&iced_term::Terminal> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt.terminal.as_ref(),
+            TabKind::Agent(_) => None,
+        }
+    }
+
+    fn terminal_mut(&mut self) -> Option<&mut iced_term::Terminal> {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.terminal.as_mut(),
+            TabKind::Agent(_) => None,
+        }
+    }
+
+    fn set_terminal(&mut self, terminal: iced_term::Terminal) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.terminal = Some(terminal),
+            TabKind::Agent(_) => {}
+        }
+    }
+
+    /// Title set by the shell via OSC escape codes — terminal tabs only.
+    fn terminal_title(&self) -> Option<&str> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt.terminal_title.as_deref(),
+            TabKind::Agent(_) => None,
+        }
+    }
+
+    fn set_terminal_title(&mut self, title: Option<String>) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.terminal_title = title,
+            TabKind::Agent(_) => {}
+        }
+    }
+
+    /// The startup command requested when this tab was created (e.g. "claude").
+    fn startup_command(&self) -> Option<&str> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt.startup_command.as_deref(),
+            TabKind::Agent(_) => None,
+        }
+    }
+
+    fn set_startup_command(&mut self, cmd: Option<String>) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.startup_command = cmd,
+            TabKind::Agent(_) => {}
+        }
+    }
+
+    /// File viewer overlay (modal-style on top of a terminal tab) if one is open.
+    fn file_viewer(&self) -> Option<&FileViewerOverlay> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt.file_viewer.as_ref(),
+            TabKind::Agent(_) => None,
+        }
+    }
+
+    fn file_viewer_mut(&mut self) -> Option<&mut FileViewerOverlay> {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.file_viewer.as_mut(),
+            TabKind::Agent(_) => None,
+        }
+    }
+
+    /// Path of the file currently shown in the file viewer overlay, if any.
+    fn viewing_file_path(&self) -> Option<&Path> {
+        self.file_viewer().map(|fv| fv.path.as_path())
+    }
+
+    /// Open (or replace) a file viewer overlay on this tab. Returns `None` for
+    /// agent tabs (which don't host file viewers in v1). The caller is responsible
+    /// for kicking off the actual file load — this just clears prior overlay state.
+    fn open_file_viewer(&mut self, path: PathBuf) -> Option<&mut FileViewerOverlay> {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => {
+                tt.file_viewer = Some(FileViewerOverlay::for_path(path));
+                Some(tt.file_viewer.as_mut().expect("just inserted"))
+            }
+            TabKind::Agent(_) => None,
+        }
+    }
+
+    fn close_file_viewer(&mut self) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => tt.file_viewer = None,
+            TabKind::Agent(_) => {}
+        }
+    }
+
+    fn last_view_request(&self) -> Option<(&Path, Instant)> {
+        match &self.kind {
+            TabKind::Terminal(tt) => tt
+                .last_view_request_path
+                .as_deref()
+                .zip(tt.last_view_request_at),
+            TabKind::Agent(_) => None,
+        }
+    }
+
+    fn set_last_view_request(&mut self, path: Option<PathBuf>, at: Option<Instant>) {
+        match &mut self.kind {
+            TabKind::Terminal(tt) => {
+                tt.last_view_request_path = path;
+                tt.last_view_request_at = at;
+            }
+            TabKind::Agent(_) => {}
+        }
+    }
+
+    /// The agent session for an agent tab, if this is one.
+    #[allow(dead_code)] // Used in Step 3+
+    fn agent_session(&self) -> Option<&AgentSession> {
+        match &self.kind {
+            TabKind::Terminal(_) => None,
+            TabKind::Agent(s) => Some(s),
+        }
+    }
+
+    #[allow(dead_code)] // Used in Step 3+
+    fn agent_session_mut(&mut self) -> Option<&mut AgentSession> {
+        match &mut self.kind {
+            TabKind::Terminal(_) => None,
+            TabKind::Agent(s) => Some(s),
         }
     }
 
@@ -1967,8 +2310,8 @@ impl TabState {
             }
 
             // Sort alphabetically
-            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-            files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            dirs.sort_by_key(|a| a.name.to_lowercase());
+            files.sort_by_key(|a| a.name.to_lowercase());
 
             // Dirs first, then files
             self.file_tree.extend(dirs);
@@ -1978,28 +2321,30 @@ impl TabState {
 
     #[allow(dead_code)]
     fn load_file(&mut self, path: &PathBuf, is_dark_theme: bool) {
-        self.file_content.clear();
-        self.image_handle = None;
-        self.webview_content = None;
-        self.file_preview_notice = None;
-        self.syntax_highlight_lines = None;
-        self.syntax_highlight_notice = None;
-        self.syntax_highlight_in_progress = false;
-        self.syntax_highlight_requested_lines = 0;
-        self.viewing_file_path = Some(path.clone());
+        // Reset / open the overlay so subsequent writes target a fresh state.
+        // No-op for agent tabs (which don't host file viewers in v1).
+        let Some(fv) = self.open_file_viewer(path.clone()) else {
+            return;
+        };
 
         let file_size = freeze_time!("file metadata check", {
             std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0)
         });
-        
+
         // Warn about potentially problematic files
-        if file_size > 1_000_000 { // 1MB
-            freeze_debug!("Loading large file ({} bytes): {}", file_size, path.display());
+        if file_size > 1_000_000 {
+            // 1MB
+            freeze_debug!(
+                "Loading large file ({} bytes): {}",
+                file_size,
+                path.display()
+            );
         }
-        
+
         // Refuse to load extremely large files synchronously
-        if file_size > 50_000_000 { // 50MB
-            self.file_preview_notice = Some(format!(
+        if file_size > 50_000_000 {
+            // 50MB
+            fv.preview_notice = Some(format!(
                 "File too large ({}) for inline preview. Click \"View in Browser\" to open externally.",
                 format_bytes(file_size)
             ));
@@ -2009,19 +2354,18 @@ impl TabState {
         #[cfg(feature = "excalidraw")]
         if excalidraw::is_excalidraw_file(path) {
             if file_size > MAX_INLINE_WEBVIEW_BYTES {
-                self.file_preview_notice = Some(format!(
+                fv.preview_notice = Some(format!(
                     "Inline preview skipped for large Excalidraw file ({}). Click \"View in Browser\".",
                     format_bytes(file_size)
                 ));
                 return;
             }
-            let content_result = freeze_time!("excalidraw file read", {
-                std::fs::read_to_string(path)
-            });
+            let content_result =
+                freeze_time!("excalidraw file read", { std::fs::read_to_string(path) });
             if let Ok(content) = content_result {
                 if excalidraw::validate_excalidraw(&content) {
                     let html = excalidraw::render_excalidraw_html(&content, is_dark_theme);
-                    self.webview_content = Some(html);
+                    fv.webview_content = Some(html);
                 }
             }
             return;
@@ -2029,91 +2373,86 @@ impl TabState {
 
         if Self::is_markdown_file(path) {
             if file_size > MAX_INLINE_WEBVIEW_BYTES {
-                self.file_preview_notice = Some(format!(
+                fv.preview_notice = Some(format!(
                     "Inline preview skipped for large Markdown file ({}). Click \"View in Browser\".",
                     format_bytes(file_size)
                 ));
                 return;
             }
             // Load as markdown - render to HTML and store for potential browser viewing
-            let content_result = freeze_time!("markdown file read", {
-                std::fs::read_to_string(path)
-            });
+            let content_result =
+                freeze_time!("markdown file read", { std::fs::read_to_string(path) });
             if let Ok(content) = content_result {
                 let html = markdown::render_markdown_to_html(&content, is_dark_theme);
-                self.webview_content = Some(html);
+                fv.webview_content = Some(html);
             }
         } else if Self::is_html_file(path) {
             if file_size > MAX_INLINE_WEBVIEW_BYTES {
-                self.file_preview_notice = Some(format!(
+                fv.preview_notice = Some(format!(
                     "Inline preview skipped for large HTML file ({}). Click \"View in Browser\".",
                     format_bytes(file_size)
                 ));
                 return;
             }
-            let content_result = freeze_time!("HTML file read", {
-                std::fs::read_to_string(path)
-            });
+            let content_result = freeze_time!("HTML file read", { std::fs::read_to_string(path) });
             if let Ok(content) = content_result {
-                self.webview_content = Some(content);
+                fv.webview_content = Some(content);
             }
         } else if Self::is_image_file(path) {
             // Load as image
-            self.image_handle = Some(image::Handle::from_path(path));
+            fv.image_handle = Some(image::Handle::from_path(path));
         } else if file_size > MAX_FULL_TEXT_LOAD_BYTES {
             if let Ok(preview) =
                 read_text_preview(path, LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES)
             {
-                self.file_content = preview;
+                fv.file_content = preview;
             } else if let Ok(content) = std::fs::read_to_string(path) {
-                self.file_content = content;
+                fv.file_content = content;
             }
-            self.file_preview_notice = Some(format!(
+            fv.preview_notice = Some(format!(
                 "Large file ({}): showing first {} lines (~{} KB).",
                 format_bytes(file_size),
                 LARGE_TEXT_PREVIEW_LINES,
                 LARGE_TEXT_PREVIEW_BYTES / 1024
             ));
         } else {
-            // For large files, show a preview only  
-            if file_size > 5_000_000 { // 5MB
+            // For large files, show a preview only
+            if file_size > 5_000_000 {
+                // 5MB
                 let preview_result = freeze_time!("large text file preview", {
                     read_text_preview(path, LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES)
                 });
                 match preview_result {
                     Ok(preview) => {
-                        self.file_content = preview;
-                        self.file_preview_notice = Some(format!(
+                        fv.file_content = preview;
+                        fv.preview_notice = Some(format!(
                             "Large file ({}): showing preview only. Click \"View in Browser\" for full content.",
                             format_bytes(file_size)
                         ));
                     }
                     Err(_) => {
-                        self.file_preview_notice = Some(format!(
+                        fv.preview_notice = Some(format!(
                             "Could not load file preview ({})",
                             format_bytes(file_size)
                         ));
                     }
                 }
             } else {
-                let content_result = freeze_time!("text file read", {
-                    std::fs::read_to_string(path)
-                });
+                let content_result =
+                    freeze_time!("text file read", { std::fs::read_to_string(path) });
                 if let Ok(content) = content_result {
                     // Load as text
-                    self.file_content = content;
+                    fv.file_content = content;
                 }
             }
         }
 
-        if self.webview_content.is_none()
-            && self.image_handle.is_none()
-            && !self.file_content.is_empty()
+        if fv.webview_content.is_none() && fv.image_handle.is_none() && !fv.file_content.is_empty()
         {
             let (lines, notice) =
-                build_syntax_highlight_lines(path, &self.file_content, is_dark_theme);
-            self.syntax_highlight_lines = lines;
-            self.syntax_highlight_notice = notice;
+                build_syntax_highlight_lines(path, &fv.file_content, is_dark_theme);
+            fv.syntax_highlight_lines = lines;
+            fv.syntax_highlight_notice = notice;
         }
     }
 
@@ -2141,7 +2480,8 @@ impl TabState {
 
             // Get file statuses
             let mut opts = StatusOptions::new();
-            opts.include_untracked(true)
+            opts.no_refresh(true)
+                .include_untracked(true)
                 .recurse_untracked_dirs(true)
                 .include_ignored(false);
 
@@ -2191,14 +2531,16 @@ impl TabState {
     }
 
     fn fetch_agent_activity(&mut self) -> Task<Event> {
-        self.agent_activity_loading = true;
+        self.agent_sidebar.loading = true;
         let tab_id = self.id;
         let repo_path = self.repo_path.clone();
         Task::perform(
             async move {
                 match tokio::task::spawn_blocking(move || {
                     agent::AgentActivity::load_from_repo(&repo_path)
-                }).await {
+                })
+                .await
+                {
                     Ok(result) => (tab_id, result),
                     Err(e) => (tab_id, Err(format!("spawn_blocking failed: {}", e))),
                 }
@@ -2265,7 +2607,7 @@ impl TabState {
         }
         self.claude_config
             .skills
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
 
         // --- Read settings.json ---
         let settings_path = claude_home.join("settings.json");
@@ -2287,7 +2629,7 @@ impl TabState {
         }
         self.claude_config
             .plugins
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
 
         // --- MCP Servers ---
         // Project .mcp.json
@@ -2323,7 +2665,7 @@ impl TabState {
         }
         self.claude_config
             .mcp_servers
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
 
         // --- Hooks ---
         if let Some(ref settings) = settings_json {
@@ -2339,7 +2681,7 @@ impl TabState {
         }
         self.claude_config
             .hooks
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
 
         // --- Settings ---
         // User settings (top-level keys, excluding plugins/hooks which have their own sections)
@@ -2375,7 +2717,7 @@ impl TabState {
         }
         self.claude_config
             .settings
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
     }
 
     #[allow(dead_code)]
@@ -2559,8 +2901,6 @@ impl TabState {
     }
 }
 
-
-
 // Bottom panel tab types
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BottomPanelTab {
@@ -2574,8 +2914,6 @@ struct BottomTerminal {
     title: Option<String>,
     cwd: PathBuf,
 }
-
-
 
 // Workspace groups tabs by project
 struct Workspace {
@@ -2894,14 +3232,28 @@ pub enum Event {
     SearchClose,
     // Markdown preview
     OpenMarkdownInBrowser,
+    // Plans viewer (in-app webview, served by warp on localhost)
+    OpenPlansViewer,
+    OpenPlan(String),
+    ClosePlansViewer,
     // Window events
     WindowResized(f32, f32),
     WindowCloseRequested,
+    WindowFocused,
+    WindowUnfocused,
     // Workspace events
     WorkspaceSelect(usize),
     WorkspaceClose(usize),
     WorkspaceCreate,
     WorkspaceCreated(Option<PathBuf>),
+    WorkspaceSettingsOpen(usize),
+    WorkspaceSettingsClose,
+    WorkspaceSettingsNewKeyChanged(String),
+    WorkspaceSettingsNewValueChanged(String),
+    WorkspaceSettingsEnvAdd,
+    WorkspaceSettingsEnvRemove(String),
+    WorkspaceSettingsColorChange(WorkspaceColor),
+    WorkspaceSettingsApplyProfile(String),
     // Slide animation events
     SlideAnimationTick,
     // Edge peek events
@@ -2930,6 +3282,23 @@ pub enum Event {
     LaunchAgentPreset(usize),
     // Resume agent preset session by index
     ResumeAgentPreset(usize),
+    // Live agent tab (TabKind::Agent) — Step 3 of TRU-29.
+    /// User submitted a prompt for the agent tab with this id.
+    AgentSubmitPrompt(usize, String),
+    /// User clicked the stop button on the agent tab with this id.
+    AgentStopRequested(usize),
+    /// One streaming event from the agent subprocess (Step 4 will refine the
+    /// payload once the parser lands; today every line arrives as `Other`).
+    AgentEventReceived(usize, tab::AgentEvent),
+    /// Step 3-only debug entry point: spawn an in-memory agent tab in the
+    /// active workspace, submit a hardcoded prompt, log events to stderr.
+    /// Bound to a hidden keyboard shortcut for verifying the subprocess
+    /// pipeline. Step 4 keeps it as the temporary launcher for an agent tab
+    /// (replaced by a real launcher UI in Step 5).
+    DebugSpawnAgentTab,
+    /// One IPC message from the agent webview, drained from the global
+    /// `AGENT_IPC_RX` channel by the subscription bridge.
+    AgentWebviewIpc(AgentIpcMessage),
     // Quick commands (run in bottom terminal)
     RunQuickCommand(usize),
     ShowQuickCommands,
@@ -3017,6 +3386,11 @@ struct App {
     current_modifiers: Modifiers,
     // Help modal
     show_help: bool,
+    // Workspace settings modal
+    workspace_settings_open: bool,
+    workspace_settings_idx: usize,
+    workspace_settings_new_key: String,
+    workspace_settings_new_value: String,
     // Tab picker popup (Option+click on "+")
     tab_picker_visible: bool,
     // Configured agent presets
@@ -3025,8 +3399,13 @@ struct App {
     quick_commands: Vec<QuickCommand>,
     // Quick commands picker visibility
     quick_commands_visible: bool,
+    // Track whether the window has focus (skip terminal processing when unfocused)
+    window_focused: bool,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
     bottom_panel_focused: bool,
+    /// Configs for workspaces that were closed but whose settings (env, color, etc.)
+    /// should be preserved in workspaces.json for reopening later.
+    closed_workspace_configs: Vec<WorkspaceConfig>,
     workspaces_dirty: bool,
     next_workspace_save_at: Option<Instant>,
     log_server_dirty: bool,
@@ -3050,6 +3429,28 @@ struct App {
     stt_sample_rate: u32,
     #[cfg(feature = "stt")]
     stt_transcribing: bool,
+    /// What kind of content the singleton webview is currently hosting. Used
+    /// to decide whether a tab activation can keep / update the webview in
+    /// place or has to destroy + recreate it (the IPC handler is set at
+    /// construction and can't be swapped, so Static<->Agent transitions need
+    /// a recreate).
+    webview_kind: WebviewKind,
+    /// The agent tab id whose state the webview is currently mirroring (if
+    /// `webview_kind == Agent`). Used to detect tab-switch-to-different-agent
+    /// transitions which need a buffer replay.
+    webview_agent_tab_id: Option<usize>,
+}
+
+/// What kind of content the singleton wry webview is currently hosting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebviewKind {
+    None,
+    /// Markdown / Excalidraw / HTML file viewer — no IPC handler.
+    Static,
+    /// Agent chat — installed once with an IPC handler at construction.
+    Agent,
+    /// Plans viewer — URL-loaded surface served by warp on localhost.
+    PlansViewer,
 }
 
 const SPINE_WIDTH: f32 = 16.0;
@@ -3179,24 +3580,15 @@ impl App {
     }
 
     fn tab_uses_inline_webview(tab: &TabState) -> bool {
-        let is_markdown_webview = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| TabState::is_markdown_file(p))
-            .unwrap_or(false)
-            && tab.webview_content.is_some();
-        let is_html = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| TabState::is_html_file(p))
-            .unwrap_or(false);
+        let Some(fv) = tab.file_viewer() else {
+            return false;
+        };
+        let is_markdown_webview =
+            TabState::is_markdown_file(&fv.path) && fv.webview_content.is_some();
+        let is_html = TabState::is_html_file(&fv.path);
 
         #[cfg(feature = "excalidraw")]
-        let is_excalidraw = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| excalidraw::is_excalidraw_file(p))
-            .unwrap_or(false);
+        let is_excalidraw = excalidraw::is_excalidraw_file(&fv.path);
         #[cfg(not(feature = "excalidraw"))]
         let is_excalidraw = false;
 
@@ -3206,7 +3598,7 @@ impl App {
     fn active_inline_webview_html(&self) -> Option<String> {
         self.active_tab().and_then(|tab| {
             if Self::tab_uses_inline_webview(tab) {
-                tab.webview_content.clone()
+                tab.file_viewer().and_then(|fv| fv.webview_content.clone())
             } else {
                 None
             }
@@ -3237,14 +3629,14 @@ impl App {
 
             for tab in &ws.tabs {
                 tab_count += 1;
-                if tab.viewing_file_path.is_some() {
+                if let Some(fv) = tab.file_viewer() {
                     viewing_files += 1;
+                    if fv.preview_notice.is_some() {
+                        preview_notice_count += 1;
+                    }
+                    file_content_bytes += fv.file_content.len();
+                    webview_html_bytes += fv.webview_content.as_ref().map(|s| s.len()).unwrap_or(0);
                 }
-                if tab.file_preview_notice.is_some() {
-                    preview_notice_count += 1;
-                }
-                file_content_bytes += tab.file_content.len();
-                webview_html_bytes += tab.webview_content.as_ref().map(|s| s.len()).unwrap_or(0);
             }
         }
 
@@ -3267,7 +3659,7 @@ impl App {
         self.bottom_panel_focused = false;
         if let Some(ws) = self.active_workspace() {
             if let Some(tab) = ws.active_tab() {
-                if let Some(term) = &tab.terminal {
+                if let Some(term) = tab.terminal() {
                     return TerminalView::focus(term.widget_id().clone());
                 }
             }
@@ -3312,6 +3704,7 @@ impl App {
     }
 
     fn save_config(&self) {
+        let started = Instant::now();
         let config = Config {
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
@@ -3334,41 +3727,83 @@ impl App {
             quick_commands: self.quick_commands.clone(),
         };
         config.save();
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(100) {
+            freeze_debug!("save_config took {}ms", elapsed.as_millis());
+        }
     }
 
     fn save_workspaces(&self) {
+        // Active workspaces from runtime state
+        let mut configs: Vec<WorkspaceConfig> = self
+            .workspaces
+            .iter()
+            .map(|ws| WorkspaceConfig {
+                name: ws.name.clone(),
+                abbrev: ws.abbrev.clone(),
+                dir: ws.dir.to_string_lossy().to_string(),
+                color: ws.color,
+                tabs: ws
+                    .tabs
+                    .iter()
+                    .map(|tab| WorkspaceTabConfig {
+                        dir: tab.current_dir.to_string_lossy().to_string(),
+                        repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
+                        startup_command: tab.startup_command().map(String::from),
+                        tab_kind: match &tab.kind {
+                            TabKind::Terminal(_) => None, // omitted for backward compat
+                            TabKind::Agent(_) => Some("agent".to_string()),
+                        },
+                        agent_config: tab.agent_session().map(|s| s.config.clone()),
+                    })
+                    .collect(),
+                run_command: ws.console.run_command.clone(),
+                bottom_terminals: ws
+                    .bottom_terminals
+                    .iter()
+                    .map(|bt| BottomTerminalConfig {
+                        dir: bt.cwd.to_string_lossy().to_string(),
+                    })
+                    .collect(),
+                env: ws.env.clone(),
+                active: true,
+            })
+            .collect();
+
+        // Append closed workspace configs so their env/settings survive
+        // (skip any whose dir matches an active workspace — it was reopened)
+        for closed in &self.closed_workspace_configs {
+            let already_active = configs.iter().any(|c| c.dir == closed.dir);
+            if !already_active {
+                configs.push(closed.clone());
+            }
+        }
+
         let ws_file = WorkspacesFile {
-            workspaces: self
-                .workspaces
-                .iter()
-                .map(|ws| WorkspaceConfig {
-                    name: ws.name.clone(),
-                    abbrev: ws.abbrev.clone(),
-                    dir: ws.dir.to_string_lossy().to_string(),
-                    color: ws.color,
-                    tabs: ws
-                        .tabs
-                        .iter()
-                        .map(|tab| WorkspaceTabConfig {
-                            dir: tab.current_dir.to_string_lossy().to_string(),
-                            repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
-                            startup_command: tab.startup_command.clone(),
-                        })
-                        .collect(),
-                    run_command: ws.console.run_command.clone(),
-                    bottom_terminals: ws
-                        .bottom_terminals
-                        .iter()
-                        .map(|bt| BottomTerminalConfig {
-                            dir: bt.cwd.to_string_lossy().to_string(),
-                        })
-                        .collect(),
-                    env: ws.env.clone(),
-                })
-                .collect(),
+            workspaces: configs,
             active_workspace: self.active_workspace_idx,
         };
         ws_file.save();
+    }
+
+    /// Load workspace profiles from ~/.config/gitterm/profiles.json
+    /// Returns a map of profile_name -> env vars
+    fn load_profiles() -> Option<HashMap<String, HashMap<String, String>>> {
+        let path = config::global_config_dir().join("profiles.json");
+        let contents = std::fs::read_to_string(&path).ok()?;
+        #[derive(serde::Deserialize)]
+        struct Profile {
+            #[allow(dead_code)]
+            description: Option<String>,
+            env: HashMap<String, String>,
+        }
+        let profiles: HashMap<String, Profile> = serde_json::from_str(&contents).ok()?;
+        Some(
+            profiles
+                .into_iter()
+                .map(|(name, p)| (name, p.env))
+                .collect(),
+        )
     }
 
     fn mark_workspaces_dirty(&mut self) {
@@ -3377,11 +3812,72 @@ impl App {
             Some(Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS));
     }
 
+    fn handle_terminal_backend_command(
+        term: &mut iced_term::Terminal,
+        cmd: iced_term::backend::Command,
+        context: &str,
+        window_focused: bool,
+    ) -> iced_term::actions::Action {
+        // Stamp the watchdog with the specific backend-command kind. The
+        // generic dispatcher heartbeat skips `Event::Terminal` (it fires at
+        // PTY-tick rate), so without this tag a freeze inside `term.handle`
+        // would surface as "Last event: CheckMenu-done" — useless. With this,
+        // a watchdog dump names the exact sub-path (Backend:Write,
+        // Backend:Resize, Backend:ProcessAlacrittyEvent, …) so we know
+        // whether we're parked in PTY write, term-lock contention, etc.
+        let cmd_name = match &cmd {
+            iced_term::backend::Command::Write(_) => "Write",
+            iced_term::backend::Command::Scroll(_) => "Scroll",
+            iced_term::backend::Command::Resize(..) => "Resize",
+            iced_term::backend::Command::SelectStart(..) => "SelectStart",
+            iced_term::backend::Command::SelectUpdate(_) => "SelectUpdate",
+            iced_term::backend::Command::ClearSelection => "ClearSelection",
+            iced_term::backend::Command::ProcessLink(..) => "ProcessLink",
+            iced_term::backend::Command::MouseReport(..) => "MouseReport",
+            iced_term::backend::Command::ProcessAlacrittyEvent(_) => "ProcessAlacrittyEvent",
+        };
+        heartbeat(&format!("Backend:{}:{}", cmd_name, context));
+        let started = Instant::now();
+        let action = if window_focused {
+            term.handle(iced_term::Command::ProxyToBackend(cmd))
+        } else {
+            // Skip expensive sync/redraw when window is not visible.
+            // Avoids font cache cold-start stalls during sleep/wake cycles.
+            term.handle_no_redraw(iced_term::Command::ProxyToBackend(cmd))
+        };
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(100) {
+            freeze_debug!(
+                "terminal.handle in {} took {}ms (cmd={})",
+                context,
+                elapsed.as_millis(),
+                cmd_name,
+            );
+        }
+        // Mark survival so the watchdog can distinguish "froze in handle"
+        // from "froze somewhere downstream that consumed the Action".
+        heartbeat(&format!("Backend:{}:{}-done", cmd_name, context));
+        action
+    }
+
     fn start_log_server(&self) {
         let server_state = self.log_server_state.clone();
         tokio::spawn(async move {
             log_server::start_server(server_state).await;
         });
+    }
+
+    /// Push the active workspace's `.plans/` directory into `ServerState` so
+    /// the plans viewer routes can resolve it. Call after any change to the
+    /// active workspace or to a workspace's directory.
+    fn sync_plans_dir(&self) {
+        let dir = self
+            .workspaces
+            .get(self.active_workspace_idx)
+            .map(|ws| ws.dir.join(".plans"));
+        if let Ok(mut p) = self.log_server_state.plans_dir.write() {
+            *p = dir;
+        }
     }
 
     fn set_log_server_enabled(&mut self, enabled: bool) {
@@ -3446,14 +3942,14 @@ impl App {
         // PERFORMANCE: Terminal content extraction (get_all_text) is expensive — it
         // locks each terminal mutex and iterates the entire scrollback history.
         // With many tabs this caused 80+ second freezes on the main thread.
-        // 
+        //
         // Mitigation: budget a max time for the collection phase and bail early
         // if it takes too long.  Each individual get_all_text() call is still
         // synchronous (Terminal is not Send), but we cap total collection time.
-        
+
         let started = Instant::now();
         const LOG_SYNC_BUDGET_MS: u128 = 200; // Max 200ms on main thread
-        
+
         let state = self.log_server_state.clone();
         let mut terminal_snapshots = std::collections::HashMap::new();
         let mut file_snapshots = std::collections::HashMap::new();
@@ -3466,7 +3962,7 @@ impl App {
         for tab in self.workspaces.iter().flat_map(|ws| ws.tabs.iter()) {
             tab.id.hash(&mut snapshot_hasher);
 
-            if let Some(term) = &tab.terminal {
+            if let Some(term) = tab.terminal() {
                 // Check time budget before expensive get_all_text()
                 if started.elapsed().as_millis() > LOG_SYNC_BUDGET_MS {
                     budget_exceeded = true;
@@ -3489,15 +3985,15 @@ impl App {
             }
 
             // If tab is viewing a file, add it to file snapshots
-            if let Some(file_path) = &tab.viewing_file_path {
-                if !tab.file_content.is_empty() {
+            if let Some(fv) = tab.file_viewer() {
+                if !fv.file_content.is_empty() {
                     true.hash(&mut snapshot_hasher);
-                    file_bytes += tab.file_content.len();
-                    file_path.to_string_lossy().hash(&mut snapshot_hasher);
-                    tab.file_content.hash(&mut snapshot_hasher);
+                    file_bytes += fv.file_content.len();
+                    fv.path.to_string_lossy().hash(&mut snapshot_hasher);
+                    fv.file_content.hash(&mut snapshot_hasher);
                     let snapshot = log_server::FileSnapshot {
-                        file_path: file_path.to_string_lossy().to_string(),
-                        content: tab.file_content.clone(),
+                        file_path: fv.path.to_string_lossy().to_string(),
+                        content: fv.file_content.clone(),
                     };
                     file_snapshots.insert(tab.id, snapshot);
                 } else {
@@ -3509,7 +4005,10 @@ impl App {
         }
 
         if budget_exceeded {
-            freeze_debug!("log_sync budget exceeded ({}ms) - skipped some terminals", started.elapsed().as_millis());
+            freeze_debug!(
+                "log_sync budget exceeded ({}ms) - skipped some terminals",
+                started.elapsed().as_millis()
+            );
         }
 
         let snapshot_hash = snapshot_hasher.finish();
@@ -3554,7 +4053,7 @@ impl App {
                 {
                     Ok(snapshot) => snapshot,
                     Err(err) => {
-                        freeze_debug!("CRITICAL: spawn_blocking failed! Skipping git status for tab {} ({}): {}", 
+                        freeze_debug!("CRITICAL: spawn_blocking failed! Skipping git status for tab {} ({}): {}",
                                      tab_id, fallback_repo_path.display(), err);
                         // Return empty snapshot instead of blocking main thread
                         GitStatusSnapshot {
@@ -3768,11 +4267,17 @@ impl App {
             attention_pulse_bright: false,
             current_modifiers: Modifiers::empty(),
             show_help: false,
+            workspace_settings_open: false,
+            workspace_settings_idx: 0,
+            workspace_settings_new_key: String::new(),
+            workspace_settings_new_value: String::new(),
             tab_picker_visible: false,
             agent_presets: config.agent_presets.clone(),
             quick_commands: config.quick_commands.clone(),
             quick_commands_visible: false,
+            window_focused: true,
             bottom_panel_focused: false,
+            closed_workspace_configs: Vec::new(),
             workspaces_dirty: false,
             next_workspace_save_at: None,
             log_server_dirty: log_server_enabled,
@@ -3796,11 +4301,19 @@ impl App {
             stt_sample_rate: 48000,
             #[cfg(feature = "stt")]
             stt_transcribing: false,
+            webview_kind: WebviewKind::None,
+            webview_agent_tab_id: None,
         };
 
         // Try to restore workspaces from saved config
         if let Some(ws_file) = WorkspacesFile::load() {
             for ws_config in &ws_file.workspaces {
+                // Keep closed workspaces in memory so their env/color/settings
+                // are preserved in workspaces.json and restored on reopen.
+                if !ws_config.active {
+                    app.closed_workspace_configs.push(ws_config.clone());
+                    continue;
+                }
                 let dir = PathBuf::from(&ws_config.dir);
                 let home = std::env::var("HOME").unwrap_or_default();
                 // If workspace dir is $HOME, name the workspace after its first tab's repo instead
@@ -3844,12 +4357,52 @@ impl App {
                         } else {
                             repo_dir.clone()
                         };
-                        app.add_tab_to_workspace_with_command(
-                            &mut workspace,
-                            repo_dir,
-                            Some(current_dir),
-                            tab_config.startup_command.clone(),
-                        );
+                        match (
+                            tab_config.tab_kind.as_deref(),
+                            tab_config.agent_config.as_ref(),
+                        ) {
+                            (Some("agent"), Some(agent_config)) => {
+                                app.add_agent_tab_to_workspace(
+                                    &mut workspace,
+                                    repo_dir,
+                                    Some(current_dir),
+                                    agent_config.clone(),
+                                );
+                            }
+                            (Some("agent"), None) => {
+                                eprintln!(
+                                    "WARN: tab_kind=\"agent\" without agent_config; falling back to terminal tab for {}",
+                                    repo_dir.display()
+                                );
+                                app.add_tab_to_workspace_with_command(
+                                    &mut workspace,
+                                    repo_dir,
+                                    Some(current_dir),
+                                    tab_config.startup_command.clone(),
+                                );
+                            }
+                            (Some(other), _) if other != "terminal" => {
+                                eprintln!(
+                                    "WARN: unknown tab_kind={:?}; falling back to terminal tab for {}",
+                                    other,
+                                    repo_dir.display()
+                                );
+                                app.add_tab_to_workspace_with_command(
+                                    &mut workspace,
+                                    repo_dir,
+                                    Some(current_dir),
+                                    tab_config.startup_command.clone(),
+                                );
+                            }
+                            _ => {
+                                app.add_tab_to_workspace_with_command(
+                                    &mut workspace,
+                                    repo_dir,
+                                    Some(current_dir),
+                                    tab_config.startup_command.clone(),
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -3881,6 +4434,7 @@ impl App {
         if app.log_server_enabled {
             app.start_log_server();
         }
+        app.sync_plans_dir();
 
         // Set initial slide position for active workspace
         let viewport_width = app.content_viewport_width();
@@ -3902,11 +4456,22 @@ impl App {
             startup_tasks.push(Self::request_git_status(tab_id, repo_path));
         }
 
+        // If the active tab on startup is an agent tab (restored from
+        // workspaces.json), dispatch its activation so the webview gets
+        // built — TabSelect doesn't fire automatically on restore.
+        let active_agent_tab_id = app
+            .active_tab()
+            .filter(|t| matches!(t.kind, TabKind::Agent(_)))
+            .map(|t| t.id);
+        if let Some(tab_id) = active_agent_tab_id {
+            startup_tasks.push(app.show_agent_webview(tab_id));
+        }
+
         (app, Task::batch(startup_tasks))
     }
 
     fn add_tab_to_workspace(&mut self, workspace: &mut Workspace, repo_path: PathBuf) {
-        let tab = self.create_tab(repo_path, None);
+        let tab = self.create_tab_for_workspace(repo_path, None, Some(&workspace.name.clone()));
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
     }
@@ -3918,7 +4483,34 @@ impl App {
         current_dir: Option<PathBuf>,
         startup_command: Option<String>,
     ) {
-        let mut tab = self.create_tab(repo_path.clone(), startup_command);
+        let mut tab = self.create_tab_for_workspace(
+            repo_path.clone(),
+            startup_command,
+            Some(&workspace.name.clone()),
+        );
+        if let Some(dir) = current_dir {
+            tab.current_dir = dir;
+        } else {
+            tab.current_dir = repo_path;
+        }
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+    }
+
+    /// Construct an agent tab (no terminal, no shell). The subprocess for the
+    /// configured backend is not started here — Step 3 (TRU-29) will spawn it
+    /// when the user submits the first prompt.
+    fn add_agent_tab_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        repo_path: PathBuf,
+        current_dir: Option<PathBuf>,
+        config: AgentBackendConfig,
+    ) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let mut tab = TabState::new(id, repo_path.clone());
+        tab.kind = TabKind::Agent(AgentSession::new(config));
         if let Some(dir) = current_dir {
             tab.current_dir = dir;
         } else {
@@ -4019,7 +4611,20 @@ impl App {
         let is_windows = cfg!(target_os = "windows");
 
         let args = if is_windows {
-            vec![]
+            if let Some(cmd) = startup_command {
+                let lower = shell.to_lowercase();
+                if lower.contains("powershell") || lower.contains("pwsh") {
+                    vec![
+                        "-NoExit".to_string(),
+                        "-Command".to_string(),
+                        cmd.to_string(),
+                    ]
+                } else {
+                    vec!["/K".to_string(), cmd.to_string()]
+                }
+            } else {
+                vec![]
+            }
         } else if is_zsh {
             let home = std::env::var("HOME").unwrap_or_default();
             let gitterm_dir = format!("{home}/.config/gitterm/zsh");
@@ -4102,17 +4707,40 @@ fi
     }
 
     fn create_tab(&mut self, repo_path: PathBuf, startup_command: Option<String>) -> TabState {
-        // Collect workspace env vars to inject into the terminal session
-        let extra_env: Vec<(String, String)> = self.active_workspace()
-            .map(|ws| ws.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        self.create_tab_for_workspace(repo_path, startup_command, None)
+    }
+
+    fn create_tab_for_workspace(
+        &mut self,
+        repo_path: PathBuf,
+        startup_command: Option<String>,
+        workspace_name: Option<&str>,
+    ) -> TabState {
+        // Read env fresh from the global workspaces.json. Caller passes the workspace name
+        // explicitly so this works correctly during init (before active_workspace is set).
+        let ws_name = workspace_name
+            .map(|s| s.to_string())
+            .or_else(|| self.active_workspace().map(|ws| ws.name.clone()));
+        let global_ws_path = config::global_config_dir().join("workspaces.json");
+        let extra_env: Vec<(String, String)> = ws_name
+            .and_then(|name| {
+                std::fs::read_to_string(&global_ws_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<WorkspacesFile>(&s).ok())
+                    .and_then(|f| f.workspaces.into_iter().find(|w| w.name == name))
+            })
+            .map(|cfg| cfg.env.into_iter().collect())
             .unwrap_or_default();
-        let extra_env_refs: Vec<(&str, &str)> = extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let extra_env_refs: Vec<(&str, &str)> = extra_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
         let mut tab = TabState::new(id, repo_path.clone());
-        tab.startup_command = startup_command.clone();
+        tab.set_startup_command(startup_command.clone());
 
         let settings = Self::build_terminal_settings(
             &repo_path,
@@ -4127,13 +4755,29 @@ fi
             terminal.handle(iced_term::Command::AddBindings(
                 Self::standard_noop_bindings(),
             ));
-            tab.terminal = Some(terminal);
+            tab.set_terminal(terminal);
         }
 
         tab
     }
 
     fn create_bottom_terminal(&mut self, cwd: PathBuf) -> BottomTerminal {
+        let ws_name = self.active_workspace().map(|ws| ws.name.clone());
+        let global_ws_path = config::global_config_dir().join("workspaces.json");
+        let extra_env: Vec<(String, String)> = ws_name
+            .and_then(|name| {
+                std::fs::read_to_string(&global_ws_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<WorkspacesFile>(&s).ok())
+                    .and_then(|f| f.workspaces.into_iter().find(|w| w.name == name))
+            })
+            .map(|cfg| cfg.env.into_iter().collect())
+            .unwrap_or_default();
+        let extra_env_refs: Vec<(&str, &str)> = extra_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let settings = Self::build_terminal_settings(
@@ -4142,7 +4786,7 @@ fi
             self.scrollback_lines,
             &self.theme,
             self.terminal_font_size,
-            &[],
+            &extra_env_refs,
         );
         let terminal = iced_term::Terminal::new(id as u64, settings)
             .ok()
@@ -4200,6 +4844,10 @@ fi
 
     fn subscription(&self) -> Subscription<Event> {
         let mut subs = vec![
+            // Agent webview IPC bridge — drains the global mpsc into events.
+            // Built once via a fn pointer; re-runs are guarded by the
+            // identity hash of `Subscription::run`'s function-pointer arg.
+            Subscription::run(agent_ipc_stream),
             iced::time::every(Duration::from_millis(5000)).map(|_| Event::Tick),
             // Poll menu events frequently
             iced::time::every(Duration::from_millis(MENU_POLL_INTERVAL_MS))
@@ -4223,6 +4871,8 @@ fi
                 iced::Event::Window(iced::window::Event::CloseRequested) => {
                     Some(Event::WindowCloseRequested)
                 }
+                iced::Event::Window(iced::window::Event::Focused) => Some(Event::WindowFocused),
+                iced::Event::Window(iced::window::Event::Unfocused) => Some(Event::WindowUnfocused),
                 _ => None,
             }),
         ];
@@ -4250,14 +4900,19 @@ fi
             .workspaces
             .iter()
             .flat_map(|ws| ws.tabs.iter())
-            .any(|tab| tab.file_load_in_progress || tab.diff_load_in_progress);
+            .any(|tab| {
+                tab.file_viewer()
+                    .map(|fv| fv.load_in_progress)
+                    .unwrap_or(false)
+                    || tab.diff_load_in_progress
+            });
         if loading_in_progress {
             subs.push(iced::time::every(Duration::from_millis(50)).map(|_| Event::LoadingUiTick));
         }
 
         for ws in &self.workspaces {
             for tab in &ws.tabs {
-                if let Some(term) = &tab.terminal {
+                if let Some(term) = tab.terminal() {
                     subs.push(
                         term.subscription()
                             .with(tab.id)
@@ -4283,14 +4938,22 @@ fi
     fn update(&mut self, event: Event) -> Task<Event> {
         // Heartbeat for freeze watchdog — skip high-frequency terminal events
         match &event {
-            Event::Terminal(_, _) | Event::BottomTerminalEvent(_, _) => {},
-            Event::CheckMenu => { heartbeat("CheckMenu"); },
-            Event::SlideAnimationTick => { heartbeat("SlideAnimationTick"); },
-            Event::AttentionPulseTick => { heartbeat("AttentionPulseTick"); },
-            Event::LoadingUiTick => { heartbeat("LoadingUiTick"); },
+            Event::Terminal(_, _) | Event::BottomTerminalEvent(_, _) => {}
+            Event::CheckMenu => {
+                heartbeat("CheckMenu");
+            }
+            Event::SlideAnimationTick => {
+                heartbeat("SlideAnimationTick");
+            }
+            Event::AttentionPulseTick => {
+                heartbeat("AttentionPulseTick");
+            }
+            Event::LoadingUiTick => {
+                heartbeat("LoadingUiTick");
+            }
             other => {
                 heartbeat(&format!("{:?}", other).chars().take(80).collect::<String>());
-            },
+            }
         }
         match event {
             Event::MainTerminalClicked => {
@@ -4304,6 +4967,7 @@ fi
                 }
             }
             Event::Terminal(tab_id, iced_term::Event::BackendCall(_, cmd)) => {
+                let focused = self.window_focused;
                 // Main terminal received input — it has focus
                 if matches!(&cmd, iced_term::backend::Command::Write(_)) {
                     self.bottom_panel_focused = false;
@@ -4341,7 +5005,6 @@ fi
                     }
                 }
                 let mut pending_task: Option<Task<Event>> = None;
-                let mut workspace_dirty = false;
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
@@ -4349,16 +5012,27 @@ fi
                     .find(|t| t.id == tab_id)
                 {
                     // Clear attention on user keyboard input (Write), not on process output (ProcessAlacrittyEvent)
-                    if matches!(&cmd, iced_term::backend::Command::Write(_)) && tab.needs_attention
-                    {
-                        tab.needs_attention = false;
+                    if matches!(&cmd, iced_term::backend::Command::Write(_)) {
+                        if tab.needs_attention {
+                            tab.needs_attention = false;
+                        }
+                        // Reset git poll to fast when user is actively typing
+                        if tab.git_poll_interval_ms > GIT_POLL_FAST_INTERVAL_MS {
+                            tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+                            tab.git_unchanged_streak = 0;
+                        }
                     }
-                    if let Some(term) = &mut tab.terminal {
-                        match term.handle(iced_term::Command::ProxyToBackend(cmd)) {
+                    if let Some(term) = tab.terminal_mut() {
+                        match Self::handle_terminal_backend_command(
+                            term,
+                            cmd,
+                            "main_terminal_event",
+                            focused,
+                        ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 // Set tab-specific title
-                                tab.terminal_title = Some(title.clone());
+                                tab.set_terminal_title(Some(title.clone()));
                                 // Detect attention: Claude Code sets "✳" (U+2733) prefix when waiting for input
                                 tab.needs_attention = title.starts_with('✳');
 
@@ -4366,7 +5040,6 @@ fi
                                 if let Some(dir) = TabState::extract_dir_from_title(&title) {
                                     if dir != tab.current_dir {
                                         tab.current_dir = dir.clone();
-                                        workspace_dirty = true;
                                         pending_task = Some(Self::request_file_tree(
                                             tab.id,
                                             dir.clone(),
@@ -4381,26 +5054,42 @@ fi
                                         tab.last_git_status_hash = None;
                                         tab.last_poll = Instant::now();
                                         tab.git_status_loading = true;
-                                        let status_task = Self::request_git_status(
-                                            tab.id,
-                                            tab.repo_path.clone(),
-                                        );
-                                        pending_task = Some(
-                                            if let Some(tree_task) = pending_task.take() {
+                                        let status_task =
+                                            Self::request_git_status(tab.id, tab.repo_path.clone());
+                                        pending_task =
+                                            Some(if let Some(tree_task) = pending_task.take() {
                                                 Task::batch([tree_task, status_task])
                                             } else {
                                                 status_task
-                                            },
-                                        );
+                                            });
                                     }
                                 }
+                            }
+                            iced_term::actions::Action::ClipboardStore(text) => {
+                                // OSC 52: program requested clipboard write
+                                pending_task = Some(iced::clipboard::write(text));
+                            }
+                            iced_term::actions::Action::ClipboardLoad(formatter) => {
+                                // OSC 52: program requested clipboard read.
+                                // Read clipboard, format the response, write back to PTY.
+                                let tid = tab_id;
+                                pending_task = Some(iced::clipboard::read().map(move |content| {
+                                    let text = content.unwrap_or_default();
+                                    let response = formatter(&text);
+                                    Event::Terminal(
+                                        tid,
+                                        iced_term::Event::BackendCall(
+                                            tid as u64,
+                                            iced_term::backend::Command::Write(
+                                                response.into_bytes(),
+                                            ),
+                                        ),
+                                    )
+                                }));
                             }
                             _ => {}
                         }
                     }
-                }
-                if workspace_dirty {
-                    self.mark_workspaces_dirty();
                 }
                 self.mark_log_server_dirty();
                 if let Some(task) = pending_task {
@@ -4467,10 +5156,11 @@ fi
             }
             Event::CheckMenu => {
                 let _check_menu_start = std::time::Instant::now();
-                
+
                 // Detect system wake: if wall clock jumped far ahead of monotonic expectations
                 {
-                    static LAST_CHECK: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+                    static LAST_CHECK: std::sync::Mutex<Option<std::time::Instant>> =
+                        std::sync::Mutex::new(None);
                     if let Ok(mut last) = LAST_CHECK.lock() {
                         if let Some(prev) = *last {
                             let gap = prev.elapsed();
@@ -4481,30 +5171,41 @@ fi
                         *last = Some(std::time::Instant::now());
                     }
                 }
-                
+
                 // Poll for native menu events
                 if let Ok(event) = MenuEvent::receiver().try_recv() {
+                    freeze_debug!("native menu event received: {:?}", event.id);
                     if let Some(ids) = MENU_IDS.get() {
                         if event.id == ids.increase_terminal_font {
+                            freeze_debug!("dispatching native menu: increase_terminal_font");
                             return self.update(Event::IncreaseTerminalFont);
                         } else if event.id == ids.decrease_terminal_font {
+                            freeze_debug!("dispatching native menu: decrease_terminal_font");
                             return self.update(Event::DecreaseTerminalFont);
                         } else if event.id == ids.increase_ui_font {
+                            freeze_debug!("dispatching native menu: increase_ui_font");
                             return self.update(Event::IncreaseUiFont);
                         } else if event.id == ids.decrease_ui_font {
+                            freeze_debug!("dispatching native menu: decrease_ui_font");
                             return self.update(Event::DecreaseUiFont);
                         } else if event.id == ids.toggle_theme {
+                            freeze_debug!("dispatching native menu: toggle_theme");
                             return self.update(Event::ToggleTheme);
                         } else if event.id == ids.toggle_log_server {
+                            freeze_debug!("dispatching native menu: toggle_log_server");
                             return self.update(Event::ToggleLogServer);
                         } else if event.id == ids.clear_terminal {
+                            freeze_debug!("dispatching native menu: clear_terminal");
                             return self.update(Event::ClearTerminal);
+                        } else if event.id == ids.open_plans_viewer {
+                            freeze_debug!("dispatching native menu: open_plans_viewer");
+                            return self.update(Event::OpenPlansViewer);
                         }
                     }
                 }
 
                 let _menu_poll_elapsed = _check_menu_start.elapsed();
-                
+
                 // Drain console output for all workspaces
                 let _drain_start = std::time::Instant::now();
                 let mut auto_expand = false;
@@ -4564,10 +5265,12 @@ fi
                 }
                 let _check_menu_elapsed = _check_menu_start.elapsed();
                 if _check_menu_elapsed > Duration::from_millis(50) {
-                    freeze_debug!("CheckMenu handler took {}ms (menu_poll={}ms, console_drain={}ms)", 
+                    freeze_debug!(
+                        "CheckMenu handler took {}ms (menu_poll={}ms, console_drain={}ms)",
                         _check_menu_elapsed.as_millis(),
                         _menu_poll_elapsed.as_millis(),
-                        _drain_elapsed.as_millis());
+                        _drain_elapsed.as_millis()
+                    );
                 }
                 heartbeat("CheckMenu-done");
             }
@@ -4578,16 +5281,28 @@ fi
                     }
                 }
                 let scroll_task = self.scroll_to_active_tab();
+                // Agent tab takes priority over the static-webview path because
+                // its webview is the tab's primary surface, not a modal overlay.
+                let active_agent_tab_id = self
+                    .active_tab()
+                    .filter(|t| matches!(t.kind, TabKind::Agent(_)))
+                    .map(|t| t.id);
+                if let Some(tab_id) = active_agent_tab_id {
+                    return Task::batch([scroll_task, self.show_agent_webview(tab_id)]);
+                }
                 if let Some(html) = self.active_inline_webview_html() {
                     let bounds = self.calculate_webview_bounds();
-                    return Task::batch([scroll_task, Self::show_webview(html, bounds)]);
+                    return Task::batch([scroll_task, self.show_webview(html, bounds)]);
                 }
-                webview::set_visible(false);
+                // No webview kind is active for this tab. Hide whatever is
+                // there but don't change webview_kind — the static webview
+                // can be reused for the next markdown/file viewer.
+                self.hide_webview_for_non_agent();
                 return scroll_task;
             }
             Event::TabClose(idx) => {
                 // Hide WebView when closing tabs
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
                 if let Some(ws) = self.active_workspace_mut() {
                     if idx < ws.tabs.len() && ws.tabs.len() > 1 {
                         ws.tabs.remove(idx);
@@ -4605,12 +5320,12 @@ fi
                 'outer_activity: for ws in &mut self.workspaces {
                     for tab in &mut ws.tabs {
                         if tab.id == tab_id {
-                            tab.agent_activity_loading = false;
+                            tab.agent_sidebar.loading = false;
                             match result {
-                                Ok(activity) => tab.agent_activity = Some(activity),
+                                Ok(activity) => tab.agent_sidebar.activity = Some(activity),
                                 Err(e) => {
                                     eprintln!("Failed to load agent activity: {}", e);
-                                    tab.agent_activity = Some(agent::AgentActivity::new());
+                                    tab.agent_sidebar.activity = Some(agent::AgentActivity::new());
                                 }
                             }
                             break 'outer_activity;
@@ -4623,7 +5338,7 @@ fi
                 'outer_conv: for ws in &mut self.workspaces {
                     for tab in &mut ws.tabs {
                         if tab.id == tab_id {
-                            tab.agent_conversation = Some(conversation);
+                            tab.agent_sidebar.conversation = Some(conversation);
                             break 'outer_conv;
                         }
                     }
@@ -4632,15 +5347,15 @@ fi
             }
             Event::SelectAgentCapture(idx) => {
                 if let Some(tab) = self.active_tab_mut() {
-                    if tab.selected_capture_idx == Some(idx) {
+                    if tab.agent_sidebar.selected_capture_idx == Some(idx) {
                         // Deselect if clicking the same one
-                        tab.selected_capture_idx = None;
-                        tab.agent_conversation = None;
+                        tab.agent_sidebar.selected_capture_idx = None;
+                        tab.agent_sidebar.conversation = None;
                     } else {
-                        tab.selected_capture_idx = Some(idx);
-                        tab.agent_conversation = None; // Clear while loading
-                        // Load conversation async
-                        if let Some(activity) = &tab.agent_activity {
+                        tab.agent_sidebar.selected_capture_idx = Some(idx);
+                        tab.agent_sidebar.conversation = None; // Clear while loading
+                                                               // Load conversation async
+                        if let Some(activity) = &tab.agent_sidebar.activity {
                             if let Some(capture) = activity.captures.get(idx) {
                                 let capture = capture.clone();
                                 let tab_id = tab.id;
@@ -4648,12 +5363,19 @@ fi
                                     async move {
                                         match tokio::task::spawn_blocking(move || {
                                             agent::Conversation::load_for_capture(&capture)
-                                        }).await {
+                                        })
+                                        .await
+                                        {
                                             Ok(conv) => (tab_id, conv),
-                                            Err(_) => (tab_id, agent::Conversation {
-                                                entries: Vec::new(),
-                                                error: Some("Failed to load conversation".to_string()),
-                                            }),
+                                            Err(_) => (
+                                                tab_id,
+                                                agent::Conversation {
+                                                    entries: Vec::new(),
+                                                    error: Some(
+                                                        "Failed to load conversation".to_string(),
+                                                    ),
+                                                },
+                                            ),
                                         }
                                     },
                                     |(tab_id, conv)| Event::AgentConversationLoaded(tab_id, conv),
@@ -4698,9 +5420,10 @@ fi
             }
             Event::ResumeAgentPreset(idx) => {
                 self.tab_picker_visible = false;
-                let command = self.agent_presets.get(idx).and_then(|p| {
-                    p.resume_command.clone().or_else(|| Some(p.command.clone()))
-                });
+                let command = self
+                    .agent_presets
+                    .get(idx)
+                    .and_then(|p| p.resume_command.clone().or_else(|| Some(p.command.clone())));
                 if let Some(ws) = self.active_workspace() {
                     let dir = ws
                         .active_tab()
@@ -4725,6 +5448,161 @@ fi
                     return self.scroll_to_active_tab();
                 }
             }
+            Event::AgentWebviewIpc(msg) => {
+                // The IPC bridge already tagged each message with a tab_id
+                // (from window.__currentTabId in the JS). Translate into the
+                // existing AgentSubmitPrompt / AgentStopRequested handlers.
+                return match msg {
+                    AgentIpcMessage::Submit { tab_id, text } => {
+                        Task::done(Event::AgentSubmitPrompt(tab_id, text))
+                    }
+                    AgentIpcMessage::Stop { tab_id } => {
+                        Task::done(Event::AgentStopRequested(tab_id))
+                    }
+                };
+            }
+            Event::AgentSubmitPrompt(tab_id, prompt) => {
+                // Find the tab. If it's an Agent tab, ensure a subprocess
+                // manager is spawned (lazy on first prompt) and forward the
+                // prompt. The first spawn returns a Task that bridges the
+                // event channel into AgentEventReceived events for this tab.
+                let mut bridge: Option<tokio::sync::mpsc::UnboundedReceiver<tab::AgentEvent>> =
+                    None;
+                // Synthetic event so the user sees their own prompt rendered
+                // immediately (the agent stream takes a few hundred ms before
+                // the first system event arrives).
+                let echo = tab::AgentEvent::Other(serde_json::json!({
+                    "type": "user_prompt",
+                    "text": prompt,
+                }));
+                'outer_submit: for ws in &mut self.workspaces {
+                    for t in &mut ws.tabs {
+                        if t.id != tab_id {
+                            continue;
+                        }
+                        let repo_path = t.repo_path.clone();
+                        let Some(session) = t.agent_session_mut() else {
+                            eprintln!("AgentSubmitPrompt: tab {} is not an agent tab", tab_id);
+                            return Task::none();
+                        };
+                        if session.task_handle.is_none() {
+                            let handle = tab::spawn_agent_task(session.config.clone(), repo_path);
+                            // Take the receiver up-front so this turn can wire
+                            // it into a Task::run; it lives for the tab's lifetime.
+                            bridge = handle.take_event_receiver();
+                            session.task_handle = Some(handle);
+                        }
+                        if let Some(handle) = session.task_handle.as_ref() {
+                            if let Err(e) = handle.submit_prompt(prompt.clone()) {
+                                eprintln!("AgentSubmitPrompt failed: {}", e);
+                            } else {
+                                session.state = tab::AgentSessionState::Streaming;
+                            }
+                        }
+                        session.conversation.push(echo.clone());
+                        break 'outer_submit;
+                    }
+                }
+                // Also push the echo into the webview if this tab is the one
+                // currently rendered there.
+                if self.webview_kind == WebviewKind::Agent
+                    && self.webview_agent_tab_id == Some(tab_id)
+                {
+                    push_agent_event_to_webview(&echo);
+                }
+                if let Some(rx) = bridge {
+                    use tokio_stream::wrappers::UnboundedReceiverStream;
+                    let stream = UnboundedReceiverStream::new(rx);
+                    return Task::run(stream, move |ev| Event::AgentEventReceived(tab_id, ev));
+                }
+                return Task::none();
+            }
+            Event::AgentStopRequested(tab_id) => {
+                for ws in &mut self.workspaces {
+                    for t in &mut ws.tabs {
+                        if t.id == tab_id {
+                            if let Some(session) = t.agent_session_mut() {
+                                if let Some(handle) = session.task_handle.as_ref() {
+                                    handle.request_stop();
+                                }
+                                session.state = tab::AgentSessionState::Stopped;
+                            }
+                            return Task::none();
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Event::AgentEventReceived(tab_id, ev) => {
+                // Append to the conversation buffer; if this tab's webview is
+                // currently visible, also push the event live for rendering.
+                let is_active_in_webview = self.webview_kind == WebviewKind::Agent
+                    && self.webview_agent_tab_id == Some(tab_id);
+                for ws in &mut self.workspaces {
+                    for t in &mut ws.tabs {
+                        if t.id == tab_id {
+                            if let Some(session) = t.agent_session_mut() {
+                                // Heuristic state transition until typed parser
+                                // lands (Step 9): `done`/`stopped` sentinels
+                                // flip back to Idle/Stopped.
+                                if let tab::AgentEvent::Other(value) = &ev {
+                                    if let Some(t) = value.get("type").and_then(|v| v.as_str()) {
+                                        if t == "done" {
+                                            session.state = tab::AgentSessionState::Idle;
+                                        } else if t == "stopped" {
+                                            session.state = tab::AgentSessionState::Stopped;
+                                        }
+                                    }
+                                }
+                                if is_active_in_webview {
+                                    push_agent_event_to_webview(&ev);
+                                }
+                                session.conversation.push(ev);
+                            }
+                            return Task::none();
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Event::DebugSpawnAgentTab => {
+                // Step 3-only: spawn a pi-backed agent tab in the active workspace
+                // and submit a hardcoded prompt so we can verify the subprocess
+                // pipeline end-to-end. Removed before Step 4 lands.
+                let model = std::env::var("PI_MODEL")
+                    .unwrap_or_else(|_| "openai-codex/gpt-5.4".to_string());
+                let session_path = format!("/tmp/gitterm-agent-debug-{}.jsonl", std::process::id());
+                let config = tab::AgentBackendConfig::Pi {
+                    model,
+                    session_path: Some(session_path),
+                    thinking: Some(true),
+                };
+                let (repo_path, current_dir) = match self.active_workspace() {
+                    Some(ws) => {
+                        let cd = ws
+                            .active_tab()
+                            .map(|t| t.current_dir.clone())
+                            .unwrap_or_else(|| ws.dir.clone());
+                        (ws.dir.clone(), Some(cd))
+                    }
+                    None => return Task::none(),
+                };
+
+                let id = self.next_tab_id;
+                self.next_tab_id += 1;
+                if let Some(ws) = self.active_workspace_mut() {
+                    let mut tab = TabState::new(id, repo_path.clone());
+                    tab.kind = TabKind::Agent(AgentSession::new(config));
+                    tab.current_dir = current_dir.unwrap_or(repo_path);
+                    ws.tabs.push(tab);
+                    ws.active_tab = ws.tabs.len() - 1;
+                }
+                eprintln!("[debug] spawned agent tab id={}", id);
+                // Surface the agent webview for the brand-new tab. The user
+                // can type prompts directly into it; no hardcoded prompt now.
+                let scroll_task = self.scroll_to_active_tab();
+                return Task::batch([scroll_task, self.show_agent_webview(id)]);
+            }
             Event::ShowQuickCommands => {
                 if !self.quick_commands.is_empty() {
                     self.quick_commands_visible = true;
@@ -4738,10 +5616,13 @@ fi
                 if let Some(qc) = self.quick_commands.get(idx).cloned() {
                     let cmd_bytes = format!("{}\n", qc.command).into_bytes();
                     // Find active bottom terminal, or create one
-                    let has_bottom_terminal = self.active_workspace().map(|ws| {
-                        matches!(ws.active_bottom_tab, BottomPanelTab::Terminal(_))
-                            && !ws.bottom_terminals.is_empty()
-                    }).unwrap_or(false);
+                    let has_bottom_terminal = self
+                        .active_workspace()
+                        .map(|ws| {
+                            matches!(ws.active_bottom_tab, BottomPanelTab::Terminal(_))
+                                && !ws.bottom_terminals.is_empty()
+                        })
+                        .unwrap_or(false);
 
                     if !has_bottom_terminal {
                         // Create a bottom terminal first
@@ -4767,9 +5648,12 @@ fi
                         if let BottomPanelTab::Terminal(bt_idx) = ws.active_bottom_tab {
                             if let Some(bt) = ws.bottom_terminals.get_mut(bt_idx) {
                                 if let Some(term) = &mut bt.terminal {
-                                    term.handle(iced_term::Command::ProxyToBackend(
+                                    Self::handle_terminal_backend_command(
+                                        term,
                                         iced_term::backend::Command::Write(cmd_bytes),
-                                    ));
+                                        "run_quick_command_bottom_terminal",
+                                        true, // user-initiated, always redraw
+                                    );
                                 }
                             }
                         }
@@ -4899,6 +5783,7 @@ fi
                 }
             }
             Event::BottomTerminalEvent(id, iced_term::Event::BackendCall(_, cmd)) => {
+                let focused = self.window_focused;
                 // Bottom terminal received input — it has focus
                 if matches!(&cmd, iced_term::backend::Command::Write(_)) {
                     self.bottom_panel_focused = true;
@@ -4929,10 +5814,34 @@ fi
                     .find(|bt| bt.id == id)
                 {
                     if let Some(term) = &mut bt.terminal {
-                        match term.handle(iced_term::Command::ProxyToBackend(cmd)) {
+                        match Self::handle_terminal_backend_command(
+                            term,
+                            cmd,
+                            "bottom_terminal_event",
+                            focused,
+                        ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 bt.title = Some(title);
+                            }
+                            iced_term::actions::Action::ClipboardStore(text) => {
+                                return iced::clipboard::write(text);
+                            }
+                            iced_term::actions::Action::ClipboardLoad(formatter) => {
+                                let tid = id;
+                                return iced::clipboard::read().map(move |content| {
+                                    let text = content.unwrap_or_default();
+                                    let response = formatter(&text);
+                                    Event::BottomTerminalEvent(
+                                        tid,
+                                        iced_term::Event::BackendCall(
+                                            tid as u64,
+                                            iced_term::backend::Command::Write(
+                                                response.into_bytes(),
+                                            ),
+                                        ),
+                                    )
+                                });
                             }
                             _ => {}
                         }
@@ -4974,7 +5883,7 @@ fi
             Event::FolderSelected(None) => {}
             Event::FileSelect(path, is_staged) => {
                 // Hide WebView when switching to git diff view
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
                 let is_dark_theme = self.theme == AppTheme::Dark;
 
                 if let Some(tab) = self.active_tab_mut() {
@@ -4986,17 +5895,7 @@ fi
                     }
 
                     // Clear file viewer if open
-                    tab.viewing_file_path = None;
-                    tab.file_content.clear();
-                    tab.image_handle = None;
-                    tab.webview_content = None;
-                    tab.file_preview_notice = None;
-                    tab.syntax_highlight_lines = None;
-                    tab.syntax_highlight_notice = None;
-                    tab.syntax_highlight_in_progress = false;
-                    tab.syntax_highlight_requested_lines = 0;
-                    tab.file_load_in_progress = false;
-                    tab.file_load_started_at = None;
+                    tab.close_file_viewer();
                     // Find the index of this file
                     let all_files = tab.all_files();
                     if let Some(idx) = all_files.iter().position(|f| f.path == path) {
@@ -5016,22 +5915,12 @@ fi
             }
             Event::FileSelectByIndex(idx) => {
                 // Hide WebView when switching to git diff view
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
                 let is_dark_theme = self.theme == AppTheme::Dark;
 
                 if let Some(tab) = self.active_tab_mut() {
                     // Clear file viewer if open
-                    tab.viewing_file_path = None;
-                    tab.file_content.clear();
-                    tab.image_handle = None;
-                    tab.webview_content = None;
-                    tab.file_preview_notice = None;
-                    tab.syntax_highlight_lines = None;
-                    tab.syntax_highlight_notice = None;
-                    tab.syntax_highlight_in_progress = false;
-                    tab.syntax_highlight_requested_lines = 0;
-                    tab.file_load_in_progress = false;
-                    tab.file_load_started_at = None;
+                    tab.close_file_viewer();
 
                     let total = tab.total_changes() as i32;
                     if total == 0 {
@@ -5084,6 +5973,14 @@ fi
             Event::KeyPressed(key, modifiers) => {
                 self.current_modifiers = modifiers;
 
+                // Workspace settings: Escape closes
+                if self.workspace_settings_open
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    self.workspace_settings_open = false;
+                    return Task::none();
+                }
+
                 // Tab picker: Escape closes
                 if self.tab_picker_visible && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
@@ -5092,10 +5989,18 @@ fi
                 }
 
                 // Quick commands picker: Escape closes
-                if self.quick_commands_visible && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                if self.quick_commands_visible
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     self.quick_commands_visible = false;
                     return Task::none();
+                }
+
+                // Plans viewer: Escape dismisses
+                if self.webview_kind == WebviewKind::PlansViewer
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    return self.update(Event::ClosePlansViewer);
                 }
 
                 // Help modal: Escape or Cmd+/ closes, all other keys consumed while open
@@ -5132,6 +6037,11 @@ fi
                 // Console shortcuts (Cmd+J, Cmd+Shift+R) - before search shortcuts
                 if modifiers.command() {
                     if let Key::Character(c) = key.as_ref() {
+                        // TRU-29 Step 3 debug entry: Cmd+Shift+G spawns an agent tab
+                        // and submits a hardcoded prompt. Removed before Step 4 ships.
+                        if (c == "g" || c == "G") && modifiers.shift() {
+                            return Task::done(Event::DebugSpawnAgentTab);
+                        }
                         // Cmd+B - Toggle sidebar
                         if c == "b" && !modifiers.shift() {
                             return Task::done(Event::ToggleSidebar);
@@ -5203,7 +6113,7 @@ fi
                     }
 
                     // Handle Escape in file viewer
-                    if tab.viewing_file_path.is_some() {
+                    if tab.viewing_file_path().is_some() {
                         if let Key::Named(key::Named::Escape) = key.as_ref() {
                             return Task::done(Event::CloseFileView);
                         }
@@ -5327,27 +6237,18 @@ fi
                 if self.sidebar_collapsed {
                     self.sidebar_collapsed = false;
                 }
-                // Hide WebView when switching modes
-                webview::set_visible(false);
+                // Hide WebView when switching modes (but keep agent webview alive
+                // — it's the agent tab's primary content, not a modal overlay).
+                self.hide_webview_for_non_agent();
 
                 if let Some(tab) = self.active_tab_mut() {
                     if tab.sidebar_mode != mode {
                         match mode {
                             SidebarMode::Git => {
                                 // Switching to Git mode - clear file viewer and refresh status
-                                tab.selected_capture_idx = None;
-                                tab.agent_conversation = None;
-                                tab.viewing_file_path = None;
-                                tab.file_content.clear();
-                                tab.image_handle = None;
-                                tab.webview_content = None;
-                                tab.file_preview_notice = None;
-                                tab.syntax_highlight_lines = None;
-                                tab.syntax_highlight_notice = None;
-                                tab.syntax_highlight_in_progress = false;
-                                tab.syntax_highlight_requested_lines = 0;
-                                tab.file_load_in_progress = false;
-                                tab.file_load_started_at = None;
+                                tab.agent_sidebar.selected_capture_idx = None;
+                                tab.agent_sidebar.conversation = None;
+                                tab.close_file_viewer();
                                 tab.diff_load_in_progress = false;
                                 tab.diff_load_started_at = None;
                                 tab.last_poll = Instant::now();
@@ -5360,8 +6261,8 @@ fi
                             }
                             SidebarMode::Files => {
                                 // Switching to Files mode - clear git selection
-                                tab.selected_capture_idx = None;
-                                tab.agent_conversation = None;
+                                tab.agent_sidebar.selected_capture_idx = None;
+                                tab.agent_sidebar.conversation = None;
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
                                 tab.diff_load_in_progress = false;
@@ -5379,19 +6280,9 @@ fi
                             }
                             SidebarMode::Claude => {
                                 // Switching to Claude mode - clear file viewer and git selection
-                                tab.selected_capture_idx = None;
-                                tab.agent_conversation = None;
-                                tab.viewing_file_path = None;
-                                tab.file_content.clear();
-                                tab.image_handle = None;
-                                tab.webview_content = None;
-                                tab.file_preview_notice = None;
-                                tab.syntax_highlight_lines = None;
-                                tab.syntax_highlight_notice = None;
-                                tab.syntax_highlight_in_progress = false;
-                                tab.syntax_highlight_requested_lines = 0;
-                                tab.file_load_in_progress = false;
-                                tab.file_load_started_at = None;
+                                tab.agent_sidebar.selected_capture_idx = None;
+                                tab.agent_sidebar.conversation = None;
+                                tab.close_file_viewer();
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
                                 tab.diff_load_in_progress = false;
@@ -5402,17 +6293,7 @@ fi
                             }
                             SidebarMode::Agent => {
                                 // Switching to Agent mode - clear file viewer and git selection
-                                tab.viewing_file_path = None;
-                                tab.file_content.clear();
-                                tab.image_handle = None;
-                                tab.webview_content = None;
-                                tab.file_preview_notice = None;
-                                tab.syntax_highlight_lines = None;
-                                tab.syntax_highlight_notice = None;
-                                tab.syntax_highlight_in_progress = false;
-                                tab.syntax_highlight_requested_lines = 0;
-                                tab.file_load_in_progress = false;
-                                tab.file_load_started_at = None;
+                                tab.close_file_viewer();
                                 tab.selected_file = None;
                                 tab.diff_lines.clear();
                                 tab.diff_load_in_progress = false;
@@ -5422,6 +6303,17 @@ fi
                                 let task = tab.fetch_agent_activity();
                                 tab.sidebar_mode = mode;
                                 return task;
+                            }
+                            SidebarMode::Plans => {
+                                // Switching to Plans mode - clear file viewer and git selection.
+                                // Plan list is read fresh in view_plans_sidebar on each render.
+                                tab.close_file_viewer();
+                                tab.selected_file = None;
+                                tab.diff_lines.clear();
+                                tab.diff_load_in_progress = false;
+                                tab.diff_load_started_at = None;
+                                tab.diff_syntax_lines = None;
+                                tab.diff_syntax_notice = None;
                             }
                         }
                         tab.sidebar_mode = mode;
@@ -5582,25 +6474,32 @@ fi
 
                 // Hide WebView if switching to non-webview file
                 if !has_webview_content && webview::is_active() {
-                    webview::set_visible(false);
+                    self.hide_webview_for_non_agent();
                 }
 
                 if let Some(tab) = self.active_tab_mut() {
                     let requested_signature = file_version_signature(&path);
-                    if tab.last_view_file_request_path.as_ref() == Some(&path)
+                    if tab.last_view_request().map(|(p, _)| p) == Some(path.as_path())
                         && tab
-                            .last_view_file_request_at
-                            .is_some_and(|t| t.elapsed() < Duration::from_millis(350))
+                            .last_view_request()
+                            .map(|(_, t)| t.elapsed() < Duration::from_millis(350))
+                            .unwrap_or(false)
                     {
                         return Task::none();
                     }
-                    if tab.viewing_file_path.as_ref() == Some(&path) && tab.file_load_in_progress {
+                    let same_path = tab.viewing_file_path() == Some(path.as_path());
+                    let load_in_progress = tab
+                        .file_viewer()
+                        .map(|fv| fv.load_in_progress)
+                        .unwrap_or(false);
+                    let loaded_signature = tab.file_viewer().and_then(|fv| fv.loaded_signature);
+                    if same_path && load_in_progress {
                         return Task::none();
                     }
-                    if tab.viewing_file_path.as_ref() == Some(&path)
-                        && !tab.file_load_in_progress
+                    if same_path
+                        && !load_in_progress
                         && requested_signature.is_some()
-                        && tab.loaded_file_signature == requested_signature
+                        && loaded_signature == requested_signature
                     {
                         perf_log!(
                             "file_load skip_unchanged tab={} path={}",
@@ -5617,19 +6516,15 @@ fi
                     tab.diff_load_started_at = None;
                     tab.diff_syntax_lines = None;
                     tab.diff_syntax_notice = None;
-                    tab.viewing_file_path = Some(path.clone());
-                    tab.file_content.clear();
-                    tab.image_handle = None;
-                    tab.webview_content = None;
-                    tab.file_preview_notice = None;
-                    tab.syntax_highlight_lines = None;
-                    tab.syntax_highlight_notice = None;
-                    tab.syntax_highlight_in_progress = false;
-                    tab.syntax_highlight_requested_lines = 0;
-                    tab.file_load_in_progress = true;
-                    tab.file_load_started_at = Some(Instant::now());
-                    tab.last_view_file_request_path = Some(path.clone());
-                    tab.last_view_file_request_at = Some(Instant::now());
+                    {
+                        // Open / replace the file viewer overlay; resets all overlay state.
+                        // No-op on agent tabs (which don't host file viewers in v1).
+                        if let Some(fv) = tab.open_file_viewer(path.clone()) {
+                            fv.load_in_progress = true;
+                            fv.load_started_at = Some(Instant::now());
+                        }
+                    }
+                    tab.set_last_view_request(Some(path.clone()), Some(Instant::now()));
                     request = Some((tab.id, path));
                 }
                 if let Some((tab_id, file_path)) = request {
@@ -5641,34 +6536,30 @@ fi
             }
             Event::CloseFileView => {
                 // Hide WebView
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
 
                 if let Some(tab) = self.active_tab_mut() {
-                    tab.viewing_file_path = None;
-                    tab.file_content.clear();
-                    tab.image_handle = None;
-                    tab.webview_content = None;
-                    tab.file_preview_notice = None;
-                    tab.syntax_highlight_lines = None;
-                    tab.syntax_highlight_notice = None;
-                    tab.syntax_highlight_in_progress = false;
-                    tab.syntax_highlight_requested_lines = 0;
-                    tab.file_load_in_progress = false;
-                    tab.file_load_started_at = None;
+                    tab.close_file_viewer();
                 }
                 self.mark_log_server_dirty();
             }
             Event::CopyFileContent => {
                 if let Some(tab) = self.active_tab() {
-                    if !tab.file_content.is_empty() {
-                        return iced::clipboard::write(tab.file_content.clone());
+                    if let Some(fv) = tab.file_viewer() {
+                        if !fv.file_content.is_empty() {
+                            return iced::clipboard::write(fv.file_content.clone());
+                        }
                     }
                 }
             }
             Event::OpenFileInBrowser => {
                 self.mark_log_server_dirty();
                 if let Some(tab) = self.active_tab() {
-                    if tab.viewing_file_path.is_some() && !tab.file_content.is_empty() {
+                    if tab
+                        .file_viewer()
+                        .map(|fv| !fv.file_content.is_empty())
+                        .unwrap_or(false)
+                    {
                         if let Some(base_url) = self.log_server_state.base_url() {
                             let url = format!("{}/file/{}", base_url, tab.id);
                             let _ = std::process::Command::new("open").arg(&url).spawn();
@@ -5697,10 +6588,12 @@ fi
                             is_dark,
                         );
                     }
-                    if let Some(path) = tab.viewing_file_path.clone() {
+                    if let Some(path) = tab.viewing_file_path().map(|p| p.to_path_buf()) {
                         if !TabState::is_image_file(&path) {
-                            tab.file_load_in_progress = true;
-                            tab.file_load_started_at = Some(Instant::now());
+                            if let Some(fv) = tab.file_viewer_mut() {
+                                fv.load_in_progress = true;
+                                fv.load_started_at = Some(Instant::now());
+                            }
                             return Self::request_file_load(tab.id, path, is_dark);
                         }
                     }
@@ -5728,11 +6621,14 @@ fi
             }
             Event::ClearTerminal => {
                 if let Some(tab) = self.active_tab_mut() {
-                    if let Some(term) = &mut tab.terminal {
+                    if let Some(term) = tab.terminal_mut() {
                         // Send the clear command to the terminal
-                        term.handle(iced_term::Command::ProxyToBackend(
+                        Self::handle_terminal_backend_command(
+                            term,
                             iced_term::backend::Command::Write(b"clear\n".to_vec()),
-                        ));
+                            "clear_terminal",
+                            true, // user-initiated, always redraw
+                        );
                     }
                 }
             }
@@ -5769,15 +6665,18 @@ fi
             }
             Event::SearchExecute => {
                 if let Some(tab) = self.active_tab_mut() {
-                    if let Some(term) = &mut tab.terminal {
-                        let matches = term.search_all(&tab.search.query);
+                    let query = tab.search.query.clone();
+                    let matches = tab.terminal_mut().map(|term| term.search_all(&query));
+                    if let Some(matches) = matches {
                         tab.search.matches = matches;
                         tab.search.current_match = 0;
 
                         // Scroll to first match if found
-                        if let Some(first_match) = tab.search.matches.first() {
-                            let line = first_match.start.line.0;
-                            term.scroll_to_line(line);
+                        let first_line = tab.search.matches.first().map(|m| m.start.line.0);
+                        if let Some(line) = first_line {
+                            if let Some(term) = tab.terminal_mut() {
+                                term.scroll_to_line(line);
+                            }
                         }
                     }
                 }
@@ -5787,9 +6686,9 @@ fi
                     if !tab.search.matches.is_empty() {
                         tab.search.current_match =
                             (tab.search.current_match + 1) % tab.search.matches.len();
-                        if let Some(term) = &mut tab.terminal {
-                            let current = &tab.search.matches[tab.search.current_match];
-                            term.scroll_to_line(current.start.line.0);
+                        let line = tab.search.matches[tab.search.current_match].start.line.0;
+                        if let Some(term) = tab.terminal_mut() {
+                            term.scroll_to_line(line);
                         }
                     }
                 }
@@ -5802,9 +6701,9 @@ fi
                         } else {
                             tab.search.current_match -= 1;
                         }
-                        if let Some(term) = &mut tab.terminal {
-                            let current = &tab.search.matches[tab.search.current_match];
-                            term.scroll_to_line(current.start.line.0);
+                        let line = tab.search.matches[tab.search.current_match].start.line.0;
+                        if let Some(term) = tab.terminal_mut() {
+                            term.scroll_to_line(line);
                         }
                     }
                 }
@@ -5820,7 +6719,7 @@ fi
             Event::OpenMarkdownInBrowser => {
                 // Write HTML to temp file and open in browser
                 if let Some(tab) = self.active_tab() {
-                    let html_to_open = tab.webview_content.clone();
+                    let html_to_open = tab.file_viewer().and_then(|fv| fv.webview_content.clone());
 
                     if html_to_open.is_none() {
                         // TODO: This should be async! Reading files synchronously on main thread
@@ -5831,8 +6730,7 @@ fi
                     if let Some(html) = &html_to_open {
                         let temp_dir = std::env::temp_dir();
                         let file_name = tab
-                            .viewing_file_path
-                            .as_ref()
+                            .viewing_file_path()
                             .and_then(|p| p.file_stem())
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| "preview".to_string());
@@ -5858,7 +6756,7 @@ fi
                                     .spawn();
                             }
                         }
-                    } else if let Some(path) = tab.viewing_file_path.as_ref() {
+                    } else if let Some(path) = tab.viewing_file_path() {
                         #[cfg(target_os = "macos")]
                         {
                             let _ = std::process::Command::new("open").arg(path).spawn();
@@ -5875,6 +6773,24 @@ fi
                                 .spawn();
                         }
                     }
+                }
+            }
+            Event::OpenPlansViewer => {
+                // If already open, treat the shortcut/menu as a toggle and dismiss.
+                if self.webview_kind == WebviewKind::PlansViewer {
+                    webview::set_visible(false);
+                    self.webview_kind = WebviewKind::None;
+                    return Task::none();
+                }
+                return self.open_plans_viewer(None);
+            }
+            Event::OpenPlan(name) => {
+                return self.open_plans_viewer(Some(name));
+            }
+            Event::ClosePlansViewer => {
+                if self.webview_kind == WebviewKind::PlansViewer {
+                    webview::set_visible(false);
+                    self.webview_kind = WebviewKind::None;
                 }
             }
             Event::WindowCloseRequested => {
@@ -5899,6 +6815,52 @@ fi
                         iced::exit()
                     }
                 });
+            }
+            Event::WindowUnfocused => {
+                self.window_focused = false;
+            }
+            Event::WindowFocused => {
+                self.window_focused = true;
+
+                // Sync all terminals that may have been updated while unfocused
+                for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
+                    if let Some(term) = tab.terminal_mut() {
+                        term.sync_and_redraw();
+                    }
+                }
+                for bt in self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.bottom_terminals.iter_mut())
+                {
+                    if let Some(term) = &mut bt.terminal {
+                        term.sync_and_redraw();
+                    }
+                }
+
+                // Detect wake from sleep: if the last heartbeat was long ago,
+                // the system likely slept. Reset git polling and trigger refresh.
+                static LAST_FOCUS: std::sync::Mutex<Option<std::time::Instant>> =
+                    std::sync::Mutex::new(None);
+                let was_sleeping = if let Ok(mut last) = LAST_FOCUS.lock() {
+                    let sleeping = last
+                        .map(|t| t.elapsed() > Duration::from_secs(300))
+                        .unwrap_or(false);
+                    *last = Some(std::time::Instant::now());
+                    sleeping
+                } else {
+                    false
+                };
+
+                if was_sleeping {
+                    freeze_debug!("WAKE RECOVERY: Window focused after sleep, refreshing state");
+                    // Reset git polling for active tab so it refreshes quickly
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+                        tab.git_unchanged_streak = 0;
+                        tab.last_poll = Instant::now() - Duration::from_secs(60);
+                    }
+                }
             }
             Event::WindowResized(width, height) => {
                 self.window_size = (width, height);
@@ -6036,47 +6998,37 @@ fi
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == snapshot.tab_id)
                 {
-                    if tab.viewing_file_path.as_ref() == Some(&snapshot.path) {
+                    if tab.viewing_file_path() == Some(snapshot.path.as_path()) {
                         let loaded_path = snapshot.path.clone();
                         let loaded_signature = snapshot.file_signature;
-                        tab.file_load_in_progress = false;
-                        tab.file_content = snapshot.file_content;
-                        tab.webview_content = snapshot.webview_content;
-                        tab.file_preview_notice = snapshot.file_preview_notice;
-                        tab.syntax_highlight_lines = snapshot.syntax_highlight_lines;
-                        tab.syntax_highlight_notice = snapshot.syntax_highlight_notice;
-                        tab.syntax_highlight_in_progress = false;
-                        tab.syntax_highlight_requested_lines = tab
+                        let tab_id = tab.id;
+                        let fv = tab.file_viewer_mut().expect("path matched just above");
+                        fv.load_in_progress = false;
+                        fv.file_content = snapshot.file_content;
+                        fv.webview_content = snapshot.webview_content;
+                        fv.preview_notice = snapshot.file_preview_notice;
+                        fv.syntax_highlight_lines = snapshot.syntax_highlight_lines;
+                        fv.syntax_highlight_notice = snapshot.syntax_highlight_notice;
+                        fv.syntax_highlight_in_progress = false;
+                        fv.syntax_highlight_requested_lines = fv
                             .syntax_highlight_lines
                             .as_ref()
                             .map(|lines| lines.len())
                             .unwrap_or(0);
-                        tab.loaded_file_signature = loaded_signature;
-                        tab.image_handle =
+                        fv.loaded_signature = loaded_signature;
+                        fv.image_handle =
                             snapshot.image_path.as_ref().map(image::Handle::from_path);
 
                         #[cfg(feature = "excalidraw")]
-                        let is_excalidraw = tab
-                            .viewing_file_path
-                            .as_ref()
-                            .map(|p| excalidraw::is_excalidraw_file(p))
-                            .unwrap_or(false);
+                        let is_excalidraw = excalidraw::is_excalidraw_file(&fv.path);
                         #[cfg(not(feature = "excalidraw"))]
                         let is_excalidraw = false;
 
-                        let is_markdown_webview = tab
-                            .viewing_file_path
-                            .as_ref()
-                            .map(|p| TabState::is_markdown_file(p))
-                            .unwrap_or(false)
-                            && tab.webview_content.is_some();
-                        let is_html_webview = tab
-                            .viewing_file_path
-                            .as_ref()
-                            .map(|p| TabState::is_html_file(p))
-                            .unwrap_or(false);
+                        let is_markdown_webview =
+                            TabState::is_markdown_file(&fv.path) && fv.webview_content.is_some();
+                        let is_html_webview = TabState::is_html_file(&fv.path);
 
-                        if let Some(html) = &tab.webview_content {
+                        if let Some(html) = &fv.webview_content {
                             if is_excalidraw || is_markdown_webview || is_html_webview {
                                 inline_webview_html = Some(html.clone());
                             } else {
@@ -6092,29 +7044,30 @@ fi
                         #[cfg(not(feature = "excalidraw"))]
                         let is_excalidraw_file = false;
 
-                        let is_text_syntax_candidate = tab.webview_content.is_none()
-                            && tab.image_handle.is_none()
-                            && !tab.file_content.is_empty()
+                        let is_text_syntax_candidate = fv.webview_content.is_none()
+                            && fv.image_handle.is_none()
+                            && !fv.file_content.is_empty()
                             && !TabState::is_markdown_file(&loaded_path)
                             && !TabState::is_html_file(&loaded_path)
                             && !is_excalidraw_file;
                         let mut waiting_for_initial_syntax = false;
 
                         if is_text_syntax_candidate {
-                            let total_lines = tab
+                            let total_lines = fv
                                 .file_content
                                 .lines()
                                 .count()
                                 .min(MAX_FILE_VIEW_RENDER_LINES);
                             let requested_lines = FILE_SYNTAX_INITIAL_LINES.min(total_lines);
                             if requested_lines > 0 {
-                                tab.syntax_highlight_in_progress = true;
-                                tab.syntax_highlight_requested_lines = requested_lines;
+                                fv.syntax_highlight_in_progress = true;
+                                fv.syntax_highlight_requested_lines = requested_lines;
                                 waiting_for_initial_syntax = true;
+                                let file_content_clone = fv.file_content.clone();
                                 syntax_request = Some((
-                                    tab.id,
+                                    tab_id,
                                     loaded_path,
-                                    tab.file_content.clone(),
+                                    file_content_clone,
                                     loaded_signature,
                                     requested_lines,
                                 ));
@@ -6122,20 +7075,22 @@ fi
                         }
 
                         if !waiting_for_initial_syntax {
-                            tab.file_load_started_at = None;
+                            if let Some(fv) = tab.file_viewer_mut() {
+                                fv.load_started_at = None;
+                            }
                         }
                     }
                 }
 
                 if hide_webview {
-                    webview::set_visible(false);
+                    self.hide_webview_for_non_agent();
                 }
 
                 // Show inline WebView after mutable borrow is released
                 if let Some(html) = inline_webview_html {
                     let bounds = self.calculate_webview_bounds();
                     self.mark_log_server_dirty();
-                    return Self::show_webview(html, bounds);
+                    return self.show_webview(html, bounds);
                 }
 
                 self.mark_log_server_dirty();
@@ -6160,21 +7115,24 @@ fi
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == tab_id)
                 {
-                    if tab.file_load_in_progress
-                        || tab.syntax_highlight_in_progress
-                        || tab.webview_content.is_some()
-                        || tab.image_handle.is_some()
-                        || tab.file_content.is_empty()
+                    let Some(fv) = tab.file_viewer() else {
+                        return Task::none();
+                    };
+                    if fv.load_in_progress
+                        || fv.syntax_highlight_in_progress
+                        || fv.webview_content.is_some()
+                        || fv.image_handle.is_some()
+                        || fv.file_content.is_empty()
                     {
                         return Task::none();
                     }
 
-                    let current_lines = tab
+                    let current_lines = fv
                         .syntax_highlight_lines
                         .as_ref()
                         .map(|lines| lines.len())
                         .unwrap_or(0);
-                    let total_lines = tab
+                    let total_lines = fv
                         .file_content
                         .lines()
                         .count()
@@ -6190,23 +7148,26 @@ fi
                         .min(total_lines);
 
                     if requested_lines <= current_lines
-                        || requested_lines <= tab.syntax_highlight_requested_lines
+                        || requested_lines <= fv.syntax_highlight_requested_lines
                     {
                         return Task::none();
                     }
 
-                    tab.syntax_highlight_in_progress = true;
-                    tab.syntax_highlight_requested_lines = requested_lines;
-                    let Some(view_path) = tab.viewing_file_path.clone() else {
-                        tab.syntax_highlight_in_progress = false;
-                        return Task::none();
-                    };
+                    let view_path = fv.path.clone();
+                    let file_content = fv.file_content.clone();
+                    let loaded_signature = fv.loaded_signature;
+                    let tab_id = tab.id;
+                    let fv_mut = tab
+                        .file_viewer_mut()
+                        .expect("file_viewer was Some just above");
+                    fv_mut.syntax_highlight_in_progress = true;
+                    fv_mut.syntax_highlight_requested_lines = requested_lines;
                     return Self::request_file_syntax_highlight(
-                        tab.id,
+                        tab_id,
                         view_path,
-                        tab.file_content.clone(),
+                        file_content,
                         is_dark_theme,
-                        tab.loaded_file_signature,
+                        loaded_signature,
                         requested_lines,
                     );
                 }
@@ -6218,21 +7179,23 @@ fi
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == snapshot.tab_id)
                 {
-                    if tab.viewing_file_path.as_ref() == Some(&snapshot.path)
-                        && tab.loaded_file_signature == snapshot.file_signature
-                    {
-                        tab.syntax_highlight_in_progress = false;
-                        tab.file_load_started_at = None;
-                        tab.syntax_highlight_requested_lines =
-                            tab.syntax_highlight_requested_lines.max(
-                                snapshot
-                                    .syntax_highlight_lines
-                                    .as_ref()
-                                    .map(|lines| lines.len())
-                                    .unwrap_or(0),
-                            );
-                        tab.syntax_highlight_lines = snapshot.syntax_highlight_lines;
-                        tab.syntax_highlight_notice = snapshot.syntax_highlight_notice;
+                    if let Some(fv) = tab.file_viewer_mut() {
+                        if fv.path == snapshot.path
+                            && fv.loaded_signature == snapshot.file_signature
+                        {
+                            fv.syntax_highlight_in_progress = false;
+                            fv.load_started_at = None;
+                            fv.syntax_highlight_requested_lines =
+                                fv.syntax_highlight_requested_lines.max(
+                                    snapshot
+                                        .syntax_highlight_lines
+                                        .as_ref()
+                                        .map(|lines| lines.len())
+                                        .unwrap_or(0),
+                                );
+                            fv.syntax_highlight_lines = snapshot.syntax_highlight_lines;
+                            fv.syntax_highlight_notice = snapshot.syntax_highlight_notice;
+                        }
                     }
                 }
             }
@@ -6333,10 +7296,13 @@ fi
                 if !text.is_empty() {
                     // Inject transcribed text into the active tab's terminal
                     if let Some(tab) = self.active_tab_mut() {
-                        if let Some(term) = &mut tab.terminal {
-                            term.handle(iced_term::Command::ProxyToBackend(
+                        if let Some(term) = tab.terminal_mut() {
+                            Self::handle_terminal_backend_command(
+                                term,
                                 iced_term::backend::Command::Write(text.into_bytes()),
-                            ));
+                                "stt_transcript_inject",
+                                true, // user-initiated, always redraw
+                            );
                         }
                     }
                 }
@@ -6361,6 +7327,7 @@ fi
                     // Update active workspace immediately (tab bar + console switch instantly)
                     self.active_workspace_idx = idx;
                     self.mark_workspaces_dirty();
+                    self.sync_plans_dir();
 
                     // Refresh claude config if active tab is in Claude mode
                     if let Some(tab) = self.active_tab_mut() {
@@ -6385,10 +7352,10 @@ fi
                         return Task::batch([
                             slide_task,
                             bar_task,
-                            Self::show_webview(html, bounds),
+                            self.show_webview(html, bounds),
                         ]);
                     }
-                    webview::set_visible(false);
+                    self.hide_webview_for_non_agent();
                     return Task::batch([slide_task, bar_task]);
                 }
             }
@@ -6463,15 +7430,30 @@ fi
                         if nearest != self.active_workspace_idx {
                             self.active_workspace_idx = nearest;
                             self.mark_workspaces_dirty();
-                            webview::set_visible(false);
+                            self.hide_webview_for_non_agent();
                             self.editing_console_command = None;
+                            self.sync_plans_dir();
                         }
                     }
                 }
             }
             Event::WorkspaceClose(idx) => {
-                webview::set_visible(false);
+                self.hide_webview_for_non_agent();
                 if idx < self.workspaces.len() && self.workspaces.len() > 1 {
+                    // Stash the workspace config (env, color, etc.) before removing,
+                    // so it's preserved in workspaces.json for reopening later.
+                    let ws = &self.workspaces[idx];
+                    self.closed_workspace_configs.push(WorkspaceConfig {
+                        name: ws.name.clone(),
+                        abbrev: ws.abbrev.clone(),
+                        dir: ws.dir.to_string_lossy().to_string(),
+                        color: ws.color,
+                        tabs: Vec::new(), // Don't preserve tabs for closed workspaces
+                        run_command: ws.console.run_command.clone(),
+                        bottom_terminals: Vec::new(),
+                        env: ws.env.clone(),
+                        active: false,
+                    });
                     // Kill console process before removing workspace
                     self.workspaces[idx].console.kill_process();
                     self.workspaces.remove(idx);
@@ -6480,6 +7462,7 @@ fi
                     }
                     self.mark_workspaces_dirty();
                     self.mark_log_server_dirty();
+                    self.sync_plans_dir();
 
                     // Snap slide to new active workspace (no animation)
                     let viewport_width = self.content_viewport_width();
@@ -6513,14 +7496,35 @@ fi
                 );
             }
             Event::WorkspaceCreated(Some(path)) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Workspace".to_string());
-                let used_colors: Vec<WorkspaceColor> =
-                    self.workspaces.iter().map(|ws| ws.color).collect();
-                let color = WorkspaceColor::next_available(&used_colors);
+                let dir_str = path.to_string_lossy().to_string();
+
+                // Check if there's a closed workspace config for this directory
+                // and restore its settings (env, color, name, etc.)
+                let saved = self
+                    .closed_workspace_configs
+                    .iter()
+                    .position(|c| c.dir == dir_str)
+                    .map(|i| self.closed_workspace_configs.remove(i));
+
+                let name = saved.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| {
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Workspace".to_string())
+                });
+                let color = saved.as_ref().map(|c| c.color).unwrap_or_else(|| {
+                    let used_colors: Vec<WorkspaceColor> =
+                        self.workspaces.iter().map(|ws| ws.color).collect();
+                    WorkspaceColor::next_available(&used_colors)
+                });
                 let mut workspace = Workspace::new(name, path.clone(), color);
+                if let Some(ref cfg) = saved {
+                    workspace.abbrev = cfg.abbrev.clone();
+                    workspace.env = cfg.env.clone();
+                    if let Some(cmd) = &cfg.run_command {
+                        workspace.console.run_command = Some(cmd.clone());
+                        workspace.console.status = ConsoleStatus::Stopped;
+                    }
+                }
                 self.add_tab_to_workspace_with_command(
                     &mut workspace,
                     path,
@@ -6531,6 +7535,7 @@ fi
                 self.active_workspace_idx = self.workspaces.len() - 1;
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
+                self.sync_plans_dir();
 
                 // Snap slide state to new workspace position
                 // (no scroll_to needed — view renders active workspace directly when not animating)
@@ -6552,6 +7557,63 @@ fi
                 }
             }
             Event::WorkspaceCreated(None) => {}
+            Event::WorkspaceSettingsOpen(idx) => {
+                self.workspace_settings_open = true;
+                self.workspace_settings_idx = idx;
+                self.workspace_settings_new_key = String::new();
+                self.workspace_settings_new_value = String::new();
+            }
+            Event::WorkspaceSettingsClose => {
+                self.workspace_settings_open = false;
+            }
+            Event::WorkspaceSettingsNewKeyChanged(s) => {
+                self.workspace_settings_new_key = s;
+            }
+            Event::WorkspaceSettingsNewValueChanged(s) => {
+                self.workspace_settings_new_value = s;
+            }
+            Event::WorkspaceSettingsEnvAdd => {
+                let key = self.workspace_settings_new_key.trim().to_string();
+                let val = self.workspace_settings_new_value.trim().to_string();
+                if !key.is_empty() {
+                    let idx = self.workspace_settings_idx;
+                    if let Some(ws) = self.workspaces.get_mut(idx) {
+                        ws.env.insert(key, val);
+                    }
+                    self.workspace_settings_new_key = String::new();
+                    self.workspace_settings_new_value = String::new();
+                    self.workspaces_dirty = true;
+                    self.next_workspace_save_at = Some(Instant::now());
+                }
+            }
+            Event::WorkspaceSettingsEnvRemove(key) => {
+                let idx = self.workspace_settings_idx;
+                if let Some(ws) = self.workspaces.get_mut(idx) {
+                    ws.env.remove(&key);
+                }
+                self.workspaces_dirty = true;
+                self.next_workspace_save_at = Some(Instant::now());
+            }
+            Event::WorkspaceSettingsColorChange(color) => {
+                let idx = self.workspace_settings_idx;
+                if let Some(ws) = self.workspaces.get_mut(idx) {
+                    ws.color = color;
+                }
+                self.workspaces_dirty = true;
+                self.next_workspace_save_at = Some(Instant::now());
+            }
+            Event::WorkspaceSettingsApplyProfile(profile_name) => {
+                let idx = self.workspace_settings_idx;
+                if let Some(ws) = self.workspaces.get_mut(idx) {
+                    if let Some(profiles) = Self::load_profiles() {
+                        if let Some(profile) = profiles.get(&profile_name) {
+                            ws.env = profile.clone();
+                        }
+                    }
+                }
+                self.workspaces_dirty = true;
+                self.next_workspace_save_at = Some(Instant::now());
+            }
             // Console panel events
             Event::ConsoleToggle => {
                 self.console_expanded = !self.console_expanded;
@@ -6574,7 +7636,9 @@ fi
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
                     ws.console.detected_url = None;
-                    ws.console.spawn_process(&dir);
+                    let env: Vec<(String, String)> =
+                        ws.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    ws.console.spawn_process_with_env(&dir, &env);
                 }
                 self.console_expanded = true;
             }
@@ -6592,7 +7656,9 @@ fi
                         .active_tab()
                         .map(|t| t.current_dir.clone())
                         .unwrap_or_else(|| ws.dir.clone());
-                    ws.console.spawn_process(&dir);
+                    let env: Vec<(String, String)> =
+                        ws.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    ws.console.spawn_process_with_env(&dir, &env);
                 }
                 self.console_expanded = true;
             }
@@ -6710,6 +7776,7 @@ fi
                                     self.slide_start_time = Some(Instant::now());
                                     self.slide_animating = true;
                                     self.active_workspace_idx = ws_idx;
+                                    self.sync_plans_dir();
                                 }
                                 self.workspaces[ws_idx].active_tab = tab_idx;
                                 self.mark_workspaces_dirty();
@@ -6730,6 +7797,26 @@ fi
             }
         }
         Task::none()
+    }
+
+    /// Hide the singleton webview unless it's the agent webview for the
+    /// currently active tab — in which case it's the tab's primary content
+    /// and should stay visible. Replaces unconditional `webview::set_visible(false)`
+    /// calls scattered across handlers that predate the agent tab kind.
+    fn hide_webview_for_non_agent(&mut self) {
+        let active_is_agent_tab_with_active_webview = self
+            .active_tab()
+            .map(|t| matches!(t.kind, TabKind::Agent(_)))
+            .unwrap_or(false)
+            && self.webview_kind == WebviewKind::Agent;
+        if !active_is_agent_tab_with_active_webview {
+            webview::set_visible(false);
+            // Clear kind for any non-agent surface so the plans-viewer header
+            // (and any future kind-driven chrome) goes away with the webview.
+            if self.webview_kind != WebviewKind::Agent {
+                self.webview_kind = WebviewKind::None;
+            }
+        }
     }
 
     /// Calculate WebView bounds based on current layout
@@ -6759,9 +7846,11 @@ fi
         (x, y, width, height)
     }
 
-    /// Create or update the embedded WebView with HTML content.
-    /// Uses iced::window::run to get the window handle for wry.
-    fn show_webview(html: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
+    /// Create or update the embedded WebView with static HTML content
+    /// (markdown, excalidraw, html file viewer). If the webview is currently
+    /// hosting agent chat, we destroy + recreate it (the chat IPC handler
+    /// can't be swapped post-construction).
+    fn show_webview(&mut self, html: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
         perf_log!(
             "webview mode={} html_bytes={} bounds=({}, {}, {}, {})",
             if webview::is_active() {
@@ -6775,15 +7864,24 @@ fi
             bounds.2,
             bounds.3
         );
+        // If the active webview is the agent chat, tear it down so we don't
+        // try to render markdown into the chat scaffold (or vice-versa).
+        if self.webview_kind == WebviewKind::Agent {
+            webview::destroy();
+            self.webview_kind = WebviewKind::None;
+            self.webview_agent_tab_id = None;
+        }
         // Reuse the existing WebView when possible to avoid expensive recreation churn.
         if webview::is_active() {
             webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
             webview::update_content(&html);
             webview::set_visible(true);
+            self.webview_kind = WebviewKind::Static;
             return Task::none();
         }
 
         webview::set_pending_content(html, bounds);
+        self.webview_kind = WebviewKind::Static;
         iced::window::oldest().then(|opt_id| {
             if let Some(id) = opt_id {
                 iced::window::run(id, |window| {
@@ -6798,38 +7896,253 @@ fi
         })
     }
 
+    /// Build the plans-viewer URL and navigate the in-app webview to it.
+    /// If `plan` is `Some`, the viewer boots straight to that plan via
+    /// `?plan=<name>`. Returns `Task::none()` if the log server isn't up
+    /// (with a hint logged to stderr).
+    fn open_plans_viewer(&mut self, plan: Option<String>) -> Task<Event> {
+        let Some(base_url) = self.log_server_state.base_url() else {
+            eprintln!(
+                "[plans-viewer] cannot open: log server not running (View → Toggle Local Log Server)"
+            );
+            return Task::none();
+        };
+        let theme_str = match self.theme {
+            AppTheme::Dark => "dark",
+            AppTheme::Light => "light",
+        };
+        // nav=hide tells the viewer to drop its built-in plan list (gitterm's
+        // sidebar already shows plans). TOC stays — it's per-document.
+        let url = match plan {
+            Some(name) => format!(
+                "{}/plans/viewer?theme={}&nav=hide&plan={}",
+                base_url,
+                theme_str,
+                urlencoding_simple(&name)
+            ),
+            None => format!("{}/plans/viewer?theme={}&nav=hide", base_url, theme_str),
+        };
+        let bounds = self.calculate_webview_bounds();
+        self.show_webview_url(url, bounds)
+    }
+
+    /// Create or update the embedded WebView to display a URL (used by the
+    /// plans viewer, which loads `/plans/viewer` from the local warp server).
+    /// Mirrors `show_webview` but stages a URL instead of HTML.
+    fn show_webview_url(&mut self, url: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
+        perf_log!(
+            "webview_url mode={} url={} bounds=({}, {}, {}, {})",
+            if webview::is_active() {
+                "reuse"
+            } else {
+                "create"
+            },
+            url,
+            bounds.0,
+            bounds.1,
+            bounds.2,
+            bounds.3
+        );
+        if self.webview_kind == WebviewKind::Agent {
+            webview::destroy();
+            self.webview_kind = WebviewKind::None;
+            self.webview_agent_tab_id = None;
+        }
+        if webview::is_active() {
+            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+            webview::navigate_to_url(&url);
+            webview::set_visible(true);
+            self.webview_kind = WebviewKind::PlansViewer;
+            return Task::none();
+        }
+
+        webview::set_pending_url(url, bounds);
+        self.webview_kind = WebviewKind::PlansViewer;
+        iced::window::oldest().then(|opt_id| {
+            if let Some(id) = opt_id {
+                iced::window::run(id, |window| {
+                    if let Err(e) = webview::try_create_with_window(window) {
+                        perf_log!("webview_create_failed: {e}");
+                    }
+                })
+                .discard()
+            } else {
+                Task::none()
+            }
+        })
+    }
+
+    /// Show the agent chat webview for `tab_id`. If the webview is currently
+    /// hosting static content (markdown / excalidraw), destroy + recreate it
+    /// with the chat HTML and IPC handler. If it's already an agent webview
+    /// for a different tab, just clear and replay this tab's buffer.
+    fn show_agent_webview(&mut self, tab_id: usize) -> Task<Event> {
+        let bounds = self.calculate_webview_bounds();
+
+        // Find the conversation buffer to replay.
+        let conversation: Vec<tab::AgentEvent> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.agent_session())
+            .map(|s| s.conversation.clone())
+            .unwrap_or_default();
+
+        // Reconcile bookkeeping with the actual webview state. If we think we
+        // have an Agent webview but `is_active()` says no, the previous
+        // construction must have failed silently (or been destroyed by a
+        // sibling code path). Fall through to the recreate branch below.
+        let webview_alive = webview::is_active();
+        let same_tab_fast_path = self.webview_kind == WebviewKind::Agent
+            && self.webview_agent_tab_id == Some(tab_id)
+            && webview_alive;
+        let other_agent_tab_path = self.webview_kind == WebviewKind::Agent
+            && self.webview_agent_tab_id != Some(tab_id)
+            && webview_alive;
+
+        eprintln!(
+            "[agent-webview] show tab={} kind={:?} alive={} same={} other={} bounds=({},{},{},{}) buf_len={}",
+            tab_id,
+            self.webview_kind,
+            webview_alive,
+            same_tab_fast_path,
+            other_agent_tab_path,
+            bounds.0,
+            bounds.1,
+            bounds.2,
+            bounds.3,
+            conversation.len()
+        );
+
+        if same_tab_fast_path {
+            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+            webview::set_visible(true);
+            return Task::none();
+        }
+
+        if other_agent_tab_path {
+            // Different agent tab on the live agent webview — reset surface
+            // and replay this tab's events. No recreate needed (the IPC
+            // handler routes by tabId, set per activation).
+            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+            webview::set_visible(true);
+            reset_agent_webview();
+            set_agent_webview_tab_id(tab_id);
+            for ev in &conversation {
+                push_agent_event_to_webview(ev);
+            }
+            self.webview_agent_tab_id = Some(tab_id);
+            return Task::none();
+        }
+
+        // No agent webview alive — destroy whatever's there and recreate.
+        if webview_alive {
+            eprintln!(
+                "[agent-webview] destroying existing kind={:?}",
+                self.webview_kind
+            );
+            webview::destroy();
+        }
+        webview::set_pending_content_with_ipc(
+            AGENT_CHAT_HTML.to_string(),
+            bounds,
+            Some(agent_ipc_handler()),
+        );
+        self.webview_kind = WebviewKind::Agent;
+        self.webview_agent_tab_id = Some(tab_id);
+
+        // After construction, set the tab id on the JS side and replay buffered
+        // events. Both happen via evaluate_script after `try_create_with_window`
+        // runs. Using Arc because Task::then's closure is FnMut, so the Vec
+        // can't be moved out of the captured environment on each call.
+        let conversation = std::sync::Arc::new(conversation);
+        iced::window::oldest().then(move |opt_id| {
+            let conversation = std::sync::Arc::clone(&conversation);
+            if let Some(id) = opt_id {
+                iced::window::run(id, move |window| {
+                    eprintln!("[agent-webview] try_create_with_window for tab={}", tab_id);
+                    if let Err(e) = webview::try_create_with_window(window) {
+                        eprintln!("[agent-webview] create FAILED for tab={}: {}", tab_id, e);
+                        return;
+                    }
+                    eprintln!(
+                        "[agent-webview] create OK for tab={}, replaying {} events",
+                        tab_id,
+                        conversation.len()
+                    );
+                    set_agent_webview_tab_id(tab_id);
+                    for ev in conversation.iter() {
+                        push_agent_event_to_webview(ev);
+                    }
+                })
+                .discard()
+            } else {
+                eprintln!("[agent-webview] no window available; skipping create");
+                Task::none()
+            }
+        })
+    }
+
     fn recreate_terminals(&mut self) {
+        let started = Instant::now();
         // Pre-compute settings params to avoid borrow conflict with iter_mut
         let scrollback = self.scrollback_lines;
         let theme = self.theme;
         let font_size = self.terminal_font_size;
+        let mut recreated_main = 0usize;
+        let mut recreated_bottom = 0usize;
 
         for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
-            let settings =
-                Self::build_terminal_settings(&tab.repo_path, None, scrollback, &theme, font_size, &[]);
+            let settings = Self::build_terminal_settings(
+                &tab.repo_path,
+                None,
+                scrollback,
+                &theme,
+                font_size,
+                &[],
+            );
             if let Ok(mut terminal) = iced_term::Terminal::new(tab.id as u64, settings) {
                 terminal.handle(iced_term::Command::AddBindings(
                     Self::standard_noop_bindings(),
                 ));
-                tab.terminal = Some(terminal);
+                tab.set_terminal(terminal);
                 tab.created_at = Instant::now();
+                recreated_main += 1;
             }
         }
 
         // Recreate bottom panel terminals
         for ws in self.workspaces.iter_mut() {
             for bt in ws.bottom_terminals.iter_mut() {
-                let settings =
-                    Self::build_terminal_settings(&bt.cwd, None, scrollback, &theme, font_size, &[]);
+                let settings = Self::build_terminal_settings(
+                    &bt.cwd,
+                    None,
+                    scrollback,
+                    &theme,
+                    font_size,
+                    &[],
+                );
                 bt.terminal = iced_term::Terminal::new(bt.id as u64, settings)
                     .ok()
                     .map(|mut t| {
                         t.handle(iced_term::Command::AddBindings(
                             Self::standard_noop_bindings(),
                         ));
+                        recreated_bottom += 1;
                         t
                     });
             }
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(25) {
+            freeze_debug!(
+                "recreate_terminals took {}ms (main={}, bottom={})",
+                elapsed.as_millis(),
+                recreated_main,
+                recreated_bottom
+            );
         }
     }
 
@@ -6845,6 +8158,9 @@ fi
             .width(Length::Fill)
             .height(Length::Fill);
         main_col = main_col.push(tab_bar);
+        if self.webview_kind == WebviewKind::PlansViewer {
+            main_col = main_col.push(self.view_plans_viewer_header());
+        }
         main_col = main_col.push(content);
 
         // Console divider (only when expanded)
@@ -6888,6 +8204,13 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        } else if self.workspace_settings_open {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_workspace_settings_modal())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else if self.tab_picker_visible {
             Stack::new()
                 .push(main_view)
@@ -6900,6 +8223,38 @@ fi
         }
     }
 
+    /// Header strip shown above the embedded webview while the plans viewer
+    /// is active. Mirrors the file-viewer header so the existing 40px
+    /// reservation in `calculate_webview_bounds` lines up.
+    fn view_plans_viewer_header(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let header_bg = theme.bg_overlay();
+        let ghost = self.ghost_button_style();
+        let header = row![
+            text("Plans Viewer").size(font).color(theme.text_primary()),
+            iced::widget::Space::new().width(Length::Fill),
+            text("Esc: close")
+                .size(font_small)
+                .color(theme.text_secondary()),
+            iced::widget::Space::new().width(Length::Fixed(8.0)),
+            button(text("Back to Terminal").size(font))
+                .style(ghost)
+                .padding([4, 12])
+                .on_press(Event::ClosePlansViewer),
+        ]
+        .padding(8)
+        .spacing(8);
+        container(header)
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(header_bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
     fn view_tab_picker(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let bg = theme.bg_surface();
@@ -6909,49 +8264,48 @@ fi
         let hover_bg = theme.surface0();
         let mono = iced::Font::with_name("Menlo");
 
-        let picker_row =
-            |label: String,
-             desc: String,
-             icon: String,
-             accent: iced::Color,
-             event: Event|
-             -> Element<'_, Event, Theme, iced::Renderer> {
-                let hover = hover_bg;
-                button(
-                    row![
-                        text(icon)
-                            .size(14)
-                            .color(accent)
-                            .font(mono)
-                            .width(Length::Fixed(24.0)),
-                        column![
-                            text(label).size(13).color(text_primary),
-                            text(desc).size(11).color(text_secondary),
-                        ]
-                        .spacing(1)
+        let picker_row = |label: String,
+                          desc: String,
+                          icon: String,
+                          accent: iced::Color,
+                          event: Event|
+         -> Element<'_, Event, Theme, iced::Renderer> {
+            let hover = hover_bg;
+            button(
+                row![
+                    text(icon)
+                        .size(14)
+                        .color(accent)
+                        .font(mono)
+                        .width(Length::Fixed(24.0)),
+                    column![
+                        text(label).size(13).color(text_primary),
+                        text(desc).size(11).color(text_secondary),
                     ]
-                    .spacing(8)
-                    .align_y(iced::Alignment::Center)
-                    .padding([6, 10]),
-                )
-                .style(move |_theme, status| {
-                    let bg_color = if matches!(status, button::Status::Hovered) {
-                        Some(hover.into())
-                    } else {
-                        None
-                    };
-                    button::Style {
-                        background: bg_color,
-                        text_color: text_primary,
-                        border: iced::Border::default(),
-                        ..Default::default()
-                    }
-                })
-                .padding(0)
-                .width(Length::Fill)
-                .on_press(event)
-                .into()
-            };
+                    .spacing(1)
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .padding([6, 10]),
+            )
+            .style(move |_theme, status| {
+                let bg_color = if matches!(status, button::Status::Hovered) {
+                    Some(hover.into())
+                } else {
+                    None
+                };
+                button::Style {
+                    background: bg_color,
+                    text_color: text_primary,
+                    border: iced::Border::default(),
+                    ..Default::default()
+                }
+            })
+            .padding(0)
+            .width(Length::Fill)
+            .on_press(event)
+            .into()
+        };
 
         let mut items = Column::new().spacing(0).width(Length::Fixed(240.0));
         for (idx, preset) in self.agent_presets.iter().enumerate() {
@@ -6989,21 +8343,21 @@ fi
         ));
 
         let picker_menu = container(items)
-        .style(move |_| container::Style {
-            background: Some(bg.into()),
-            border: iced::Border {
-                color: border_color,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            shadow: iced::Shadow {
-                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3),
-                offset: iced::Vector::new(0.0, 2.0),
-                blur_radius: 8.0,
-            },
-            ..Default::default()
-        })
-        .padding(4);
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3),
+                    offset: iced::Vector::new(0.0, 2.0),
+                    blur_radius: 8.0,
+                },
+                ..Default::default()
+            })
+            .padding(4);
 
         // Click-away backdrop to dismiss
         let backdrop = iced::widget::mouse_area(
@@ -7171,6 +8525,308 @@ fi
         .into()
     }
 
+    fn view_workspace_settings_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let bg_surface = theme.bg_surface();
+        let bg_base = theme.bg_base();
+        let border_color = theme.border();
+        let bg_crust = theme.bg_crust();
+        let accent = theme.accent();
+        let danger = theme.danger();
+        let mono = iced::Font::with_name("Menlo");
+
+        let idx = self.workspace_settings_idx;
+        let ws = match self.workspaces.get(idx) {
+            Some(w) => w,
+            None => {
+                return container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+            }
+        };
+
+        // --- Title ---
+        let title = text(format!("Workspace: {}", ws.name))
+            .size(16)
+            .color(text_primary);
+
+        // --- Color swatches ---
+        let mut color_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        color_row = color_row.push(text("Color:").size(12).color(text_secondary).font(mono));
+        for c in WorkspaceColor::ALL {
+            let swatch_color = c.color(theme);
+            let is_selected = ws.color == c;
+            let border_width = if is_selected { 2.0 } else { 0.0 };
+            let border_c = if is_selected {
+                accent
+            } else {
+                iced::Color::TRANSPARENT
+            };
+            color_row = color_row.push(
+                button(iced::widget::Space::new())
+                    .width(Length::Fixed(18.0))
+                    .height(Length::Fixed(18.0))
+                    .style(move |_, _| button::Style {
+                        background: Some(swatch_color.into()),
+                        border: iced::Border {
+                            color: border_c,
+                            width: border_width,
+                            radius: 9.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .on_press(Event::WorkspaceSettingsColorChange(c)),
+            );
+        }
+
+        // --- Profile selector ---
+        let profiles = Self::load_profiles();
+        let mut profile_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        profile_row = profile_row.push(text("Profile:").size(12).color(text_secondary).font(mono));
+
+        if let Some(ref profiles) = profiles {
+            // Detect which profile is currently active (all keys match)
+            let current_profile = profiles.iter().find_map(|(name, env)| {
+                if !env.is_empty() && env.iter().all(|(k, v)| ws.env.get(k) == Some(v)) {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            });
+
+            let mut profile_names: Vec<&String> = profiles.keys().collect();
+            profile_names.sort();
+
+            for name in profile_names {
+                let is_active = current_profile == Some(name.as_str());
+                let name_label = name.clone();
+                let name_event = name.clone();
+                let btn_accent = accent;
+                let btn_border = if is_active { accent } else { border_color };
+                let btn_bg = if is_active {
+                    accent
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                let btn_text_color = if is_active { bg_base } else { text_primary };
+
+                profile_row = profile_row.push(
+                    button(text(name_label).size(11).color(btn_text_color).font(mono))
+                        .style(move |_, status| button::Style {
+                            background: Some(
+                                if is_active {
+                                    btn_bg
+                                } else if matches!(status, button::Status::Hovered) {
+                                    btn_accent
+                                } else {
+                                    btn_bg
+                                }
+                                .into(),
+                            ),
+                            text_color: if !is_active && matches!(status, button::Status::Hovered) {
+                                bg_base
+                            } else {
+                                btn_text_color
+                            },
+                            border: iced::Border {
+                                color: btn_border,
+                                width: 1.0,
+                                radius: 3.0.into(),
+                            },
+                            ..Default::default()
+                        })
+                        .padding([3, 10])
+                        .on_press(Event::WorkspaceSettingsApplyProfile(name_event)),
+                );
+            }
+        } else {
+            profile_row = profile_row.push(
+                text("No profiles.json found")
+                    .size(11)
+                    .color(text_muted)
+                    .font(mono),
+            );
+        }
+
+        // --- Env vars table ---
+        let section_label = text("Environment Variables")
+            .size(12)
+            .color(accent)
+            .font(mono);
+
+        let mut env_col = Column::new().spacing(4);
+
+        // Header row
+        env_col = env_col.push(
+            row![
+                container(text("KEY").size(11).color(text_muted).font(mono))
+                    .width(Length::Fixed(180.0)),
+                text("VALUE").size(11).color(text_muted).font(mono),
+            ]
+            .spacing(8),
+        );
+
+        // Existing entries (sorted for stable display)
+        let mut env_entries: Vec<(&String, &String)> = ws.env.iter().collect();
+        env_entries.sort_by_key(|(k, _)| k.as_str());
+
+        for (key, val) in env_entries {
+            let k = key.clone();
+            let remove_btn = button(text("✕").size(10).color(danger).font(mono))
+                .style(move |_, _| button::Style {
+                    background: Some(iced::Color::TRANSPARENT.into()),
+                    ..Default::default()
+                })
+                .padding([1, 4])
+                .on_press(Event::WorkspaceSettingsEnvRemove(k));
+
+            env_col = env_col.push(
+                row![
+                    container(text(key.as_str()).size(12).color(text_primary).font(mono))
+                        .width(Length::Fixed(180.0)),
+                    text(val.as_str()).size(12).color(text_secondary).font(mono),
+                    iced::widget::Space::new().width(Length::Fill),
+                    remove_btn,
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+
+        // Add new row
+        let input_style = move |_theme: &Theme, _status: text_input::Status| text_input::Style {
+            background: bg_base.into(),
+            border: iced::Border {
+                width: 1.0,
+                color: border_color,
+                radius: 3.0.into(),
+            },
+            icon: iced::Color::TRANSPARENT,
+            placeholder: theme.overlay0(),
+            value: text_primary,
+            selection: accent,
+        };
+
+        let key_input = text_input("KEY", &self.workspace_settings_new_key)
+            .on_input(Event::WorkspaceSettingsNewKeyChanged)
+            .on_submit(Event::WorkspaceSettingsEnvAdd)
+            .size(12)
+            .width(Length::Fixed(174.0))
+            .padding([4, 6])
+            .style(input_style);
+
+        let val_input = text_input("VALUE", &self.workspace_settings_new_value)
+            .on_input(Event::WorkspaceSettingsNewValueChanged)
+            .on_submit(Event::WorkspaceSettingsEnvAdd)
+            .size(12)
+            .width(Length::Fixed(200.0))
+            .padding([4, 6])
+            .style(input_style);
+
+        let add_btn = button(text("Add").size(12).color(accent).font(mono))
+            .style(move |_, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        theme.surface0()
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    color: accent,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            })
+            .padding([4, 10])
+            .on_press(Event::WorkspaceSettingsEnvAdd);
+
+        env_col = env_col.push(
+            row![key_input, val_input, add_btn]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+        );
+
+        // --- Close button ---
+        let close_btn = button(text("Close").size(12).color(text_secondary).font(mono))
+            .style(move |_, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        bg_surface
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            })
+            .padding([4, 14])
+            .on_press(Event::WorkspaceSettingsClose);
+
+        let note = text("Changes apply to new terminal sessions")
+            .size(11)
+            .color(text_muted);
+
+        // --- Compose card ---
+        let card_content = column![
+            title,
+            container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
+            color_row,
+            container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
+            profile_row,
+            container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
+            section_label,
+            container(iced::widget::Space::new()).height(Length::Fixed(6.0)),
+            scrollable(env_col).height(Length::Fixed(200.0)),
+            container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
+            row![
+                note,
+                iced::widget::Space::new().width(Length::Fill),
+                close_btn
+            ]
+            .align_y(iced::Alignment::Center),
+        ]
+        .padding([24, 28])
+        .spacing(0);
+
+        let card = container(card_content)
+            .max_width(560)
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+
+        let backdrop_color = iced::Color { a: 0.8, ..bg_crust };
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop_color.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
     fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mut bar_row = Row::new().spacing(0).align_y(iced::Alignment::Center);
@@ -7224,6 +8880,31 @@ fi
                 .font(iced::Font::with_name("Menlo"));
 
             let mut btn_content = row![dot, label].spacing(6).align_y(iced::Alignment::Center);
+
+            // Gear icon button for active workspace settings
+            if is_active {
+                let gear_color = theme.overlay0();
+                let gear_hover = theme.text_secondary();
+                let gear_btn = button(
+                    text("⚙")
+                        .size(10)
+                        .color(gear_color)
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .style(move |_theme, status| button::Style {
+                    background: Some(iced::Color::TRANSPARENT.into()),
+                    text_color: if matches!(status, button::Status::Hovered) {
+                        gear_hover
+                    } else {
+                        gear_color
+                    },
+                    border: iced::Border::default(),
+                    ..Default::default()
+                })
+                .padding([0, 4])
+                .on_press(Event::WorkspaceSettingsOpen(idx));
+                btn_content = btn_content.push(gear_btn);
+            }
 
             // Attention/error badge
             if has_error {
@@ -7573,8 +9254,7 @@ fi
 
             // Determine if this is a Claude Code tab
             let is_claude = tab
-                .terminal_title
-                .as_ref()
+                .terminal_title()
                 .map(|t| t.to_lowercase().contains("claude"))
                 .unwrap_or(false);
 
@@ -7595,13 +9275,12 @@ fi
             // Tab label - strip leading "*" when attention (redundant with visual indicator),
             // shorten path-like titles to last component, truncate at 20 chars
             let base_title = tab
-                .terminal_title
-                .as_ref()
+                .terminal_title()
                 .map(|t| {
                     let display = if has_attention {
                         t.trim_start_matches('*').trim_start()
                     } else {
-                        t.as_str()
+                        t
                     };
                     // Path-like titles (e.g. from Codex) — extract last component
                     let display = if display.starts_with('/') || display.starts_with('~') {
@@ -7909,9 +9588,19 @@ fi
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         if let Some(tab) = ws.active_tab() {
-            let main_panel = if tab.selected_capture_idx.is_some() && tab.sidebar_mode == SidebarMode::Agent {
-                freeze_time!("view_agent_conversation", { self.view_agent_conversation(tab) })
-            } else if tab.viewing_file_path.is_some() {
+            let main_panel = if matches!(tab.kind, TabKind::Agent(_)) {
+                // Agent tabs render the chat UI in the wry webview which is
+                // positioned by `calculate_webview_bounds` and managed via
+                // `show_agent_webview`. The Iced view here is just an empty
+                // background that lets the webview occupy the same area.
+                freeze_time!("view_agent_tab", { self.view_agent_tab(tab) })
+            } else if tab.agent_sidebar.selected_capture_idx.is_some()
+                && tab.sidebar_mode == SidebarMode::Agent
+            {
+                freeze_time!("view_agent_conversation", {
+                    self.view_agent_conversation(tab)
+                })
+            } else if tab.viewing_file_path().is_some() {
                 freeze_time!("view_file_content", { self.view_file_content(tab) })
             } else if tab.selected_file.is_some() {
                 freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
@@ -8079,8 +9768,15 @@ fi
         let mode_content: Element<'_, Event, Theme, iced::Renderer> = match tab.sidebar_mode {
             SidebarMode::Git => freeze_time!("view_git_list", { self.view_git_list(tab) }),
             SidebarMode::Files => freeze_time!("view_file_tree", { self.view_file_tree(tab) }),
-            SidebarMode::Claude => freeze_time!("view_claude_sidebar", { self.view_claude_sidebar(tab) }),
-            SidebarMode::Agent => freeze_time!("view_agent_sidebar", { self.view_agent_sidebar(tab) }),
+            SidebarMode::Claude => {
+                freeze_time!("view_claude_sidebar", { self.view_claude_sidebar(tab) })
+            }
+            SidebarMode::Agent => {
+                freeze_time!("view_agent_sidebar", { self.view_agent_sidebar(tab) })
+            }
+            SidebarMode::Plans => {
+                freeze_time!("view_plans_sidebar", { self.view_plans_sidebar() })
+            }
         };
 
         content = content.push(mode_content);
@@ -8326,14 +10022,14 @@ fi
             Event::SetSidebarMode(SidebarMode::Files),
         );
 
-        // Claude tab
-        let claude_text_color = if claude_active {
+        // Agent tab (was "Claude" — same SidebarMode::Claude variant, shows skills/plugins/hooks)
+        let agent_text_color = if claude_active {
             theme.text_primary()
         } else {
             theme.overlay1()
         };
-        let claude_tab = self.view_sidebar_tab(
-            text("Claude").size(font).color(claude_text_color).into(),
+        let agent_tab = self.view_sidebar_tab(
+            text("Agent").size(font).color(agent_text_color).into(),
             claude_active,
             Event::SetSidebarMode(SidebarMode::Claude),
         );
@@ -8353,26 +10049,27 @@ fi
         .padding([4, 4])
         .on_press(Event::ToggleSidebar);
 
-        // Agent tab
-        let agent_active = tab.sidebar_mode == SidebarMode::Agent;
-        let agent_text_color = if agent_active {
+        // Plans tab (replaces the legacy "Agent" sidebar tab)
+        let plans_active = tab.sidebar_mode == SidebarMode::Plans;
+        let plans_text_color = if plans_active {
             theme.text_primary()
         } else {
             theme.overlay1()
         };
-        let agent_tab = self.view_sidebar_tab(
-            text("Agent").size(font).color(agent_text_color).into(),
-            agent_active,
-            Event::SetSidebarMode(SidebarMode::Agent),
+        let plans_tab = self.view_sidebar_tab(
+            text("Plans").size(font).color(plans_text_color).into(),
+            plans_active,
+            Event::SetSidebarMode(SidebarMode::Plans),
         );
 
-        let tab_row = container(row![git_tab, files_tab, claude_tab, agent_tab, collapse_chevron].spacing(0))
-            .padding([4, 4])
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(bg.into()),
-                ..Default::default()
-            });
+        let tab_row =
+            container(row![git_tab, files_tab, agent_tab, plans_tab, collapse_chevron].spacing(0))
+                .padding([4, 4])
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(bg.into()),
+                    ..Default::default()
+                });
 
         let separator = container(iced::widget::Space::new().height(0))
             .width(Length::Fill)
@@ -8392,12 +10089,15 @@ fi
         let theme = &self.theme;
         let font = self.ui_font();
         let font_small = self.ui_font_small();
-        
+
         // Debug large file trees
         if tab.file_tree.len() > 500 {
-            freeze_debug!("Large file tree with {} entries in view_file_tree", tab.file_tree.len());
+            freeze_debug!(
+                "Large file tree with {} entries in view_file_tree",
+                tab.file_tree.len()
+            );
         }
-        
+
         let mut content = Column::new().spacing(2).padding(8);
 
         // Current path - show relative to repo if inside it, otherwise show with ~ for home
@@ -8419,11 +10119,9 @@ fi
 
         // Path display
         content = content.push(
-            row![
-                text(path_display).size(font).color(theme.accent()),
-            ]
-            .padding([4, 0])
-            .align_y(iced::Alignment::Center),
+            row![text(path_display).size(font).color(theme.accent()),]
+                .padding([4, 0])
+                .align_y(iced::Alignment::Center),
         );
 
         // Up button (if not at repo root)
@@ -8450,9 +10148,8 @@ fi
         for entry in &tab.file_tree {
             let is_selected_file = !entry.is_dir
                 && tab
-                    .viewing_file_path
-                    .as_ref()
-                    .is_some_and(|selected| selected == &entry.path);
+                    .viewing_file_path()
+                    .is_some_and(|selected| selected == entry.path.as_path());
             let (icon, name_suffix, icon_color, name_color, bg_color) = if entry.is_dir {
                 // Folders: blue folder icon, trailing /, light background
                 (
@@ -8572,6 +10269,90 @@ fi
             .into()
     }
 
+    /// Sidebar list of `.md` files from the active workspace's `.plans/`
+    /// directory. Each entry is a button — clicking opens the in-app plans
+    /// viewer with that file pre-selected. Reads the directory fresh on each
+    /// render (cheap for typical .plans sizes; cache if it ever grows).
+    fn view_plans_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        let plans_dir = self
+            .workspaces
+            .get(self.active_workspace_idx)
+            .map(|ws| ws.dir.join(".plans"));
+
+        let Some(dir) = plans_dir else {
+            return container(
+                text("No active workspace")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            )
+            .padding(16)
+            .into();
+        };
+
+        let mut entries: Vec<(String, String)> = Vec::new(); // (name, title)
+        if let Ok(read_dir) = std::fs::read_dir(&dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with('.')
+                    || !name.ends_with(".md")
+                    || name.contains('/')
+                    || name.contains('\\')
+                {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                let title = content
+                    .lines()
+                    .find_map(|l| {
+                        l.trim_start()
+                            .strip_prefix("# ")
+                            .map(|s| s.trim().to_string())
+                    })
+                    .unwrap_or_else(|| name.trim_end_matches(".md").to_string());
+                entries.push((name.to_string(), title));
+            }
+        }
+        entries.sort_by_key(|a| a.1.to_lowercase());
+
+        if entries.is_empty() {
+            return container(
+                column![
+                    text("No plans found")
+                        .size(font)
+                        .color(theme.text_primary()),
+                    text(format!("Looked in {}", dir.display()))
+                        .size(font_small)
+                        .color(theme.text_secondary()),
+                ]
+                .spacing(6),
+            )
+            .padding(16)
+            .into();
+        }
+
+        let mut list = Column::new().spacing(2).padding(8);
+        for (name, title) in entries {
+            let btn = button(text(title).size(font).color(theme.text_primary()))
+                .style(self.ghost_button_style())
+                .padding([6, 8])
+                .width(Length::Fill)
+                .on_press(Event::OpenPlan(name));
+            list = list.push(btn);
+        }
+
+        iced::widget::scrollable(list)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     fn view_agent_sidebar<'a>(
         &'a self,
         tab: &'a TabState,
@@ -8579,20 +10360,20 @@ fi
         let theme = &self.theme;
         let font = self.ui_font();
         let font_small = self.ui_font_small();
-        
-        if tab.agent_activity_loading {
+
+        if tab.agent_sidebar.loading {
             let spinner = container(
                 text("Loading agent activity...")
                     .size(font_small)
-                    .color(theme.subtext0())
+                    .color(theme.subtext0()),
             )
             .padding(20)
             .center_x(Length::Fill);
-            
+
             return spinner.into();
         }
 
-        let activity = match &tab.agent_activity {
+        let activity = match &tab.agent_sidebar.activity {
             Some(activity) => activity,
             None => {
                 let no_data = container(
@@ -8604,11 +10385,11 @@ fi
                             .size(font_small)
                             .color(theme.subtext0())
                     ]
-                    .spacing(4)
+                    .spacing(4),
                 )
                 .padding(20)
                 .center_x(Length::Fill);
-                
+
                 return no_data.into();
             }
         };
@@ -8621,65 +10402,79 @@ fi
             a: 0.1,
             ..theme.mauve()
         };
-        
+
         let commits_count = activity.total_commits;
         let live_count = activity.live_capture_count();
         let git_count = commits_count - live_count;
         let cost_display = activity.format_total_cost();
-        
+
         let mut stats_row = Row::new().spacing(8);
-        
+
         // Agent sessions badge (live captures)
         if live_count > 0 {
             stats_row = stats_row.push(
                 container(
                     text(format!("{} sessions", live_count))
                         .size(font_small)
-                        .color(theme.mauve())
+                        .color(theme.mauve()),
                 )
                 .padding([2, 8])
                 .style(move |_| container::Style {
-                    background: Some(iced::Color { a: 0.15, ..theme.mauve() }.into()),
+                    background: Some(
+                        iced::Color {
+                            a: 0.15,
+                            ..theme.mauve()
+                        }
+                        .into(),
+                    ),
                     border: iced::Border::default().rounded(8),
                     ..Default::default()
-                })
+                }),
             );
         }
-        
+
         // Git commits badge (reconstructed)
         if git_count > 0 {
             stats_row = stats_row.push(
                 container(
                     text(format!("{} commits", git_count))
                         .size(font_small)
-                        .color(theme.overlay1())
+                        .color(theme.overlay1()),
                 )
                 .padding([2, 8])
                 .style(move |_| container::Style {
-                    background: Some(iced::Color { a: 0.12, ..theme.overlay1() }.into()),
+                    background: Some(
+                        iced::Color {
+                            a: 0.12,
+                            ..theme.overlay1()
+                        }
+                        .into(),
+                    ),
                     border: iced::Border::default().rounded(8),
                     ..Default::default()
-                })
+                }),
             );
         }
-        
+
         // Cost badge (only if there are live captures with cost)
         if activity.total_cost > 0.0 {
             stats_row = stats_row.push(
-                container(
-                    text(cost_display)
-                        .size(font_small)
-                        .color(theme.peach())
-                )
-                .padding([2, 8])
-                .style(move |_| container::Style {
-                    background: Some(iced::Color { a: 0.15, ..theme.peach() }.into()),
-                    border: iced::Border::default().rounded(8),
-                    ..Default::default()
-                })
+                container(text(cost_display).size(font_small).color(theme.peach()))
+                    .padding([2, 8])
+                    .style(move |_| container::Style {
+                        background: Some(
+                            iced::Color {
+                                a: 0.15,
+                                ..theme.peach()
+                            }
+                            .into(),
+                        ),
+                        border: iced::Border::default().rounded(8),
+                        ..Default::default()
+                    }),
             );
         }
-        
+
         let header_stats = container(
             column![
                 text("Agent Activity Journal")
@@ -8687,7 +10482,7 @@ fi
                     .color(theme.text_primary()),
                 stats_row
             ]
-            .spacing(6)
+            .spacing(6),
         )
         .padding(12)
         .width(Length::Fill)
@@ -8716,21 +10511,22 @@ fi
                         .color(theme.subtext0())
                 ]
                 .spacing(4)
-                .align_x(iced::Alignment::Center)
+                .align_x(iced::Alignment::Center),
             )
             .padding(20)
             .width(Length::Fill)
             .center_x(Length::Fill);
-            
+
             content = content.push(empty_state);
         } else {
             // Show recent captures
             let recent_captures = activity.recent_captures(50);
-            let selected_idx = tab.selected_capture_idx;
-            
+            let selected_idx = tab.agent_sidebar.selected_capture_idx;
+
             for (idx, capture) in recent_captures.iter().enumerate() {
                 let is_selected = selected_idx == Some(idx);
-                content = content.push(self.view_agent_capture_entry(capture, theme, idx, is_selected));
+                content =
+                    content.push(self.view_agent_capture_entry(capture, theme, idx, is_selected));
             }
         }
 
@@ -8790,20 +10586,24 @@ fi
             } else {
                 desc
             };
-            let desc_color = if is_live { theme.text_primary() } else { theme.subtext1() };
-            entry_content = entry_content.push(
-                text(truncated).size(font_small).color(desc_color)
-            );
+            let desc_color = if is_live {
+                theme.text_primary()
+            } else {
+                theme.subtext1()
+            };
+            entry_content = entry_content.push(text(truncated).size(font_small).color(desc_color));
         }
 
         // === Row 2: Badges row — hash, type badge, key stat, timestamp ===
         let mut badges_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
 
         // Commit hash
-        let hash_color = if is_live { theme.blue() } else { theme.overlay0() };
-        badges_row = badges_row.push(
-            text(capture.short_hash()).size(font_tiny).color(hash_color)
-        );
+        let hash_color = if is_live {
+            theme.blue()
+        } else {
+            theme.overlay0()
+        };
+        badges_row = badges_row.push(text(capture.short_hash()).size(font_tiny).color(hash_color));
 
         if is_live {
             // Model badge
@@ -8812,70 +10612,76 @@ fi
                     theme.mauve()
                 } else if name.contains("sonnet") {
                     theme.blue()
-                } else if name.contains("haiku") {
-                    theme.green()
-                } else if name.contains("gpt") {
+                } else if name.contains("haiku") || name.contains("gpt") {
                     theme.green()
                 } else {
                     theme.overlay1()
                 };
                 // Short name: "opus-4-6" from "claude-opus-4-6"
-                let short = name.split('/').last().unwrap_or(name);
+                let short = name.split('/').next_back().unwrap_or(name);
                 let short = short.strip_prefix("claude-").unwrap_or(short);
                 (short, color)
             } else {
                 ("unknown", theme.overlay1())
             };
             badges_row = badges_row.push(
-                container(
-                    text(model_name).size(font_tiny).color(model_badge_color)
-                )
-                .padding([1, 5])
-                .style(move |_| container::Style {
-                    background: Some(iced::Color { a: 0.15, ..model_badge_color }.into()),
-                    border: iced::Border::default().rounded(4),
-                    ..Default::default()
-                })
+                container(text(model_name).size(font_tiny).color(model_badge_color))
+                    .padding([1, 5])
+                    .style(move |_| container::Style {
+                        background: Some(
+                            iced::Color {
+                                a: 0.15,
+                                ..model_badge_color
+                            }
+                            .into(),
+                        ),
+                        border: iced::Border::default().rounded(4),
+                        ..Default::default()
+                    }),
             );
 
             // Turns count
             badges_row = badges_row.push(
-                text(format!("{}t", capture.turns)).size(font_tiny).color(theme.subtext0())
+                text(format!("{}t", capture.turns))
+                    .size(font_tiny)
+                    .color(theme.subtext0()),
             );
 
             // Duration
             badges_row = badges_row.push(
-                text(capture.format_duration()).size(font_tiny).color(theme.subtext0())
+                text(capture.format_duration())
+                    .size(font_tiny)
+                    .color(theme.subtext0()),
             );
         } else {
             // Git badge for reconstructed
             let git_color = theme.overlay1();
             badges_row = badges_row.push(
-                container(
-                    text("git").size(font_tiny).color(git_color)
-                )
-                .padding([1, 5])
-                .style(move |_| container::Style {
-                    background: Some(iced::Color { a: 0.12, ..git_color }.into()),
-                    border: iced::Border::default().rounded(4),
-                    ..Default::default()
-                })
+                container(text("git").size(font_tiny).color(git_color))
+                    .padding([1, 5])
+                    .style(move |_| container::Style {
+                        background: Some(
+                            iced::Color {
+                                a: 0.12,
+                                ..git_color
+                            }
+                            .into(),
+                        ),
+                        border: iced::Border::default().rounded(4),
+                        ..Default::default()
+                    }),
             );
 
             // Diff summary
             let diff = capture.diff_summary();
             if !diff.is_empty() {
-                badges_row = badges_row.push(
-                    text(diff).size(font_tiny).color(theme.overlay0())
-                );
+                badges_row = badges_row.push(text(diff).size(font_tiny).color(theme.overlay0()));
             }
         }
 
         // Timestamp pushed to the right
         badges_row = badges_row.push(iced::widget::Space::new().width(Length::Fill));
-        badges_row = badges_row.push(
-            text(time_display).size(font_tiny).color(theme.overlay0())
-        );
+        badges_row = badges_row.push(text(time_display).size(font_tiny).color(theme.overlay0()));
 
         entry_content = entry_content.push(badges_row);
 
@@ -8911,13 +10717,13 @@ fi
         let font_small = self.ui_font_small();
         let font_tiny = font_small * 0.9;
 
-        let conversation = match &tab.agent_conversation {
+        let conversation = match &tab.agent_sidebar.conversation {
             Some(c) => c,
             None => {
                 return container(
                     text("Select a session to view its conversation")
                         .size(font_small)
-                        .color(theme.subtext0())
+                        .color(theme.subtext0()),
                 )
                 .padding(20)
                 .center_x(Length::Fill)
@@ -8927,15 +10733,19 @@ fi
         };
 
         // Get capture info for the header
-        let capture = tab.selected_capture_idx
-            .and_then(|idx| tab.agent_activity.as_ref()?.captures.get(idx));
+        let capture = tab
+            .agent_sidebar
+            .selected_capture_idx
+            .and_then(|idx| tab.agent_sidebar.activity.as_ref()?.captures.get(idx));
 
         let mut content = Column::new().spacing(0);
 
         // Header with capture info
         if let Some(cap) = capture {
             let header_bg = theme.surface0();
-            let desc = cap.description().unwrap_or_else(|| cap.short_hash().to_string());
+            let desc = cap
+                .description()
+                .unwrap_or_else(|| cap.short_hash().to_string());
             let desc_truncated: String = if desc.len() > 80 {
                 format!("{}…", truncate_str(&desc, 79))
             } else {
@@ -8943,24 +10753,25 @@ fi
             };
 
             let mut header_col = Column::new().spacing(4);
-            header_col = header_col.push(
-                text(desc_truncated).size(font).color(theme.text_primary())
-            );
+            header_col =
+                header_col.push(text(desc_truncated).size(font).color(theme.text_primary()));
 
             // Stats line
             let mut stats_parts = Vec::new();
             stats_parts.push(cap.short_hash().to_string());
             if let Some((name, _)) = cap.primary_model() {
-                let short = name.split('/').last().unwrap_or(name);
+                let short = name.split('/').next_back().unwrap_or(name);
                 let short = short.strip_prefix("claude-").unwrap_or(short);
                 stats_parts.push(short.to_string());
             }
             stats_parts.push(format!("{}t", cap.turns));
             stats_parts.push(cap.format_duration());
             stats_parts.push(cap.format_cost());
-            
+
             header_col = header_col.push(
-                text(stats_parts.join(" · ")).size(font_tiny).color(theme.subtext0())
+                text(stats_parts.join(" · "))
+                    .size(font_tiny)
+                    .color(theme.subtext0()),
             );
 
             content = content.push(
@@ -8970,32 +10781,38 @@ fi
                     .style(move |_| container::Style {
                         background: Some(header_bg.into()),
                         ..Default::default()
-                    })
+                    }),
             );
         }
 
         // Error state
         if let Some(err) = &conversation.error {
             content = content.push(
-                container(
-                    text(err).size(font_small).color(theme.subtext0())
-                )
-                .padding([16, 16])
-                .width(Length::Fill)
-                .center_x(Length::Fill)
+                container(text(err).size(font_small).color(theme.subtext0()))
+                    .padding([16, 16])
+                    .width(Length::Fill)
+                    .center_x(Length::Fill),
             );
-            return scrollable(content).width(Length::Fill).height(Length::Fill).into();
+            return scrollable(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
         }
 
         if conversation.entries.is_empty() {
             content = content.push(
                 container(
-                    text("No conversation entries found").size(font_small).color(theme.subtext0())
+                    text("No conversation entries found")
+                        .size(font_small)
+                        .color(theme.subtext0()),
                 )
                 .padding([16, 16])
-                .width(Length::Fill)
+                .width(Length::Fill),
             );
-            return scrollable(content).width(Length::Fill).height(Length::Fill).into();
+            return scrollable(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
         }
 
         // Render conversation entries
@@ -9005,21 +10822,26 @@ fi
             match entry {
                 agent::ConversationEntry::User { text: user_text } => {
                     let user_color = theme.blue();
-                    let bg = iced::Color { a: 0.08, ..user_color };
-                    
+                    let bg = iced::Color {
+                        a: 0.08,
+                        ..user_color
+                    };
+
                     let display_text: String = if user_text.len() > 500 {
                         format!("{}…", truncate_str(user_text, 497))
                     } else {
                         user_text.clone()
                     };
-                    
+
                     thread = thread.push(
                         container(
                             column![
                                 text("You").size(font_tiny).color(user_color),
-                                text(display_text).size(font_small).color(theme.text_primary())
+                                text(display_text)
+                                    .size(font_small)
+                                    .color(theme.text_primary())
                             ]
-                            .spacing(2)
+                            .spacing(2),
                         )
                         .padding([8, 12])
                         .width(Length::Fill)
@@ -9031,27 +10853,35 @@ fi
                                 radius: iced::border::Radius::from(6),
                             },
                             ..Default::default()
-                        })
+                        }),
                     );
                 }
-                agent::ConversationEntry::Assistant { text: asst_text, model } => {
+                agent::ConversationEntry::Assistant {
+                    text: asst_text,
+                    model,
+                } => {
                     let model_short = model.strip_prefix("claude-").unwrap_or(model);
                     let asst_color = theme.mauve();
-                    let bg = iced::Color { a: 0.05, ..asst_color };
-                    
+                    let bg = iced::Color {
+                        a: 0.05,
+                        ..asst_color
+                    };
+
                     let display_text: String = if asst_text.len() > 1000 {
                         format!("{}…", truncate_str(asst_text, 997))
                     } else {
                         asst_text.clone()
                     };
-                    
+
                     thread = thread.push(
                         container(
                             column![
                                 text(model_short).size(font_tiny).color(asst_color),
-                                text(display_text).size(font_small).color(theme.text_secondary())
+                                text(display_text)
+                                    .size(font_small)
+                                    .color(theme.text_secondary())
                             ]
-                            .spacing(2)
+                            .spacing(2),
                         )
                         .padding([8, 12])
                         .width(Length::Fill)
@@ -9063,36 +10893,45 @@ fi
                                 radius: iced::border::Radius::from(6),
                             },
                             ..Default::default()
-                        })
+                        }),
                     );
                 }
                 agent::ConversationEntry::ToolCall { tool, summary } => {
                     let tool_color = theme.yellow();
-                    
+
                     let label = format!("→ {} {}", tool, summary);
                     let label_truncated: String = if label.len() > 100 {
                         format!("{}…", truncate_str(&label, 97))
                     } else {
                         label
                     };
-                    
+
                     thread = thread.push(
-                        container(
-                            text(label_truncated).size(font_tiny).color(tool_color)
-                        )
-                        .padding([3, 12])
+                        container(text(label_truncated).size(font_tiny).color(tool_color))
+                            .padding([3, 12]),
                     );
                 }
-                agent::ConversationEntry::ToolResult { tool: _, output, is_error } => {
+                agent::ConversationEntry::ToolResult {
+                    tool: _,
+                    output,
+                    is_error,
+                } => {
                     if !output.is_empty() {
-                        let result_color = if *is_error { theme.red() } else { theme.overlay1() };
+                        let result_color = if *is_error {
+                            theme.red()
+                        } else {
+                            theme.overlay1()
+                        };
                         let prefix = if *is_error { "✗ " } else { "" };
                         let bg = if *is_error {
-                            iced::Color { a: 0.06, ..theme.red() }
+                            iced::Color {
+                                a: 0.06,
+                                ..theme.red()
+                            }
                         } else {
                             theme.bg_base()
                         };
-                        
+
                         // Only show first few lines of output
                         let lines: Vec<&str> = output.lines().take(6).collect();
                         let display = if output.lines().count() > 6 {
@@ -9100,22 +10939,20 @@ fi
                         } else {
                             format!("{}{}", prefix, lines.join("\n"))
                         };
-                        
+
                         thread = thread.push(
-                            container(
-                                text(display).size(font_tiny).color(result_color)
-                            )
-                            .padding([4, 12])
-                            .width(Length::Fill)
-                            .style(move |_| container::Style {
-                                background: Some(bg.into()),
-                                border: iced::Border {
-                                    width: 0.0,
-                                    color: iced::Color::TRANSPARENT,
-                                    radius: iced::border::Radius::from(4),
-                                },
-                                ..Default::default()
-                            })
+                            container(text(display).size(font_tiny).color(result_color))
+                                .padding([4, 12])
+                                .width(Length::Fill)
+                                .style(move |_| container::Style {
+                                    background: Some(bg.into()),
+                                    border: iced::Border {
+                                        width: 0.0,
+                                        color: iced::Color::TRANSPARENT,
+                                        radius: iced::border::Radius::from(4),
+                                    },
+                                    ..Default::default()
+                                }),
                         );
                     }
                 }
@@ -9126,12 +10963,10 @@ fi
                     } else {
                         format!("💭 {}", think_text)
                     };
-                    
+
                     thread = thread.push(
-                        container(
-                            text(display).size(font_tiny).color(think_color)
-                        )
-                        .padding([3, 12])
+                        container(text(display).size(font_tiny).color(think_color))
+                            .padding([3, 12]),
                     );
                 }
                 agent::ConversationEntry::Compaction { summary } => {
@@ -9141,12 +10976,10 @@ fi
                     } else {
                         format!("⟳ Context compacted: {}", summary)
                     };
-                    
+
                     thread = thread.push(
-                        container(
-                            text(display).size(font_tiny).color(compact_color)
-                        )
-                        .padding([6, 12])
+                        container(text(display).size(font_tiny).color(compact_color))
+                            .padding([6, 12]),
                     );
                 }
             }
@@ -9439,42 +11272,38 @@ fi
         let font_small = self.ui_font_small();
         let mut content = Column::new().spacing(0);
 
+        let Some(fv) = tab.file_viewer() else {
+            return container(text("(no file)").size(font).color(theme.text_secondary()))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into();
+        };
+
         // Header with filename and close button
-        let file_name = tab
-            .viewing_file_path
-            .as_ref()
-            .and_then(|p| p.file_name())
+        let file_name = fv
+            .path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let rel_path = tab
-            .viewing_file_path
-            .as_ref()
-            .and_then(|p| p.strip_prefix(&tab.repo_path).ok())
+        let rel_path = fv
+            .path
+            .strip_prefix(&tab.repo_path)
+            .ok()
             .map(|p| p.display().to_string())
             .unwrap_or(file_name.clone());
 
         // Determine file viewer mode by extension/state.
-        let is_markdown = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| TabState::is_markdown_file(p))
-            .unwrap_or(false);
-        let is_html = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| TabState::is_html_file(p))
-            .unwrap_or(false);
+        let is_markdown = TabState::is_markdown_file(&fv.path);
+        let is_html = TabState::is_html_file(&fv.path);
         #[cfg(feature = "excalidraw")]
-        let is_excalidraw = tab
-            .viewing_file_path
-            .as_ref()
-            .map(|p| excalidraw::is_excalidraw_file(p))
-            .unwrap_or(false);
+        let is_excalidraw = excalidraw::is_excalidraw_file(&fv.path);
         #[cfg(not(feature = "excalidraw"))]
         let is_excalidraw = false;
         let has_inline_webview =
-            tab.webview_content.is_some() && (is_markdown || is_html || is_excalidraw);
+            fv.webview_content.is_some() && (is_markdown || is_html || is_excalidraw);
 
         let header_bg = theme.bg_overlay();
         let ghost = self.ghost_button_style();
@@ -9555,7 +11384,7 @@ fi
             );
         }
 
-        if let Some(notice) = &tab.file_preview_notice {
+        if let Some(notice) = &fv.preview_notice {
             let notice_bg = theme.bg_overlay();
             let notice_border = theme.surface0();
             content = content.push(
@@ -9574,7 +11403,7 @@ fi
             );
         }
 
-        if let Some(notice) = &tab.syntax_highlight_notice {
+        if let Some(notice) = &fv.syntax_highlight_notice {
             let notice_bg = theme.bg_overlay();
             let notice_border = theme.surface0();
             content = content.push(
@@ -9592,21 +11421,21 @@ fi
                     }),
             );
         }
-        let waiting_for_file_load = tab.file_load_in_progress
-            && tab.file_content.is_empty()
-            && tab.image_handle.is_none()
-            && tab.webview_content.is_none();
-        let waiting_for_initial_syntax = tab.syntax_highlight_in_progress
-            && tab.syntax_highlight_lines.is_none()
-            && !tab.file_content.is_empty()
-            && tab.webview_content.is_none()
-            && tab.image_handle.is_none();
+        let waiting_for_file_load = fv.load_in_progress
+            && fv.file_content.is_empty()
+            && fv.image_handle.is_none()
+            && fv.webview_content.is_none();
+        let waiting_for_initial_syntax = fv.syntax_highlight_in_progress
+            && fv.syntax_highlight_lines.is_none()
+            && !fv.file_content.is_empty()
+            && fv.webview_content.is_none()
+            && fv.image_handle.is_none();
         let show_file_loading_message = waiting_for_file_load
-            && tab.file_load_started_at.is_some_and(|started| {
+            && fv.load_started_at.is_some_and(|started| {
                 started.elapsed() >= Duration::from_millis(LOADING_INDICATOR_DELAY_MS)
             });
         let show_initial_syntax_message = waiting_for_initial_syntax
-            && tab.file_load_started_at.is_some_and(|started| {
+            && fv.load_started_at.is_some_and(|started| {
                 started.elapsed() >= Duration::from_millis(LOADING_INDICATOR_DELAY_MS)
             });
 
@@ -9645,7 +11474,7 @@ fi
             } else {
                 content = content.push(iced::widget::Space::new().height(Length::Fill));
             }
-        } else if let Some(handle) = &tab.image_handle {
+        } else if let Some(handle) = &fv.image_handle {
             // Display image
             let img = image(handle.clone()).content_fit(iced::ContentFit::Contain);
 
@@ -9662,12 +11491,12 @@ fi
         } else if has_inline_webview {
             // Excalidraw, Mermaid-markdown, and HTML render inline via WebView.
             content = content.push(iced::widget::Space::new().height(Length::Fill));
-        } else if is_markdown && tab.file_preview_notice.is_none() && !tab.file_content.is_empty() {
+        } else if is_markdown && fv.preview_notice.is_none() && !fv.file_content.is_empty() {
             // Fallback markdown rendering when HTML preview is unavailable.
             content = content.push(self.view_markdown_content(tab));
         } else if is_markdown || is_html || is_excalidraw {
-            let msg = tab
-                .file_preview_notice
+            let msg = fv
+                .preview_notice
                 .as_deref()
                 .unwrap_or("Inline preview unavailable for this file. Click \"View in Browser\".");
             content = content.push(
@@ -9683,8 +11512,8 @@ fi
             let render_started_at = Instant::now();
             let mut file_column = Column::new().spacing(0);
             let mono = iced::Font::MONOSPACE;
-            let has_syntax_lines = tab.syntax_highlight_lines.is_some();
-            let total_line_count = tab.file_content.lines().count();
+            let has_syntax_lines = fv.syntax_highlight_lines.is_some();
+            let total_line_count = fv.file_content.lines().count();
             let render_line_limit = if has_syntax_lines {
                 MAX_FILE_VIEW_RENDER_LINES_WITH_SYNTAX
             } else {
@@ -9720,12 +11549,12 @@ fi
                 );
             }
 
-            for (i, line) in tab.file_content.lines().take(render_line_count).enumerate() {
+            for (i, line) in fv.file_content.lines().take(render_line_count).enumerate() {
                 let line_num = format!("{:4}", i + 1);
                 let shown_line = if line.is_empty() { " " } else { line };
 
                 let line_body: Element<'_, Event, Theme, iced::Renderer> =
-                    if let Some(highlighted_line) = tab
+                    if let Some(highlighted_line) = fv
                         .syntax_highlight_lines
                         .as_ref()
                         .and_then(|lines| lines.get(i))
@@ -9785,7 +11614,7 @@ fi
                 );
             }
 
-            if tab.file_content.is_empty() {
+            if fv.file_content.is_empty() {
                 file_column = file_column.push(
                     text("(empty file)")
                         .size(font)
@@ -9794,7 +11623,7 @@ fi
             }
 
             maybe_log_file_view_build(
-                tab.viewing_file_path.as_deref(),
+                Some(fv.path.as_path()),
                 total_line_count,
                 render_line_count,
                 has_syntax_lines,
@@ -9832,6 +11661,10 @@ fi
         let font = self.ui_font();
         let mut content = Column::new().spacing(8).padding(16);
 
+        let Some(fv) = tab.file_viewer() else {
+            return content.into();
+        };
+
         let mut in_code_block = false;
         let mut in_mermaid_block = false;
         let mut code_block_content: Vec<String> = Vec::new();
@@ -9839,7 +11672,7 @@ fi
         let mut table_rows: Vec<Vec<String>> = Vec::new();
         let mut table_has_header = false;
 
-        for line in tab.file_content.lines() {
+        for line in fv.file_content.lines() {
             let trimmed = line.trim();
 
             // Table row accumulation — detect end of table and render
@@ -10405,14 +12238,14 @@ fi
         // Only show the loading banner for the initial fetch. Subsequent polls refresh in place
         // to avoid visible flashing in the Git list.
         let show_loading = tab.git_status_loading && tab.last_git_status_hash.is_none();
-        
+
         // Debug large git status results
         let total_files = tab.staged.len() + tab.unstaged.len() + tab.untracked.len();
         if total_files > 1000 {
-            freeze_debug!("Large git status with {} files ({} staged, {} unstaged, {} untracked) in view_git_list", 
+            freeze_debug!("Large git status with {} files ({} staged, {} unstaged, {} untracked) in view_git_list",
                 total_files, tab.staged.len(), tab.unstaged.len(), tab.untracked.len());
         }
-        
+
         let mut content = Column::new().spacing(8).padding(8);
 
         // Branch display - styled rounded container with diamond icon
@@ -10836,12 +12669,38 @@ fi
         }
     }
 
+    /// Background placeholder for an agent tab. The wry webview is positioned
+    /// by `calculate_webview_bounds` and overlays this area; the placeholder is
+    /// only visible briefly during webview construction or as a fallback if
+    /// the webview fails to attach.
+    fn view_agent_tab<'a>(
+        &'a self,
+        _tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let bg = theme.bg_base();
+        container(
+            text("Loading agent…")
+                .size(13)
+                .color(theme.text_secondary()),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
     fn view_terminal<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
 
         let bg = theme.bg_base();
         let terminal_view: Element<'a, Event, Theme, iced::Renderer> =
-            if let Some(term) = &tab.terminal {
+            if let Some(term) = tab.terminal() {
                 let tab_id = tab.id;
                 let term_container =
                     container(TerminalView::show(term).map(move |e| Event::Terminal(tab_id, e)))
