@@ -3,7 +3,7 @@
 
 set -e
 
-APP_NAME="GitTerm3"
+APP_NAME="GitTerm"
 BUNDLE_ID="com.cree8.gitterm"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -11,7 +11,7 @@ BUILD_DIR="$PROJECT_DIR/target/release"
 APP_DIR="$PROJECT_DIR/target/$APP_NAME.app"
 
 echo "Building release binary..."
-cargo build --release --features excalidraw --manifest-path "$PROJECT_DIR/Cargo.toml"
+cargo build --release --features "stt excalidraw" --manifest-path "$PROJECT_DIR/Cargo.toml"
 
 echo "Creating app bundle..."
 rm -rf "$APP_DIR"

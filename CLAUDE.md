@@ -1,33 +1,13 @@
-# GitTerm v2
+# Claude Code Instructions
 
-A Rust terminal application with integrated git status viewer and file explorer, built with the [Iced](https://github.com/iced-rs/iced) GUI framework.
+The canonical instruction source for this repository is
+[`AGENTS.md`](./AGENTS.md). Read it before doing any substantive work.
 
-## Architecture
+This file exists only as a pointer for Claude Code and any other harness that
+defaults to `CLAUDE.md`. Repo rules, workflow facts, build commands, issue
+conventions, and PR readiness gates all live in `AGENTS.md`, and they are
+generated/governed by [`agent-workflow-kit`](https://github.com/Tru-Insights/agent-workflow-kit)
+via the checked-in `agent-workflow.config.json`.
 
-- **Single-file app**: `src/main.rs` (~3300 lines) contains the entire application
-- **Supporting modules**: `src/log_server.rs`, `src/markdown.rs`, `src/webview.rs`
-- **Terminal**: Uses `iced_term` fork at `../iced_term_fork`
-- **Theme**: Catppuccin Mocha (dark) / Latte (light)
-
-## Build & Run
-
-```bash
-cargo run          # Debug build
-cargo build --release  # Release build
-```
-
-## Key Conventions
-
-- Single-file architecture — all app logic lives in `main.rs`
-- Catppuccin color theme with `AppTheme::Dark` / `AppTheme::Light`
-- Config persisted to `~/.config/gitterm/config.json`
-- Workspace state persisted to `~/.config/gitterm/workspaces.json`
-- Iced `Task<Event>` pattern for async operations (file dialogs, etc.)
-
-## Design Roadmap
-
-See `design/WORKSPACE_DESIGN.md` for the multi-phase workspace system plan:
-1. Workspace System (grouping tabs by project)
-2. Attention System (detecting when Claude Code needs input)
-3. Tab Overflow Handling
-4. Console Panel (always-visible process runner)
+Do not add rules here. Promote anything durable to `AGENTS.md`'s
+`Repo-Specific Rules` section instead.

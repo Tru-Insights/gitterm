@@ -1,0 +1,31 @@
+#!/bin/sh
+# Commit message hook — requires a Linear issue key in the commit message.
+#
+# Activate repo hooks with:
+#
+#     git config core.hooksPath .githooks
+
+set -e
+
+MSG_FILE="$1"
+LINEAR_KEY_PATTERN='(^|[^A-Z0-9])[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}([^A-Z0-9]|$)'
+
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+    exit 0
+fi
+
+if grep -v '^[[:space:]]*#' "$MSG_FILE" | grep -Eq "$LINEAR_KEY_PATTERN"; then
+    exit 0
+fi
+
+echo ""
+echo "ERROR: Commit message must include a Linear issue key like TRU-1234."
+echo ""
+echo "If the issue is known, include it in the subject:"
+echo "  TRU-1234: Short imperative summary"
+echo ""
+echo "For new work, create the Linear issue first:"
+echo "  linear --workspace truinsights issue create --team TRU --title \"...\" \\"
+echo "    --description-file <path> --assignee self --no-interactive"
+echo ""
+exit 1
