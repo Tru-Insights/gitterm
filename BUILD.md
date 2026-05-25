@@ -1,5 +1,17 @@
 # Building GitTerm
 
+## First-Time Setup (Any Platform)
+
+After cloning, activate the local git hooks once so commits run the same
+gates CI does (`cargo clippy -- -D warnings && cargo fmt --check && cargo test`)
+and reject commit messages without a `TRU-NN` Linear key:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This is a per-clone setting; you don't need to commit it.
+
 ## macOS (Local Build)
 
 ### Development Build
