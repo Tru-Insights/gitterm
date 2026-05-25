@@ -70,9 +70,8 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        if line.starts_with("# branch.head ") {
-            // Parse branch name from v2 header ("# branch.head " is 14 chars)
-            let branch = line[14..].trim();
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            let branch = rest.trim();
             if !branch.is_empty() && branch != "(detached)" {
                 snapshot.branch_name = branch.to_string();
             }
@@ -93,7 +92,7 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
                 // Rename: "2 XY ... X### path\torigPath"
                 line.split('\t')
                     .next()
-                    .and_then(|before_tab| before_tab.rsplitn(2, ' ').next())
+                    .and_then(|before_tab| before_tab.rsplit(' ').next())
                     .unwrap_or("")
                     .to_string()
             } else {
@@ -159,11 +158,9 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
                 }),
                 _ => {}
             }
-        } else if line.starts_with("? ") {
-            // Untracked: "? path"
-            let path = line[2..].to_string();
+        } else if let Some(path) = line.strip_prefix("? ") {
             snapshot.untracked.push(FileEntry {
-                path,
+                path: path.to_string(),
                 status: "?".to_string(),
                 is_staged: false,
             });
@@ -299,6 +296,9 @@ pub(crate) fn collect_file_tree(
             if name == "node_modules" || name == "target" {
                 continue;
             }
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
 
             let is_dir = path.is_dir();
             let entry = FileTreeEntry { name, path, is_dir };
@@ -310,8 +310,8 @@ pub(crate) fn collect_file_tree(
         }
     }
 
-    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    dirs.sort_by_key(|a| a.name.to_lowercase());
+    files.sort_by_key(|a| a.name.to_lowercase());
     dirs.extend(files);
 
     let snapshot = FileTreeSnapshot {

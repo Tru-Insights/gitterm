@@ -78,8 +78,10 @@ pub fn routes(state: ServerState) -> BoxedFilter<(warp::reply::Response,)> {
 
 async fn handle_viewer() -> Result<warp::reply::Response, Rejection> {
     use warp::Reply;
-    Ok(warp::reply::with_header(VIEWER_HTML, "content-type", "text/html; charset=utf-8")
-        .into_response())
+    Ok(
+        warp::reply::with_header(VIEWER_HTML, "content-type", "text/html; charset=utf-8")
+            .into_response(),
+    )
 }
 
 async fn handle_list(state: ServerState) -> Result<warp::reply::Response, Rejection> {
@@ -105,7 +107,7 @@ async fn handle_list(state: ServerState) -> Result<warp::reply::Response, Reject
             });
         }
     }
-    entries.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    entries.sort_by_key(|a| a.title.to_lowercase());
     Ok(warp::reply::json(&PlansList { plans: entries }).into_response())
 }
 
@@ -134,11 +136,10 @@ async fn handle_raw(name: String, state: ServerState) -> Result<warp::reply::Res
     };
     let candidate = dir.join(&name);
     let Ok(canon_path) = candidate.canonicalize() else {
-        return Ok(warp::reply::with_status(
-            "plan not found",
-            warp::http::StatusCode::NOT_FOUND,
-        )
-        .into_response());
+        return Ok(
+            warp::reply::with_status("plan not found", warp::http::StatusCode::NOT_FOUND)
+                .into_response(),
+        );
     };
     // Defense in depth: even if is_safe_name passed, refuse anything that
     // canonicalizes outside the plans dir (e.g. symlink shenanigans).
@@ -150,17 +151,16 @@ async fn handle_raw(name: String, state: ServerState) -> Result<warp::reply::Res
         .into_response());
     }
     match fs::read(&canon_path) {
-        Ok(bytes) => Ok(warp::reply::with_header(
-            bytes,
-            "content-type",
-            "text/markdown; charset=utf-8",
-        )
-        .into_response()),
-        Err(_) => Ok(warp::reply::with_status(
-            "plan not found",
-            warp::http::StatusCode::NOT_FOUND,
-        )
-        .into_response()),
+        Ok(bytes) => {
+            Ok(
+                warp::reply::with_header(bytes, "content-type", "text/markdown; charset=utf-8")
+                    .into_response(),
+            )
+        }
+        Err(_) => Ok(
+            warp::reply::with_status("plan not found", warp::http::StatusCode::NOT_FOUND)
+                .into_response(),
+        ),
     }
 }
 

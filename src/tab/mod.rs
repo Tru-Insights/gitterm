@@ -15,8 +15,8 @@ mod agent;
 // AgentEvent variants in earnest.
 #[allow(unused_imports)]
 pub(crate) use agent::{
-    AgentBackend, AgentBackendConfig, AgentEvent, AgentInput, AgentSession, AgentSessionState,
-    AgentTaskHandle, spawn_agent_task,
+    spawn_agent_task, AgentBackend, AgentBackendConfig, AgentEvent, AgentInput, AgentSession,
+    AgentSessionState, AgentTaskHandle,
 };
 
 use std::path::PathBuf;
@@ -24,9 +24,9 @@ use std::time::Instant;
 
 use iced::widget::image;
 
+use crate::agent as agent_log;
 use crate::FileVersionSignature;
 use crate::SyntaxHighlightLine;
-use crate::agent as agent_log;
 
 /// File viewer state attached to a Terminal tab while the user is viewing a file.
 /// Closing the file (Back / Close button) drops this back to None and reveals the terminal.
@@ -96,6 +96,11 @@ impl TerminalTab {
 
 /// Tab content kind. Terminal tabs run a shell (with an optional file viewer overlay);
 /// Agent tabs host a Claude Code or pi conversation in a wry webview.
+///
+/// Variant size differs significantly (TerminalTab ~5KB, AgentSession ~200B) but
+/// boxing the larger variant would add indirection on the dominant terminal path
+/// for negligible benefit — Tabs are pinned in a Vec and not moved frequently.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum TabKind {
     Terminal(TerminalTab),
     Agent(AgentSession),

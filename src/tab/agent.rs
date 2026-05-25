@@ -201,9 +201,7 @@ impl AgentTaskHandle {
     /// `Some` exactly once per handle; subsequent calls return `None`. The
     /// caller owns the receiver after this and is responsible for keeping the
     /// subscription alive until the tab is dropped.
-    pub(crate) fn take_event_receiver(
-        &self,
-    ) -> Option<mpsc::UnboundedReceiver<AgentEvent>> {
+    pub(crate) fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<AgentEvent>> {
         self.pending_event_rx.lock().ok().and_then(|mut g| g.take())
     }
 }
@@ -219,10 +217,7 @@ impl AgentTaskHandle {
 /// turn, streams its stdout JSON, and emits a terminating `Other(...)` event
 /// when the turn completes (so the UI can flip state from Streaming to Idle).
 /// Closing the receiver / dropping the handle ends the task naturally.
-pub(crate) fn spawn_agent_task(
-    config: AgentBackendConfig,
-    repo_path: PathBuf,
-) -> AgentTaskHandle {
+pub(crate) fn spawn_agent_task(config: AgentBackendConfig, repo_path: PathBuf) -> AgentTaskHandle {
     let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let stop_slot: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
@@ -311,7 +306,7 @@ async fn run_turn(
                         // turns these into `AssistantText` / `ToolCallStart` / etc.
                         // lands in Step 4, alongside the chat UI that consumes them.
                         let value = serde_json::from_str::<serde_json::Value>(&line)
-                            .unwrap_or_else(|_| serde_json::Value::String(line));
+                            .unwrap_or(serde_json::Value::String(line));
                         // Drop high-volume / low-value events at the source. The
                         // tool-call info we want is in `turn_end.message.content`,
                         // which already renders. Filtering here keeps Iced's

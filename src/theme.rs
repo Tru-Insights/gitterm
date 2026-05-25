@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 use iced::{color, Color, Theme};
-use iced_term;
 
 // App theme (affects entire UI)
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

@@ -67,10 +67,7 @@ fn summarize_event(v: &serde_json::Value, assistant_text: &mut String) {
         "assistant" => {
             if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) {
                 for block in content {
-                    let block_type = block
-                        .get("type")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("?");
+                    let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("?");
                     match block_type {
                         "text" => {
                             let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
@@ -78,18 +75,13 @@ fn summarize_event(v: &serde_json::Value, assistant_text: &mut String) {
                             assistant_text.push_str(text);
                         }
                         "thinking" => {
-                            let thinking = block
-                                .get("thinking")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("");
+                            let thinking =
+                                block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
                             let preview = thinking.chars().take(80).collect::<String>();
                             println!("  [thinking] {}...", preview);
                         }
                         "tool_use" => {
-                            let name = block
-                                .get("name")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("?");
+                            let name = block.get("name").and_then(|t| t.as_str()).unwrap_or("?");
                             println!("  [tool_use] {}", name);
                         }
                         other => println!("  [assistant block: {}]", other),
@@ -107,10 +99,7 @@ fn summarize_event(v: &serde_json::Value, assistant_text: &mut String) {
                 .and_then(|c| c.as_f64())
                 .unwrap_or(0.0);
             let duration = v.get("duration_ms").and_then(|d| d.as_i64()).unwrap_or(0);
-            let stop = v
-                .get("stop_reason")
-                .and_then(|s| s.as_str())
-                .unwrap_or("?");
+            let stop = v.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("?");
             println!(
                 "[result] stop={} duration={}ms cost=${:.4}",
                 stop, duration, cost

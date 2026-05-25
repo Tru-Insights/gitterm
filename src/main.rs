@@ -131,8 +131,7 @@ fn push_agent_event_to_webview(ev: &tab::AgentEvent) {
         // into a richer JS-side shape.
         _ => return,
     };
-    let payload_json = serde_json::to_string(&payload)
-        .unwrap_or_else(|_| "null".to_string());
+    let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string());
     webview::evaluate_script(&format!("window.__appendEvent({})", payload_json));
 }
 
@@ -205,7 +204,7 @@ fn start_freeze_watchdog() {
         unsafe {
             libc::signal(
                 libc::SIGUSR1,
-                freeze_backtrace_handler as libc::sighandler_t,
+                freeze_backtrace_handler as *const () as libc::sighandler_t,
             );
         }
     }
@@ -268,7 +267,7 @@ fn start_freeze_watchdog() {
                     // After 10 logs, only log every 60s
                     if log_count >= 10 {
                         let secs = elapsed.as_secs();
-                        if secs % 60 == 0 {
+                        if secs.is_multiple_of(60) {
                             eprintln!(
                                 "[FREEZE-WATCHDOG] Still stalled after {}m. Force quit to restart.",
                                 secs / 60
@@ -348,7 +347,13 @@ extern "C" fn freeze_backtrace_handler(_sig: libc::c_int) {
                 line[7] = b'x';
             }
             // Write 16 hex digits for the address (always 64-bit)
-            let hex_start = if i >= 100 { 10 } else if i >= 10 { 9 } else { 8 };
+            let hex_start = if i >= 100 {
+                10
+            } else if i >= 10 {
+                9
+            } else {
+                8
+            };
             for digit in 0..16 {
                 let nibble = (addr >> (60 - digit * 4)) & 0xf;
                 line[hex_start + digit] = hex_chars[nibble];
@@ -2305,8 +2310,8 @@ impl TabState {
             }
 
             // Sort alphabetically
-            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-            files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            dirs.sort_by_key(|a| a.name.to_lowercase());
+            files.sort_by_key(|a| a.name.to_lowercase());
 
             // Dirs first, then files
             self.file_tree.extend(dirs);
@@ -2442,9 +2447,7 @@ impl TabState {
             }
         }
 
-        if fv.webview_content.is_none()
-            && fv.image_handle.is_none()
-            && !fv.file_content.is_empty()
+        if fv.webview_content.is_none() && fv.image_handle.is_none() && !fv.file_content.is_empty()
         {
             let (lines, notice) =
                 build_syntax_highlight_lines(path, &fv.file_content, is_dark_theme);
@@ -2604,7 +2607,7 @@ impl TabState {
         }
         self.claude_config
             .skills
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
 
         // --- Read settings.json ---
         let settings_path = claude_home.join("settings.json");
@@ -2626,7 +2629,7 @@ impl TabState {
         }
         self.claude_config
             .plugins
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
 
         // --- MCP Servers ---
         // Project .mcp.json
@@ -2662,7 +2665,7 @@ impl TabState {
         }
         self.claude_config
             .mcp_servers
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
 
         // --- Hooks ---
         if let Some(ref settings) = settings_json {
@@ -2678,7 +2681,7 @@ impl TabState {
         }
         self.claude_config
             .hooks
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
 
         // --- Settings ---
         // User settings (top-level keys, excluding plugins/hooks which have their own sections)
@@ -2714,7 +2717,7 @@ impl TabState {
         }
         self.claude_config
             .settings
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|a| a.name.to_lowercase());
     }
 
     #[allow(dead_code)]
@@ -3632,8 +3635,7 @@ impl App {
                         preview_notice_count += 1;
                     }
                     file_content_bytes += fv.file_content.len();
-                    webview_html_bytes +=
-                        fv.webview_content.as_ref().map(|s| s.len()).unwrap_or(0);
+                    webview_html_bytes += fv.webview_content.as_ref().map(|s| s.len()).unwrap_or(0);
                 }
             }
         }
@@ -4899,7 +4901,9 @@ fi
             .iter()
             .flat_map(|ws| ws.tabs.iter())
             .any(|tab| {
-                tab.file_viewer().map(|fv| fv.load_in_progress).unwrap_or(false)
+                tab.file_viewer()
+                    .map(|fv| fv.load_in_progress)
+                    .unwrap_or(false)
                     || tab.diff_load_in_progress
             });
         if loading_in_progress {
@@ -5069,21 +5073,19 @@ fi
                                 // OSC 52: program requested clipboard read.
                                 // Read clipboard, format the response, write back to PTY.
                                 let tid = tab_id;
-                                pending_task = Some(
-                                    iced::clipboard::read().map(move |content| {
-                                        let text = content.unwrap_or_default();
-                                        let response = formatter(&text);
-                                        Event::Terminal(
-                                            tid,
-                                            iced_term::Event::BackendCall(
-                                                tid as u64,
-                                                iced_term::backend::Command::Write(
-                                                    response.into_bytes(),
-                                                ),
+                                pending_task = Some(iced::clipboard::read().map(move |content| {
+                                    let text = content.unwrap_or_default();
+                                    let response = formatter(&text);
+                                    Event::Terminal(
+                                        tid,
+                                        iced_term::Event::BackendCall(
+                                            tid as u64,
+                                            iced_term::backend::Command::Write(
+                                                response.into_bytes(),
                                             ),
-                                        )
-                                    }),
-                                );
+                                        ),
+                                    )
+                                }));
                             }
                             _ => {}
                         }
@@ -5352,7 +5354,7 @@ fi
                     } else {
                         tab.agent_sidebar.selected_capture_idx = Some(idx);
                         tab.agent_sidebar.conversation = None; // Clear while loading
-                                                       // Load conversation async
+                                                               // Load conversation async
                         if let Some(activity) = &tab.agent_sidebar.activity {
                             if let Some(capture) = activity.captures.get(idx) {
                                 let capture = capture.clone();
@@ -5480,15 +5482,11 @@ fi
                         }
                         let repo_path = t.repo_path.clone();
                         let Some(session) = t.agent_session_mut() else {
-                            eprintln!(
-                                "AgentSubmitPrompt: tab {} is not an agent tab",
-                                tab_id
-                            );
+                            eprintln!("AgentSubmitPrompt: tab {} is not an agent tab", tab_id);
                             return Task::none();
                         };
                         if session.task_handle.is_none() {
-                            let handle =
-                                tab::spawn_agent_task(session.config.clone(), repo_path);
+                            let handle = tab::spawn_agent_task(session.config.clone(), repo_path);
                             // Take the receiver up-front so this turn can wire
                             // it into a Task::run; it lives for the tab's lifetime.
                             bridge = handle.take_event_receiver();
@@ -5515,9 +5513,7 @@ fi
                 if let Some(rx) = bridge {
                     use tokio_stream::wrappers::UnboundedReceiverStream;
                     let stream = UnboundedReceiverStream::new(rx);
-                    return Task::run(stream, move |ev| {
-                        Event::AgentEventReceived(tab_id, ev)
-                    });
+                    return Task::run(stream, move |ev| Event::AgentEventReceived(tab_id, ev));
                 }
                 return Task::none();
             }
@@ -5575,10 +5571,7 @@ fi
                 // pipeline end-to-end. Removed before Step 4 lands.
                 let model = std::env::var("PI_MODEL")
                     .unwrap_or_else(|_| "openai-codex/gpt-5.4".to_string());
-                let session_path = format!(
-                    "/tmp/gitterm-agent-debug-{}.jsonl",
-                    std::process::id()
-                );
+                let session_path = format!("/tmp/gitterm-agent-debug-{}.jsonl", std::process::id());
                 let config = tab::AgentBackendConfig::Pi {
                     model,
                     session_path: Some(session_path),
@@ -6499,8 +6492,7 @@ fi
                         .file_viewer()
                         .map(|fv| fv.load_in_progress)
                         .unwrap_or(false);
-                    let loaded_signature =
-                        tab.file_viewer().and_then(|fv| fv.loaded_signature);
+                    let loaded_signature = tab.file_viewer().and_then(|fv| fv.loaded_signature);
                     if same_path && load_in_progress {
                         return Task::none();
                     }
@@ -6674,9 +6666,7 @@ fi
             Event::SearchExecute => {
                 if let Some(tab) = self.active_tab_mut() {
                     let query = tab.search.query.clone();
-                    let matches = tab
-                        .terminal_mut()
-                        .map(|term| term.search_all(&query));
+                    let matches = tab.terminal_mut().map(|term| term.search_all(&query));
                     if let Some(matches) = matches {
                         tab.search.matches = matches;
                         tab.search.current_match = 0;
@@ -7190,7 +7180,8 @@ fi
                     .find(|t| t.id == snapshot.tab_id)
                 {
                     if let Some(fv) = tab.file_viewer_mut() {
-                        if fv.path == snapshot.path && fv.loaded_signature == snapshot.file_signature
+                        if fv.path == snapshot.path
+                            && fv.loaded_signature == snapshot.file_signature
                         {
                             fv.syntax_highlight_in_progress = false;
                             fv.load_started_at = None;
@@ -7515,14 +7506,11 @@ fi
                     .position(|c| c.dir == dir_str)
                     .map(|i| self.closed_workspace_configs.remove(i));
 
-                let name = saved
-                    .as_ref()
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| {
-                        path.file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "Workspace".to_string())
-                    });
+                let name = saved.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| {
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Workspace".to_string())
+                });
                 let color = saved.as_ref().map(|c| c.color).unwrap_or_else(|| {
                     let used_colors: Vec<WorkspaceColor> =
                         self.workspaces.iter().map(|ws| ws.color).collect();
@@ -7944,7 +7932,11 @@ fi
     fn show_webview_url(&mut self, url: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
         perf_log!(
             "webview_url mode={} url={} bounds=({}, {}, {}, {})",
-            if webview::is_active() { "reuse" } else { "create" },
+            if webview::is_active() {
+                "reuse"
+            } else {
+                "create"
+            },
             url,
             bounds.0,
             bounds.1,
@@ -8046,7 +8038,10 @@ fi
 
         // No agent webview alive — destroy whatever's there and recreate.
         if webview_alive {
-            eprintln!("[agent-webview] destroying existing kind={:?}", self.webview_kind);
+            eprintln!(
+                "[agent-webview] destroying existing kind={:?}",
+                self.webview_kind
+            );
             webview::destroy();
         }
         webview::set_pending_content_with_ipc(
@@ -8071,7 +8066,11 @@ fi
                         eprintln!("[agent-webview] create FAILED for tab={}: {}", tab_id, e);
                         return;
                     }
-                    eprintln!("[agent-webview] create OK for tab={}, replaying {} events", tab_id, conversation.len());
+                    eprintln!(
+                        "[agent-webview] create OK for tab={}, replaying {} events",
+                        tab_id,
+                        conversation.len()
+                    );
                     set_agent_webview_tab_id(tab_id);
                     for ev in conversation.iter() {
                         push_agent_event_to_webview(ev);
@@ -10311,12 +10310,16 @@ fi
                 let content = std::fs::read_to_string(&path).unwrap_or_default();
                 let title = content
                     .lines()
-                    .find_map(|l| l.trim_start().strip_prefix("# ").map(|s| s.trim().to_string()))
+                    .find_map(|l| {
+                        l.trim_start()
+                            .strip_prefix("# ")
+                            .map(|s| s.trim().to_string())
+                    })
                     .unwrap_or_else(|| name.trim_end_matches(".md").to_string());
                 entries.push((name.to_string(), title));
             }
         }
-        entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        entries.sort_by_key(|a| a.1.to_lowercase());
 
         if entries.is_empty() {
             return container(
@@ -10609,15 +10612,13 @@ fi
                     theme.mauve()
                 } else if name.contains("sonnet") {
                     theme.blue()
-                } else if name.contains("haiku") {
-                    theme.green()
-                } else if name.contains("gpt") {
+                } else if name.contains("haiku") || name.contains("gpt") {
                     theme.green()
                 } else {
                     theme.overlay1()
                 };
                 // Short name: "opus-4-6" from "claude-opus-4-6"
-                let short = name.split('/').last().unwrap_or(name);
+                let short = name.split('/').next_back().unwrap_or(name);
                 let short = short.strip_prefix("claude-").unwrap_or(short);
                 (short, color)
             } else {
@@ -10759,7 +10760,7 @@ fi
             let mut stats_parts = Vec::new();
             stats_parts.push(cap.short_hash().to_string());
             if let Some((name, _)) = cap.primary_model() {
-                let short = name.split('/').last().unwrap_or(name);
+                let short = name.split('/').next_back().unwrap_or(name);
                 let short = short.strip_prefix("claude-").unwrap_or(short);
                 stats_parts.push(short.to_string());
             }

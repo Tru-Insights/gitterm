@@ -282,7 +282,7 @@ impl AgentActivity {
         let needs_message: Vec<usize> = captures
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.message.as_ref().map_or(true, |m| m.is_empty()))
+            .filter(|(_, c)| c.message.as_ref().is_none_or(|m| m.is_empty()))
             .map(|(i, _)| i)
             .collect();
 

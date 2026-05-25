@@ -99,7 +99,10 @@ pub async fn start_server(state: ServerState) {
         .and(state_filter.clone())
         .and_then(handle_file);
 
-    let routes = index.or(tab).or(file).or(crate::plans_viewer::routes(plans_state));
+    let routes = index
+        .or(tab)
+        .or(file)
+        .or(crate::plans_viewer::routes(plans_state));
 
     let Some(port) = find_available_port() else {
         eprintln!("Log server disabled: unable to bind any localhost port");

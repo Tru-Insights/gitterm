@@ -34,8 +34,7 @@ enum AppEvent {
 const HTML: &str = include_str!("claude_webview_test.html");
 
 fn main() -> wry::Result<()> {
-    let event_loop: EventLoop<AppEvent> =
-        EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let event_loop: EventLoop<AppEvent> = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let window = WindowBuilder::new()
         .with_title("Claude webview spike")
         .with_inner_size(tao::dpi::LogicalSize::new(900.0, 700.0))
@@ -45,8 +44,7 @@ fn main() -> wry::Result<()> {
     let proxy = event_loop.create_proxy();
 
     // Channel: main thread (IPC handler) → tokio thread (subprocess manager)
-    let (input_tx, input_rx) =
-        tokio::sync::mpsc::unbounded_channel::<String>();
+    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Background tokio runtime, owns the input channel and subprocess lifecycle.
     {
@@ -70,9 +68,7 @@ fn main() -> wry::Result<()> {
             match serde_json::from_str::<serde_json::Value>(body) {
                 Ok(v) => {
                     if v.get("type").and_then(|t| t.as_str()) == Some("submit") {
-                        if let Some(text) =
-                            v.get("text").and_then(|t| t.as_str())
-                        {
+                        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
                             if !text.trim().is_empty() {
                                 let _ = input_tx.send(text.to_string());
                             }
@@ -110,10 +106,7 @@ fn main() -> wry::Result<()> {
                 let _ = webview.evaluate_script("window.__claudeDone()");
             }
             Event::UserEvent(AppEvent::ClaudeError(msg)) => {
-                let script = format!(
-                    "window.__claudeError({})",
-                    serde_json::Value::String(msg)
-                );
+                let script = format!("window.__claudeError({})", serde_json::Value::String(msg));
                 let _ = webview.evaluate_script(&script);
             }
             _ => {}
@@ -156,8 +149,8 @@ async fn run_claude(
     // prompt, so we pick a mode up-front. Default to bypassPermissions so
     // the agent can actually *do* things while we evaluate the experience.
     // Override: CLAUDE_PERMISSION_MODE=default|acceptEdits|bypassPermissions|plan
-    let permission_mode = std::env::var("CLAUDE_PERMISSION_MODE")
-        .unwrap_or_else(|_| "bypassPermissions".into());
+    let permission_mode =
+        std::env::var("CLAUDE_PERMISSION_MODE").unwrap_or_else(|_| "bypassPermissions".into());
     // Effort controls thinking budget. Opus is particularly selective about
     // when to think at default effort; bump to "high" or "max" to force it.
     let effort = std::env::var("CLAUDE_EFFORT").ok();
@@ -206,10 +199,7 @@ async fn run_claude(
                 }
             }
         }
-        if proxy
-            .send_event(AppEvent::ClaudeLine(line))
-            .is_err()
-        {
+        if proxy.send_event(AppEvent::ClaudeLine(line)).is_err() {
             // Main thread is gone, bail out.
             break;
         }

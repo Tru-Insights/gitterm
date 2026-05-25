@@ -43,8 +43,7 @@ enum AppEvent {
 const HTML: &str = include_str!("pi_webview_test.html");
 
 fn main() -> wry::Result<()> {
-    let event_loop: EventLoop<AppEvent> =
-        EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let event_loop: EventLoop<AppEvent> = EventLoopBuilder::<AppEvent>::with_user_event().build();
 
     // Install an Edit menu with the standard AppKit selectors so Cmd+C / Cmd+V
     // / Cmd+X / Cmd+A work inside the WKWebView. Held for the life of the
@@ -60,8 +59,7 @@ fn main() -> wry::Result<()> {
     let proxy = event_loop.create_proxy();
 
     // Channel: main thread (IPC handler) → tokio thread (subprocess manager)
-    let (input_tx, input_rx) =
-        tokio::sync::mpsc::unbounded_channel::<String>();
+    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Stop-signal slot shared between IPC handler and tokio runtime.
     let stop_slot: StopSlot = Arc::new(Mutex::new(None));
@@ -93,9 +91,7 @@ fn main() -> wry::Result<()> {
             match serde_json::from_str::<serde_json::Value>(body) {
                 Ok(v) => match v.get("type").and_then(|t| t.as_str()) {
                     Some("submit") => {
-                        if let Some(text) =
-                            v.get("text").and_then(|t| t.as_str())
-                        {
+                        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
                             if !text.trim().is_empty() {
                                 let _ = input_tx.send(text.to_string());
                             }
@@ -146,10 +142,7 @@ fn main() -> wry::Result<()> {
                 let _ = webview.evaluate_script("window.__streamStopped()");
             }
             Event::UserEvent(AppEvent::Error(msg)) => {
-                let script = format!(
-                    "window.__streamError({})",
-                    serde_json::Value::String(msg)
-                );
+                let script = format!("window.__streamError({})", serde_json::Value::String(msg));
                 let _ = webview.evaluate_script(&script);
             }
             _ => {}
@@ -222,9 +215,8 @@ async fn tokio_main(
 ) {
     // pi uses a session file for multi-turn continuity. Pick a stable path
     // per process so every submit in this window continues the same session.
-    let session_path = std::env::var("PI_SESSION_PATH").unwrap_or_else(|_| {
-        format!("/tmp/pi-spike-session-{}.jsonl", std::process::id())
-    });
+    let session_path = std::env::var("PI_SESSION_PATH")
+        .unwrap_or_else(|_| format!("/tmp/pi-spike-session-{}.jsonl", std::process::id()));
     eprintln!("[tokio] session file: {}", session_path);
 
     while let Some(prompt) = input_rx.recv().await {
@@ -259,8 +251,7 @@ async fn run_pi(
     session_path: &str,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let model =
-        std::env::var("PI_MODEL").unwrap_or_else(|_| "openai-codex/gpt-5.4".into());
+    let model = std::env::var("PI_MODEL").unwrap_or_else(|_| "openai-codex/gpt-5.4".into());
     let thinking = std::env::var("PI_THINKING").ok();
     eprintln!(
         "[tokio] spawning pi (model={} thinking={:?})",
