@@ -28,6 +28,7 @@ use syntect::util::LinesWithEndings;
 mod excalidraw;
 mod log_server;
 mod markdown;
+mod plans_viewer;
 mod services;
 mod webview;
 
@@ -384,6 +385,22 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Percent-encode RFC 3986 reserved characters in a query-string value.
+/// Used for `?plan=<name>` so plan filenames with spaces or punctuation
+/// round-trip cleanly into the viewer's URL.
+fn urlencoding_simple(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 fn freeze_debug_enabled() -> bool {
     FREEZE_DEBUG.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var("GITTERM_DEBUG_FREEZES").is_ok()
@@ -421,6 +438,7 @@ struct MenuIds {
     toggle_theme: muda::MenuId,
     toggle_log_server: muda::MenuId,
     clear_terminal: muda::MenuId,
+    open_plans_viewer: muda::MenuId,
 }
 
 fn setup_menu_bar() {
@@ -518,6 +536,14 @@ fn setup_menu_bar() {
             muda::accelerator::Code::KeyL,
         )),
     );
+    let open_plans_viewer = MenuItem::new(
+        "Plans Viewer",
+        true,
+        Some(Accelerator::new(
+            Some(muda::accelerator::Modifiers::META | muda::accelerator::Modifiers::SHIFT),
+            muda::accelerator::Code::KeyP,
+        )),
+    );
 
     view_menu
         .append_items(&[
@@ -526,6 +552,8 @@ fn setup_menu_bar() {
             &PredefinedMenuItem::separator(),
             &toggle_theme,
             &toggle_log_server,
+            &PredefinedMenuItem::separator(),
+            &open_plans_viewer,
         ])
         .unwrap();
 
@@ -552,6 +580,7 @@ fn setup_menu_bar() {
         toggle_theme: toggle_theme.id().clone(),
         toggle_log_server: toggle_log_server.id().clone(),
         clear_terminal: clear_terminal.id().clone(),
+        open_plans_viewer: open_plans_viewer.id().clone(),
     });
 
     // Initialize menu for macOS - this must happen after NSApp exists
@@ -3200,6 +3229,10 @@ pub enum Event {
     SearchClose,
     // Markdown preview
     OpenMarkdownInBrowser,
+    // Plans viewer (in-app webview, served by warp on localhost)
+    OpenPlansViewer,
+    OpenPlan(String),
+    ClosePlansViewer,
     // Window events
     WindowResized(f32, f32),
     WindowCloseRequested,
@@ -3413,6 +3446,8 @@ enum WebviewKind {
     Static,
     /// Agent chat — installed once with an IPC handler at construction.
     Agent,
+    /// Plans viewer — URL-loaded surface served by warp on localhost.
+    PlansViewer,
 }
 
 const SPINE_WIDTH: f32 = 16.0;
@@ -3828,6 +3863,19 @@ impl App {
         tokio::spawn(async move {
             log_server::start_server(server_state).await;
         });
+    }
+
+    /// Push the active workspace's `.plans/` directory into `ServerState` so
+    /// the plans viewer routes can resolve it. Call after any change to the
+    /// active workspace or to a workspace's directory.
+    fn sync_plans_dir(&self) {
+        let dir = self
+            .workspaces
+            .get(self.active_workspace_idx)
+            .map(|ws| ws.dir.join(".plans"));
+        if let Ok(mut p) = self.log_server_state.plans_dir.write() {
+            *p = dir;
+        }
     }
 
     fn set_log_server_enabled(&mut self, enabled: bool) {
@@ -4384,6 +4432,7 @@ impl App {
         if app.log_server_enabled {
             app.start_log_server();
         }
+        app.sync_plans_dir();
 
         // Set initial slide position for active workspace
         let viewport_width = app.content_viewport_width();
@@ -5146,6 +5195,9 @@ fi
                         } else if event.id == ids.clear_terminal {
                             freeze_debug!("dispatching native menu: clear_terminal");
                             return self.update(Event::ClearTerminal);
+                        } else if event.id == ids.open_plans_viewer {
+                            freeze_debug!("dispatching native menu: open_plans_viewer");
+                            return self.update(Event::OpenPlansViewer);
                         }
                     }
                 }
@@ -5951,6 +6003,13 @@ fi
                     return Task::none();
                 }
 
+                // Plans viewer: Escape dismisses
+                if self.webview_kind == WebviewKind::PlansViewer
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    return self.update(Event::ClosePlansViewer);
+                }
+
                 // Help modal: Escape or Cmd+/ closes, all other keys consumed while open
                 if self.show_help {
                     match key.as_ref() {
@@ -6251,6 +6310,17 @@ fi
                                 let task = tab.fetch_agent_activity();
                                 tab.sidebar_mode = mode;
                                 return task;
+                            }
+                            SidebarMode::Plans => {
+                                // Switching to Plans mode - clear file viewer and git selection.
+                                // Plan list is read fresh in view_plans_sidebar on each render.
+                                tab.close_file_viewer();
+                                tab.selected_file = None;
+                                tab.diff_lines.clear();
+                                tab.diff_load_in_progress = false;
+                                tab.diff_load_started_at = None;
+                                tab.diff_syntax_lines = None;
+                                tab.diff_syntax_notice = None;
                             }
                         }
                         tab.sidebar_mode = mode;
@@ -6713,6 +6783,24 @@ fi
                                 .spawn();
                         }
                     }
+                }
+            }
+            Event::OpenPlansViewer => {
+                // If already open, treat the shortcut/menu as a toggle and dismiss.
+                if self.webview_kind == WebviewKind::PlansViewer {
+                    webview::set_visible(false);
+                    self.webview_kind = WebviewKind::None;
+                    return Task::none();
+                }
+                return self.open_plans_viewer(None);
+            }
+            Event::OpenPlan(name) => {
+                return self.open_plans_viewer(Some(name));
+            }
+            Event::ClosePlansViewer => {
+                if self.webview_kind == WebviewKind::PlansViewer {
+                    webview::set_visible(false);
+                    self.webview_kind = WebviewKind::None;
                 }
             }
             Event::WindowCloseRequested => {
@@ -7248,6 +7336,7 @@ fi
                     // Update active workspace immediately (tab bar + console switch instantly)
                     self.active_workspace_idx = idx;
                     self.mark_workspaces_dirty();
+                    self.sync_plans_dir();
 
                     // Refresh claude config if active tab is in Claude mode
                     if let Some(tab) = self.active_tab_mut() {
@@ -7352,6 +7441,7 @@ fi
                             self.mark_workspaces_dirty();
                             self.hide_webview_for_non_agent();
                             self.editing_console_command = None;
+                            self.sync_plans_dir();
                         }
                     }
                 }
@@ -7381,6 +7471,7 @@ fi
                     }
                     self.mark_workspaces_dirty();
                     self.mark_log_server_dirty();
+                    self.sync_plans_dir();
 
                     // Snap slide to new active workspace (no animation)
                     let viewport_width = self.content_viewport_width();
@@ -7456,6 +7547,7 @@ fi
                 self.active_workspace_idx = self.workspaces.len() - 1;
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
+                self.sync_plans_dir();
 
                 // Snap slide state to new workspace position
                 // (no scroll_to needed — view renders active workspace directly when not animating)
@@ -7696,6 +7788,7 @@ fi
                                     self.slide_start_time = Some(Instant::now());
                                     self.slide_animating = true;
                                     self.active_workspace_idx = ws_idx;
+                                    self.sync_plans_dir();
                                 }
                                 self.workspaces[ws_idx].active_tab = tab_idx;
                                 self.mark_workspaces_dirty();
@@ -7722,7 +7815,7 @@ fi
     /// currently active tab — in which case it's the tab's primary content
     /// and should stay visible. Replaces unconditional `webview::set_visible(false)`
     /// calls scattered across handlers that predate the agent tab kind.
-    fn hide_webview_for_non_agent(&self) {
+    fn hide_webview_for_non_agent(&mut self) {
         let active_is_agent_tab_with_active_webview = self
             .active_tab()
             .map(|t| matches!(t.kind, TabKind::Agent(_)))
@@ -7730,6 +7823,11 @@ fi
             && self.webview_kind == WebviewKind::Agent;
         if !active_is_agent_tab_with_active_webview {
             webview::set_visible(false);
+            // Clear kind for any non-agent surface so the plans-viewer header
+            // (and any future kind-driven chrome) goes away with the webview.
+            if self.webview_kind != WebviewKind::Agent {
+                self.webview_kind = WebviewKind::None;
+            }
         }
     }
 
@@ -7796,6 +7894,78 @@ fi
 
         webview::set_pending_content(html, bounds);
         self.webview_kind = WebviewKind::Static;
+        iced::window::oldest().then(|opt_id| {
+            if let Some(id) = opt_id {
+                iced::window::run(id, |window| {
+                    if let Err(e) = webview::try_create_with_window(window) {
+                        perf_log!("webview_create_failed: {e}");
+                    }
+                })
+                .discard()
+            } else {
+                Task::none()
+            }
+        })
+    }
+
+    /// Build the plans-viewer URL and navigate the in-app webview to it.
+    /// If `plan` is `Some`, the viewer boots straight to that plan via
+    /// `?plan=<name>`. Returns `Task::none()` if the log server isn't up
+    /// (with a hint logged to stderr).
+    fn open_plans_viewer(&mut self, plan: Option<String>) -> Task<Event> {
+        let Some(base_url) = self.log_server_state.base_url() else {
+            eprintln!(
+                "[plans-viewer] cannot open: log server not running (View → Toggle Local Log Server)"
+            );
+            return Task::none();
+        };
+        let theme_str = match self.theme {
+            AppTheme::Dark => "dark",
+            AppTheme::Light => "light",
+        };
+        // nav=hide tells the viewer to drop its built-in plan list (gitterm's
+        // sidebar already shows plans). TOC stays — it's per-document.
+        let url = match plan {
+            Some(name) => format!(
+                "{}/plans/viewer?theme={}&nav=hide&plan={}",
+                base_url,
+                theme_str,
+                urlencoding_simple(&name)
+            ),
+            None => format!("{}/plans/viewer?theme={}&nav=hide", base_url, theme_str),
+        };
+        let bounds = self.calculate_webview_bounds();
+        self.show_webview_url(url, bounds)
+    }
+
+    /// Create or update the embedded WebView to display a URL (used by the
+    /// plans viewer, which loads `/plans/viewer` from the local warp server).
+    /// Mirrors `show_webview` but stages a URL instead of HTML.
+    fn show_webview_url(&mut self, url: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
+        perf_log!(
+            "webview_url mode={} url={} bounds=({}, {}, {}, {})",
+            if webview::is_active() { "reuse" } else { "create" },
+            url,
+            bounds.0,
+            bounds.1,
+            bounds.2,
+            bounds.3
+        );
+        if self.webview_kind == WebviewKind::Agent {
+            webview::destroy();
+            self.webview_kind = WebviewKind::None;
+            self.webview_agent_tab_id = None;
+        }
+        if webview::is_active() {
+            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+            webview::navigate_to_url(&url);
+            webview::set_visible(true);
+            self.webview_kind = WebviewKind::PlansViewer;
+            return Task::none();
+        }
+
+        webview::set_pending_url(url, bounds);
+        self.webview_kind = WebviewKind::PlansViewer;
         iced::window::oldest().then(|opt_id| {
             if let Some(id) = opt_id {
                 iced::window::run(id, |window| {
@@ -7989,6 +8159,9 @@ fi
             .width(Length::Fill)
             .height(Length::Fill);
         main_col = main_col.push(tab_bar);
+        if self.webview_kind == WebviewKind::PlansViewer {
+            main_col = main_col.push(self.view_plans_viewer_header());
+        }
         main_col = main_col.push(content);
 
         // Console divider (only when expanded)
@@ -8049,6 +8222,38 @@ fi
         } else {
             main_view
         }
+    }
+
+    /// Header strip shown above the embedded webview while the plans viewer
+    /// is active. Mirrors the file-viewer header so the existing 40px
+    /// reservation in `calculate_webview_bounds` lines up.
+    fn view_plans_viewer_header(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let header_bg = theme.bg_overlay();
+        let ghost = self.ghost_button_style();
+        let header = row![
+            text("Plans Viewer").size(font).color(theme.text_primary()),
+            iced::widget::Space::new().width(Length::Fill),
+            text("Esc: close")
+                .size(font_small)
+                .color(theme.text_secondary()),
+            iced::widget::Space::new().width(Length::Fixed(8.0)),
+            button(text("Back to Terminal").size(font))
+                .style(ghost)
+                .padding([4, 12])
+                .on_press(Event::ClosePlansViewer),
+        ]
+        .padding(8)
+        .spacing(8);
+        container(header)
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(header_bg.into()),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn view_tab_picker(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -9570,6 +9775,9 @@ fi
             SidebarMode::Agent => {
                 freeze_time!("view_agent_sidebar", { self.view_agent_sidebar(tab) })
             }
+            SidebarMode::Plans => {
+                freeze_time!("view_plans_sidebar", { self.view_plans_sidebar() })
+            }
         };
 
         content = content.push(mode_content);
@@ -9815,14 +10023,14 @@ fi
             Event::SetSidebarMode(SidebarMode::Files),
         );
 
-        // Claude tab
-        let claude_text_color = if claude_active {
+        // Agent tab (was "Claude" — same SidebarMode::Claude variant, shows skills/plugins/hooks)
+        let agent_text_color = if claude_active {
             theme.text_primary()
         } else {
             theme.overlay1()
         };
-        let claude_tab = self.view_sidebar_tab(
-            text("Claude").size(font).color(claude_text_color).into(),
+        let agent_tab = self.view_sidebar_tab(
+            text("Agent").size(font).color(agent_text_color).into(),
             claude_active,
             Event::SetSidebarMode(SidebarMode::Claude),
         );
@@ -9842,21 +10050,21 @@ fi
         .padding([4, 4])
         .on_press(Event::ToggleSidebar);
 
-        // Agent tab
-        let agent_active = tab.sidebar_mode == SidebarMode::Agent;
-        let agent_text_color = if agent_active {
+        // Plans tab (replaces the legacy "Agent" sidebar tab)
+        let plans_active = tab.sidebar_mode == SidebarMode::Plans;
+        let plans_text_color = if plans_active {
             theme.text_primary()
         } else {
             theme.overlay1()
         };
-        let agent_tab = self.view_sidebar_tab(
-            text("Agent").size(font).color(agent_text_color).into(),
-            agent_active,
-            Event::SetSidebarMode(SidebarMode::Agent),
+        let plans_tab = self.view_sidebar_tab(
+            text("Plans").size(font).color(plans_text_color).into(),
+            plans_active,
+            Event::SetSidebarMode(SidebarMode::Plans),
         );
 
         let tab_row =
-            container(row![git_tab, files_tab, claude_tab, agent_tab, collapse_chevron].spacing(0))
+            container(row![git_tab, files_tab, agent_tab, plans_tab, collapse_chevron].spacing(0))
                 .padding([4, 4])
                 .width(Length::Fill)
                 .style(move |_| container::Style {
@@ -10059,6 +10267,86 @@ fi
         scrollable(content)
             .height(Length::Fill)
             .width(Length::Fill)
+            .into()
+    }
+
+    /// Sidebar list of `.md` files from the active workspace's `.plans/`
+    /// directory. Each entry is a button — clicking opens the in-app plans
+    /// viewer with that file pre-selected. Reads the directory fresh on each
+    /// render (cheap for typical .plans sizes; cache if it ever grows).
+    fn view_plans_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        let plans_dir = self
+            .workspaces
+            .get(self.active_workspace_idx)
+            .map(|ws| ws.dir.join(".plans"));
+
+        let Some(dir) = plans_dir else {
+            return container(
+                text("No active workspace")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            )
+            .padding(16)
+            .into();
+        };
+
+        let mut entries: Vec<(String, String)> = Vec::new(); // (name, title)
+        if let Ok(read_dir) = std::fs::read_dir(&dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with('.')
+                    || !name.ends_with(".md")
+                    || name.contains('/')
+                    || name.contains('\\')
+                {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                let title = content
+                    .lines()
+                    .find_map(|l| l.trim_start().strip_prefix("# ").map(|s| s.trim().to_string()))
+                    .unwrap_or_else(|| name.trim_end_matches(".md").to_string());
+                entries.push((name.to_string(), title));
+            }
+        }
+        entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+        if entries.is_empty() {
+            return container(
+                column![
+                    text("No plans found")
+                        .size(font)
+                        .color(theme.text_primary()),
+                    text(format!("Looked in {}", dir.display()))
+                        .size(font_small)
+                        .color(theme.text_secondary()),
+                ]
+                .spacing(6),
+            )
+            .padding(16)
+            .into();
+        }
+
+        let mut list = Column::new().spacing(2).padding(8);
+        for (name, title) in entries {
+            let btn = button(text(title).size(font).color(theme.text_primary()))
+                .style(self.ghost_button_style())
+                .padding([6, 8])
+                .width(Length::Fill)
+                .on_press(Event::OpenPlan(name));
+            list = list.push(btn);
+        }
+
+        iced::widget::scrollable(list)
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
     }
 

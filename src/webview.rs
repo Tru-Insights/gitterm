@@ -13,12 +13,20 @@ type WebViewBounds = (f32, f32, f32, f32);
 /// the handler from the platform's web-process callback path.
 pub type IpcHandler = Box<dyn Fn(String) + Send + 'static>;
 
+/// What kind of content is staged for the next webview create / reuse. The
+/// markdown / excalidraw / agent surfaces stage HTML. The plans viewer stages
+/// a URL pointing at the local warp server.
+enum PendingContent {
+    Html(String),
+    Url(String),
+}
+
 use wry::raw_window_handle::{HasWindowHandle, WindowHandle};
 use wry::{Rect, WebView, WebViewBuilder};
 
 thread_local! {
     static WEBVIEW: RefCell<Option<WebView>> = const { RefCell::new(None) };
-    static PENDING_HTML: RefCell<Option<(String, WebViewBounds)>> = const { RefCell::new(None) };
+    static PENDING_CONTENT: RefCell<Option<(PendingContent, WebViewBounds)>> = const { RefCell::new(None) };
     static PENDING_IPC_HANDLER: RefCell<Option<IpcHandler>> = const { RefCell::new(None) };
 }
 
@@ -59,11 +67,37 @@ pub fn set_pending_content_with_ipc(
     bounds: (f32, f32, f32, f32),
     ipc_handler: Option<IpcHandler>,
 ) {
-    PENDING_HTML.with(|p| {
-        *p.borrow_mut() = Some((html, bounds));
+    PENDING_CONTENT.with(|p| {
+        *p.borrow_mut() = Some((PendingContent::Html(html), bounds));
     });
     PENDING_IPC_HANDLER.with(|h| {
         *h.borrow_mut() = ipc_handler;
+    });
+}
+
+/// Stage a URL for the next `try_create_with_window` to load. Used by the
+/// plans viewer (and any other surface that wants to navigate the embedded
+/// webview to a localhost route instead of injecting HTML). No IPC handler;
+/// URL-loaded surfaces communicate only via HTTP back to the warp server.
+#[allow(dead_code)]
+pub fn set_pending_url(url: String, bounds: (f32, f32, f32, f32)) {
+    PENDING_CONTENT.with(|p| {
+        *p.borrow_mut() = Some((PendingContent::Url(url), bounds));
+    });
+    PENDING_IPC_HANDLER.with(|h| {
+        *h.borrow_mut() = None;
+    });
+}
+
+/// Navigate the live webview to a URL. No-op if no webview exists. Use this
+/// when the webview is already up (`is_active()` returns true) and you want
+/// to swap its location without recreating the surface.
+#[allow(dead_code)]
+pub fn navigate_to_url(url: &str) {
+    WEBVIEW.with(|wv| {
+        if let Some(webview) = wv.borrow().as_ref() {
+            let _ = webview.load_url(url);
+        }
     });
 }
 
@@ -71,10 +105,10 @@ pub fn set_pending_content_with_ipc(
 /// This should be called from the main thread with window access
 #[allow(dead_code)]
 pub fn try_create_with_window(window: &dyn HasWindowHandle) -> Result<(), String> {
-    let pending = PENDING_HTML.with(|p| p.borrow_mut().take());
+    let pending = PENDING_CONTENT.with(|p| p.borrow_mut().take());
     let ipc_handler = PENDING_IPC_HANDLER.with(|h| h.borrow_mut().take());
 
-    if let Some((html, bounds)) = pending {
+    if let Some((content, bounds)) = pending {
         // Get the raw handle from the trait object
         let handle = window
             .window_handle()
@@ -100,9 +134,18 @@ pub fn try_create_with_window(window: &dyn HasWindowHandle) -> Result<(), String
                         height as f64,
                     )),
                 });
-                webview
-                    .load_html(&html)
-                    .map_err(|e| format!("Failed to load HTML: {}", e))?;
+                match &content {
+                    PendingContent::Html(html) => {
+                        webview
+                            .load_html(html)
+                            .map_err(|e| format!("Failed to load HTML: {}", e))?;
+                    }
+                    PendingContent::Url(url) => {
+                        webview
+                            .load_url(url)
+                            .map_err(|e| format!("Failed to load URL: {}", e))?;
+                    }
+                }
                 // ipc_handler is dropped here — wry has no API to replace the handler
                 // post-construction. See module-level docs on `set_pending_content_with_ipc`.
                 return Ok(());
@@ -121,8 +164,12 @@ pub fn try_create_with_window(window: &dyn HasWindowHandle) -> Result<(), String
                         height as f64,
                     )),
                 })
-                .with_html(&html)
                 .with_transparent(false);
+
+            builder = match &content {
+                PendingContent::Html(html) => builder.with_html(html),
+                PendingContent::Url(url) => builder.with_url(url),
+            };
 
             if let Some(handler) = ipc_handler {
                 builder = builder.with_ipc_handler(move |req: wry::http::Request<String>| {

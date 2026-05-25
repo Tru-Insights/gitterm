@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Plans · GitTerm</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" />
+<link id="hljs-theme" rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark.min.css" />
+<style>
+  :root[data-theme="dark"] {
+    --bg: #1e1e2e;
+    --panel: #181825;
+    --panel-2: #313244;
+    --border: #45475a;
+    --text: #cdd6f4;
+    --muted: #6c7086;
+    --accent: #89b4fa;
+    --accent-2: #a6e3a1;
+    --code-bg: #11111b;
+    --blockquote-bg: #313244;
+    --error-bg: #2a1818;
+    --error-border: #5a2a2a;
+  }
+  :root[data-theme="light"] {
+    --bg: #eff1f5;
+    --panel: #e6e9ef;
+    --panel-2: #dce0e8;
+    --border: #ccd0da;
+    --text: #4c4f69;
+    --muted: #8c8fa1;
+    --accent: #1e66f5;
+    --accent-2: #40a02b;
+    --code-bg: #dce0e8;
+    --blockquote-bg: #dce0e8;
+    --error-bg: #fbe9e9;
+    --error-border: #f0c2c2;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
+    font-size: 14.5px; line-height: 1.6;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .layout { display: grid; grid-template-columns: 300px 1fr; min-height: 100vh; }
+  aside {
+    background: var(--panel); border-right: 1px solid var(--border);
+    padding: 18px 16px; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  }
+  main { padding: 30px clamp(20px, 5vw, 60px); max-width: 1000px; }
+  .brand {
+    font-size: 11px; letter-spacing: 0.12em; color: var(--muted);
+    text-transform: uppercase; margin-bottom: 14px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .brand .controls { display: flex; gap: 6px; }
+  .brand button {
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 4px;
+    font-size: 10.5px; padding: 3px 7px; cursor: pointer;
+  }
+  .brand button:hover { color: var(--text); border-color: var(--muted); }
+  .section-label {
+    font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--muted); margin: 18px 0 8px;
+  }
+  .plan-list { list-style: none; margin: 0; padding: 0; }
+  .plan-list li a {
+    display: block; color: var(--text); padding: 5px 8px;
+    border-radius: 4px; font-size: 12.5px;
+  }
+  .plan-list li a:hover { background: var(--panel-2); text-decoration: none; }
+  .plan-list li a.active { background: var(--panel-2); color: var(--accent); }
+  .plan-list .empty {
+    color: var(--muted); font-size: 12px; padding: 5px 8px; font-style: italic;
+  }
+  /* Embedded mode (?nav=hide): host app (e.g. gitterm) provides its own plan
+     picker, so hide the in-viewer plan list. TOC stays — it's per-document. */
+  body.nav-hidden #plan-list-label,
+  body.nav-hidden #plan-list { display: none; }
+  .toc { list-style: none; margin: 0; padding: 0; border-left: 1px solid var(--border); }
+  .toc li a {
+    display: block; padding: 3px 10px; font-size: 12.5px;
+    color: var(--muted); border-left: 2px solid transparent; margin-left: -1px;
+  }
+  .toc li a.h3 { padding-left: 22px; font-size: 12px; }
+  .toc li a:hover { color: var(--text); text-decoration: none; }
+  .toc li a.active { color: var(--accent); border-left-color: var(--accent); }
+  h1 { font-size: 28px; margin: 8px 0 24px; line-height: 1.25; }
+  h2 {
+    font-size: 19px; margin: 32px 0 12px; padding: 0 0 6px 18px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer; position: relative; user-select: none;
+  }
+  h2::before {
+    content: "▾"; position: absolute; left: 0; top: 4px;
+    color: var(--muted); font-size: 11px;
+    transition: transform 0.12s ease;
+  }
+  h2.collapsed::before { transform: rotate(-90deg); }
+  h2:hover::before { color: var(--text); }
+  h3 { font-size: 16px; margin: 24px 0 8px; }
+  h4 { font-size: 14px; margin: 18px 0 6px; color: var(--accent-2); }
+  .section.collapsed { display: none; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 4px 0; }
+  p { margin: 10px 0; }
+  pre {
+    background: var(--code-bg) !important;
+    padding: 14px 16px !important;
+    border-radius: 6px; border: 1px solid var(--border);
+    overflow-x: auto; font-size: 12.5px;
+  }
+  code { font-family: "JetBrains Mono", "SF Mono", "Menlo", monospace; }
+  p code, li code, td code {
+    background: var(--panel-2); padding: 1px 5px;
+    border-radius: 3px; font-size: 12.5px; color: var(--accent-2);
+  }
+  blockquote {
+    border-left: 3px solid var(--accent); margin: 12px 0;
+    padding: 4px 14px; color: var(--muted);
+    background: var(--blockquote-bg); border-radius: 0 4px 4px 0;
+  }
+  table { border-collapse: collapse; margin: 12px 0; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; font-size: 13px; }
+  th { background: var(--panel-2); text-align: left; }
+  .mermaid {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 18px; margin: 14px 0;
+    text-align: center; overflow-x: auto;
+  }
+  .empty-state { padding: 60px 20px; text-align: center; color: var(--muted); }
+  .empty-state h2 { border: none; cursor: default; padding-left: 0; }
+  .empty-state h2::before { display: none; }
+  .drop-zone {
+    border: 2px dashed var(--border); border-radius: 8px;
+    padding: 30px; margin: 20px auto; max-width: 480px;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .drop-zone.over { border-color: var(--accent); background: var(--panel-2); }
+  .meta-line { color: var(--muted); font-size: 12px; margin-bottom: 24px; font-family: "JetBrains Mono", monospace; }
+  .error { background: var(--error-bg); border: 1px solid var(--error-border); padding: 14px 16px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <div class="brand">
+      <span>Plans Viewer</span>
+      <div class="controls">
+        <button id="collapse-all" title="Collapse all sections">Collapse</button>
+        <button id="expand-all" title="Expand all sections">Expand</button>
+      </div>
+    </div>
+    <div class="section-label" id="plan-list-label">Plans</div>
+    <ul class="plan-list" id="plan-list"></ul>
+    <div class="section-label" id="toc-label" style="display:none">On this page</div>
+    <ul class="toc" id="toc"></ul>
+  </aside>
+  <main id="content">
+    <div class="empty-state">
+      <h2>Pick a plan from the sidebar</h2>
+      <p>Or drop a <code>.md</code> file anywhere on this page.</p>
+      <div class="drop-zone" id="drop">Drop a .md file to view</div>
+    </div>
+  </main>
+</div>
+
+<script type="module">
+  // --- Theme: read ?theme= from URL, apply to <html>, swap hljs stylesheet. ---
+  const params = new URLSearchParams(location.search);
+  const theme = params.get("theme") === "light" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", theme);
+  // --- Embedded mode (?nav=hide): host app provides its own plan picker. ---
+  if (params.get("nav") === "hide") {
+    document.body.classList.add("nav-hidden");
+  }
+  const hljsLink = document.getElementById("hljs-theme");
+  hljsLink.href = theme === "light"
+    ? "https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github.min.css"
+    : "https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/styles/github-dark.min.css";
+
+  import { marked } from "https://cdn.jsdelivr.net/npm/marked@14/+esm";
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  import hljs from "https://cdn.jsdelivr.net/npm/highlight.js@11.10.0/+esm";
+
+  // Mermaid: pick palette to match Catppuccin Mocha/Latte.
+  const mermaidPalette = theme === "light"
+    ? {
+        background: "#e6e9ef",
+        primaryColor: "#dce0e8",
+        primaryBorderColor: "#ccd0da",
+        primaryTextColor: "#4c4f69",
+        lineColor: "#1e66f5",
+        tertiaryColor: "#dce0e8",
+      }
+    : {
+        background: "#181825",
+        primaryColor: "#313244",
+        primaryBorderColor: "#45475a",
+        primaryTextColor: "#cdd6f4",
+        lineColor: "#89b4fa",
+        tertiaryColor: "#313244",
+      };
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: theme === "light" ? "default" : "dark",
+    themeVariables: mermaidPalette,
+  });
+
+  const planList = document.getElementById("plan-list");
+  const toc = document.getElementById("toc");
+  const tocLabel = document.getElementById("toc-label");
+  const content = document.getElementById("content");
+  const dropZone = document.getElementById("drop");
+
+  function buildPlanHref(name) {
+    const qp = new URLSearchParams(location.search);
+    qp.set("plan", name);
+    return "?" + qp.toString();
+  }
+
+  function renderPlanList(plans, active) {
+    if (!plans.length) {
+      planList.innerHTML = `<li class="empty">No plans found in .plans/</li>`;
+      return;
+    }
+    planList.innerHTML = plans.map(p =>
+      `<li><a href="${buildPlanHref(p.name)}" class="${p.name === active ? "active" : ""}">${escapeHtml(p.title)}</a></li>`
+    ).join("");
+  }
+
+  async function fetchPlans() {
+    try {
+      const res = await fetch("/plans");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      return json.plans || [];
+    } catch (err) {
+      console.warn("plan list fetch failed", err);
+      return [];
+    }
+  }
+
+  function slugify(s) {
+    return String(s).toLowerCase().trim()
+      .replace(/[`*_]/g, "")
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-");
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function renderMarkdown(md) {
+    const renderer = new marked.Renderer();
+    const headings = [];
+    const seen = new Map();
+
+    renderer.heading = ({ tokens, depth, text }) => {
+      const t = text ?? tokens.map(tk => tk.raw ?? tk.text ?? "").join("");
+      let id = slugify(t);
+      const n = (seen.get(id) ?? 0) + 1;
+      seen.set(id, n);
+      if (n > 1) id = `${id}-${n}`;
+      if (depth >= 2 && depth <= 3) headings.push({ depth, text: t, id });
+      const inner = marked.parseInline(t);
+      return `<h${depth} id="${id}">${inner}</h${depth}>`;
+    };
+
+    renderer.code = ({ text, lang }) => {
+      if (lang === "mermaid") {
+        return `<div class="mermaid">${escapeHtml(text)}</div>`;
+      }
+      const language = lang && hljs.getLanguage(lang) ? lang : "plaintext";
+      const highlighted = hljs.highlight(text, { language, ignoreIllegals: true }).value;
+      return `<pre><code class="hljs language-${language}">${highlighted}</code></pre>`;
+    };
+
+    marked.setOptions({ renderer, gfm: true, breaks: false });
+    return { html: marked.parse(md), headings };
+  }
+
+  function wrapH2Sections(html) {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = html;
+    const out = document.createDocumentFragment();
+    let currentSection = null;
+    for (const node of Array.from(tmp.childNodes)) {
+      if (node.nodeType === 1 && node.tagName === "H2") {
+        currentSection = document.createElement("div");
+        currentSection.className = "section";
+        out.appendChild(node);
+        out.appendChild(currentSection);
+      } else if (currentSection) {
+        currentSection.appendChild(node);
+      } else {
+        out.appendChild(node);
+      }
+    }
+    const wrap = document.createElement("div");
+    wrap.appendChild(out);
+    return wrap.innerHTML;
+  }
+
+  function renderTOC(headings) {
+    if (!headings.length) {
+      tocLabel.style.display = "none";
+      toc.innerHTML = "";
+      return;
+    }
+    tocLabel.style.display = "block";
+    toc.innerHTML = headings.map(h =>
+      `<li><a href="#${h.id}" class="${h.depth === 3 ? "h3" : ""}" data-target="${h.id}">${escapeHtml(h.text)}</a></li>`
+    ).join("");
+  }
+
+  function setupCollapsing() {
+    document.querySelectorAll("main h2").forEach(h2 => {
+      h2.addEventListener("click", () => {
+        h2.classList.toggle("collapsed");
+        const section = h2.nextElementSibling;
+        if (section && section.classList.contains("section")) {
+          section.classList.toggle("collapsed");
+        }
+      });
+    });
+    document.getElementById("collapse-all").onclick = () => {
+      document.querySelectorAll("main h2").forEach(h => h.classList.add("collapsed"));
+      document.querySelectorAll("main .section").forEach(s => s.classList.add("collapsed"));
+    };
+    document.getElementById("expand-all").onclick = () => {
+      document.querySelectorAll("main h2").forEach(h => h.classList.remove("collapsed"));
+      document.querySelectorAll("main .section").forEach(s => s.classList.remove("collapsed"));
+    };
+  }
+
+  function setupTOCLinks() {
+    document.querySelectorAll(".toc a").forEach(link => {
+      link.addEventListener("click", () => {
+        const id = link.dataset.target;
+        const target = document.getElementById(id);
+        if (!target) return;
+        let section = target.closest(".section");
+        if (!section && target.tagName === "H2") section = target.nextElementSibling;
+        if (section && section.classList.contains("section") && section.classList.contains("collapsed")) {
+          section.classList.remove("collapsed");
+          const prevH2 = section.previousElementSibling;
+          if (prevH2 && prevH2.tagName === "H2") prevH2.classList.remove("collapsed");
+        }
+        if (target.tagName === "H2" && target.classList.contains("collapsed")) {
+          target.classList.remove("collapsed");
+          const sec = target.nextElementSibling;
+          if (sec && sec.classList.contains("section")) sec.classList.remove("collapsed");
+        }
+      });
+    });
+  }
+
+  function setupScrollSpy() {
+    const headings = Array.from(document.querySelectorAll("main h2[id], main h3[id]"));
+    const links = Array.from(document.querySelectorAll(".toc a"));
+    const linkById = new Map(links.map(l => [l.dataset.target, l]));
+    if (!headings.length) return;
+    const obs = new IntersectionObserver(entries => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(l => l.classList.remove("active"));
+          const link = linkById.get(e.target.id);
+          if (link) link.classList.add("active");
+        }
+      });
+    }, { rootMargin: "-10% 0px -75% 0px", threshold: 0 });
+    headings.forEach(h => obs.observe(h));
+  }
+
+  async function loadPlan(name, sourceText) {
+    let md = sourceText;
+    if (!md) {
+      try {
+        const res = await fetch(`/plans/raw/${encodeURIComponent(name)}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        md = await res.text();
+      } catch (err) {
+        content.innerHTML = `
+          <h1>Could not load ${escapeHtml(name)}</h1>
+          <div class="error">
+            <p><strong>${escapeHtml(err.message)}</strong></p>
+            <p>Check that the file exists in the active <code>.plans/</code> directory.</p>
+          </div>`;
+        return;
+      }
+    }
+    const { html, headings } = renderMarkdown(md);
+    const wrapped = wrapH2Sections(html);
+    content.innerHTML = `<div class="meta-line">${escapeHtml(name)}</div>${wrapped}`;
+    renderTOC(headings);
+    setupCollapsing();
+    setupTOCLinks();
+    try {
+      await mermaid.run({ querySelector: "main .mermaid" });
+    } catch (e) {
+      console.warn("mermaid render failed", e);
+    }
+    setupScrollSpy();
+    document.title = `${name} · Plans`;
+    if (location.hash) {
+      const el = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+      if (el) el.scrollIntoView();
+    }
+  }
+
+  function setupDrop() {
+    document.addEventListener("dragover", e => {
+      e.preventDefault();
+      dropZone?.classList.add("over");
+    });
+    document.addEventListener("dragleave", () => dropZone?.classList.remove("over"));
+    document.addEventListener("drop", (e) => {
+      e.preventDefault();
+      dropZone?.classList.remove("over");
+      const file = e.dataTransfer?.files?.[0];
+      if (!file || !file.name.endsWith(".md")) return;
+      const reader = new FileReader();
+      reader.onload = () => loadPlan(file.name, reader.result);
+      reader.readAsText(file);
+    });
+  }
+
+  const requested = params.get("plan");
+  const plans = await fetchPlans();
+  renderPlanList(plans, requested);
+  setupDrop();
+  if (requested) loadPlan(requested);
+</script>
+</body>
+</html>

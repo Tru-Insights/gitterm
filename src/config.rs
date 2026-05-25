@@ -129,7 +129,7 @@ fn default_console_expanded() -> bool {
 }
 
 fn default_log_server_enabled() -> bool {
-    false
+    true
 }
 
 #[cfg(feature = "stt")]
@@ -268,7 +268,7 @@ impl Default for Config {
             show_hidden: false,
             console_height: 200.0,
             console_expanded: true,
-            log_server_enabled: false,
+            log_server_enabled: true,
             #[cfg(feature = "stt")]
             stt_enabled: true,
             #[cfg(feature = "stt")]
