@@ -1,0 +1,43 @@
+#!/bin/sh
+# Pre-commit hook — runs the configured verification.beforeCommit set
+# (lint, check, test) to catch CI failures before they ship.
+#
+# Checked into the repo so every dev runs the same gate. To activate after
+# cloning (or after pulling this change for the first time):
+#
+#     git config core.hooksPath .githooks
+#
+# The project's AGENTS.md records this as the setup step.
+
+set -e
+
+echo "Running cargo clippy (lint)..."
+if ! cargo clippy --quiet -- -D warnings; then
+    echo ""
+    echo "ERROR: Clippy failed. Fix the errors above before committing."
+    echo "Reproduce with: cargo clippy -- -D warnings"
+    exit 1
+fi
+echo "Lint passed."
+echo ""
+
+echo "Running cargo fmt --check..."
+if ! cargo fmt -- --check; then
+    echo ""
+    echo "ERROR: Formatting drift. Run 'cargo fmt' and re-stage."
+    exit 1
+fi
+echo "Format passed."
+echo ""
+
+echo "Running cargo test..."
+if ! cargo test --quiet; then
+    echo ""
+    echo "ERROR: Tests failed. Fix the failures above before committing."
+    echo "Reproduce with: cargo test"
+    exit 1
+fi
+echo "Tests passed."
+echo ""
+
+echo "All pre-commit gates passed."

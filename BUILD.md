@@ -57,10 +57,15 @@ GitTerm depends on a custom `iced_term` fork that needs to be cloned alongside i
 git clone https://github.com/Tru-Insights/gitterm.git
 git clone https://github.com/Tru-Insights/iced_term.git iced_term_fork
 cd gitterm
-cargo build --release
+cargo build --release --features stt
 ```
 
 Binary at: `target/release/gitterm`
+
+Feature flags:
+- `stt` — voice (whisper-rs + cpal). Required for shipping.
+- `excalidraw` — diagram viewer surface. Optional.
+- `./scripts/bundle.sh` builds with both (`stt excalidraw`).
 
 ### Running
 
@@ -70,43 +75,26 @@ Binary at: `target/release/gitterm`
 
 ## Cross-Platform Builds (GitHub Actions)
 
-### Prerequisites
-Before GitHub Actions can build, you need to publish your `iced_term_fork` changes:
-
-1. **Fork iced_term to your GitHub account**
-   ```bash
-   cd ../iced_term_fork
-   git remote add myfork https://github.com/YOUR_USERNAME/iced_term.git
-   git push myfork master
-   ```
-
-2. **Update Cargo.toml to use git dependency**
-   ```toml
-   # Change from:
-   iced_term = { path = "../iced_term_fork" }
-
-   # To:
-   iced_term = { git = "https://github.com/YOUR_USERNAME/iced_term.git", branch = "master" }
-   ```
-
-3. **Push to GitHub**
-   ```bash
-   git add Cargo.toml
-   git commit -m "Use git dependency for iced_term"
-   git push
-   ```
-
-### Triggering Builds
-
-GitHub Actions will automatically build for all platforms on:
-- Push to `master` or `main` branch
-- Creating a tag (e.g., `v1.0.0`)
+GitHub Actions builds run on:
+- Push to `master`
+- Tag push (e.g. `v1.0.0`) — also creates a Release with attached binaries
 - Manual workflow dispatch
 
-**Platforms built:**
-- macOS (x86_64 Intel & aarch64 Apple Silicon) - `.app` bundle
-- Windows (x86_64) - `.exe`
-- Linux (x86_64) - binary
+**Platforms built:** macOS (x86_64 + aarch64) `.app`, Windows `.exe`, Linux binary.
+
+### Before triggering CI
+
+All three workflows (`build.yml`, `ci.yml`, `windows-build.yml`) clone
+`https://github.com/Tru-Insights/iced_term.git` master fresh on every run.
+If you've made local commits to `../iced_term_fork` that gitterm now depends
+on, **push them first** — otherwise CI compiles against the old API and fails
+with errors like `no method named X found`.
+
+```bash
+cd ../iced_term_fork
+git log @{u}..HEAD --oneline   # must be empty before CI
+git push origin master          # if it's not
+```
 
 ### Creating a Release
 

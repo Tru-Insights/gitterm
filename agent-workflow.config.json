@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "name": "gitterm-v2",
+    "instructionFile": "AGENTS.md"
+  },
+  "harnesses": {
+    "claude": true,
+    "codex": true,
+    "pi": true
+  },
+  "paths": {
+    "skillsDir": ".agents/skills",
+    "claudeCommandsDir": ".claude/commands",
+    "claudeSkillsLink": ".claude/skills",
+    "checkpointFile": ".agents/checkpoint.md",
+    "memoryFile": ".agents/memory.md",
+    "overlayDir": ".agent-workflow/overlays",
+    "preferencesFile": ".agents/preferences.md"
+  },
+  "commands": {
+    "build": "cargo build",
+    "check": "cargo fmt -- --check && cargo clippy -- -D warnings",
+    "lint": "cargo clippy -- -D warnings",
+    "test": "cargo test",
+    "dev": "cargo run"
+  },
+  "issueTracking": {
+    "provider": "linear",
+    "keyPattern": "[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}",
+    "defaultTeam": "TRU",
+    "requireIssueInCommit": true,
+    "requireIssueInPr": true
+  },
+  "git": {
+    "defaultBaseBranch": "master",
+    "protectedBranches": ["master"],
+    "hooksPath": ".githooks"
+  },
+  "github": {
+    "draftPrByDefault": true,
+    "requirePrReadyBeforeReview": true,
+    "prTemplatePath": ".github/pull_request_template.md"
+  },
+  "verification": {
+    "beforeCommit": ["lint", "check", "test"],
+    "beforePrReady": ["check", "test", "build"],
+    "allowManualVerificationNotes": true
+  },
+  "hooks": {
+    "install": true,
+    "commitMsgIssueKey": true,
+    "preCommit": true,
+    "prePush": false
+  }
+}
