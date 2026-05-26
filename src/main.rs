@@ -599,6 +599,13 @@ fn setup_menu_bar() {
 // === Speech-to-Text helpers ===
 
 #[cfg(feature = "stt")]
+const STT_MIN_RECORDING_SECONDS: f32 = 0.25;
+#[cfg(feature = "stt")]
+const STT_MIN_RMS: f32 = 0.001;
+#[cfg(feature = "stt")]
+const STT_MIN_PEAK: f32 = 0.01;
+
+#[cfg(feature = "stt")]
 fn stt_model_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -606,6 +613,25 @@ fn stt_model_path() -> PathBuf {
         .join("gitterm")
         .join("models")
         .join("ggml-base.en.bin")
+}
+
+#[cfg(feature = "stt")]
+fn stt_audio_stats(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut sum_squares = 0.0f64;
+    let mut peak = 0.0f32;
+    for &sample in samples {
+        let abs = sample.abs();
+        peak = peak.max(abs);
+        let sample = sample as f64;
+        sum_squares += sample * sample;
+    }
+
+    let rms = (sum_squares / samples.len() as f64).sqrt() as f32;
+    (rms, peak)
 }
 
 #[cfg(feature = "stt")]
@@ -622,6 +648,16 @@ fn stt_start_recording(audio_buffer: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stre
         .map_err(|e| format!("Failed to get input config: {}", e))?;
 
     let sample_rate = config.sample_rate().0;
+    let device_name = device
+        .name()
+        .unwrap_or_else(|_| "<unknown input device>".to_string());
+    eprintln!(
+        "[STT] Starting recording: device={} sample_rate={} channels={} format={:?}",
+        device_name,
+        sample_rate,
+        config.channels(),
+        config.sample_format()
+    );
 
     // Clear existing buffer
     {
@@ -7231,6 +7267,32 @@ fi
                         std::mem::take(&mut *buf)
                     };
                     if samples.is_empty() {
+                        eprintln!("[STT] Recording stopped with no audio samples");
+                        return Task::none();
+                    }
+                    let duration_secs = samples.len() as f32 / self.stt_sample_rate as f32;
+                    let (rms, peak) = stt_audio_stats(&samples);
+                    eprintln!(
+                        "[STT] Recording stopped: samples={} sample_rate={} duration={:.2}s rms={:.6} peak={:.6}",
+                        samples.len(),
+                        self.stt_sample_rate,
+                        duration_secs,
+                        rms,
+                        peak
+                    );
+                    if duration_secs < STT_MIN_RECORDING_SECONDS {
+                        eprintln!(
+                            "[STT] Ignoring recording shorter than {:.2}s",
+                            STT_MIN_RECORDING_SECONDS
+                        );
+                        return Task::none();
+                    }
+                    if rms < STT_MIN_RMS && peak < STT_MIN_PEAK {
+                        eprintln!(
+                            "[STT] Ignoring near-silent recording (rms={:.6}, peak={:.6}); check macOS microphone permission/input device",
+                            rms,
+                            peak
+                        );
                         return Task::none();
                     }
                     self.stt_transcribing = true;
@@ -14346,5 +14408,20 @@ mod tests {
     fn strip_ansi_preserves_non_escape_content() {
         let input = "line1\nline2\ttab";
         assert_eq!(ConsoleState::strip_ansi(input), input);
+    }
+
+    #[cfg(feature = "stt")]
+    #[test]
+    fn stt_audio_stats_empty() {
+        assert_eq!(stt_audio_stats(&[]), (0.0, 0.0));
+    }
+
+    #[cfg(feature = "stt")]
+    #[test]
+    fn stt_audio_stats_reports_rms_and_peak() {
+        let (rms, peak) = stt_audio_stats(&[0.0, 0.5, -0.5]);
+        let expected_rms = (0.5f32 / 3.0).sqrt();
+        assert!((rms - expected_rms).abs() < 0.000001);
+        assert_eq!(peak, 0.5);
     }
 }
