@@ -67,6 +67,7 @@ fn is_safe_relative_md_path(path: &str) -> bool {
             !segment.is_empty()
                 && segment != "."
                 && segment != ".."
+                && segment != "_archive"
                 && !segment.starts_with('.')
                 && !segment.contains('\\')
         })
@@ -92,7 +93,7 @@ fn collect_markdown_entries(root: &Path, dir: &Path, entries: &mut Vec<PlanEntry
         let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if file_name.starts_with('.') {
+        if file_name.starts_with('.') || file_name == "_archive" {
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
@@ -281,6 +282,8 @@ mod tests {
         assert!(!is_safe_relative_md_path("foo\\bar.md"));
         assert!(!is_safe_relative_md_path(".hidden.md"));
         assert!(!is_safe_relative_md_path("foo/.hidden.md"));
+        assert!(!is_safe_relative_md_path("_archive/old.md"));
+        assert!(!is_safe_relative_md_path("foo/_archive/old.md"));
         assert!(!is_safe_relative_md_path("foo//bar.md"));
         assert!(!is_safe_relative_md_path(""));
     }
@@ -305,6 +308,10 @@ mod tests {
         let hidden_dir = dir.path().join(".hidden");
         std::fs::create_dir_all(&hidden_dir).unwrap();
         std::fs::write(hidden_dir.join("ignored.md"), "# Hidden\n").unwrap();
+
+        let archive_dir = dir.path().join("_archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("old.md"), "# Old\n").unwrap();
 
         let mut entries = Vec::new();
         collect_markdown_entries(dir.path(), dir.path(), &mut entries);

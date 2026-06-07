@@ -10369,6 +10369,7 @@ fi
                     !segment.is_empty()
                         && segment != "."
                         && segment != ".."
+                        && segment != "_archive"
                         && !segment.starts_with('.')
                         && !segment.contains('\\')
                 })
@@ -10398,7 +10399,7 @@ fi
                 let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                if file_name.starts_with('.') {
+                if file_name.starts_with('.') || file_name == "_archive" {
                     continue;
                 }
                 let Ok(file_type) = entry.file_type() else {
