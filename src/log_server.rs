@@ -26,11 +26,12 @@ pub struct ServerState {
     pub files: Arc<RwLock<HashMap<usize, FileSnapshot>>>,
     pub shutdown: Arc<tokio::sync::Notify>,
     pub bound_port: Arc<std::sync::Mutex<Option<u16>>>,
-    /// Absolute path to the active workspace's `.plans/` directory, pushed by
-    /// the app whenever the active workspace changes. `None` means no
-    /// workspace is selected or its directory is unknown — in that case the
-    /// plans viewer shows an empty list rather than guessing.
+    /// Absolute paths to the active workspace's markdown document directories,
+    /// pushed by the app whenever the active workspace changes. `None` means no
+    /// workspace is selected or its directory is unknown, so viewers show an
+    /// empty list rather than guessing.
     pub plans_dir: Arc<std::sync::RwLock<Option<PathBuf>>>,
+    pub docs_dir: Arc<std::sync::RwLock<Option<PathBuf>>>,
 }
 
 impl ServerState {
@@ -41,6 +42,7 @@ impl ServerState {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             bound_port: Arc::new(std::sync::Mutex::new(None)),
             plans_dir: Arc::new(std::sync::RwLock::new(None)),
+            docs_dir: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 

@@ -3270,7 +3270,7 @@ pub enum Event {
     OpenMarkdownInBrowser,
     // Plans viewer (in-app webview, served by warp on localhost)
     OpenPlansViewer,
-    OpenPlan(String),
+    OpenPlan(plans_viewer::DocumentSource, String),
     ClosePlansViewer,
     // Window events
     WindowResized(f32, f32),
@@ -3903,16 +3903,18 @@ impl App {
         });
     }
 
-    /// Push the active workspace's `.plans/` directory into `ServerState` so
-    /// the plans viewer routes can resolve it. Call after any change to the
-    /// active workspace or to a workspace's directory.
+    /// Push the active workspace's markdown document directories into
+    /// `ServerState` so the local viewer routes can resolve them.
     fn sync_plans_dir(&self) {
-        let dir = self
+        let workspace_dir = self
             .workspaces
             .get(self.active_workspace_idx)
-            .map(|ws| ws.dir.join(".plans"));
+            .map(|ws| &ws.dir);
         if let Ok(mut p) = self.log_server_state.plans_dir.write() {
-            *p = dir;
+            *p = workspace_dir.map(|dir| dir.join(".plans"));
+        }
+        if let Ok(mut p) = self.log_server_state.docs_dir.write() {
+            *p = workspace_dir.map(|dir| dir.join("docs"));
         }
     }
 
@@ -6818,10 +6820,10 @@ fi
                     self.webview_kind = WebviewKind::None;
                     return Task::none();
                 }
-                return self.open_plans_viewer(None);
+                return self.open_plans_viewer(plans_viewer::DocumentSource::Plans, None);
             }
-            Event::OpenPlan(name) => {
-                return self.open_plans_viewer(Some(name));
+            Event::OpenPlan(source, name) => {
+                return self.open_plans_viewer(source, Some(name));
             }
             Event::ClosePlansViewer => {
                 if self.webview_kind == WebviewKind::PlansViewer {
@@ -7958,11 +7960,15 @@ fi
         })
     }
 
-    /// Build the plans-viewer URL and navigate the in-app webview to it.
-    /// If `plan` is `Some`, the viewer boots straight to that plan via
+    /// Build the markdown-viewer URL and navigate the in-app webview to it.
+    /// If `plan` is `Some`, the viewer boots straight to that file via
     /// `?plan=<name>`. Returns `Task::none()` if the log server isn't up
     /// (with a hint logged to stderr).
-    fn open_plans_viewer(&mut self, plan: Option<String>) -> Task<Event> {
+    fn open_plans_viewer(
+        &mut self,
+        source: plans_viewer::DocumentSource,
+        plan: Option<String>,
+    ) -> Task<Event> {
         let Some(base_url) = self.log_server_state.base_url() else {
             eprintln!(
                 "[plans-viewer] cannot open: log server not running (View → Toggle Local Log Server)"
@@ -7975,14 +7981,16 @@ fi
         };
         // nav=hide tells the viewer to drop its built-in plan list (gitterm's
         // sidebar already shows plans). TOC stays — it's per-document.
+        let route = source.route_segment();
         let url = match plan {
             Some(name) => format!(
-                "{}/plans/viewer?theme={}&nav=hide&plan={}",
+                "{}/{}/viewer?theme={}&nav=hide&plan={}",
                 base_url,
+                route,
                 theme_str,
                 urlencoding_simple(&name)
             ),
-            None => format!("{}/plans/viewer?theme={}&nav=hide", base_url, theme_str),
+            None => format!("{}/{}/viewer?theme={}&nav=hide", base_url, route, theme_str),
         };
         let bounds = self.calculate_webview_bounds();
         self.show_webview_url(url, bounds)
@@ -10331,21 +10339,18 @@ fi
             .into()
     }
 
-    /// Sidebar list of `.md` files from the active workspace's `.plans/`
-    /// directory. Each entry is a button — clicking opens the in-app plans
-    /// viewer with that file pre-selected. Reads the directory fresh on each
-    /// render (cheap for typical .plans sizes; cache if it ever grows).
+    /// Sidebar list of markdown files from the active workspace's `.plans/`
+    /// and `docs/` directories. Reads fresh on render; cache if it grows.
     fn view_plans_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
         let font_small = self.ui_font_small();
 
-        let plans_dir = self
+        let Some(workspace_dir) = self
             .workspaces
             .get(self.active_workspace_idx)
-            .map(|ws| ws.dir.join(".plans"));
-
-        let Some(dir) = plans_dir else {
+            .map(|ws| &ws.dir)
+        else {
             return container(
                 text("No active workspace")
                     .size(font_small)
@@ -10355,58 +10360,129 @@ fi
             .into();
         };
 
-        let mut entries: Vec<(String, String)> = Vec::new(); // (name, title)
-        if let Ok(read_dir) = std::fs::read_dir(&dir) {
+        fn is_safe_sidebar_document_path(path: &str) -> bool {
+            !path.is_empty()
+                && path.ends_with(".md")
+                && !path.starts_with('/')
+                && !path.starts_with('\\')
+                && path.split('/').all(|segment| {
+                    !segment.is_empty()
+                        && segment != "."
+                        && segment != ".."
+                        && !segment.starts_with('.')
+                        && !segment.contains('\\')
+                })
+        }
+
+        fn extract_sidebar_document_title(content: &str, fallback: &str) -> String {
+            content
+                .lines()
+                .find_map(|l| {
+                    l.trim_start()
+                        .strip_prefix("# ")
+                        .map(|s| s.trim().to_string())
+                })
+                .unwrap_or_else(|| fallback.trim_end_matches(".md").to_string())
+        }
+
+        fn collect_sidebar_document_entries(
+            root: &Path,
+            dir: &Path,
+            entries: &mut Vec<(String, String)>,
+        ) {
+            let Ok(read_dir) = std::fs::read_dir(dir) else {
+                return;
+            };
             for entry in read_dir.flatten() {
                 let path = entry.path();
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                if name.starts_with('.')
-                    || !name.ends_with(".md")
-                    || name.contains('/')
-                    || name.contains('\\')
-                {
+                if file_name.starts_with('.') {
+                    continue;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    collect_sidebar_document_entries(root, &path, entries);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Ok(rel_path) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let name = rel_path.to_string_lossy().replace('\\', "/");
+                if !is_safe_sidebar_document_path(&name) {
                     continue;
                 }
                 let content = std::fs::read_to_string(&path).unwrap_or_default();
-                let title = content
-                    .lines()
-                    .find_map(|l| {
-                        l.trim_start()
-                            .strip_prefix("# ")
-                            .map(|s| s.trim().to_string())
-                    })
-                    .unwrap_or_else(|| name.trim_end_matches(".md").to_string());
-                entries.push((name.to_string(), title));
+                let title = extract_sidebar_document_title(&content, &name);
+                entries.push((name, title));
             }
         }
-        entries.sort_by_key(|a| a.1.to_lowercase());
 
-        if entries.is_empty() {
-            return container(
-                column![
-                    text("No plans found")
-                        .size(font)
-                        .color(theme.text_primary()),
-                    text(format!("Looked in {}", dir.display()))
-                        .size(font_small)
-                        .color(theme.text_secondary()),
-                ]
-                .spacing(6),
-            )
-            .padding(16)
-            .into();
-        }
+        let collect_entries = |dir: &Path| -> Vec<(String, String)> {
+            let mut entries: Vec<(String, String)> = Vec::new();
+            collect_sidebar_document_entries(dir, dir, &mut entries);
+            entries.sort_by_key(|a| a.1.to_lowercase());
+            entries
+        };
 
         let mut list = Column::new().spacing(2).padding(8);
-        for (name, title) in entries {
-            let btn = button(text(title).size(font).color(theme.text_primary()))
-                .style(self.ghost_button_style())
-                .padding([6, 8])
-                .width(Length::Fill)
-                .on_press(Event::OpenPlan(name));
-            list = list.push(btn);
+        for (source, label, dir) in [
+            (
+                plans_viewer::DocumentSource::Plans,
+                "Plans",
+                workspace_dir.join(".plans"),
+            ),
+            (
+                plans_viewer::DocumentSource::Docs,
+                "Docs",
+                workspace_dir.join("docs"),
+            ),
+        ] {
+            list = list.push(text(label.to_uppercase()).size(10).color(theme.overlay0()));
+
+            let entries = collect_entries(&dir);
+            if entries.is_empty() {
+                list = list.push(
+                    column![
+                        text(format!("No {} found", label.to_lowercase()))
+                            .size(font_small)
+                            .color(theme.text_secondary()),
+                        text(format!("Looked in {}", dir.display()))
+                            .size(font_small)
+                            .color(theme.text_muted()),
+                    ]
+                    .spacing(2)
+                    .padding([2, 8]),
+                );
+            } else {
+                for (name, title) in entries {
+                    let button_content: Element<'_, Event, Theme, iced::Renderer> =
+                        if name.contains('/') {
+                            column![
+                                text(title).size(font).color(theme.text_primary()),
+                                text(name.clone())
+                                    .size(font_small)
+                                    .color(theme.text_muted()),
+                            ]
+                            .spacing(1)
+                            .into()
+                        } else {
+                            text(title).size(font).color(theme.text_primary()).into()
+                        };
+                    let btn = button(button_content)
+                        .style(self.ghost_button_style())
+                        .padding([6, 8])
+                        .width(Length::Fill)
+                        .on_press(Event::OpenPlan(source, name));
+                    list = list.push(btn);
+                }
+            }
         }
 
         iced::widget::scrollable(list)
