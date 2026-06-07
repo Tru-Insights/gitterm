@@ -265,7 +265,7 @@ impl Default for Config {
             scrollback_lines: 30_000,
             font_size: None,
             theme: "dark".to_string(),
-            show_hidden: false,
+            show_hidden: true,
             console_height: 200.0,
             console_expanded: true,
             log_server_enabled: true,
