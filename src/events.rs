@@ -11,4 +11,6 @@ pub enum SidebarMode {
     /// Lists `.md` files from the active workspace's `.plans/` directory.
     /// Clicking an item opens the plans viewer in the right pane.
     Plans,
+    /// Lists persistent remote tmux sessions reachable over SSH.
+    Remote,
 }

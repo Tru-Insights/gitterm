@@ -179,7 +179,7 @@ pub async fn serve(config: AgentServerConfig) -> Result<(), Box<dyn Error + Send
     Ok(())
 }
 
-pub(crate) fn is_authorized_metadata(metadata: &MetadataMap, expected_token: &str) -> bool {
+pub fn is_authorized_metadata(metadata: &MetadataMap, expected_token: &str) -> bool {
     let Some(value) = metadata.get("authorization") else {
         return false;
     };

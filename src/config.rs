@@ -132,6 +132,22 @@ fn default_log_server_enabled() -> bool {
     true
 }
 
+fn default_remote_session_shell() -> String {
+    "/bin/zsh".to_string()
+}
+
+fn default_remote_session_tmux_path() -> String {
+    "/opt/homebrew/bin/tmux".to_string()
+}
+
+pub fn default_remote_sessions() -> Vec<RemoteSessionConfig> {
+    Vec::new()
+}
+
+pub fn default_remote_agents() -> Vec<RemoteAgentConfig> {
+    Vec::new()
+}
+
 #[cfg(feature = "stt")]
 fn default_stt_enabled() -> bool {
     false
@@ -312,6 +328,70 @@ impl Config {
 pub struct WorkspacesFile {
     pub workspaces: Vec<WorkspaceConfig>,
     pub active_workspace: usize,
+    #[serde(default = "default_remote_sessions")]
+    pub remote_sessions: Vec<RemoteSessionConfig>,
+    #[serde(
+        default = "default_remote_agents",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub remote_agents: Vec<RemoteAgentConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteSessionsFile {
+    #[serde(default = "default_remote_sessions")]
+    pub remote_sessions: Vec<RemoteSessionConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteAgentsFile {
+    #[serde(default = "default_remote_agents")]
+    pub remote_agents: Vec<RemoteAgentConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSessionConfig {
+    pub label: String,
+    pub host_name: String,
+    pub ssh_target: String,
+    pub identity_file: String,
+    #[serde(default = "default_remote_session_tmux_path")]
+    pub tmux_path: String,
+    pub session_name: String,
+    pub remote_dir: String,
+    #[serde(default = "default_remote_session_shell")]
+    pub shell_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteAgentConfig {
+    pub id: String,
+    pub name: String,
+    pub endpoint: String,
+    pub auth: RemoteAgentAuthConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RemoteAgentAuthConfig {
+    Token { token_ref: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceLocationConfig {
+    Local {
+        root: String,
+    },
+    RemoteAgent {
+        remote_id: String,
+        workspace_id: String,
+        root: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +400,14 @@ pub struct WorkspaceConfig {
     pub abbrev: String,
     pub dir: String,
     pub color: WorkspaceColor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<WorkspaceLocationConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_session: Option<RemoteSessionConfig>,
+    /// Active tab index for this workspace. Older config files omit this; restore
+    /// code falls back to the workspace-root tab when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tab: Option<usize>,
     pub tabs: Vec<WorkspaceTabConfig>,
     #[serde(default)]
     pub run_command: Option<String>,
@@ -366,6 +454,58 @@ pub struct BottomTerminalConfig {
 impl WorkspacesFile {
     pub fn file_path() -> PathBuf {
         global_config_dir().join("workspaces.json")
+    }
+
+    pub fn load() -> Option<Self> {
+        let path = Self::file_path();
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path).ok()?;
+            serde_json::from_str(&contents).ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn save(&self) {
+        let path = Self::file_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+impl RemoteSessionsFile {
+    pub fn file_path() -> PathBuf {
+        global_config_dir().join("remotes.json")
+    }
+
+    pub fn load() -> Option<Self> {
+        let path = Self::file_path();
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path).ok()?;
+            serde_json::from_str(&contents).ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn save(&self) {
+        let path = Self::file_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+impl RemoteAgentsFile {
+    pub fn file_path() -> PathBuf {
+        global_config_dir().join("remote-agents.json")
     }
 
     pub fn load() -> Option<Self> {
