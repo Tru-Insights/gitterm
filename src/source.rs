@@ -204,7 +204,7 @@ impl WorkspaceSource {
                 open_file: true,
                 edit_file: false,
                 git_status: true,
-                git_diff: false,
+                git_diff: true,
                 git_worktrees: false,
                 sessions: false,
             },
@@ -330,6 +330,41 @@ impl WorkspaceSource {
                     untracked: status.untracked.into_iter().map(map).collect(),
                 })
             }
+        }
+    }
+
+    /// Diff one repo-relative file (from this source's git status). Lines
+    /// come back unshaped; presentation (word diffs, syntax highlighting)
+    /// happens on the desktop.
+    pub async fn git_diff(
+        &self,
+        file_path: String,
+        staged: bool,
+    ) -> Result<Vec<gitterm::agentd::git::FileDiffLine>, String> {
+        const MAX_UNTRACKED_PREVIEW_LINES: usize = 3000;
+        match self {
+            WorkspaceSource::Local { root } => {
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || {
+                    gitterm::agentd::git::collect_file_diff(
+                        &root,
+                        &file_path,
+                        staged,
+                        MAX_UNTRACKED_PREVIEW_LINES,
+                    )
+                })
+                .await
+                .map_err(|err| format!("git diff task failed: {err}"))
+            }
+            WorkspaceSource::RemoteAgent {
+                workspace_id,
+                root,
+                client,
+            } => RemoteAgentBackend::new(client.clone())
+                .git_diff(workspace_id.clone(), root.clone(), file_path, staged)
+                .await
+                .map(|diff| diff.lines)
+                .map_err(|err| format!("remote git diff for {root}: {err}")),
         }
     }
 

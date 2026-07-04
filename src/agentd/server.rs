@@ -9,8 +9,9 @@ use tonic::{Request, Response, Status};
 
 use super::protocol::v1::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
 use super::protocol::v1::{
-    DirEntry, GitStatusRequest, GitStatusResponse, HandshakeRequest, HandshakeResponse,
-    ListDirRequest, ListDirResponse, ReadFileChunk, ReadFileRequest,
+    DirEntry, GitDiffRequest, GitDiffResponse, GitStatusRequest, GitStatusResponse,
+    HandshakeRequest, HandshakeResponse, ListDirRequest, ListDirResponse, ReadFileChunk,
+    ReadFileRequest,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -60,6 +61,7 @@ impl GitTermAgent for GitTermAgentService {
                 "list_dir".to_string(),
                 "read_file".to_string(),
                 "git_status".to_string(),
+                "git_diff".to_string(),
             ],
         }))
     }
@@ -162,6 +164,61 @@ impl GitTermAgent for GitTermAgentService {
         .map_err(|err| Status::internal(format!("git status task failed: {err}")))?;
 
         Ok(Response::new(response))
+    }
+
+    async fn git_diff(
+        &self,
+        request: Request<GitDiffRequest>,
+    ) -> Result<Response<GitDiffResponse>, Status> {
+        let request = request.into_inner();
+        if request.workspace_id.trim().is_empty() {
+            return Err(Status::invalid_argument("workspace_id must not be empty"));
+        }
+        if request.file_path.trim().is_empty() {
+            return Err(Status::invalid_argument("file_path must not be empty"));
+        }
+        let file = Path::new(&request.file_path);
+        if file.is_absolute()
+            || file
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(Status::invalid_argument(
+                "file_path must be repo-relative without parent components",
+            ));
+        }
+        let root = canonical_dir(&request.root, "root")?;
+
+        let response = tokio::task::spawn_blocking(move || {
+            let lines =
+                super::git::collect_file_diff(&root, &request.file_path, request.staged, 3000);
+            GitDiffResponse {
+                workspace_id: request.workspace_id,
+                file_path: request.file_path,
+                staged: request.staged,
+                lines: lines.into_iter().map(proto_diff_line).collect(),
+            }
+        })
+        .await
+        .map_err(|err| Status::internal(format!("git diff task failed: {err}")))?;
+
+        Ok(Response::new(response))
+    }
+}
+
+fn proto_diff_line(line: super::git::FileDiffLine) -> super::protocol::v1::GitDiffLine {
+    use super::git::DiffLineKind;
+    use super::protocol::v1::GitDiffLineKind;
+    super::protocol::v1::GitDiffLine {
+        content: line.content,
+        kind: match line.kind {
+            DiffLineKind::Context => GitDiffLineKind::Context,
+            DiffLineKind::Addition => GitDiffLineKind::Addition,
+            DiffLineKind::Deletion => GitDiffLineKind::Deletion,
+            DiffLineKind::Header => GitDiffLineKind::Header,
+        } as i32,
+        old_line: line.old_line.unwrap_or(0),
+        new_line: line.new_line.unwrap_or(0),
     }
 }
 

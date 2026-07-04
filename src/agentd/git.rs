@@ -167,6 +167,149 @@ fn parse_porcelain_v2(stdout: &str, status: &mut RepoStatus) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineKind {
+    Context,
+    Addition,
+    Deletion,
+    Header,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiffLine {
+    pub content: String,
+    pub kind: DiffLineKind,
+    /// 1-based; `None` when the line doesn't exist on that side.
+    pub old_line: Option<u32>,
+    pub new_line: Option<u32>,
+}
+
+/// Collect the diff for one repo-relative file, staged (HEAD→index) or
+/// unstaged (index→worktree). Untracked files render as an added-lines
+/// preview capped at `max_untracked_preview_lines`.
+pub fn collect_file_diff(
+    repo_root: &Path,
+    file_path: &str,
+    is_staged: bool,
+    max_untracked_preview_lines: usize,
+) -> Vec<FileDiffLine> {
+    let mut lines = Vec::new();
+    let Ok(repo) = Repository::open(repo_root) else {
+        return lines;
+    };
+
+    // Use no_refresh + pathspec so status doesn't rewrite .git/index.lock
+    // (would contend with concurrent git commands) and only inspects this file.
+    let mut untracked_opts = StatusOptions::new();
+    untracked_opts
+        .no_refresh(true)
+        .include_untracked(true)
+        .pathspec(file_path);
+    let is_untracked = repo
+        .statuses(Some(&mut untracked_opts))
+        .ok()
+        .map(|statuses| {
+            statuses
+                .iter()
+                .any(|e| e.path() == Some(file_path) && e.status().contains(Status::WT_NEW))
+        })
+        .unwrap_or(false);
+
+    if is_untracked {
+        let full_path = repo_root.join(file_path);
+        if let Ok(content) = std::fs::read_to_string(&full_path) {
+            let total_lines = content.lines().count();
+            lines.push(FileDiffLine {
+                content: format!("@@ -0,0 +1,{} @@ (new file)", total_lines),
+                kind: DiffLineKind::Header,
+                old_line: None,
+                new_line: None,
+            });
+            for (i, line) in content
+                .lines()
+                .take(max_untracked_preview_lines)
+                .enumerate()
+            {
+                lines.push(FileDiffLine {
+                    content: line.to_string(),
+                    kind: DiffLineKind::Addition,
+                    old_line: None,
+                    new_line: Some((i + 1) as u32),
+                });
+            }
+            if total_lines > max_untracked_preview_lines {
+                lines.push(FileDiffLine {
+                    content: format!(
+                        "... truncated to first {} lines ({} total)",
+                        max_untracked_preview_lines, total_lines
+                    ),
+                    kind: DiffLineKind::Header,
+                    old_line: None,
+                    new_line: None,
+                });
+            }
+        }
+        return lines;
+    }
+
+    let mut diff_opts = git2::DiffOptions::new();
+    diff_opts.pathspec(file_path);
+    let diff = if is_staged {
+        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+        repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
+    } else {
+        repo.diff_index_to_workdir(None, Some(&mut diff_opts))
+    };
+
+    if let Ok(diff) = diff {
+        let _ = diff.print(git2::DiffFormat::Patch, |_delta, hunk, line| {
+            let content = String::from_utf8_lossy(line.content())
+                .trim_end()
+                .to_string();
+            match line.origin() {
+                'H' => {
+                    if let Some(h) = hunk {
+                        lines.push(FileDiffLine {
+                            content: format!(
+                                "@@ -{},{} +{},{} @@",
+                                h.old_start(),
+                                h.old_lines(),
+                                h.new_start(),
+                                h.new_lines()
+                            ),
+                            kind: DiffLineKind::Header,
+                            old_line: None,
+                            new_line: None,
+                        });
+                    }
+                }
+                '+' => lines.push(FileDiffLine {
+                    content,
+                    kind: DiffLineKind::Addition,
+                    old_line: None,
+                    new_line: line.new_lineno(),
+                }),
+                '-' => lines.push(FileDiffLine {
+                    content,
+                    kind: DiffLineKind::Deletion,
+                    old_line: line.old_lineno(),
+                    new_line: None,
+                }),
+                ' ' => lines.push(FileDiffLine {
+                    content,
+                    kind: DiffLineKind::Context,
+                    old_line: line.old_lineno(),
+                    new_line: line.new_lineno(),
+                }),
+                _ => {}
+            }
+            true
+        });
+    }
+
+    lines
+}
+
 pub fn status_char(status: Status, staged: bool) -> String {
     if staged {
         if status.contains(Status::INDEX_NEW) {
@@ -308,6 +451,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["untracked.txt"]
         );
+    }
+
+    #[test]
+    fn collects_diff_for_modified_and_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        git(dir.path(), &["config", "user.email", "t@example.com"]);
+        git(dir.path(), &["config", "user.name", "T"]);
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+
+        std::fs::write(dir.path().join("a.txt"), "one\nchanged\n").unwrap();
+        let lines = collect_file_diff(dir.path(), "a.txt", false, 100);
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Deletion && l.content == "two"));
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Addition && l.content == "changed"));
+
+        std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
+        let lines = collect_file_diff(dir.path(), "new.txt", false, 100);
+        assert!(matches!(lines.first(), Some(l) if l.kind == DiffLineKind::Header));
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Addition && l.content == "hello"));
     }
 
     #[test]

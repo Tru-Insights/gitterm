@@ -4833,6 +4833,69 @@ impl App {
         )
     }
 
+    /// Diff through a workspace source; local keeps the existing collector
+    /// path, remote fetches lines from the agent and shapes them (word
+    /// diffs + syntax highlighting) on the desktop.
+    fn request_source_diff(
+        source: WorkspaceSource,
+        tab_id: usize,
+        file_path: String,
+        staged: bool,
+        is_dark_theme: bool,
+    ) -> Task<Event> {
+        if let WorkspaceSource::Local { root } = source {
+            return Self::request_diff(tab_id, root, file_path, staged, is_dark_theme);
+        }
+        Task::perform(
+            async move {
+                let result = source.git_diff(file_path.clone(), staged).await;
+                tokio::task::spawn_blocking(move || {
+                    let mut lines: Vec<DiffLine> = match result {
+                        Ok(lines) => lines.into_iter().map(services::diff_line).collect(),
+                        Err(err) => vec![DiffLine {
+                            content: format!("Could not load diff: {err}"),
+                            line_type: DiffLineType::Header,
+                            old_line_num: None,
+                            new_line_num: None,
+                            inline_changes: None,
+                        }],
+                    };
+                    add_word_diffs_to_lines(&mut lines);
+                    let (syntax_lines, syntax_notice) = build_diff_syntax_highlight_lines_cached(
+                        &file_path,
+                        staged,
+                        &lines,
+                        is_dark_theme,
+                    );
+                    DiffSnapshot {
+                        tab_id,
+                        file_path,
+                        is_staged: staged,
+                        lines,
+                        diff_syntax_lines: syntax_lines,
+                        diff_syntax_notice: syntax_notice,
+                    }
+                })
+                .await
+                .unwrap_or_else(|join_err| DiffSnapshot {
+                    tab_id,
+                    file_path: String::new(),
+                    is_staged: staged,
+                    lines: vec![DiffLine {
+                        content: format!("diff task failed: {join_err}"),
+                        line_type: DiffLineType::Header,
+                        old_line_num: None,
+                        new_line_num: None,
+                        inline_changes: None,
+                    }],
+                    diff_syntax_lines: None,
+                    diff_syntax_notice: None,
+                })
+            },
+            Event::DiffLoaded,
+        )
+    }
+
     fn request_diff(
         tab_id: usize,
         repo_path: PathBuf,
@@ -7441,9 +7504,17 @@ fi
                     tab.diff_syntax_lines = None;
                     tab.diff_syntax_notice = None;
                     let tab_id = tab.id;
-                    let repo_path = tab.repo_path.clone();
                     self.mark_log_server_dirty();
-                    return Self::request_diff(tab_id, repo_path, path, is_staged, is_dark_theme);
+                    if let Ok(source) = self.source_for_active_tab() {
+                        return Self::request_source_diff(
+                            source,
+                            tab_id,
+                            path,
+                            is_staged,
+                            is_dark_theme,
+                        );
+                    }
+                    return Task::none();
                 }
             }
             Event::FileSelectByIndex(idx) => {
@@ -7488,15 +7559,17 @@ fi
                         tab.diff_syntax_lines = None;
                         tab.diff_syntax_notice = None;
                         let tab_id = tab.id;
-                        let repo_path = tab.repo_path.clone();
                         self.mark_log_server_dirty();
-                        return Self::request_diff(
-                            tab_id,
-                            repo_path,
-                            path,
-                            is_staged,
-                            is_dark_theme,
-                        );
+                        if let Ok(source) = self.source_for_active_tab() {
+                            return Self::request_source_diff(
+                                source,
+                                tab_id,
+                                path,
+                                is_staged,
+                                is_dark_theme,
+                            );
+                        }
+                        return Task::none();
                     }
                 }
             }
@@ -8395,13 +8468,14 @@ fi
                         tab.diff_load_started_at = Some(Instant::now());
                         tab.diff_syntax_lines = None;
                         tab.diff_syntax_notice = None;
-                        return Self::request_diff(
-                            tab.id,
-                            tab.repo_path.clone(),
-                            path,
-                            tab.selected_is_staged,
-                            is_dark,
-                        );
+                        let tab_id = tab.id;
+                        let is_staged = tab.selected_is_staged;
+                        if let Ok(source) = self.source_for_active_tab() {
+                            return Self::request_source_diff(
+                                source, tab_id, path, is_staged, is_dark,
+                            );
+                        }
+                        return Task::none();
                     }
                     if let Some(path) = tab.viewing_file_path().map(|p| p.to_path_buf()) {
                         if !TabState::is_image_file(&path) {
@@ -15847,6 +15921,16 @@ fi
 
         // Don't show edit button for deleted files
         if file.status == "D" {
+            return select_btn.into();
+        }
+
+        // Edit opens $EDITOR in a local terminal — only offered when the
+        // source supports editing.
+        let can_edit = self
+            .source_for_active_tab()
+            .map(|source| source.capabilities().edit_file)
+            .unwrap_or(false);
+        if !can_edit {
             return select_btn.into();
         }
 

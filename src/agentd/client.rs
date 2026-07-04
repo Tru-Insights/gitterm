@@ -7,6 +7,7 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Request;
 
 use super::protocol::v1::git_term_agent_client::GitTermAgentClient;
+use super::protocol::v1::GitDiffRequest;
 use super::protocol::v1::GitStatusRequest;
 use super::protocol::v1::HandshakeRequest;
 use super::protocol::v1::ListDirRequest;
@@ -64,6 +65,14 @@ pub struct RemoteAgentGitFile {
     pub path: String,
     pub status: String,
     pub is_staged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAgentDiff {
+    pub remote_id: String,
+    pub file_path: String,
+    pub staged: bool,
+    pub lines: Vec<crate::agentd::git::FileDiffLine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +258,60 @@ impl RemoteAgentBackend {
             staged: response.staged.into_iter().map(map).collect(),
             unstaged: response.unstaged.into_iter().map(map).collect(),
             untracked: response.untracked.into_iter().map(map).collect(),
+        })
+    }
+
+    pub async fn git_diff(
+        &self,
+        workspace_id: String,
+        root: String,
+        file_path: String,
+        staged: bool,
+    ) -> Result<RemoteAgentDiff, RemoteAgentClientError> {
+        let token = resolve_token_ref(&self.config.token_ref)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let mut client = GitTermAgentClient::new(channel);
+        let mut request = Request::new(GitDiffRequest {
+            workspace_id,
+            root,
+            file_path,
+            staged,
+        });
+
+        let auth_header = format!("Bearer {token}");
+        let auth_value = auth_header
+            .parse()
+            .map_err(|err| RemoteAgentClientError::new(format!("invalid token metadata: {err}")))?;
+        request.metadata_mut().insert("authorization", auth_value);
+
+        let response = client
+            .git_diff(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("git_diff failed: {err:?}")))?
+            .into_inner();
+
+        use super::protocol::v1::GitDiffLineKind;
+        let lines = response
+            .lines
+            .into_iter()
+            .map(|line| crate::agentd::git::FileDiffLine {
+                content: line.content,
+                kind: match GitDiffLineKind::try_from(line.kind) {
+                    Ok(GitDiffLineKind::Addition) => crate::agentd::git::DiffLineKind::Addition,
+                    Ok(GitDiffLineKind::Deletion) => crate::agentd::git::DiffLineKind::Deletion,
+                    Ok(GitDiffLineKind::Header) => crate::agentd::git::DiffLineKind::Header,
+                    _ => crate::agentd::git::DiffLineKind::Context,
+                },
+                old_line: (line.old_line > 0).then_some(line.old_line),
+                new_line: (line.new_line > 0).then_some(line.new_line),
+            })
+            .collect();
+
+        Ok(RemoteAgentDiff {
+            remote_id: self.config.remote_id.clone(),
+            file_path: response.file_path,
+            staged: response.staged,
+            lines,
         })
     }
 }

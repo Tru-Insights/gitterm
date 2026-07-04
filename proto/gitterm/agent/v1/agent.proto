@@ -7,6 +7,7 @@ service GitTermAgent {
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
   rpc ReadFile(ReadFileRequest) returns (stream ReadFileChunk);
   rpc GitStatus(GitStatusRequest) returns (GitStatusResponse);
+  rpc GitDiff(GitDiffRequest) returns (GitDiffResponse);
 }
 
 message HandshakeRequest {
@@ -81,4 +82,36 @@ message GitFileStatus {
   // Single-letter porcelain status: A/M/D/R/?.
   string status = 2;
   bool is_staged = 3;
+}
+
+message GitDiffRequest {
+  string workspace_id = 1;
+  string root = 2;
+  // Repo-relative path from GitStatusResponse; absolute or parent-escaping
+  // paths are rejected.
+  string file_path = 3;
+  bool staged = 4;
+}
+
+message GitDiffResponse {
+  string workspace_id = 1;
+  string file_path = 2;
+  bool staged = 3;
+  repeated GitDiffLine lines = 4;
+}
+
+enum GitDiffLineKind {
+  GIT_DIFF_LINE_KIND_UNSPECIFIED = 0;
+  GIT_DIFF_LINE_KIND_CONTEXT = 1;
+  GIT_DIFF_LINE_KIND_ADDITION = 2;
+  GIT_DIFF_LINE_KIND_DELETION = 3;
+  GIT_DIFF_LINE_KIND_HEADER = 4;
+}
+
+message GitDiffLine {
+  string content = 1;
+  GitDiffLineKind kind = 2;
+  // 1-based; 0 means the line doesn't exist on that side.
+  uint32 old_line = 3;
+  uint32 new_line = 4;
 }

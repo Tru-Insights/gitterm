@@ -9,7 +9,6 @@ use crate::{
     LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES, MAX_FULL_TEXT_LOAD_BYTES,
     MAX_INLINE_WEBVIEW_BYTES,
 };
-use git2::{DiffOptions, Repository, Status, StatusOptions};
 use std::path::PathBuf;
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -325,159 +324,17 @@ pub(crate) fn collect_diff(
     is_staged: bool,
 ) -> DiffSnapshot {
     let started = Instant::now();
-    let mut lines = Vec::new();
-    let Ok(repo) = Repository::open(&repo_path) else {
-        let snapshot = DiffSnapshot {
-            tab_id,
-            file_path,
-            is_staged,
-            lines,
-            diff_syntax_lines: None,
-            diff_syntax_notice: None,
-        };
-        perf_log!(
-            "diff tab={} file={} staged={} lines={} took={}ms (repo open failed)",
-            tab_id,
-            snapshot.file_path,
-            snapshot.is_staged,
-            snapshot.lines.len(),
-            started.elapsed().as_millis()
-        );
-        return snapshot;
-    };
 
-    // Use no_refresh + pathspec so status doesn't rewrite .git/index.lock
-    // (would contend with concurrent git commands) and only inspects this file.
-    let mut untracked_opts = StatusOptions::new();
-    untracked_opts
-        .no_refresh(true)
-        .include_untracked(true)
-        .pathspec(&file_path);
-    let is_untracked = repo
-        .statuses(Some(&mut untracked_opts))
-        .ok()
-        .map(|statuses| {
-            statuses.iter().any(|e| {
-                e.path() == Some(file_path.as_str()) && e.status().contains(Status::WT_NEW)
-            })
-        })
-        .unwrap_or(false);
-
-    if is_untracked {
-        let full_path = repo_path.join(&file_path);
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
-            let total_lines = content.lines().count();
-            lines.push(DiffLine {
-                content: format!("@@ -0,0 +1,{} @@ (new file)", total_lines),
-                line_type: DiffLineType::Header,
-                old_line_num: None,
-                new_line_num: None,
-                inline_changes: None,
-            });
-            for (i, line) in content
-                .lines()
-                .take(MAX_UNTRACKED_DIFF_PREVIEW_LINES)
-                .enumerate()
-            {
-                lines.push(DiffLine {
-                    content: line.to_string(),
-                    line_type: DiffLineType::Addition,
-                    old_line_num: None,
-                    new_line_num: Some((i + 1) as u32),
-                    inline_changes: None,
-                });
-            }
-            if total_lines > MAX_UNTRACKED_DIFF_PREVIEW_LINES {
-                lines.push(DiffLine {
-                    content: format!(
-                        "... truncated to first {} lines ({} total)",
-                        MAX_UNTRACKED_DIFF_PREVIEW_LINES, total_lines
-                    ),
-                    line_type: DiffLineType::Header,
-                    old_line_num: None,
-                    new_line_num: None,
-                    inline_changes: None,
-                });
-            }
-        }
-        let snapshot = DiffSnapshot {
-            tab_id,
-            file_path,
-            is_staged,
-            lines,
-            diff_syntax_lines: None,
-            diff_syntax_notice: None,
-        };
-        perf_log!(
-            "diff tab={} file={} staged={} lines={} took={}ms (untracked preview)",
-            tab_id,
-            snapshot.file_path,
-            snapshot.is_staged,
-            snapshot.lines.len(),
-            started.elapsed().as_millis()
-        );
-        return snapshot;
-    }
-
-    let mut diff_opts = DiffOptions::new();
-    diff_opts.pathspec(&file_path);
-    let diff = if is_staged {
-        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-        repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))
-    } else {
-        repo.diff_index_to_workdir(None, Some(&mut diff_opts))
-    };
-
-    if let Ok(diff) = diff {
-        let _ = diff.print(git2::DiffFormat::Patch, |_delta, hunk, line| {
-            let content = String::from_utf8_lossy(line.content())
-                .trim_end()
-                .to_string();
-            match line.origin() {
-                'H' => {
-                    if let Some(h) = hunk {
-                        lines.push(DiffLine {
-                            content: format!(
-                                "@@ -{},{} +{},{} @@",
-                                h.old_start(),
-                                h.old_lines(),
-                                h.new_start(),
-                                h.new_lines()
-                            ),
-                            line_type: DiffLineType::Header,
-                            old_line_num: None,
-                            new_line_num: None,
-                            inline_changes: None,
-                        });
-                    }
-                }
-                '+' => lines.push(DiffLine {
-                    content,
-                    line_type: DiffLineType::Addition,
-                    old_line_num: None,
-                    new_line_num: line.new_lineno(),
-                    inline_changes: None,
-                }),
-                '-' => lines.push(DiffLine {
-                    content,
-                    line_type: DiffLineType::Deletion,
-                    old_line_num: line.old_lineno(),
-                    new_line_num: None,
-                    inline_changes: None,
-                }),
-                ' ' => lines.push(DiffLine {
-                    content,
-                    line_type: DiffLineType::Context,
-                    old_line_num: line.old_lineno(),
-                    new_line_num: line.new_lineno(),
-                    inline_changes: None,
-                }),
-                _ => {}
-            }
-            true
-        });
-        add_word_diffs_to_lines(&mut lines);
-    }
+    let mut lines: Vec<DiffLine> = gitterm::agentd::git::collect_file_diff(
+        &repo_path,
+        &file_path,
+        is_staged,
+        MAX_UNTRACKED_DIFF_PREVIEW_LINES,
+    )
+    .into_iter()
+    .map(diff_line)
+    .collect();
+    add_word_diffs_to_lines(&mut lines);
 
     let snapshot = DiffSnapshot {
         tab_id,
@@ -498,6 +355,22 @@ pub(crate) fn collect_diff(
     );
 
     snapshot
+}
+
+pub(crate) fn diff_line(line: gitterm::agentd::git::FileDiffLine) -> DiffLine {
+    use gitterm::agentd::git::DiffLineKind;
+    DiffLine {
+        content: line.content,
+        line_type: match line.kind {
+            DiffLineKind::Context => DiffLineType::Context,
+            DiffLineKind::Addition => DiffLineType::Addition,
+            DiffLineKind::Deletion => DiffLineType::Deletion,
+            DiffLineKind::Header => DiffLineType::Header,
+        },
+        old_line_num: line.old_line,
+        new_line_num: line.new_line,
+        inline_changes: None,
+    }
 }
 
 pub(crate) fn collect_file_load(
