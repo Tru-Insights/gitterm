@@ -382,34 +382,35 @@ Goal: same Files panel works for local and remote through the backend facade.
 - [x] Route Files tab through active workspace backend.
 - [x] Support folder navigation.
 - [x] Add loading/error states for file tree.
-- [ ] Implement `ReadFile` for preview after listing works.
+- [x] Implement `ReadFile` for preview after listing works.
 - [x] Keep write/edit actions disabled for remote until explicitly implemented.
 
 Acceptance:
 
 - [x] Local Files behavior unchanged.
-- [ ] Remote Files shows actual remote repo files after deploying the updated
+- [x] Remote Files shows actual remote repo files after deploying the updated
       agent binary.
 - [x] Navigating remote directories never reads local filesystem.
-- [ ] Clicking remote file can preview content once `ReadFile` lands.
+- [x] Clicking remote file can preview content once `ReadFile` lands.
 
 ### Phase 5 - Backend-Driven Git
 
 Goal: same Git panel works for local and remote.
 
-- [ ] Extract git status request/result into backend-shaped types.
-- [ ] Implement agent `GitStatus`.
+- [x] Extract git status request/result into backend-shaped types.
+- [x] Implement agent `GitStatus`.
 - [ ] Implement agent `GitWorktrees`.
-- [ ] Implement agent `GitDiff`.
-- [ ] Route Git tab through active workspace backend.
-- [ ] Preserve current branch/worktree UI.
+- [x] Implement agent `GitDiff`.
+- [x] Route Git tab through active workspace backend.
+- [x] Preserve current branch/worktree UI (worktrees stay local-only until
+      the worktrees RPC lands).
 
 Acceptance:
 
-- [ ] Local Git behavior unchanged.
-- [ ] Remote Git shows status for remote repo.
+- [x] Local Git behavior unchanged.
+- [x] Remote Git shows status for remote repo.
 - [ ] Remote branches/worktrees do not show local branches/worktrees.
-- [ ] Errors include remote path and command context.
+- [x] Errors include remote path and command context.
 
 ### Phase 6 - Session Runtime And Terminal Streaming
 
@@ -427,30 +428,31 @@ AttachTerminal stream in raw mode. Desktop terminal tabs run that CLI as
 their startup command inside the existing local iced_term machinery — no
 terminal-emulator changes, and the CLI works from any terminal.
 
-- [ ] Define `SessionKind` and `Session` protocol messages.
-- [ ] Implement agent session registry.
-- [ ] Implement `ListSessions`.
-- [ ] Implement `StartSession`.
-- [ ] Implement `StopSession`.
-- [ ] Implement bidirectional `AttachTerminal`.
-- [ ] Decide direct PTY vs tmux-behind-agent for the first implementation.
-- [ ] Update desktop tab creation so remote sessions behave like local terminal
-      tabs.
+- [x] Define `SessionKind` and `Session` protocol messages.
+- [x] Implement agent session registry.
+- [x] Implement `ListSessions`.
+- [x] Implement `StartSession`.
+- [x] Implement `StopSession`.
+- [x] Implement bidirectional `AttachTerminal`.
+- [x] Decide direct PTY vs tmux-behind-agent for the first implementation.
+- [x] Update desktop tab creation so remote sessions behave like local terminal
+      tabs (attach CLI inside a normal local tab).
 
 Acceptance:
 
-- [ ] Multiple remote shell sessions can run at once.
-- [ ] Multiple remote Codex sessions can run at once.
-- [ ] Multiple remote Claude sessions can run at once.
+- [x] Multiple remote shell sessions can run at once.
+- [x] Multiple remote Codex sessions can run at once.
+- [x] Multiple remote Claude sessions can run at once.
 - [ ] Pi is modeled as a peer session kind, not a later special case.
-- [ ] Laptop disconnect/reconnect does not stop remote sessions while agent is
+- [x] Laptop disconnect/reconnect does not stop remote sessions while agent is
       running.
 
 ### Phase 7 - Remote Agent Tabs
 
 Goal: the existing local agent-tab direction works against remote sessions too.
 
-- [ ] Ensure Codex/Claude/Pi launch commands are configured per remote.
+- [x] Ensure Codex/Claude/Pi launch commands are configured per remote
+      (`session_commands` in remote-agents.json).
 - [ ] Represent agent sessions with the same session model as shell sessions.
 - [ ] Feed remote agent stream events to the same UI surfaces as local agent
       tabs where possible.
@@ -458,8 +460,8 @@ Goal: the existing local agent-tab direction works against remote sessions too.
 
 Acceptance:
 
-- [ ] User can create remote Codex/Claude/Pi sessions from a remote workspace.
-- [ ] The existing option-click "+" launcher works identically in remote
+- [x] User can create remote Codex/Claude/Pi sessions from a remote workspace.
+- [x] The existing option-click "+" launcher works identically in remote
       workspaces for every configured harness (Claude, Codex, pi, custom
       commands), driven by backend session capabilities — no separate remote
       launcher UI and no remote conditionals in the launcher code.
