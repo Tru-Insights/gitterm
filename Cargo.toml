@@ -19,6 +19,7 @@ rfd = "0.15"
 similar = "2.6"
 warp = "0.3"
 tonic = { version = "0.12", features = ["transport", "tls-roots"] }
+portable-pty = "0.8"
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "process", "io-util", "macros"] }
 tokio-stream = { version = "0.1", features = ["net"] }

@@ -206,7 +206,7 @@ impl WorkspaceSource {
                 git_status: true,
                 git_diff: true,
                 git_worktrees: false,
-                sessions: false,
+                sessions: true,
             },
         }
     }

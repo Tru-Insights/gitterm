@@ -373,6 +373,15 @@ pub struct RemoteAgentConfig {
     pub name: String,
     pub endpoint: String,
     pub auth: RemoteAgentAuthConfig,
+    /// Shell command for plain sessions; run via `/bin/sh -lc` on the
+    /// remote. Defaults to a login zsh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_command: Option<String>,
+    /// Launch commands per agent-preset name (lowercased), e.g.
+    /// {"claude": "/Users/me/.local/bin/claude"}. Unlisted presets fall
+    /// back to their lowercase name on the remote PATH.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub session_commands: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

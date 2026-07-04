@@ -12,6 +12,10 @@ use super::protocol::v1::GitStatusRequest;
 use super::protocol::v1::HandshakeRequest;
 use super::protocol::v1::ListDirRequest;
 use super::protocol::v1::ReadFileRequest;
+use super::protocol::v1::{
+    terminal_input, AttachRequest, EnvVar, ListSessionsRequest, Resize, StartSessionRequest,
+    StopSessionRequest, TerminalInput,
+};
 use super::server::PROTOCOL_VERSION;
 
 #[derive(Debug, Clone)]
@@ -73,6 +77,41 @@ pub struct RemoteAgentDiff {
     pub file_path: String,
     pub staged: bool,
     pub lines: Vec<crate::agentd::git::FileDiffLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAgentSession {
+    pub session_id: String,
+    pub workspace_id: String,
+    pub kind: String,
+    pub command: String,
+    pub cwd: String,
+    pub running: bool,
+    pub exit_code: i32,
+    pub created_unix_secs: u64,
+}
+
+/// An attached session: the input/resize sender plus the live output
+/// stream (scrollback replay arrives first).
+pub type TerminalAttachment = (
+    tokio::sync::mpsc::Sender<TerminalSend>,
+    std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<TerminalRecv, RemoteAgentClientError>> + Send>,
+    >,
+);
+
+/// Messages the attach bridge sends after the initial attach.
+#[derive(Debug, Clone)]
+pub enum TerminalSend {
+    Data(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+}
+
+/// Output events received from an attached session.
+#[derive(Debug, Clone)]
+pub enum TerminalRecv {
+    Data(Vec<u8>),
+    Exited(i32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +353,176 @@ impl RemoteAgentBackend {
             lines,
         })
     }
+
+    pub async fn list_sessions(
+        &self,
+        workspace_id: String,
+    ) -> Result<Vec<RemoteAgentSession>, RemoteAgentClientError> {
+        let mut request = Request::new(ListSessionsRequest { workspace_id });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .list_sessions(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("list_sessions failed: {err:?}")))?
+            .into_inner();
+        Ok(response
+            .sessions
+            .into_iter()
+            .map(session_from_proto)
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_session(
+        &self,
+        workspace_id: String,
+        cwd: String,
+        kind: String,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<RemoteAgentSession, RemoteAgentClientError> {
+        let mut request = Request::new(StartSessionRequest {
+            workspace_id,
+            cwd,
+            kind,
+            command,
+            env: env
+                .into_iter()
+                .map(|(name, value)| EnvVar { name, value })
+                .collect(),
+            cols: cols as u32,
+            rows: rows as u32,
+        });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .start_session(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("start_session failed: {err:?}")))?
+            .into_inner();
+        Ok(session_from_proto(response))
+    }
+
+    pub async fn stop_session(&self, session_id: String) -> Result<bool, RemoteAgentClientError> {
+        let mut request = Request::new(StopSessionRequest { session_id });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .stop_session(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("stop_session failed: {err:?}")))?
+            .into_inner();
+        Ok(response.stopped)
+    }
+
+    /// Attach to a session: returns a sender for input/resizes and the
+    /// live output stream (recent scrollback replays first). The connection
+    /// has no request timeout — it lives as long as the session/attach.
+    pub async fn attach_terminal(
+        &self,
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    ) -> Result<TerminalAttachment, RemoteAgentClientError> {
+        use tokio_stream::StreamExt;
+
+        let token = resolve_token_ref(&self.config.token_ref)?;
+        // No per-request timeout: this stream is long-lived by design.
+        let endpoint = Endpoint::from_shared(self.config.endpoint.clone())
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!(
+                    "invalid endpoint {}: {err}",
+                    self.config.endpoint
+                ))
+            })?
+            .connect_timeout(Duration::from_secs(5));
+        let endpoint = if self.config.endpoint.starts_with("https://") {
+            endpoint
+                .tls_config(ClientTlsConfig::new().with_enabled_roots())
+                .map_err(|err| RemoteAgentClientError::new(format!("invalid TLS config: {err}")))?
+        } else {
+            endpoint
+        };
+        let channel = endpoint.connect().await.map_err(|err| {
+            RemoteAgentClientError::new(format!(
+                "could not connect to {}: {err:?}",
+                self.config.endpoint
+            ))
+        })?;
+
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel::<TerminalSend>(64);
+        let attach = TerminalInput {
+            input: Some(terminal_input::Input::Attach(AttachRequest {
+                session_id,
+                cols: cols as u32,
+                rows: rows as u32,
+            })),
+        };
+        let outbound = tokio_stream::once(attach).chain(
+            tokio_stream::wrappers::ReceiverStream::new(input_rx).map(|send| match send {
+                TerminalSend::Data(data) => TerminalInput {
+                    input: Some(terminal_input::Input::Data(data)),
+                },
+                TerminalSend::Resize { cols, rows } => TerminalInput {
+                    input: Some(terminal_input::Input::Resize(Resize {
+                        cols: cols as u32,
+                        rows: rows as u32,
+                    })),
+                },
+            }),
+        );
+
+        let mut request = Request::new(outbound);
+        let auth_value = format!("Bearer {token}")
+            .parse()
+            .map_err(|err| RemoteAgentClientError::new(format!("invalid token metadata: {err}")))?;
+        request.metadata_mut().insert("authorization", auth_value);
+
+        let stream = GitTermAgentClient::new(channel)
+            .attach_terminal(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("attach_terminal failed: {err:?}")))?
+            .into_inner();
+
+        use super::protocol::v1::terminal_output;
+        let output = stream.map(|item| {
+            item.map_err(|err| RemoteAgentClientError::new(format!("attach stream: {err:?}")))
+                .map(|out| match out.output {
+                    Some(terminal_output::Output::Data(data)) => TerminalRecv::Data(data),
+                    Some(terminal_output::Output::Exited(exited)) => {
+                        TerminalRecv::Exited(exited.exit_code)
+                    }
+                    None => TerminalRecv::Data(Vec::new()),
+                })
+        });
+
+        Ok((input_tx, Box::pin(output)))
+    }
+
+    fn authorize<T>(&self, request: &mut Request<T>) -> Result<(), RemoteAgentClientError> {
+        let token = resolve_token_ref(&self.config.token_ref)?;
+        let auth_value = format!("Bearer {token}")
+            .parse()
+            .map_err(|err| RemoteAgentClientError::new(format!("invalid token metadata: {err}")))?;
+        request.metadata_mut().insert("authorization", auth_value);
+        Ok(())
+    }
+}
+
+fn session_from_proto(session: super::protocol::v1::Session) -> RemoteAgentSession {
+    RemoteAgentSession {
+        session_id: session.session_id,
+        workspace_id: session.workspace_id,
+        kind: session.kind,
+        command: session.command,
+        cwd: session.cwd,
+        running: session.running,
+        exit_code: session.exit_code,
+        created_unix_secs: session.created_unix_secs,
+    }
 }
 
 async fn connect_channel(endpoint: &str) -> Result<Channel, RemoteAgentClientError> {
@@ -535,6 +744,99 @@ mod tests {
         assert_eq!(handshake.agent_name, "phase3-agent");
         assert_eq!(handshake.protocol_version, PROTOCOL_VERSION);
         assert!(handshake.capabilities.contains(&"handshake".to_string()));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_session_lifecycle_over_grpc() {
+        use tokio_stream::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected_token = Arc::new("sess-secret".to_string());
+        let service = GitTermAgentServer::with_interceptor(
+            GitTermAgentService::new("sess-agent".to_string()),
+            move |request: Request<()>| {
+                if is_authorized_metadata(request.metadata(), expected_token.as_str()) {
+                    Ok(request)
+                } else {
+                    Err(tonic::Status::unauthenticated("bad token"))
+                }
+            },
+        );
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        std::env::set_var("GITTERM_AGENT_SESS_TEST_TOKEN", "sess-secret");
+        let backend = RemoteAgentBackend::new(RemoteAgentClientConfig {
+            remote_id: "sess".to_string(),
+            name: "sess".to_string(),
+            endpoint: format!("http://{addr}"),
+            token_ref: "env:GITTERM_AGENT_SESS_TEST_TOKEN".to_string(),
+        });
+
+        let session = backend
+            .start_session(
+                "ws".to_string(),
+                std::env::temp_dir().to_string_lossy().to_string(),
+                "shell".to_string(),
+                vec!["/bin/cat".to_string()],
+                Vec::new(),
+                80,
+                24,
+            )
+            .await
+            .unwrap();
+        assert!(session.running);
+
+        let listed = backend.list_sessions("ws".to_string()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, session.session_id);
+
+        let (input_tx, output) = backend
+            .attach_terminal(session.session_id.clone(), 80, 24)
+            .await
+            .unwrap();
+        input_tx
+            .send(TerminalSend::Data(b"round-trip\n".to_vec()))
+            .await
+            .unwrap();
+
+        tokio::pin!(output);
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !seen.contains("round-trip") {
+            let item = tokio::time::timeout_at(deadline, output.next())
+                .await
+                .expect("echo before deadline")
+                .expect("stream open");
+            match item.unwrap() {
+                TerminalRecv::Data(data) => seen.push_str(&String::from_utf8_lossy(&data)),
+                TerminalRecv::Exited(code) => panic!("unexpected exit {code}: {seen:?}"),
+            }
+        }
+
+        assert!(backend
+            .stop_session(session.session_id.clone())
+            .await
+            .unwrap());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let item = tokio::time::timeout_at(deadline, output.next())
+                .await
+                .expect("exit before deadline");
+            match item {
+                Some(Ok(TerminalRecv::Exited(_))) | None => break,
+                Some(Ok(TerminalRecv::Data(_))) => continue,
+                Some(Err(err)) => panic!("stream error: {err}"),
+            }
+        }
 
         server.abort();
     }

@@ -416,6 +416,17 @@ Acceptance:
 Goal: remote shell/codex/claude/pi/custom sessions are first-class and
 multi-instance.
 
+**Decision (2026-07-03):** direct agent-owned PTY supervision, no tmux. The
+agent is the durable host: sessions keep running when the desktop
+disconnects; an output ring buffer replays recent scrollback on reattach.
+(Sessions do not survive an agent restart — tmux-behind-agent remains the
+upgrade path if that matters later.)
+
+**Desktop attach:** a `gitterm-agent attach` CLI bridges stdio to the
+AttachTerminal stream in raw mode. Desktop terminal tabs run that CLI as
+their startup command inside the existing local iced_term machinery — no
+terminal-emulator changes, and the CLI works from any terminal.
+
 - [ ] Define `SessionKind` and `Session` protocol messages.
 - [ ] Implement agent session registry.
 - [ ] Implement `ListSessions`.

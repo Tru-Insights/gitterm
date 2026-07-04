@@ -3515,6 +3515,7 @@ pub enum Event {
     AgentConversationLoaded(usize, agent::Conversation),
     SelectAgentCapture(usize),
     LaunchAgentPreset(usize),
+    RemoteSessionLaunched(Result<(String, String), String>),
     // Resume agent preset session by index
     ResumeAgentPreset(usize),
     // Live agent tab (TabKind::Agent) — Step 3 of TRU-29.
@@ -5524,6 +5525,127 @@ impl App {
         workspace.active_tab = workspace.tabs.len() - 1;
     }
 
+    /// Open a new session tab through the active workspace's source: local
+    /// sources spawn the usual local terminal; remote-agent sources start a
+    /// session on the agent and the tab attaches to it.
+    fn launch_session_tab(
+        &mut self,
+        preset_name: Option<String>,
+        local_command: Option<String>,
+    ) -> Task<Event> {
+        let remote = match self.source_for_active_tab() {
+            Ok(source @ WorkspaceSource::RemoteAgent { .. }) if source.capabilities().sessions => {
+                Some(source)
+            }
+            _ => None,
+        };
+
+        let Some(WorkspaceSource::RemoteAgent {
+            workspace_id,
+            root,
+            client,
+        }) = remote
+        else {
+            // Local flow, unchanged.
+            if let Some(ws) = self.active_workspace() {
+                let dir = ws
+                    .active_tab()
+                    .map(|t| t.current_dir.clone())
+                    .unwrap_or_else(|| ws.dir.clone());
+                self.add_tab_with_command(dir, local_command);
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
+                if let Some((tab_id, repo_path)) = {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.git_status_loading = true;
+                        Some((tab.id, tab.repo_path.clone()))
+                    } else {
+                        None
+                    }
+                } {
+                    return Task::batch([
+                        self.scroll_to_active_tab(),
+                        self.request_git_status_for_active_source(tab_id, repo_path),
+                    ]);
+                }
+                return self.scroll_to_active_tab();
+            }
+            return Task::none();
+        };
+
+        // Resolve what to run on the remote from per-remote config.
+        let agent_config = self
+            .active_workspace()
+            .and_then(|ws| self.remote_agent_config_for_workspace(ws))
+            .cloned();
+        let kind = preset_name
+            .as_deref()
+            .map(|name| name.to_lowercase())
+            .unwrap_or_else(|| "shell".to_string());
+        let remote_command = match (&preset_name, &agent_config) {
+            (Some(name), Some(config)) => config
+                .session_commands
+                .get(&name.to_lowercase())
+                .cloned()
+                .unwrap_or_else(|| name.to_lowercase()),
+            (Some(name), None) => name.to_lowercase(),
+            (None, Some(config)) => config
+                .shell_command
+                .clone()
+                .unwrap_or_else(|| "/bin/zsh -il".to_string()),
+            (None, None) => "/bin/zsh -il".to_string(),
+        };
+        // Start the session in the directory the user is browsing.
+        let cwd = self
+            .active_tab()
+            .map(|tab| tab.files.dir.display())
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(|| root.clone());
+
+        Task::perform(
+            async move {
+                RemoteAgentBackend::new(client)
+                    .start_session(
+                        workspace_id,
+                        cwd,
+                        kind.clone(),
+                        vec!["/bin/sh".to_string(), "-lc".to_string(), remote_command],
+                        Vec::new(),
+                        120,
+                        32,
+                    )
+                    .await
+                    .map(|session| (session.session_id, kind))
+                    .map_err(|err| err.to_string())
+            },
+            Event::RemoteSessionLaunched,
+        )
+    }
+
+    /// The local attach command for a remote session: the gitterm-agent
+    /// binary next to the running executable (or on PATH) bridging stdio
+    /// to the AttachTerminal stream.
+    fn remote_session_attach_command(&self, session_id: &str) -> Option<String> {
+        let workspace = self.active_workspace()?;
+        let config = self.remote_agent_config_for_workspace(workspace)?;
+        let token_ref = match &config.auth {
+            config::RemoteAgentAuthConfig::Token { token_ref } => token_ref.clone(),
+        };
+        let agent_bin = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("gitterm-agent")))
+            .filter(|path| path.exists())
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "gitterm-agent".to_string());
+        Some(format!(
+            "{} attach --endpoint {} --token-ref {} --session {}",
+            shell_quote(&agent_bin),
+            shell_quote(&config.endpoint),
+            shell_quote(&token_ref),
+            shell_quote(session_id),
+        ))
+    }
+
     fn add_tab(&mut self, repo_path: PathBuf) {
         let tab = self.create_tab(repo_path, None);
         if let Some(ws) = self.active_workspace_mut() {
@@ -6969,60 +7091,27 @@ fi
                     self.tab_picker_visible = true;
                 } else {
                     self.tab_picker_visible = false;
-                    let command = self.agent_presets.get(idx).map(|p| p.command.clone());
-                    if let Some(ws) = self.active_workspace() {
-                        let dir = ws
-                            .active_tab()
-                            .map(|t| t.current_dir.clone())
-                            .unwrap_or_else(|| ws.dir.clone());
-                        self.add_tab_with_command(dir, command);
-                        self.mark_workspaces_dirty();
-                        self.mark_log_server_dirty();
-                        if let Some((tab_id, repo_path)) = {
-                            if let Some(tab) = self.active_tab_mut() {
-                                tab.git_status_loading = true;
-                                Some((tab.id, tab.repo_path.clone()))
-                            } else {
-                                None
-                            }
-                        } {
-                            return Task::batch([
-                                self.scroll_to_active_tab(),
-                                self.request_git_status_for_active_source(tab_id, repo_path),
-                            ]);
-                        }
-                        return self.scroll_to_active_tab();
+                    let preset = self
+                        .agent_presets
+                        .get(idx)
+                        .map(|p| (p.name.clone(), p.command.clone()));
+                    if let Some((name, command)) = preset {
+                        return self.launch_session_tab(Some(name), Some(command));
                     }
                 }
             }
             Event::ResumeAgentPreset(idx) => {
                 self.tab_picker_visible = false;
-                let command = self
-                    .agent_presets
-                    .get(idx)
-                    .and_then(|p| p.resume_command.clone().or_else(|| Some(p.command.clone())));
-                if let Some(ws) = self.active_workspace() {
-                    let dir = ws
-                        .active_tab()
-                        .map(|t| t.current_dir.clone())
-                        .unwrap_or_else(|| ws.dir.clone());
-                    self.add_tab_with_command(dir, command);
-                    self.mark_workspaces_dirty();
-                    self.mark_log_server_dirty();
-                    if let Some((tab_id, repo_path)) = {
-                        if let Some(tab) = self.active_tab_mut() {
-                            tab.git_status_loading = true;
-                            Some((tab.id, tab.repo_path.clone()))
-                        } else {
-                            None
-                        }
-                    } {
-                        return Task::batch([
-                            self.scroll_to_active_tab(),
-                            self.request_git_status_for_active_source(tab_id, repo_path),
-                        ]);
-                    }
-                    return self.scroll_to_active_tab();
+                let preset = self.agent_presets.get(idx).map(|p| {
+                    (
+                        p.name.clone(),
+                        p.resume_command
+                            .clone()
+                            .unwrap_or_else(|| p.command.clone()),
+                    )
+                });
+                if let Some((name, command)) = preset {
+                    return self.launch_session_tab(Some(name), Some(command));
                 }
             }
             Event::AgentWebviewIpc(msg) => {
@@ -7239,32 +7328,41 @@ fi
                 }
             }
             Event::NewPlainTab => {
-                // Create a plain terminal tab (no startup command)
+                // New session tab through the active workspace's source.
                 self.tab_picker_visible = false;
-                if let Some(ws) = self.active_workspace() {
-                    let dir = ws
-                        .active_tab()
-                        .map(|t| t.current_dir.clone())
-                        .unwrap_or_else(|| ws.dir.clone());
-                    self.add_tab_with_command(dir, None);
+                return self.launch_session_tab(None, None);
+            }
+            Event::RemoteSessionLaunched(result) => match result {
+                Ok((session_id, kind)) => {
+                    let Some(attach_command) = self.remote_session_attach_command(&session_id)
+                    else {
+                        eprintln!(
+                            "remote session {session_id} started but the workspace lost its \
+                             agent config before attach"
+                        );
+                        return Task::none();
+                    };
+                    let local_cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                    self.add_tab_with_command(local_cwd, Some(attach_command));
+                    if let Some(tab) = self.active_tab_mut() {
+                        let mut label = kind;
+                        if let Some(first) = label.get_mut(0..1) {
+                            first.make_ascii_uppercase();
+                        }
+                        tab.repo_name = label.clone();
+                        tab.set_terminal_title(Some(label));
+                    }
                     self.mark_workspaces_dirty();
                     self.mark_log_server_dirty();
-                    if let Some((tab_id, repo_path)) = {
-                        if let Some(tab) = self.active_tab_mut() {
-                            tab.git_status_loading = true;
-                            Some((tab.id, tab.repo_path.clone()))
-                        } else {
-                            None
-                        }
-                    } {
-                        return Task::batch([
-                            self.scroll_to_active_tab(),
-                            self.request_git_status_for_active_source(tab_id, repo_path),
-                        ]);
-                    }
                     return self.scroll_to_active_tab();
                 }
-            }
+                Err(err) => {
+                    eprintln!("remote session launch failed: {err}");
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.files.error = Some(format!("Could not start remote session: {err}"));
+                    }
+                }
+            },
             Event::ShowTabPicker => {
                 self.tab_picker_visible = true;
             }
@@ -11455,7 +11553,11 @@ fi
             );
         }
 
-        if !workspace_is_remote {
+        let sessions_supported = self
+            .source_for_active_tab()
+            .map(|source| source.capabilities().sessions)
+            .unwrap_or(false);
+        if sessions_supported {
             // Add tab button
             let add_color = theme.overlay0();
             let add_hover = theme.text_primary();
@@ -17243,6 +17345,8 @@ mod tests {
             auth: config::RemoteAgentAuthConfig::Token {
                 token_ref: "env:GITTERM_TEST_TOKEN".to_string(),
             },
+            shell_command: None,
+            session_commands: std::collections::HashMap::new(),
         }
     }
 

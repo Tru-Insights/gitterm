@@ -4,6 +4,9 @@ use std::net::SocketAddr;
 use gitterm::agentd::config::AgentConfigFile;
 use gitterm::agentd::server::{self, AgentServerConfig};
 
+#[cfg(unix)]
+mod attach;
+
 const DEFAULT_ADDR: &str = "127.0.0.1:7777";
 
 #[tokio::main]
@@ -25,6 +28,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             );
             server::serve(config).await
         }
+        #[cfg(unix)]
+        Some("attach") => attach::run(args).await,
+        #[cfg(unix)]
+        Some("sessions") => attach::list(args).await,
         Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -96,6 +103,8 @@ fn print_usage() {
     eprintln!(
         "Usage:
   gitterm-agent serve [--addr HOST:PORT] [--token TOKEN] [--name NAME]
+  gitterm-agent attach --endpoint URL --token-ref REF --session ID
+  gitterm-agent sessions --endpoint URL --token-ref REF [--workspace ID]
 
 Environment:
   GITTERM_AGENT_ADDR    default: {DEFAULT_ADDR}
