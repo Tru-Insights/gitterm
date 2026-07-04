@@ -6,6 +6,9 @@ use std::sync::OnceLock;
 // Global instance ID for this process
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
+// Config directory override, read once from GITTERM_CONFIG_DIR
+static CONFIG_DIR_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 /// Get or generate the unique instance ID for this GitTerm process
 pub fn instance_id() -> &'static str {
     INSTANCE_ID.get_or_init(|| {
@@ -14,8 +17,37 @@ pub fn instance_id() -> &'static str {
     })
 }
 
+/// The config directory override from GITTERM_CONFIG_DIR, if set.
+/// Dev/test instances set this so they can never read or write the
+/// real ~/.config/gitterm/* state of a running daily-driver instance.
+pub fn config_dir_override() -> Option<&'static PathBuf> {
+    CONFIG_DIR_OVERRIDE
+        .get_or_init(|| resolve_config_dir_override(std::env::var_os("GITTERM_CONFIG_DIR")))
+        .as_ref()
+}
+
+fn resolve_config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let raw = raw?;
+    if raw.is_empty() {
+        eprintln!("GITTERM_CONFIG_DIR is set but empty; ignoring override");
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    if path.is_relative() {
+        eprintln!(
+            "GITTERM_CONFIG_DIR is relative ({}); ignoring override",
+            path.display()
+        );
+        return None;
+    }
+    Some(path)
+}
+
 /// Get the shared (non-instance-specific) config directory
 pub fn global_config_dir() -> PathBuf {
+    if let Some(dir) = config_dir_override() {
+        return dir.clone();
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
@@ -31,6 +63,12 @@ pub fn instance_config_dir() -> PathBuf {
 pub fn print_instance_info() {
     eprintln!("GitTerm instance: {}", instance_id());
     eprintln!("Config directory: {}", instance_config_dir().display());
+    if let Some(dir) = config_dir_override() {
+        eprintln!(
+            "Config dir override (GITTERM_CONFIG_DIR): {}",
+            dir.display()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -50,6 +88,29 @@ mod tests {
         let dir = instance_config_dir();
         assert!(dir.to_string_lossy().contains("instance-"));
         assert!(dir.to_string_lossy().contains(instance_id()));
+    }
+
+    #[test]
+    fn test_resolve_config_dir_override_unset() {
+        assert_eq!(resolve_config_dir_override(None), None);
+    }
+
+    #[test]
+    fn test_resolve_config_dir_override_empty_ignored() {
+        assert_eq!(resolve_config_dir_override(Some("".into())), None);
+    }
+
+    #[test]
+    fn test_resolve_config_dir_override_relative_ignored() {
+        assert_eq!(resolve_config_dir_override(Some("rel/path".into())), None);
+    }
+
+    #[test]
+    fn test_resolve_config_dir_override_absolute() {
+        assert_eq!(
+            resolve_config_dir_override(Some("/tmp/gitterm-dev".into())),
+            Some(PathBuf::from("/tmp/gitterm-dev"))
+        );
     }
 }
 
