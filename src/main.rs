@@ -30,6 +30,7 @@ mod log_server;
 mod markdown;
 mod plans_viewer;
 mod services;
+mod source;
 mod webview;
 
 // New modules
@@ -39,14 +40,17 @@ mod events;
 mod tab;
 mod theme;
 
+use gitterm::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake};
+use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{
     AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
 };
 
 // Start with just config for now to avoid conflicts
 use config::{
-    AgentPreset, BottomTerminalConfig, Config, QuickCommand, WorkspaceColor, WorkspaceConfig,
-    WorkspaceTabConfig, WorkspacesFile,
+    AgentPreset, BottomTerminalConfig, Config, QuickCommand, RemoteAgentConfig, RemoteAgentsFile,
+    RemoteSessionConfig, RemoteSessionsFile, WorkspaceColor, WorkspaceConfig,
+    WorkspaceLocationConfig, WorkspaceTabConfig, WorkspacesFile,
 };
 use events::SidebarMode;
 use theme::AppTheme;
@@ -812,12 +816,55 @@ struct FileEntry {
     is_staged: bool,
 }
 
-// File tree entry for explorer
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitViewMode {
+    Changes,
+    Worktrees,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitSelection {
+    Worktree(PathBuf),
+    Branch(String),
+}
+
 #[derive(Debug, Clone)]
-struct FileTreeEntry {
-    name: String,
+pub struct GitWorktreeEntry {
     path: PathBuf,
-    is_dir: bool,
+    branch_name: String,
+    head: String,
+    is_current: bool,
+    is_detached: bool,
+    is_prunable: bool,
+    is_git_repo: bool,
+    staged_count: usize,
+    unstaged_count: usize,
+    untracked_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitBranchEntry {
+    name: String,
+    head: String,
+    is_current: bool,
+    upstream: Option<String>,
+    worktree_path: Option<PathBuf>,
+}
+
+impl GitWorktreeEntry {
+    fn total_changes(&self) -> usize {
+        self.staged_count + self.unstaged_count + self.untracked_count
+    }
+
+    fn short_head(&self) -> &str {
+        self.head.get(..7).unwrap_or(&self.head)
+    }
+}
+
+impl GitBranchEntry {
+    fn short_head(&self) -> &str {
+        self.head.get(..7).unwrap_or(&self.head)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2025,6 +2072,14 @@ struct TabState {
     git_unchanged_streak: u32,
     last_git_status_hash: Option<u64>,
     git_status_loading: bool,
+    git_view_mode: GitViewMode,
+    worktrees: Vec<GitWorktreeEntry>,
+    branches: Vec<GitBranchEntry>,
+    worktrees_repo_path: Option<PathBuf>,
+    worktrees_loading: bool,
+    worktrees_error: Option<String>,
+    last_worktrees_poll: Instant,
+    selected_git_ref: Option<GitSelection>,
     selected_file: Option<String>,
     selected_is_staged: bool,
     diff_lines: Vec<DiffLine>,
@@ -2038,9 +2093,13 @@ struct TabState {
     created_at: Instant,
     // Sidebar mode (Git or Files)
     sidebar_mode: SidebarMode,
-    // File explorer state
+    // Local working directory of this tab (terminal-tracked for terminal
+    // tabs; used as the cwd for spawning consoles/agents/new tabs). For
+    // local tabs the file browser mirrors it; remote browsing never touches
+    // it.
     current_dir: PathBuf,
-    file_tree: Vec<FileTreeEntry>,
+    // File browser state, fed exclusively by WorkspaceSource listings.
+    files: FilesState,
     // Search state
     search: SearchState,
     // Attention: true when terminal title starts with "*" (e.g. Claude Code waiting for input)
@@ -2075,6 +2134,15 @@ impl TabState {
             git_unchanged_streak: 0,
             last_git_status_hash: None,
             git_status_loading: false,
+            git_view_mode: GitViewMode::Changes,
+            worktrees: Vec::new(),
+            branches: Vec::new(),
+            worktrees_repo_path: None,
+            worktrees_loading: false,
+            worktrees_error: None,
+            last_worktrees_poll: Instant::now()
+                - Duration::from_millis(GIT_WORKTREES_POLL_INTERVAL_MS),
+            selected_git_ref: None,
             selected_file: None,
             selected_is_staged: false,
             diff_lines: Vec::new(),
@@ -2085,14 +2153,22 @@ impl TabState {
             file_index: -1,
             created_at: Instant::now(),
             sidebar_mode: SidebarMode::Git,
+            files: FilesState::at(SourcePath::Local(current_dir.clone())),
             current_dir,
-            file_tree: Vec::new(),
             search: SearchState::default(),
             needs_attention: false,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
             is_git_repo,
         }
+    }
+
+    /// Point both the tab-local working directory and the file browser at a
+    /// local directory. Creation-time only; afterwards the browser follows
+    /// WorkspaceSource listings.
+    fn set_local_dir(&mut self, dir: PathBuf) {
+        self.files = FilesState::at(SourcePath::Local(dir.clone()));
+        self.current_dir = dir;
     }
 
     // ---- Tab-kind accessors -------------------------------------------------
@@ -2316,43 +2392,6 @@ impl TabState {
         }
 
         None
-    }
-
-    #[allow(dead_code)]
-    fn fetch_file_tree(&mut self, _show_hidden: bool) {
-        self.file_tree.clear();
-
-        if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
-            let mut dirs: Vec<FileTreeEntry> = Vec::new();
-            let mut files: Vec<FileTreeEntry> = Vec::new();
-
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-
-                // Always skip node_modules and target
-                if name == "node_modules" || name == "target" {
-                    continue;
-                }
-
-                let is_dir = path.is_dir();
-                let entry = FileTreeEntry { name, path, is_dir };
-
-                if is_dir {
-                    dirs.push(entry);
-                } else {
-                    files.push(entry);
-                }
-            }
-
-            // Sort alphabetically
-            dirs.sort_by_key(|a| a.name.to_lowercase());
-            files.sort_by_key(|a| a.name.to_lowercase());
-
-            // Dirs first, then files
-            self.file_tree.extend(dirs);
-            self.file_tree.extend(files);
-        }
     }
 
     #[allow(dead_code)]
@@ -2951,12 +2990,128 @@ struct BottomTerminal {
     cwd: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+enum WorkspaceLocation {
+    Local {
+        root: PathBuf,
+    },
+    RemoteAgent {
+        remote_id: String,
+        workspace_id: String,
+        root: String,
+    },
+    LegacyRemoteSession {
+        session_name: String,
+        root: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum WorkspaceBackendRef {
+    Local {
+        root: PathBuf,
+    },
+    RemoteAgent {
+        remote_id: String,
+        workspace_id: String,
+        root: String,
+    },
+    LegacyRemoteSession {
+        session_name: String,
+        root: String,
+    },
+}
+
+impl WorkspaceBackendRef {
+    fn is_remote(&self) -> bool {
+        match self {
+            Self::Local { root } => {
+                let _ = root;
+                false
+            }
+            Self::RemoteAgent {
+                remote_id,
+                workspace_id,
+                root,
+            } => {
+                let _ = (remote_id, workspace_id, root);
+                true
+            }
+            Self::LegacyRemoteSession { session_name, root } => {
+                let _ = (session_name, root);
+                true
+            }
+        }
+    }
+
+    fn from_location(location: &WorkspaceLocation) -> Self {
+        match location {
+            WorkspaceLocation::Local { root } => Self::Local { root: root.clone() },
+            WorkspaceLocation::RemoteAgent {
+                remote_id,
+                workspace_id,
+                root,
+            } => Self::RemoteAgent {
+                remote_id: remote_id.clone(),
+                workspace_id: workspace_id.clone(),
+                root: root.clone(),
+            },
+            WorkspaceLocation::LegacyRemoteSession { session_name, root } => {
+                Self::LegacyRemoteSession {
+                    session_name: session_name.clone(),
+                    root: root.clone(),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceGitStatusRequest {
+    backend: WorkspaceBackendRef,
+    tab_id: usize,
+    repo_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceGitWorktreesRequest {
+    backend: WorkspaceBackendRef,
+    tab_id: usize,
+    repo_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+enum RemoteAgentConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected(RemoteAgentHandshake),
+    Error(String),
+}
+
+#[derive(Debug, Clone)]
+struct RemoteAgentConnection {
+    name: String,
+    endpoint: String,
+    status: RemoteAgentConnectionStatus,
+    last_attempt: Option<Instant>,
+    last_connected: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteAgentHandshakeSnapshot {
+    remote_id: String,
+    endpoint: String,
+    result: Result<RemoteAgentHandshake, String>,
+}
+
 // Workspace groups tabs by project
 struct Workspace {
     name: String,
     abbrev: String,
     dir: PathBuf,
     color: WorkspaceColor,
+    location: WorkspaceLocation,
+    remote_session: Option<RemoteSessionDefinition>,
     tabs: Vec<TabState>,
     active_tab: usize,
     console: ConsoleState,
@@ -2973,8 +3128,10 @@ impl Workspace {
         Self {
             name,
             abbrev,
-            dir,
+            dir: dir.clone(),
             color,
+            location: WorkspaceLocation::Local { root: dir.clone() },
+            remote_session: None,
             tabs: Vec::new(),
             active_tab: 0,
             console,
@@ -2984,8 +3141,35 @@ impl Workspace {
         }
     }
 
+    fn new_remote(session: RemoteSessionDefinition, color: WorkspaceColor) -> Self {
+        let name = remote_workspace_name(&session);
+        let abbrev = Self::derive_abbrev(&name);
+        let dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        Self {
+            name,
+            abbrev,
+            dir,
+            color,
+            location: WorkspaceLocation::LegacyRemoteSession {
+                session_name: session.session_name.clone(),
+                root: session.remote_dir.clone(),
+            },
+            remote_session: Some(session),
+            tabs: Vec::new(),
+            active_tab: 0,
+            console: ConsoleState::new(None),
+            bottom_terminals: Vec::new(),
+            active_bottom_tab: BottomPanelTab::Console,
+            env: std::collections::HashMap::new(),
+        }
+    }
+
     fn derive_abbrev(name: &str) -> String {
         name.chars().take(2).collect::<String>().to_uppercase()
+    }
+
+    fn backend_ref(&self) -> WorkspaceBackendRef {
+        WorkspaceBackendRef::from_location(&self.location)
     }
 
     fn active_tab(&self) -> Option<&TabState> {
@@ -3089,8 +3273,23 @@ fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatusSnapshot {
     services::collect_git_status(tab_id, repo_path)
 }
 
-fn collect_file_tree(tab_id: usize, current_dir: PathBuf, show_hidden: bool) -> FileTreeSnapshot {
-    services::collect_file_tree(tab_id, current_dir, show_hidden)
+fn collect_git_worktrees(tab_id: usize, repo_path: PathBuf) -> GitWorktreesSnapshot {
+    services::collect_git_worktrees(tab_id, repo_path)
+}
+
+fn collect_remote_sessions(host: RemoteHostConfig) -> RemoteSessionsSnapshot {
+    services::collect_remote_sessions(host)
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -3233,13 +3432,17 @@ pub enum Event {
     FileSelect(String, bool),
     FileSelectByIndex(i32),
     ClearSelection,
+    SetGitViewMode(GitViewMode),
+    SelectGitWorktree(PathBuf),
+    SelectGitBranch(String),
+    OpenWorktree(PathBuf),
     KeyPressed(Key, Modifiers),
     // Sidebar
     ToggleSidebar,
     SetSidebarMode(SidebarMode),
-    NavigateDir(PathBuf),
+    NavigateDir(SourcePath),
     NavigateUp,
-    ViewFile(PathBuf),
+    ViewFile(SourcePath),
     CloseFileView,
     CopyFileContent,
     OpenFileInBrowser,
@@ -3282,6 +3485,7 @@ pub enum Event {
     WorkspaceClose(usize),
     WorkspaceCreate,
     WorkspaceCreated(Option<PathBuf>),
+    RemoteWorkspaceOpen(String),
     WorkspaceSettingsOpen(usize),
     WorkspaceSettingsClose,
     WorkspaceSettingsNewKeyChanged(String),
@@ -3345,7 +3549,7 @@ pub enum Event {
     ShowTabPicker,
     HideTabPicker,
     // Edit file in editor
-    EditFile(PathBuf),
+    EditFile(SourcePath),
     // Claude sidebar events
     ToggleClaudeSection(String),
     ClaudeItemSelect(String, usize),
@@ -3368,7 +3572,18 @@ pub enum Event {
     MainTerminalClicked,
     BottomTerminalClicked(usize),
     GitStatusLoaded(GitStatusSnapshot),
-    FileTreeLoaded(FileTreeSnapshot),
+    GitWorktreesLoaded(GitWorktreesSnapshot),
+    RefreshRemoteSessions,
+    RemoteSessionsLoaded(RemoteSessionsSnapshot),
+    RemoteAgentConnect(String),
+    RemoteAgentHandshakeLoaded(RemoteAgentHandshakeSnapshot),
+    AttachRemoteSession(String),
+    AttachRemoteCodexSession(String),
+    AttachRemoteClaudeSession(String),
+    FileTreeLoaded {
+        seq: u64,
+        listing: SourceDirListing,
+    },
     DiffLoaded(DiffSnapshot),
     FileLoaded(FileLoadSnapshot),
     FileViewScrolled(usize, scrollable::Viewport),
@@ -3435,6 +3650,13 @@ struct App {
     quick_commands: Vec<QuickCommand>,
     // Quick commands picker visibility
     quick_commands_visible: bool,
+    remote_agent_defs: Vec<RemoteAgentConfig>,
+    remote_agent_connections: HashMap<String, RemoteAgentConnection>,
+    remote_session_defs: Vec<RemoteSessionDefinition>,
+    remote_sessions: Vec<RemoteSessionEntry>,
+    remote_sessions_loading: bool,
+    remote_sessions_error: Option<String>,
+    remote_sessions_loaded_at: Option<Instant>,
     // Track whether the window has focus (skip terminal processing when unfocused)
     window_focused: bool,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
@@ -3526,6 +3748,222 @@ const GIT_POLL_MEDIUM_INTERVAL_MS: u64 = 10000;
 const GIT_POLL_SLOW_INTERVAL_MS: u64 = 15000;
 const GIT_POLL_IDLE_INTERVAL_MS: u64 = 30000;
 const GIT_POLL_NON_REPO_INTERVAL_MS: u64 = 20000;
+const GIT_WORKTREES_POLL_INTERVAL_MS: u64 = 15000;
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn remote_session_definition_from_config(config: &RemoteSessionConfig) -> RemoteSessionDefinition {
+    RemoteSessionDefinition {
+        host: RemoteHostConfig {
+            name: config.host_name.clone(),
+            ssh_target: config.ssh_target.clone(),
+            identity_file: expand_home_path(&config.identity_file),
+            tmux_path: config.tmux_path.clone(),
+        },
+        label: config.label.clone(),
+        session_name: config.session_name.clone(),
+        remote_dir: config.remote_dir.clone(),
+        shell_command: config.shell_command.clone(),
+        codex_command: config.codex_command.clone(),
+        claude_command: config.claude_command.clone(),
+    }
+}
+
+fn remote_session_config_from_definition(
+    definition: &RemoteSessionDefinition,
+) -> RemoteSessionConfig {
+    RemoteSessionConfig {
+        label: definition.label.clone(),
+        host_name: definition.host.name.clone(),
+        ssh_target: definition.host.ssh_target.clone(),
+        identity_file: definition.host.identity_file.to_string_lossy().to_string(),
+        tmux_path: definition.host.tmux_path.clone(),
+        session_name: definition.session_name.clone(),
+        remote_dir: definition.remote_dir.clone(),
+        shell_command: definition.shell_command.clone(),
+        codex_command: definition.codex_command.clone(),
+        claude_command: definition.claude_command.clone(),
+    }
+}
+
+fn remote_session_definitions_from_config(
+    configs: &[RemoteSessionConfig],
+) -> Vec<RemoteSessionDefinition> {
+    configs
+        .iter()
+        .map(remote_session_definition_from_config)
+        .collect()
+}
+
+fn push_remote_agent_config(definitions: &mut Vec<RemoteAgentConfig>, agent: RemoteAgentConfig) {
+    if !definitions.iter().any(|existing| existing.id == agent.id) {
+        definitions.push(agent);
+    }
+}
+
+fn remote_agent_for_session<'a>(
+    definitions: &'a [RemoteAgentConfig],
+    session: &RemoteSessionDefinition,
+) -> Option<&'a RemoteAgentConfig> {
+    definitions.iter().find(|agent| {
+        agent.id == session.host.name
+            || agent.name == session.host.name
+            || agent.name.eq_ignore_ascii_case(&session.host.name)
+    })
+}
+
+fn remote_agent_location_for_session(
+    definitions: &[RemoteAgentConfig],
+    session: &RemoteSessionDefinition,
+) -> Option<WorkspaceLocation> {
+    let agent = remote_agent_for_session(definitions, session)?;
+    Some(WorkspaceLocation::RemoteAgent {
+        remote_id: agent.id.clone(),
+        workspace_id: session.session_name.clone(),
+        root: session.remote_dir.clone(),
+    })
+}
+
+fn remote_agent_client_config(agent: RemoteAgentConfig) -> RemoteAgentClientConfig {
+    let token_ref = match agent.auth {
+        config::RemoteAgentAuthConfig::Token { token_ref } => token_ref,
+    };
+    RemoteAgentClientConfig {
+        remote_id: agent.id,
+        name: agent.name,
+        endpoint: agent.endpoint,
+        token_ref,
+    }
+}
+
+fn push_remote_session_definition(
+    definitions: &mut Vec<RemoteSessionDefinition>,
+    session: RemoteSessionDefinition,
+) {
+    if !definitions
+        .iter()
+        .any(|existing| existing.session_name == session.session_name)
+    {
+        definitions.push(session);
+    }
+}
+
+fn remote_codex_session_name(session: &RemoteSessionDefinition) -> String {
+    format!("{}-codex", session.session_name)
+}
+
+fn remote_claude_session_name(session: &RemoteSessionDefinition) -> String {
+    format!("{}-claude", session.session_name)
+}
+
+fn remote_workspace_name(session: &RemoteSessionDefinition) -> String {
+    format!("{}:{}", session.host.name, session.label)
+}
+
+fn remote_tab_title_for_startup_command(
+    session: &RemoteSessionDefinition,
+    startup_command: Option<&str>,
+) -> String {
+    let Some(startup_command) = startup_command else {
+        return "Shell".to_string();
+    };
+    if startup_command.contains(&remote_codex_session_name(session)) {
+        "Codex".to_string()
+    } else if startup_command.contains(&remote_claude_session_name(session)) {
+        "Claude".to_string()
+    } else if startup_command.contains(&session.session_name) {
+        "Shell".to_string()
+    } else {
+        "Remote".to_string()
+    }
+}
+
+fn default_remote_session_definitions() -> Vec<RemoteSessionDefinition> {
+    remote_session_definitions_from_config(&config::default_remote_sessions())
+}
+
+fn workspace_location_from_config(
+    config: Option<&WorkspaceLocationConfig>,
+    local_dir: &Path,
+    remote_session: Option<&RemoteSessionDefinition>,
+    remote_agents: &[RemoteAgentConfig],
+) -> WorkspaceLocation {
+    match config {
+        Some(WorkspaceLocationConfig::Local { root }) => WorkspaceLocation::Local {
+            root: PathBuf::from(root),
+        },
+        Some(WorkspaceLocationConfig::RemoteAgent {
+            remote_id,
+            workspace_id,
+            root,
+        }) => WorkspaceLocation::RemoteAgent {
+            remote_id: remote_id.clone(),
+            workspace_id: workspace_id.clone(),
+            root: root.clone(),
+        },
+        None => {
+            if let Some(session) = remote_session {
+                remote_agent_location_for_session(remote_agents, session).unwrap_or_else(|| {
+                    WorkspaceLocation::LegacyRemoteSession {
+                        session_name: session.session_name.clone(),
+                        root: session.remote_dir.clone(),
+                    }
+                })
+            } else {
+                WorkspaceLocation::Local {
+                    root: local_dir.to_path_buf(),
+                }
+            }
+        }
+    }
+}
+
+fn workspace_location_config_from_location(
+    location: &WorkspaceLocation,
+) -> Option<WorkspaceLocationConfig> {
+    match location {
+        WorkspaceLocation::Local { root } => {
+            let _ = root;
+            None
+        }
+        WorkspaceLocation::LegacyRemoteSession { session_name, root } => {
+            let _ = (session_name, root);
+            None
+        }
+        WorkspaceLocation::RemoteAgent {
+            remote_id,
+            workspace_id,
+            root,
+        } => Some(WorkspaceLocationConfig::RemoteAgent {
+            remote_id: remote_id.clone(),
+            workspace_id: workspace_id.clone(),
+            root: root.clone(),
+        }),
+    }
+}
+
+fn workspace_config_dir(workspace: &Workspace) -> String {
+    match &workspace.location {
+        WorkspaceLocation::RemoteAgent { root, .. } => root.clone(),
+        WorkspaceLocation::Local { .. } | WorkspaceLocation::LegacyRemoteSession { .. } => {
+            workspace.dir.to_string_lossy().to_string()
+        }
+    }
+}
+
+fn remote_agent_root(location: &WorkspaceLocation) -> Option<&str> {
+    match location {
+        WorkspaceLocation::RemoteAgent { root, .. } => Some(root.as_str()),
+        WorkspaceLocation::Local { .. } | WorkspaceLocation::LegacyRemoteSession { .. } => None,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GitStatusSnapshot {
@@ -3540,10 +3978,46 @@ pub struct GitStatusSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct FileTreeSnapshot {
+pub struct GitWorktreesSnapshot {
     tab_id: usize,
-    current_dir: PathBuf,
-    entries: Vec<FileTreeEntry>,
+    repo_path: PathBuf,
+    is_git_repo: bool,
+    worktrees: Vec<GitWorktreeEntry>,
+    branches: Vec<GitBranchEntry>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteHostConfig {
+    name: String,
+    ssh_target: String,
+    identity_file: PathBuf,
+    tmux_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteSessionDefinition {
+    host: RemoteHostConfig,
+    label: String,
+    session_name: String,
+    remote_dir: String,
+    shell_command: String,
+    codex_command: Option<String>,
+    claude_command: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteSessionEntry {
+    name: String,
+    windows: usize,
+    attached: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteSessionsSnapshot {
+    host_name: String,
+    sessions: Vec<RemoteSessionEntry>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3777,13 +4251,27 @@ impl App {
             .map(|ws| WorkspaceConfig {
                 name: ws.name.clone(),
                 abbrev: ws.abbrev.clone(),
-                dir: ws.dir.to_string_lossy().to_string(),
+                dir: workspace_config_dir(ws),
                 color: ws.color,
+                location: workspace_location_config_from_location(&ws.location),
+                remote_session: self
+                    .remote_session_for_workspace(ws)
+                    .map(remote_session_config_from_definition),
+                active_tab: Some(ws.active_tab),
                 tabs: ws
                     .tabs
                     .iter()
                     .map(|tab| WorkspaceTabConfig {
-                        dir: tab.current_dir.to_string_lossy().to_string(),
+                        // Terminal-style tabs persist their tracked local
+                        // cwd; source-browsing tabs persist the browser dir
+                        // so remote workspaces restore where they left off.
+                        dir: if matches!(ws.location, WorkspaceLocation::RemoteAgent { .. })
+                            && tab.startup_command().is_none()
+                        {
+                            tab.files.dir.display()
+                        } else {
+                            tab.current_dir.to_string_lossy().to_string()
+                        },
                         repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
                         startup_command: tab.startup_command().map(String::from),
                         tab_kind: match &tab.kind {
@@ -3815,9 +4303,52 @@ impl App {
             }
         }
 
+        let mut remote_session_defs = RemoteSessionsFile::load()
+            .map(|file| remote_session_definitions_from_config(&file.remote_sessions))
+            .unwrap_or_default();
+        for session in &self.remote_session_defs {
+            push_remote_session_definition(&mut remote_session_defs, session.clone());
+        }
+        for ws in &self.workspaces {
+            if let Some(session) = self.remote_session_for_workspace(ws) {
+                push_remote_session_definition(&mut remote_session_defs, session.clone());
+            }
+        }
+        for closed in &self.closed_workspace_configs {
+            if let Some(remote_session) = &closed.remote_session {
+                push_remote_session_definition(
+                    &mut remote_session_defs,
+                    remote_session_definition_from_config(remote_session),
+                );
+            }
+        }
+        let mut remote_agent_defs = RemoteAgentsFile::load()
+            .map(|file| file.remote_agents)
+            .unwrap_or_default();
+        for agent in &self.remote_agent_defs {
+            push_remote_agent_config(&mut remote_agent_defs, agent.clone());
+        }
+
+        let remote_sessions: Vec<RemoteSessionConfig> = remote_session_defs
+            .iter()
+            .map(remote_session_config_from_definition)
+            .collect();
+        RemoteSessionsFile {
+            remote_sessions: remote_sessions.clone(),
+        }
+        .save();
+        if !remote_agent_defs.is_empty() || RemoteAgentsFile::file_path().exists() {
+            RemoteAgentsFile {
+                remote_agents: remote_agent_defs.clone(),
+            }
+            .save();
+        }
+
         let ws_file = WorkspacesFile {
             workspaces: configs,
             active_workspace: self.active_workspace_idx,
+            remote_sessions,
+            remote_agents: remote_agent_defs,
         };
         ws_file.save();
     }
@@ -4083,6 +4614,23 @@ impl App {
     }
 
     fn request_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
+        Self::request_workspace_git_status(WorkspaceGitStatusRequest {
+            backend: WorkspaceBackendRef::Local {
+                root: repo_path.clone(),
+            },
+            tab_id,
+            repo_path,
+        })
+    }
+
+    fn request_workspace_git_status(request: WorkspaceGitStatusRequest) -> Task<Event> {
+        if request.backend.is_remote() {
+            return Task::none();
+        }
+        Self::request_local_git_status(request.tab_id, request.repo_path)
+    }
+
+    fn request_local_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
         let fallback_repo_path = repo_path.clone();
         Task::perform(
             async move {
@@ -4111,6 +4659,92 @@ impl App {
         )
     }
 
+    fn request_git_worktrees(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
+        Self::request_workspace_git_worktrees(WorkspaceGitWorktreesRequest {
+            backend: WorkspaceBackendRef::Local {
+                root: repo_path.clone(),
+            },
+            tab_id,
+            repo_path,
+        })
+    }
+
+    fn request_workspace_git_worktrees(request: WorkspaceGitWorktreesRequest) -> Task<Event> {
+        if request.backend.is_remote() {
+            return Task::none();
+        }
+        Self::request_local_git_worktrees(request.tab_id, request.repo_path)
+    }
+
+    fn request_local_git_worktrees(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
+        let fallback_repo_path = repo_path.clone();
+        Task::perform(
+            async move {
+                match tokio::task::spawn_blocking(move || collect_git_worktrees(tab_id, repo_path))
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        freeze_debug!(
+                            "CRITICAL: spawn_blocking failed! Skipping git worktrees for tab {} ({}): {}",
+                            tab_id,
+                            fallback_repo_path.display(),
+                            err
+                        );
+                        GitWorktreesSnapshot {
+                            tab_id,
+                            repo_path: fallback_repo_path,
+                            is_git_repo: false,
+                            worktrees: Vec::new(),
+                            branches: Vec::new(),
+                            error: Some(format!("Failed to load worktrees: {}", err)),
+                        }
+                    }
+                }
+            },
+            Event::GitWorktreesLoaded,
+        )
+    }
+
+    fn request_remote_sessions(host: RemoteHostConfig) -> Task<Event> {
+        let fallback_host_name = host.name.clone();
+        Task::perform(
+            async move {
+                match tokio::task::spawn_blocking(move || collect_remote_sessions(host)).await {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => RemoteSessionsSnapshot {
+                        host_name: fallback_host_name,
+                        sessions: Vec::new(),
+                        error: Some(format!("Failed to load remote sessions: {}", err)),
+                    },
+                }
+            },
+            Event::RemoteSessionsLoaded,
+        )
+    }
+
+    fn request_remote_agent_handshake(agent: RemoteAgentConfig) -> Task<Event> {
+        let remote_id = agent.id.clone();
+        let endpoint = agent.endpoint.clone();
+        let client_config = remote_agent_client_config(agent);
+
+        Task::perform(
+            async move {
+                RemoteAgentBackend::new(client_config)
+                    .handshake()
+                    .await
+                    .map_err(|err| err.to_string())
+            },
+            move |result| {
+                Event::RemoteAgentHandshakeLoaded(RemoteAgentHandshakeSnapshot {
+                    remote_id: remote_id.clone(),
+                    endpoint: endpoint.clone(),
+                    result,
+                })
+            },
+        )
+    }
+
     fn request_syntect_warmup() -> Task<Event> {
         Task::perform(
             async {
@@ -4120,24 +4754,19 @@ impl App {
         )
     }
 
-    fn request_file_tree(tab_id: usize, current_dir: PathBuf, show_hidden: bool) -> Task<Event> {
-        let fallback_dir = current_dir.clone();
+    /// Run one directory listing against a source and deliver it as a
+    /// FileTreeLoaded event. `seq` must come from FilesState::begin_request
+    /// so stale responses are dropped.
+    fn request_source_listing(
+        source: WorkspaceSource,
+        tab_id: usize,
+        dir: SourcePath,
+        seq: u64,
+        show_hidden: bool,
+    ) -> Task<Event> {
         Task::perform(
-            async move {
-                match tokio::task::spawn_blocking(move || {
-                    collect_file_tree(tab_id, current_dir, show_hidden)
-                })
-                .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(_) => FileTreeSnapshot {
-                        tab_id,
-                        current_dir: fallback_dir,
-                        entries: Vec::new(),
-                    },
-                }
-            },
-            Event::FileTreeLoaded,
+            async move { source.list_dir(tab_id, dir, show_hidden).await },
+            move |listing| Event::FileTreeLoaded { seq, listing },
         )
     }
 
@@ -4184,6 +4813,37 @@ impl App {
                 }
             },
             Event::DiffLoaded,
+        )
+    }
+
+    /// Load a file through a workspace source and shape it into the same
+    /// FileLoadSnapshot the local loader produces, so the viewer pipeline
+    /// (webview, syntax highlight, notices) is shared.
+    fn request_source_file_load(
+        source: WorkspaceSource,
+        tab_id: usize,
+        path: SourcePath,
+        is_dark_theme: bool,
+    ) -> Task<Event> {
+        Task::perform(
+            async move {
+                let content = source.read_file(&path, MAX_INLINE_WEBVIEW_BYTES).await;
+                let display_path = PathBuf::from(path.display());
+                let fallback_path = display_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    services::shape_source_file_load(tab_id, display_path, content, is_dark_theme)
+                })
+                .await
+                .unwrap_or_else(|join_err| {
+                    services::shape_source_file_load(
+                        tab_id,
+                        fallback_path,
+                        Err(format!("file load task failed: {join_err}")),
+                        is_dark_theme,
+                    )
+                })
+            },
+            Event::FileLoaded,
         )
     }
 
@@ -4313,6 +4973,13 @@ impl App {
             agent_presets: config.agent_presets.clone(),
             quick_commands: config.quick_commands.clone(),
             quick_commands_visible: false,
+            remote_agent_defs: Vec::new(),
+            remote_agent_connections: HashMap::new(),
+            remote_session_defs: default_remote_session_definitions(),
+            remote_sessions: Vec::new(),
+            remote_sessions_loading: false,
+            remote_sessions_error: None,
+            remote_sessions_loaded_at: None,
             window_focused: true,
             bottom_panel_focused: false,
             closed_workspace_configs: Vec::new(),
@@ -4343,19 +5010,54 @@ impl App {
             webview_agent_tab_id: None,
         };
 
+        if let Some(remote_file) = RemoteSessionsFile::load() {
+            for session in remote_session_definitions_from_config(&remote_file.remote_sessions) {
+                push_remote_session_definition(&mut app.remote_session_defs, session);
+            }
+        }
+        if let Some(remote_agents_file) = RemoteAgentsFile::load() {
+            for agent in remote_agents_file.remote_agents {
+                push_remote_agent_config(&mut app.remote_agent_defs, agent);
+            }
+        }
+
         // Try to restore workspaces from saved config
         if let Some(ws_file) = WorkspacesFile::load() {
+            for agent in &ws_file.remote_agents {
+                push_remote_agent_config(&mut app.remote_agent_defs, agent.clone());
+            }
+            for session in remote_session_definitions_from_config(&ws_file.remote_sessions) {
+                push_remote_session_definition(&mut app.remote_session_defs, session);
+            }
             for ws_config in &ws_file.workspaces {
                 // Keep closed workspaces in memory so their env/color/settings
                 // are preserved in workspaces.json and restored on reopen.
                 if !ws_config.active {
+                    if let Some(remote_session) = &ws_config.remote_session {
+                        push_remote_session_definition(
+                            &mut app.remote_session_defs,
+                            remote_session_definition_from_config(remote_session),
+                        );
+                    }
                     app.closed_workspace_configs.push(ws_config.clone());
                     continue;
                 }
+                let remote_session = ws_config
+                    .remote_session
+                    .as_ref()
+                    .map(remote_session_definition_from_config)
+                    .or_else(|| {
+                        app.remote_session_defs
+                            .iter()
+                            .find(|session| remote_workspace_name(session) == ws_config.name)
+                            .cloned()
+                    });
                 let dir = PathBuf::from(&ws_config.dir);
                 let home = std::env::var("HOME").unwrap_or_default();
                 // If workspace dir is $HOME, name the workspace after its first tab's repo instead
-                let name = if dir == Path::new(&home) {
+                let name = if remote_session.is_some() {
+                    ws_config.name.clone()
+                } else if dir == Path::new(&home) {
                     ws_config
                         .tabs
                         .first()
@@ -4365,7 +5067,34 @@ impl App {
                 } else {
                     ws_config.name.clone()
                 };
-                let mut workspace = Workspace::new(name, dir.clone(), ws_config.color);
+                let location = workspace_location_from_config(
+                    ws_config.location.as_ref(),
+                    &dir,
+                    remote_session.as_ref(),
+                    &app.remote_agent_defs,
+                );
+                let inferred_remote_agent_location = ws_config.location.is_none()
+                    && remote_session.as_ref().is_some_and(|session| {
+                        remote_agent_for_session(&app.remote_agent_defs, session).is_some()
+                    });
+                let mut workspace = if let Some(remote_session) = remote_session {
+                    let mut workspace = Workspace::new_remote(remote_session, ws_config.color);
+                    workspace.name = name;
+                    workspace.dir = dir.clone();
+                    workspace
+                } else {
+                    Workspace::new(name, dir.clone(), ws_config.color)
+                };
+                workspace.location = location;
+                if let Some(root) = remote_agent_root(&workspace.location) {
+                    workspace.dir = PathBuf::from(root);
+                    if inferred_remote_agent_location {
+                        app.workspaces_dirty = true;
+                        app.next_workspace_save_at = Some(
+                            Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS),
+                        );
+                    }
+                }
                 workspace.abbrev = ws_config.abbrev.clone();
                 workspace.env = ws_config.env.clone();
                 // Restore saved run command if present
@@ -4374,11 +5103,53 @@ impl App {
                     workspace.console.status = ConsoleStatus::Stopped;
                 }
 
+                let workspace_is_remote_agent =
+                    matches!(workspace.location, WorkspaceLocation::RemoteAgent { .. });
+                let remote_agent_root = remote_agent_root(&workspace.location).map(str::to_string);
+                let mut remote_agent_files_tab_added = false;
                 if ws_config.tabs.is_empty() {
-                    // Always have at least one tab
-                    app.add_tab_to_workspace(&mut workspace, dir);
+                    if workspace_is_remote_agent {
+                        let root = remote_agent_root
+                            .clone()
+                            .unwrap_or_else(|| dir.to_string_lossy().to_string());
+                        app.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
+                    } else if workspace.remote_session.is_none() {
+                        // Always have at least one local tab.
+                        app.add_tab_to_workspace(&mut workspace, dir);
+                    }
                 } else {
                     for tab_config in &ws_config.tabs {
+                        if workspace_is_remote_agent {
+                            let Some(root) = remote_agent_root.as_deref() else {
+                                continue;
+                            };
+                            if tab_config.startup_command.is_some() {
+                                // Legacy SSH/tmux terminal tab: keeps its
+                                // remote session dir purely for display.
+                                let local_cwd =
+                                    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                                app.add_tab_to_workspace_with_command(
+                                    &mut workspace,
+                                    local_cwd,
+                                    Some(PathBuf::from(&tab_config.dir)),
+                                    tab_config.startup_command.clone(),
+                                );
+                                continue;
+                            }
+                            if remote_agent_files_tab_added {
+                                continue;
+                            }
+                            // The persisted browse dir is validated by the
+                            // agent on the first listing; errors show in the
+                            // sidebar rather than being second-guessed here.
+                            app.add_remote_agent_tab_to_workspace(
+                                &mut workspace,
+                                root.to_string(),
+                                Some(tab_config.dir.clone()),
+                            );
+                            remote_agent_files_tab_added = true;
+                            continue;
+                        }
                         let tab_dir = PathBuf::from(&tab_config.dir);
                         let repo_dir = tab_config
                             .repo_dir
@@ -4450,8 +5221,50 @@ impl App {
                     workspace.bottom_terminals.push(bt);
                 }
 
+                workspace.active_tab = ws_config
+                    .active_tab
+                    .filter(|idx| *idx < workspace.tabs.len())
+                    .or_else(|| {
+                        workspace.tabs.iter().position(|tab| {
+                            paths_equal(&tab.repo_path, &workspace.dir)
+                                || paths_equal(&tab.current_dir, &workspace.dir)
+                        })
+                    })
+                    .unwrap_or(0);
+
                 app.workspaces.push(workspace);
             }
+
+            for workspace in &app.workspaces {
+                if let Some(session) = &workspace.remote_session {
+                    push_remote_session_definition(&mut app.remote_session_defs, session.clone());
+                }
+            }
+
+            let remote_defs = app.remote_session_defs.clone();
+            for remote_def in remote_defs {
+                let already_present = app.workspaces.iter().any(|workspace| {
+                    workspace
+                        .remote_session
+                        .as_ref()
+                        .is_some_and(|session| session.session_name == remote_def.session_name)
+                        || workspace.name == remote_workspace_name(&remote_def)
+                });
+                let already_closed = app.closed_workspace_configs.iter().any(|workspace| {
+                    workspace
+                        .remote_session
+                        .as_ref()
+                        .is_some_and(|session| session.session_name == remote_def.session_name)
+                        || workspace.name == remote_workspace_name(&remote_def)
+                });
+                if !already_present && !already_closed {
+                    let color = WorkspaceColor::from_index(app.workspaces.len());
+                    app.workspaces
+                        .push(Workspace::new_remote(remote_def, color));
+                    app.workspaces_dirty = true;
+                }
+            }
+
             app.active_workspace_idx = ws_file
                 .active_workspace
                 .min(app.workspaces.len().saturating_sub(1));
@@ -4473,6 +5286,7 @@ impl App {
             app.start_log_server();
         }
         app.sync_plans_dir();
+        app.register_remote_agent_connection_defaults();
 
         // Set initial slide position for active workspace
         let viewport_width = app.content_viewport_width();
@@ -4482,17 +5296,21 @@ impl App {
 
         // Return startup tasks (menu init + initial git status for active tab)
         let mut startup_tasks = vec![Task::done(Event::InitMenu), Self::request_syntect_warmup()];
-        if let Some((tab_id, repo_path)) = {
-            if let Some(tab) = app.active_tab_mut() {
-                tab.git_status_loading = true;
-                tab.last_poll = Instant::now();
-                Some((tab.id, tab.repo_path.clone()))
-            } else {
-                None
+        if !app.active_workspace_is_remote() {
+            if let Some((tab_id, repo_path)) = {
+                if let Some(tab) = app.active_tab_mut() {
+                    tab.git_status_loading = true;
+                    tab.last_poll = Instant::now();
+                    Some((tab.id, tab.repo_path.clone()))
+                } else {
+                    None
+                }
+            } {
+                startup_tasks.push(Self::request_git_status(tab_id, repo_path));
             }
-        } {
-            startup_tasks.push(Self::request_git_status(tab_id, repo_path));
         }
+        startup_tasks.push(app.ensure_active_remote_agent_connection(false));
+        startup_tasks.push(app.refresh_files_for_active_tab());
 
         // If the active tab on startup is an agent tab (restored from
         // workspaces.json), dispatch its activation so the webview gets
@@ -4521,15 +5339,19 @@ impl App {
         current_dir: Option<PathBuf>,
         startup_command: Option<String>,
     ) {
+        let startup_command_for_title = startup_command.clone();
         let mut tab = self.create_tab_for_workspace(
             repo_path.clone(),
             startup_command,
             Some(&workspace.name.clone()),
         );
-        if let Some(dir) = current_dir {
-            tab.current_dir = dir;
-        } else {
-            tab.current_dir = repo_path;
+        tab.set_local_dir(current_dir.unwrap_or(repo_path));
+        if let Some(session) = self.remote_session_for_workspace(workspace) {
+            let title =
+                remote_tab_title_for_startup_command(session, startup_command_for_title.as_deref());
+            tab.repo_name = title.clone();
+            tab.set_terminal_title(Some(title));
+            tab.sidebar_mode = SidebarMode::Remote;
         }
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
@@ -4549,11 +5371,29 @@ impl App {
         self.next_tab_id += 1;
         let mut tab = TabState::new(id, repo_path.clone());
         tab.kind = TabKind::Agent(AgentSession::new(config));
-        if let Some(dir) = current_dir {
-            tab.current_dir = dir;
-        } else {
-            tab.current_dir = repo_path;
-        }
+        tab.set_local_dir(current_dir.unwrap_or(repo_path));
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+    }
+
+    fn add_remote_agent_tab_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        root: String,
+        browse_dir: Option<String>,
+    ) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let mut tab = TabState::new(id, PathBuf::from(&root));
+        tab.repo_name = workspace.name.clone();
+        tab.branch_name = "remote".to_string();
+        tab.sidebar_mode = SidebarMode::Files;
+        tab.is_git_repo = false;
+        // Browser state is remote-native; the agent validates the persisted
+        // dir on the first listing and any error is shown in the sidebar.
+        tab.files = FilesState::at(SourcePath::Remote(
+            browse_dir.unwrap_or_else(|| root.clone()),
+        ));
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
     }
@@ -4855,6 +5695,134 @@ fi
         self.workspaces.get_mut(self.active_workspace_idx)
     }
 
+    fn remote_session_for_workspace<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+    ) -> Option<&'a RemoteSessionDefinition> {
+        workspace.remote_session.as_ref().or_else(|| {
+            self.remote_session_defs
+                .iter()
+                .find(|session| remote_workspace_name(session) == workspace.name)
+        })
+    }
+
+    fn remote_agent_id_for_workspace<'a>(&self, workspace: &'a Workspace) -> Option<&'a str> {
+        match &workspace.location {
+            WorkspaceLocation::RemoteAgent { remote_id, .. } => Some(remote_id.as_str()),
+            WorkspaceLocation::Local { .. } | WorkspaceLocation::LegacyRemoteSession { .. } => None,
+        }
+    }
+
+    fn remote_agent_config_for_workspace<'a>(
+        &'a self,
+        workspace: &Workspace,
+    ) -> Option<&'a RemoteAgentConfig> {
+        let remote_id = self.remote_agent_id_for_workspace(workspace)?;
+        self.remote_agent_defs
+            .iter()
+            .find(|agent| agent.id == remote_id)
+    }
+
+    fn remote_agent_config_by_id(&self, remote_id: &str) -> Option<&RemoteAgentConfig> {
+        self.remote_agent_defs
+            .iter()
+            .find(|agent| agent.id == remote_id)
+    }
+
+    fn ensure_active_remote_agent_connection(&mut self, force: bool) -> Task<Event> {
+        let Some(remote_id) = self
+            .active_workspace()
+            .and_then(|workspace| self.remote_agent_id_for_workspace(workspace))
+            .map(ToOwned::to_owned)
+        else {
+            return Task::none();
+        };
+        self.ensure_remote_agent_connection(&remote_id, force)
+    }
+
+    fn ensure_remote_agent_connection(&mut self, remote_id: &str, force: bool) -> Task<Event> {
+        let Some(agent) = self.remote_agent_config_by_id(remote_id).cloned() else {
+            self.remote_agent_connections.insert(
+                remote_id.to_string(),
+                RemoteAgentConnection {
+                    name: remote_id.to_string(),
+                    endpoint: String::new(),
+                    status: RemoteAgentConnectionStatus::Error(format!(
+                        "Remote agent config not found for {remote_id}"
+                    )),
+                    last_attempt: Some(Instant::now()),
+                    last_connected: None,
+                },
+            );
+            return Task::none();
+        };
+
+        let existing_status = self
+            .remote_agent_connections
+            .get(remote_id)
+            .map(|connection| &connection.status);
+        if !force
+            && matches!(
+                existing_status,
+                Some(RemoteAgentConnectionStatus::Connecting)
+                    | Some(RemoteAgentConnectionStatus::Connected(_))
+            )
+        {
+            return Task::none();
+        }
+
+        self.remote_agent_connections.insert(
+            remote_id.to_string(),
+            RemoteAgentConnection {
+                name: agent.name.clone(),
+                endpoint: agent.endpoint.clone(),
+                status: RemoteAgentConnectionStatus::Connecting,
+                last_attempt: Some(Instant::now()),
+                last_connected: None,
+            },
+        );
+
+        Self::request_remote_agent_handshake(agent)
+    }
+
+    fn register_remote_agent_connection_defaults(&mut self) {
+        for agent in &self.remote_agent_defs {
+            self.remote_agent_connections
+                .entry(agent.id.clone())
+                .or_insert_with(|| RemoteAgentConnection {
+                    name: agent.name.clone(),
+                    endpoint: agent.endpoint.clone(),
+                    status: RemoteAgentConnectionStatus::Disconnected,
+                    last_attempt: None,
+                    last_connected: None,
+                });
+        }
+    }
+
+    fn workspace_has_remote_identity(&self, workspace: &Workspace) -> bool {
+        workspace.backend_ref().is_remote()
+            || self.remote_session_for_workspace(workspace).is_some()
+    }
+
+    fn active_workspace_is_remote(&self) -> bool {
+        self.active_workspace()
+            .is_some_and(|workspace| self.workspace_has_remote_identity(workspace))
+    }
+
+    fn tab_belongs_to_remote_workspace(&self, tab_id: usize) -> bool {
+        self.workspaces.iter().any(|workspace| {
+            self.workspace_has_remote_identity(workspace)
+                && workspace.tabs.iter().any(|tab| tab.id == tab_id)
+        })
+    }
+
+    fn tab_belongs_to_remote_agent_workspace(&self, tab_id: usize) -> bool {
+        self.workspaces.iter().any(|workspace| {
+            matches!(workspace.location, WorkspaceLocation::RemoteAgent { .. })
+                && workspace.tabs.iter().any(|tab| tab.id == tab_id)
+        })
+    }
+
     fn active_tab(&self) -> Option<&TabState> {
         self.active_workspace().and_then(|ws| ws.active_tab())
     }
@@ -4862,6 +5830,381 @@ fi
     fn active_tab_mut(&mut self) -> Option<&mut TabState> {
         self.active_workspace_mut()
             .and_then(|ws| ws.active_tab_mut())
+    }
+
+    /// The source behind the active workspace's file browser. `Err` carries
+    /// a user-facing message (shown in the Files sidebar, never swallowed).
+    fn files_source_for_active_tab(&self) -> Result<WorkspaceSource, String> {
+        let Some(workspace) = self.active_workspace() else {
+            return Err("No active workspace".to_string());
+        };
+        match &workspace.location {
+            WorkspaceLocation::Local { .. } => {
+                // Local browsing is confined to the tab's current repo root,
+                // which terminal cwd tracking keeps up to date.
+                let root = workspace
+                    .active_tab()
+                    .map(|tab| tab.repo_path.clone())
+                    .unwrap_or_else(|| workspace.dir.clone());
+                Ok(WorkspaceSource::Local { root })
+            }
+            WorkspaceLocation::RemoteAgent {
+                remote_id,
+                workspace_id,
+                root,
+            } => {
+                let Some(agent) = self.remote_agent_config_by_id(remote_id) else {
+                    return Err(format!(
+                        "Remote \"{remote_id}\" is not configured in remote-agents.json"
+                    ));
+                };
+                Ok(WorkspaceSource::RemoteAgent {
+                    workspace_id: workspace_id.clone(),
+                    root: root.clone(),
+                    client: remote_agent_client_config(agent.clone()),
+                })
+            }
+            WorkspaceLocation::LegacyRemoteSession { .. } => Err(
+                "This workspace uses the legacy SSH remote prototype, which has no file browser"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Navigate the active tab's file browser to `dir` (or refresh in place)
+    /// and kick off the listing through the workspace source.
+    fn browse_active_tab_to(&mut self, dir: SourcePath) -> Task<Event> {
+        let source = self.files_source_for_active_tab();
+        let show_hidden = self.show_hidden;
+        let Some(tab) = self.active_tab_mut() else {
+            return Task::none();
+        };
+        // Keep the tab-local working directory mirrored while browsing local
+        // dirs; remote browsing must never touch it.
+        if let Some(local) = dir.as_local() {
+            tab.current_dir = local.to_path_buf();
+        }
+        let seq = tab.files.begin_request(dir.clone());
+        let tab_id = tab.id;
+        let source = match source {
+            Ok(source) => source,
+            Err(message) => {
+                tab.files.loading = false;
+                tab.files.error = Some(message);
+                return Task::none();
+            }
+        };
+        self.mark_workspaces_dirty();
+        Self::request_source_listing(source, tab_id, dir, seq, show_hidden)
+    }
+
+    fn refresh_worktrees_for_active_tab(&mut self) -> Task<Event> {
+        if self.active_workspace_is_remote() {
+            return Task::none();
+        }
+        let Some(workspace_dir) = self.active_workspace().map(|ws| ws.dir.clone()) else {
+            return Task::none();
+        };
+        let Some(tab) = self.active_tab_mut() else {
+            return Task::none();
+        };
+        if tab.sidebar_mode != SidebarMode::Git || tab.git_view_mode != GitViewMode::Worktrees {
+            return Task::none();
+        }
+        if tab
+            .worktrees_repo_path
+            .as_ref()
+            .is_some_and(|path| paths_equal(path, &workspace_dir))
+            && !tab.worktrees_loading
+        {
+            return Task::none();
+        }
+
+        tab.worktrees_loading = true;
+        tab.last_worktrees_poll = Instant::now();
+        Self::request_git_worktrees(tab.id, workspace_dir)
+    }
+
+    fn refresh_files_for_active_tab(&mut self) -> Task<Event> {
+        let refresh = self
+            .active_tab()
+            .filter(|tab| tab.sidebar_mode == SidebarMode::Files)
+            .map(|tab| tab.files.dir.clone());
+        match refresh {
+            Some(dir) => self.browse_active_tab_to(dir),
+            None => Task::none(),
+        }
+    }
+
+    fn open_remote_workspace(&mut self, session_name: &str) -> Task<Event> {
+        self.hide_webview_for_non_agent();
+
+        if let Some(idx) = self.workspaces.iter().position(|workspace| {
+            self.remote_session_for_workspace(workspace)
+                .is_some_and(|session| session.session_name == session_name)
+        }) {
+            self.active_workspace_idx = idx;
+            self.mark_workspaces_dirty();
+            self.sync_plans_dir();
+            let viewport_width = self.content_viewport_width();
+            let target = self.active_workspace_idx as f32 * viewport_width;
+            self.slide_offset = target;
+            self.slide_target = target;
+            self.slide_animating = false;
+            self.slide_start_time = None;
+            let remote_agent_workspace = self
+                .active_workspace()
+                .is_some_and(|workspace| self.remote_agent_id_for_workspace(workspace).is_some());
+            let legacy_remote_task = if remote_agent_workspace {
+                Task::none()
+            } else {
+                self.refresh_remote_sessions()
+            };
+            return Task::batch([
+                self.scroll_to_active_workspace_bar(),
+                self.ensure_active_remote_agent_connection(false),
+                self.refresh_files_for_active_tab(),
+                legacy_remote_task,
+            ]);
+        }
+
+        let saved_idx = self.closed_workspace_configs.iter().position(|workspace| {
+            workspace
+                .remote_session
+                .as_ref()
+                .is_some_and(|session| session.session_name == session_name)
+                || self
+                    .remote_session_defs
+                    .iter()
+                    .find(|session| session.session_name == session_name)
+                    .is_some_and(|session| workspace.name == remote_workspace_name(session))
+        });
+        let saved = saved_idx.map(|idx| self.closed_workspace_configs.remove(idx));
+        let session = saved
+            .as_ref()
+            .and_then(|workspace| {
+                workspace
+                    .remote_session
+                    .as_ref()
+                    .map(remote_session_definition_from_config)
+            })
+            .or_else(|| {
+                self.remote_session_defs
+                    .iter()
+                    .find(|session| session.session_name == session_name)
+                    .cloned()
+            });
+
+        let Some(session) = session else {
+            return Task::none();
+        };
+        push_remote_session_definition(&mut self.remote_session_defs, session.clone());
+        let agent_location = remote_agent_location_for_session(&self.remote_agent_defs, &session);
+
+        let mut workspace = if let Some(saved) = saved.as_ref() {
+            let mut workspace = Workspace::new_remote(session.clone(), saved.color);
+            workspace.name = saved.name.clone();
+            workspace.abbrev = saved.abbrev.clone();
+            workspace.dir = PathBuf::from(&saved.dir);
+            workspace.env = saved.env.clone();
+            if let Some(cmd) = &saved.run_command {
+                workspace.console.run_command = Some(cmd.clone());
+                workspace.console.status = ConsoleStatus::Stopped;
+            }
+            workspace
+        } else {
+            let used_colors: Vec<WorkspaceColor> = self
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.color)
+                .collect();
+            Workspace::new_remote(session, WorkspaceColor::next_available(&used_colors))
+        };
+        if let Some(location) = agent_location {
+            if let Some(root) = remote_agent_root(&location) {
+                workspace.dir = PathBuf::from(root);
+            }
+            workspace.location = location;
+            let root = remote_agent_root(&workspace.location)
+                .map(str::to_string)
+                .unwrap_or_else(|| workspace.dir.to_string_lossy().to_string());
+            self.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
+        }
+        workspace.active_tab = 0;
+
+        self.workspaces.push(workspace);
+        self.active_workspace_idx = self.workspaces.len() - 1;
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.sync_plans_dir();
+
+        let viewport_width = self.content_viewport_width();
+        let target = self.active_workspace_idx as f32 * viewport_width;
+        self.slide_offset = target;
+        self.slide_target = target;
+        self.slide_animating = false;
+        self.slide_start_time = None;
+
+        Task::batch([
+            self.scroll_to_active_workspace_bar(),
+            self.ensure_active_remote_agent_connection(false),
+            self.refresh_files_for_active_tab(),
+            if self
+                .active_workspace()
+                .is_some_and(|workspace| self.remote_agent_id_for_workspace(workspace).is_some())
+            {
+                Task::none()
+            } else {
+                self.refresh_remote_sessions()
+            },
+        ])
+    }
+
+    fn refresh_remote_sessions(&mut self) -> Task<Event> {
+        let Some(host) = self
+            .active_workspace()
+            .and_then(|workspace| self.remote_session_for_workspace(workspace))
+            .map(|def| def.host.clone())
+        else {
+            self.remote_sessions.clear();
+            self.remote_sessions_error =
+                Some("Select a remote workspace to refresh sessions".to_string());
+            self.remote_sessions_loading = false;
+            return Task::none();
+        };
+
+        self.remote_sessions_loading = true;
+        self.remote_sessions_error = None;
+        Self::request_remote_sessions(host)
+    }
+
+    fn remote_attach_command(
+        &self,
+        session: &RemoteSessionDefinition,
+        tmux_session_name: &str,
+        startup_command: &str,
+    ) -> String {
+        let remote_script = format!(
+            "SESSION={}; DIR={}; {} has-session -t \"$SESSION\" 2>/dev/null || {} new-session -d -s \"$SESSION\" -c \"$DIR\" {}; {} set-option -t \"$SESSION\" mouse on >/dev/null 2>&1 || true; exec {} attach -t \"$SESSION\"",
+            shell_quote(tmux_session_name),
+            shell_quote(&session.remote_dir),
+            shell_quote(&session.host.tmux_path),
+            shell_quote(&session.host.tmux_path),
+            shell_quote(startup_command),
+            shell_quote(&session.host.tmux_path),
+            shell_quote(&session.host.tmux_path),
+        );
+
+        format!(
+            "exec ssh -t -i {} -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 {} {}",
+            shell_quote(session.host.identity_file.to_string_lossy().as_ref()),
+            shell_quote(&session.host.ssh_target),
+            shell_quote(&remote_script),
+        )
+    }
+
+    fn open_remote_session_tab_with_command(
+        &mut self,
+        session: RemoteSessionDefinition,
+        tmux_session_name: String,
+        startup_command: String,
+        title_suffix: Option<&str>,
+    ) -> Task<Event> {
+        let startup_command =
+            self.remote_attach_command(&session, &tmux_session_name, &startup_command);
+        let ws_idx = self.active_workspace_idx;
+        if ws_idx >= self.workspaces.len() {
+            return Task::none();
+        }
+
+        let title = title_suffix.unwrap_or("Shell").to_string();
+        if let Some(idx) = self.workspaces[ws_idx].tabs.iter().position(|tab| {
+            tab.startup_command()
+                .is_some_and(|cmd| cmd == startup_command)
+        }) {
+            if let Some(tab) = self.workspaces[ws_idx].tabs.get_mut(idx) {
+                tab.repo_name = title.clone();
+                tab.set_terminal_title(Some(title));
+                tab.sidebar_mode = SidebarMode::Remote;
+            }
+            self.workspaces[ws_idx].active_tab = idx;
+            self.mark_workspaces_dirty();
+            return self.scroll_to_active_tab();
+        }
+
+        let workspace_name = self.workspaces[ws_idx].name.clone();
+        let local_cwd = if self.workspace_has_remote_identity(&self.workspaces[ws_idx]) {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            self.workspaces[ws_idx].dir.clone()
+        };
+        let mut tab =
+            self.create_tab_for_workspace(local_cwd, Some(startup_command), Some(&workspace_name));
+        tab.repo_name = title.clone();
+        tab.set_terminal_title(Some(title));
+        tab.sidebar_mode = SidebarMode::Remote;
+        self.workspaces[ws_idx].tabs.push(tab);
+        self.workspaces[ws_idx].active_tab = self.workspaces[ws_idx].tabs.len() - 1;
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.scroll_to_active_tab()
+    }
+
+    fn open_remote_session_tab(&mut self, session_name: &str) -> Task<Event> {
+        let Some(session) = self
+            .active_workspace()
+            .and_then(|workspace| self.remote_session_for_workspace(workspace))
+            .filter(|def| def.session_name == session_name)
+            .cloned()
+        else {
+            return Task::none();
+        };
+        self.open_remote_session_tab_with_command(
+            session.clone(),
+            session.session_name.clone(),
+            session.shell_command.clone(),
+            None,
+        )
+    }
+
+    fn open_remote_codex_session_tab(&mut self, session_name: &str) -> Task<Event> {
+        let Some(session) = self
+            .active_workspace()
+            .and_then(|workspace| self.remote_session_for_workspace(workspace))
+            .filter(|def| def.session_name == session_name)
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let Some(codex_command) = session.codex_command.clone() else {
+            return Task::none();
+        };
+        self.open_remote_session_tab_with_command(
+            session.clone(),
+            remote_codex_session_name(&session),
+            codex_command,
+            Some("Codex"),
+        )
+    }
+
+    fn open_remote_claude_session_tab(&mut self, session_name: &str) -> Task<Event> {
+        let Some(session) = self
+            .active_workspace()
+            .and_then(|workspace| self.remote_session_for_workspace(workspace))
+            .filter(|def| def.session_name == session_name)
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let Some(claude_command) = session.claude_command.clone() else {
+            return Task::none();
+        };
+        self.open_remote_session_tab_with_command(
+            session.clone(),
+            remote_claude_session_name(&session),
+            claude_command,
+            Some("Claude"),
+        )
     }
 
     fn any_tab_needs_attention(&self) -> bool {
@@ -5043,6 +6386,7 @@ fi
                     }
                 }
                 let mut pending_task: Option<Task<Event>> = None;
+                let tab_workspace_is_remote = self.tab_belongs_to_remote_workspace(tab_id);
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
@@ -5075,31 +6419,43 @@ fi
                                 tab.needs_attention = title.starts_with('✳');
 
                                 // Try to sync sidebar directory from terminal title
-                                if let Some(dir) = TabState::extract_dir_from_title(&title) {
-                                    if dir != tab.current_dir {
-                                        tab.current_dir = dir.clone();
-                                        pending_task = Some(Self::request_file_tree(
-                                            tab.id,
-                                            dir.clone(),
-                                            self.show_hidden,
-                                        ));
+                                if !tab_workspace_is_remote {
+                                    if let Some(dir) = TabState::extract_dir_from_title(&title) {
+                                        if dir != tab.current_dir {
+                                            tab.current_dir = dir.clone();
+                                            let seq = tab
+                                                .files
+                                                .begin_request(SourcePath::Local(dir.clone()));
+                                            // The repo root is rediscovered from the new cwd
+                                            // just below; browsing is confined to it.
+                                            pending_task = Some(Self::request_source_listing(
+                                                WorkspaceSource::Local { root: dir.clone() },
+                                                tab.id,
+                                                SourcePath::Local(dir.clone()),
+                                                seq,
+                                                self.show_hidden,
+                                            ));
 
-                                        // Trigger a git status refresh — the worker will
-                                        // discover the correct repo root off the main thread.
-                                        tab.repo_path = dir.clone();
-                                        tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
-                                        tab.git_unchanged_streak = 0;
-                                        tab.last_git_status_hash = None;
-                                        tab.last_poll = Instant::now();
-                                        tab.git_status_loading = true;
-                                        let status_task =
-                                            Self::request_git_status(tab.id, tab.repo_path.clone());
-                                        pending_task =
-                                            Some(if let Some(tree_task) = pending_task.take() {
-                                                Task::batch([tree_task, status_task])
-                                            } else {
-                                                status_task
-                                            });
+                                            // Trigger a git status refresh — the worker will
+                                            // discover the correct repo root off the main thread.
+                                            tab.repo_path = dir.clone();
+                                            tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
+                                            tab.git_unchanged_streak = 0;
+                                            tab.last_git_status_hash = None;
+                                            tab.last_poll = Instant::now();
+                                            tab.git_status_loading = true;
+                                            let status_task = Self::request_git_status(
+                                                tab.id,
+                                                tab.repo_path.clone(),
+                                            );
+                                            pending_task = Some(
+                                                if let Some(tree_task) = pending_task.take() {
+                                                    Task::batch([tree_task, status_task])
+                                                } else {
+                                                    status_task
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -5139,27 +6495,54 @@ fi
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
-                if let Some(tab) = self.active_tab_mut() {
-                    // NOTE: repo root self-heal moved to GitStatusLoaded handler
-                    // to avoid blocking main thread with Repository::discover().
+                if !self.active_workspace_is_remote() {
+                    let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
+                    if let Some(tab) = self.active_tab_mut() {
+                        // NOTE: repo root self-heal moved to GitStatusLoaded handler
+                        // to avoid blocking main thread with Repository::discover().
 
-                    let git_focus_active =
-                        tab.sidebar_mode == SidebarMode::Git || tab.selected_file.is_some();
-                    let effective_git_poll_interval_ms = if git_focus_active {
-                        tab.git_poll_interval_ms
-                    } else {
-                        tab.git_poll_interval_ms.max(GIT_POLL_SLOW_INTERVAL_MS)
-                    };
+                        let git_focus_active =
+                            tab.sidebar_mode == SidebarMode::Git || tab.selected_file.is_some();
+                        let effective_git_poll_interval_ms = if git_focus_active {
+                            tab.git_poll_interval_ms
+                        } else {
+                            tab.git_poll_interval_ms.max(GIT_POLL_SLOW_INTERVAL_MS)
+                        };
 
-                    if !tab.git_status_loading
-                        && tab.last_poll.elapsed()
-                            >= Duration::from_millis(effective_git_poll_interval_ms)
-                    {
-                        let tab_id = tab.id;
-                        let repo_path = tab.repo_path.clone();
-                        tab.last_poll = Instant::now();
-                        tab.git_status_loading = true;
-                        tasks.push(Self::request_git_status(tab_id, repo_path));
+                        if !tab.git_status_loading
+                            && tab.last_poll.elapsed()
+                                >= Duration::from_millis(effective_git_poll_interval_ms)
+                        {
+                            let tab_id = tab.id;
+                            let repo_path = tab.repo_path.clone();
+                            tab.last_poll = Instant::now();
+                            tab.git_status_loading = true;
+                            tasks.push(Self::request_git_status(tab_id, repo_path));
+                        }
+
+                        if tab.sidebar_mode == SidebarMode::Git
+                            && tab.git_view_mode == GitViewMode::Worktrees
+                            && !tab.worktrees_loading
+                        {
+                            let worktrees_source_current =
+                                active_workspace_dir.as_ref().is_some_and(|workspace_dir| {
+                                    tab.worktrees_repo_path
+                                        .as_ref()
+                                        .is_some_and(|path| paths_equal(path, workspace_dir))
+                                });
+                            if !worktrees_source_current
+                                || tab.last_worktrees_poll.elapsed()
+                                    >= Duration::from_millis(GIT_WORKTREES_POLL_INTERVAL_MS)
+                            {
+                                let tab_id = tab.id;
+                                let repo_path = active_workspace_dir
+                                    .clone()
+                                    .unwrap_or_else(|| tab.repo_path.clone());
+                                tab.last_worktrees_poll = Instant::now();
+                                tab.worktrees_loading = true;
+                                tasks.push(Self::request_git_worktrees(tab_id, repo_path));
+                            }
+                        }
                     }
                 }
                 if workspace_dirty {
@@ -5316,8 +6699,10 @@ fi
                 if let Some(ws) = self.active_workspace_mut() {
                     if idx < ws.tabs.len() {
                         ws.active_tab = idx;
+                        self.mark_workspaces_dirty();
                     }
                 }
+                let refresh_worktrees_task = self.refresh_worktrees_for_active_tab();
                 let scroll_task = self.scroll_to_active_tab();
                 // Agent tab takes priority over the static-webview path because
                 // its webview is the tab's primary surface, not a modal overlay.
@@ -5326,17 +6711,25 @@ fi
                     .filter(|t| matches!(t.kind, TabKind::Agent(_)))
                     .map(|t| t.id);
                 if let Some(tab_id) = active_agent_tab_id {
-                    return Task::batch([scroll_task, self.show_agent_webview(tab_id)]);
+                    return Task::batch([
+                        scroll_task,
+                        refresh_worktrees_task,
+                        self.show_agent_webview(tab_id),
+                    ]);
                 }
                 if let Some(html) = self.active_inline_webview_html() {
                     let bounds = self.calculate_webview_bounds();
-                    return Task::batch([scroll_task, self.show_webview(html, bounds)]);
+                    return Task::batch([
+                        scroll_task,
+                        refresh_worktrees_task,
+                        self.show_webview(html, bounds),
+                    ]);
                 }
                 // No webview kind is active for this tab. Hide whatever is
                 // there but don't change webview_kind — the static webview
                 // can be reused for the next markdown/file viewer.
                 self.hide_webview_for_non_agent();
-                return scroll_task;
+                return Task::batch([scroll_task, refresh_worktrees_task]);
             }
             Event::TabClose(idx) => {
                 // Hide WebView when closing tabs
@@ -5631,7 +7024,7 @@ fi
                 if let Some(ws) = self.active_workspace_mut() {
                     let mut tab = TabState::new(id, repo_path.clone());
                     tab.kind = TabKind::Agent(AgentSession::new(config));
-                    tab.current_dir = current_dir.unwrap_or(repo_path);
+                    tab.set_local_dir(current_dir.unwrap_or(repo_path));
                     ws.tabs.push(tab);
                     ws.active_tab = ws.tabs.len() - 1;
                 }
@@ -5733,6 +7126,13 @@ fi
                 self.tab_picker_visible = false;
             }
             Event::EditFile(path) => {
+                let Some(path) = path.as_local().map(|p| p.to_path_buf()) else {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.files.error =
+                            Some("Editing files isn't available for this source yet".to_string());
+                    }
+                    return Task::none();
+                };
                 // Open a file in $EDITOR (fallback: vim) in a new tab
                 let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
                 let cmd = format!("{} \"{}\"", editor, path.display());
@@ -6181,7 +7581,7 @@ fi
                             Key::Character("e") => {
                                 // Open selected file in $EDITOR
                                 let full_path = tab.repo_path.join(selected);
-                                return Task::done(Event::EditFile(full_path));
+                                return Task::done(Event::EditFile(SourcePath::Local(full_path)));
                             }
                             _ => {}
                         }
@@ -6271,6 +7671,15 @@ fi
                 }
             }
             Event::SetSidebarMode(mode) => {
+                let active_workspace_is_remote = self.active_workspace_is_remote();
+                let active_workspace_is_remote_agent =
+                    self.active_workspace().is_some_and(|workspace| {
+                        self.remote_agent_id_for_workspace(workspace).is_some()
+                    });
+                if mode == SidebarMode::Remote && !active_workspace_is_remote {
+                    return Task::none();
+                }
+
                 // Expand sidebar if collapsed when switching modes
                 if self.sidebar_collapsed {
                     self.sidebar_collapsed = false;
@@ -6279,8 +7688,25 @@ fi
                 // — it's the agent tab's primary content, not a modal overlay).
                 self.hide_webview_for_non_agent();
 
+                let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
                 if let Some(tab) = self.active_tab_mut() {
                     if tab.sidebar_mode != mode {
+                        if active_workspace_is_remote
+                            && !active_workspace_is_remote_agent
+                            && mode != SidebarMode::Remote
+                        {
+                            tab.agent_sidebar.selected_capture_idx = None;
+                            tab.agent_sidebar.conversation = None;
+                            tab.close_file_viewer();
+                            tab.selected_file = None;
+                            tab.diff_lines.clear();
+                            tab.diff_load_in_progress = false;
+                            tab.diff_load_started_at = None;
+                            tab.diff_syntax_lines = None;
+                            tab.diff_syntax_notice = None;
+                            tab.sidebar_mode = mode;
+                            return Task::none();
+                        }
                         match mode {
                             SidebarMode::Git => {
                                 // Switching to Git mode - clear file viewer and refresh status
@@ -6293,8 +7719,21 @@ fi
                                 tab.git_status_loading = true;
                                 let tab_id = tab.id;
                                 let repo_path = tab.repo_path.clone();
+                                let load_worktrees = tab.git_view_mode == GitViewMode::Worktrees;
+                                if load_worktrees {
+                                    tab.worktrees_loading = true;
+                                    tab.last_worktrees_poll = Instant::now();
+                                }
                                 tab.sidebar_mode = mode;
                                 self.mark_log_server_dirty();
+                                if load_worktrees {
+                                    let worktrees_repo_path =
+                                        active_workspace_dir.unwrap_or_else(|| repo_path.clone());
+                                    return Task::batch([
+                                        Self::request_git_status(tab_id, repo_path.clone()),
+                                        Self::request_git_worktrees(tab_id, worktrees_repo_path),
+                                    ]);
+                                }
                                 return Self::request_git_status(tab_id, repo_path);
                             }
                             SidebarMode::Files => {
@@ -6307,14 +7746,9 @@ fi
                                 tab.diff_load_started_at = None;
                                 tab.diff_syntax_lines = None;
                                 tab.diff_syntax_notice = None;
-                                let tab_id = tab.id;
-                                let current_dir = tab.current_dir.clone();
                                 tab.sidebar_mode = mode;
-                                return Self::request_file_tree(
-                                    tab_id,
-                                    current_dir,
-                                    self.show_hidden,
-                                );
+                                let dir = tab.files.dir.clone();
+                                return self.browse_active_tab_to(dir);
                             }
                             SidebarMode::Claude => {
                                 // Switching to Claude mode - clear file viewer and git selection
@@ -6353,10 +7787,213 @@ fi
                                 tab.diff_syntax_lines = None;
                                 tab.diff_syntax_notice = None;
                             }
+                            SidebarMode::Remote => {
+                                // Switching to Remote mode - clear local file/git detail panes.
+                                tab.agent_sidebar.selected_capture_idx = None;
+                                tab.agent_sidebar.conversation = None;
+                                tab.close_file_viewer();
+                                tab.selected_file = None;
+                                tab.diff_lines.clear();
+                                tab.diff_load_in_progress = false;
+                                tab.diff_load_started_at = None;
+                                tab.diff_syntax_lines = None;
+                                tab.diff_syntax_notice = None;
+                                tab.sidebar_mode = mode;
+                                return self.refresh_remote_sessions();
+                            }
                         }
                         tab.sidebar_mode = mode;
                     }
                 }
+            }
+            Event::SetGitViewMode(mode) => {
+                let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
+                if let Some(tab) = self.active_tab_mut() {
+                    if tab.git_view_mode != mode {
+                        tab.git_view_mode = mode;
+                    }
+
+                    if mode == GitViewMode::Worktrees {
+                        tab.worktrees_loading = true;
+                        tab.last_worktrees_poll = Instant::now();
+                        let tab_id = tab.id;
+                        let repo_path =
+                            active_workspace_dir.unwrap_or_else(|| tab.repo_path.clone());
+                        return Self::request_git_worktrees(tab_id, repo_path);
+                    }
+                }
+            }
+            Event::SelectGitWorktree(path) => {
+                let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
+                if let Some(tab) = self.active_tab_mut() {
+                    let source_matches = active_workspace_dir.as_ref().is_some_and(|dir| {
+                        tab.worktrees_repo_path
+                            .as_ref()
+                            .is_some_and(|source| paths_equal(source, dir))
+                    });
+                    if source_matches
+                        && tab
+                            .worktrees
+                            .iter()
+                            .any(|worktree| paths_equal(&worktree.path, &path))
+                    {
+                        tab.selected_git_ref = Some(GitSelection::Worktree(path));
+                    }
+                }
+            }
+            Event::SelectGitBranch(name) => {
+                let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
+                if let Some(tab) = self.active_tab_mut() {
+                    let source_matches = active_workspace_dir.as_ref().is_some_and(|dir| {
+                        tab.worktrees_repo_path
+                            .as_ref()
+                            .is_some_and(|source| paths_equal(source, dir))
+                    });
+                    if source_matches && tab.branches.iter().any(|branch| branch.name == name) {
+                        tab.selected_git_ref = Some(GitSelection::Branch(name));
+                    }
+                }
+            }
+            Event::OpenWorktree(path) => {
+                self.hide_webview_for_non_agent();
+                if self.active_workspace_idx >= self.workspaces.len() {
+                    return Task::none();
+                }
+
+                let allowed_path = self.active_workspace().is_some_and(|workspace| {
+                    self.active_tab().is_some_and(|tab| {
+                        let source_matches = tab
+                            .worktrees_repo_path
+                            .as_ref()
+                            .is_some_and(|source| paths_equal(source, &workspace.dir));
+                        source_matches
+                            && tab.worktrees.iter().any(|worktree| {
+                                worktree.is_git_repo
+                                    && !worktree.is_prunable
+                                    && paths_equal(&worktree.path, &path)
+                            })
+                    })
+                });
+                if !allowed_path {
+                    return self.refresh_worktrees_for_active_tab();
+                }
+
+                let ws_idx = self.active_workspace_idx;
+                let existing_idx = self.workspaces[ws_idx].tabs.iter().position(|tab| {
+                    paths_equal(&tab.repo_path, &path) || paths_equal(&tab.current_dir, &path)
+                });
+
+                if let Some(idx) = existing_idx {
+                    self.workspaces[ws_idx].active_tab = idx;
+                    self.mark_workspaces_dirty();
+                } else {
+                    let ws_name = self.workspaces[ws_idx].name.clone();
+                    let tab = self.create_tab_for_workspace(path.clone(), None, Some(&ws_name));
+                    self.workspaces[ws_idx].tabs.push(tab);
+                    self.workspaces[ws_idx].active_tab = self.workspaces[ws_idx].tabs.len() - 1;
+                    self.mark_workspaces_dirty();
+                    self.mark_log_server_dirty();
+                }
+
+                let mut tasks = vec![self.scroll_to_active_tab()];
+                if let Some((tab_id, repo_path)) = {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.git_status_loading = true;
+                        tab.last_poll = Instant::now();
+                        Some((tab.id, tab.repo_path.clone()))
+                    } else {
+                        None
+                    }
+                } {
+                    tasks.push(Self::request_git_status(tab_id, repo_path));
+                }
+
+                let active_agent_tab_id = self
+                    .active_tab()
+                    .filter(|t| matches!(t.kind, TabKind::Agent(_)))
+                    .map(|t| t.id);
+                if let Some(tab_id) = active_agent_tab_id {
+                    tasks.push(self.show_agent_webview(tab_id));
+                } else if let Some(html) = self.active_inline_webview_html() {
+                    let bounds = self.calculate_webview_bounds();
+                    tasks.push(self.show_webview(html, bounds));
+                }
+
+                return Task::batch(tasks);
+            }
+            Event::RefreshRemoteSessions => {
+                return self.refresh_remote_sessions();
+            }
+            Event::RemoteSessionsLoaded(snapshot) => {
+                self.remote_sessions_loading = false;
+                self.remote_sessions_loaded_at = Some(Instant::now());
+                if let Some(error) = snapshot.error {
+                    self.remote_sessions.clear();
+                    self.remote_sessions_error = Some(format!("{}: {}", snapshot.host_name, error));
+                } else {
+                    self.remote_sessions = snapshot.sessions;
+                    self.remote_sessions_error = None;
+                }
+            }
+            Event::RemoteAgentConnect(remote_id) => {
+                return self.ensure_remote_agent_connection(&remote_id, true);
+            }
+            Event::RemoteAgentHandshakeLoaded(snapshot) => {
+                let now = Instant::now();
+                let (name, endpoint) = self
+                    .remote_agent_config_by_id(&snapshot.remote_id)
+                    .map(|agent| (agent.name.clone(), agent.endpoint.clone()))
+                    .unwrap_or_else(|| (snapshot.remote_id.clone(), snapshot.endpoint.clone()));
+
+                let status = match snapshot.result {
+                    Ok(handshake) => {
+                        eprintln!(
+                            "Remote agent connected: id={} endpoint={} agent={} protocol={} capabilities={}",
+                            snapshot.remote_id,
+                            snapshot.endpoint,
+                            handshake.agent_name,
+                            handshake.protocol_version,
+                            handshake.capabilities.join(", ")
+                        );
+                        RemoteAgentConnectionStatus::Connected(handshake)
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Remote agent connection failed: id={} endpoint={} error={}",
+                            snapshot.remote_id, snapshot.endpoint, error
+                        );
+                        RemoteAgentConnectionStatus::Error(error)
+                    }
+                };
+                let last_connected = match &status {
+                    RemoteAgentConnectionStatus::Connected(_) => Some(now),
+                    RemoteAgentConnectionStatus::Disconnected
+                    | RemoteAgentConnectionStatus::Connecting
+                    | RemoteAgentConnectionStatus::Error(_) => self
+                        .remote_agent_connections
+                        .get(&snapshot.remote_id)
+                        .and_then(|connection| connection.last_connected),
+                };
+
+                self.remote_agent_connections.insert(
+                    snapshot.remote_id,
+                    RemoteAgentConnection {
+                        name,
+                        endpoint,
+                        status,
+                        last_attempt: Some(now),
+                        last_connected,
+                    },
+                );
+            }
+            Event::AttachRemoteSession(session_name) => {
+                return self.open_remote_session_tab(&session_name);
+            }
+            Event::AttachRemoteCodexSession(session_name) => {
+                return self.open_remote_codex_session_tab(&session_name);
+            }
+            Event::AttachRemoteClaudeSession(session_name) => {
+                return self.open_remote_claude_session_tab(&session_name);
             }
             Event::ToggleClaudeSection(section) => {
                 if let Some(tab) = self.active_tab_mut() {
@@ -6399,49 +8036,28 @@ fi
                         _ => None,
                     };
                     if let Some(path) = file_path {
-                        return Task::done(Event::ViewFile(path));
+                        return Task::done(Event::ViewFile(SourcePath::Local(path)));
                     }
                 }
             }
             Event::NavigateDir(path) => {
-                let mut request: Option<(usize, PathBuf)> = None;
-                if let Some(tab) = self.active_tab_mut() {
-                    tab.current_dir = path.clone();
-                    request = Some((tab.id, path));
-                }
-                if let Some((tab_id, dir)) = request {
-                    self.mark_workspaces_dirty();
-                    return Self::request_file_tree(tab_id, dir, self.show_hidden);
-                }
+                return self.browse_active_tab_to(path);
             }
             Event::NavigateUp => {
-                let mut request: Option<(usize, PathBuf)> = None;
-                if let Some(tab) = self.active_tab_mut() {
-                    if let Some(parent) = tab.current_dir.parent() {
-                        // Don't go above repo root
-                        if parent.starts_with(&tab.repo_path) || parent == tab.repo_path {
-                            let next_dir = parent.to_path_buf();
-                            tab.current_dir = next_dir.clone();
-                            request = Some((tab.id, next_dir));
-                        }
-                    }
-                }
-                if let Some((tab_id, dir)) = request {
-                    self.mark_workspaces_dirty();
-                    return Self::request_file_tree(tab_id, dir, self.show_hidden);
+                let parent = self.active_tab().and_then(|tab| tab.files.parent.clone());
+                if let Some(parent) = parent {
+                    return self.browse_active_tab_to(parent);
                 }
             }
             Event::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
                 self.save_config();
-                if let Some(tab) = self.active_tab_mut() {
-                    if tab.sidebar_mode == SidebarMode::Files {
-                        return Self::request_file_tree(
-                            tab.id,
-                            tab.current_dir.clone(),
-                            self.show_hidden,
-                        );
-                    }
+                let refresh = self
+                    .active_tab()
+                    .filter(|tab| tab.sidebar_mode == SidebarMode::Files)
+                    .map(|tab| tab.files.dir.clone());
+                if let Some(dir) = refresh {
+                    return self.browse_active_tab_to(dir);
                 }
             }
             Event::DividerDragStart => {
@@ -6499,7 +8115,22 @@ fi
                     }
                 }
             }
-            Event::ViewFile(path) => {
+            Event::ViewFile(source_path) => {
+                // The overlay and all kind checks work on a display path;
+                // only the loader at the end differs per source.
+                let remote_source = match &source_path {
+                    SourcePath::Local(_) => None,
+                    SourcePath::Remote(_) => match self.files_source_for_active_tab() {
+                        Ok(source) => Some(source),
+                        Err(message) => {
+                            if let Some(tab) = self.active_tab_mut() {
+                                tab.files.error = Some(message);
+                            }
+                            return Task::none();
+                        }
+                    },
+                };
+                let path = PathBuf::from(source_path.display());
                 let is_dark_theme = self.theme == AppTheme::Dark;
                 let is_markdown = TabState::is_markdown_file(&path);
                 let is_html = TabState::is_html_file(&path);
@@ -6567,7 +8198,15 @@ fi
                 }
                 if let Some((tab_id, file_path)) = request {
                     self.mark_log_server_dirty();
-                    return Self::request_file_load(tab_id, file_path, is_dark_theme);
+                    return match remote_source {
+                        None => Self::request_file_load(tab_id, file_path, is_dark_theme),
+                        Some(source) => Self::request_source_file_load(
+                            source,
+                            tab_id,
+                            source_path,
+                            is_dark_theme,
+                        ),
+                    };
                 }
 
                 // Inline WebView files (markdown/html/excalidraw) are shown once load completes.
@@ -6932,6 +8571,17 @@ fi
                 return scroll_task;
             }
             Event::GitStatusLoaded(snapshot) => {
+                if self.tab_belongs_to_remote_workspace(snapshot.tab_id) {
+                    if let Some(tab) = self
+                        .workspaces
+                        .iter_mut()
+                        .flat_map(|ws| ws.tabs.iter_mut())
+                        .find(|t| t.id == snapshot.tab_id)
+                    {
+                        tab.git_status_loading = false;
+                    }
+                    return Task::none();
+                }
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
@@ -6988,16 +8638,66 @@ fi
                     }
                 }
             }
-            Event::FileTreeLoaded(snapshot) => {
+            Event::GitWorktreesLoaded(snapshot) => {
+                if self.tab_belongs_to_remote_workspace(snapshot.tab_id) {
+                    if let Some(tab) = self
+                        .workspaces
+                        .iter_mut()
+                        .flat_map(|ws| ws.tabs.iter_mut())
+                        .find(|t| t.id == snapshot.tab_id)
+                    {
+                        tab.worktrees_loading = false;
+                    }
+                    return Task::none();
+                }
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == snapshot.tab_id)
                 {
-                    if tab.current_dir == snapshot.current_dir {
-                        tab.file_tree = snapshot.entries;
+                    tab.worktrees_loading = false;
+                    tab.last_worktrees_poll = Instant::now();
+                    if snapshot.is_git_repo {
+                        tab.worktrees = snapshot.worktrees;
+                        tab.branches = snapshot.branches;
+                        tab.worktrees_repo_path = Some(snapshot.repo_path);
+                        tab.worktrees_error = None;
+                        let selection_exists = match &tab.selected_git_ref {
+                            Some(GitSelection::Worktree(path)) => tab
+                                .worktrees
+                                .iter()
+                                .any(|worktree| paths_equal(&worktree.path, path)),
+                            Some(GitSelection::Branch(name)) => {
+                                tab.branches.iter().any(|branch| &branch.name == name)
+                            }
+                            None => true,
+                        };
+                        if !selection_exists {
+                            tab.selected_git_ref = None;
+                        }
+                    } else {
+                        tab.worktrees.clear();
+                        tab.branches.clear();
+                        tab.worktrees_repo_path = None;
+                        tab.worktrees_error = snapshot.error.or_else(|| {
+                            Some(format!(
+                                "Not a git repository: {}",
+                                snapshot.repo_path.display()
+                            ))
+                        });
+                        tab.selected_git_ref = None;
                     }
+                }
+            }
+            Event::FileTreeLoaded { seq, listing } => {
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == listing.tab_id)
+                {
+                    tab.files.apply(seq, listing);
                 }
             }
             Event::DiffLoaded(snapshot) => {
@@ -7399,6 +9099,9 @@ fi
                             tab.fetch_claude_config();
                         }
                     }
+                    let refresh_worktrees_task = self.refresh_worktrees_for_active_tab();
+                    let refresh_files_task = self.refresh_files_for_active_tab();
+                    let remote_agent_task = self.ensure_active_remote_agent_connection(false);
 
                     // Set scrollable to starting position for the animation
                     let slide_task = iced::advanced::widget::operate(
@@ -7416,11 +9119,20 @@ fi
                         return Task::batch([
                             slide_task,
                             bar_task,
+                            refresh_worktrees_task,
+                            refresh_files_task,
+                            remote_agent_task,
                             self.show_webview(html, bounds),
                         ]);
                     }
                     self.hide_webview_for_non_agent();
-                    return Task::batch([slide_task, bar_task]);
+                    return Task::batch([
+                        slide_task,
+                        bar_task,
+                        refresh_worktrees_task,
+                        refresh_files_task,
+                        remote_agent_task,
+                    ]);
                 }
             }
             Event::SlideAnimationTick => {
@@ -7497,6 +9209,15 @@ fi
                             self.hide_webview_for_non_agent();
                             self.editing_console_command = None;
                             self.sync_plans_dir();
+                            let refresh_worktrees_task = self.refresh_worktrees_for_active_tab();
+                            let refresh_files_task = self.refresh_files_for_active_tab();
+                            let remote_agent_task =
+                                self.ensure_active_remote_agent_connection(false);
+                            return Task::batch([
+                                refresh_worktrees_task,
+                                refresh_files_task,
+                                remote_agent_task,
+                            ]);
                         }
                     }
                 }
@@ -7507,15 +9228,21 @@ fi
                     // Stash the workspace config (env, color, etc.) before removing,
                     // so it's preserved in workspaces.json for reopening later.
                     let ws = &self.workspaces[idx];
+                    let remote_session = self
+                        .remote_session_for_workspace(ws)
+                        .map(remote_session_config_from_definition);
                     self.closed_workspace_configs.push(WorkspaceConfig {
                         name: ws.name.clone(),
                         abbrev: ws.abbrev.clone(),
                         dir: ws.dir.to_string_lossy().to_string(),
                         color: ws.color,
+                        location: workspace_location_config_from_location(&ws.location),
+                        active_tab: None,
                         tabs: Vec::new(), // Don't preserve tabs for closed workspaces
                         run_command: ws.console.run_command.clone(),
                         bottom_terminals: Vec::new(),
                         env: ws.env.clone(),
+                        remote_session,
                         active: false,
                     });
                     // Kill console process before removing workspace
@@ -7536,7 +9263,7 @@ fi
                     self.slide_animating = false;
                     self.slide_start_time = None;
 
-                    return iced::advanced::widget::operate(
+                    let scroll_task = iced::advanced::widget::operate(
                         iced::advanced::widget::operation::scrollable::scroll_to(
                             workspace_scrollable_id(),
                             scrollable::AbsoluteOffset {
@@ -7545,6 +9272,8 @@ fi
                             },
                         ),
                     );
+                    let remote_agent_task = self.ensure_active_remote_agent_connection(false);
+                    return Task::batch([scroll_task, remote_agent_task]);
                 }
             }
             Event::WorkspaceCreate => {
@@ -7621,6 +9350,9 @@ fi
                 }
             }
             Event::WorkspaceCreated(None) => {}
+            Event::RemoteWorkspaceOpen(session_name) => {
+                return self.open_remote_workspace(&session_name);
+            }
             Event::WorkspaceSettingsOpen(idx) => {
                 self.workspace_settings_open = true;
                 self.workspace_settings_idx = idx;
@@ -9077,6 +10809,45 @@ fi
             }
         }
 
+        let unopened_remote_sessions: Vec<&RemoteSessionDefinition> = self
+            .remote_session_defs
+            .iter()
+            .filter(|session| {
+                !self.workspaces.iter().any(|workspace| {
+                    workspace
+                        .remote_session
+                        .as_ref()
+                        .is_some_and(|open| open.session_name == session.session_name)
+                })
+            })
+            .collect();
+
+        for session in unopened_remote_sessions {
+            let remote_color = theme.accent();
+            let remote_hover = theme.surface0();
+            let label = text(format!("+ {}", remote_workspace_name(session)))
+                .size(11)
+                .color(remote_color)
+                .font(iced::Font::with_name("Menlo"));
+            let remote_btn = button(label)
+                .style(move |_theme, status| {
+                    let bg = if matches!(status, button::Status::Hovered) {
+                        remote_hover
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    button::Style {
+                        background: Some(bg.into()),
+                        text_color: remote_color,
+                        border: iced::Border::default(),
+                        ..Default::default()
+                    }
+                })
+                .padding([6, 12])
+                .on_press(Event::RemoteWorkspaceOpen(session.session_name.clone()));
+            bar_row = bar_row.push(remote_btn);
+        }
+
         // "+ workspace" button at the end
         let ws_add_color = theme.overlay0();
         let ws_add_hover = theme.overlay1();
@@ -9310,10 +11081,15 @@ fi
             }
         }
 
-        let (tabs, active_tab_idx) = if let Some(ws) = self.active_workspace() {
-            (ws.tabs.as_slice(), ws.active_tab)
+        let (tabs, active_tab_idx, workspace_is_remote) = if let Some(ws) = self.active_workspace()
+        {
+            (
+                ws.tabs.as_slice(),
+                ws.active_tab,
+                self.workspace_has_remote_identity(ws),
+            )
         } else {
-            (&[] as &[TabState], 0)
+            (&[] as &[TabState], 0, false)
         };
 
         let pulse_bright = self.attention_pulse_bright;
@@ -9323,10 +11099,12 @@ fi
             let has_attention = tab.needs_attention;
 
             // Determine if this is a Claude Code tab
-            let is_claude = tab
-                .terminal_title()
-                .map(|t| t.to_lowercase().contains("claude"))
-                .unwrap_or(false);
+            let display_title = if workspace_is_remote {
+                tab.repo_name.as_str()
+            } else {
+                tab.terminal_title().unwrap_or(tab.repo_name.as_str())
+            };
+            let is_claude = display_title.to_lowercase().contains("claude");
 
             // Icon prefix — attention overrides normal icon
             let (icon_str, icon_color) = if has_attention {
@@ -9344,30 +11122,25 @@ fi
 
             // Tab label - strip leading "*" when attention (redundant with visual indicator),
             // shorten path-like titles to last component, truncate at 20 chars
-            let base_title = tab
-                .terminal_title()
-                .map(|t| {
-                    let display = if has_attention {
-                        t.trim_start_matches('*').trim_start()
-                    } else {
-                        t
-                    };
-                    // Path-like titles (e.g. from Codex) — extract last component
-                    let display = if display.starts_with('/') || display.starts_with('~') {
-                        std::path::Path::new(display)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| display.to_string())
-                    } else {
-                        display.to_string()
-                    };
-                    if display.len() > 20 {
-                        format!("{}…", truncate_str(&display, 19))
-                    } else {
-                        display
-                    }
-                })
-                .unwrap_or_else(|| tab.repo_name.clone());
+            let display = if has_attention {
+                display_title.trim_start_matches('*').trim_start()
+            } else {
+                display_title
+            };
+            let display =
+                if !workspace_is_remote && (display.starts_with('/') || display.starts_with('~')) {
+                    std::path::Path::new(display)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| display.to_string())
+                } else {
+                    display.to_string()
+                };
+            let base_title = if display.len() > 20 {
+                format!("{}…", truncate_str(&display, 19))
+            } else {
+                display
+            };
 
             let text_color = if is_active {
                 theme.text_primary()
@@ -9475,29 +11248,31 @@ fi
             );
         }
 
-        // Add tab button
-        let add_color = theme.overlay0();
-        let add_hover = theme.text_primary();
-        let add_btn = button(text("+").size(14).color(add_color))
-            .style(move |_theme, status| {
-                let tc = if matches!(status, button::Status::Hovered) {
-                    add_hover
+        if !workspace_is_remote {
+            // Add tab button
+            let add_color = theme.overlay0();
+            let add_hover = theme.text_primary();
+            let add_btn = button(text("+").size(14).color(add_color))
+                .style(move |_theme, status| {
+                    let tc = if matches!(status, button::Status::Hovered) {
+                        add_hover
+                    } else {
+                        add_color
+                    };
+                    button::Style {
+                        background: Some(iced::Color::TRANSPARENT.into()),
+                        text_color: tc,
+                        ..Default::default()
+                    }
+                })
+                .padding([4, 8])
+                .on_press(if self.agent_presets.is_empty() {
+                    Event::NewPlainTab
                 } else {
-                    add_color
-                };
-                button::Style {
-                    background: Some(iced::Color::TRANSPARENT.into()),
-                    text_color: tc,
-                    ..Default::default()
-                }
-            })
-            .padding([4, 8])
-            .on_press(if self.agent_presets.is_empty() {
-                Event::NewPlainTab
-            } else {
-                Event::LaunchAgentPreset(0)
-            });
-        tabs_row = tabs_row.push(add_btn);
+                    Event::LaunchAgentPreset(0)
+                });
+            tabs_row = tabs_row.push(add_btn);
+        }
 
         // Wrap tabs in a horizontal scrollable
         let scrollable_tabs = scrollable(tabs_row.padding([4, 8]).align_y(iced::Alignment::Center))
@@ -9722,6 +11497,10 @@ fi
                     .into()
             }
         } else {
+            if self.workspace_has_remote_identity(ws) {
+                return self.view_remote_workspace_home(ws);
+            }
+
             let bg = theme.bg_base();
             container(
                 column![
@@ -9746,6 +11525,329 @@ fi
             })
             .into()
         }
+    }
+
+    fn view_remote_workspace_home<'a>(
+        &'a self,
+        ws: &'a Workspace,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let bg = theme.bg_base();
+        if self.remote_agent_id_for_workspace(ws).is_some() {
+            return self.view_remote_agent_workspace_home(ws);
+        }
+
+        let Some(session) = self.remote_session_for_workspace(ws) else {
+            return container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        };
+
+        let runtime = self
+            .remote_sessions
+            .iter()
+            .find(|entry| entry.name == session.session_name);
+        let codex_session_name = remote_codex_session_name(session);
+        let codex_runtime = self
+            .remote_sessions
+            .iter()
+            .find(|entry| entry.name == codex_session_name);
+        let claude_session_name = remote_claude_session_name(session);
+        let claude_runtime = self
+            .remote_sessions
+            .iter()
+            .find(|entry| entry.name == claude_session_name);
+
+        let mut content = Column::new()
+            .spacing(12)
+            .padding(24)
+            .push(
+                text(&ws.name)
+                    .size(18)
+                    .color(theme.text_primary())
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .push(
+                text(&session.remote_dir)
+                    .size(font)
+                    .color(theme.text_secondary())
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .push(
+                text(&session.host.ssh_target)
+                    .size(font_small)
+                    .color(theme.overlay1())
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .push(
+                row![
+                    button(text("Refresh").size(font_small))
+                        .style(self.ghost_button_style())
+                        .padding([4, 10])
+                        .on_press(Event::RefreshRemoteSessions),
+                    button(text("Shell").size(font_small))
+                        .style(self.ghost_button_style())
+                        .padding([4, 10])
+                        .on_press(Event::AttachRemoteSession(session.session_name.clone())),
+                    button(text("Codex").size(font_small))
+                        .style(self.ghost_button_style())
+                        .padding([4, 10])
+                        .on_press_maybe(session.codex_command.as_ref().map(|_| {
+                            Event::AttachRemoteCodexSession(session.session_name.clone())
+                        })),
+                    button(text("Claude").size(font_small))
+                        .style(self.ghost_button_style())
+                        .padding([4, 10])
+                        .on_press_maybe(session.claude_command.as_ref().map(|_| {
+                            Event::AttachRemoteClaudeSession(session.session_name.clone())
+                        })),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .push(self.view_remote_session_item(session, runtime, codex_runtime, claude_runtime));
+
+        if self.remote_sessions_loading {
+            content = content.push(
+                text("Loading remote sessions...")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            );
+        }
+        if let Some(error) = &self.remote_sessions_error {
+            content = content.push(text(error).size(font_small).color(theme.danger()));
+        }
+
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_remote_agent_workspace_home<'a>(
+        &'a self,
+        ws: &'a Workspace,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let bg = theme.bg_base();
+        let root = match &ws.location {
+            WorkspaceLocation::RemoteAgent { root, .. } => root.as_str(),
+            WorkspaceLocation::Local { .. } | WorkspaceLocation::LegacyRemoteSession { .. } => "",
+        };
+
+        let mut content = Column::new()
+            .spacing(12)
+            .padding(24)
+            .push(
+                text(&ws.name)
+                    .size(18)
+                    .color(theme.text_primary())
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .push(
+                text(root)
+                    .size(font)
+                    .color(theme.text_secondary())
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .push(self.view_remote_agent_connection_panel(ws))
+            .push(
+                text("Agent connection for this workspace.")
+                    .size(font_small)
+                    .color(theme.overlay1()),
+            );
+
+        if let Some(actions) = self.view_remote_agent_session_actions(ws) {
+            content = content.push(actions);
+        }
+
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_remote_agent_session_actions<'a>(
+        &'a self,
+        ws: &'a Workspace,
+    ) -> Option<Element<'a, Event, Theme, iced::Renderer>> {
+        let font_small = self.ui_font_small();
+        let session = self.remote_session_for_workspace(ws)?;
+
+        Some(
+            row![
+                button(text("Shell").size(font_small))
+                    .style(self.ghost_button_style())
+                    .padding([4, 10])
+                    .on_press(Event::AttachRemoteSession(session.session_name.clone())),
+                button(text("Codex").size(font_small))
+                    .style(self.ghost_button_style())
+                    .padding([4, 10])
+                    .on_press_maybe(
+                        session
+                            .codex_command
+                            .as_ref()
+                            .map(|_| Event::AttachRemoteCodexSession(session.session_name.clone()))
+                    ),
+                button(text("Claude").size(font_small))
+                    .style(self.ghost_button_style())
+                    .padding([4, 10])
+                    .on_press_maybe(
+                        session
+                            .claude_command
+                            .as_ref()
+                            .map(|_| Event::AttachRemoteClaudeSession(
+                                session.session_name.clone()
+                            ))
+                    ),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into(),
+        )
+    }
+
+    fn view_remote_agent_connection_panel<'a>(
+        &'a self,
+        ws: &'a Workspace,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let panel_bg = theme.bg_surface();
+        let border_color = theme.surface1();
+        let Some(remote_id) = self.remote_agent_id_for_workspace(ws) else {
+            return container(iced::widget::Space::new()).into();
+        };
+        let agent = self.remote_agent_config_for_workspace(ws);
+        let connection = self.remote_agent_connections.get(remote_id);
+
+        let name = connection
+            .map(|connection| connection.name.as_str())
+            .or_else(|| agent.map(|agent| agent.name.as_str()))
+            .unwrap_or(remote_id);
+        let endpoint = connection
+            .map(|connection| connection.endpoint.as_str())
+            .or_else(|| agent.map(|agent| agent.endpoint.as_str()))
+            .unwrap_or("");
+
+        let (status_label, status_color, detail) = match connection.map(|c| &c.status) {
+            Some(RemoteAgentConnectionStatus::Connecting) => (
+                "connecting".to_string(),
+                theme.warning(),
+                format!("Connecting to {endpoint}"),
+            ),
+            Some(RemoteAgentConnectionStatus::Connected(handshake)) => {
+                let capabilities = if handshake.capabilities.is_empty() {
+                    "no capabilities reported".to_string()
+                } else {
+                    handshake.capabilities.join(", ")
+                };
+                (
+                    "connected".to_string(),
+                    theme.success(),
+                    format!(
+                        "{} v{} - protocol {} - {}",
+                        handshake.agent_name,
+                        handshake.agent_version,
+                        handshake.protocol_version,
+                        capabilities
+                    ),
+                )
+            }
+            Some(RemoteAgentConnectionStatus::Error(error)) => {
+                ("error".to_string(), theme.danger(), error.clone())
+            }
+            Some(RemoteAgentConnectionStatus::Disconnected) | None => (
+                "disconnected".to_string(),
+                theme.overlay1(),
+                "No active connection".to_string(),
+            ),
+        };
+
+        let status_bg = iced::Color {
+            a: 0.16,
+            ..status_color
+        };
+        let last_line = connection.and_then(|connection| {
+            connection
+                .last_connected
+                .map(|connected| format!("connected {}s ago", connected.elapsed().as_secs()))
+                .or_else(|| {
+                    connection
+                        .last_attempt
+                        .map(|attempt| format!("attempted {}s ago", attempt.elapsed().as_secs()))
+                })
+        });
+
+        let mut details = Column::new()
+            .spacing(3)
+            .push(
+                row![
+                    text(name)
+                        .size(font)
+                        .color(theme.text_primary())
+                        .font(iced::Font::with_name("Menlo"))
+                        .width(Length::Fill),
+                    container(text(status_label).size(10).color(status_color))
+                        .padding([1, 5])
+                        .style(move |_| container::Style {
+                            background: Some(status_bg.into()),
+                            border: iced::Border {
+                                radius: 6.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            )
+            .push(
+                text(endpoint)
+                    .size(font_small)
+                    .color(theme.text_secondary())
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .push(text(detail).size(font_small).color(theme.overlay1()));
+
+        if let Some(last_line) = last_line {
+            details = details.push(text(last_line).size(10).color(theme.overlay0()));
+        }
+
+        let actions = row![button(text("Reconnect").size(font_small))
+            .style(self.ghost_button_style())
+            .padding([3, 8])
+            .on_press(Event::RemoteAgentConnect(remote_id.to_string()))]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        container(column![details, actions].spacing(8))
+            .padding([8, 10])
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(panel_bg.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
     }
 
     fn view_workspace_slide(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -9829,23 +11931,49 @@ fi
     fn view_sidebar<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mut content = Column::new().spacing(0);
+        let workspace_is_remote = self.active_workspace_is_remote();
+        let workspace_is_remote_agent = self.tab_belongs_to_remote_agent_workspace(tab.id);
 
         // Mode toggle buttons
         let toggle = self.view_sidebar_toggle(tab);
         content = content.push(toggle);
 
+        let sidebar_mode = if tab.sidebar_mode == SidebarMode::Remote && !workspace_is_remote {
+            SidebarMode::Git
+        } else {
+            tab.sidebar_mode
+        };
+
         // Content based on mode
-        let mode_content: Element<'_, Event, Theme, iced::Renderer> = match tab.sidebar_mode {
+        let mode_content: Element<'_, Event, Theme, iced::Renderer> = match sidebar_mode {
+            SidebarMode::Git if workspace_is_remote => {
+                self.view_remote_local_mode_placeholder("Git")
+            }
             SidebarMode::Git => freeze_time!("view_git_list", { self.view_git_list(tab) }),
+            SidebarMode::Files if workspace_is_remote && !workspace_is_remote_agent => {
+                self.view_remote_local_mode_placeholder("Files")
+            }
             SidebarMode::Files => freeze_time!("view_file_tree", { self.view_file_tree(tab) }),
+            SidebarMode::Claude if workspace_is_remote => {
+                self.view_remote_local_mode_placeholder("Agent")
+            }
             SidebarMode::Claude => {
                 freeze_time!("view_claude_sidebar", { self.view_claude_sidebar(tab) })
+            }
+            SidebarMode::Agent if workspace_is_remote => {
+                self.view_remote_local_mode_placeholder("Agent")
             }
             SidebarMode::Agent => {
                 freeze_time!("view_agent_sidebar", { self.view_agent_sidebar(tab) })
             }
+            SidebarMode::Plans if workspace_is_remote => {
+                self.view_remote_local_mode_placeholder("Plans")
+            }
             SidebarMode::Plans => {
                 freeze_time!("view_plans_sidebar", { self.view_plans_sidebar() })
+            }
+            SidebarMode::Remote => {
+                freeze_time!("view_remote_sidebar", { self.view_remote_sidebar() })
             }
         };
 
@@ -9862,6 +11990,47 @@ fi
             .into()
     }
 
+    fn view_remote_local_mode_placeholder<'a>(
+        &'a self,
+        mode_label: &'a str,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        let mut content = Column::new().spacing(8).padding(12).push(
+            text(format!("Remote {}", mode_label))
+                .size(font)
+                .color(theme.text_primary()),
+        );
+
+        if let Some(workspace) = self
+            .active_workspace()
+            .filter(|workspace| self.remote_agent_id_for_workspace(workspace).is_some())
+        {
+            content = content.push(self.view_remote_agent_connection_panel(workspace));
+            content = content.push(
+                text(format!(
+                    "{} data unavailable for this connection.",
+                    mode_label
+                ))
+                .size(font_small)
+                .color(theme.text_secondary()),
+            );
+        } else {
+            content = content.push(
+                text("Not connected to the remote filesystem yet.")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            );
+        }
+
+        scrollable(content)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    }
+
     /// Collapsed sidebar: vertical icon rail with single-letter mode buttons
     fn view_sidebar_rail<'a>(
         &'a self,
@@ -9871,12 +12040,16 @@ fi
         let font = self.ui_font();
 
         let rail_width: f32 = 36.0;
+        let workspace_is_remote = self.active_workspace_is_remote();
 
-        let modes = [
+        let mut modes = vec![
             ("\u{2387}", SidebarMode::Git),    // ⎇ branch symbol
             ("\u{1F4C1}", SidebarMode::Files), // 📁 folder
             ("\u{2726}", SidebarMode::Claude), // ✦ sparkle
         ];
+        if workspace_is_remote {
+            modes.push(("\u{2601}", SidebarMode::Remote)); // cloud
+        }
 
         let mut rail_col = Column::new().spacing(0).width(Length::Fixed(rail_width));
 
@@ -10043,6 +12216,8 @@ fi
         let git_active = tab.sidebar_mode == SidebarMode::Git;
         let files_active = tab.sidebar_mode == SidebarMode::Files;
         let claude_active = tab.sidebar_mode == SidebarMode::Claude;
+        let workspace_is_remote = self.active_workspace_is_remote();
+        let remote_active = workspace_is_remote && tab.sidebar_mode == SidebarMode::Remote;
         let _agent_active = tab.sidebar_mode == SidebarMode::Agent;
 
         // Git tab label with optional badge
@@ -10132,14 +12307,36 @@ fi
             Event::SetSidebarMode(SidebarMode::Plans),
         );
 
-        let tab_row =
-            container(row![git_tab, files_tab, agent_tab, plans_tab, collapse_chevron].spacing(0))
-                .padding([4, 4])
-                .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(bg.into()),
-                    ..Default::default()
-                });
+        let mut tabs = Row::new()
+            .spacing(0)
+            .push(git_tab)
+            .push(files_tab)
+            .push(agent_tab)
+            .push(plans_tab);
+
+        if workspace_is_remote {
+            let remote_text_color = if remote_active {
+                theme.text_primary()
+            } else {
+                theme.overlay1()
+            };
+            let remote_tab = self.view_sidebar_tab(
+                text("Remote").size(font).color(remote_text_color).into(),
+                remote_active,
+                Event::SetSidebarMode(SidebarMode::Remote),
+            );
+            tabs = tabs.push(remote_tab);
+        }
+
+        tabs = tabs.push(collapse_chevron);
+
+        let tab_row = container(tabs)
+            .padding([4, 4])
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            });
 
         let separator = container(iced::widget::Space::new().height(0))
             .width(Length::Fill)
@@ -10152,6 +12349,280 @@ fi
         column![tab_row, separator].into()
     }
 
+    fn view_remote_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let mut content = Column::new().spacing(8).padding(8);
+        let active_remote_agent_workspace = self
+            .active_workspace()
+            .filter(|workspace| self.remote_agent_id_for_workspace(workspace).is_some());
+
+        let header = row![
+            text(if active_remote_agent_workspace.is_some() {
+                "Remote agent"
+            } else {
+                "Remote sessions"
+            })
+            .size(font)
+            .color(theme.text_primary())
+            .width(Length::Fill),
+            button(
+                text(if active_remote_agent_workspace.is_some() {
+                    "Reconnect"
+                } else {
+                    "Refresh"
+                })
+                .size(font_small)
+            )
+            .style(self.ghost_button_style())
+            .padding([3, 8])
+            .on_press_maybe(active_remote_agent_workspace.map_or(
+                Some(Event::RefreshRemoteSessions),
+                |workspace| {
+                    self.remote_agent_id_for_workspace(workspace)
+                        .map(|remote_id| Event::RemoteAgentConnect(remote_id.to_string()))
+                },
+            )),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        content = content.push(header);
+
+        if let Some(workspace) = active_remote_agent_workspace {
+            content = content.push(self.view_remote_agent_connection_panel(workspace));
+            if let Some(actions) = self.view_remote_agent_session_actions(workspace) {
+                content = content.push(actions);
+            }
+            return scrollable(content)
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .into();
+        }
+
+        if self.remote_sessions_loading {
+            content = content.push(
+                text("Loading remote sessions...")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            );
+        }
+
+        if let Some(error) = &self.remote_sessions_error {
+            let error_bg = iced::Color {
+                a: 0.12,
+                ..theme.danger()
+            };
+            content = content.push(
+                container(text(error).size(font_small).color(theme.danger()))
+                    .padding([6, 8])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(error_bg.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        if let Some(loaded_at) = self.remote_sessions_loaded_at {
+            content = content.push(
+                text(format!("Updated {}s ago", loaded_at.elapsed().as_secs()))
+                    .size(10)
+                    .color(theme.overlay0()),
+            );
+        }
+
+        let active_remote_session = self
+            .active_workspace()
+            .and_then(|workspace| self.remote_session_for_workspace(workspace));
+        let Some(session) = active_remote_session else {
+            content = content.push(
+                text("Remote sessions are scoped to remote workspaces.")
+                    .size(font)
+                    .color(theme.text_secondary()),
+            );
+            content = content.push(
+                text("Use the workspace bar to open a mac-mini:* workspace.")
+                    .size(font_small)
+                    .color(theme.overlay1()),
+            );
+            return scrollable(content)
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .into();
+        };
+
+        let runtime = self
+            .remote_sessions
+            .iter()
+            .find(|entry| entry.name == session.session_name);
+        let codex_session_name = remote_codex_session_name(session);
+        let codex_runtime = self
+            .remote_sessions
+            .iter()
+            .find(|entry| entry.name == codex_session_name);
+        let claude_session_name = remote_claude_session_name(session);
+        let claude_runtime = self
+            .remote_sessions
+            .iter()
+            .find(|entry| entry.name == claude_session_name);
+        content = content.push(self.view_remote_session_item(
+            session,
+            runtime,
+            codex_runtime,
+            claude_runtime,
+        ));
+
+        scrollable(content)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_remote_session_item<'a>(
+        &'a self,
+        session: &'a RemoteSessionDefinition,
+        runtime: Option<&'a RemoteSessionEntry>,
+        codex_runtime: Option<&'a RemoteSessionEntry>,
+        claude_runtime: Option<&'a RemoteSessionEntry>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let panel_bg = theme.bg_base();
+        let border_color = theme.surface1();
+
+        let (status_label, status_color) = match runtime {
+            Some(entry) if entry.attached > 0 => {
+                (format!("attached {}", entry.attached), theme.accent())
+            }
+            Some(_) => ("running".to_string(), theme.success()),
+            None => ("not running".to_string(), theme.overlay1()),
+        };
+        let status_bg = iced::Color {
+            a: 0.16,
+            ..status_color
+        };
+
+        let mut detail = Column::new()
+            .spacing(3)
+            .push(
+                row![
+                    text(&session.label)
+                        .size(font)
+                        .color(theme.text_primary())
+                        .font(iced::Font::with_name("Menlo"))
+                        .width(Length::Fill),
+                    container(text(status_label).size(10).color(status_color))
+                        .padding([1, 5])
+                        .style(move |_| container::Style {
+                            background: Some(status_bg.into()),
+                            border: iced::Border {
+                                radius: 6.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            )
+            .push(
+                text(&session.host.name)
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            )
+            .push(
+                text(&session.remote_dir)
+                    .size(font_small)
+                    .color(theme.overlay1()),
+            )
+            .push(text(&session.session_name).size(10).color(theme.overlay0()));
+
+        if let Some(entry) = runtime {
+            detail = detail.push(
+                text(format!("windows: {}", entry.windows))
+                    .size(10)
+                    .color(theme.overlay0()),
+            );
+        }
+
+        if let Some(codex_command) = &session.codex_command {
+            let codex_status = match codex_runtime {
+                Some(entry) if entry.attached > 0 => format!("Codex attached {}", entry.attached),
+                Some(_) => "Codex running".to_string(),
+                None => "Codex not running".to_string(),
+            };
+            detail = detail.push(
+                text(format!("{} - {}", codex_status, codex_command))
+                    .size(10)
+                    .color(theme.overlay0()),
+            );
+        }
+
+        if let Some(claude_command) = &session.claude_command {
+            let claude_status = match claude_runtime {
+                Some(entry) if entry.attached > 0 => {
+                    format!("Claude attached {}", entry.attached)
+                }
+                Some(_) => "Claude running".to_string(),
+                None => "Claude not running".to_string(),
+            };
+            detail = detail.push(
+                text(format!("{} - {}", claude_status, claude_command))
+                    .size(10)
+                    .color(theme.overlay0()),
+            );
+        }
+
+        let mut actions = Row::new().spacing(6).align_y(iced::Alignment::Center).push(
+            button(text("Shell").size(font_small))
+                .style(self.ghost_button_style())
+                .padding([3, 8])
+                .on_press(Event::AttachRemoteSession(session.session_name.clone())),
+        );
+
+        if session.codex_command.is_some() {
+            actions = actions.push(
+                button(text("Codex").size(font_small))
+                    .style(self.ghost_button_style())
+                    .padding([3, 8])
+                    .on_press(Event::AttachRemoteCodexSession(
+                        session.session_name.clone(),
+                    )),
+            );
+        }
+
+        if session.claude_command.is_some() {
+            actions = actions.push(
+                button(text("Claude").size(font_small))
+                    .style(self.ghost_button_style())
+                    .padding([3, 8])
+                    .on_press(Event::AttachRemoteClaudeSession(
+                        session.session_name.clone(),
+                    )),
+            );
+        }
+
+        container(column![detail, actions].spacing(8))
+            .padding([8, 10])
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(panel_bg.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
     fn view_file_tree<'a>(
         &'a self,
         tab: &'a TabState,
@@ -10161,41 +12632,68 @@ fi
         let font_small = self.ui_font_small();
 
         // Debug large file trees
-        if tab.file_tree.len() > 500 {
+        if tab.files.entries.len() > 500 {
             freeze_debug!(
                 "Large file tree with {} entries in view_file_tree",
-                tab.file_tree.len()
+                tab.files.entries.len()
             );
         }
 
+        // What the workspace's source supports drives which affordances
+        // render; the view never asks where the files live.
+        let caps = self
+            .files_source_for_active_tab()
+            .map(|source| source.capabilities())
+            .unwrap_or_else(|_| SourceCapabilities::none());
         let mut content = Column::new().spacing(2).padding(8);
-
-        // Current path - show relative to repo if inside it, otherwise show with ~ for home
-        let home = std::env::var("HOME").unwrap_or_default();
-        let path_display = if let Ok(rel_path) = tab.current_dir.strip_prefix(&tab.repo_path) {
-            // Inside repo - show repo_name/relative/path/
-            if rel_path.as_os_str().is_empty() {
-                format!("{}/", tab.repo_name)
-            } else {
-                format!("{}/{}/", tab.repo_name, rel_path.display())
-            }
-        } else if let Ok(rel_home) = tab.current_dir.strip_prefix(&home) {
-            // Outside repo but under home - show ~/path/
-            format!("~/{}/", rel_home.display())
-        } else {
-            // Absolute path
-            format!("{}/", tab.current_dir.display())
-        };
 
         // Path display
         content = content.push(
-            row![text(path_display).size(font).color(theme.accent()),]
-                .padding([4, 0])
-                .align_y(iced::Alignment::Center),
+            row![text(tab.files.display_dir.clone())
+                .size(font)
+                .color(theme.accent()),]
+            .padding([4, 0])
+            .align_y(iced::Alignment::Center),
         );
 
-        // Up button (if not at repo root)
-        if tab.current_dir != tab.repo_path {
+        if let Some(error) = &tab.files.error {
+            let error_bg = iced::Color {
+                a: 0.12,
+                ..theme.danger()
+            };
+            content = content.push(
+                container(text(error).size(font_small).color(theme.danger()))
+                    .padding([6, 8])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(error_bg.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        if tab.files.loading {
+            content = content.push(
+                text("Loading...")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            );
+        }
+
+        if !caps.open_file && tab.files.entries.iter().any(|entry| !entry.is_dir) {
+            content = content.push(
+                text("File preview isn't available for this source yet")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            );
+        }
+
+        // Up button — the source reports whether a parent exists
+        if tab.files.parent.is_some() {
             let muted = theme.text_secondary();
             content = content.push(
                 button(
@@ -10215,11 +12713,14 @@ fi
         }
 
         // File tree entries
-        for entry in &tab.file_tree {
+        let viewing_display = tab
+            .viewing_file_path()
+            .map(|path| path.to_string_lossy().to_string());
+        for entry in &tab.files.entries {
             let is_selected_file = !entry.is_dir
-                && tab
-                    .viewing_file_path()
-                    .is_some_and(|selected| selected == entry.path.as_path());
+                && viewing_display
+                    .as_deref()
+                    .is_some_and(|selected| selected == entry.path.display());
             let (icon, name_suffix, icon_color, name_color, bg_color) = if entry.is_dir {
                 // Folders: blue folder icon, trailing /, light background
                 (
@@ -10231,8 +12732,7 @@ fi
                 )
             } else {
                 // Files: colored by extension
-                let ext = entry
-                    .path
+                let ext = Path::new(&entry.name)
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("");
@@ -10278,34 +12778,34 @@ fi
             ]
             .spacing(4);
 
-            let event = if entry.is_dir {
-                Event::NavigateDir(entry.path.clone())
-            } else {
-                Event::ViewFile(entry.path.clone())
-            };
-
             let row_btn_style = if is_selected_file {
                 button::primary
             } else {
                 button::text
             };
 
-            let file_btn = button(entry_row)
+            let mut file_btn = button(entry_row)
                 .style(row_btn_style)
                 .padding([4, 8])
-                .width(Length::Fill)
-                .on_press(event);
+                .width(Length::Fill);
+            if entry.is_dir {
+                file_btn = file_btn.on_press(Event::NavigateDir(entry.path.clone()));
+            } else if caps.open_file {
+                file_btn = file_btn.on_press(Event::ViewFile(entry.path.clone()));
+            }
 
             // For files, add an edit button; for dirs, just use the nav button
             let btn: Element<'a, Event, Theme, iced::Renderer> = if !entry.is_dir {
-                let edit_btn = button(
+                let mut edit_btn = button(
                     text("\u{270e}")
                         .size(font_small)
                         .color(theme.text_secondary()),
                 )
                 .style(button::text)
-                .padding([4, 6])
-                .on_press(Event::EditFile(entry.path.clone()));
+                .padding([4, 6]);
+                if caps.edit_file {
+                    edit_btn = edit_btn.on_press(Event::EditFile(entry.path.clone()));
+                }
                 row![file_btn, edit_btn]
                     .align_y(iced::Alignment::Center)
                     .into()
@@ -10325,7 +12825,7 @@ fi
             }
         }
 
-        if tab.file_tree.is_empty() {
+        if tab.files.entries.is_empty() && tab.files.error.is_none() && !tab.files.loading {
             content = content.push(
                 text("Empty directory")
                     .size(font)
@@ -12372,8 +14872,6 @@ fi
     }
 
     fn view_git_list<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font = self.ui_font();
         // Only show the loading banner for the initial fetch. Subsequent polls refresh in place
         // to avoid visible flashing in the Git list.
         let show_loading = tab.git_status_loading && tab.last_git_status_hash.is_none();
@@ -12386,7 +14884,96 @@ fi
         }
 
         let mut content = Column::new().spacing(8).padding(8);
+        content = content.push(self.view_git_mode_toggle(tab));
 
+        content = match tab.git_view_mode {
+            GitViewMode::Changes => self.append_git_changes(content, tab, show_loading),
+            GitViewMode::Worktrees => self.append_git_worktrees(content, tab),
+        };
+
+        scrollable(content)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_git_mode_toggle<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let bg = theme.bg_base();
+        let border = theme.surface0();
+
+        let toggle = row![
+            self.view_git_mode_button("Changes", GitViewMode::Changes, tab.git_view_mode),
+            self.view_git_mode_button("Worktrees", GitViewMode::Worktrees, tab.git_view_mode),
+        ]
+        .spacing(2);
+
+        container(toggle)
+            .padding(2)
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_git_mode_button<'a>(
+        &'a self,
+        label: &'static str,
+        mode: GitViewMode,
+        active_mode: GitViewMode,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font_small();
+        let active = mode == active_mode;
+        let active_bg = theme.surface1();
+        let hover_bg = theme.surface0();
+        let text_active = theme.text_primary();
+        let text_inactive = theme.overlay1();
+        let text_color = if active { text_active } else { text_inactive };
+
+        button(text(label).size(font).color(text_color))
+            .padding([4, 8])
+            .width(Length::FillPortion(1))
+            .style(move |_theme, status| {
+                let bg = if active {
+                    Some(active_bg.into())
+                } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                    Some(hover_bg.into())
+                } else {
+                    None
+                };
+                button::Style {
+                    background: bg,
+                    text_color,
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })
+            .on_press(Event::SetGitViewMode(mode))
+            .into()
+    }
+
+    fn append_git_changes<'a>(
+        &'a self,
+        mut content: Column<'a, Event, Theme, iced::Renderer>,
+        tab: &'a TabState,
+        show_loading: bool,
+    ) -> Column<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
         // Branch display - styled rounded container with diamond icon
         if tab.is_git_repo {
             let branch_bg = theme.bg_base();
@@ -12480,10 +15067,575 @@ fi
             }
         }
 
-        scrollable(content)
-            .height(Length::Fill)
+        content
+    }
+
+    fn append_git_worktrees<'a>(
+        &'a self,
+        mut content: Column<'a, Event, Theme, iced::Renderer>,
+        tab: &'a TabState,
+    ) -> Column<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let source_matches = self.active_workspace().is_some_and(|workspace| {
+            tab.worktrees_repo_path
+                .as_ref()
+                .is_some_and(|path| paths_equal(path, &workspace.dir))
+        });
+        let worktrees = if source_matches {
+            tab.worktrees.as_slice()
+        } else {
+            &[]
+        };
+        let branches = if source_matches {
+            tab.branches.as_slice()
+        } else {
+            &[]
+        };
+
+        if tab.worktrees_loading && worktrees.is_empty() {
+            content = content.push(
+                text("Loading worktrees...")
+                    .size(font - 1.0)
+                    .color(theme.text_secondary()),
+            );
+        }
+
+        if let Some(error) = &tab.worktrees_error {
+            if source_matches && worktrees.is_empty() {
+                content = content.push(text(error).size(font).color(theme.text_secondary()));
+            }
+        }
+
+        if source_matches {
+            if let Some(actions) = self.view_git_selection_actions(tab) {
+                content = content.push(actions);
+            }
+        }
+
+        if !worktrees.is_empty() {
+            content = content.push(
+                row![
+                    text("W O R K T R E E S").size(10).color(theme.overlay0()),
+                    text(format!("{}", worktrees.len()))
+                        .size(10)
+                        .color(theme.accent()),
+                ]
+                .spacing(6),
+            );
+
+            for worktree in worktrees {
+                let is_selected = matches!(
+                    tab.selected_git_ref.as_ref(),
+                    Some(GitSelection::Worktree(path)) if paths_equal(path, &worktree.path)
+                );
+                content = content.push(self.view_worktree_item(worktree, is_selected));
+            }
+        } else if !tab.worktrees_loading && tab.worktrees_error.is_none() && source_matches {
+            let msg = if tab.is_git_repo {
+                "No linked worktrees"
+            } else {
+                "Not a git repository"
+            };
+            content = content.push(text(msg).size(font).color(theme.text_secondary()));
+        } else if !source_matches && !tab.worktrees_loading {
+            content = content.push(
+                text("Loading worktrees...")
+                    .size(font - 1.0)
+                    .color(theme.text_secondary()),
+            );
+        }
+
+        if !branches.is_empty() {
+            content = content.push(
+                row![
+                    text("B R A N C H E S").size(10).color(theme.overlay0()),
+                    text(format!("{}", branches.len()))
+                        .size(10)
+                        .color(theme.accent()),
+                ]
+                .spacing(6),
+            );
+
+            for branch in branches {
+                let is_selected = matches!(
+                    tab.selected_git_ref.as_ref(),
+                    Some(GitSelection::Branch(name)) if name == &branch.name
+                );
+                content = content.push(self.view_branch_item(branch, is_selected));
+            }
+        }
+
+        content
+    }
+
+    fn view_git_selection_actions<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Option<Element<'a, Event, Theme, iced::Renderer>> {
+        match tab.selected_git_ref.as_ref()? {
+            GitSelection::Worktree(path) => tab
+                .worktrees
+                .iter()
+                .find(|worktree| paths_equal(&worktree.path, path))
+                .map(|worktree| self.view_selected_worktree_actions(worktree)),
+            GitSelection::Branch(name) => tab
+                .branches
+                .iter()
+                .find(|branch| &branch.name == name)
+                .map(|branch| self.view_selected_branch_actions(branch)),
+        }
+    }
+
+    fn view_selected_worktree_actions<'a>(
+        &'a self,
+        worktree: &'a GitWorktreeEntry,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let panel_bg = theme.bg_base();
+        let border_color = theme.surface1();
+        let title = worktree
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| worktree.path.display().to_string());
+        let branch = self.worktree_branch_label(worktree);
+        let path_display = self.compact_path_display(&worktree.path);
+
+        let mut actions = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        if worktree.is_git_repo && !worktree.is_prunable {
+            actions = actions.push(
+                button(text("Open Terminal").size(font_small))
+                    .style(self.ghost_button_style())
+                    .padding([3, 8])
+                    .on_press(Event::OpenWorktree(worktree.path.clone())),
+            );
+        } else {
+            let disabled_bg = theme.surface0();
+            actions = actions.push(
+                container(text("Unavailable").size(font_small).color(theme.overlay1()))
+                    .padding([3, 8])
+                    .style(move |_| container::Style {
+                        background: Some(disabled_bg.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        container(
+            column![
+                text("Selected worktree").size(10).color(theme.overlay0()),
+                text(title)
+                    .size(font)
+                    .color(theme.text_primary())
+                    .font(iced::Font::with_name("Menlo")),
+                text(format!("branch: {}", branch))
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+                text(path_display).size(font_small).color(theme.overlay1()),
+                actions,
+            ]
+            .spacing(4),
+        )
+        .padding([8, 10])
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(panel_bg.into()),
+            border: iced::Border {
+                color: border_color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+    }
+
+    fn view_selected_branch_actions<'a>(
+        &'a self,
+        branch: &'a GitBranchEntry,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let panel_bg = theme.bg_base();
+        let border_color = theme.surface1();
+
+        let mut detail = branch.short_head().to_string();
+        if let Some(upstream) = &branch.upstream {
+            detail.push_str(" \u{2192} ");
+            detail.push_str(upstream);
+        }
+
+        let mut content = Column::new()
+            .spacing(4)
+            .push(text("Selected branch").size(10).color(theme.overlay0()))
+            .push(
+                text(&branch.name)
+                    .size(font)
+                    .color(theme.text_primary())
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .push(text(detail).size(font_small).color(theme.text_secondary()));
+
+        let mut actions = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        if let Some(path) = &branch.worktree_path {
+            content = content.push(
+                text(self.compact_path_display(path))
+                    .size(font_small)
+                    .color(theme.overlay1()),
+            );
+            actions = actions.push(
+                button(text("Open Terminal").size(font_small))
+                    .style(self.ghost_button_style())
+                    .padding([3, 8])
+                    .on_press(Event::OpenWorktree(path.clone())),
+            );
+        } else {
+            let disabled_bg = theme.surface0();
+            actions = actions.push(
+                container(text("No worktree").size(font_small).color(theme.overlay1()))
+                    .padding([3, 8])
+                    .style(move |_| container::Style {
+                        background: Some(disabled_bg.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        content = content.push(actions);
+
+        container(content)
+            .padding([8, 10])
             .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(panel_bg.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
             .into()
+    }
+
+    fn worktree_branch_label(&self, worktree: &GitWorktreeEntry) -> String {
+        if worktree.is_detached {
+            let short_head = worktree.short_head();
+            if short_head.is_empty() {
+                "detached".to_string()
+            } else {
+                format!("detached {}", short_head)
+            }
+        } else if worktree.branch_name.is_empty() {
+            let short_head = worktree.short_head();
+            if short_head.is_empty() {
+                "(unknown)".to_string()
+            } else {
+                short_head.to_string()
+            }
+        } else {
+            worktree.branch_name.clone()
+        }
+    }
+
+    fn view_branch_item<'a>(
+        &'a self,
+        branch: &'a GitBranchEntry,
+        is_selected: bool,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let is_checked_out = branch.worktree_path.is_some();
+        let marker = if branch.is_current {
+            "\u{25c6}"
+        } else if is_checked_out {
+            "\u{25c7}"
+        } else {
+            "\u{2219}"
+        };
+        let marker_color = if branch.is_current {
+            theme.mauve()
+        } else if is_checked_out {
+            theme.accent()
+        } else {
+            theme.overlay1()
+        };
+        let name_color = if branch.is_current {
+            theme.text_primary()
+        } else {
+            theme.text_secondary()
+        };
+
+        let mut top = Row::new()
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .push(text(marker).size(font).color(marker_color))
+            .push(
+                text(&branch.name)
+                    .size(font)
+                    .color(name_color)
+                    .font(iced::Font::with_name("Menlo"))
+                    .width(Length::Fill),
+            );
+
+        let detail_text = if let Some(path) = &branch.worktree_path {
+            let chip_bg = iced::Color {
+                a: 0.16,
+                ..theme.accent()
+            };
+            let chip_color = theme.accent();
+            let label = if branch.is_current {
+                "current"
+            } else {
+                "worktree"
+            };
+            top = top.push(
+                container(text(label).size(10).color(chip_color))
+                    .padding([1, 5])
+                    .style(move |_| container::Style {
+                        background: Some(chip_bg.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+
+            self.compact_path_display(path)
+        } else {
+            let mut text = branch.short_head().to_string();
+            if let Some(upstream) = &branch.upstream {
+                text.push_str(" \u{2192} ");
+                text.push_str(upstream);
+            }
+            text
+        };
+
+        let row_bg = if is_selected {
+            Some(theme.surface1())
+        } else {
+            None
+        };
+        let border_color = theme.accent();
+        let border_width = if is_selected { 1.0 } else { 0.0 };
+        let content = container(
+            column![
+                top,
+                text(detail_text).size(font_small).color(theme.overlay1())
+            ]
+            .spacing(2),
+        )
+        .padding([5, 8])
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: row_bg.map(Into::into),
+            border: iced::Border {
+                color: border_color,
+                width: border_width,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        });
+
+        button(content)
+            .style(button::text)
+            .padding(0)
+            .width(Length::Fill)
+            .on_press(Event::SelectGitBranch(branch.name.clone()))
+            .into()
+    }
+
+    fn view_worktree_item<'a>(
+        &'a self,
+        worktree: &'a GitWorktreeEntry,
+        is_selected: bool,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let changes = worktree.total_changes();
+        let worktree_name = worktree
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| worktree.path.display().to_string());
+        let branch = self.worktree_branch_label(worktree);
+
+        let status_label = if worktree.is_prunable {
+            "prunable".to_string()
+        } else if !worktree.is_git_repo {
+            "unavailable".to_string()
+        } else if changes == 0 {
+            "clean".to_string()
+        } else {
+            format!("{} changed", changes)
+        };
+        let status_color = if worktree.is_prunable || !worktree.is_git_repo {
+            theme.danger()
+        } else if changes == 0 {
+            theme.success()
+        } else {
+            theme.warning()
+        };
+        let icon_color = if worktree.is_current {
+            theme.mauve()
+        } else {
+            theme.overlay1()
+        };
+        let branch_color = if worktree.is_current {
+            theme.text_primary()
+        } else {
+            theme.text_secondary()
+        };
+        let marker = if worktree.is_current {
+            "\u{25c6}"
+        } else {
+            "\u{25c7}"
+        };
+
+        let mut top = Row::new()
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .push(text(marker).size(font).color(icon_color))
+            .push(
+                text(worktree_name)
+                    .size(font)
+                    .color(branch_color)
+                    .font(iced::Font::with_name("Menlo"))
+                    .width(Length::Fill),
+            )
+            .push(text(status_label).size(font_small).color(status_color));
+
+        let usage_label = if worktree.is_current {
+            Some("current".to_string())
+        } else {
+            self.worktree_usage_label(&worktree.path)
+        };
+        if let Some(label) = usage_label {
+            let chip_bg = iced::Color {
+                a: 0.16,
+                ..theme.accent()
+            };
+            let chip_color = theme.accent();
+            top = top.push(
+                container(text(label).size(10).color(chip_color))
+                    .padding([1, 5])
+                    .style(move |_| container::Style {
+                        background: Some(chip_bg.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        let path_display = self.compact_path_display(&worktree.path);
+        let mut detail = Row::new().spacing(6).align_y(iced::Alignment::Center).push(
+            text(format!("branch: {}", branch))
+                .size(font_small)
+                .color(theme.overlay1())
+                .width(Length::Fill),
+        );
+        if changes > 0 {
+            detail = detail.push(
+                text(format!(
+                    "S {} U {} ? {}",
+                    worktree.staged_count, worktree.unstaged_count, worktree.untracked_count
+                ))
+                .size(10)
+                .color(theme.overlay0()),
+            );
+        }
+        let path_row = text(path_display)
+            .size(font_small)
+            .color(theme.overlay0())
+            .width(Length::Fill);
+
+        let row_bg = if is_selected {
+            Some(theme.surface1())
+        } else if worktree.is_current {
+            Some(theme.bg_base())
+        } else {
+            None
+        };
+        let border_color = theme.accent();
+        let border_width = if is_selected { 1.0 } else { 0.0 };
+        let content = container(column![top, detail, path_row].spacing(2))
+            .padding([6, 8])
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: row_bg.map(Into::into),
+                border: iced::Border {
+                    color: border_color,
+                    width: border_width,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            });
+
+        button(content)
+            .style(button::text)
+            .padding(0)
+            .width(Length::Fill)
+            .on_press(Event::SelectGitWorktree(worktree.path.clone()))
+            .into()
+    }
+
+    fn compact_path_display(&self, path: &Path) -> String {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            if let Ok(rel) = path.strip_prefix(&home) {
+                if rel.as_os_str().is_empty() {
+                    return "~".to_string();
+                }
+                return format!("~/{}", rel.display());
+            }
+        }
+        path.display().to_string()
+    }
+
+    fn worktree_usage_label(&self, path: &Path) -> Option<String> {
+        let mut has_tab = false;
+        let mut has_bottom_terminal = false;
+        for workspace in &self.workspaces {
+            for tab in &workspace.tabs {
+                if paths_equal(&tab.repo_path, path) || paths_equal(&tab.current_dir, path) {
+                    if matches!(tab.kind, TabKind::Agent(_)) {
+                        return Some("Agent".to_string());
+                    }
+                    has_tab = true;
+                }
+            }
+            for terminal in &workspace.bottom_terminals {
+                if paths_equal(&terminal.cwd, path) {
+                    has_bottom_terminal = true;
+                }
+            }
+        }
+
+        if has_tab {
+            Some("Tab".to_string())
+        } else if has_bottom_terminal {
+            Some("Console".to_string())
+        } else {
+            None
+        }
     }
 
     fn view_file_item<'a>(
@@ -12546,7 +15698,7 @@ fi
         )
         .style(button::text)
         .padding([4, 6])
-        .on_press(Event::EditFile(full_path));
+        .on_press(Event::EditFile(SourcePath::Local(full_path)));
 
         row![select_btn, edit_btn]
             .align_y(iced::Alignment::Center)
@@ -12853,6 +16005,19 @@ fi
                 iced::widget::mouse_area(term_container)
                     .on_press(Event::MainTerminalClicked)
                     .into()
+            } else if self.tab_belongs_to_remote_agent_workspace(tab.id) {
+                if let Some(ws) = self.active_workspace().filter(|ws| {
+                    ws.tabs
+                        .iter()
+                        .any(|workspace_tab| workspace_tab.id == tab.id)
+                }) {
+                    self.view_remote_agent_workspace_home(ws)
+                } else {
+                    container(iced::widget::Space::new())
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                }
             } else {
                 container(
                     text("Terminal unavailable")
@@ -13809,6 +16974,34 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    fn test_remote_session() -> RemoteSessionDefinition {
+        RemoteSessionDefinition {
+            host: RemoteHostConfig {
+                name: "mac-mini".to_string(),
+                ssh_target: "tracey@example.local".to_string(),
+                identity_file: PathBuf::from("/tmp/key"),
+                tmux_path: "/opt/homebrew/bin/tmux".to_string(),
+            },
+            label: "truinsights-website".to_string(),
+            session_name: "gitterm-truinsights-website".to_string(),
+            remote_dir: "/Users/traceytrewin/GitRepo/truinsights-website".to_string(),
+            shell_command: "/bin/zsh".to_string(),
+            codex_command: None,
+            claude_command: None,
+        }
+    }
+
+    fn test_remote_agent(id: &str, name: &str) -> RemoteAgentConfig {
+        RemoteAgentConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            endpoint: "http://100.64.0.1:7777".to_string(),
+            auth: config::RemoteAgentAuthConfig::Token {
+                token_ref: "env:GITTERM_TEST_TOKEN".to_string(),
+            },
+        }
+    }
+
     // === ConsoleState::strip_ansi ===
 
     #[test]
@@ -14113,6 +17306,87 @@ mod tests {
         assert_eq!(result, WorkspaceColor::from_index(all.len()));
     }
 
+    // === Remote agent workspace migration ===
+
+    #[test]
+    fn workspace_location_upgrades_matching_remote_session_to_agent() {
+        let session = test_remote_session();
+        let agents = vec![test_remote_agent("mac-mini", "Mac mini")];
+
+        let location = workspace_location_from_config(
+            None,
+            Path::new("/Users/t.trewin"),
+            Some(&session),
+            &agents,
+        );
+
+        match location {
+            WorkspaceLocation::RemoteAgent {
+                remote_id,
+                workspace_id,
+                root,
+            } => {
+                assert_eq!(remote_id, "mac-mini");
+                assert_eq!(workspace_id, "gitterm-truinsights-website");
+                assert_eq!(root, "/Users/traceytrewin/GitRepo/truinsights-website");
+            }
+            other => panic!("expected RemoteAgent location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_location_keeps_unmatched_remote_session_legacy() {
+        let session = test_remote_session();
+        let agents = vec![test_remote_agent("other-host", "Other Host")];
+
+        let location = workspace_location_from_config(
+            None,
+            Path::new("/Users/t.trewin"),
+            Some(&session),
+            &agents,
+        );
+
+        match location {
+            WorkspaceLocation::LegacyRemoteSession { session_name, root } => {
+                assert_eq!(session_name, "gitterm-truinsights-website");
+                assert_eq!(root, "/Users/traceytrewin/GitRepo/truinsights-website");
+            }
+            other => panic!("expected legacy remote location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_source_file_load_renders_markdown_webview() {
+        let snapshot = services::shape_source_file_load(
+            1,
+            PathBuf::from("/remote/repo/README.md"),
+            Ok(crate::source::SourceFileContent {
+                data: b"# Title\n\nbody".to_vec(),
+                total_size: 13,
+                truncated: false,
+            }),
+            true,
+        );
+        assert!(snapshot.webview_content.is_some());
+        assert!(snapshot.file_preview_notice.is_none());
+    }
+
+    #[test]
+    fn shape_source_file_load_flags_binary() {
+        let snapshot = services::shape_source_file_load(
+            1,
+            PathBuf::from("/remote/repo/blob.bin"),
+            Ok(crate::source::SourceFileContent {
+                data: vec![0u8, 159, 146, 150],
+                total_size: 4,
+                truncated: false,
+            }),
+            true,
+        );
+        assert!(snapshot.file_content.is_empty());
+        assert!(snapshot.file_preview_notice.is_some());
+    }
+
     // === AppTheme::toggle ===
 
     #[test]
@@ -14301,77 +17575,6 @@ mod tests {
     }
 
     // === collect_file_tree ===
-
-    #[test]
-    fn collect_file_tree_sorts_dirs_before_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("zebra.txt"), "").unwrap();
-        std::fs::write(dir.path().join("apple.txt"), "").unwrap();
-        std::fs::create_dir(dir.path().join("beta_dir")).unwrap();
-        std::fs::create_dir(dir.path().join("alpha_dir")).unwrap();
-
-        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
-        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
-        // Dirs first (sorted), then files (sorted)
-        assert_eq!(
-            names,
-            vec!["alpha_dir", "beta_dir", "apple.txt", "zebra.txt"]
-        );
-    }
-
-    #[test]
-    fn collect_file_tree_hides_dotfiles() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".hidden"), "").unwrap();
-        std::fs::write(dir.path().join("visible.txt"), "").unwrap();
-
-        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
-        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["visible.txt"]);
-    }
-
-    #[test]
-    fn collect_file_tree_shows_dotfiles_when_enabled() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".hidden"), "").unwrap();
-        std::fs::write(dir.path().join("visible.txt"), "").unwrap();
-
-        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), true);
-        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&".hidden"));
-        assert!(names.contains(&"visible.txt"));
-    }
-
-    #[test]
-    fn collect_file_tree_excludes_node_modules_and_target() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
-        std::fs::create_dir(dir.path().join("target")).unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-
-        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
-        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["src"]);
-    }
-
-    #[test]
-    fn collect_file_tree_case_insensitive_sort() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Zebra.txt"), "").unwrap();
-        std::fs::write(dir.path().join("apple.txt"), "").unwrap();
-        std::fs::write(dir.path().join("Banana.txt"), "").unwrap();
-
-        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
-        let names: Vec<&str> = snapshot.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["apple.txt", "Banana.txt", "Zebra.txt"]);
-    }
-
-    #[test]
-    fn collect_file_tree_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let snapshot = collect_file_tree(1, dir.path().to_path_buf(), false);
-        assert!(snapshot.entries.is_empty());
-    }
 
     #[test]
     fn read_text_preview_limits_lines() {

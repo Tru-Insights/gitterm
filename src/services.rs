@@ -4,7 +4,8 @@ use crate::markdown;
 use crate::{
     add_word_diffs_to_lines, build_syntax_highlight_lines, format_bytes, read_text_preview,
     DiffLine, DiffLineType, DiffSnapshot, FileEntry, FileLoadSnapshot, FileSyntaxSnapshot,
-    FileTreeEntry, FileTreeSnapshot, FileVersionSignature, GitStatusSnapshot, TabState,
+    FileVersionSignature, GitBranchEntry, GitStatusSnapshot, GitWorktreeEntry,
+    GitWorktreesSnapshot, RemoteHostConfig, RemoteSessionEntry, RemoteSessionsSnapshot, TabState,
     LARGE_TEXT_PREVIEW_BYTES, LARGE_TEXT_PREVIEW_LINES, MAX_FULL_TEXT_LOAD_BYTES,
     MAX_INLINE_WEBVIEW_BYTES,
 };
@@ -214,6 +215,254 @@ pub(crate) fn collect_git_status(tab_id: usize, repo_path: PathBuf) -> GitStatus
     snapshot
 }
 
+pub(crate) fn collect_git_worktrees(tab_id: usize, repo_path: PathBuf) -> GitWorktreesSnapshot {
+    let started = Instant::now();
+    let mut snapshot = GitWorktreesSnapshot {
+        tab_id,
+        repo_path: repo_path.clone(),
+        is_git_repo: false,
+        worktrees: Vec::new(),
+        branches: Vec::new(),
+        error: None,
+    };
+
+    let output = match std::process::Command::new("git")
+        .args(["--no-optional-locks", "worktree", "list", "--porcelain"])
+        .current_dir(&repo_path)
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            snapshot.error = if stderr.is_empty() {
+                Some("Not a git repository".to_string())
+            } else {
+                Some(stderr)
+            };
+            return snapshot;
+        }
+        Err(e) => {
+            snapshot.error = Some(format!("Failed to run git worktree list: {}", e));
+            return snapshot;
+        }
+    };
+
+    snapshot.is_git_repo = true;
+
+    let finalize_entry = |mut entry: GitWorktreeEntry| {
+        if entry.path.is_dir() {
+            let status = collect_git_status(tab_id, entry.path.clone());
+            entry.is_git_repo = status.is_git_repo;
+            entry.staged_count = status.staged.len();
+            entry.unstaged_count = status.unstaged.len();
+            entry.untracked_count = status.untracked.len();
+            if entry.branch_name.is_empty() && status.is_git_repo && status.branch_name != "main" {
+                entry.branch_name = status.branch_name;
+            }
+        }
+        entry
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut current: Option<GitWorktreeEntry> = None;
+    for line in stdout.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let Some(entry) = current.take() {
+                snapshot.worktrees.push(finalize_entry(entry));
+            }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                snapshot.worktrees.push(finalize_entry(entry));
+            }
+            let path = PathBuf::from(path);
+            current = Some(GitWorktreeEntry {
+                is_current: paths_equal(&path, &repo_path),
+                path,
+                branch_name: String::new(),
+                head: String::new(),
+                is_detached: false,
+                is_prunable: false,
+                is_git_repo: false,
+                staged_count: 0,
+                unstaged_count: 0,
+                untracked_count: 0,
+            });
+        } else if let Some(entry) = current.as_mut() {
+            if let Some(head) = line.strip_prefix("HEAD ") {
+                entry.head = head.to_string();
+            } else if let Some(branch) = line.strip_prefix("branch ") {
+                entry.branch_name = branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_string();
+            } else if line == "detached" {
+                entry.is_detached = true;
+            } else if line.starts_with("prunable") {
+                entry.is_prunable = true;
+            }
+        }
+    }
+
+    snapshot.worktrees.sort_by(|a, b| {
+        b.is_current
+            .cmp(&a.is_current)
+            .then_with(|| b.total_changes().cmp(&a.total_changes()))
+            .then_with(|| a.branch_name.cmp(&b.branch_name))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let checked_out_branches: std::collections::HashMap<String, PathBuf> = snapshot
+        .worktrees
+        .iter()
+        .filter(|worktree| !worktree.is_detached && !worktree.branch_name.is_empty())
+        .map(|worktree| (worktree.branch_name.clone(), worktree.path.clone()))
+        .collect();
+
+    if let Ok(branch_output) = std::process::Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "for-each-ref",
+            "refs/heads",
+            "--format=%(refname:short)%00%(objectname)%00%(HEAD)%00%(upstream:short)",
+        ])
+        .current_dir(&repo_path)
+        .output()
+    {
+        if branch_output.status.success() {
+            let stdout = String::from_utf8_lossy(&branch_output.stdout);
+            for line in stdout.lines() {
+                let mut parts = line.split('\0');
+                let name = parts.next().unwrap_or("").to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let head = parts.next().unwrap_or("").to_string();
+                let is_current = parts.next().unwrap_or("") == "*";
+                let upstream = parts
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let worktree_path = checked_out_branches.get(&name).cloned();
+                snapshot.branches.push(GitBranchEntry {
+                    name,
+                    head,
+                    is_current,
+                    upstream,
+                    worktree_path,
+                });
+            }
+        }
+    }
+
+    snapshot.branches.sort_by(|a, b| {
+        b.is_current
+            .cmp(&a.is_current)
+            .then_with(|| b.worktree_path.is_some().cmp(&a.worktree_path.is_some()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let elapsed = started.elapsed();
+    perf_log!(
+        "git_worktrees tab={} repo={} worktrees={} branches={} took={}ms",
+        tab_id,
+        repo_path.display(),
+        snapshot.worktrees.len(),
+        snapshot.branches.len(),
+        elapsed.as_millis()
+    );
+
+    snapshot
+}
+
+pub(crate) fn collect_remote_sessions(host: RemoteHostConfig) -> RemoteSessionsSnapshot {
+    let started = Instant::now();
+    let mut snapshot = RemoteSessionsSnapshot {
+        host_name: host.name.clone(),
+        sessions: Vec::new(),
+        error: None,
+    };
+
+    let remote_command = format!(
+        "{} list-sessions -F '#{{session_name}}\t#{{session_windows}}\t#{{session_attached}}' 2>/dev/null || true",
+        host.tmux_path
+    );
+    let output = match std::process::Command::new("ssh")
+        .arg("-i")
+        .arg(&host.identity_file)
+        .args([
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+        ])
+        .arg(&host.ssh_target)
+        .arg(remote_command)
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            snapshot.error = Some(format!("Failed to run ssh: {}", e));
+            return snapshot;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        snapshot.error = if stderr.is_empty() {
+            Some(format!("ssh exited with status {}", output.status))
+        } else {
+            Some(stderr)
+        };
+        return snapshot;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.split('\t');
+        let name = parts.next().unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let windows = parts
+            .next()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let attached = parts
+            .next()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        snapshot.sessions.push(RemoteSessionEntry {
+            name,
+            windows,
+            attached,
+        });
+    }
+
+    snapshot.sessions.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let elapsed = started.elapsed();
+    perf_log!(
+        "remote_sessions host={} sessions={} took={}ms",
+        host.name,
+        snapshot.sessions.len(),
+        elapsed.as_millis()
+    );
+
+    snapshot
+}
+
+fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Fallback git status collection using the git2 library, used when the `git` CLI is not found.
 fn collect_git_status_git2(
     mut snapshot: GitStatusSnapshot,
@@ -275,59 +524,6 @@ fn collect_git_status_git2(
             }
         }
     }
-
-    snapshot
-}
-
-pub(crate) fn collect_file_tree(
-    tab_id: usize,
-    current_dir: PathBuf,
-    show_hidden: bool,
-) -> FileTreeSnapshot {
-    let started = Instant::now();
-    let mut dirs: Vec<FileTreeEntry> = Vec::new();
-    let mut files: Vec<FileTreeEntry> = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(&current_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            if name == "node_modules" || name == "target" {
-                continue;
-            }
-            if !show_hidden && name.starts_with('.') {
-                continue;
-            }
-
-            let is_dir = path.is_dir();
-            let entry = FileTreeEntry { name, path, is_dir };
-            if is_dir {
-                dirs.push(entry);
-            } else {
-                files.push(entry);
-            }
-        }
-    }
-
-    dirs.sort_by_key(|a| a.name.to_lowercase());
-    files.sort_by_key(|a| a.name.to_lowercase());
-    dirs.extend(files);
-
-    let snapshot = FileTreeSnapshot {
-        tab_id,
-        current_dir,
-        entries: dirs,
-    };
-
-    perf_log!(
-        "file_tree tab={} dir={} entries={} hidden={} took={}ms",
-        tab_id,
-        snapshot.current_dir.display(),
-        snapshot.entries.len(),
-        show_hidden,
-        started.elapsed().as_millis()
-    );
 
     snapshot
 }
@@ -673,6 +869,110 @@ pub(crate) fn collect_file_load(
         false,
         started.elapsed().as_millis()
     );
+
+    snapshot
+}
+
+/// Shape a FileLoadSnapshot from bytes fetched via a WorkspaceSource so
+/// remote files render through the exact same viewer pipeline as local
+/// ones. `path` is the remote path as a display/extension token — nothing
+/// here touches the local filesystem.
+pub(crate) fn shape_source_file_load(
+    tab_id: usize,
+    path: PathBuf,
+    content: Result<crate::source::SourceFileContent, String>,
+    is_dark_theme: bool,
+) -> FileLoadSnapshot {
+    let mut snapshot = FileLoadSnapshot {
+        tab_id,
+        path: path.clone(),
+        file_content: String::new(),
+        image_path: None,
+        webview_content: None,
+        file_preview_notice: None,
+        syntax_highlight_lines: None,
+        syntax_highlight_notice: None,
+        file_signature: None,
+    };
+
+    let content = match content {
+        Ok(content) => content,
+        Err(err) => {
+            snapshot.file_preview_notice = Some(format!("Could not load remote file: {err}"));
+            return snapshot;
+        }
+    };
+    let total_size = content.total_size;
+
+    #[cfg(feature = "excalidraw")]
+    if excalidraw::is_excalidraw_file(&path) {
+        if total_size > MAX_INLINE_WEBVIEW_BYTES {
+            snapshot.file_preview_notice = Some(format!(
+                "Inline preview skipped for large Excalidraw file ({}).",
+                format_bytes(total_size)
+            ));
+            return snapshot;
+        }
+        if let Ok(text) = String::from_utf8(content.data) {
+            if excalidraw::validate_excalidraw(&text) {
+                snapshot.webview_content =
+                    Some(excalidraw::render_excalidraw_html(&text, is_dark_theme));
+            }
+        }
+        return snapshot;
+    }
+
+    if TabState::is_markdown_file(&path) {
+        if total_size > MAX_INLINE_WEBVIEW_BYTES {
+            snapshot.file_preview_notice = Some(format!(
+                "Inline preview skipped for large Markdown file ({}).",
+                format_bytes(total_size)
+            ));
+            return snapshot;
+        }
+        let text = String::from_utf8_lossy(&content.data);
+        snapshot.webview_content = Some(markdown::render_markdown_to_html(&text, is_dark_theme));
+    } else if TabState::is_html_file(&path) {
+        if total_size > MAX_INLINE_WEBVIEW_BYTES {
+            snapshot.file_preview_notice = Some(format!(
+                "Inline preview skipped for large HTML file ({}).",
+                format_bytes(total_size)
+            ));
+            return snapshot;
+        }
+        snapshot.webview_content = Some(String::from_utf8_lossy(&content.data).to_string());
+    } else if TabState::is_image_file(&path) {
+        snapshot.file_preview_notice =
+            Some("Image preview isn't supported for remote files yet.".to_string());
+    } else if std::str::from_utf8(&content.data).is_err() {
+        snapshot.file_preview_notice = Some(format!(
+            "Binary file ({}) — no preview.",
+            format_bytes(total_size)
+        ));
+    } else if total_size > MAX_FULL_TEXT_LOAD_BYTES {
+        let cut = content.data.len().min(LARGE_TEXT_PREVIEW_BYTES);
+        let text = String::from_utf8_lossy(&content.data[..cut]);
+        snapshot.file_content = text
+            .lines()
+            .take(LARGE_TEXT_PREVIEW_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        snapshot.file_preview_notice = Some(format!(
+            "Large file ({}): showing first {} lines (~{} KB).",
+            format_bytes(total_size),
+            LARGE_TEXT_PREVIEW_LINES,
+            LARGE_TEXT_PREVIEW_BYTES / 1024
+        ));
+    } else {
+        snapshot.file_content = String::from_utf8_lossy(&content.data).to_string();
+        if content.truncated {
+            snapshot.file_preview_notice = Some(format!(
+                "Preview truncated: showing {} of {}.",
+                format_bytes(snapshot.file_content.len() as u64),
+                format_bytes(total_size)
+            ));
+        }
+    }
 
     snapshot
 }
