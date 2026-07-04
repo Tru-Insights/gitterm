@@ -68,6 +68,8 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <true/>
     <key>LSMultipleInstancesProhibited</key>
     <false/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>GitTerm uses the microphone for speech-to-text input to the terminal.</string>
 </dict>
 </plist>
 EOF

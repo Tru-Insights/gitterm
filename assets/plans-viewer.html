@@ -149,7 +149,7 @@
 <div class="layout">
   <aside>
     <div class="brand">
-      <span>Plans Viewer</span>
+      <span id="viewer-title">Plans Viewer</span>
       <div class="controls">
         <button id="collapse-all" title="Collapse all sections">Collapse</button>
         <button id="expand-all" title="Expand all sections">Expand</button>
@@ -162,7 +162,7 @@
   </aside>
   <main id="content">
     <div class="empty-state">
-      <h2>Pick a plan from the sidebar</h2>
+      <h2>Pick a document from the sidebar</h2>
       <p>Or drop a <code>.md</code> file anywhere on this page.</p>
       <div class="drop-zone" id="drop">Drop a .md file to view</div>
     </div>
@@ -172,6 +172,12 @@
 <script type="module">
   // --- Theme: read ?theme= from URL, apply to <html>, swap hljs stylesheet. ---
   const params = new URLSearchParams(location.search);
+  const source = location.pathname.startsWith("/docs")
+    ? { base: "/docs", label: "Docs", dir: "docs/" }
+    : { base: "/plans", label: "Plans", dir: ".plans/" };
+  document.title = `${source.label} · GitTerm`;
+  document.getElementById("viewer-title").textContent = `${source.label} Viewer`;
+  document.getElementById("plan-list-label").textContent = source.label;
   const theme = params.get("theme") === "light" ? "light" : "dark";
   document.documentElement.setAttribute("data-theme", theme);
   // --- Embedded mode (?nav=hide): host app provides its own plan picker. ---
@@ -225,7 +231,7 @@
 
   function renderPlanList(plans, active) {
     if (!plans.length) {
-      planList.innerHTML = `<li class="empty">No plans found in .plans/</li>`;
+      planList.innerHTML = `<li class="empty">No documents found in ${source.dir}</li>`;
       return;
     }
     planList.innerHTML = plans.map(p =>
@@ -235,7 +241,7 @@
 
   async function fetchPlans() {
     try {
-      const res = await fetch("/plans");
+      const res = await fetch(source.base);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       return json.plans || [];
@@ -383,7 +389,7 @@
     let md = sourceText;
     if (!md) {
       try {
-        const res = await fetch(`/plans/raw/${encodeURIComponent(name)}`);
+        const res = await fetch(`${source.base}/raw?path=${encodeURIComponent(name)}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         md = await res.text();
       } catch (err) {
@@ -391,7 +397,7 @@
           <h1>Could not load ${escapeHtml(name)}</h1>
           <div class="error">
             <p><strong>${escapeHtml(err.message)}</strong></p>
-            <p>Check that the file exists in the active <code>.plans/</code> directory.</p>
+            <p>Check that the file exists in the active <code>${source.dir}</code> directory.</p>
           </div>`;
         return;
       }
@@ -408,7 +414,7 @@
       console.warn("mermaid render failed", e);
     }
     setupScrollSpy();
-    document.title = `${name} · Plans`;
+    document.title = `${name} · ${source.label}`;
     if (location.hash) {
       const el = document.getElementById(decodeURIComponent(location.hash.slice(1)));
       if (el) el.scrollIntoView();
