@@ -28,7 +28,7 @@ async fn main() {
 
     if let Some(root) = root {
         let dir = backend
-            .list_dir("probe".to_string(), root.clone(), root, false)
+            .list_dir("probe".to_string(), root.clone(), root.clone(), false)
             .await
             .expect("list_dir failed");
         println!(
@@ -38,6 +38,24 @@ async fn main() {
         );
         for entry in dir.entries.iter().take(12) {
             println!("  {} {}", if entry.is_dir { "d" } else { "-" }, entry.name);
+        }
+
+        if let Some(file) = std::env::args().nth(4) {
+            let content = backend
+                .read_file("probe".to_string(), root, file.clone(), 1_000_000)
+                .await
+                .expect("read_file failed");
+            println!(
+                "read_file ok: {} — {} bytes (total {}, truncated {})",
+                file,
+                content.data.len(),
+                content.total_size,
+                content.truncated
+            );
+            let preview = String::from_utf8_lossy(&content.data);
+            for line in preview.lines().take(5) {
+                println!("  | {line}");
+            }
         }
     }
 }
