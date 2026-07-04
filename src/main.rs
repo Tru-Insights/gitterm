@@ -8051,6 +8051,7 @@ fi
             }
             Event::RemoteAgentHandshakeLoaded(snapshot) => {
                 let now = Instant::now();
+                let mut pending_refresh: Option<Task<Event>> = None;
                 let (name, endpoint) = self
                     .remote_agent_config_by_id(&snapshot.remote_id)
                     .map(|agent| (agent.name.clone(), agent.endpoint.clone()))
@@ -8066,6 +8067,21 @@ fi
                             handshake.protocol_version,
                             handshake.capabilities.join(", ")
                         );
+                        let refresh_active = self
+                            .active_workspace()
+                            .and_then(|ws| self.remote_agent_id_for_workspace(ws))
+                            .is_some_and(|id| id == snapshot.remote_id);
+                        if refresh_active {
+                            let git_task = self
+                                .active_tab()
+                                .map(|tab| (tab.id, tab.repo_path.clone()))
+                                .map(|(tab_id, repo_path)| {
+                                    self.request_git_status_for_active_source(tab_id, repo_path)
+                                })
+                                .unwrap_or_else(Task::none);
+                            pending_refresh =
+                                Some(Task::batch([self.refresh_files_for_active_tab(), git_task]));
+                        }
                         RemoteAgentConnectionStatus::Connected(handshake)
                     }
                     Err(error) => {
@@ -8096,6 +8112,9 @@ fi
                         last_connected,
                     },
                 );
+                if let Some(refresh) = pending_refresh {
+                    return refresh;
+                }
             }
             Event::AttachRemoteSession(session_name) => {
                 return self.open_remote_session_tab(&session_name);
@@ -12050,9 +12069,14 @@ fi
             tab.sidebar_mode
         };
 
+        let sidebar_caps = self
+            .source_for_active_tab()
+            .map(|source| source.capabilities())
+            .unwrap_or_else(|_| SourceCapabilities::none());
+
         // Content based on mode
         let mode_content: Element<'_, Event, Theme, iced::Renderer> = match sidebar_mode {
-            SidebarMode::Git if workspace_is_remote => {
+            SidebarMode::Git if !sidebar_caps.git_status => {
                 self.view_remote_local_mode_placeholder("Git")
             }
             SidebarMode::Git => freeze_time!("view_git_list", { self.view_git_list(tab) }),
