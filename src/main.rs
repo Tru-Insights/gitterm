@@ -3516,6 +3516,7 @@ pub enum Event {
     SelectAgentCapture(usize),
     LaunchAgentPreset(usize),
     RemoteSessionLaunched(Result<(String, String), String>),
+    LaunchSessionKind(Option<String>),
     // Resume agent preset session by index
     ResumeAgentPreset(usize),
     // Live agent tab (TabKind::Agent) — Step 3 of TRU-29.
@@ -5578,28 +5579,50 @@ impl App {
             .active_workspace()
             .and_then(|ws| self.remote_agent_config_for_workspace(ws))
             .cloned();
-        let kind = preset_name
-            .as_deref()
-            .map(|name| name.to_lowercase())
+        // Preset names like "Claude Code" resolve by full lowercased name,
+        // then by first word ("claude"), against the remote's configured
+        // session_commands; the last resort is the first word on the
+        // remote PATH.
+        let normalized = preset_name.as_deref().map(|name| {
+            let full = name.to_lowercase();
+            let first_word = full
+                .split_whitespace()
+                .next()
+                .unwrap_or("shell")
+                .to_string();
+            (full, first_word)
+        });
+        let kind = normalized
+            .as_ref()
+            .map(|(_, first_word)| first_word.clone())
             .unwrap_or_else(|| "shell".to_string());
-        let remote_command = match (&preset_name, &agent_config) {
-            (Some(name), Some(config)) => config
+        let remote_command = match (&normalized, &agent_config) {
+            (Some((full, first_word)), Some(config)) => config
                 .session_commands
-                .get(&name.to_lowercase())
+                .get(full)
+                .or_else(|| config.session_commands.get(first_word))
                 .cloned()
-                .unwrap_or_else(|| name.to_lowercase()),
-            (Some(name), None) => name.to_lowercase(),
+                .unwrap_or_else(|| first_word.clone()),
+            (Some((_, first_word)), None) => first_word.clone(),
             (None, Some(config)) => config
                 .shell_command
                 .clone()
                 .unwrap_or_else(|| "/bin/zsh -il".to_string()),
             (None, None) => "/bin/zsh -il".to_string(),
         };
-        // Start the session in the directory the user is browsing.
+        // Start the session in the directory the user is browsing — but
+        // only when that browser state belongs to this source (an attach
+        // tab's browser is local and would be meaningless on the remote).
+        let source_for_cwd = WorkspaceSource::RemoteAgent {
+            workspace_id: workspace_id.clone(),
+            root: root.clone(),
+            client: client.clone(),
+        };
         let cwd = self
             .active_tab()
-            .map(|tab| tab.files.dir.display())
-            .filter(|dir| !dir.is_empty())
+            .map(|tab| tab.files.dir.clone())
+            .filter(|dir| source_for_cwd.owns(dir))
+            .map(|dir| dir.display())
             .unwrap_or_else(|| root.clone());
 
         Task::perform(
@@ -7332,6 +7355,9 @@ fi
                 self.tab_picker_visible = false;
                 return self.launch_session_tab(None, None);
             }
+            Event::LaunchSessionKind(kind) => {
+                return self.launch_session_tab(kind, None);
+            }
             Event::RemoteSessionLaunched(result) => match result {
                 Ok((session_id, kind)) => {
                     let Some(attach_command) = self.remote_session_attach_command(&session_id)
@@ -7358,8 +7384,11 @@ fi
                 }
                 Err(err) => {
                     eprintln!("remote session launch failed: {err}");
+                    let message = format!("Could not start remote session: {err}");
+                    self.remote_sessions_error = Some(message.clone());
                     if let Some(tab) = self.active_tab_mut() {
-                        tab.files.error = Some(format!("Could not start remote session: {err}"));
+                        tab.files.error = Some(message.clone());
+                        tab.git_status_error = Some(message);
                     }
                 }
             },
@@ -11900,19 +11929,15 @@ fi
                     button(text("Shell").size(font_small))
                         .style(self.ghost_button_style())
                         .padding([4, 10])
-                        .on_press(Event::AttachRemoteSession(session.session_name.clone())),
+                        .on_press(Event::LaunchSessionKind(None)),
                     button(text("Codex").size(font_small))
                         .style(self.ghost_button_style())
                         .padding([4, 10])
-                        .on_press_maybe(session.codex_command.as_ref().map(|_| {
-                            Event::AttachRemoteCodexSession(session.session_name.clone())
-                        })),
+                        .on_press(Event::LaunchSessionKind(Some("codex".to_string()))),
                     button(text("Claude").size(font_small))
                         .style(self.ghost_button_style())
                         .padding([4, 10])
-                        .on_press_maybe(session.claude_command.as_ref().map(|_| {
-                            Event::AttachRemoteClaudeSession(session.session_name.clone())
-                        })),
+                        .on_press(Event::LaunchSessionKind(Some("claude".to_string()))),
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),

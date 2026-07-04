@@ -32,6 +32,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some("attach") => attach::run(args).await,
         #[cfg(unix)]
         Some("sessions") => attach::list(args).await,
+        #[cfg(unix)]
+        Some("start") => attach::start(args).await,
+        #[cfg(unix)]
+        Some("stop") => attach::stop(args).await,
         Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(())
@@ -105,6 +109,8 @@ fn print_usage() {
   gitterm-agent serve [--addr HOST:PORT] [--token TOKEN] [--name NAME]
   gitterm-agent attach --endpoint URL --token-ref REF --session ID
   gitterm-agent sessions --endpoint URL --token-ref REF [--workspace ID]
+  gitterm-agent start --endpoint URL --token-ref REF --workspace ID --cwd DIR [--kind K] --cmd CMD
+  gitterm-agent stop --endpoint URL --token-ref REF --session ID
 
 Environment:
   GITTERM_AGENT_ADDR    default: {DEFAULT_ADDR}

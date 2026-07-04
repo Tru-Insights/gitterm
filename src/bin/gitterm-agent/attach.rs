@@ -91,6 +91,50 @@ pub async fn list(
     Ok(())
 }
 
+pub async fn start(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (common, extra) = parse_common(&mut args)?;
+    let get = |name: &str| {
+        extra
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    };
+    let workspace = get("--workspace").ok_or("--workspace is required")?;
+    let cwd = get("--cwd").ok_or("--cwd is required")?;
+    let kind = get("--kind").unwrap_or_else(|| "shell".to_string());
+    let command = get("--cmd").ok_or("--cmd is required")?;
+
+    let session = backend(&common)
+        .start_session(
+            workspace,
+            cwd,
+            kind,
+            vec!["/bin/sh".to_string(), "-lc".to_string(), command],
+            Vec::new(),
+            120,
+            32,
+        )
+        .await?;
+    println!("{}", session.session_id);
+    Ok(())
+}
+
+pub async fn stop(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (common, extra) = parse_common(&mut args)?;
+    let session = extra
+        .iter()
+        .find(|(name, _)| name == "--session")
+        .map(|(_, value)| value.clone())
+        .ok_or("--session is required")?;
+    let stopped = backend(&common).stop_session(session).await?;
+    println!("{}", if stopped { "stopped" } else { "already exited" });
+    Ok(())
+}
+
 pub async fn run(
     mut args: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -106,29 +150,37 @@ pub async fn run(
         .attach_terminal(session_id, cols, rows)
         .await?;
 
-    let _raw = RawModeGuard::enable()?;
+    // Read-only attach when stdin isn't a terminal (piping/inspection).
+    let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    let _raw = if interactive {
+        Some(RawModeGuard::enable()?)
+    } else {
+        None
+    };
 
     // stdin → session, from a blocking thread (stdin has no async story
     // worth having here).
     let stdin_tx = input_tx.clone();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdin_tx
-                        .blocking_send(TerminalSend::Data(buf[..n].to_vec()))
-                        .is_err()
-                    {
-                        break;
+    if interactive {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdin_tx
+                            .blocking_send(TerminalSend::Data(buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     // SIGWINCH → resize
     let resize_tx = input_tx.clone();
