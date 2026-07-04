@@ -4330,9 +4330,14 @@ impl App {
                 );
             }
         }
+        // remote-agents.json is user-maintained (no in-app editor yet):
+        // the on-disk file is authoritative, and we only write it back when
+        // this instance actually knows agents the file doesn't. Rewriting it
+        // unconditionally lets a stale instance clobber hand edits.
         let mut remote_agent_defs = RemoteAgentsFile::load()
             .map(|file| file.remote_agents)
             .unwrap_or_default();
+        let remote_agents_on_disk = remote_agent_defs.len();
         for agent in &self.remote_agent_defs {
             push_remote_agent_config(&mut remote_agent_defs, agent.clone());
         }
@@ -4345,7 +4350,7 @@ impl App {
             remote_sessions: remote_sessions.clone(),
         }
         .save();
-        if !remote_agent_defs.is_empty() || RemoteAgentsFile::file_path().exists() {
+        if remote_agent_defs.len() != remote_agents_on_disk {
             RemoteAgentsFile {
                 remote_agents: remote_agent_defs.clone(),
             }
