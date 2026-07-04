@@ -3491,6 +3491,12 @@ pub enum Event {
     },
     RemotePickerConfirm,
     RemotePickerCancel,
+    RemoteConnectOpen,
+    RemoteConnectClose,
+    RemoteConnectNameChanged(String),
+    RemoteConnectEndpointChanged(String),
+    RemoteConnectTokenChanged(String),
+    RemoteConnectSubmit,
     RemoteWorkspaceOpen(String),
     WorkspaceSettingsOpen(usize),
     WorkspaceSettingsClose,
@@ -3655,6 +3661,8 @@ struct App {
     // "New workspace" source chooser + remote directory picker (Phase 8)
     workspace_source_picker_visible: bool,
     remote_workspace_picker: Option<RemoteWorkspacePicker>,
+    // "Connect remote host" form (in-app editor for remote-agents.json)
+    remote_connect_form: Option<RemoteConnectForm>,
     // Configured agent presets
     agent_presets: Vec<AgentPreset>,
     // Quick commands (app-level, run in bottom terminal)
@@ -3817,6 +3825,67 @@ fn push_remote_agent_config(definitions: &mut Vec<RemoteAgentConfig>, agent: Rem
     if !definitions.iter().any(|existing| existing.id == agent.id) {
         definitions.push(agent);
     }
+}
+
+/// Insert or update an agent by id. Updates touch only the fields the
+/// connect form edits; hand-maintained `shell_command` / `session_commands`
+/// on an existing entry are preserved.
+fn upsert_remote_agent_config(definitions: &mut Vec<RemoteAgentConfig>, agent: RemoteAgentConfig) {
+    if let Some(existing) = definitions
+        .iter_mut()
+        .find(|existing| existing.id == agent.id)
+    {
+        existing.name = agent.name;
+        existing.endpoint = agent.endpoint;
+        existing.auth = agent.auth;
+    } else {
+        definitions.push(agent);
+    }
+}
+
+/// Upsert a single agent into remote-agents.json, leaving every other
+/// entry exactly as the user maintains it on disk.
+fn save_remote_agent_to_disk(agent: &RemoteAgentConfig) {
+    let mut file = RemoteAgentsFile::load().unwrap_or_default();
+    upsert_remote_agent_config(&mut file.remote_agents, agent.clone());
+    file.save();
+}
+
+/// Derive a stable id from a display name: lowercase alphanumerics with
+/// single dashes, e.g. "Mac mini" -> "mac-mini".
+fn remote_agent_id_slug(name: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        "remote".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+/// Store a pasted token under ~/.config/gitterm/tokens/<id>.token and
+/// return the path. Owner-only permissions on unix.
+fn write_remote_agent_token(remote_id: &str, token: &str) -> std::io::Result<PathBuf> {
+    let dir = config::global_config_dir().join("tokens");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{remote_id}.token"));
+    std::fs::write(&path, format!("{token}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(path)
 }
 
 fn remote_agent_for_session<'a>(
@@ -3984,6 +4053,19 @@ struct RemoteWorkspacePicker {
     remote_id: String,
     remote_name: String,
     files: FilesState,
+}
+
+/// "Connect remote host" form — the in-app editor for adding an entry to
+/// remote-agents.json. `saved_remote_id` is set once the entry has been
+/// written, so re-submitting after an edit updates that entry in place
+/// instead of appending a near-duplicate.
+#[derive(Debug, Clone, Default)]
+struct RemoteConnectForm {
+    name: String,
+    endpoint: String,
+    token: String,
+    error: Option<String>,
+    saved_remote_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4354,10 +4436,11 @@ impl App {
                 );
             }
         }
-        // remote-agents.json is user-maintained (no in-app editor yet):
-        // the on-disk file is authoritative, and we only write it back when
-        // this instance actually knows agents the file doesn't. Rewriting it
-        // unconditionally lets a stale instance clobber hand edits.
+        // remote-agents.json is primarily user-maintained: the on-disk file
+        // is authoritative, and this save path only writes it back when this
+        // instance knows agents the file doesn't. (The connect-remote form
+        // does its own targeted upsert via save_remote_agent_to_disk.)
+        // Rewriting unconditionally lets a stale instance clobber hand edits.
         let mut remote_agent_defs = RemoteAgentsFile::load()
             .map(|file| file.remote_agents)
             .unwrap_or_default();
@@ -5151,6 +5234,7 @@ impl App {
             tab_picker_visible: false,
             workspace_source_picker_visible: false,
             remote_workspace_picker: None,
+            remote_connect_form: None,
             agent_presets: config.agent_presets.clone(),
             quick_commands: config.quick_commands.clone(),
             quick_commands_visible: false,
@@ -6067,6 +6151,94 @@ fi
         self.remote_agent_defs
             .iter()
             .find(|agent| agent.id == remote_id)
+    }
+
+    /// Validate the connect form, persist the agent (token file + upsert
+    /// into remote-agents.json), and kick a handshake so the form shows
+    /// live connect/error feedback.
+    fn submit_remote_connect_form(&mut self) -> Task<Event> {
+        let Some(form) = self.remote_connect_form.as_ref() else {
+            return Task::none();
+        };
+        let name = form.name.trim().to_string();
+        let endpoint_raw = form.endpoint.trim().to_string();
+        let token = form.token.trim().to_string();
+        let saved_id = form.saved_remote_id.clone();
+
+        let fail = |app: &mut Self, message: String| {
+            if let Some(form) = app.remote_connect_form.as_mut() {
+                form.error = Some(message);
+            }
+            Task::none()
+        };
+
+        if name.is_empty() || endpoint_raw.is_empty() || token.is_empty() {
+            return fail(
+                self,
+                "Name, endpoint, and token are all required".to_string(),
+            );
+        }
+        let endpoint = if endpoint_raw.contains("://") {
+            endpoint_raw
+        } else {
+            format!("http://{endpoint_raw}")
+        };
+
+        // Keep the id stable across retries so an edited endpoint/token
+        // updates the entry we already wrote instead of appending another.
+        let id = saved_id.unwrap_or_else(|| {
+            let base = remote_agent_id_slug(&name);
+            let on_disk: Vec<String> = RemoteAgentsFile::load()
+                .map(|file| {
+                    file.remote_agents
+                        .into_iter()
+                        .map(|agent| agent.id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let taken = |candidate: &str| {
+                on_disk.iter().any(|id| id == candidate)
+                    || self
+                        .remote_agent_defs
+                        .iter()
+                        .any(|agent| agent.id == candidate)
+            };
+            let mut id = base.clone();
+            let mut suffix = 2;
+            while taken(&id) {
+                id = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            id
+        });
+
+        let token_ref = if token.starts_with("env:")
+            || token.starts_with("file:")
+            || token.starts_with("keychain:")
+        {
+            token
+        } else {
+            match write_remote_agent_token(&id, &token) {
+                Ok(path) => format!("file:{}", path.display()),
+                Err(err) => return fail(self, format!("Could not store token: {err}")),
+            }
+        };
+
+        let agent = RemoteAgentConfig {
+            id: id.clone(),
+            name,
+            endpoint,
+            auth: config::RemoteAgentAuthConfig::Token { token_ref },
+            shell_command: None,
+            session_commands: Default::default(),
+        };
+        save_remote_agent_to_disk(&agent);
+        upsert_remote_agent_config(&mut self.remote_agent_defs, agent);
+        if let Some(form) = self.remote_connect_form.as_mut() {
+            form.error = None;
+            form.saved_remote_id = Some(id.clone());
+        }
+        self.ensure_remote_agent_connection(&id, true)
     }
 
     fn ensure_active_remote_agent_connection(&mut self, force: bool) -> Task<Event> {
@@ -7788,6 +7960,14 @@ fi
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     self.workspace_settings_open = false;
+                    return Task::none();
+                }
+
+                // Remote connect form: Escape closes
+                if self.remote_connect_form.is_some()
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    self.remote_connect_form = None;
                     return Task::none();
                 }
 
@@ -9680,9 +9860,8 @@ fi
                 }
             }
             Event::WorkspaceCreate => {
-                if self.remote_agent_defs.is_empty() {
-                    return Task::done(Event::WorkspaceCreateLocal);
-                }
+                // Always show the source chooser: it is also the entry
+                // point for connecting a new remote host.
                 self.workspace_source_picker_visible = true;
             }
             Event::WorkspaceCreateLocal => {
@@ -9700,6 +9879,31 @@ fi
             }
             Event::WorkspaceSourcePickerCancel => {
                 self.workspace_source_picker_visible = false;
+            }
+            Event::RemoteConnectOpen => {
+                self.workspace_source_picker_visible = false;
+                self.remote_connect_form = Some(RemoteConnectForm::default());
+            }
+            Event::RemoteConnectClose => {
+                self.remote_connect_form = None;
+            }
+            Event::RemoteConnectNameChanged(value) => {
+                if let Some(form) = self.remote_connect_form.as_mut() {
+                    form.name = value;
+                }
+            }
+            Event::RemoteConnectEndpointChanged(value) => {
+                if let Some(form) = self.remote_connect_form.as_mut() {
+                    form.endpoint = value;
+                }
+            }
+            Event::RemoteConnectTokenChanged(value) => {
+                if let Some(form) = self.remote_connect_form.as_mut() {
+                    form.token = value;
+                }
+            }
+            Event::RemoteConnectSubmit => {
+                return self.submit_remote_connect_form();
             }
             Event::RemoteWorkspaceBrowse(remote_id) => {
                 self.workspace_source_picker_visible = false;
@@ -10524,6 +10728,13 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        } else if self.remote_connect_form.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_remote_connect_form())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else if self.remote_workspace_picker.is_some() {
             Stack::new()
                 .push(main_view)
@@ -10586,6 +10797,11 @@ fi
                 Event::RemoteWorkspaceBrowse(agent.id.clone()),
             ));
         }
+        items = items.push(entry(
+            "Connect Remote Host…".to_string(),
+            "Add a gitterm-agent endpoint".to_string(),
+            Event::RemoteConnectOpen,
+        ));
 
         let menu = container(items)
             .style(move |_| container::Style {
@@ -10621,6 +10837,208 @@ fi
                     .center_y(Length::Fill),
             )
             .into()
+    }
+
+    /// "Connect Remote Host" form: writes an entry into remote-agents.json
+    /// (token stored under ~/.config/gitterm/tokens/) and shows live
+    /// handshake feedback after Connect.
+    fn view_remote_connect_form(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let bg_surface = theme.bg_surface();
+        let bg_base = theme.bg_base();
+        let border_color = theme.border();
+        let bg_crust = theme.bg_crust();
+        let accent = theme.accent();
+        let danger = theme.danger();
+        let success = theme.success();
+        let mono = iced::Font::with_name("Menlo");
+
+        let Some(form) = &self.remote_connect_form else {
+            return container(iced::widget::Space::new()).into();
+        };
+
+        let input_style = move |_theme: &Theme, _status: text_input::Status| text_input::Style {
+            background: bg_base.into(),
+            border: iced::Border {
+                width: 1.0,
+                color: border_color,
+                radius: 3.0.into(),
+            },
+            icon: iced::Color::TRANSPARENT,
+            placeholder: theme.overlay0(),
+            value: text_primary,
+            selection: accent,
+        };
+
+        let field = |label: &'static str,
+                     placeholder: &'static str,
+                     value: &str,
+                     on_input: fn(String) -> Event,
+                     secure: bool| {
+            let mut input = text_input(placeholder, value)
+                .on_input(on_input)
+                .on_submit(Event::RemoteConnectSubmit)
+                .size(12)
+                .padding([6, 8])
+                .font(mono)
+                .style(input_style);
+            if secure {
+                input = input.secure(true);
+            }
+            column![text(label).size(11).color(text_secondary), input].spacing(4)
+        };
+
+        let name_field = field(
+            "Name",
+            "Mac mini",
+            &form.name,
+            Event::RemoteConnectNameChanged,
+            false,
+        );
+        let endpoint_field = field(
+            "Endpoint",
+            "http://host-or-tailscale-ip:7777",
+            &form.endpoint,
+            Event::RemoteConnectEndpointChanged,
+            false,
+        );
+        let token_field = field(
+            "Token",
+            "paste the agent token",
+            &form.token,
+            Event::RemoteConnectTokenChanged,
+            true,
+        );
+        let token_hint = text(
+            "Stored in ~/.config/gitterm/tokens/. Or paste a ref: \
+             env:VAR, file:~/path, keychain:service/account",
+        )
+        .size(10)
+        .color(text_muted);
+
+        let status: Element<'_, Event, Theme, iced::Renderer> = if let Some(error) = &form.error {
+            text(error.clone()).size(11).color(danger).into()
+        } else if let Some(remote_id) = &form.saved_remote_id {
+            match self
+                .remote_agent_connections
+                .get(remote_id)
+                .map(|connection| &connection.status)
+            {
+                Some(RemoteAgentConnectionStatus::Connecting) => {
+                    text("Connecting…").size(11).color(text_secondary).into()
+                }
+                Some(RemoteAgentConnectionStatus::Connected(handshake)) => text(format!(
+                    "✓ Connected — {} (protocol {})",
+                    handshake.agent_name, handshake.protocol_version
+                ))
+                .size(11)
+                .color(success)
+                .into(),
+                Some(RemoteAgentConnectionStatus::Error(error)) => {
+                    text(format!("Connection failed: {error}"))
+                        .size(11)
+                        .color(danger)
+                        .into()
+                }
+                Some(RemoteAgentConnectionStatus::Disconnected) | None => {
+                    text("Saved").size(11).color(text_secondary).into()
+                }
+            }
+        } else {
+            text("").size(11).into()
+        };
+
+        let connect_btn = button(text("Connect").size(12).color(accent).font(mono))
+            .style(move |_, btn_status| button::Style {
+                background: Some(
+                    if matches!(btn_status, button::Status::Hovered) {
+                        theme.surface0()
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    color: accent,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            })
+            .padding([4, 14])
+            .on_press(Event::RemoteConnectSubmit);
+
+        let close_btn = button(text("Close").size(12).color(text_secondary).font(mono))
+            .style(move |_, btn_status| button::Style {
+                background: Some(
+                    if matches!(btn_status, button::Status::Hovered) {
+                        bg_surface
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            })
+            .padding([4, 14])
+            .on_press(Event::RemoteConnectClose);
+
+        let card_content = column![
+            text("Connect Remote Host").size(14).color(text_primary),
+            text("Adds a gitterm-agent host to remote-agents.json")
+                .size(11)
+                .color(text_muted),
+            container(iced::widget::Space::new()).height(Length::Fixed(8.0)),
+            name_field,
+            endpoint_field,
+            token_field,
+            token_hint,
+            container(iced::widget::Space::new()).height(Length::Fixed(4.0)),
+            status,
+            row![
+                iced::widget::Space::new().width(Length::Fill),
+                close_btn,
+                connect_btn,
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(10)
+        .padding([24, 28]);
+
+        let card = container(card_content)
+            .max_width(460)
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+
+        let backdrop_color = iced::Color { a: 0.8, ..bg_crust };
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop_color.into()),
+            ..Default::default()
+        })
+        .into()
     }
 
     /// Remote directory browser for picking a new workspace root — fed by
@@ -18113,6 +18531,48 @@ mod tests {
             }
             other => panic!("expected legacy remote location, got {other:?}"),
         }
+    }
+
+    // === Connect-remote form helpers ===
+
+    #[test]
+    fn remote_agent_id_slug_normalizes_names() {
+        assert_eq!(remote_agent_id_slug("Mac mini"), "mac-mini");
+        assert_eq!(remote_agent_id_slug("  Tracey's M2!  "), "tracey-s-m2");
+        assert_eq!(remote_agent_id_slug("---"), "remote");
+        assert_eq!(remote_agent_id_slug(""), "remote");
+    }
+
+    #[test]
+    fn upsert_remote_agent_config_appends_new_id() {
+        let mut defs = vec![test_remote_agent("mac-mini", "Mac mini")];
+        upsert_remote_agent_config(&mut defs, test_remote_agent("studio", "Studio"));
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[1].id, "studio");
+    }
+
+    #[test]
+    fn upsert_remote_agent_config_preserves_hand_maintained_fields() {
+        let mut existing = test_remote_agent("mac-mini", "Mac mini");
+        existing.shell_command = Some("/bin/zsh -l".to_string());
+        existing.session_commands.insert(
+            "claude".to_string(),
+            "/Users/me/.local/bin/claude".to_string(),
+        );
+        let mut defs = vec![existing];
+
+        let mut update = test_remote_agent("mac-mini", "Mac mini (renamed)");
+        update.endpoint = "http://100.64.0.2:7777".to_string();
+        upsert_remote_agent_config(&mut defs, update);
+
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "Mac mini (renamed)");
+        assert_eq!(defs[0].endpoint, "http://100.64.0.2:7777");
+        assert_eq!(defs[0].shell_command.as_deref(), Some("/bin/zsh -l"));
+        assert_eq!(
+            defs[0].session_commands.get("claude").map(String::as_str),
+            Some("/Users/me/.local/bin/claude")
+        );
     }
 
     #[test]
