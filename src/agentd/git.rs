@@ -29,7 +29,7 @@ pub struct RepoStatus {
 /// process is spawned from a git hook, git exports GIT_DIR / GIT_WORK_TREE /
 /// GIT_INDEX_FILE pointing at the hook's repo; inheriting them would
 /// redirect every command away from the `current_dir` it is aimed at.
-pub(crate) fn git_command() -> std::process::Command {
+pub fn git_command() -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     for var in [
         "GIT_DIR",

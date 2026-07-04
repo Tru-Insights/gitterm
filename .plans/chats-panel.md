@@ -85,6 +85,13 @@ workspace root incl. worktrees, on the same machine; exact when GitTerm
 spawned the tab and stamped it), flags: live / possibly-running / dead-cwd /
 closed-workspace / machine-unreachable (index cached).
 
+Headless sessions (claude entrypoint `sdk*` — `claude -p`/SDK runs such as
+hook-spawned push reviews and standup writers) are excluded from the index:
+they're one-shot automation, not conversations to go back to. On this
+machine that's 165 of 215 session files (2026-07-04). Could become an
+opt-in filter chip if ever needed. Missing entrypoint = interactive (old
+transcripts stay visible).
+
 ### Tab↔session registry
 
 - `WorkspaceTabConfig.agent_config` already carries backend config for
