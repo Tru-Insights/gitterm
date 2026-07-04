@@ -5,6 +5,7 @@ package gitterm.agent.v1;
 service GitTermAgent {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileChunk);
 }
 
 message HandshakeRequest {
@@ -38,4 +39,20 @@ message DirEntry {
   string name = 1;
   string path = 2;
   bool is_dir = 3;
+}
+
+message ReadFileRequest {
+  string workspace_id = 1;
+  string root = 2;
+  string path = 3;
+  // Stop streaming after this many bytes; 0 means the agent default cap.
+  uint64 max_bytes = 4;
+}
+
+message ReadFileChunk {
+  bytes data = 1;
+  // Full size of the file on disk, independent of max_bytes.
+  uint64 total_size = 2;
+  // True when the stream stops before total_size due to max_bytes.
+  bool truncated = 3;
 }

@@ -4816,6 +4816,37 @@ impl App {
         )
     }
 
+    /// Load a file through a workspace source and shape it into the same
+    /// FileLoadSnapshot the local loader produces, so the viewer pipeline
+    /// (webview, syntax highlight, notices) is shared.
+    fn request_source_file_load(
+        source: WorkspaceSource,
+        tab_id: usize,
+        path: SourcePath,
+        is_dark_theme: bool,
+    ) -> Task<Event> {
+        Task::perform(
+            async move {
+                let content = source.read_file(&path, MAX_INLINE_WEBVIEW_BYTES).await;
+                let display_path = PathBuf::from(path.display());
+                let fallback_path = display_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    services::shape_source_file_load(tab_id, display_path, content, is_dark_theme)
+                })
+                .await
+                .unwrap_or_else(|join_err| {
+                    services::shape_source_file_load(
+                        tab_id,
+                        fallback_path,
+                        Err(format!("file load task failed: {join_err}")),
+                        is_dark_theme,
+                    )
+                })
+            },
+            Event::FileLoaded,
+        )
+    }
+
     fn request_file_load(tab_id: usize, path: PathBuf, is_dark_theme: bool) -> Task<Event> {
         let fallback_path = path.clone();
         Task::perform(
@@ -8084,16 +8115,22 @@ fi
                     }
                 }
             }
-            Event::ViewFile(path) => {
-                // File open is a local-capability flow; sources without
-                // open_file never render the button (defensive check here).
-                let Some(path) = path.as_local().map(|p| p.to_path_buf()) else {
-                    if let Some(tab) = self.active_tab_mut() {
-                        tab.files.error =
-                            Some("Opening files isn't available for this source yet".to_string());
-                    }
-                    return Task::none();
+            Event::ViewFile(source_path) => {
+                // The overlay and all kind checks work on a display path;
+                // only the loader at the end differs per source.
+                let remote_source = match &source_path {
+                    SourcePath::Local(_) => None,
+                    SourcePath::Remote(_) => match self.files_source_for_active_tab() {
+                        Ok(source) => Some(source),
+                        Err(message) => {
+                            if let Some(tab) = self.active_tab_mut() {
+                                tab.files.error = Some(message);
+                            }
+                            return Task::none();
+                        }
+                    },
                 };
+                let path = PathBuf::from(source_path.display());
                 let is_dark_theme = self.theme == AppTheme::Dark;
                 let is_markdown = TabState::is_markdown_file(&path);
                 let is_html = TabState::is_html_file(&path);
@@ -8161,7 +8198,15 @@ fi
                 }
                 if let Some((tab_id, file_path)) = request {
                     self.mark_log_server_dirty();
-                    return Self::request_file_load(tab_id, file_path, is_dark_theme);
+                    return match remote_source {
+                        None => Self::request_file_load(tab_id, file_path, is_dark_theme),
+                        Some(source) => Self::request_source_file_load(
+                            source,
+                            tab_id,
+                            source_path,
+                            is_dark_theme,
+                        ),
+                    };
                 }
 
                 // Inline WebView files (markdown/html/excalidraw) are shown once load completes.
@@ -12668,11 +12713,14 @@ fi
         }
 
         // File tree entries
+        let viewing_display = tab
+            .viewing_file_path()
+            .map(|path| path.to_string_lossy().to_string());
         for entry in &tab.files.entries {
             let is_selected_file = !entry.is_dir
-                && tab.viewing_file_path().is_some_and(|selected| {
-                    entry.path.as_local().is_some_and(|path| selected == path)
-                });
+                && viewing_display
+                    .as_deref()
+                    .is_some_and(|selected| selected == entry.path.display());
             let (icon, name_suffix, icon_color, name_color, bg_color) = if entry.is_dir {
                 // Folders: blue folder icon, trailing /, light background
                 (

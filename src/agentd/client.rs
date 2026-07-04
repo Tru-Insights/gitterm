@@ -9,6 +9,7 @@ use tonic::Request;
 use super::protocol::v1::git_term_agent_client::GitTermAgentClient;
 use super::protocol::v1::HandshakeRequest;
 use super::protocol::v1::ListDirRequest;
+use super::protocol::v1::ReadFileRequest;
 use super::server::PROTOCOL_VERSION;
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,16 @@ pub struct RemoteAgentDirEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAgentFileContent {
+    pub remote_id: String,
+    pub path: String,
+    pub data: Vec<u8>,
+    /// Full on-disk size, which can exceed `data.len()` when truncated.
+    pub total_size: u64,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +141,55 @@ impl RemoteAgentBackend {
                     is_dir: entry.is_dir,
                 })
                 .collect(),
+        })
+    }
+
+    pub async fn read_file(
+        &self,
+        workspace_id: String,
+        root: String,
+        path: String,
+        max_bytes: u64,
+    ) -> Result<RemoteAgentFileContent, RemoteAgentClientError> {
+        let token = resolve_token_ref(&self.config.token_ref)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let mut client = GitTermAgentClient::new(channel);
+        let mut request = Request::new(ReadFileRequest {
+            workspace_id,
+            root,
+            path: path.clone(),
+            max_bytes,
+        });
+
+        let auth_header = format!("Bearer {token}");
+        let auth_value = auth_header
+            .parse()
+            .map_err(|err| RemoteAgentClientError::new(format!("invalid token metadata: {err}")))?;
+        request.metadata_mut().insert("authorization", auth_value);
+
+        let mut stream = client
+            .read_file(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("read_file failed: {err:?}")))?
+            .into_inner();
+
+        let mut data = Vec::new();
+        let mut total_size = 0u64;
+        let mut truncated = false;
+        while let Some(chunk) = stream.message().await.map_err(|err| {
+            RemoteAgentClientError::new(format!("read_file stream failed: {err:?}"))
+        })? {
+            total_size = chunk.total_size;
+            truncated = chunk.truncated;
+            data.extend_from_slice(&chunk.data);
+        }
+
+        Ok(RemoteAgentFileContent {
+            remote_id: self.config.remote_id.clone(),
+            path,
+            data,
+            total_size,
+            truncated,
         })
     }
 }

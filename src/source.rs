@@ -15,6 +15,16 @@ use std::path::PathBuf;
 
 use gitterm::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig};
 
+/// File bytes returned by [`WorkspaceSource::read_file`], plus enough
+/// metadata to explain truncation to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFileContent {
+    pub data: Vec<u8>,
+    /// Full size at the source; can exceed `data.len()` when truncated.
+    pub total_size: u64,
+    pub truncated: bool,
+}
+
 /// An opaque location token. UI code may display it and pass it back to the
 /// source that produced it, nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,11 +171,11 @@ impl WorkspaceSource {
                 git_status: true,
                 sessions: true,
             },
-            // Grows as the agent gains ReadFile (open), write ops (edit),
-            // GitStatus, and the session runtime. Flipping a flag here is
-            // the only change the UI needs.
+            // Grows as the agent gains write ops (edit), GitStatus, and the
+            // session runtime. Flipping a flag here is the only change the
+            // UI needs.
             WorkspaceSource::RemoteAgent { .. } => SourceCapabilities {
-                open_file: false,
+                open_file: true,
                 edit_file: false,
                 git_status: false,
                 sessions: false,
@@ -234,6 +244,59 @@ impl WorkspaceSource {
                     dir.display()
                 )),
             },
+        }
+    }
+
+    /// Read a file's bytes, capped at `max_bytes`. The path must have come
+    /// from this source's listings.
+    pub async fn read_file(
+        &self,
+        path: &SourcePath,
+        max_bytes: u64,
+    ) -> Result<SourceFileContent, String> {
+        match (self, path) {
+            (WorkspaceSource::Local { .. }, SourcePath::Local(path)) => {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Read as _;
+                    let metadata = std::fs::metadata(&path)
+                        .map_err(|err| format!("could not stat {}: {err}", path.display()))?;
+                    let total_size = metadata.len();
+                    let file = std::fs::File::open(&path)
+                        .map_err(|err| format!("could not open {}: {err}", path.display()))?;
+                    let mut data = Vec::new();
+                    std::io::Read::take(file, max_bytes)
+                        .read_to_end(&mut data)
+                        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+                    Ok(SourceFileContent {
+                        truncated: total_size > data.len() as u64,
+                        total_size,
+                        data,
+                    })
+                })
+                .await
+                .map_err(|err| format!("file read task failed: {err}"))?
+            }
+            (
+                WorkspaceSource::RemoteAgent {
+                    workspace_id,
+                    root,
+                    client,
+                },
+                SourcePath::Remote(path),
+            ) => RemoteAgentBackend::new(client.clone())
+                .read_file(workspace_id.clone(), root.clone(), path.clone(), max_bytes)
+                .await
+                .map(|content| SourceFileContent {
+                    data: content.data,
+                    total_size: content.total_size,
+                    truncated: content.truncated,
+                })
+                .map_err(|err| err.to_string()),
+            (_, path) => Err(format!(
+                "internal error: path {} does not belong to this source",
+                path.display()
+            )),
         }
     }
 }
@@ -475,6 +538,13 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["main.rs"]);
 
+        // Read a file through the source, as the viewer pipeline does.
+        let file_path = src_listing.entries[0].path.clone();
+        let content = source.read_file(&file_path, 1_000_000).await.unwrap();
+        assert_eq!(content.data, b"fn main() {}");
+        assert_eq!(content.total_size, 12);
+        assert!(!content.truncated);
+
         // A directory outside the root is refused by the agent and surfaces
         // as a visible error with a recovery parent, not a silent fallback.
         let outside = source
@@ -484,6 +554,31 @@ mod tests {
         assert_eq!(outside.parent, Some(SourcePath::Remote(canonical_root)));
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_source_reads_files_with_truncation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("big.txt");
+        std::fs::write(&path, vec![b'y'; 500]).unwrap();
+        let source = WorkspaceSource::Local {
+            root: root.path().to_path_buf(),
+        };
+
+        let full = source
+            .read_file(&SourcePath::Local(path.clone()), 1_000)
+            .await
+            .unwrap();
+        assert_eq!(full.data.len(), 500);
+        assert!(!full.truncated);
+
+        let capped = source
+            .read_file(&SourcePath::Local(path), 100)
+            .await
+            .unwrap();
+        assert_eq!(capped.data.len(), 100);
+        assert_eq!(capped.total_size, 500);
+        assert!(capped.truncated);
     }
 
     #[test]

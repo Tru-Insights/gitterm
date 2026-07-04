@@ -9,10 +9,15 @@ use tonic::{Request, Response, Status};
 
 use super::protocol::v1::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
 use super::protocol::v1::{
-    DirEntry, HandshakeRequest, HandshakeResponse, ListDirRequest, ListDirResponse,
+    DirEntry, HandshakeRequest, HandshakeResponse, ListDirRequest, ListDirResponse, ReadFileChunk,
+    ReadFileRequest,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Hard ceiling for one ReadFile stream; requests may ask for less.
+const READ_FILE_DEFAULT_MAX_BYTES: u64 = 2_000_000;
+const READ_FILE_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AgentServerConfig {
@@ -50,7 +55,11 @@ impl GitTermAgent for GitTermAgentService {
             agent_name: self.agent_name.clone(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
-            capabilities: vec!["handshake".to_string(), "list_dir".to_string()],
+            capabilities: vec![
+                "handshake".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+            ],
         }))
     }
 
@@ -62,6 +71,111 @@ impl GitTermAgent for GitTermAgentService {
         let response = list_dir_response(request)?;
         Ok(Response::new(response))
     }
+
+    type ReadFileStream = tokio_stream::wrappers::ReceiverStream<Result<ReadFileChunk, Status>>;
+
+    async fn read_file(
+        &self,
+        request: Request<ReadFileRequest>,
+    ) -> Result<Response<Self::ReadFileStream>, Status> {
+        let request = request.into_inner();
+        let (path, total_size, read_limit) = validate_read_file_request(&request)?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::task::spawn_blocking(move || {
+            let mut file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(Status::internal(format!(
+                        "could not open {}: {err}",
+                        path.display()
+                    ))));
+                    return;
+                }
+            };
+            let truncated = total_size > read_limit;
+            let mut remaining = read_limit;
+            let mut buf = vec![0u8; READ_FILE_CHUNK_BYTES];
+            loop {
+                let want = buf.len().min(remaining as usize);
+                if want == 0 {
+                    break;
+                }
+                match std::io::Read::read(&mut file, &mut buf[..want]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        remaining -= n as u64;
+                        let chunk = ReadFileChunk {
+                            data: buf[..n].to_vec(),
+                            total_size,
+                            truncated,
+                        };
+                        if tx.blocking_send(Ok(chunk)).is_err() {
+                            return; // client went away
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(Status::internal(format!(
+                            "read failed for {}: {err}",
+                            path.display()
+                        ))));
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+}
+
+/// Validate a ReadFile request: path must be an existing regular file whose
+/// canonical location stays under the canonical root. Returns the canonical
+/// path, the file's total size, and the effective read limit.
+#[allow(clippy::result_large_err)]
+fn validate_read_file_request(request: &ReadFileRequest) -> Result<(PathBuf, u64, u64), Status> {
+    if request.workspace_id.trim().is_empty() {
+        return Err(Status::invalid_argument("workspace_id must not be empty"));
+    }
+    if request.root.trim().is_empty() {
+        return Err(Status::invalid_argument("root must not be empty"));
+    }
+    if request.path.trim().is_empty() {
+        return Err(Status::invalid_argument("path must not be empty"));
+    }
+
+    let root = canonical_dir(&request.root, "root")?;
+    let path = Path::new(&request.path);
+    if !path.is_absolute() {
+        return Err(Status::invalid_argument("path must be absolute"));
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|err| Status::not_found(format!("could not resolve path: {err}")))?;
+    if !canonical.starts_with(&root) {
+        return Err(Status::permission_denied(format!(
+            "path {} is outside root {}",
+            canonical.display(),
+            root.display()
+        )));
+    }
+    let metadata = std::fs::metadata(&canonical).map_err(|err| {
+        Status::not_found(format!("could not stat {}: {err}", canonical.display()))
+    })?;
+    if !metadata.is_file() {
+        return Err(Status::invalid_argument(format!(
+            "{} is not a regular file",
+            canonical.display()
+        )));
+    }
+
+    let read_limit = if request.max_bytes == 0 {
+        READ_FILE_DEFAULT_MAX_BYTES
+    } else {
+        request.max_bytes.min(READ_FILE_DEFAULT_MAX_BYTES)
+    };
+    Ok((canonical, metadata.len(), read_limit))
 }
 
 #[allow(clippy::result_large_err)]
@@ -313,6 +427,103 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn read_file_streams_content_within_root() {
+        use tokio_stream::StreamExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("hello.txt"), "hello remote").unwrap();
+
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let response = service
+            .read_file(Request::new(ReadFileRequest {
+                workspace_id: "workspace".to_string(),
+                root: root.path().to_string_lossy().to_string(),
+                path: root.path().join("hello.txt").to_string_lossy().to_string(),
+                max_bytes: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let mut data = Vec::new();
+        let mut stream = response;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert_eq!(chunk.total_size, 12);
+            assert!(!chunk.truncated);
+            data.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(data, b"hello remote");
+    }
+
+    #[tokio::test]
+    async fn read_file_marks_truncation_at_max_bytes() {
+        use tokio_stream::StreamExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("big.txt"), vec![b'x'; 1000]).unwrap();
+
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let mut stream = service
+            .read_file(Request::new(ReadFileRequest {
+                workspace_id: "workspace".to_string(),
+                root: root.path().to_string_lossy().to_string(),
+                path: root.path().join("big.txt").to_string_lossy().to_string(),
+                max_bytes: 100,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let mut data = Vec::new();
+        let mut truncated = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert_eq!(chunk.total_size, 1000);
+            truncated = chunk.truncated;
+            data.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(data.len(), 100);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_paths_outside_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret").unwrap();
+
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let status = service
+            .read_file(Request::new(ReadFileRequest {
+                workspace_id: "workspace".to_string(),
+                root: root.path().to_string_lossy().to_string(),
+                path: outside_file.to_string_lossy().to_string(),
+                max_bytes: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let status = service
+            .read_file(Request::new(ReadFileRequest {
+                workspace_id: "workspace".to_string(),
+                root: root.path().to_string_lossy().to_string(),
+                path: root.path().to_string_lossy().to_string(),
+                max_bytes: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
     #[allow(clippy::result_large_err)]
