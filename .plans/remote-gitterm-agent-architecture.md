@@ -448,6 +448,10 @@ Goal: the existing local agent-tab direction works against remote sessions too.
 Acceptance:
 
 - [ ] User can create remote Codex/Claude/Pi sessions from a remote workspace.
+- [ ] The existing option-click "+" launcher works identically in remote
+      workspaces for every configured harness (Claude, Codex, pi, custom
+      commands), driven by backend session capabilities — no separate remote
+      launcher UI and no remote conditionals in the launcher code.
 - [ ] Multiple sessions are supported.
 - [ ] Session status survives desktop reconnect.
 
@@ -462,6 +466,10 @@ Goal: make setup repeatable.
 - [ ] Start/restart service.
 - [ ] Detect and suggest endpoint, including Tailscale/MagicDNS when present.
 - [ ] Store desktop token in Keychain.
+- [ ] Remote workspace creation flow: after pairing, the user browses the
+      remote machine's directories (agent `ListDir`) with the same picker UX
+      as local workspace creation and selects a workspace root. No typing
+      remote paths by hand.
 
 Acceptance:
 
