@@ -5942,6 +5942,14 @@ fi
         let Some(tab) = self.active_tab_mut() else {
             return Task::none();
         };
+        // A tab's browser state is only meaningful for the source that
+        // produced it. Tabs created for other purposes (e.g. legacy SSH
+        // terminal tabs inside a remote workspace) start with a local dir;
+        // browsing them restarts at the workspace source's root.
+        let dir = match &source {
+            Ok(source) if !source.owns(&dir) => source.root(),
+            _ => dir,
+        };
         // Keep the tab-local working directory mirrored while browsing local
         // dirs; remote browsing must never touch it.
         if let Some(local) = dir.as_local() {

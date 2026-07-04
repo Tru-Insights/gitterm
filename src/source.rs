@@ -211,6 +211,16 @@ impl WorkspaceSource {
         }
     }
 
+    /// Whether a path token came from this source (Local paths belong to
+    /// local sources, remote paths to remote ones).
+    pub fn owns(&self, path: &SourcePath) -> bool {
+        matches!(
+            (self, path),
+            (WorkspaceSource::Local { .. }, SourcePath::Local(_))
+                | (WorkspaceSource::RemoteAgent { .. }, SourcePath::Remote(_))
+        )
+    }
+
     /// The directory a fresh Files view starts in.
     pub fn root(&self) -> SourcePath {
         match self {
