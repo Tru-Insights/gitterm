@@ -1,7 +1,11 @@
 # Chats Panel — workspace-scoped session browser with resume-as-tab
 
-**Mockup (interactive):** https://claude.ai/code/artifact/1299f08e-68ae-46a0-8c76-326dba0d341c
-**Status:** planned · **Ticket:** [TRU-78](https://linear.app/truinsights/issue/TRU-78/chats-panel-workspace-scoped-session-browser-with-resume-as-tab)
+**Mockup (interactive, v2 — machine axis):** https://claude.ai/code/artifact/1299f08e-68ae-46a0-8c76-326dba0d341c
+**Status:** in progress (slice 0 done) · **Ticket:** [TRU-78](https://linear.app/truinsights/issue/TRU-78/chats-panel-workspace-scoped-session-browser-with-resume-as-tab)
+
+**Decisions (2026-07-04):** one workspace = one machine (a workspace never
+spans machines; same repo on two machines = two workspaces). All configured
+remotes are always visible, grouped by machine, marked reachable or not.
 
 ## Problem
 
@@ -14,45 +18,72 @@ make it worse: claude keys sessions by exact cwd, so one repo's chats scatter
 across `cree8-bun-api`, `-pr141`, `-hotfix`, `/private/tmp/...-surface-cleanup`,
 and `--continue` in the main checkout never surfaces them.
 
-## Design principles (user-confirmed via mockup)
+## Design principles (user-confirmed via mockup, v2 2026-07-04)
 
-1. **Workspace is the organizing principle, not the chat.** The panel is a
-   sidebar tab (next to Git/Files/Agent/Plans) scoped to the active workspace
-   by default. Chats are the workspace's memory, not a competing top level.
-2. **"All workspaces" is an escape hatch**, for "I can't remember where that
-   conversation happened." Groups there carry workspace attribution; scoped
-   search offers "N matches in other workspaces" when local search misses.
-3. **Resume follows the chat home.** Resuming from the All view switches to
-   the owning workspace (reopening it if closed) and opens the tab there, in
-   the conversation's recorded cwd.
-4. **One conversation ⇒ at most one live tab (the registry rule).** A live
-   chat shows "● open"; clicking focuses the existing tab — across workspaces
-   if needed — never spawns a second process on the same session file.
-5. **Read-only over harness files.** The index never writes or moves
+1. **Machine is the top axis; workspace is the day-to-day organizing
+   principle.** The hierarchy is machine → workspace → chats. Every
+   workspace is bound to exactly one machine (local or a remote host —
+   already true in code: `WorkspaceSource` is `Local | RemoteAgent`).
+   The same repo checked out on two machines is two workspaces, two
+   separate chat groups — repo groups never merge across machines.
+2. **A session's identity is (machine, backend, cwd, session-id).**
+   Backend (claude/codex/pi) says which harness; machine says where the
+   transcript lives — and resume can only happen there. "Remote" is a
+   transport, not a backend: a remote machine has its own claude/codex/pi
+   sessions, reached through agentd instead of the local filesystem.
+3. **Scope is three rings: This workspace → This machine → Everywhere.**
+   The panel defaults to the active workspace; "This machine" is the active
+   workspace's machine; "Everywhere" groups machine → repo with workspace
+   attribution. Scoped search misses widen ring by ring ("N matches
+   elsewhere on this machine" / "N on other machines").
+4. **Connected remotes are always visible.** Every configured remote shows
+   in the workspace bar/rail grouped under its machine, marked reachable or
+   unreachable. An unreachable machine keeps its place and its cached chat
+   index; resume is disabled until it reconnects. (Otherwise remotes have
+   no way to be visible at all — user-confirmed.)
+5. **Resume follows the chat home.** Resuming from a wider scope switches
+   to the owning workspace (reopening it if closed) on the owning machine
+   and opens the tab there, in the conversation's recorded cwd. Local →
+   spawn in recorded cwd; remote → agentd session + attach.
+6. **One conversation ⇒ at most one live tab (the registry rule),** keyed
+   on the full (machine, session-id). A live chat shows "● open"; clicking
+   focuses the existing tab — across workspaces and machines — never a
+   second process on the same session file.
+7. **Read-only over harness files.** The index never writes or moves
    transcripts; resume is pure process-spawning. Harnesses stay untouched.
 
 ## Data model
 
-### Session sources (backend adapters, config-driven like session_commands)
+### Session sources: machine × backend, not backend-with-remote-bolted-on
 
-| backend | store | resume command |
+Backend adapters (config-driven like session_commands):
+
+| backend | store (on the session's machine) | resume command |
 |---|---|---|
 | claude | `~/.claude/projects/<cwd-slug>/<uuid>.jsonl` | `claude --resume <uuid>` (run in recorded cwd) |
 | codex  | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `codex resume <id>` |
 | pi     | `~/.pi/agent/sessions/<cwd-slug>/<ts>_<uuid>.jsonl` | `pi --resume <id>` |
-| remote | agentd `sessions` capability via WorkspaceSource | `gitterm-agent attach` path (already exists) |
 
 Adapter = { glob pattern, id extraction, metadata parse, resume command
 template }. New backends are config, not code.
 
+Machines are the other axis. The **local machine** runs adapters against the
+local filesystem. A **remote machine** exposes the same adapter data through
+agentd (list/stat/tail of transcript files via the `sessions`/file
+capabilities); resume there means starting an agentd session running the
+adapter's resume command and attaching the tab to it. The remote chat index
+is cached locally so Everywhere search works instantly and unreachable
+machines still show their (stale-marked) chats.
+
 ### Index entry (cached, built in background)
 
-id, backend, cwd, repo-root (git common dir — collapses worktrees into one
-repo group), branch (claude records gitBranch), title (claude summary line;
-first user message fallback), mtime, size, message count, workspace
-(derived: cwd under workspace root incl. worktrees; exact when GitTerm
+id, **machine**, backend, cwd, repo-root (git common dir — collapses
+worktrees into one repo group *within a machine*, never across machines),
+branch (claude records gitBranch), title (claude summary line; first user
+message fallback), mtime, size, message count, workspace (derived: cwd under
+workspace root incl. worktrees, on the same machine; exact when GitTerm
 spawned the tab and stamped it), flags: live / possibly-running / dead-cwd /
-closed-workspace.
+closed-workspace / machine-unreachable (index cached).
 
 ### Tab↔session registry
 
@@ -67,18 +98,26 @@ closed-workspace.
 
 ## UI
 
-- Sidebar tab **Chats**: search box, scope toggle [This workspace | All
-  workspaces], backend filter chips (claude/codex/pi/remote), list grouped by
-  repo (worktree chats badge under their repo group).
+- Sidebar tab **Chats**: search box, scope toggle [This workspace | This
+  machine | Everywhere], backend filter chips (claude/codex/pi), list grouped
+  by repo (worktree chats badge under their repo group). Everywhere scope
+  adds machine sections (this mac / each remote, with ● connected /
+  ○ unreachable status) containing the repo groups.
 - Row: title, backend dot, age, branch, badges (● open / ◐ possibly running /
   worktree / ⚠ dir gone).
+- Workspace bar / rail: workspaces grouped by machine — local first, then
+  each configured remote under its machine label, always visible with
+  reachable/unreachable state.
 - Main-pane preview on select: metadata header (backend, msgs, size, branch,
   age, cwd) + transcript tail (last N messages, parsed lazily) + primary
   action:
-  - dormant → **Resume as Tab** (shows the exact command + cwd it will run)
-  - live → **Go to Tab** (focuses, jumping workspaces if needed)
+  - dormant → **Resume as Tab** (shows the exact command + cwd it will run;
+    remote chats note the agentd session + machine)
+  - live → **Go to Tab** (focuses, jumping workspaces/machines if needed)
   - dead cwd → disabled + "Resume in <repo root> instead"
   - closed workspace → "Reopen workspace & resume"
+  - machine unreachable → disabled + "shown from cached index; resume when
+    <machine> reconnects"
 
 ## Performance constraints (12–15 h/day daily driver)
 
@@ -120,8 +159,14 @@ on `master` as the stable daily driver.
         new picker-launched sessions, possibly-running heuristic, dead-cwd
         rescue.
 - [ ] 3. Codex + pi adapters via config.
-- [ ] 4. Remote sessions through WorkspaceSource (subsumes the TRU-77
-        "session reattach UI" slice; remote group looks identical to local).
+- [ ] 4. Remote machines: run the same adapters over agentd (list/stat/tail
+        via WorkspaceSource `sessions` capability), machine sections in
+        Everywhere scope, locally cached remote index with unreachable
+        state, resume = agentd session + attach (subsumes the TRU-77
+        "session reattach UI" slice).
+- [ ] 4b. Workspace bar/rail grouped by machine, remotes always visible
+        with reachable/unreachable state (own mockup before build — this
+        touches the whole rail, not just Chats).
 - [ ] 5. Closed-workspace reopen-on-resume.
 - [ ] 6. (Optional, later) per-tab composer input box that writes to the PTY —
         deprioritized; voice input covers most of this need.
