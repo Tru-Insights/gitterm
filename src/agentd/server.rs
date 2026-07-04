@@ -9,9 +9,13 @@ use tonic::{Request, Response, Status};
 
 use super::protocol::v1::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
 use super::protocol::v1::{
-    DirEntry, HandshakeRequest, HandshakeResponse, ListDirRequest, ListDirResponse, ReadFileChunk,
-    ReadFileRequest,
+    terminal_input, terminal_output, DirEntry, GitDiffRequest, GitDiffResponse, GitStatusRequest,
+    GitStatusResponse, HandshakeRequest, HandshakeResponse, ListDirRequest, ListDirResponse,
+    ListSessionsRequest, ListSessionsResponse, ReadFileChunk, ReadFileRequest, Session,
+    SessionExited, StartSessionRequest, StopSessionRequest, StopSessionResponse, TerminalInput,
+    TerminalOutput,
 };
+use super::sessions::{SessionManager, SessionOutput};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -26,14 +30,18 @@ pub struct AgentServerConfig {
     pub agent_name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GitTermAgentService {
     agent_name: String,
+    sessions: Arc<SessionManager>,
 }
 
 impl GitTermAgentService {
     pub fn new(agent_name: String) -> Self {
-        Self { agent_name }
+        Self {
+            agent_name,
+            sessions: Arc::new(SessionManager::default()),
+        }
     }
 }
 
@@ -59,6 +67,9 @@ impl GitTermAgent for GitTermAgentService {
                 "handshake".to_string(),
                 "list_dir".to_string(),
                 "read_file".to_string(),
+                "git_status".to_string(),
+                "git_diff".to_string(),
+                "sessions".to_string(),
             ],
         }))
     }
@@ -128,6 +139,289 @@ impl GitTermAgent for GitTermAgentService {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    async fn git_status(
+        &self,
+        request: Request<GitStatusRequest>,
+    ) -> Result<Response<GitStatusResponse>, Status> {
+        let request = request.into_inner();
+        if request.workspace_id.trim().is_empty() {
+            return Err(Status::invalid_argument("workspace_id must not be empty"));
+        }
+        let root = canonical_dir(&request.root, "root")?;
+
+        let response = tokio::task::spawn_blocking(move || {
+            let status = super::git::collect_repo_status(&root);
+            GitStatusResponse {
+                workspace_id: request.workspace_id,
+                root: status.root.to_string_lossy().to_string(),
+                is_git_repo: status.is_git_repo,
+                repo_name: status.repo_name,
+                branch_name: status.branch_name,
+                staged: status.staged.into_iter().map(proto_file_status).collect(),
+                unstaged: status.unstaged.into_iter().map(proto_file_status).collect(),
+                untracked: status
+                    .untracked
+                    .into_iter()
+                    .map(proto_file_status)
+                    .collect(),
+            }
+        })
+        .await
+        .map_err(|err| Status::internal(format!("git status task failed: {err}")))?;
+
+        Ok(Response::new(response))
+    }
+
+    async fn git_diff(
+        &self,
+        request: Request<GitDiffRequest>,
+    ) -> Result<Response<GitDiffResponse>, Status> {
+        let request = request.into_inner();
+        if request.workspace_id.trim().is_empty() {
+            return Err(Status::invalid_argument("workspace_id must not be empty"));
+        }
+        if request.file_path.trim().is_empty() {
+            return Err(Status::invalid_argument("file_path must not be empty"));
+        }
+        let file = Path::new(&request.file_path);
+        if file.is_absolute()
+            || file
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(Status::invalid_argument(
+                "file_path must be repo-relative without parent components",
+            ));
+        }
+        let root = canonical_dir(&request.root, "root")?;
+
+        let response = tokio::task::spawn_blocking(move || {
+            let lines =
+                super::git::collect_file_diff(&root, &request.file_path, request.staged, 3000);
+            GitDiffResponse {
+                workspace_id: request.workspace_id,
+                file_path: request.file_path,
+                staged: request.staged,
+                lines: lines.into_iter().map(proto_diff_line).collect(),
+            }
+        })
+        .await
+        .map_err(|err| Status::internal(format!("git diff task failed: {err}")))?;
+
+        Ok(Response::new(response))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: Request<ListSessionsRequest>,
+    ) -> Result<Response<ListSessionsResponse>, Status> {
+        let request = request.into_inner();
+        let sessions = self
+            .sessions
+            .list_sessions(&request.workspace_id)
+            .into_iter()
+            .map(proto_session)
+            .collect();
+        Ok(Response::new(ListSessionsResponse { sessions }))
+    }
+
+    async fn start_session(
+        &self,
+        request: Request<StartSessionRequest>,
+    ) -> Result<Response<Session>, Status> {
+        let request = request.into_inner();
+        if request.workspace_id.trim().is_empty() {
+            return Err(Status::invalid_argument("workspace_id must not be empty"));
+        }
+        let env = request
+            .env
+            .into_iter()
+            .map(|var| (var.name, var.value))
+            .collect();
+        let info = self
+            .sessions
+            .start_session(
+                request.workspace_id,
+                request.cwd,
+                request.kind,
+                request.command,
+                env,
+                request.cols.min(u16::MAX as u32) as u16,
+                request.rows.min(u16::MAX as u32) as u16,
+            )
+            .map_err(Status::invalid_argument)?;
+        Ok(Response::new(proto_session(info)))
+    }
+
+    async fn stop_session(
+        &self,
+        request: Request<StopSessionRequest>,
+    ) -> Result<Response<StopSessionResponse>, Status> {
+        let request = request.into_inner();
+        let stopped = self
+            .sessions
+            .stop_session(&request.session_id)
+            .map_err(Status::not_found)?;
+        Ok(Response::new(StopSessionResponse { stopped }))
+    }
+
+    type AttachTerminalStream =
+        tokio_stream::wrappers::ReceiverStream<Result<TerminalOutput, Status>>;
+
+    async fn attach_terminal(
+        &self,
+        request: Request<tonic::Streaming<TerminalInput>>,
+    ) -> Result<Response<Self::AttachTerminalStream>, Status> {
+        let mut input = request.into_inner();
+
+        let first = input
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("input stream closed before attach"))?;
+        let Some(terminal_input::Input::Attach(attach)) = first.input else {
+            return Err(Status::invalid_argument(
+                "first message must be an attach request",
+            ));
+        };
+
+        let handles = self
+            .sessions
+            .attach(
+                &attach.session_id,
+                attach.cols.min(u16::MAX as u32) as u16,
+                attach.rows.min(u16::MAX as u32) as u16,
+            )
+            .map_err(Status::not_found)?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<TerminalOutput, Status>>(64);
+
+        // Replay recent scrollback, then either report the exit (session
+        // already finished) or stream live output.
+        if !handles.replay.is_empty() {
+            let _ = tx
+                .send(Ok(TerminalOutput {
+                    output: Some(terminal_output::Output::Data(handles.replay.clone())),
+                }))
+                .await;
+        }
+        if let Some(code) = handles.already_exited {
+            let _ = tx
+                .send(Ok(TerminalOutput {
+                    output: Some(terminal_output::Output::Exited(SessionExited {
+                        exit_code: code,
+                    })),
+                }))
+                .await;
+            return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            )));
+        }
+
+        let mut output_rx = handles.output_rx;
+        let output_tx = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match output_rx.recv().await {
+                    Ok(SessionOutput::Data(chunk)) => {
+                        if output_tx
+                            .send(Ok(TerminalOutput {
+                                output: Some(terminal_output::Output::Data(chunk)),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break; // client detached
+                        }
+                    }
+                    Ok(SessionOutput::Exited(code)) => {
+                        let _ = output_tx
+                            .send(Ok(TerminalOutput {
+                                output: Some(terminal_output::Output::Exited(SessionExited {
+                                    exit_code: code,
+                                })),
+                            }))
+                            .await;
+                        break;
+                    }
+                    // Slow consumer: chunks were dropped; keep streaming.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        let sessions = self.sessions.clone();
+        let session_id = attach.session_id.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(message)) = input.message().await {
+                match message.input {
+                    Some(terminal_input::Input::Data(data)) => {
+                        let sessions = sessions.clone();
+                        let session_id = session_id.clone();
+                        // PTY writes can block when the child stops reading;
+                        // keep them off the async runtime.
+                        let result = tokio::task::spawn_blocking(move || {
+                            sessions.write_input(&session_id, &data)
+                        })
+                        .await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            break;
+                        }
+                    }
+                    Some(terminal_input::Input::Resize(resize)) => {
+                        let _ = sessions.resize(
+                            &session_id,
+                            resize.cols.min(u16::MAX as u32) as u16,
+                            resize.rows.min(u16::MAX as u32) as u16,
+                        );
+                    }
+                    Some(terminal_input::Input::Attach(_)) | None => {}
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+}
+
+fn proto_session(info: super::sessions::SessionInfo) -> Session {
+    Session {
+        session_id: info.session_id,
+        workspace_id: info.workspace_id,
+        kind: info.kind,
+        command: info.command,
+        cwd: info.cwd,
+        running: info.running,
+        exit_code: info.exit_code,
+        created_unix_secs: info.created_unix_secs,
+    }
+}
+
+fn proto_diff_line(line: super::git::FileDiffLine) -> super::protocol::v1::GitDiffLine {
+    use super::git::DiffLineKind;
+    use super::protocol::v1::GitDiffLineKind;
+    super::protocol::v1::GitDiffLine {
+        content: line.content,
+        kind: match line.kind {
+            DiffLineKind::Context => GitDiffLineKind::Context,
+            DiffLineKind::Addition => GitDiffLineKind::Addition,
+            DiffLineKind::Deletion => GitDiffLineKind::Deletion,
+            DiffLineKind::Header => GitDiffLineKind::Header,
+        } as i32,
+        old_line: line.old_line.unwrap_or(0),
+        new_line: line.new_line.unwrap_or(0),
+    }
+}
+
+fn proto_file_status(status: super::git::GitFileStatus) -> super::protocol::v1::GitFileStatus {
+    super::protocol::v1::GitFileStatus {
+        path: status.path,
+        status: status.status,
+        is_staged: status.is_staged,
     }
 }
 
@@ -427,6 +721,49 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn git_status_reports_changes_for_real_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.path().join("new.txt"), "n").unwrap();
+
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let response = service
+            .git_status(Request::new(GitStatusRequest {
+                workspace_id: "workspace".to_string(),
+                root: root.path().to_string_lossy().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(response.is_git_repo);
+        assert_eq!(response.branch_name, "main");
+        assert_eq!(response.untracked.len(), 1);
+        assert_eq!(response.untracked[0].path, "new.txt");
+    }
+
+    #[tokio::test]
+    async fn git_status_rejects_missing_root() {
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let status = service
+            .git_status(Request::new(GitStatusRequest {
+                workspace_id: "workspace".to_string(),
+                root: "/definitely/not/a/real/dir".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
