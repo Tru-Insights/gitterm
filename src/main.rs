@@ -5627,11 +5627,13 @@ impl App {
             return Task::none();
         };
 
-        // Resolve what to run on the remote from per-remote config.
+        // Resolve what to run on the remote from per-remote config, read
+        // fresh from disk so session_commands edits apply immediately.
         let agent_config = self
             .active_workspace()
-            .and_then(|ws| self.remote_agent_config_for_workspace(ws))
-            .cloned();
+            .and_then(|ws| self.remote_agent_id_for_workspace(ws))
+            .map(str::to_string)
+            .and_then(|remote_id| self.fresh_remote_agent_config(&remote_id));
         // Preset names like "Claude Code" resolve by full lowercased name,
         // then by first word ("claude"), against the remote's configured
         // session_commands; the last resort is the first word on the
@@ -5703,7 +5705,8 @@ impl App {
     /// to the AttachTerminal stream.
     fn remote_session_attach_command(&self, session_id: &str) -> Option<String> {
         let workspace = self.active_workspace()?;
-        let config = self.remote_agent_config_for_workspace(workspace)?;
+        let remote_id = self.remote_agent_id_for_workspace(workspace)?.to_string();
+        let config = self.fresh_remote_agent_config(&remote_id)?;
         let token_ref = match &config.auth {
             config::RemoteAgentAuthConfig::Token { token_ref } => token_ref.clone(),
         };
@@ -6045,6 +6048,19 @@ fi
         self.remote_agent_defs
             .iter()
             .find(|agent| agent.id == remote_id)
+    }
+
+    /// Latest config for a remote: prefer the on-disk remote-agents.json
+    /// (user-editable while the app runs) over the startup snapshot, so
+    /// session-command edits apply without relaunching.
+    fn fresh_remote_agent_config(&self, remote_id: &str) -> Option<RemoteAgentConfig> {
+        RemoteAgentsFile::load()
+            .and_then(|file| {
+                file.remote_agents
+                    .into_iter()
+                    .find(|agent| agent.id == remote_id)
+            })
+            .or_else(|| self.remote_agent_config_by_id(remote_id).cloned())
     }
 
     fn remote_agent_config_by_id(&self, remote_id: &str) -> Option<&RemoteAgentConfig> {
