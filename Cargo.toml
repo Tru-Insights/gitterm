@@ -2,6 +2,7 @@
 name = "gitterm"
 version = "0.1.0"
 edition = "2021"
+default-run = "gitterm"
 description = "A Git status viewer with integrated terminal, built with Iced"
 
 [dependencies]
@@ -17,8 +18,10 @@ serde_json = "1.0"
 rfd = "0.15"
 similar = "2.6"
 warp = "0.3"
+tonic = { version = "0.12", features = ["transport", "tls-roots"] }
+prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "process", "io-util", "macros"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 chrono = "0.4"
 libc = "0.2"
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
@@ -46,3 +49,5 @@ tao = "0.31"
 
 [build-dependencies]
 winres = "0.1"
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
