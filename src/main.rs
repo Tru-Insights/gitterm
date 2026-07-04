@@ -3479,7 +3479,18 @@ pub enum Event {
     WorkspaceSelect(usize),
     WorkspaceClose(usize),
     WorkspaceCreate,
+    WorkspaceCreateLocal,
     WorkspaceCreated(Option<PathBuf>),
+    WorkspaceSourcePickerCancel,
+    RemoteWorkspaceBrowse(String),
+    RemotePickerNavigate(SourcePath),
+    RemotePickerUp,
+    RemotePickerLoaded {
+        seq: u64,
+        listing: SourceDirListing,
+    },
+    RemotePickerConfirm,
+    RemotePickerCancel,
     RemoteWorkspaceOpen(String),
     WorkspaceSettingsOpen(usize),
     WorkspaceSettingsClose,
@@ -3641,6 +3652,9 @@ struct App {
     workspace_settings_new_value: String,
     // Tab picker popup (Option+click on "+")
     tab_picker_visible: bool,
+    // "New workspace" source chooser + remote directory picker (Phase 8)
+    workspace_source_picker_visible: bool,
+    remote_workspace_picker: Option<RemoteWorkspacePicker>,
     // Configured agent presets
     agent_presets: Vec<AgentPreset>,
     // Quick commands (app-level, run in bottom terminal)
@@ -3960,6 +3974,16 @@ fn remote_agent_root(location: &WorkspaceLocation) -> Option<&str> {
         WorkspaceLocation::RemoteAgent { root, .. } => Some(root.as_str()),
         WorkspaceLocation::Local { .. } | WorkspaceLocation::LegacyRemoteSession { .. } => None,
     }
+}
+
+/// In-app directory browser for choosing a new remote workspace root.
+/// Reuses FilesState so listing/navigation behaves exactly like the Files
+/// sidebar, fed by the same source.
+#[derive(Debug, Clone)]
+struct RemoteWorkspacePicker {
+    remote_id: String,
+    remote_name: String,
+    files: FilesState,
 }
 
 #[derive(Debug, Clone)]
@@ -4824,6 +4848,28 @@ impl App {
         )
     }
 
+    /// Source used by the remote workspace picker: browses the whole remote
+    /// filesystem (root "/") so any directory can become a workspace root.
+    fn picker_source(agent: RemoteAgentConfig) -> WorkspaceSource {
+        WorkspaceSource::RemoteAgent {
+            workspace_id: "workspace-picker".to_string(),
+            root: "/".to_string(),
+            client: remote_agent_client_config(agent),
+        }
+    }
+
+    fn request_picker_listing(
+        source: WorkspaceSource,
+        dir: SourcePath,
+        seq: u64,
+        show_hidden: bool,
+    ) -> Task<Event> {
+        Task::perform(
+            async move { source.list_dir(0, dir, show_hidden).await },
+            move |listing| Event::RemotePickerLoaded { seq, listing },
+        )
+    }
+
     /// Run one directory listing against a source and deliver it as a
     /// FileTreeLoaded event. `seq` must come from FilesState::begin_request
     /// so stale responses are dropped.
@@ -5103,6 +5149,8 @@ impl App {
             workspace_settings_new_key: String::new(),
             workspace_settings_new_value: String::new(),
             tab_picker_visible: false,
+            workspace_source_picker_visible: false,
+            remote_workspace_picker: None,
             agent_presets: config.agent_presets.clone(),
             quick_commands: config.quick_commands.clone(),
             quick_commands_visible: false,
@@ -9616,6 +9664,13 @@ fi
                 }
             }
             Event::WorkspaceCreate => {
+                if self.remote_agent_defs.is_empty() {
+                    return Task::done(Event::WorkspaceCreateLocal);
+                }
+                self.workspace_source_picker_visible = true;
+            }
+            Event::WorkspaceCreateLocal => {
+                self.workspace_source_picker_visible = false;
                 return Task::perform(
                     async {
                         let folder = rfd::AsyncFileDialog::new()
@@ -9626,6 +9681,100 @@ fi
                     },
                     Event::WorkspaceCreated,
                 );
+            }
+            Event::WorkspaceSourcePickerCancel => {
+                self.workspace_source_picker_visible = false;
+            }
+            Event::RemoteWorkspaceBrowse(remote_id) => {
+                self.workspace_source_picker_visible = false;
+                let Some(agent) = self.remote_agent_config_by_id(&remote_id).cloned() else {
+                    return Task::none();
+                };
+                let start = SourcePath::Remote("/".to_string());
+                let mut files = FilesState::at(start.clone());
+                let seq = files.begin_request(start.clone());
+                self.remote_workspace_picker = Some(RemoteWorkspacePicker {
+                    remote_id: agent.id.clone(),
+                    remote_name: agent.name.clone(),
+                    files,
+                });
+                let source = Self::picker_source(agent);
+                return Self::request_picker_listing(source, start, seq, self.show_hidden);
+            }
+            Event::RemotePickerNavigate(dir) => {
+                let Some(picker) = self.remote_workspace_picker.as_mut() else {
+                    return Task::none();
+                };
+                let seq = picker.files.begin_request(dir.clone());
+                let remote_id = picker.remote_id.clone();
+                let Some(agent) = self.remote_agent_config_by_id(&remote_id).cloned() else {
+                    return Task::none();
+                };
+                return Self::request_picker_listing(
+                    Self::picker_source(agent),
+                    dir,
+                    seq,
+                    self.show_hidden,
+                );
+            }
+            Event::RemotePickerUp => {
+                let parent = self
+                    .remote_workspace_picker
+                    .as_ref()
+                    .and_then(|picker| picker.files.parent.clone());
+                if let Some(parent) = parent {
+                    return Task::done(Event::RemotePickerNavigate(parent));
+                }
+            }
+            Event::RemotePickerLoaded { seq, listing } => {
+                if let Some(picker) = self.remote_workspace_picker.as_mut() {
+                    picker.files.apply(seq, listing);
+                }
+            }
+            Event::RemotePickerCancel => {
+                self.remote_workspace_picker = None;
+            }
+            Event::RemotePickerConfirm => {
+                let Some(picker) = self.remote_workspace_picker.take() else {
+                    return Task::none();
+                };
+                let root = picker.files.dir.display();
+                let name = root
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .filter(|segment| !segment.is_empty())
+                    .unwrap_or("remote")
+                    .to_string();
+                let used_colors: Vec<WorkspaceColor> =
+                    self.workspaces.iter().map(|ws| ws.color).collect();
+                let mut workspace = Workspace::new(
+                    format!("{}:{}", picker.remote_name, name),
+                    PathBuf::from(&root),
+                    WorkspaceColor::next_available(&used_colors),
+                );
+                workspace.location = WorkspaceLocation::RemoteAgent {
+                    remote_id: picker.remote_id.clone(),
+                    workspace_id: root.clone(),
+                    root: root.clone(),
+                };
+                self.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
+                workspace.active_tab = 0;
+                self.workspaces.push(workspace);
+                self.active_workspace_idx = self.workspaces.len() - 1;
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
+                self.sync_plans_dir();
+                let viewport_width = self.content_viewport_width();
+                let new_target = self.active_workspace_idx as f32 * viewport_width;
+                self.slide_offset = new_target;
+                self.slide_target = new_target;
+                self.slide_animating = false;
+                self.slide_start_time = None;
+                return Task::batch([
+                    self.ensure_active_remote_agent_connection(true),
+                    self.refresh_files_for_active_tab(),
+                ]);
             }
             Event::WorkspaceCreated(Some(path)) => {
                 let dir_str = path.to_string_lossy().to_string();
@@ -10359,9 +10508,226 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        } else if self.remote_workspace_picker.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_remote_workspace_picker())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.workspace_source_picker_visible {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_workspace_source_picker())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else {
             main_view
         }
+    }
+
+    /// "New workspace" source chooser: local folder or one of the
+    /// configured remote agents.
+    fn view_workspace_source_picker(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let bg = theme.bg_surface();
+        let border_color = theme.border();
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let hover_bg = theme.surface0();
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        let mut items = Column::new().spacing(4).width(Length::Fixed(320.0));
+        items = items.push(text("New workspace").size(font).color(text_primary));
+        let entry = |label: String, desc: String, event: Event| {
+            button(
+                column![
+                    text(label).size(font).color(text_primary),
+                    text(desc).size(font_small).color(text_secondary),
+                ]
+                .spacing(2),
+            )
+            .style(move |_theme, status| button::Style {
+                background: matches!(status, button::Status::Hovered).then_some(hover_bg.into()),
+                text_color: text_primary,
+                ..Default::default()
+            })
+            .padding([8, 10])
+            .width(Length::Fill)
+            .on_press(event)
+        };
+        items = items.push(entry(
+            "Local Folder…".to_string(),
+            "Choose a folder on this Mac".to_string(),
+            Event::WorkspaceCreateLocal,
+        ));
+        for agent in &self.remote_agent_defs {
+            items = items.push(entry(
+                format!("On {}…", agent.name),
+                agent.endpoint.clone(),
+                Event::RemoteWorkspaceBrowse(agent.id.clone()),
+            ));
+        }
+
+        let menu = container(items)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3),
+                    offset: iced::Vector::new(0.0, 2.0),
+                    blur_radius: 8.0,
+                },
+                ..Default::default()
+            })
+            .padding(12);
+
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Event::WorkspaceSourcePickerCancel);
+
+        Stack::new()
+            .push(backdrop)
+            .push(
+                container(menu)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill),
+            )
+            .into()
+    }
+
+    /// Remote directory browser for picking a new workspace root — fed by
+    /// the same source listings as the Files sidebar.
+    fn view_remote_workspace_picker(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let bg = theme.bg_surface();
+        let border_color = theme.border();
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let hover_bg = theme.surface0();
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        let Some(picker) = &self.remote_workspace_picker else {
+            return container(iced::widget::Space::new()).into();
+        };
+
+        let mut body = Column::new().spacing(6).width(Length::Fixed(440.0));
+        body = body.push(
+            text(format!("Choose a folder on {}", picker.remote_name))
+                .size(font)
+                .color(text_primary),
+        );
+        body = body.push(
+            text(picker.files.display_dir.clone())
+                .size(font_small)
+                .color(theme.accent()),
+        );
+        if let Some(error) = &picker.files.error {
+            body = body.push(text(error).size(font_small).color(theme.danger()));
+        }
+        if picker.files.loading {
+            body = body.push(text("Loading…").size(font_small).color(text_secondary));
+        }
+
+        let mut list = Column::new().spacing(1);
+        if picker.files.parent.is_some() {
+            list = list.push(
+                button(text(".. (parent)").size(font_small).color(text_secondary))
+                    .style(move |_theme, status| button::Style {
+                        background: matches!(status, button::Status::Hovered)
+                            .then_some(hover_bg.into()),
+                        text_color: text_secondary,
+                        ..Default::default()
+                    })
+                    .padding([4, 8])
+                    .width(Length::Fill)
+                    .on_press(Event::RemotePickerUp),
+            );
+        }
+        for dir_entry in picker.files.entries.iter().filter(|entry| entry.is_dir) {
+            list = list.push(
+                button(
+                    text(format!("📁 {}", dir_entry.name))
+                        .size(font_small)
+                        .color(text_primary),
+                )
+                .style(move |_theme, status| button::Style {
+                    background: matches!(status, button::Status::Hovered)
+                        .then_some(hover_bg.into()),
+                    text_color: text_primary,
+                    ..Default::default()
+                })
+                .padding([4, 8])
+                .width(Length::Fill)
+                .on_press(Event::RemotePickerNavigate(dir_entry.path.clone())),
+            );
+        }
+        body = body.push(
+            scrollable(list)
+                .height(Length::Fixed(320.0))
+                .width(Length::Fill),
+        );
+
+        body = body.push(
+            row![
+                button(text("Use this folder").size(font_small))
+                    .style(button::primary)
+                    .padding([6, 12])
+                    .on_press(Event::RemotePickerConfirm),
+                button(text("Cancel").size(font_small))
+                    .style(button::text)
+                    .padding([6, 12])
+                    .on_press(Event::RemotePickerCancel),
+            ]
+            .spacing(8),
+        );
+
+        let panel = container(body)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3),
+                    offset: iced::Vector::new(0.0, 2.0),
+                    blur_radius: 8.0,
+                },
+                ..Default::default()
+            })
+            .padding(14);
+
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Event::RemotePickerCancel);
+
+        Stack::new()
+            .push(backdrop)
+            .push(
+                container(panel)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill),
+            )
+            .into()
     }
 
     /// Header strip shown above the embedded webview while the plans viewer
