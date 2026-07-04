@@ -17355,6 +17355,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shape_source_file_load_renders_markdown_webview() {
+        let snapshot = services::shape_source_file_load(
+            1,
+            PathBuf::from("/remote/repo/README.md"),
+            Ok(crate::source::SourceFileContent {
+                data: b"# Title\n\nbody".to_vec(),
+                total_size: 13,
+                truncated: false,
+            }),
+            true,
+        );
+        assert!(snapshot.webview_content.is_some());
+        assert!(snapshot.file_preview_notice.is_none());
+    }
+
+    #[test]
+    fn shape_source_file_load_flags_binary() {
+        let snapshot = services::shape_source_file_load(
+            1,
+            PathBuf::from("/remote/repo/blob.bin"),
+            Ok(crate::source::SourceFileContent {
+                data: vec![0u8, 159, 146, 150],
+                total_size: 4,
+                truncated: false,
+            }),
+            true,
+        );
+        assert!(snapshot.file_content.is_empty());
+        assert!(snapshot.file_preview_notice.is_some());
+    }
+
     // === AppTheme::toggle ===
 
     #[test]
