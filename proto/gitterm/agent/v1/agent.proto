@@ -6,6 +6,7 @@ service GitTermAgent {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
   rpc ReadFile(ReadFileRequest) returns (stream ReadFileChunk);
+  rpc GitStatus(GitStatusRequest) returns (GitStatusResponse);
 }
 
 message HandshakeRequest {
@@ -55,4 +56,29 @@ message ReadFileChunk {
   uint64 total_size = 2;
   // True when the stream stops before total_size due to max_bytes.
   bool truncated = 3;
+}
+
+message GitStatusRequest {
+  string workspace_id = 1;
+  string root = 2;
+}
+
+message GitStatusResponse {
+  string workspace_id = 1;
+  // Canonical repo root actually used (self-healed to the toplevel).
+  string root = 2;
+  bool is_git_repo = 3;
+  string repo_name = 4;
+  string branch_name = 5;
+  repeated GitFileStatus staged = 6;
+  repeated GitFileStatus unstaged = 7;
+  repeated GitFileStatus untracked = 8;
+}
+
+message GitFileStatus {
+  // Repo-relative path.
+  string path = 1;
+  // Single-letter porcelain status: A/M/D/R/?.
+  string status = 2;
+  bool is_staged = 3;
 }

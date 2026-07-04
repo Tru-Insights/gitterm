@@ -2072,6 +2072,7 @@ struct TabState {
     git_unchanged_streak: u32,
     last_git_status_hash: Option<u64>,
     git_status_loading: bool,
+    git_status_error: Option<String>,
     git_view_mode: GitViewMode,
     worktrees: Vec<GitWorktreeEntry>,
     branches: Vec<GitBranchEntry>,
@@ -2134,6 +2135,7 @@ impl TabState {
             git_unchanged_streak: 0,
             last_git_status_hash: None,
             git_status_loading: false,
+            git_status_error: None,
             git_view_mode: GitViewMode::Changes,
             worktrees: Vec::new(),
             branches: Vec::new(),
@@ -3067,13 +3069,6 @@ impl WorkspaceBackendRef {
 }
 
 #[derive(Debug, Clone)]
-struct WorkspaceGitStatusRequest {
-    backend: WorkspaceBackendRef,
-    tab_id: usize,
-    repo_path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
 struct WorkspaceGitWorktreesRequest {
     backend: WorkspaceBackendRef,
     tab_id: usize,
@@ -3975,6 +3970,17 @@ pub struct GitStatusSnapshot {
     staged: Vec<FileEntry>,
     unstaged: Vec<FileEntry>,
     untracked: Vec<FileEntry>,
+    /// Source-level failure (e.g. remote agent unreachable); shown in the
+    /// Git sidebar instead of silently reporting a clean tree.
+    error: Option<String>,
+}
+
+fn file_entry_from_source(file: source::SourceGitFile) -> FileEntry {
+    FileEntry {
+        path: file.path,
+        status: file.status,
+        is_staged: file.is_staged,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4614,20 +4620,76 @@ impl App {
     }
 
     fn request_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
-        Self::request_workspace_git_status(WorkspaceGitStatusRequest {
-            backend: WorkspaceBackendRef::Local {
-                root: repo_path.clone(),
-            },
-            tab_id,
-            repo_path,
-        })
+        Self::request_local_git_status(tab_id, repo_path)
     }
 
-    fn request_workspace_git_status(request: WorkspaceGitStatusRequest) -> Task<Event> {
-        if request.backend.is_remote() {
-            return Task::none();
+    /// Refresh git status for the active tab through its workspace source.
+    /// No-op when the source doesn't support git status (legacy remotes).
+    fn request_git_status_for_active_source(
+        &self,
+        tab_id: usize,
+        repo_path: PathBuf,
+    ) -> Task<Event> {
+        match self.source_for_active_tab() {
+            Ok(source) if source.capabilities().git_status => {
+                Self::request_source_git_status(source, tab_id, repo_path)
+            }
+            _ => Task::none(),
         }
-        Self::request_local_git_status(request.tab_id, request.repo_path)
+    }
+
+    /// Git status through a workspace source. Local delegates to the
+    /// existing collector path; remote asks the agent. Errors surface in
+    /// the snapshot rather than pretending the tree is clean.
+    fn request_source_git_status(
+        source: WorkspaceSource,
+        tab_id: usize,
+        fallback_root: PathBuf,
+    ) -> Task<Event> {
+        if let WorkspaceSource::Local { root } = source {
+            return Self::request_local_git_status(tab_id, root);
+        }
+        Task::perform(
+            async move {
+                match source.git_status().await {
+                    Ok(status) => GitStatusSnapshot {
+                        tab_id,
+                        repo_path: PathBuf::from(status.root.display()),
+                        repo_name: status.repo_name,
+                        branch_name: status.branch_name,
+                        is_git_repo: status.is_git_repo,
+                        staged: status
+                            .staged
+                            .into_iter()
+                            .map(file_entry_from_source)
+                            .collect(),
+                        unstaged: status
+                            .unstaged
+                            .into_iter()
+                            .map(file_entry_from_source)
+                            .collect(),
+                        untracked: status
+                            .untracked
+                            .into_iter()
+                            .map(file_entry_from_source)
+                            .collect(),
+                        error: None,
+                    },
+                    Err(err) => GitStatusSnapshot {
+                        tab_id,
+                        repo_path: fallback_root,
+                        repo_name: String::new(),
+                        branch_name: String::new(),
+                        is_git_repo: false,
+                        staged: Vec::new(),
+                        unstaged: Vec::new(),
+                        untracked: Vec::new(),
+                        error: Some(err),
+                    },
+                }
+            },
+            Event::GitStatusLoaded,
+        )
     }
 
     fn request_local_git_status(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
@@ -4651,6 +4713,7 @@ impl App {
                             staged: Vec::new(),
                             unstaged: Vec::new(),
                             untracked: Vec::new(),
+                            error: Some(format!("git status task failed: {err}")),
                         }
                     }
                 }
@@ -5834,7 +5897,7 @@ fi
 
     /// The source behind the active workspace's file browser. `Err` carries
     /// a user-facing message (shown in the Files sidebar, never swallowed).
-    fn files_source_for_active_tab(&self) -> Result<WorkspaceSource, String> {
+    fn source_for_active_tab(&self) -> Result<WorkspaceSource, String> {
         let Some(workspace) = self.active_workspace() else {
             return Err("No active workspace".to_string());
         };
@@ -5874,7 +5937,7 @@ fi
     /// Navigate the active tab's file browser to `dir` (or refresh in place)
     /// and kick off the listing through the workspace source.
     fn browse_active_tab_to(&mut self, dir: SourcePath) -> Task<Event> {
-        let source = self.files_source_for_active_tab();
+        let source = self.source_for_active_tab();
         let show_hidden = self.show_hidden;
         let Some(tab) = self.active_tab_mut() else {
             return Task::none();
@@ -6495,7 +6558,14 @@ fi
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
-                if !self.active_workspace_is_remote() {
+                // What gets polled is decided by the workspace source's
+                // capabilities, not by where the workspace lives.
+                let poll_source = self
+                    .source_for_active_tab()
+                    .ok()
+                    .filter(|source| source.capabilities().git_status);
+                if let Some(poll_source) = poll_source {
+                    let poll_caps = poll_source.capabilities();
                     let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
                     if let Some(tab) = self.active_tab_mut() {
                         // NOTE: repo root self-heal moved to GitStatusLoaded handler
@@ -6517,10 +6587,15 @@ fi
                             let repo_path = tab.repo_path.clone();
                             tab.last_poll = Instant::now();
                             tab.git_status_loading = true;
-                            tasks.push(Self::request_git_status(tab_id, repo_path));
+                            tasks.push(Self::request_source_git_status(
+                                poll_source.clone(),
+                                tab_id,
+                                repo_path,
+                            ));
                         }
 
-                        if tab.sidebar_mode == SidebarMode::Git
+                        if poll_caps.git_worktrees
+                            && tab.sidebar_mode == SidebarMode::Git
                             && tab.git_view_mode == GitViewMode::Worktrees
                             && !tab.worktrees_loading
                         {
@@ -6842,7 +6917,7 @@ fi
                         } {
                             return Task::batch([
                                 self.scroll_to_active_tab(),
-                                Self::request_git_status(tab_id, repo_path),
+                                self.request_git_status_for_active_source(tab_id, repo_path),
                             ]);
                         }
                         return self.scroll_to_active_tab();
@@ -6873,7 +6948,7 @@ fi
                     } {
                         return Task::batch([
                             self.scroll_to_active_tab(),
-                            Self::request_git_status(tab_id, repo_path),
+                            self.request_git_status_for_active_source(tab_id, repo_path),
                         ]);
                     }
                     return self.scroll_to_active_tab();
@@ -7113,7 +7188,7 @@ fi
                     } {
                         return Task::batch([
                             self.scroll_to_active_tab(),
-                            Self::request_git_status(tab_id, repo_path),
+                            self.request_git_status_for_active_source(tab_id, repo_path),
                         ]);
                     }
                     return self.scroll_to_active_tab();
@@ -7154,7 +7229,7 @@ fi
                     } {
                         return Task::batch([
                             self.scroll_to_active_tab(),
-                            Self::request_git_status(tab_id, repo_path),
+                            self.request_git_status_for_active_source(tab_id, repo_path),
                         ]);
                     }
                     return self.scroll_to_active_tab();
@@ -7313,13 +7388,25 @@ fi
                 } {
                     return Task::batch([
                         self.scroll_to_active_tab(),
-                        Self::request_git_status(tab_id, repo_path),
+                        self.request_git_status_for_active_source(tab_id, repo_path),
                     ]);
                 }
                 return self.scroll_to_active_tab();
             }
             Event::FolderSelected(None) => {}
             Event::FileSelect(path, is_staged) => {
+                let git_diff_supported = self
+                    .source_for_active_tab()
+                    .ok()
+                    .map(|source| source.capabilities().git_diff)
+                    .unwrap_or(false);
+                if !git_diff_supported {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.git_status_error =
+                            Some("Diffs aren't available for this source yet".to_string());
+                    }
+                    return Task::none();
+                }
                 // Hide WebView when switching to git diff view
                 self.hide_webview_for_non_agent();
                 let is_dark_theme = self.theme == AppTheme::Dark;
@@ -7352,6 +7439,14 @@ fi
                 }
             }
             Event::FileSelectByIndex(idx) => {
+                let git_diff_supported = self
+                    .source_for_active_tab()
+                    .ok()
+                    .map(|source| source.capabilities().git_diff)
+                    .unwrap_or(false);
+                if !git_diff_supported {
+                    return Task::none();
+                }
                 // Hide WebView when switching to git diff view
                 self.hide_webview_for_non_agent();
                 let is_dark_theme = self.theme == AppTheme::Dark;
@@ -7671,6 +7766,11 @@ fi
                 }
             }
             Event::SetSidebarMode(mode) => {
+                let active_source = self.source_for_active_tab().ok();
+                let active_caps = active_source
+                    .as_ref()
+                    .map(|source| source.capabilities())
+                    .unwrap_or_else(SourceCapabilities::none);
                 let active_workspace_is_remote = self.active_workspace_is_remote();
                 let active_workspace_is_remote_agent =
                     self.active_workspace().is_some_and(|workspace| {
@@ -7719,22 +7819,33 @@ fi
                                 tab.git_status_loading = true;
                                 let tab_id = tab.id;
                                 let repo_path = tab.repo_path.clone();
-                                let load_worktrees = tab.git_view_mode == GitViewMode::Worktrees;
+                                let load_worktrees = tab.git_view_mode == GitViewMode::Worktrees
+                                    && active_caps.git_worktrees;
                                 if load_worktrees {
                                     tab.worktrees_loading = true;
                                     tab.last_worktrees_poll = Instant::now();
                                 }
+                                let Some(source) = active_source else {
+                                    tab.git_status_loading = false;
+                                    tab.sidebar_mode = mode;
+                                    return Task::none();
+                                };
                                 tab.sidebar_mode = mode;
                                 self.mark_log_server_dirty();
+                                let status_task = Self::request_source_git_status(
+                                    source,
+                                    tab_id,
+                                    repo_path.clone(),
+                                );
                                 if load_worktrees {
                                     let worktrees_repo_path =
                                         active_workspace_dir.unwrap_or_else(|| repo_path.clone());
                                     return Task::batch([
-                                        Self::request_git_status(tab_id, repo_path.clone()),
+                                        status_task,
                                         Self::request_git_worktrees(tab_id, worktrees_repo_path),
                                     ]);
                                 }
-                                return Self::request_git_status(tab_id, repo_path);
+                                return status_task;
                             }
                             SidebarMode::Files => {
                                 // Switching to Files mode - clear git selection
@@ -7905,7 +8016,7 @@ fi
                         None
                     }
                 } {
-                    tasks.push(Self::request_git_status(tab_id, repo_path));
+                    tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
                 }
 
                 let active_agent_tab_id = self
@@ -8120,7 +8231,7 @@ fi
                 // only the loader at the end differs per source.
                 let remote_source = match &source_path {
                     SourcePath::Local(_) => None,
-                    SourcePath::Remote(_) => match self.files_source_for_active_tab() {
+                    SourcePath::Remote(_) => match self.source_for_active_tab() {
                         Ok(source) => Some(source),
                         Err(message) => {
                             if let Some(tab) = self.active_tab_mut() {
@@ -8571,17 +8682,6 @@ fi
                 return scroll_task;
             }
             Event::GitStatusLoaded(snapshot) => {
-                if self.tab_belongs_to_remote_workspace(snapshot.tab_id) {
-                    if let Some(tab) = self
-                        .workspaces
-                        .iter_mut()
-                        .flat_map(|ws| ws.tabs.iter_mut())
-                        .find(|t| t.id == snapshot.tab_id)
-                    {
-                        tab.git_status_loading = false;
-                    }
-                    return Task::none();
-                }
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
@@ -8589,6 +8689,12 @@ fi
                     .find(|t| t.id == snapshot.tab_id)
                 {
                     tab.git_status_loading = false;
+                    tab.git_status_error = snapshot.error.clone();
+                    if snapshot.error.is_some() {
+                        // Keep the last good status visible alongside the error;
+                        // retry on the normal poll cadence.
+                        return Task::none();
+                    }
                     {
                         // Self-heal: if the worker discovered a different repo root, update
                         if snapshot.repo_path != tab.repo_path && snapshot.is_git_repo {
@@ -9346,7 +9452,7 @@ fi
                         None
                     }
                 } {
-                    return Self::request_git_status(tab_id, repo_path);
+                    return self.request_git_status_for_active_source(tab_id, repo_path);
                 }
             }
             Event::WorkspaceCreated(None) => {}
@@ -12642,7 +12748,7 @@ fi
         // What the workspace's source supports drives which affordances
         // render; the view never asks where the files live.
         let caps = self
-            .files_source_for_active_tab()
+            .source_for_active_tab()
             .map(|source| source.capabilities())
             .unwrap_or_else(|_| SourceCapabilities::none());
         let mut content = Column::new().spacing(2).padding(8);
@@ -14974,6 +15080,28 @@ fi
     ) -> Column<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        if let Some(error) = &tab.git_status_error {
+            let error_bg = iced::Color {
+                a: 0.12,
+                ..theme.danger()
+            };
+            content = content.push(
+                container(text(error).size(font_small).color(theme.danger()))
+                    .padding([6, 8])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(error_bg.into()),
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
         // Branch display - styled rounded container with diamond icon
         if tab.is_git_repo {
             let branch_bg = theme.bg_base();

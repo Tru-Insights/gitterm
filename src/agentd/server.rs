@@ -9,8 +9,8 @@ use tonic::{Request, Response, Status};
 
 use super::protocol::v1::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
 use super::protocol::v1::{
-    DirEntry, HandshakeRequest, HandshakeResponse, ListDirRequest, ListDirResponse, ReadFileChunk,
-    ReadFileRequest,
+    DirEntry, GitStatusRequest, GitStatusResponse, HandshakeRequest, HandshakeResponse,
+    ListDirRequest, ListDirResponse, ReadFileChunk, ReadFileRequest,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -59,6 +59,7 @@ impl GitTermAgent for GitTermAgentService {
                 "handshake".to_string(),
                 "list_dir".to_string(),
                 "read_file".to_string(),
+                "git_status".to_string(),
             ],
         }))
     }
@@ -128,6 +129,47 @@ impl GitTermAgent for GitTermAgentService {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    async fn git_status(
+        &self,
+        request: Request<GitStatusRequest>,
+    ) -> Result<Response<GitStatusResponse>, Status> {
+        let request = request.into_inner();
+        if request.workspace_id.trim().is_empty() {
+            return Err(Status::invalid_argument("workspace_id must not be empty"));
+        }
+        let root = canonical_dir(&request.root, "root")?;
+
+        let response = tokio::task::spawn_blocking(move || {
+            let status = super::git::collect_repo_status(&root);
+            GitStatusResponse {
+                workspace_id: request.workspace_id,
+                root: status.root.to_string_lossy().to_string(),
+                is_git_repo: status.is_git_repo,
+                repo_name: status.repo_name,
+                branch_name: status.branch_name,
+                staged: status.staged.into_iter().map(proto_file_status).collect(),
+                unstaged: status.unstaged.into_iter().map(proto_file_status).collect(),
+                untracked: status
+                    .untracked
+                    .into_iter()
+                    .map(proto_file_status)
+                    .collect(),
+            }
+        })
+        .await
+        .map_err(|err| Status::internal(format!("git status task failed: {err}")))?;
+
+        Ok(Response::new(response))
+    }
+}
+
+fn proto_file_status(status: super::git::GitFileStatus) -> super::protocol::v1::GitFileStatus {
+    super::protocol::v1::GitFileStatus {
+        path: status.path,
+        status: status.status,
+        is_staged: status.is_staged,
     }
 }
 
@@ -427,6 +469,49 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn git_status_reports_changes_for_real_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.path().join("new.txt"), "n").unwrap();
+
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let response = service
+            .git_status(Request::new(GitStatusRequest {
+                workspace_id: "workspace".to_string(),
+                root: root.path().to_string_lossy().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(response.is_git_repo);
+        assert_eq!(response.branch_name, "main");
+        assert_eq!(response.untracked.len(), 1);
+        assert_eq!(response.untracked[0].path, "new.txt");
+    }
+
+    #[tokio::test]
+    async fn git_status_rejects_missing_root() {
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let status = service
+            .git_status(Request::new(GitStatusRequest {
+                workspace_id: "workspace".to_string(),
+                root: "/definitely/not/a/real/dir".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

@@ -60,6 +60,8 @@ pub struct SourceCapabilities {
     pub open_file: bool,
     pub edit_file: bool,
     pub git_status: bool,
+    pub git_diff: bool,
+    pub git_worktrees: bool,
     pub sessions: bool,
 }
 
@@ -71,6 +73,8 @@ impl SourceCapabilities {
             open_file: false,
             edit_file: false,
             git_status: false,
+            git_diff: false,
+            git_worktrees: false,
             sessions: false,
         }
     }
@@ -148,6 +152,26 @@ impl FilesState {
     }
 }
 
+/// Git status shaped identically for every source. `root` is the canonical
+/// repo root the source actually used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceGitStatus {
+    pub root: SourcePath,
+    pub is_git_repo: bool,
+    pub repo_name: String,
+    pub branch_name: String,
+    pub staged: Vec<SourceGitFile>,
+    pub unstaged: Vec<SourceGitFile>,
+    pub untracked: Vec<SourceGitFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceGitFile {
+    pub path: String,
+    pub status: String,
+    pub is_staged: bool,
+}
+
 /// A workspace's source. Cheap to clone; async calls own everything they
 /// need so they can run on any task.
 #[derive(Debug, Clone)]
@@ -169,6 +193,8 @@ impl WorkspaceSource {
                 open_file: true,
                 edit_file: true,
                 git_status: true,
+                git_diff: true,
+                git_worktrees: true,
                 sessions: true,
             },
             // Grows as the agent gains write ops (edit), GitStatus, and the
@@ -177,7 +203,9 @@ impl WorkspaceSource {
             WorkspaceSource::RemoteAgent { .. } => SourceCapabilities {
                 open_file: true,
                 edit_file: false,
-                git_status: false,
+                git_status: true,
+                git_diff: false,
+                git_worktrees: false,
                 sessions: false,
             },
         }
@@ -244,6 +272,54 @@ impl WorkspaceSource {
                     dir.display()
                 )),
             },
+        }
+    }
+
+    /// Collect git status at this source's root. Errors carry user-facing
+    /// context (endpoint/root), never a silent empty status.
+    pub async fn git_status(&self) -> Result<SourceGitStatus, String> {
+        match self {
+            WorkspaceSource::Local { root } => {
+                let root = root.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    gitterm::agentd::git::collect_repo_status(&root)
+                })
+                .await
+                .map_err(|err| format!("git status task failed: {err}"))?;
+                Ok(SourceGitStatus {
+                    root: SourcePath::Local(status.root),
+                    is_git_repo: status.is_git_repo,
+                    repo_name: status.repo_name,
+                    branch_name: status.branch_name,
+                    staged: status.staged.into_iter().map(source_git_file).collect(),
+                    unstaged: status.unstaged.into_iter().map(source_git_file).collect(),
+                    untracked: status.untracked.into_iter().map(source_git_file).collect(),
+                })
+            }
+            WorkspaceSource::RemoteAgent {
+                workspace_id,
+                root,
+                client,
+            } => {
+                let status = RemoteAgentBackend::new(client.clone())
+                    .git_status(workspace_id.clone(), root.clone())
+                    .await
+                    .map_err(|err| format!("remote git status for {root}: {err}"))?;
+                let map = |file: gitterm::agentd::client::RemoteAgentGitFile| SourceGitFile {
+                    path: file.path,
+                    status: file.status,
+                    is_staged: file.is_staged,
+                };
+                Ok(SourceGitStatus {
+                    root: SourcePath::Remote(status.root),
+                    is_git_repo: status.is_git_repo,
+                    repo_name: status.repo_name,
+                    branch_name: status.branch_name,
+                    staged: status.staged.into_iter().map(map).collect(),
+                    unstaged: status.unstaged.into_iter().map(map).collect(),
+                    untracked: status.untracked.into_iter().map(map).collect(),
+                })
+            }
         }
     }
 
@@ -456,6 +532,14 @@ fn remote_parent_within_root(current_dir: &str, root: &str) -> Option<String> {
         return None;
     }
     Some(parent.to_string())
+}
+
+fn source_git_file(status: gitterm::agentd::git::GitFileStatus) -> SourceGitFile {
+    SourceGitFile {
+        path: status.path,
+        status: status.status,
+        is_staged: status.is_staged,
+    }
 }
 
 #[cfg(test)]

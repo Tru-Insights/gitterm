@@ -7,6 +7,7 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Request;
 
 use super::protocol::v1::git_term_agent_client::GitTermAgentClient;
+use super::protocol::v1::GitStatusRequest;
 use super::protocol::v1::HandshakeRequest;
 use super::protocol::v1::ListDirRequest;
 use super::protocol::v1::ReadFileRequest;
@@ -44,6 +45,25 @@ pub struct RemoteAgentDirEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAgentGitStatus {
+    pub remote_id: String,
+    pub root: String,
+    pub is_git_repo: bool,
+    pub repo_name: String,
+    pub branch_name: String,
+    pub staged: Vec<RemoteAgentGitFile>,
+    pub unstaged: Vec<RemoteAgentGitFile>,
+    pub untracked: Vec<RemoteAgentGitFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAgentGitFile {
+    pub path: String,
+    pub status: String,
+    pub is_staged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +210,45 @@ impl RemoteAgentBackend {
             data,
             total_size,
             truncated,
+        })
+    }
+
+    pub async fn git_status(
+        &self,
+        workspace_id: String,
+        root: String,
+    ) -> Result<RemoteAgentGitStatus, RemoteAgentClientError> {
+        let token = resolve_token_ref(&self.config.token_ref)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let mut client = GitTermAgentClient::new(channel);
+        let mut request = Request::new(GitStatusRequest { workspace_id, root });
+
+        let auth_header = format!("Bearer {token}");
+        let auth_value = auth_header
+            .parse()
+            .map_err(|err| RemoteAgentClientError::new(format!("invalid token metadata: {err}")))?;
+        request.metadata_mut().insert("authorization", auth_value);
+
+        let response = client
+            .git_status(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("git_status failed: {err:?}")))?
+            .into_inner();
+
+        let map = |file: super::protocol::v1::GitFileStatus| RemoteAgentGitFile {
+            path: file.path,
+            status: file.status,
+            is_staged: file.is_staged,
+        };
+        Ok(RemoteAgentGitStatus {
+            remote_id: self.config.remote_id.clone(),
+            root: response.root,
+            is_git_repo: response.is_git_repo,
+            repo_name: response.repo_name,
+            branch_name: response.branch_name,
+            staged: response.staged.into_iter().map(map).collect(),
+            unstaged: response.unstaged.into_iter().map(map).collect(),
+            untracked: response.untracked.into_iter().map(map).collect(),
         })
     }
 }
