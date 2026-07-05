@@ -5097,10 +5097,10 @@ impl App {
             return Task::none();
         }
         let cwd = entry.cwd.to_string_lossy().into_owned();
-        let command = entry.resume_command();
         let kind = entry.backend.label().to_string();
         let entry_cwd = entry.cwd.clone();
         let entry_root = entry.repo_root.clone();
+        let entry_snapshot = entry.clone();
 
         let ws_of_remote = |ws: &Workspace| match &ws.location {
             WorkspaceLocation::RemoteAgent { remote_id: rid, .. } => *rid == remote_id,
@@ -5139,6 +5139,14 @@ impl App {
             eprintln!("[chats] no config for remote {remote_id}; cannot resume {id}");
             return Task::none();
         };
+        // Agent daemons run with a minimal launchd PATH; the harness
+        // binary must come from the remote's session_commands map.
+        let base = agent
+            .session_commands
+            .get(&kind)
+            .cloned()
+            .unwrap_or_else(|| kind.clone());
+        let command = entry_snapshot.resume_command_with(&base);
         let client = remote_agent_client_config(agent);
 
         let mut tasks = Vec::new();
@@ -15137,6 +15145,14 @@ fi
         // warning when the transcript is still growing).
         let is_live = self.find_chat_tab(&entry.id).is_some();
         let is_remote = entry_remote_id.is_some();
+        // Remote resume parents the session under an open workspace on
+        // that machine; without one we must say so, not silently no-op.
+        let remote_ws_open = entry_remote_id.is_none_or(|rid| {
+            self.workspaces.iter().any(|ws| {
+                matches!(&ws.location,
+                    WorkspaceLocation::RemoteAgent { remote_id, .. } if remote_id == rid)
+            })
+        });
         let action_button = |label: &'static str, color: iced::Color, event: Event| {
             button(text(label).size(font_small).color(color))
                 .style(move |_theme, _status| button::Style {
@@ -15172,6 +15188,16 @@ fi
                 ))
                 .size(font_small - 1.0)
                 .color(theme.overlay1()),
+            );
+        } else if is_remote && !remote_ws_open {
+            actions = actions.push(
+                text(format!(
+                    "open a workspace on {} first — resume parents the session there \
+                     (reopen-on-resume lands in slice 5)",
+                    machine_name.as_deref().unwrap_or("that machine")
+                ))
+                .size(font_small - 1.0)
+                .color(theme.yellow()),
             );
         } else if cwd_gone && is_remote {
             actions = actions.push(

@@ -148,12 +148,19 @@ impl ChatIndexEntry {
     /// Shell command that resumes this conversation. Must run in the
     /// conversation's recorded cwd (or the rescue dir when cwd is dead).
     pub fn resume_command(&self) -> String {
+        self.resume_command_with(self.backend.label())
+    }
+
+    /// Resume command with an explicit harness binary/launch command —
+    /// remote machines resolve the binary through the remote's
+    /// session_commands map (agent daemons run with a minimal PATH).
+    pub fn resume_command_with(&self, base: &str) -> String {
         match self.backend {
-            ChatBackend::Claude => format!("claude --resume {}", self.id),
-            ChatBackend::Codex => format!("codex resume {}", self.id),
+            ChatBackend::Claude => format!("{base} --resume {}", self.id),
+            ChatBackend::Codex => format!("{base} resume {}", self.id),
             // pi resumes a specific session via --session (`--resume` is
             // the interactive picker).
-            ChatBackend::Pi => format!("pi --session {}", self.id),
+            ChatBackend::Pi => format!("{base} --session {}", self.id),
         }
     }
 
