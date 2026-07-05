@@ -35,13 +35,13 @@ mod webview;
 
 // New modules
 mod agent;
-mod chats;
 mod config;
 mod events;
 mod tab;
 mod theme;
 
 use gitterm::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake};
+use gitterm::chats;
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{
     AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
@@ -3539,7 +3539,7 @@ pub enum Event {
     AgentConversationLoaded(usize, agent::Conversation),
     SelectAgentCapture(usize),
     LaunchAgentPreset(usize),
-    RemoteSessionLaunched(Result<(String, String), String>),
+    RemoteSessionLaunched(Result<(String, String, Option<String>), String>),
     LaunchSessionKind(Option<String>),
     // Resume agent preset session by index
     ResumeAgentPreset(usize),
@@ -3600,6 +3600,10 @@ pub enum Event {
     ChatsQueryChanged(String),
     ChatsScopeChanged(chats::ChatScope),
     ChatsBackendFilterChanged(Option<chats::ChatBackend>),
+    RemoteChatIndexLoaded(String, Result<Vec<chats::ChatIndexEntry>, String>),
+    /// Expand/collapse one machine section in the Everywhere scope
+    /// ("local" or a remote id).
+    ToggleChatMachine(String),
     SelectChat(String),
     CloseChatPreview,
     ChatPreviewLoaded(String, chats::ChatPreview),
@@ -3710,6 +3714,14 @@ struct App {
     chat_scope: chats::ChatScope,
     /// Backend filter chip; None shows all backends.
     chat_backend_filter: Option<chats::ChatBackend>,
+    /// Machines whose Everywhere section is expanded ("local" or a
+    /// remote id). Sections start collapsed so the machine list itself
+    /// is scannable; an active search overrides collapse.
+    chat_expanded_machines: std::collections::HashSet<String>,
+    /// Per-remote chat indexes (TRU-78 slice 4), keyed by remote id.
+    /// Kept when a machine becomes unreachable so Everywhere still shows
+    /// its (stale) chats.
+    remote_chat_indexes: HashMap<String, RemoteChatState>,
     /// Preview tail for the most recently selected chat, keyed by session
     /// id so a stale load never renders under the wrong chat.
     chat_preview: Option<(String, chats::ChatPreview)>,
@@ -3946,6 +3958,16 @@ fn remote_agent_location_for_session(
         workspace_id: session.session_name.clone(),
         root: session.remote_dir.clone(),
     })
+}
+
+/// Cached chat index for one remote machine (TRU-78 slice 4).
+#[derive(Debug, Default)]
+struct RemoteChatState {
+    entries: Vec<chats::ChatIndexEntry>,
+    loading: bool,
+    loaded_at: Option<Instant>,
+    /// Last fetch failure; entries (if any) are a stale cache while set.
+    error: Option<String>,
 }
 
 fn remote_agent_client_config(agent: RemoteAgentConfig) -> RemoteAgentClientConfig {
@@ -4874,6 +4896,107 @@ impl App {
         )
     }
 
+    /// A chat entry by session id, searching the local index first and
+    /// then every remote machine's cache. The first element is the
+    /// owning remote id (None = this machine).
+    fn find_chat_entry(&self, id: &str) -> Option<(Option<&str>, &chats::ChatIndexEntry)> {
+        if let Some(entry) = self.chat_index.iter().find(|entry| entry.id == id) {
+            return Some((None, entry));
+        }
+        self.remote_chat_indexes
+            .iter()
+            .find_map(|(remote_id, state)| {
+                state
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| (Some(remote_id.as_str()), entry))
+            })
+    }
+
+    /// Entries for one machine's index (None = local).
+    fn chat_entries_for_machine(&self, remote_id: Option<&str>) -> &[chats::ChatIndexEntry] {
+        match remote_id {
+            None => &self.chat_index,
+            Some(id) => self
+                .remote_chat_indexes
+                .get(id)
+                .map(|state| state.entries.as_slice())
+                .unwrap_or(&[]),
+        }
+    }
+
+    fn filter_chat_entries<'a>(
+        &self,
+        entries: &'a [chats::ChatIndexEntry],
+        ws_root: Option<&Path>,
+        query: &str,
+    ) -> Vec<&'a chats::ChatIndexEntry> {
+        entries
+            .iter()
+            .filter(|entry| ws_root.is_none_or(|dir| entry.in_workspace(dir)))
+            .filter(|entry| {
+                self.chat_backend_filter
+                    .is_none_or(|backend| entry.backend == backend)
+            })
+            .filter(|entry| entry.matches_query(query))
+            .collect()
+    }
+
+    /// The machine the active workspace lives on (None = local).
+    fn active_machine_remote_id(&self) -> Option<&str> {
+        self.active_workspace().and_then(|ws| match &ws.location {
+            WorkspaceLocation::RemoteAgent { remote_id, .. } => Some(remote_id.as_str()),
+            _ => None,
+        })
+    }
+
+    fn request_remote_chat_index(
+        remote_id: String,
+        client: RemoteAgentClientConfig,
+    ) -> Task<Event> {
+        Task::perform(
+            async move {
+                let result = RemoteAgentBackend::new(client)
+                    .list_chats()
+                    .await
+                    .map_err(|err| err.to_string());
+                (remote_id, result)
+            },
+            |(remote_id, result)| Event::RemoteChatIndexLoaded(remote_id, result),
+        )
+    }
+
+    /// Kick off remote index fetches for every configured remote whose
+    /// cache is stale. Runs alongside the local refresh.
+    fn refresh_remote_chat_indexes(&mut self) -> Task<Event> {
+        const REMOTE_CHAT_FRESH_SECS: u64 = 60;
+        let mut tasks = Vec::new();
+        let defs: Vec<(String, RemoteAgentClientConfig)> = self
+            .remote_agent_defs
+            .iter()
+            .map(|agent| (agent.id.clone(), remote_agent_client_config(agent.clone())))
+            .collect();
+        for (remote_id, client) in defs {
+            let state = self
+                .remote_chat_indexes
+                .entry(remote_id.clone())
+                .or_default();
+            if state.loading {
+                continue;
+            }
+            if state
+                .loaded_at
+                .is_some_and(|at| at.elapsed().as_secs() < REMOTE_CHAT_FRESH_SECS)
+            {
+                continue;
+            }
+            state.loading = true;
+            tasks.push(Self::request_remote_chat_index(remote_id, client));
+        }
+        Task::batch(tasks)
+    }
+
     /// The open tab owning a conversation, as (workspace idx, tab idx).
     /// Backbone of the registry rule: one conversation ⇒ at most one tab.
     fn find_chat_tab(&self, session_id: &str) -> Option<(usize, usize)> {
@@ -4903,7 +5026,12 @@ impl App {
         if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
+        if let Some((Some(remote_id), _)) = self.find_chat_entry(&id) {
+            let remote_id = remote_id.to_string();
+            return self.resume_remote_chat(id, remote_id);
+        }
         let Some(entry) = self.chat_index.iter().find(|entry| entry.id == id) else {
+            eprintln!("[chats] cannot resume {id}: not in any machine's index");
             return Task::none();
         };
         let cwd = entry.cwd.clone();
@@ -4952,6 +5080,92 @@ impl App {
         Task::batch(tasks)
     }
 
+    /// Resume a chat that lives on a remote machine: start an agentd
+    /// session running the resume command in the chat's recorded cwd,
+    /// then attach a tab (the shared RemoteSessionLaunched flow). Needs
+    /// an open workspace bound to that remote — reopening closed
+    /// workspaces is slice 5.
+    fn resume_remote_chat(&mut self, id: String, remote_id: String) -> Task<Event> {
+        let Some((_, entry)) = self.find_chat_entry(&id) else {
+            return Task::none();
+        };
+        if entry.dead_cwd {
+            eprintln!(
+                "[chats] not resuming {id}: recorded cwd {} is gone on {remote_id}",
+                entry.cwd.display()
+            );
+            return Task::none();
+        }
+        let cwd = entry.cwd.to_string_lossy().into_owned();
+        let command = entry.resume_command();
+        let kind = entry.backend.label().to_string();
+        let entry_cwd = entry.cwd.clone();
+        let entry_root = entry.repo_root.clone();
+
+        let ws_of_remote = |ws: &Workspace| match &ws.location {
+            WorkspaceLocation::RemoteAgent { remote_id: rid, .. } => *rid == remote_id,
+            _ => false,
+        };
+        // Prefer a workspace whose root actually contains the chat;
+        // fall back to any open workspace on that remote.
+        let owning_exact = self.workspaces.iter().position(|ws| match &ws.location {
+            WorkspaceLocation::RemoteAgent {
+                remote_id: rid,
+                root,
+                ..
+            } => {
+                *rid == remote_id
+                    && (entry_cwd.starts_with(Path::new(root))
+                        || entry_root
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with(Path::new(root))))
+            }
+            _ => false,
+        });
+        let Some(ws_idx) = owning_exact.or_else(|| self.workspaces.iter().position(ws_of_remote))
+        else {
+            eprintln!(
+                "[chats] no open workspace for remote {remote_id}; cannot resume {id} \
+                 (reopen-on-resume lands in slice 5)"
+            );
+            return Task::none();
+        };
+        let WorkspaceLocation::RemoteAgent { workspace_id, .. } =
+            self.workspaces[ws_idx].location.clone()
+        else {
+            return Task::none();
+        };
+        let Some(agent) = self.fresh_remote_agent_config(&remote_id) else {
+            eprintln!("[chats] no config for remote {remote_id}; cannot resume {id}");
+            return Task::none();
+        };
+        let client = remote_agent_client_config(agent);
+
+        let mut tasks = Vec::new();
+        if ws_idx != self.active_workspace_idx {
+            tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
+        }
+        tasks.push(Task::perform(
+            async move {
+                RemoteAgentBackend::new(client)
+                    .start_session(
+                        workspace_id,
+                        cwd,
+                        kind.clone(),
+                        vec!["/bin/sh".to_string(), "-lc".to_string(), command],
+                        Vec::new(),
+                        120,
+                        32,
+                    )
+                    .await
+                    .map(|session| (session.session_id, kind, Some(id)))
+                    .map_err(|err| err.to_string())
+            },
+            Event::RemoteSessionLaunched,
+        ));
+        Task::batch(tasks)
+    }
+
     fn request_chat_index() -> Task<Event> {
         Task::perform(
             async move {
@@ -4967,21 +5181,20 @@ impl App {
         )
     }
 
-    /// Refresh the chat index unless a load is in flight or the current
-    /// one is fresh enough. Called when the Chats tab is opened.
+    /// Refresh the local chat index (and every stale remote cache)
+    /// unless loads are already in flight. Called when the Chats tab is
+    /// opened.
     fn refresh_chat_index_if_stale(&mut self) -> Task<Event> {
         const CHAT_INDEX_FRESH_SECS: u64 = 30;
-        if self.chat_index_loading {
-            return Task::none();
-        }
-        if self
+        let remote = self.refresh_remote_chat_indexes();
+        let fresh = self
             .chat_index_loaded_at
-            .is_some_and(|at| at.elapsed().as_secs() < CHAT_INDEX_FRESH_SECS)
-        {
-            return Task::none();
+            .is_some_and(|at| at.elapsed().as_secs() < CHAT_INDEX_FRESH_SECS);
+        if self.chat_index_loading || fresh {
+            return remote;
         }
         self.chat_index_loading = true;
-        Self::request_chat_index()
+        Task::batch([Self::request_chat_index(), remote])
     }
 
     fn request_chat_preview(id: String, path: PathBuf, backend: chats::ChatBackend) -> Task<Event> {
@@ -4997,6 +5210,30 @@ impl App {
                             chats::ChatPreview::default()
                         }
                     };
+                (id, preview)
+            },
+            |(id, preview)| Event::ChatPreviewLoaded(id, preview),
+        )
+    }
+
+    fn request_remote_chat_preview(
+        id: String,
+        path: PathBuf,
+        backend: chats::ChatBackend,
+        client: RemoteAgentClientConfig,
+    ) -> Task<Event> {
+        Task::perform(
+            async move {
+                let preview = match RemoteAgentBackend::new(client)
+                    .chat_preview(path.to_string_lossy().into_owned(), backend)
+                    .await
+                {
+                    Ok(preview) => preview,
+                    Err(err) => {
+                        eprintln!("[chats] remote preview failed: {err}");
+                        chats::ChatPreview::default()
+                    }
+                };
                 (id, preview)
             },
             |(id, preview)| Event::ChatPreviewLoaded(id, preview),
@@ -5458,6 +5695,8 @@ impl App {
             chat_query: String::new(),
             chat_scope: chats::ChatScope::default(),
             chat_backend_filter: None,
+            chat_expanded_machines: std::collections::HashSet::new(),
+            remote_chat_indexes: HashMap::new(),
             chat_preview: None,
         };
 
@@ -5989,7 +6228,7 @@ impl App {
                         32,
                     )
                     .await
-                    .map(|session| (session.session_id, kind))
+                    .map(|session| (session.session_id, kind, None))
                     .map_err(|err| err.to_string())
             },
             Event::RemoteSessionLaunched,
@@ -7816,7 +8055,7 @@ fi
                 return self.launch_session_tab(kind, None, None);
             }
             Event::RemoteSessionLaunched(result) => match result {
-                Ok((session_id, kind)) => {
+                Ok((session_id, kind, chat_session_id)) => {
                     let Some(attach_command) = self.remote_session_attach_command(&session_id)
                     else {
                         eprintln!(
@@ -7834,6 +8073,9 @@ fi
                         }
                         tab.repo_name = label.clone();
                         tab.set_terminal_title(Some(label));
+                        // Registry rule: a chat resumed on its remote
+                        // machine owns this attach tab.
+                        tab.chat_session_id = chat_session_id;
                     }
                     self.mark_workspaces_dirty();
                     self.mark_log_server_dirty();
@@ -9414,6 +9656,29 @@ fi
             Event::ChatsBackendFilterChanged(filter) => {
                 self.chat_backend_filter = filter;
             }
+            Event::ToggleChatMachine(key) => {
+                if !self.chat_expanded_machines.remove(&key) {
+                    self.chat_expanded_machines.insert(key);
+                }
+            }
+            Event::RemoteChatIndexLoaded(remote_id, result) => {
+                let state = self
+                    .remote_chat_indexes
+                    .entry(remote_id.clone())
+                    .or_default();
+                state.loading = false;
+                state.loaded_at = Some(Instant::now());
+                match result {
+                    Ok(entries) => {
+                        state.entries = entries;
+                        state.error = None;
+                    }
+                    Err(err) => {
+                        eprintln!("[chats] remote index fetch for {remote_id} failed: {err}");
+                        state.error = Some(err);
+                    }
+                }
+            }
             Event::SelectChat(id) => {
                 let already_selected = self
                     .active_tab()
@@ -9424,16 +9689,34 @@ fi
                     }
                     return Task::none();
                 }
-                let source = self
-                    .chat_index
-                    .iter()
-                    .find(|entry| entry.id == id)
-                    .map(|entry| (entry.path.clone(), entry.backend));
+                let source = self.find_chat_entry(&id).map(|(remote_id, entry)| {
+                    (
+                        remote_id.map(str::to_string),
+                        entry.path.clone(),
+                        entry.backend,
+                    )
+                });
                 if let Some(tab) = self.active_tab_mut() {
                     tab.selected_chat_id = Some(id.clone());
                 }
-                if let Some((path, backend)) = source {
-                    return Self::request_chat_preview(id, path, backend);
+                if let Some((remote_id, path, backend)) = source {
+                    return match remote_id {
+                        None => Self::request_chat_preview(id, path, backend),
+                        Some(remote_id) => {
+                            let Some(agent) = self.fresh_remote_agent_config(&remote_id) else {
+                                eprintln!(
+                                    "[chats] no config for remote {remote_id}; cannot preview {id}"
+                                );
+                                return Task::none();
+                            };
+                            Self::request_remote_chat_preview(
+                                id,
+                                path,
+                                backend,
+                                remote_agent_client_config(agent),
+                            )
+                        }
+                    };
                 }
             }
             Event::CloseChatPreview => {
@@ -13420,9 +13703,6 @@ fi
             SidebarMode::Plans => {
                 freeze_time!("view_plans_sidebar", { self.view_plans_sidebar() })
             }
-            SidebarMode::Chats if workspace_is_remote => {
-                self.view_remote_local_mode_placeholder("Chats")
-            }
             SidebarMode::Chats => {
                 freeze_time!("view_chats_sidebar", { self.view_chats_sidebar(tab) })
             }
@@ -14416,41 +14696,54 @@ fi
             ));
         }
 
-        let workspace_dir = self
-            .workspaces
-            .get(self.active_workspace_idx)
-            .map(|ws| ws.dir.clone());
+        // Machine axis: the active workspace's machine for the two inner
+        // rings; every configured remote (always visible) for Everywhere.
+        let active_remote_id = self.active_machine_remote_id().map(str::to_string);
+        let workspace_root: Option<PathBuf> =
+            self.active_workspace().map(|ws| match &ws.location {
+                WorkspaceLocation::RemoteAgent { root, .. } => PathBuf::from(root),
+                _ => ws.dir.clone(),
+            });
         let query = self.chat_query.to_lowercase();
-        let in_scope = |entry: &&chats::ChatIndexEntry| match self.chat_scope {
-            chats::ChatScope::Workspace => workspace_dir
-                .as_deref()
-                .is_some_and(|dir| entry.in_workspace(dir)),
-            // One machine indexed so far; these rings diverge at slice 4.
-            chats::ChatScope::Machine | chats::ChatScope::Everywhere => true,
-        };
-        let backend_ok = |entry: &&chats::ChatIndexEntry| {
-            self.chat_backend_filter
-                .is_none_or(|backend| entry.backend == backend)
-        };
-        let visible: Vec<&chats::ChatIndexEntry> = self
-            .chat_index
-            .iter()
-            .filter(in_scope)
-            .filter(backend_ok)
-            .filter(|entry| entry.matches_query(&query))
-            .collect();
 
-        // Group by repo root, preserving most-recent-first order.
-        let mut groups: Vec<(&std::path::Path, Vec<&chats::ChatIndexEntry>)> = Vec::new();
-        for entry in &visible {
-            match groups
-                .iter_mut()
-                .find(|(root, _)| *root == entry.group_root())
-            {
-                Some((_, list)) => list.push(entry),
-                None => groups.push((entry.group_root(), vec![entry])),
+        // (remote id, entries) per machine section, in render order.
+        let mut sections: Vec<(Option<String>, Vec<&chats::ChatIndexEntry>)> = Vec::new();
+        match self.chat_scope {
+            chats::ChatScope::Workspace => sections.push((
+                active_remote_id.clone(),
+                self.filter_chat_entries(
+                    self.chat_entries_for_machine(active_remote_id.as_deref()),
+                    workspace_root.as_deref(),
+                    &query,
+                ),
+            )),
+            chats::ChatScope::Machine => sections.push((
+                active_remote_id.clone(),
+                self.filter_chat_entries(
+                    self.chat_entries_for_machine(active_remote_id.as_deref()),
+                    None,
+                    &query,
+                ),
+            )),
+            chats::ChatScope::Everywhere => {
+                sections.push((
+                    None,
+                    self.filter_chat_entries(&self.chat_index, None, &query),
+                ));
+                for agent in &self.remote_agent_defs {
+                    sections.push((
+                        Some(agent.id.clone()),
+                        self.filter_chat_entries(
+                            self.chat_entries_for_machine(Some(&agent.id)),
+                            None,
+                            &query,
+                        ),
+                    ));
+                }
             }
         }
+        let visible_count: usize = sections.iter().map(|(_, entries)| entries.len()).sum();
+        let everywhere = self.chat_scope == chats::ChatScope::Everywhere;
 
         let mut list = Column::new().spacing(2).padding([4, 6]);
         if self.chat_index_loading && self.chat_index.is_empty() {
@@ -14459,7 +14752,7 @@ fi
                     .size(font_small)
                     .color(theme.text_muted()),
             );
-        } else if visible.is_empty() {
+        } else if visible_count == 0 && !everywhere {
             let msg = if self.chat_query.is_empty() {
                 "no conversations in this scope"
             } else {
@@ -14476,116 +14769,247 @@ fi
             .collect();
         let selected_bg = theme.surface0();
         let selected_border = theme.surface1();
-        for (root, entries) in groups {
-            let group_name = root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| root.to_string_lossy().to_string());
-            list = list.push(
-                row![
-                    text(group_name.to_uppercase())
-                        .size(10)
-                        .color(theme.overlay0()),
-                    text(format!("{}", entries.len()))
-                        .size(10)
-                        .color(theme.text_muted()),
-                ]
-                .spacing(6)
-                .padding([6, 2]),
-            );
-            for entry in entries {
-                let is_selected = tab.selected_chat_id.as_deref() == Some(entry.id.as_str());
-                let mut meta = Row::new().spacing(8).push(
-                    text(chats::format_age(entry.mtime))
-                        .size(font_small - 1.0)
-                        .color(theme.text_muted()),
-                );
-                if let Some(branch) = &entry.branch {
-                    meta = meta.push(
-                        text(branch.clone())
-                            .size(font_small - 1.0)
-                            .color(theme.overlay1()),
-                    );
-                }
-                if live_ids.contains(entry.id.as_str()) {
-                    meta = meta.push(text("● open").size(font_small - 1.0).color(theme.green()));
-                } else if entry.possibly_running() {
-                    meta = meta.push(
-                        text("◐ possibly running")
-                            .size(font_small - 1.0)
-                            .color(theme.yellow()),
-                    );
-                }
-                if entry.is_worktree {
-                    meta = meta.push(text("worktree").size(font_small - 1.0).color(theme.mauve()));
-                }
-                if entry.dead_cwd {
-                    meta = meta.push(text("⚠ dir gone").size(font_small - 1.0).color(theme.red()));
-                }
-                let content = column![
-                    row![
-                        text("●")
-                            .size(8)
-                            .color(self.chat_backend_color(entry.backend)),
-                        text(entry.title.clone())
-                            .size(font_small)
-                            .color(theme.text_primary()),
-                    ]
-                    .spacing(6),
-                    meta,
-                ]
-                .spacing(2);
-                let mut btn = button(content)
-                    .padding([6, 8])
-                    .width(Length::Fill)
-                    .on_press(Event::SelectChat(entry.id.clone()));
-                btn = if is_selected {
-                    btn.style(move |_theme, _status| button::Style {
-                        background: Some(selected_bg.into()),
-                        border: iced::Border {
-                            width: 1.0,
-                            color: selected_border,
-                            radius: 6.0.into(),
-                        },
-                        ..Default::default()
-                    })
-                } else {
-                    btn.style(self.ghost_button_style())
+        for (section_remote_id, section_entries) in &sections {
+            // Machine section header (Everywhere only): a collapsible
+            // row with count + status, so the machine list itself is
+            // scannable even when thousands of chats are indexed. An
+            // active search expands every section.
+            let machine_key = section_remote_id
+                .clone()
+                .unwrap_or_else(|| "local".to_string());
+            let section_expanded = !everywhere
+                || !self.chat_query.is_empty()
+                || self.chat_expanded_machines.contains(&machine_key);
+            if everywhere {
+                let (label, status_text, status_color) = match section_remote_id.as_deref() {
+                    None => ("this mac".to_string(), String::new(), theme.text_muted()),
+                    Some(remote_id) => {
+                        let name = self
+                            .remote_agent_defs
+                            .iter()
+                            .find(|agent| agent.id == remote_id)
+                            .map(|agent| agent.name.clone())
+                            .unwrap_or_else(|| remote_id.to_string());
+                        let state = self.remote_chat_indexes.get(remote_id);
+                        let (status, color) = match state {
+                            Some(state) if state.loading => {
+                                ("⟳ syncing".to_string(), theme.yellow())
+                            }
+                            Some(state) if state.error.is_some() => {
+                                if state.entries.is_empty() {
+                                    ("○ unreachable".to_string(), theme.overlay0())
+                                } else {
+                                    ("○ unreachable · cached index".to_string(), theme.overlay0())
+                                }
+                            }
+                            Some(_) => ("● connected".to_string(), theme.green()),
+                            None => ("○ not yet synced".to_string(), theme.overlay0()),
+                        };
+                        (name, status, color)
+                    }
                 };
-                list = list.push(btn);
+                let chevron = if section_expanded { "▾" } else { "▸" };
+                let mut header = Row::new()
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center)
+                    .push(text(chevron).size(10).color(theme.overlay1()))
+                    .push(
+                        text(label.to_uppercase())
+                            .size(10)
+                            .color(theme.text_secondary()),
+                    )
+                    .push(
+                        text(format!("{}", section_entries.len()))
+                            .size(10)
+                            .color(theme.text_muted()),
+                    );
+                if !status_text.is_empty() {
+                    header = header.push(text(status_text).size(10).color(status_color));
+                }
+                list = list.push(
+                    button(header)
+                        .style(self.ghost_button_style())
+                        .padding([6, 6])
+                        .width(Length::Fill)
+                        .on_press(Event::ToggleChatMachine(machine_key.clone())),
+                );
+                if section_expanded && section_entries.is_empty() {
+                    let note = if self.chat_query.is_empty() {
+                        "no conversations indexed"
+                    } else {
+                        "no matches"
+                    };
+                    list = list.push(text(note).size(font_small - 1.0).color(theme.text_muted()));
+                }
+            }
+            if !section_expanded {
+                continue;
+            }
+
+            // Group by repo root, preserving most-recent-first order.
+            let mut groups: Vec<(&std::path::Path, Vec<&chats::ChatIndexEntry>)> = Vec::new();
+            for entry in section_entries {
+                match groups
+                    .iter_mut()
+                    .find(|(root, _)| *root == entry.group_root())
+                {
+                    Some((_, list)) => list.push(entry),
+                    None => groups.push((entry.group_root(), vec![entry])),
+                }
+            }
+
+            for (root, entries) in groups {
+                let group_name = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| root.to_string_lossy().to_string());
+                list = list.push(
+                    row![
+                        text(group_name.to_uppercase())
+                            .size(10)
+                            .color(theme.overlay0()),
+                        text(format!("{}", entries.len()))
+                            .size(10)
+                            .color(theme.text_muted()),
+                    ]
+                    .spacing(6)
+                    .padding([6, 2]),
+                );
+                for entry in entries {
+                    let is_selected = tab.selected_chat_id.as_deref() == Some(entry.id.as_str());
+                    let mut meta = Row::new().spacing(8).push(
+                        text(chats::format_age(entry.mtime))
+                            .size(font_small - 1.0)
+                            .color(theme.text_muted()),
+                    );
+                    if let Some(branch) = &entry.branch {
+                        meta = meta.push(
+                            text(branch.clone())
+                                .size(font_small - 1.0)
+                                .color(theme.overlay1()),
+                        );
+                    }
+                    if live_ids.contains(entry.id.as_str()) {
+                        meta =
+                            meta.push(text("● open").size(font_small - 1.0).color(theme.green()));
+                    } else if entry.possibly_running() {
+                        meta = meta.push(
+                            text("◐ possibly running")
+                                .size(font_small - 1.0)
+                                .color(theme.yellow()),
+                        );
+                    }
+                    if entry.is_worktree {
+                        meta =
+                            meta.push(text("worktree").size(font_small - 1.0).color(theme.mauve()));
+                    }
+                    if entry.dead_cwd {
+                        meta =
+                            meta.push(text("⚠ dir gone").size(font_small - 1.0).color(theme.red()));
+                    }
+                    let content = column![
+                        row![
+                            text("●")
+                                .size(8)
+                                .color(self.chat_backend_color(entry.backend)),
+                            text(entry.title.clone())
+                                .size(font_small)
+                                .color(theme.text_primary()),
+                        ]
+                        .spacing(6),
+                        meta,
+                    ]
+                    .spacing(2);
+                    let mut btn = button(content)
+                        .padding([6, 8])
+                        .width(Length::Fill)
+                        .on_press(Event::SelectChat(entry.id.clone()));
+                    btn = if is_selected {
+                        btn.style(move |_theme, _status| button::Style {
+                            background: Some(selected_bg.into()),
+                            border: iced::Border {
+                                width: 1.0,
+                                color: selected_border,
+                                radius: 6.0.into(),
+                            },
+                            ..Default::default()
+                        })
+                    } else {
+                        btn.style(self.ghost_button_style())
+                    };
+                    list = list.push(btn);
+                }
             }
         }
 
-        // Scoped search missed (or partially missed) — offer the wider ring.
-        if self.chat_scope == chats::ChatScope::Workspace && !self.chat_query.is_empty() {
-            let total_matches = self
-                .chat_index
-                .iter()
-                .filter(backend_ok)
-                .filter(|entry| entry.matches_query(&query))
-                .count();
-            let elsewhere = total_matches.saturating_sub(visible.len());
-            if elsewhere > 0 {
-                list = list.push(
-                    column![
-                        text(format!(
-                            "{elsewhere} match{} in other workspaces",
-                            if elsewhere == 1 { "" } else { "es" }
-                        ))
-                        .size(font_small)
-                        .color(theme.text_secondary()),
+        // Scoped search missed (or partially missed) — widen ring by ring.
+        if !self.chat_query.is_empty() && self.chat_scope != chats::ChatScope::Everywhere {
+            let machine_total = self
+                .filter_chat_entries(
+                    self.chat_entries_for_machine(active_remote_id.as_deref()),
+                    None,
+                    &query,
+                )
+                .len();
+            let other_machines: usize = {
+                let mut n = 0;
+                if active_remote_id.is_some() {
+                    n += self
+                        .filter_chat_entries(&self.chat_index, None, &query)
+                        .len();
+                }
+                for agent in &self.remote_agent_defs {
+                    if active_remote_id.as_deref() != Some(agent.id.as_str()) {
+                        n += self
+                            .filter_chat_entries(
+                                self.chat_entries_for_machine(Some(&agent.id)),
+                                None,
+                                &query,
+                            )
+                            .len();
+                    }
+                }
+                n
+            };
+            let mut hints = Column::new().spacing(4).padding([10, 8]);
+            let mut any = false;
+            if self.chat_scope == chats::ChatScope::Workspace {
+                let elsewhere = machine_total.saturating_sub(visible_count);
+                if elsewhere > 0 {
+                    any = true;
+                    hints = hints.push(
                         button(
-                            text("Search everywhere")
-                                .size(font_small)
-                                .color(theme.accent())
+                            text(format!(
+                                "{elsewhere} match{} elsewhere on this machine",
+                                if elsewhere == 1 { "" } else { "es" }
+                            ))
+                            .size(font_small)
+                            .color(theme.accent()),
                         )
                         .style(self.ghost_button_style())
                         .padding([3, 8])
-                        .on_press(Event::ChatsScopeChanged(chats::ChatScope::Everywhere)),
-                    ]
-                    .spacing(4)
-                    .padding([10, 8]),
+                        .on_press(Event::ChatsScopeChanged(chats::ChatScope::Machine)),
+                    );
+                }
+            }
+            if other_machines > 0 {
+                any = true;
+                hints = hints.push(
+                    button(
+                        text(format!(
+                            "{other_machines} match{} on other machines",
+                            if other_machines == 1 { "" } else { "es" }
+                        ))
+                        .size(font_small)
+                        .color(theme.accent()),
+                    )
+                    .style(self.ghost_button_style())
+                    .padding([3, 8])
+                    .on_press(Event::ChatsScopeChanged(chats::ChatScope::Everywhere)),
                 );
+            }
+            if any {
+                list = list.push(hints);
             }
         }
 
@@ -14622,7 +15046,8 @@ fi
             .center_y(Length::Fill)
             .into();
         };
-        let Some(entry) = self.chat_index.iter().find(|entry| entry.id == selected_id) else {
+        let found = self.find_chat_entry(selected_id);
+        let Some((entry_remote_id, entry)) = found else {
             return container(
                 text("conversation no longer in the index")
                     .size(font)
@@ -14640,12 +15065,34 @@ fi
             .filter(|(id, _)| *id == entry.id)
             .map(|(_, preview)| preview);
 
+        let machine_name = entry_remote_id.map(|remote_id| {
+            self.remote_agent_defs
+                .iter()
+                .find(|agent| agent.id == remote_id)
+                .map(|agent| agent.name.clone())
+                .unwrap_or_else(|| remote_id.to_string())
+        });
+        let machine_unreachable = entry_remote_id
+            .and_then(|remote_id| self.remote_chat_indexes.get(remote_id))
+            .is_some_and(|state| state.error.is_some());
         let mut meta = Row::new()
             .spacing(14)
             .push(
                 text(format!("● {}", entry.backend.label()))
                     .size(font_small)
                     .color(self.chat_backend_color(entry.backend)),
+            )
+            .push(
+                text(match &machine_name {
+                    Some(name) => format!("@ {name}"),
+                    None => "this mac".to_string(),
+                })
+                .size(font_small)
+                .color(if machine_name.is_some() {
+                    theme.accent()
+                } else {
+                    theme.text_muted()
+                }),
             )
             .push(
                 text(chats::format_size(entry.size))
@@ -14689,6 +15136,7 @@ fi
         // dead-cwd rescue, then plain resume (with a possibly-running
         // warning when the transcript is still growing).
         let is_live = self.find_chat_tab(&entry.id).is_some();
+        let is_remote = entry_remote_id.is_some();
         let action_button = |label: &'static str, color: iced::Color, event: Event| {
             button(text(label).size(font_small).color(color))
                 .style(move |_theme, _status| button::Style {
@@ -14716,6 +15164,21 @@ fi
                         .size(font_small - 1.0)
                         .color(theme.overlay1()),
                 );
+        } else if is_remote && machine_unreachable {
+            actions = actions.push(
+                text(format!(
+                    "{} is unreachable — shown from the cached index; resume when it reconnects",
+                    machine_name.as_deref().unwrap_or("machine")
+                ))
+                .size(font_small - 1.0)
+                .color(theme.overlay1()),
+            );
+        } else if cwd_gone && is_remote {
+            actions = actions.push(
+                text("the recorded directory is gone on the remote machine")
+                    .size(font_small - 1.0)
+                    .color(theme.red()),
+            );
         } else if cwd_gone {
             actions = actions
                 .push(action_button(
@@ -14739,6 +15202,16 @@ fi
                     text("◐ transcript is still growing — may be running in a terminal GitTerm didn't start")
                         .size(font_small - 1.0)
                         .color(theme.yellow()),
+                );
+            } else if is_remote {
+                actions = actions.push(
+                    text(format!(
+                        "starts an agentd session on {} running {}",
+                        machine_name.as_deref().unwrap_or("the remote"),
+                        entry.resume_command()
+                    ))
+                    .size(font_small - 1.0)
+                    .color(theme.overlay1()),
                 );
             } else {
                 actions = actions.push(

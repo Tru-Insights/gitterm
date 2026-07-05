@@ -9,11 +9,12 @@ use tonic::{Request, Response, Status};
 
 use super::protocol::v1::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
 use super::protocol::v1::{
-    terminal_input, terminal_output, DirEntry, GitDiffRequest, GitDiffResponse, GitStatusRequest,
-    GitStatusResponse, HandshakeRequest, HandshakeResponse, ListDirRequest, ListDirResponse,
-    ListSessionsRequest, ListSessionsResponse, ReadFileChunk, ReadFileRequest, Session,
-    SessionExited, StartSessionRequest, StopSessionRequest, StopSessionResponse, TerminalInput,
-    TerminalOutput,
+    terminal_input, terminal_output, ChatEntry, ChatPreviewMessage, ChatPreviewRequest,
+    ChatPreviewResponse, DirEntry, GitDiffRequest, GitDiffResponse, GitStatusRequest,
+    GitStatusResponse, HandshakeRequest, HandshakeResponse, ListChatsRequest, ListChatsResponse,
+    ListDirRequest, ListDirResponse, ListSessionsRequest, ListSessionsResponse, ReadFileChunk,
+    ReadFileRequest, Session, SessionExited, StartSessionRequest, StopSessionRequest,
+    StopSessionResponse, TerminalInput, TerminalOutput,
 };
 use super::sessions::{SessionManager, SessionOutput};
 
@@ -70,6 +71,7 @@ impl GitTermAgent for GitTermAgentService {
                 "git_status".to_string(),
                 "git_diff".to_string(),
                 "sessions".to_string(),
+                "chats".to_string(),
             ],
         }))
     }
@@ -225,6 +227,55 @@ impl GitTermAgent for GitTermAgentService {
             .map(proto_session)
             .collect();
         Ok(Response::new(ListSessionsResponse { sessions }))
+    }
+
+    async fn list_chats(
+        &self,
+        _request: Request<ListChatsRequest>,
+    ) -> Result<Response<ListChatsResponse>, Status> {
+        let entries = tokio::task::spawn_blocking(crate::chats::build_local_index)
+            .await
+            .map_err(|err| Status::internal(format!("chat index task failed: {err}")))?;
+        let chats = entries.into_iter().map(chat_entry_to_proto).collect();
+        Ok(Response::new(ListChatsResponse { chats }))
+    }
+
+    async fn chat_preview(
+        &self,
+        request: Request<ChatPreviewRequest>,
+    ) -> Result<Response<ChatPreviewResponse>, Status> {
+        let request = request.into_inner();
+        let backend = crate::chats::ChatBackend::from_label(&request.backend).ok_or_else(|| {
+            Status::invalid_argument(format!("unknown chat backend {:?}", request.backend))
+        })?;
+        let path = PathBuf::from(&request.path);
+        let canonical = path
+            .canonicalize()
+            .map_err(|err| Status::not_found(format!("transcript {}: {err}", path.display())))?;
+        // Transcripts only ever live under the agent user's home; refuse
+        // anything else so this RPC can't become an arbitrary file reader.
+        let home =
+            dirs::home_dir().ok_or_else(|| Status::internal("agent home directory unavailable"))?;
+        if !canonical.starts_with(&home) {
+            return Err(Status::permission_denied(
+                "transcript path must be under the agent home directory",
+            ));
+        }
+        let preview =
+            tokio::task::spawn_blocking(move || crate::chats::load_preview(&canonical, backend))
+                .await
+                .map_err(|err| Status::internal(format!("chat preview task failed: {err}")))?;
+        Ok(Response::new(ChatPreviewResponse {
+            messages: preview
+                .messages
+                .into_iter()
+                .map(|message| ChatPreviewMessage {
+                    is_user: message.is_user,
+                    text: message.text,
+                })
+                .collect(),
+            message_count: preview.message_count,
+        }))
     }
 
     async fn start_session(
@@ -385,6 +436,29 @@ impl GitTermAgent for GitTermAgentService {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+}
+
+fn chat_entry_to_proto(entry: crate::chats::ChatIndexEntry) -> ChatEntry {
+    ChatEntry {
+        id: entry.id,
+        backend: entry.backend.label().to_string(),
+        path: entry.path.to_string_lossy().into_owned(),
+        cwd: entry.cwd.to_string_lossy().into_owned(),
+        repo_root: entry
+            .repo_root
+            .map(|root| root.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        is_worktree: entry.is_worktree,
+        branch: entry.branch.unwrap_or_default(),
+        title: entry.title,
+        mtime_unix_secs: entry
+            .mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        size_bytes: entry.size,
+        dead_cwd: entry.dead_cwd,
     }
 }
 

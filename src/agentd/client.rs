@@ -13,8 +13,8 @@ use super::protocol::v1::HandshakeRequest;
 use super::protocol::v1::ListDirRequest;
 use super::protocol::v1::ReadFileRequest;
 use super::protocol::v1::{
-    terminal_input, AttachRequest, EnvVar, ListSessionsRequest, Resize, StartSessionRequest,
-    StopSessionRequest, TerminalInput,
+    terminal_input, AttachRequest, ChatEntry, ChatPreviewRequest, EnvVar, ListChatsRequest,
+    ListSessionsRequest, Resize, StartSessionRequest, StopSessionRequest, TerminalInput,
 };
 use super::server::PROTOCOL_VERSION;
 
@@ -354,6 +354,56 @@ impl RemoteAgentBackend {
         })
     }
 
+    /// The agent machine's chat index (TRU-78): entries in the same
+    /// shape the desktop builds locally, with paths that are only
+    /// meaningful on the agent's machine.
+    pub async fn list_chats(
+        &self,
+    ) -> Result<Vec<crate::chats::ChatIndexEntry>, RemoteAgentClientError> {
+        let mut request = Request::new(ListChatsRequest {});
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .list_chats(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("list_chats failed: {err:?}")))?
+            .into_inner();
+        Ok(response
+            .chats
+            .into_iter()
+            .filter_map(chat_entry_from_proto)
+            .collect())
+    }
+
+    pub async fn chat_preview(
+        &self,
+        path: String,
+        backend: crate::chats::ChatBackend,
+    ) -> Result<crate::chats::ChatPreview, RemoteAgentClientError> {
+        let mut request = Request::new(ChatPreviewRequest {
+            path,
+            backend: backend.label().to_string(),
+        });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .chat_preview(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("chat_preview failed: {err:?}")))?
+            .into_inner();
+        Ok(crate::chats::ChatPreview {
+            messages: response
+                .messages
+                .into_iter()
+                .map(|message| crate::chats::ChatPreviewMessage {
+                    is_user: message.is_user,
+                    text: message.text,
+                })
+                .collect(),
+            message_count: response.message_count,
+        })
+    }
+
     pub async fn list_sessions(
         &self,
         workspace_id: String,
@@ -510,6 +560,25 @@ impl RemoteAgentBackend {
         request.metadata_mut().insert("authorization", auth_value);
         Ok(())
     }
+}
+
+/// Decode a wire chat entry. Entries with an unknown backend label
+/// (from a newer agent) are skipped rather than failing the whole list.
+fn chat_entry_from_proto(entry: ChatEntry) -> Option<crate::chats::ChatIndexEntry> {
+    let backend = crate::chats::ChatBackend::from_label(&entry.backend)?;
+    Some(crate::chats::ChatIndexEntry {
+        id: entry.id,
+        backend,
+        path: PathBuf::from(entry.path),
+        cwd: PathBuf::from(entry.cwd),
+        repo_root: (!entry.repo_root.is_empty()).then(|| PathBuf::from(entry.repo_root)),
+        is_worktree: entry.is_worktree,
+        branch: (!entry.branch.is_empty()).then_some(entry.branch),
+        title: entry.title,
+        mtime: std::time::UNIX_EPOCH + Duration::from_secs(entry.mtime_unix_secs.max(0) as u64),
+        size: entry.size_bytes,
+        dead_cwd: entry.dead_cwd,
+    })
 }
 
 fn session_from_proto(session: super::protocol::v1::Session) -> RemoteAgentSession {
@@ -901,6 +970,63 @@ mod tests {
             entries,
             vec![("src".to_string(), true), ("Cargo.toml".to_string(), false),]
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chats_round_trip_over_grpc() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected_token = Arc::new("chats-secret".to_string());
+        let service = GitTermAgentServer::with_interceptor(
+            GitTermAgentService::new("chats-agent".to_string()),
+            move |request: Request<()>| {
+                if is_authorized_metadata(request.metadata(), expected_token.as_str()) {
+                    Ok(request)
+                } else {
+                    Err(tonic::Status::unauthenticated("bad token"))
+                }
+            },
+        );
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        std::env::set_var("GITTERM_AGENT_CHATS_TEST_TOKEN", "chats-secret");
+        let backend = RemoteAgentBackend::new(RemoteAgentClientConfig {
+            remote_id: "chats".to_string(),
+            name: "chats".to_string(),
+            endpoint: format!("http://{addr}"),
+            token_ref: "env:GITTERM_AGENT_CHATS_TEST_TOKEN".to_string(),
+        });
+
+        // Handshake advertises the new capability.
+        let handshake = backend.handshake().await.unwrap();
+        assert!(handshake.capabilities.contains(&"chats".to_string()));
+
+        // The index round-trips (contents depend on the machine; the
+        // decode path and RPC plumbing are what's under test).
+        let entries = backend.list_chats().await.unwrap();
+
+        // Preview is path-restricted to the agent home; /etc must fail.
+        let denied = backend
+            .chat_preview("/etc/hosts".to_string(), crate::chats::ChatBackend::Claude)
+            .await;
+        assert!(denied.is_err(), "preview outside home must be rejected");
+
+        // Preview a real transcript through the wire when one exists.
+        if let Some(entry) = entries.first() {
+            let preview = backend
+                .chat_preview(entry.path.to_string_lossy().into_owned(), entry.backend)
+                .await
+                .unwrap();
+            assert!(!preview.messages.is_empty() || preview.message_count.is_none());
+        }
 
         server.abort();
     }
