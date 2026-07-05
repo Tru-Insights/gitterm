@@ -26,6 +26,9 @@ const TAIL_READ_BYTES: u64 = 128 * 1024;
 const PREVIEW_MESSAGES: usize = 8;
 /// Truncation length for titles derived from the first user message.
 const TITLE_MAX_CHARS: usize = 90;
+/// A transcript younger than this that no GitTerm tab owns was probably
+/// started by hand in a bare terminal and may still be running.
+const POSSIBLY_RUNNING_SECS: u64 = 120;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatIndexEntry {
@@ -121,6 +124,24 @@ impl ChatIndexEntry {
                 .repo_root
                 .as_deref()
                 .is_some_and(|root| root.starts_with(ws_dir))
+    }
+
+    /// Shell command that resumes this conversation. Must run in the
+    /// conversation's recorded cwd (or the rescue dir when cwd is dead).
+    pub fn resume_command(&self) -> String {
+        match self.backend {
+            ChatBackend::Claude => format!("claude --resume {}", self.id),
+        }
+    }
+
+    /// The transcript was modified moments ago yet no GitTerm tab owns
+    /// it — likely a session running in a plain terminal GitTerm didn't
+    /// start. Callers overlay this with the live-tab registry.
+    pub fn possibly_running(&self) -> bool {
+        SystemTime::now()
+            .duration_since(self.mtime)
+            .map(|age| age.as_secs() < POSSIBLY_RUNNING_SECS)
+            .unwrap_or(true)
     }
 
     pub fn matches_query(&self, query_lower: &str) -> bool {

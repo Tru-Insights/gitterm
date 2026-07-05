@@ -157,14 +157,18 @@ on `master` as the stable daily driver.
 
 ## Slices
 
-- [ ] 0. Config isolation for dev instances (`GITTERM_CONFIG_DIR` +
-        v3-dev window title). Prerequisite for all live testing.
-- [ ] 1. Local claude index + workspace-scoped Chats sidebar tab (list,
+- [x] 0. Config isolation for dev instances (`GITTERM_CONFIG_DIR` +
+        v3-dev window title). Prerequisite for all live testing. (PR #9)
+- [x] 1. Local claude index + workspace-scoped Chats sidebar tab (list,
         search, scope toggle, repo grouping, preview pane). Read-only.
-- [ ] 2. Resume-as-tab + registry rule: spawn in recorded cwd, live badges,
+        (PR #10)
+- [x] 2. Resume-as-tab + registry rule: spawn in recorded cwd, live badges,
         Go-to-Tab focus (cross-workspace jump), pre-assigned session ids for
         new picker-launched sessions, possibly-running heuristic, dead-cwd
-        rescue.
+        rescue. **Verified 2026-07-04: `claude --resume` is cwd-scoped**
+        (session not found from any other directory), so resume must always
+        spawn in the recorded cwd and the dead-cwd rescue is "recreate
+        directory & resume", not "resume in repo root".
 - [ ] 3. Codex + pi adapters via config.
 - [ ] 4. Remote machines: run the same adapters over agentd (list/stat/tail
         via WorkspaceSource `sessions` capability), machine sections in
