@@ -3604,6 +3604,15 @@ pub enum Event {
     /// Expand/collapse one machine section in the Everywhere scope
     /// ("local" or a remote id).
     ToggleChatMachine(String),
+    /// Fold/unfold one machine group in the workspace bar.
+    ToggleMachineGroup(String),
+    /// Open/close the machine label menu in the workspace bar.
+    MachineMenuOpen(String),
+    MachineMenuClose,
+    /// Jump the Chats panel to one machine's conversations.
+    ShowMachineChats(String),
+    /// Force a reconnect attempt to a remote agent.
+    MachineReconnect(String),
     SelectChat(String),
     CloseChatPreview,
     ChatPreviewLoaded(String, chats::ChatPreview),
@@ -3718,6 +3727,10 @@ struct App {
     /// remote id). Sections start collapsed so the machine list itself
     /// is scannable; an active search overrides collapse.
     chat_expanded_machines: std::collections::HashSet<String>,
+    /// Workspace-bar machine groups the user folded (session-only).
+    collapsed_machine_groups: std::collections::HashSet<String>,
+    /// Machine label menu open in the workspace bar (group key).
+    machine_menu: Option<String>,
     /// Per-remote chat indexes (TRU-78 slice 4), keyed by remote id.
     /// Kept when a machine becomes unreachable so Everywhere still shows
     /// its (stale) chats.
@@ -5022,6 +5035,62 @@ impl App {
     /// Resume a conversation as a new tab running its resume command in
     /// its recorded cwd. Honors the registry rule and follows the chat
     /// home to its owning workspace when that workspace is open.
+    /// Stable identity of the machine group a workspace belongs to in
+    /// the bar: "local", "agent:<remote id>", or "ssh:<host>" (legacy).
+    fn machine_group_key(&self, ws: &Workspace) -> String {
+        match &ws.location {
+            WorkspaceLocation::RemoteAgent { remote_id, .. } => format!("agent:{remote_id}"),
+            WorkspaceLocation::LegacyRemoteSession { session_name, .. } => {
+                format!("ssh:{session_name}")
+            }
+            WorkspaceLocation::Local { .. } => "local".to_string(),
+        }
+    }
+
+    /// Keep the workspace Vec grouped by machine (local first, then each
+    /// configured remote in remote-agents order, legacy ssh last), stable
+    /// within a group. Display order, Ctrl+1-9 order, and the slide
+    /// animation all follow Vec order, so the invariant lives here.
+    fn normalize_workspace_order(&mut self) {
+        let def_rank: HashMap<&str, usize> = self
+            .remote_agent_defs
+            .iter()
+            .enumerate()
+            .map(|(rank, def)| (def.id.as_str(), rank))
+            .collect();
+        let rank_of = |ws: &Workspace| match &ws.location {
+            WorkspaceLocation::Local { .. } => 0usize,
+            WorkspaceLocation::RemoteAgent { remote_id, .. } => {
+                1 + def_rank
+                    .get(remote_id.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX / 2)
+            }
+            WorkspaceLocation::LegacyRemoteSession { .. } => usize::MAX / 2 + 1,
+        };
+        let ranks: Vec<usize> = self.workspaces.iter().map(rank_of).collect();
+        let mut order: Vec<usize> = (0..self.workspaces.len()).collect();
+        order.sort_by_key(|&i| ranks[i]);
+        if order.iter().enumerate().all(|(new, &old)| new == old) {
+            return;
+        }
+        let new_active = order
+            .iter()
+            .position(|&old| old == self.active_workspace_idx)
+            .unwrap_or(0);
+        let mut slots: Vec<Option<Workspace>> = std::mem::take(&mut self.workspaces)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.workspaces = order
+            .iter()
+            .map(|&old| slots[old].take().expect("permutation is a bijection"))
+            .collect();
+        self.active_workspace_idx = new_active;
+        self.snap_slide_to_active_workspace();
+        self.mark_workspaces_dirty();
+    }
+
     fn snap_slide_to_active_workspace(&mut self) {
         let viewport_width = self.content_viewport_width();
         let new_target = self.active_workspace_idx as f32 * viewport_width;
@@ -5077,6 +5146,7 @@ impl App {
         };
         self.workspaces.push(workspace);
         self.active_workspace_idx = self.workspaces.len() - 1;
+        self.normalize_workspace_order();
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.sync_plans_dir();
@@ -5163,6 +5233,7 @@ impl App {
         self.add_remote_agent_tab_to_workspace(&mut workspace, browse_root, None);
         self.workspaces.push(workspace);
         self.active_workspace_idx = self.workspaces.len() - 1;
+        self.normalize_workspace_order();
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.sync_plans_dir();
@@ -5825,6 +5896,8 @@ impl App {
             chat_scope: chats::ChatScope::default(),
             chat_backend_filter: None,
             chat_expanded_machines: std::collections::HashSet::new(),
+            collapsed_machine_groups: std::collections::HashSet::new(),
+            machine_menu: None,
             remote_chat_indexes: HashMap::new(),
             chat_preview: None,
         };
@@ -6094,6 +6167,7 @@ impl App {
             app.active_workspace_idx = ws_file
                 .active_workspace
                 .min(app.workspaces.len().saturating_sub(1));
+            app.normalize_workspace_order();
         }
 
         // If no workspaces were loaded, create one from the current directory
@@ -8584,6 +8658,14 @@ fi
                     return Task::none();
                 }
 
+                // Machine menu: Escape closes
+                if self.machine_menu.is_some()
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    self.machine_menu = None;
+                    return Task::none();
+                }
+
                 // Tab picker: Escape closes
                 if self.tab_picker_visible && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
@@ -9811,6 +9893,41 @@ fi
             Event::ChatsBackendFilterChanged(filter) => {
                 self.chat_backend_filter = filter;
             }
+            Event::ToggleMachineGroup(key) => {
+                self.machine_menu = None;
+                if !self.collapsed_machine_groups.remove(&key) {
+                    self.collapsed_machine_groups.insert(key);
+                }
+            }
+            Event::MachineMenuOpen(key) => {
+                self.machine_menu = if self.machine_menu.as_deref() == Some(key.as_str()) {
+                    None
+                } else {
+                    Some(key)
+                };
+            }
+            Event::MachineMenuClose => {
+                self.machine_menu = None;
+            }
+            Event::ShowMachineChats(key) => {
+                self.machine_menu = None;
+                // Everywhere scope with only that machine's section open.
+                let machine = match key.split_once(':') {
+                    Some(("agent", remote_id)) => remote_id.to_string(),
+                    _ => "local".to_string(),
+                };
+                self.chat_scope = chats::ChatScope::Everywhere;
+                self.chat_expanded_machines.clear();
+                self.chat_expanded_machines.insert(machine);
+                return self.update(Event::SetSidebarMode(SidebarMode::Chats));
+            }
+            Event::MachineReconnect(key) => {
+                self.machine_menu = None;
+                if let Some(("agent", remote_id)) = key.split_once(':') {
+                    let remote_id = remote_id.to_string();
+                    return self.ensure_remote_agent_connection(&remote_id, true);
+                }
+            }
             Event::ToggleChatMachine(key) => {
                 if !self.chat_expanded_machines.remove(&key) {
                     self.chat_expanded_machines.insert(key);
@@ -10602,6 +10719,7 @@ fi
                 self.workspace_source_picker_visible = true;
             }
             Event::WorkspaceCreateLocal => {
+                self.machine_menu = None;
                 self.workspace_source_picker_visible = false;
                 return Task::perform(
                     async {
@@ -10643,6 +10761,7 @@ fi
                 return self.submit_remote_connect_form();
             }
             Event::RemoteWorkspaceBrowse(remote_id) => {
+                self.machine_menu = None;
                 self.workspace_source_picker_visible = false;
                 let Some(agent) = self.remote_agent_config_by_id(&remote_id).cloned() else {
                     return Task::none();
@@ -10719,6 +10838,7 @@ fi
                 workspace.active_tab = 0;
                 self.workspaces.push(workspace);
                 self.active_workspace_idx = self.workspaces.len() - 1;
+                self.normalize_workspace_order();
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
                 self.sync_plans_dir();
@@ -10771,6 +10891,7 @@ fi
                 );
                 self.workspaces.push(workspace);
                 self.active_workspace_idx = self.workspaces.len() - 1;
+                self.normalize_workspace_order();
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
                 self.sync_plans_dir();
@@ -11455,6 +11576,13 @@ fi
             Stack::new()
                 .push(main_view)
                 .push(self.view_workspace_settings_modal())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.machine_menu.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_machine_menu())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -12505,14 +12633,326 @@ fi
         .into()
     }
 
+    fn machine_group_separator(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let sep_color = self.theme.surface1();
+        container(iced::widget::Space::new().width(0).height(0))
+            .width(Length::Fixed(1.0))
+            .height(Length::Fixed(20.0))
+            .style(move |_| container::Style {
+                background: Some(sep_color.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// Machine label chip: name, reachability, click to fold/unfold.
+    fn machine_group_label(
+        &self,
+        key: &str,
+        count: usize,
+        collapsed: bool,
+    ) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let (name, status) = match key.split_once(':') {
+            None => ("this mac".to_string(), None),
+            Some(("agent", remote_id)) => {
+                let name = self
+                    .remote_agent_config_by_id(remote_id)
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_else(|| remote_id.to_string());
+                let status = match self
+                    .remote_agent_connections
+                    .get(remote_id)
+                    .map(|c| &c.status)
+                {
+                    Some(RemoteAgentConnectionStatus::Connected(_)) => ("●", theme.green()),
+                    Some(RemoteAgentConnectionStatus::Connecting) => ("◐", theme.yellow()),
+                    Some(RemoteAgentConnectionStatus::Error(_)) => ("○", theme.red()),
+                    _ => ("○", theme.overlay0()),
+                };
+                (name, Some(status))
+            }
+            Some(("ssh", host)) => (host.to_string(), None),
+            Some((_, rest)) => (rest.to_string(), None),
+        };
+        let label_color = if key == "local" {
+            theme.overlay1()
+        } else {
+            theme.accent()
+        };
+        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center);
+        if collapsed {
+            content = content.push(text("▸").size(9).color(theme.overlay0()));
+        }
+        content = content.push(
+            text(name.to_uppercase())
+                .size(9)
+                .color(label_color)
+                .font(iced::Font::with_name("Menlo")),
+        );
+        if let Some((glyph, color)) = status {
+            content = content.push(text(glyph).size(9).color(color));
+        }
+        if collapsed && count > 0 {
+            content = content.push(
+                text(format!("×{count}"))
+                    .size(9)
+                    .color(theme.overlay0())
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+        let hover_bg = theme.surface0();
+        button(content)
+            .style(move |_theme, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        hover_bg
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    radius: 5.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .padding([4, 8])
+            .on_press(Event::MachineMenuOpen(key.to_string()))
+            .into()
+    }
+
+    /// Machine-scoped "+": local opens the folder picker, remotes open
+    /// their directory browser. Legacy ssh groups get none.
+    fn machine_group_plus(&self, key: &str) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+        let event = match key.split_once(':') {
+            None => Event::WorkspaceCreateLocal,
+            Some(("agent", remote_id)) => Event::RemoteWorkspaceBrowse(remote_id.to_string()),
+            _ => return None,
+        };
+        let color = self.theme.overlay0();
+        let hover = self.theme.overlay1();
+        Some(
+            button(
+                text("+")
+                    .size(12)
+                    .color(color)
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .style(move |_theme, status| button::Style {
+                background: Some(iced::Color::TRANSPARENT.into()),
+                text_color: if matches!(status, button::Status::Hovered) {
+                    hover
+                } else {
+                    color
+                },
+                ..Default::default()
+            })
+            .padding([2, 6])
+            .on_press(event)
+            .into(),
+        )
+    }
+
+    /// The machine label menu: fold, new workspace, chats, reconnect.
+    /// Anchored above the bar (bottom-center card over a click-away
+    /// backdrop), following the app's modal overlay pattern.
+    fn view_machine_menu(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let Some(key) = self.machine_menu.clone() else {
+            return iced::widget::Space::new().into();
+        };
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        let (name, is_agent, connected) = match key.split_once(':') {
+            Some(("agent", remote_id)) => {
+                let name = self
+                    .remote_agent_config_by_id(remote_id)
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_else(|| remote_id.to_string());
+                let connected = matches!(
+                    self.remote_agent_connections
+                        .get(remote_id)
+                        .map(|c| &c.status),
+                    Some(RemoteAgentConnectionStatus::Connected(_))
+                );
+                (name, true, connected)
+            }
+            Some(("ssh", host)) => (host.to_string(), false, true),
+            _ => ("this mac".to_string(), false, true),
+        };
+        let ws_count = self
+            .workspaces
+            .iter()
+            .filter(|ws| self.machine_group_key(ws) == key)
+            .count();
+        let folded = self.collapsed_machine_groups.contains(&key);
+
+        let item = |label: String, event: Event| {
+            let hover_bg = theme.surface0();
+            let color = theme.text_secondary();
+            let hover_color = theme.text_primary();
+            button(text(label).size(font))
+                .style(move |_theme, status| {
+                    let hovered = matches!(status, button::Status::Hovered);
+                    button::Style {
+                        background: Some(
+                            if hovered {
+                                hover_bg
+                            } else {
+                                iced::Color::TRANSPARENT
+                            }
+                            .into(),
+                        ),
+                        text_color: if hovered { hover_color } else { color },
+                        border: iced::Border {
+                            radius: 5.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                })
+                .padding([6, 10])
+                .width(Length::Fill)
+                .on_press(event)
+        };
+
+        let mut card_col = Column::new().spacing(2).push(
+            text(format!(
+                "{} · {} workspace{}{}",
+                name.to_uppercase(),
+                ws_count,
+                if ws_count == 1 { "" } else { "s" },
+                if is_agent {
+                    if connected {
+                        " · ● connected"
+                    } else {
+                        " · ○ not connected"
+                    }
+                } else {
+                    ""
+                }
+            ))
+            .size(font_small - 1.0)
+            .color(theme.overlay1()),
+        );
+        card_col = card_col.push(item(
+            if folded {
+                "Unfold workspaces".to_string()
+            } else {
+                "Fold workspaces".to_string()
+            },
+            Event::ToggleMachineGroup(key.clone()),
+        ));
+        if key == "local" {
+            card_col = card_col.push(item(
+                "New workspace on this mac…".to_string(),
+                Event::WorkspaceCreateLocal,
+            ));
+        } else if let Some(("agent", remote_id)) = key.split_once(':') {
+            card_col = card_col.push(item(
+                format!("New workspace on {name}…"),
+                Event::RemoteWorkspaceBrowse(remote_id.to_string()),
+            ));
+        }
+        card_col = card_col.push(item(
+            format!("Show {name} chats"),
+            Event::ShowMachineChats(key.clone()),
+        ));
+        if is_agent && !connected {
+            card_col = card_col.push(item(
+                "Reconnect…".to_string(),
+                Event::MachineReconnect(key.clone()),
+            ));
+        }
+
+        let card_bg = theme.bg_surface();
+        let card_border = theme.surface1();
+        let card = container(card_col.width(Length::Fixed(260.0)))
+            .style(move |_| container::Style {
+                background: Some(card_bg.into()),
+                border: iced::Border {
+                    color: card_border,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::BLACK,
+                    offset: iced::Vector::new(0.0, 6.0),
+                    blur_radius: 16.0,
+                },
+                ..Default::default()
+            })
+            .padding(8);
+
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Event::MachineMenuClose);
+
+        Stack::new()
+            .push(backdrop)
+            .push(
+                container(card)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .align_bottom(Length::Fill)
+                    .padding(iced::Padding {
+                        top: 0.0,
+                        right: 0.0,
+                        bottom: 46.0,
+                        left: 0.0,
+                    }),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mut bar_row = Row::new().spacing(0).align_y(iced::Alignment::Center);
 
         let pulse_bright = self.attention_pulse_bright;
 
+        // 4b: the Vec is machine-normalized, so groups are contiguous.
+        let group_keys: Vec<String> = self
+            .workspaces
+            .iter()
+            .map(|ws| self.machine_group_key(ws))
+            .collect();
+        let group_size = |key: &str| group_keys.iter().filter(|k| *k == key).count();
+        let mut prev_group: Option<String> = None;
+
         for (idx, ws) in self.workspaces.iter().enumerate() {
             let is_active = idx == self.active_workspace_idx;
+            let group_key = group_keys[idx].clone();
+            let group_collapsed = self.collapsed_machine_groups.contains(&group_key);
+            if prev_group.as_deref() != Some(group_key.as_str()) {
+                // Close the previous group with its machine-scoped "+".
+                if let Some(prev) = &prev_group {
+                    if let Some(plus) = self.machine_group_plus(prev) {
+                        bar_row = bar_row.push(plus);
+                    }
+                    bar_row = bar_row.push(self.machine_group_separator());
+                }
+                bar_row = bar_row.push(self.machine_group_label(
+                    &group_key,
+                    group_size(&group_key),
+                    group_collapsed,
+                ));
+                prev_group = Some(group_key.clone());
+            }
+            // Folded groups hide their chips — except the active one,
+            // which never disappears out from under the user.
+            if group_collapsed && !is_active {
+                continue;
+            }
             let ws_color = ws.color.color(theme);
             let text_color = if is_active {
                 ws_color
@@ -12557,18 +12997,7 @@ fi
                 .color(text_color)
                 .font(iced::Font::with_name("Menlo"));
 
-            let mut btn_content = row![dot].spacing(6).align_y(iced::Alignment::Center);
-            // Remote workspaces carry a machine glyph so "where am I"
-            // never depends on how the workspace happens to be named.
-            if matches!(ws.location, WorkspaceLocation::RemoteAgent { .. }) {
-                btn_content = btn_content.push(
-                    text("⇄")
-                        .size(10)
-                        .color(theme.accent())
-                        .font(iced::Font::with_name("Menlo")),
-                );
-            }
-            btn_content = btn_content.push(label);
+            let mut btn_content = row![dot, label].spacing(6).align_y(iced::Alignment::Center);
 
             // Gear icon button for active workspace settings
             if is_active {
@@ -12681,8 +13110,8 @@ fi
                 bar_row = bar_row.push(ws_btn);
             }
 
-            // Separator between workspaces
-            if idx < self.workspaces.len() - 1 {
+            // Separator between workspaces of the same machine group
+            if idx + 1 < self.workspaces.len() && group_keys[idx + 1] == group_key {
                 let sep_color = theme.surface0();
                 bar_row = bar_row.push(
                     container(iced::widget::Space::new().width(0).height(0))
@@ -12693,6 +13122,26 @@ fi
                             ..Default::default()
                         }),
                 );
+            }
+        }
+        // Close the final group's "+".
+        if let Some(prev) = &prev_group {
+            if let Some(plus) = self.machine_group_plus(prev) {
+                bar_row = bar_row.push(plus);
+            }
+        }
+
+        // Configured remotes with no open workspace stay visible: label
+        // plus a "+" to open their first one (the always-visible rule).
+        for def in &self.remote_agent_defs {
+            let key = format!("agent:{}", def.id);
+            if group_keys.contains(&key) {
+                continue;
+            }
+            bar_row = bar_row.push(self.machine_group_separator());
+            bar_row = bar_row.push(self.machine_group_label(&key, 0, false));
+            if let Some(plus) = self.machine_group_plus(&key) {
+                bar_row = bar_row.push(plus);
             }
         }
 

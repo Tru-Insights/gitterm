@@ -180,9 +180,18 @@ on `master` as the stable daily driver.
         open from this slice: disk-persisted remote cache across app
         restarts, remote dead-cwd rescue, pre-assigned session ids for
         remote picker launches.
-- [ ] 4b. Workspace bar/rail grouped by machine, remotes always visible
-        with reachable/unreachable state (own mockup before build — this
-        touches the whole rail, not just Chats).
+- [ ] 4b. Workspace bar grouped by machine (mockup v3 approved
+        2026-07-04: "it helps to keep them grouped like that").
+        Decisions: keyboard = **global Ctrl+1-9** following the grouped
+        left-to-right order (workspace Vec normalized to machine order:
+        local first, then each configured remote, stable within);
+        machine labels with reachability dot, click = collapse/expand;
+        per-machine "+" replaces the global one (local → folder picker,
+        remote → that remote's browse picker); configured remotes always
+        visible even with zero workspaces; chips plain-named (the ⇄
+        glyph retires inside grouped sections). Machine label MENU
+        (new/reconnect/show-chats) deferred to 4b.1 pending popover
+        infrastructure.
 - [x] 5. Reopen-on-resume, extended per user feedback (2026-07-04): a
         chat always resumes into its repo's workspace on its machine —
         open workspace activated, closed workspace reopened with its
