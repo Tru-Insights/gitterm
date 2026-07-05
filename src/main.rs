@@ -3599,6 +3599,7 @@ pub enum Event {
     ChatIndexLoaded(Vec<chats::ChatIndexEntry>),
     ChatsQueryChanged(String),
     ChatsScopeChanged(chats::ChatScope),
+    ChatsBackendFilterChanged(Option<chats::ChatBackend>),
     SelectChat(String),
     CloseChatPreview,
     ChatPreviewLoaded(String, chats::ChatPreview),
@@ -3707,6 +3708,8 @@ struct App {
     chat_index_loaded_at: Option<Instant>,
     chat_query: String,
     chat_scope: chats::ChatScope,
+    /// Backend filter chip; None shows all backends.
+    chat_backend_filter: Option<chats::ChatBackend>,
     /// Preview tail for the most recently selected chat, keyed by session
     /// id so a stale load never renders under the wrong chat.
     chat_preview: Option<(String, chats::ChatPreview)>,
@@ -4981,11 +4984,13 @@ impl App {
         Self::request_chat_index()
     }
 
-    fn request_chat_preview(id: String, path: PathBuf) -> Task<Event> {
+    fn request_chat_preview(id: String, path: PathBuf, backend: chats::ChatBackend) -> Task<Event> {
         Task::perform(
             async move {
                 let preview =
-                    match tokio::task::spawn_blocking(move || chats::load_preview(&path)).await {
+                    match tokio::task::spawn_blocking(move || chats::load_preview(&path, backend))
+                        .await
+                    {
                         Ok(preview) => preview,
                         Err(err) => {
                             eprintln!("[chats] preview task failed: {err}");
@@ -4996,6 +5001,14 @@ impl App {
             },
             |(id, preview)| Event::ChatPreviewLoaded(id, preview),
         )
+    }
+
+    fn chat_backend_color(&self, backend: chats::ChatBackend) -> iced::Color {
+        match backend {
+            chats::ChatBackend::Claude => self.theme.peach(),
+            chats::ChatBackend::Codex => self.theme.blue(),
+            chats::ChatBackend::Pi => self.theme.mauve(),
+        }
     }
 
     fn request_git_worktrees(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
@@ -5444,6 +5457,7 @@ impl App {
             chat_index_loaded_at: None,
             chat_query: String::new(),
             chat_scope: chats::ChatScope::default(),
+            chat_backend_filter: None,
             chat_preview: None,
         };
 
@@ -9397,6 +9411,9 @@ fi
             Event::ChatsScopeChanged(scope) => {
                 self.chat_scope = scope;
             }
+            Event::ChatsBackendFilterChanged(filter) => {
+                self.chat_backend_filter = filter;
+            }
             Event::SelectChat(id) => {
                 let already_selected = self
                     .active_tab()
@@ -9407,16 +9424,16 @@ fi
                     }
                     return Task::none();
                 }
-                let path = self
+                let source = self
                     .chat_index
                     .iter()
                     .find(|entry| entry.id == id)
-                    .map(|entry| entry.path.clone());
+                    .map(|entry| (entry.path.clone(), entry.backend));
                 if let Some(tab) = self.active_tab_mut() {
                     tab.selected_chat_id = Some(id.clone());
                 }
-                if let Some(path) = path {
-                    return Self::request_chat_preview(id, path);
+                if let Some((path, backend)) = source {
+                    return Self::request_chat_preview(id, path, backend);
                 }
             }
             Event::CloseChatPreview => {
@@ -14354,6 +14371,51 @@ fi
         ]
         .spacing(2);
 
+        // Backend filter chips: All · claude · codex · pi.
+        let backend_chip =
+            |label: &'static str, filter: Option<chats::ChatBackend>, dot: Option<iced::Color>| {
+                let active = self.chat_backend_filter == filter;
+                let bg = if active {
+                    Some(theme.surface0().into())
+                } else {
+                    None
+                };
+                let color = if active {
+                    theme.text_primary()
+                } else {
+                    theme.overlay1()
+                };
+                let mut content = Row::new().spacing(4).align_y(iced::Alignment::Center);
+                if let Some(dot) = dot {
+                    content = content.push(text("●").size(7).color(dot));
+                }
+                content = content.push(text(label).size(font_small - 1.0).color(color));
+                button(content)
+                    .style(move |_theme, _status| button::Style {
+                        background: bg,
+                        border: iced::Border {
+                            width: 1.0,
+                            color: if active {
+                                theme.surface1()
+                            } else {
+                                theme.surface0()
+                            },
+                            radius: 99.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .padding([2, 9])
+                    .on_press(Event::ChatsBackendFilterChanged(filter))
+            };
+        let mut chips_row = Row::new().spacing(6).push(backend_chip("All", None, None));
+        for backend in chats::ChatBackend::ALL {
+            chips_row = chips_row.push(backend_chip(
+                backend.label(),
+                Some(backend),
+                Some(self.chat_backend_color(backend)),
+            ));
+        }
+
         let workspace_dir = self
             .workspaces
             .get(self.active_workspace_idx)
@@ -14366,10 +14428,15 @@ fi
             // One machine indexed so far; these rings diverge at slice 4.
             chats::ChatScope::Machine | chats::ChatScope::Everywhere => true,
         };
+        let backend_ok = |entry: &&chats::ChatIndexEntry| {
+            self.chat_backend_filter
+                .is_none_or(|backend| entry.backend == backend)
+        };
         let visible: Vec<&chats::ChatIndexEntry> = self
             .chat_index
             .iter()
             .filter(in_scope)
+            .filter(backend_ok)
             .filter(|entry| entry.matches_query(&query))
             .collect();
 
@@ -14457,7 +14524,9 @@ fi
                 }
                 let content = column![
                     row![
-                        text("●").size(8).color(theme.peach()),
+                        text("●")
+                            .size(8)
+                            .color(self.chat_backend_color(entry.backend)),
                         text(entry.title.clone())
                             .size(font_small)
                             .color(theme.text_primary()),
@@ -14492,6 +14561,7 @@ fi
             let total_matches = self
                 .chat_index
                 .iter()
+                .filter(backend_ok)
                 .filter(|entry| entry.matches_query(&query))
                 .count();
             let elsewhere = total_matches.saturating_sub(visible.len());
@@ -14522,6 +14592,7 @@ fi
         column![
             container(search).padding([6, 8]),
             container(scope_row).padding([0, 8]),
+            container(chips_row).padding([2, 8]),
             scrollable(list).height(Length::Fill),
         ]
         .spacing(4)
@@ -14574,7 +14645,7 @@ fi
             .push(
                 text(format!("● {}", entry.backend.label()))
                     .size(font_small)
-                    .color(theme.peach()),
+                    .color(self.chat_backend_color(entry.backend)),
             )
             .push(
                 text(chats::format_size(entry.size))
@@ -14737,7 +14808,10 @@ fi
                     let (who, who_color) = if message.is_user {
                         ("YOU", theme.green())
                     } else {
-                        (entry.backend.label(), theme.peach())
+                        (
+                            entry.backend.label(),
+                            self.chat_backend_color(entry.backend),
+                        )
                     };
                     body = body.push(
                         column![
