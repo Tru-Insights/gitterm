@@ -228,11 +228,7 @@ impl AgentActivity {
     }
 
     pub fn load_from_repo(repo_path: &Path) -> Result<Self, String> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let captures_base = Path::new(&home)
-            .join(".config")
-            .join("gitterm")
-            .join("captures");
+        let captures_base = crate::config::global_config_dir().join("captures");
 
         let repo_name = repo_path
             .file_name()

@@ -727,7 +727,7 @@ mod tests {
     async fn git_status_reports_changes_for_real_repo() {
         let root = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::agentd::git::git_command()
                 .args(args)
                 .current_dir(root.path())
                 .output()

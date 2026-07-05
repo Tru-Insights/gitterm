@@ -25,6 +25,24 @@ pub struct RepoStatus {
     pub untracked: Vec<GitFileStatus>,
 }
 
+/// Build a `git` Command with repo-discovery env scrubbed. When this
+/// process is spawned from a git hook, git exports GIT_DIR / GIT_WORK_TREE /
+/// GIT_INDEX_FILE pointing at the hook's repo; inheriting them would
+/// redirect every command away from the `current_dir` it is aimed at.
+pub(crate) fn git_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn dir_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -47,7 +65,7 @@ pub fn collect_repo_status(repo_path: &Path) -> RepoStatus {
         untracked: Vec::new(),
     };
 
-    let cli_result = std::process::Command::new("git")
+    let cli_result = git_command()
         .args([
             "--no-optional-locks",
             "status",
@@ -74,7 +92,7 @@ pub fn collect_repo_status(repo_path: &Path) -> RepoStatus {
         // NOTE: --no-optional-locks is a git-level flag and must precede the
         // subcommand; after `rev-parse` it gets echoed into stdout and
         // corrupts the discovered root.
-        if let Ok(toplevel_output) = std::process::Command::new("git")
+        if let Ok(toplevel_output) = git_command()
             .args(["--no-optional-locks", "rev-parse", "--show-toplevel"])
             .current_dir(repo_path)
             .output()
@@ -401,7 +419,7 @@ mod tests {
     use super::*;
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = git_command()
             .args(args)
             .current_dir(dir)
             .output()

@@ -611,10 +611,7 @@ const STT_MIN_PEAK: f32 = 0.01;
 
 #[cfg(feature = "stt")]
 fn stt_model_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("gitterm")
+    config::global_config_dir()
         .join("models")
         .join("ggml-base.en.bin")
 }
@@ -5197,7 +5194,11 @@ impl App {
         let log_server_state = log_server::ServerState::new();
 
         let mut app = Self {
-            title: String::from("GitTerm"),
+            title: if config::config_dir_override().is_some() {
+                String::from("GitTerm v3-dev")
+            } else {
+                String::from("GitTerm")
+            },
             workspaces: Vec::new(),
             active_workspace_idx: 0,
             next_tab_id: 0,
@@ -5916,7 +5917,10 @@ impl App {
             }
         } else if is_zsh {
             let home = std::env::var("HOME").unwrap_or_default();
-            let gitterm_dir = format!("{home}/.config/gitterm/zsh");
+            let gitterm_dir = config::global_config_dir()
+                .join("zsh")
+                .to_string_lossy()
+                .into_owned();
             let gitterm_zshrc = format!("{gitterm_dir}/.zshrc");
 
             let _ = std::fs::create_dir_all(&gitterm_dir);
@@ -9586,11 +9590,13 @@ fi
                         let model_path = stt_model_path();
                         if !model_path.exists() {
                             self.stt_transcribing = false;
+                            let model_dir = model_path.parent().unwrap_or(&model_path).display();
                             eprintln!(
                                 "[STT] Model not found. Download it with:\n  \
-                                 mkdir -p ~/.config/gitterm/models && \\\n  \
-                                 curl -L -o ~/.config/gitterm/models/ggml-base.en.bin \\\n  \
-                                 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+                                 mkdir -p \"{model_dir}\" && \\\n  \
+                                 curl -L -o \"{}\" \\\n  \
+                                 https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+                                model_path.display()
                             );
                             return Task::none();
                         }
