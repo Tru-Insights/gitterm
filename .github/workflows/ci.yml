@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, v3 ]
   pull_request:
-    branches: [ master, main ]
+    # tracey/** covers stacked PRs whose base is another feature branch
+    # (the v3 lane workflow); workflow_dispatch is the manual backstop.
+    branches: [ master, main, v3, 'tracey/**' ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
