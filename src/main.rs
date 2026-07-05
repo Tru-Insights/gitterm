@@ -5022,6 +5022,154 @@ impl App {
     /// Resume a conversation as a new tab running its resume command in
     /// its recorded cwd. Honors the registry rule and follows the chat
     /// home to its owning workspace when that workspace is open.
+    fn snap_slide_to_active_workspace(&mut self) {
+        let viewport_width = self.content_viewport_width();
+        let new_target = self.active_workspace_idx as f32 * viewport_width;
+        self.slide_offset = new_target;
+        self.slide_target = new_target;
+        self.slide_animating = false;
+        self.slide_start_time = None;
+    }
+
+    /// Slice 5 (reopen-on-resume): the workspace owning a local chat —
+    /// an already-open one, a closed one restored from its saved config,
+    /// or a fresh workspace rooted at the chat's repo. Reopen/create
+    /// paths push the workspace, activate it, and leave it tabless; the
+    /// caller adds the resume tab in the same update pass.
+    fn ensure_local_workspace_for_chat(
+        &mut self,
+        cwd: &Path,
+        repo_root: Option<&Path>,
+        repo_name: &str,
+    ) -> usize {
+        let contains = |dir: &Path| {
+            cwd.starts_with(dir) || repo_root.is_some_and(|root| root.starts_with(dir))
+        };
+        if let Some(idx) = self.workspaces.iter().position(|ws| {
+            matches!(ws.location, WorkspaceLocation::Local { .. }) && contains(&ws.dir)
+        }) {
+            return idx;
+        }
+        let closed_idx = self.closed_workspace_configs.iter().position(|cfg| {
+            matches!(
+                cfg.location,
+                None | Some(config::WorkspaceLocationConfig::Local { .. })
+            ) && contains(Path::new(&cfg.dir))
+        });
+        let workspace = if let Some(closed_idx) = closed_idx {
+            let cfg = self.closed_workspace_configs.remove(closed_idx);
+            let mut ws = Workspace::new(cfg.name.clone(), PathBuf::from(&cfg.dir), cfg.color);
+            ws.abbrev = cfg.abbrev.clone();
+            ws.env = cfg.env.clone();
+            if let Some(cmd) = &cfg.run_command {
+                ws.console.run_command = Some(cmd.clone());
+                ws.console.status = ConsoleStatus::Stopped;
+            }
+            ws
+        } else {
+            let used_colors: Vec<WorkspaceColor> =
+                self.workspaces.iter().map(|ws| ws.color).collect();
+            Workspace::new(
+                repo_name.to_string(),
+                repo_root.unwrap_or(cwd).to_path_buf(),
+                WorkspaceColor::next_available(&used_colors),
+            )
+        };
+        self.workspaces.push(workspace);
+        self.active_workspace_idx = self.workspaces.len() - 1;
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.sync_plans_dir();
+        self.snap_slide_to_active_workspace();
+        self.active_workspace_idx
+    }
+
+    /// Slice 5, remote form: open / reopen / create the workspace that
+    /// owns a chat on a remote machine. Created workspaces follow the
+    /// remote picker's conventions (name "<remote>:<dir>", workspace_id
+    /// = root path) and get a remote browser tab.
+    fn ensure_remote_workspace_for_chat(
+        &mut self,
+        remote_id: &str,
+        cwd: &Path,
+        repo_root: Option<&Path>,
+    ) -> usize {
+        let contains = |dir: &Path| {
+            cwd.starts_with(dir) || repo_root.is_some_and(|root| root.starts_with(dir))
+        };
+        if let Some(idx) = self.workspaces.iter().position(|ws| match &ws.location {
+            WorkspaceLocation::RemoteAgent {
+                remote_id: rid,
+                root,
+                ..
+            } => rid == remote_id && contains(Path::new(root)),
+            _ => false,
+        }) {
+            return idx;
+        }
+        let closed_idx = self.closed_workspace_configs.iter().position(|cfg| {
+            matches!(
+                &cfg.location,
+                Some(config::WorkspaceLocationConfig::RemoteAgent { remote_id: rid, root, .. })
+                    if rid == remote_id && contains(Path::new(root))
+            )
+        });
+        let mut workspace = if let Some(closed_idx) = closed_idx {
+            let cfg = self.closed_workspace_configs.remove(closed_idx);
+            let mut ws = Workspace::new(cfg.name.clone(), PathBuf::from(&cfg.dir), cfg.color);
+            ws.abbrev = cfg.abbrev.clone();
+            ws.env = cfg.env.clone();
+            if let Some(config::WorkspaceLocationConfig::RemoteAgent {
+                remote_id,
+                workspace_id,
+                root,
+            }) = &cfg.location
+            {
+                ws.location = WorkspaceLocation::RemoteAgent {
+                    remote_id: remote_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    root: root.clone(),
+                };
+            }
+            ws
+        } else {
+            let root = repo_root.unwrap_or(cwd).to_string_lossy().into_owned();
+            let base = Path::new(&root)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.clone());
+            let used_colors: Vec<WorkspaceColor> =
+                self.workspaces.iter().map(|ws| ws.color).collect();
+            // Plain repo name: the machine shows via the ⇄ chip glyph and
+            // the window title, not name mangling (matches the 4b mockup,
+            // where the same repo on two machines is two same-named
+            // workspaces under different machine groups).
+            let mut ws = Workspace::new(
+                base,
+                PathBuf::from(&root),
+                WorkspaceColor::next_available(&used_colors),
+            );
+            ws.location = WorkspaceLocation::RemoteAgent {
+                remote_id: remote_id.to_string(),
+                workspace_id: root.clone(),
+                root,
+            };
+            ws
+        };
+        let browse_root = match &workspace.location {
+            WorkspaceLocation::RemoteAgent { root, .. } => root.clone(),
+            _ => workspace.dir.to_string_lossy().into_owned(),
+        };
+        self.add_remote_agent_tab_to_workspace(&mut workspace, browse_root, None);
+        self.workspaces.push(workspace);
+        self.active_workspace_idx = self.workspaces.len() - 1;
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.sync_plans_dir();
+        self.snap_slide_to_active_workspace();
+        self.active_workspace_idx
+    }
+
     fn resume_chat_as_tab(&mut self, id: String, recreate_dir: bool) -> Task<Event> {
         if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
@@ -5036,10 +5184,8 @@ impl App {
         };
         let cwd = entry.cwd.clone();
         let command = entry.resume_command();
-        let owning_ws = self
-            .workspaces
-            .iter()
-            .position(|ws| entry.in_workspace(&ws.dir));
+        let repo_root = entry.repo_root.clone();
+        let repo_name = entry.group_name();
 
         if !cwd.exists() {
             if !recreate_dir {
@@ -5059,10 +5205,9 @@ impl App {
         }
 
         let mut tasks = Vec::new();
-        if let Some(ws_idx) = owning_ws {
-            if ws_idx != self.active_workspace_idx {
-                tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
-            }
+        let ws_idx = self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name);
+        if ws_idx != self.active_workspace_idx {
+            tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
         self.add_tab_with_command(cwd, Some(command));
         if let Some(tab) = self.active_tab_mut() {
@@ -5102,41 +5247,17 @@ impl App {
         let entry_root = entry.repo_root.clone();
         let entry_snapshot = entry.clone();
 
-        let ws_of_remote = |ws: &Workspace| match &ws.location {
-            WorkspaceLocation::RemoteAgent { remote_id: rid, .. } => *rid == remote_id,
-            _ => false,
-        };
-        // Prefer a workspace whose root actually contains the chat;
-        // fall back to any open workspace on that remote.
-        let owning_exact = self.workspaces.iter().position(|ws| match &ws.location {
-            WorkspaceLocation::RemoteAgent {
-                remote_id: rid,
-                root,
-                ..
-            } => {
-                *rid == remote_id
-                    && (entry_cwd.starts_with(Path::new(root))
-                        || entry_root
-                            .as_deref()
-                            .is_some_and(|r| r.starts_with(Path::new(root))))
-            }
-            _ => false,
-        });
-        let Some(ws_idx) = owning_exact.or_else(|| self.workspaces.iter().position(ws_of_remote))
-        else {
-            eprintln!(
-                "[chats] no open workspace for remote {remote_id}; cannot resume {id} \
-                 (reopen-on-resume lands in slice 5)"
-            );
+        let Some(agent) = self.fresh_remote_agent_config(&remote_id) else {
+            eprintln!("[chats] no config for remote {remote_id}; cannot resume {id}");
             return Task::none();
         };
+        // Slice 5: open, reopen, or create the owning workspace on that
+        // machine — a chat always resumes into its repo's workspace.
+        let ws_idx =
+            self.ensure_remote_workspace_for_chat(&remote_id, &entry_cwd, entry_root.as_deref());
         let WorkspaceLocation::RemoteAgent { workspace_id, .. } =
             self.workspaces[ws_idx].location.clone()
         else {
-            return Task::none();
-        };
-        let Some(agent) = self.fresh_remote_agent_config(&remote_id) else {
-            eprintln!("[chats] no config for remote {remote_id}; cannot resume {id}");
             return Task::none();
         };
         // Agent daemons run with a minimal launchd PATH; the harness
@@ -7194,14 +7315,24 @@ fi
     }
 
     fn title(&self) -> String {
-        if let Some(ws) = self.active_workspace() {
-            if let Some(tab) = ws.active_tab() {
-                format!("{} - {} - {}", self.title, ws.name, tab.repo_name)
-            } else {
-                format!("{} - {}", self.title, ws.name)
+        let Some(ws) = self.active_workspace() else {
+            return self.title.clone();
+        };
+        // Make the machine unmistakable when working on a remote.
+        let machine = match &ws.location {
+            WorkspaceLocation::RemoteAgent { remote_id, .. } => {
+                let name = self
+                    .remote_agent_config_by_id(remote_id)
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_else(|| remote_id.clone());
+                format!(" @ {name}")
             }
+            _ => String::new(),
+        };
+        if let Some(tab) = ws.active_tab() {
+            format!("{} - {} - {}{machine}", self.title, ws.name, tab.repo_name)
         } else {
-            self.title.clone()
+            format!("{} - {}{machine}", self.title, ws.name)
         }
     }
 
@@ -8073,11 +8204,27 @@ fi
                         return Task::none();
                     };
                     let local_cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                    let machine = self
+                        .active_workspace()
+                        .and_then(|ws| match &ws.location {
+                            WorkspaceLocation::RemoteAgent { remote_id, .. } => {
+                                Some(remote_id.clone())
+                            }
+                            _ => None,
+                        })
+                        .map(|remote_id| {
+                            self.remote_agent_config_by_id(&remote_id)
+                                .map(|agent| agent.name.clone())
+                                .unwrap_or(remote_id)
+                        });
                     self.add_tab_with_command(local_cwd, Some(attach_command));
                     if let Some(tab) = self.active_tab_mut() {
                         let mut label = kind;
                         if let Some(first) = label.get_mut(0..1) {
                             first.make_ascii_uppercase();
+                        }
+                        if let Some(machine) = &machine {
+                            label = format!("{label} @ {machine}");
                         }
                         tab.repo_name = label.clone();
                         tab.set_terminal_title(Some(label));
@@ -12410,7 +12557,18 @@ fi
                 .color(text_color)
                 .font(iced::Font::with_name("Menlo"));
 
-            let mut btn_content = row![dot, label].spacing(6).align_y(iced::Alignment::Center);
+            let mut btn_content = row![dot].spacing(6).align_y(iced::Alignment::Center);
+            // Remote workspaces carry a machine glyph so "where am I"
+            // never depends on how the workspace happens to be named.
+            if matches!(ws.location, WorkspaceLocation::RemoteAgent { .. }) {
+                btn_content = btn_content.push(
+                    text("⇄")
+                        .size(10)
+                        .color(theme.accent())
+                        .font(iced::Font::with_name("Menlo")),
+                );
+            }
+            btn_content = btn_content.push(label);
 
             // Gear icon button for active workspace settings
             if is_active {
@@ -15145,14 +15303,6 @@ fi
         // warning when the transcript is still growing).
         let is_live = self.find_chat_tab(&entry.id).is_some();
         let is_remote = entry_remote_id.is_some();
-        // Remote resume parents the session under an open workspace on
-        // that machine; without one we must say so, not silently no-op.
-        let remote_ws_open = entry_remote_id.is_none_or(|rid| {
-            self.workspaces.iter().any(|ws| {
-                matches!(&ws.location,
-                    WorkspaceLocation::RemoteAgent { remote_id, .. } if remote_id == rid)
-            })
-        });
         let action_button = |label: &'static str, color: iced::Color, event: Event| {
             button(text(label).size(font_small).color(color))
                 .style(move |_theme, _status| button::Style {
@@ -15188,16 +15338,6 @@ fi
                 ))
                 .size(font_small - 1.0)
                 .color(theme.overlay1()),
-            );
-        } else if is_remote && !remote_ws_open {
-            actions = actions.push(
-                text(format!(
-                    "open a workspace on {} first — resume parents the session there \
-                     (reopen-on-resume lands in slice 5)",
-                    machine_name.as_deref().unwrap_or("that machine")
-                ))
-                .size(font_small - 1.0)
-                .color(theme.yellow()),
             );
         } else if cwd_gone && is_remote {
             actions = actions.push(

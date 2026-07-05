@@ -183,7 +183,12 @@ on `master` as the stable daily driver.
 - [ ] 4b. Workspace bar/rail grouped by machine, remotes always visible
         with reachable/unreachable state (own mockup before build — this
         touches the whole rail, not just Chats).
-- [ ] 5. Closed-workspace reopen-on-resume.
+- [x] 5. Reopen-on-resume, extended per user feedback (2026-07-04): a
+        chat always resumes into its repo's workspace on its machine —
+        open workspace activated, closed workspace reopened with its
+        saved settings, and a brand-new workspace created when the repo
+        never had one (local: repo root; remote: picker conventions,
+        remote browser tab). The slice-4 guest-tab fallback is gone.
 - [ ] 6. (Optional, later) per-tab composer input box that writes to the PTY —
         deprioritized; voice input covers most of this need.
 
