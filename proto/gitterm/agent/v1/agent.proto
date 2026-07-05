@@ -12,6 +12,10 @@ service GitTermAgent {
   rpc StartSession(StartSessionRequest) returns (Session);
   rpc StopSession(StopSessionRequest) returns (StopSessionResponse);
   rpc AttachTerminal(stream TerminalInput) returns (stream TerminalOutput);
+  // Chats index (TRU-78): the agent scans its own harness transcript
+  // stores (claude/codex/pi) with the same code the desktop uses locally.
+  rpc ListChats(ListChatsRequest) returns (ListChatsResponse);
+  rpc ChatPreview(ChatPreviewRequest) returns (ChatPreviewResponse);
 }
 
 message HandshakeRequest {
@@ -195,4 +199,45 @@ message TerminalOutput {
 
 message SessionExited {
   int32 exit_code = 1;
+}
+
+message ListChatsRequest {}
+
+message ChatEntry {
+  string id = 1;
+  // "claude" | "codex" | "pi"
+  string backend = 2;
+  // Transcript path on the agent's machine (opaque to the desktop).
+  string path = 3;
+  string cwd = 4;
+  // Empty when unknown (dead cwd / not a git repo).
+  string repo_root = 5;
+  bool is_worktree = 6;
+  // Empty when unknown.
+  string branch = 7;
+  string title = 8;
+  int64 mtime_unix_secs = 9;
+  uint64 size_bytes = 10;
+  bool dead_cwd = 11;
+}
+
+message ListChatsResponse {
+  repeated ChatEntry chats = 1;
+}
+
+message ChatPreviewRequest {
+  // Path previously returned by ListChats; must stay under the agent
+  // user's home directory.
+  string path = 1;
+  string backend = 2;
+}
+
+message ChatPreviewMessage {
+  bool is_user = 1;
+  string text = 2;
+}
+
+message ChatPreviewResponse {
+  repeated ChatPreviewMessage messages = 1;
+  optional uint64 message_count = 2;
 }

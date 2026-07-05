@@ -54,16 +54,6 @@ pub fn global_config_dir() -> PathBuf {
         .join("gitterm")
 }
 
-/// Claude Code's home directory (session transcripts live under
-/// `projects/`). Deliberately NOT affected by GITTERM_CONFIG_DIR: that
-/// override isolates GitTerm's own state; the chats index is read-only
-/// over harness files and should see the real ones.
-pub fn claude_home_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
-}
-
 /// Get the base config directory for this instance
 pub fn instance_config_dir() -> PathBuf {
     global_config_dir().join(format!("instance-{}", instance_id()))

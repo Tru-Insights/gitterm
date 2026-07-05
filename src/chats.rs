@@ -60,6 +60,17 @@ pub enum ChatBackend {
 
 impl ChatBackend {
     pub const ALL: [ChatBackend; 3] = [ChatBackend::Claude, ChatBackend::Codex, ChatBackend::Pi];
+
+    /// Inverse of `label()`; used to decode the wire form of remote
+    /// chat entries.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "claude" => Some(ChatBackend::Claude),
+            "codex" => Some(ChatBackend::Codex),
+            "pi" => Some(ChatBackend::Pi),
+            _ => None,
+        }
+    }
 }
 
 /// The three scope rings of the Chats panel. With only the local machine
@@ -554,7 +565,7 @@ fn index_pi_transcript(path: &Path) -> Option<ChatIndexEntry> {
 
 /// Resolved git identity of a cwd: (main-repo root, is_worktree).
 fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
-    let out = gitterm::agentd::git::git_command()
+    let out = crate::agentd::git::git_command()
         .args([
             "--no-optional-locks",
             "rev-parse",
@@ -606,11 +617,19 @@ fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Claude Code's home dir. Deliberately independent of GitTerm's config
+/// dir override: the index is read-only over harness files and should
+/// see the real ones on whichever machine this code runs (desktop or
+/// agentd on a remote host).
+fn claude_home_dir() -> PathBuf {
+    home_dir().join(".claude")
+}
+
 /// Build the full local index across all backends. Blocking; run on a
 /// background Task.
 pub fn build_local_index() -> Vec<ChatIndexEntry> {
     let mut entries = Vec::new();
-    for path in jsonl_files_under(&crate::config::claude_home_dir().join("projects"), 1) {
+    for path in jsonl_files_under(&claude_home_dir().join("projects"), 1) {
         if let Some(entry) = index_transcript(&path, ChatBackend::Claude) {
             entries.push(entry);
         }

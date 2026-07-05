@@ -169,12 +169,17 @@ on `master` as the stable daily driver.
         (session not found from any other directory), so resume must always
         spawn in the recorded cwd and the dead-cwd rescue is "recreate
         directory & resume", not "resume in repo root".
-- [ ] 3. Codex + pi adapters via config.
-- [ ] 4. Remote machines: run the same adapters over agentd (list/stat/tail
-        via WorkspaceSource `sessions` capability), machine sections in
-        Everywhere scope, locally cached remote index with unreachable
-        state, resume = agentd session + attach (subsumes the TRU-77
-        "session reattach UI" slice).
+- [x] 3. Codex + pi adapters via config. (PR #13; headless codex exec
+        runs excluded; `pi --session <id>` is the direct resume form.)
+- [x] 4. Remote machines: the agent runs the same `chats` module against
+        its own disk and serves ListChats/ChatPreview RPCs; machine
+        sections in Everywhere scope with ● connected / ⟳ syncing /
+        ○ unreachable (cached index kept in memory); resume = agentd
+        session running the resume command in the recorded cwd + attach
+        tab (subsumes the TRU-77 "session reattach UI" slice). Still
+        open from this slice: disk-persisted remote cache across app
+        restarts, remote dead-cwd rescue, pre-assigned session ids for
+        remote picker launches.
 - [ ] 4b. Workspace bar/rail grouped by machine, remotes always visible
         with reachable/unreachable state (own mockup before build — this
         touches the whole rail, not just Chats).
