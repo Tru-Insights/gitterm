@@ -35,6 +35,7 @@ mod webview;
 
 // New modules
 mod agent;
+mod chats;
 mod config;
 mod events;
 mod tab;
@@ -2106,6 +2107,9 @@ struct TabState {
     claude_config: ClaudeConfig,
     // Agent activity sidebar state (shared across tab kinds — see AgentActivityState).
     agent_sidebar: AgentActivityState,
+    // Chat selected in the Chats sidebar; the main pane shows its preview
+    // while the Chats mode is active.
+    selected_chat_id: Option<String>,
     is_git_repo: bool,
 }
 
@@ -2155,6 +2159,7 @@ impl TabState {
             files: FilesState::at(SourcePath::Local(current_dir.clone())),
             current_dir,
             search: SearchState::default(),
+            selected_chat_id: None,
             needs_attention: false,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
@@ -3584,6 +3589,14 @@ pub enum Event {
     BottomTerminalClicked(usize),
     GitStatusLoaded(GitStatusSnapshot),
     GitWorktreesLoaded(GitWorktreesSnapshot),
+    // Chats panel (TRU-78)
+    RefreshChatIndex,
+    ChatIndexLoaded(Vec<chats::ChatIndexEntry>),
+    ChatsQueryChanged(String),
+    ChatsScopeChanged(chats::ChatScope),
+    SelectChat(String),
+    CloseChatPreview,
+    ChatPreviewLoaded(String, chats::ChatPreview),
     RefreshRemoteSessions,
     RemoteSessionsLoaded(RemoteSessionsSnapshot),
     RemoteAgentConnect(String),
@@ -3673,6 +3686,16 @@ struct App {
     remote_sessions_loading: bool,
     remote_sessions_error: Option<String>,
     remote_sessions_loaded_at: Option<Instant>,
+    // Chats panel (TRU-78): machine-wide conversation index + UI state.
+    // App-level because the index spans workspaces; selection is per-tab.
+    chat_index: Vec<chats::ChatIndexEntry>,
+    chat_index_loading: bool,
+    chat_index_loaded_at: Option<Instant>,
+    chat_query: String,
+    chat_scope: chats::ChatScope,
+    /// Preview tail for the most recently selected chat, keyed by session
+    /// id so a stale load never renders under the wrong chat.
+    chat_preview: Option<(String, chats::ChatPreview)>,
     // Track whether the window has focus (skip terminal processing when unfocused)
     window_focused: bool,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
@@ -4833,6 +4856,55 @@ impl App {
         )
     }
 
+    fn request_chat_index() -> Task<Event> {
+        Task::perform(
+            async move {
+                match tokio::task::spawn_blocking(chats::build_local_index).await {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        eprintln!("[chats] index task failed: {err}");
+                        Vec::new()
+                    }
+                }
+            },
+            Event::ChatIndexLoaded,
+        )
+    }
+
+    /// Refresh the chat index unless a load is in flight or the current
+    /// one is fresh enough. Called when the Chats tab is opened.
+    fn refresh_chat_index_if_stale(&mut self) -> Task<Event> {
+        const CHAT_INDEX_FRESH_SECS: u64 = 30;
+        if self.chat_index_loading {
+            return Task::none();
+        }
+        if self
+            .chat_index_loaded_at
+            .is_some_and(|at| at.elapsed().as_secs() < CHAT_INDEX_FRESH_SECS)
+        {
+            return Task::none();
+        }
+        self.chat_index_loading = true;
+        Self::request_chat_index()
+    }
+
+    fn request_chat_preview(id: String, path: PathBuf) -> Task<Event> {
+        Task::perform(
+            async move {
+                let preview =
+                    match tokio::task::spawn_blocking(move || chats::load_preview(&path)).await {
+                        Ok(preview) => preview,
+                        Err(err) => {
+                            eprintln!("[chats] preview task failed: {err}");
+                            chats::ChatPreview::default()
+                        }
+                    };
+                (id, preview)
+            },
+            |(id, preview)| Event::ChatPreviewLoaded(id, preview),
+        )
+    }
+
     fn request_git_worktrees(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
         Self::request_workspace_git_worktrees(WorkspaceGitWorktreesRequest {
             backend: WorkspaceBackendRef::Local {
@@ -5274,6 +5346,12 @@ impl App {
             stt_transcribing: false,
             webview_kind: WebviewKind::None,
             webview_agent_tab_id: None,
+            chat_index: Vec::new(),
+            chat_index_loading: false,
+            chat_index_loaded_at: None,
+            chat_query: String::new(),
+            chat_scope: chats::ChatScope::default(),
+            chat_preview: None,
         };
 
         if let Some(remote_file) = RemoteSessionsFile::load() {
@@ -8113,6 +8191,13 @@ fi
                         }
                     }
 
+                    // Escape closes the chat preview in Chats mode
+                    if tab.sidebar_mode == SidebarMode::Chats && tab.selected_chat_id.is_some() {
+                        if let Key::Named(key::Named::Escape) = key.as_ref() {
+                            return Task::done(Event::CloseChatPreview);
+                        }
+                    }
+
                     if let Some(selected) = &tab.selected_file {
                         // In diff view - handle navigation
                         match key.as_ref() {
@@ -8358,6 +8443,21 @@ fi
                                 tab.diff_load_started_at = None;
                                 tab.diff_syntax_lines = None;
                                 tab.diff_syntax_notice = None;
+                            }
+                            SidebarMode::Chats => {
+                                // Switching to Chats mode - clear other detail panes;
+                                // the index refreshes in the background if stale.
+                                tab.agent_sidebar.selected_capture_idx = None;
+                                tab.agent_sidebar.conversation = None;
+                                tab.close_file_viewer();
+                                tab.selected_file = None;
+                                tab.diff_lines.clear();
+                                tab.diff_load_in_progress = false;
+                                tab.diff_load_started_at = None;
+                                tab.diff_syntax_lines = None;
+                                tab.diff_syntax_notice = None;
+                                tab.sidebar_mode = mode;
+                                return self.refresh_chat_index_if_stale();
                             }
                             SidebarMode::Remote => {
                                 // Switching to Remote mode - clear local file/git detail panes.
@@ -9161,6 +9261,51 @@ fi
                 }
 
                 return scroll_task;
+            }
+            Event::RefreshChatIndex => {
+                self.chat_index_loading = true;
+                return Self::request_chat_index();
+            }
+            Event::ChatIndexLoaded(entries) => {
+                self.chat_index = entries;
+                self.chat_index_loading = false;
+                self.chat_index_loaded_at = Some(Instant::now());
+            }
+            Event::ChatsQueryChanged(query) => {
+                self.chat_query = query;
+            }
+            Event::ChatsScopeChanged(scope) => {
+                self.chat_scope = scope;
+            }
+            Event::SelectChat(id) => {
+                let already_selected = self
+                    .active_tab()
+                    .is_some_and(|tab| tab.selected_chat_id.as_deref() == Some(id.as_str()));
+                if already_selected {
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.selected_chat_id = None;
+                    }
+                    return Task::none();
+                }
+                let path = self
+                    .chat_index
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| entry.path.clone());
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selected_chat_id = Some(id.clone());
+                }
+                if let Some(path) = path {
+                    return Self::request_chat_preview(id, path);
+                }
+            }
+            Event::CloseChatPreview => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selected_chat_id = None;
+                }
+            }
+            Event::ChatPreviewLoaded(id, preview) => {
+                self.chat_preview = Some((id, preview));
             }
             Event::GitStatusLoaded(snapshot) => {
                 if let Some(tab) = self
@@ -12594,6 +12739,11 @@ fi
                 freeze_time!("view_agent_conversation", {
                     self.view_agent_conversation(tab)
                 })
+            } else if tab.sidebar_mode == SidebarMode::Chats {
+                // The whole main pane belongs to Chats while the panel is
+                // open — also keeps the terminal out of the widget tree so
+                // typing in the chats search can never leak into the PTY.
+                freeze_time!("view_chat_preview", { self.view_chat_preview(tab) })
             } else if tab.viewing_file_path().is_some() {
                 freeze_time!("view_file_content", { self.view_file_content(tab) })
             } else if tab.selected_file.is_some() {
@@ -13122,6 +13272,12 @@ fi
             SidebarMode::Plans => {
                 freeze_time!("view_plans_sidebar", { self.view_plans_sidebar() })
             }
+            SidebarMode::Chats if workspace_is_remote => {
+                self.view_remote_local_mode_placeholder("Chats")
+            }
+            SidebarMode::Chats => {
+                freeze_time!("view_chats_sidebar", { self.view_chats_sidebar(tab) })
+            }
             SidebarMode::Remote => {
                 freeze_time!("view_remote_sidebar", { self.view_remote_sidebar() })
             }
@@ -13457,11 +13613,24 @@ fi
             Event::SetSidebarMode(SidebarMode::Plans),
         );
 
+        let chats_active = tab.sidebar_mode == SidebarMode::Chats;
+        let chats_text_color = if chats_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
+        let chats_tab = self.view_sidebar_tab(
+            text("Chats").size(font).color(chats_text_color).into(),
+            chats_active,
+            Event::SetSidebarMode(SidebarMode::Chats),
+        );
+
         let mut tabs = Row::new()
             .spacing(0)
             .push(git_tab)
             .push(files_tab)
             .push(agent_tab)
+            .push(chats_tab)
             .push(plans_tab);
 
         if workspace_is_remote {
@@ -13991,6 +14160,399 @@ fi
 
     /// Sidebar list of markdown files from the active workspace's `.plans/`
     /// and `docs/` directories. Reads fresh on render; cache if it grows.
+    /// Sidebar for the Chats tab (TRU-78 slice 1): search, scope toggle,
+    /// conversations grouped by repo. Pure render over `self.chat_index`;
+    /// all file IO happened in the background index task.
+    fn view_chats_sidebar<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+
+        let input_bg = theme.bg_crust();
+        let input_border = theme.surface1();
+        let input_text = theme.text_primary();
+        let input_placeholder = theme.overlay0();
+        let input_selection = theme.accent();
+        let search = text_input("search conversations…", &self.chat_query)
+            .on_input(Event::ChatsQueryChanged)
+            .size(font_small)
+            .padding([5, 8])
+            .style(move |_theme, _status| text_input::Style {
+                background: input_bg.into(),
+                border: iced::Border {
+                    width: 1.0,
+                    color: input_border,
+                    radius: 4.0.into(),
+                },
+                icon: iced::Color::TRANSPARENT,
+                placeholder: input_placeholder,
+                value: input_text,
+                selection: input_selection,
+            });
+
+        let scope_button = |label: &'static str, scope: chats::ChatScope| {
+            let active = self.chat_scope == scope;
+            let bg = if active {
+                Some(theme.surface0().into())
+            } else {
+                None
+            };
+            let color = if active {
+                theme.text_primary()
+            } else {
+                theme.overlay1()
+            };
+            button(text(label).size(font_small - 1.0).color(color))
+                .style(move |_theme, _status| button::Style {
+                    background: bg,
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .padding([3, 8])
+                .on_press(Event::ChatsScopeChanged(scope))
+        };
+        let scope_row = row![
+            scope_button("This workspace", chats::ChatScope::Workspace),
+            scope_button("This machine", chats::ChatScope::Machine),
+            scope_button("Everywhere", chats::ChatScope::Everywhere),
+        ]
+        .spacing(2);
+
+        let workspace_dir = self
+            .workspaces
+            .get(self.active_workspace_idx)
+            .map(|ws| ws.dir.clone());
+        let query = self.chat_query.to_lowercase();
+        let in_scope = |entry: &&chats::ChatIndexEntry| match self.chat_scope {
+            chats::ChatScope::Workspace => workspace_dir
+                .as_deref()
+                .is_some_and(|dir| entry.in_workspace(dir)),
+            // One machine indexed so far; these rings diverge at slice 4.
+            chats::ChatScope::Machine | chats::ChatScope::Everywhere => true,
+        };
+        let visible: Vec<&chats::ChatIndexEntry> = self
+            .chat_index
+            .iter()
+            .filter(in_scope)
+            .filter(|entry| entry.matches_query(&query))
+            .collect();
+
+        // Group by repo root, preserving most-recent-first order.
+        let mut groups: Vec<(&std::path::Path, Vec<&chats::ChatIndexEntry>)> = Vec::new();
+        for entry in &visible {
+            match groups
+                .iter_mut()
+                .find(|(root, _)| *root == entry.group_root())
+            {
+                Some((_, list)) => list.push(entry),
+                None => groups.push((entry.group_root(), vec![entry])),
+            }
+        }
+
+        let mut list = Column::new().spacing(2).padding([4, 6]);
+        if self.chat_index_loading && self.chat_index.is_empty() {
+            list = list.push(
+                text("indexing conversations…")
+                    .size(font_small)
+                    .color(theme.text_muted()),
+            );
+        } else if visible.is_empty() {
+            let msg = if self.chat_query.is_empty() {
+                "no conversations in this scope"
+            } else {
+                "no matches in this scope"
+            };
+            list = list.push(text(msg).size(font_small).color(theme.text_secondary()));
+        }
+
+        let selected_bg = theme.surface0();
+        let selected_border = theme.surface1();
+        for (root, entries) in groups {
+            let group_name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.to_string_lossy().to_string());
+            list = list.push(
+                row![
+                    text(group_name.to_uppercase())
+                        .size(10)
+                        .color(theme.overlay0()),
+                    text(format!("{}", entries.len()))
+                        .size(10)
+                        .color(theme.text_muted()),
+                ]
+                .spacing(6)
+                .padding([6, 2]),
+            );
+            for entry in entries {
+                let is_selected = tab.selected_chat_id.as_deref() == Some(entry.id.as_str());
+                let mut meta = Row::new().spacing(8).push(
+                    text(chats::format_age(entry.mtime))
+                        .size(font_small - 1.0)
+                        .color(theme.text_muted()),
+                );
+                if let Some(branch) = &entry.branch {
+                    meta = meta.push(
+                        text(branch.clone())
+                            .size(font_small - 1.0)
+                            .color(theme.overlay1()),
+                    );
+                }
+                if entry.is_worktree {
+                    meta = meta.push(text("worktree").size(font_small - 1.0).color(theme.mauve()));
+                }
+                if entry.dead_cwd {
+                    meta = meta.push(text("⚠ dir gone").size(font_small - 1.0).color(theme.red()));
+                }
+                let content = column![
+                    row![
+                        text("●").size(8).color(theme.peach()),
+                        text(entry.title.clone())
+                            .size(font_small)
+                            .color(theme.text_primary()),
+                    ]
+                    .spacing(6),
+                    meta,
+                ]
+                .spacing(2);
+                let mut btn = button(content)
+                    .padding([6, 8])
+                    .width(Length::Fill)
+                    .on_press(Event::SelectChat(entry.id.clone()));
+                btn = if is_selected {
+                    btn.style(move |_theme, _status| button::Style {
+                        background: Some(selected_bg.into()),
+                        border: iced::Border {
+                            width: 1.0,
+                            color: selected_border,
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                } else {
+                    btn.style(self.ghost_button_style())
+                };
+                list = list.push(btn);
+            }
+        }
+
+        // Scoped search missed (or partially missed) — offer the wider ring.
+        if self.chat_scope == chats::ChatScope::Workspace && !self.chat_query.is_empty() {
+            let total_matches = self
+                .chat_index
+                .iter()
+                .filter(|entry| entry.matches_query(&query))
+                .count();
+            let elsewhere = total_matches.saturating_sub(visible.len());
+            if elsewhere > 0 {
+                list = list.push(
+                    column![
+                        text(format!(
+                            "{elsewhere} match{} in other workspaces",
+                            if elsewhere == 1 { "" } else { "es" }
+                        ))
+                        .size(font_small)
+                        .color(theme.text_secondary()),
+                        button(
+                            text("Search everywhere")
+                                .size(font_small)
+                                .color(theme.accent())
+                        )
+                        .style(self.ghost_button_style())
+                        .padding([3, 8])
+                        .on_press(Event::ChatsScopeChanged(chats::ChatScope::Everywhere)),
+                    ]
+                    .spacing(4)
+                    .padding([10, 8]),
+                );
+            }
+        }
+
+        column![
+            container(search).padding([6, 8]),
+            container(scope_row).padding([0, 8]),
+            scrollable(list).height(Length::Fill),
+        ]
+        .spacing(4)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// Main-pane preview for the chat selected in the Chats sidebar:
+    /// metadata header + lazily loaded transcript tail. Read-only —
+    /// resume actions land in slice 2.
+    fn view_chat_preview<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+
+        let Some(selected_id) = tab.selected_chat_id.as_deref() else {
+            return container(
+                text("select a conversation to preview it")
+                    .size(font)
+                    .color(theme.text_muted()),
+            )
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into();
+        };
+        let Some(entry) = self.chat_index.iter().find(|entry| entry.id == selected_id) else {
+            return container(
+                text("conversation no longer in the index")
+                    .size(font)
+                    .color(theme.text_muted()),
+            )
+            .padding(20)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        };
+
+        let preview = self
+            .chat_preview
+            .as_ref()
+            .filter(|(id, _)| *id == entry.id)
+            .map(|(_, preview)| preview);
+
+        let mut meta = Row::new()
+            .spacing(14)
+            .push(
+                text(format!("● {}", entry.backend.label()))
+                    .size(font_small)
+                    .color(theme.peach()),
+            )
+            .push(
+                text(chats::format_size(entry.size))
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            )
+            .push(
+                text(format!("{} ago", chats::format_age(entry.mtime)))
+                    .size(font_small)
+                    .color(theme.text_muted()),
+            );
+        if let Some(count) = preview.and_then(|p| p.message_count) {
+            meta = meta.push(
+                text(format!("{count} messages"))
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            );
+        }
+        if let Some(branch) = &entry.branch {
+            meta = meta.push(
+                text(branch.clone())
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            );
+        }
+
+        let cwd_color = if entry.dead_cwd {
+            theme.red()
+        } else {
+            theme.overlay1()
+        };
+        let cwd_suffix = if entry.dead_cwd {
+            " — directory no longer exists"
+        } else {
+            ""
+        };
+        let header = row![
+            column![
+                text(entry.title.clone())
+                    .size(font + 2.0)
+                    .color(theme.text_primary()),
+                meta,
+                text(format!(
+                    "{}{}{}",
+                    if entry.dead_cwd { "⚠ " } else { "" },
+                    entry.cwd.display(),
+                    cwd_suffix
+                ))
+                .size(font_small)
+                .color(cwd_color),
+            ]
+            .spacing(6)
+            .width(Length::Fill),
+            button(text("✕").size(font).color(theme.overlay1()))
+                .style(self.ghost_button_style())
+                .padding([2, 8])
+                .on_press(Event::CloseChatPreview),
+        ]
+        .spacing(10);
+
+        let mut body = Column::new().spacing(12).padding([14, 18]);
+        match preview {
+            None => {
+                body = body.push(
+                    text("loading preview…")
+                        .size(font_small)
+                        .color(theme.text_muted()),
+                );
+            }
+            Some(preview) => {
+                if let Some(count) = preview.message_count {
+                    let shown = preview.messages.len() as u64;
+                    if count > shown {
+                        body = body.push(
+                            text(format!("— {} earlier messages —", count - shown))
+                                .size(font_small)
+                                .color(theme.overlay0()),
+                        );
+                    }
+                }
+                if preview.messages.is_empty() {
+                    body = body.push(
+                        text("no renderable messages in the transcript tail")
+                            .size(font_small)
+                            .color(theme.text_muted()),
+                    );
+                }
+                for message in &preview.messages {
+                    let (who, who_color) = if message.is_user {
+                        ("YOU", theme.green())
+                    } else {
+                        (entry.backend.label(), theme.peach())
+                    };
+                    body = body.push(
+                        column![
+                            text(who.to_uppercase()).size(9).color(who_color),
+                            text(message.text.clone())
+                                .size(font_small)
+                                .color(if message.is_user {
+                                    theme.text_primary()
+                                } else {
+                                    theme.text_secondary()
+                                }),
+                        ]
+                        .spacing(3),
+                    );
+                }
+                body = body.push(
+                    text("end of transcript · read-only preview (resume lands in slice 2)")
+                        .size(font_small - 1.0)
+                        .color(theme.overlay0()),
+                );
+            }
+        }
+
+        column![
+            container(header).padding([14, 18]).width(Length::Fill),
+            scrollable(body).height(Length::Fill),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
     fn view_plans_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
