@@ -524,6 +524,12 @@ pub struct WorkspaceTabConfig {
     /// ignored otherwise. Schema: `{"backend": "pi"|"claude", ...backend-specific fields}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_config: Option<crate::tab::AgentBackendConfig>,
+    /// Harness conversation owned by this tab (claude session uuid) — set
+    /// when the tab was spawned by the Chats panel resume flow or by a
+    /// picker launch with a pre-assigned id. Keys the one-live-tab-per-
+    /// conversation registry rule (TRU-78) and survives restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

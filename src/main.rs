@@ -2110,6 +2110,10 @@ struct TabState {
     // Chat selected in the Chats sidebar; the main pane shows its preview
     // while the Chats mode is active.
     selected_chat_id: Option<String>,
+    // Harness conversation this tab owns (claude session uuid). Set by the
+    // Chats resume flow and by picker launches with a pre-assigned id;
+    // persisted so the registry rule survives restarts.
+    chat_session_id: Option<String>,
     is_git_repo: bool,
 }
 
@@ -2160,6 +2164,7 @@ impl TabState {
             current_dir,
             search: SearchState::default(),
             selected_chat_id: None,
+            chat_session_id: None,
             needs_attention: false,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
@@ -3597,6 +3602,15 @@ pub enum Event {
     SelectChat(String),
     CloseChatPreview,
     ChatPreviewLoaded(String, chats::ChatPreview),
+    /// Resume a conversation as a new tab in its recorded cwd (registry
+    /// rule: focuses the existing tab instead if one owns the session).
+    ResumeChatAsTab(String),
+    /// Dead-cwd rescue: recreate the recorded directory, then resume.
+    /// (`claude --resume` is cwd-scoped — verified 2026-07-04 — so the
+    /// session can only be found from its original directory.)
+    ResumeChatRecreateDir(String),
+    /// Focus the live tab owning a conversation, jumping workspaces.
+    FocusChatTab(String),
     RefreshRemoteSessions,
     RemoteSessionsLoaded(RemoteSessionsSnapshot),
     RemoteAgentConnect(String),
@@ -4413,6 +4427,7 @@ impl App {
                             TabKind::Agent(_) => Some("agent".to_string()),
                         },
                         agent_config: tab.agent_session().map(|s| s.config.clone()),
+                        chat_session_id: tab.chat_session_id.clone(),
                     })
                     .collect(),
                 run_command: ws.console.run_command.clone(),
@@ -4854,6 +4869,84 @@ impl App {
             },
             Event::GitStatusLoaded,
         )
+    }
+
+    /// The open tab owning a conversation, as (workspace idx, tab idx).
+    /// Backbone of the registry rule: one conversation ⇒ at most one tab.
+    fn find_chat_tab(&self, session_id: &str) -> Option<(usize, usize)> {
+        self.workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
+            ws.tabs
+                .iter()
+                .position(|tab| tab.chat_session_id.as_deref() == Some(session_id))
+                .map(|tab_idx| (ws_idx, tab_idx))
+        })
+    }
+
+    /// Focus a specific tab, switching workspaces first when needed
+    /// (the Chats panel's Go-to-Tab, which may jump workspaces).
+    fn focus_workspace_tab(&mut self, ws_idx: usize, tab_idx: usize) -> Task<Event> {
+        let mut tasks = Vec::new();
+        if ws_idx != self.active_workspace_idx {
+            tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
+        }
+        tasks.push(self.update(Event::TabSelect(tab_idx)));
+        Task::batch(tasks)
+    }
+
+    /// Resume a conversation as a new tab running its resume command in
+    /// its recorded cwd. Honors the registry rule and follows the chat
+    /// home to its owning workspace when that workspace is open.
+    fn resume_chat_as_tab(&mut self, id: String, recreate_dir: bool) -> Task<Event> {
+        if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
+            return self.focus_workspace_tab(ws_idx, tab_idx);
+        }
+        let Some(entry) = self.chat_index.iter().find(|entry| entry.id == id) else {
+            return Task::none();
+        };
+        let cwd = entry.cwd.clone();
+        let command = entry.resume_command();
+        let owning_ws = self
+            .workspaces
+            .iter()
+            .position(|ws| entry.in_workspace(&ws.dir));
+
+        if !cwd.exists() {
+            if !recreate_dir {
+                eprintln!(
+                    "[chats] not resuming {id}: recorded cwd {} is gone (use the rescue action)",
+                    cwd.display()
+                );
+                return Task::none();
+            }
+            if let Err(err) = std::fs::create_dir_all(&cwd) {
+                eprintln!(
+                    "[chats] cannot recreate {} to resume {id}: {err}",
+                    cwd.display()
+                );
+                return Task::none();
+            }
+        }
+
+        let mut tasks = Vec::new();
+        if let Some(ws_idx) = owning_ws {
+            if ws_idx != self.active_workspace_idx {
+                tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
+            }
+        }
+        self.add_tab_with_command(cwd, Some(command));
+        if let Some(tab) = self.active_tab_mut() {
+            tab.chat_session_id = Some(id);
+            tab.git_status_loading = true;
+        }
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        if let Some((tab_id, repo_path)) =
+            self.active_tab().map(|tab| (tab.id, tab.repo_path.clone()))
+        {
+            tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
+        }
+        tasks.push(self.scroll_to_active_tab());
+        Task::batch(tasks)
     }
 
     fn request_chat_index() -> Task<Event> {
@@ -5556,6 +5649,13 @@ impl App {
                                 );
                             }
                         }
+                        // Restore the tab↔conversation mapping so the
+                        // Chats registry rule survives restarts.
+                        if let Some(session_id) = &tab_config.chat_session_id {
+                            if let Some(tab) = workspace.tabs.last_mut() {
+                                tab.chat_session_id = Some(session_id.clone());
+                            }
+                        }
                     }
                 }
 
@@ -5745,10 +5845,28 @@ impl App {
     /// Open a new session tab through the active workspace's source: local
     /// sources spawn the usual local terminal; remote-agent sources start a
     /// session on the agent and the tab attaches to it.
+    /// For backends that support it, pre-assign a session id at launch so
+    /// the tab↔conversation mapping is exact from birth (TRU-78 registry
+    /// rule). Only plain `claude` launches qualify — resume commands and
+    /// other backends pass through untouched.
+    fn with_preassigned_session_id(command: &str) -> (String, Option<String>) {
+        let is_plain_claude_launch = command.split_whitespace().next() == Some("claude")
+            && !command.contains("--resume")
+            && !command.contains("--continue")
+            && !command.contains("--session-id");
+        if is_plain_claude_launch {
+            let id = uuid::Uuid::new_v4().to_string();
+            (format!("{command} --session-id {id}"), Some(id))
+        } else {
+            (command.to_string(), None)
+        }
+    }
+
     fn launch_session_tab(
         &mut self,
         preset_name: Option<String>,
         local_command: Option<String>,
+        chat_session_id: Option<String>,
     ) -> Task<Event> {
         let remote = match self.source_for_active_tab() {
             Ok(source @ WorkspaceSource::RemoteAgent { .. }) if source.capabilities().sessions => {
@@ -5775,6 +5893,7 @@ impl App {
                 if let Some((tab_id, repo_path)) = {
                     if let Some(tab) = self.active_tab_mut() {
                         tab.git_status_loading = true;
+                        tab.chat_session_id = chat_session_id;
                         Some((tab.id, tab.repo_path.clone()))
                     } else {
                         None
@@ -7442,7 +7561,8 @@ fi
                         .get(idx)
                         .map(|p| (p.name.clone(), p.command.clone()));
                     if let Some((name, command)) = preset {
-                        return self.launch_session_tab(Some(name), Some(command));
+                        let (command, session_id) = Self::with_preassigned_session_id(&command);
+                        return self.launch_session_tab(Some(name), Some(command), session_id);
                     }
                 }
             }
@@ -7457,7 +7577,7 @@ fi
                     )
                 });
                 if let Some((name, command)) = preset {
-                    return self.launch_session_tab(Some(name), Some(command));
+                    return self.launch_session_tab(Some(name), Some(command), None);
                 }
             }
             Event::AgentWebviewIpc(msg) => {
@@ -7676,10 +7796,10 @@ fi
             Event::NewPlainTab => {
                 // New session tab through the active workspace's source.
                 self.tab_picker_visible = false;
-                return self.launch_session_tab(None, None);
+                return self.launch_session_tab(None, None, None);
             }
             Event::LaunchSessionKind(kind) => {
-                return self.launch_session_tab(kind, None);
+                return self.launch_session_tab(kind, None, None);
             }
             Event::RemoteSessionLaunched(result) => match result {
                 Ok((session_id, kind)) => {
@@ -9306,6 +9426,17 @@ fi
             }
             Event::ChatPreviewLoaded(id, preview) => {
                 self.chat_preview = Some((id, preview));
+            }
+            Event::ResumeChatAsTab(id) => {
+                return self.resume_chat_as_tab(id, false);
+            }
+            Event::ResumeChatRecreateDir(id) => {
+                return self.resume_chat_as_tab(id, true);
+            }
+            Event::FocusChatTab(id) => {
+                if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
+                    return self.focus_workspace_tab(ws_idx, tab_idx);
+                }
             }
             Event::GitStatusLoaded(snapshot) => {
                 if let Some(tab) = self
@@ -14270,6 +14401,12 @@ fi
             list = list.push(text(msg).size(font_small).color(theme.text_secondary()));
         }
 
+        let live_ids: std::collections::HashSet<&str> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .filter_map(|t| t.chat_session_id.as_deref())
+            .collect();
         let selected_bg = theme.surface0();
         let selected_border = theme.surface1();
         for (root, entries) in groups {
@@ -14301,6 +14438,15 @@ fi
                         text(branch.clone())
                             .size(font_small - 1.0)
                             .color(theme.overlay1()),
+                    );
+                }
+                if live_ids.contains(entry.id.as_str()) {
+                    meta = meta.push(text("● open").size(font_small - 1.0).color(theme.green()));
+                } else if entry.possibly_running() {
+                    meta = meta.push(
+                        text("◐ possibly running")
+                            .size(font_small - 1.0)
+                            .color(theme.yellow()),
                     );
                 }
                 if entry.is_worktree {
@@ -14455,16 +14601,86 @@ fi
             );
         }
 
-        let cwd_color = if entry.dead_cwd {
+        // From index time — resume re-checks the filesystem at action time.
+        let cwd_gone = entry.dead_cwd;
+        let cwd_color = if cwd_gone {
             theme.red()
         } else {
             theme.overlay1()
         };
-        let cwd_suffix = if entry.dead_cwd {
+        let cwd_suffix = if cwd_gone {
             " — directory no longer exists"
         } else {
             ""
         };
+
+        // Primary action per the registry rule: a live tab wins, then
+        // dead-cwd rescue, then plain resume (with a possibly-running
+        // warning when the transcript is still growing).
+        let is_live = self.find_chat_tab(&entry.id).is_some();
+        let action_button = |label: &'static str, color: iced::Color, event: Event| {
+            button(text(label).size(font_small).color(color))
+                .style(move |_theme, _status| button::Style {
+                    background: None,
+                    border: iced::Border {
+                        width: 1.0,
+                        color,
+                        radius: 5.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([5, 14])
+                .on_press(event)
+        };
+        let mut actions = Row::new().spacing(10).align_y(iced::Alignment::Center);
+        if is_live {
+            actions = actions
+                .push(action_button(
+                    "Go to Tab",
+                    theme.green(),
+                    Event::FocusChatTab(entry.id.clone()),
+                ))
+                .push(
+                    text("already open in a tab — one process per conversation")
+                        .size(font_small - 1.0)
+                        .color(theme.overlay1()),
+                );
+        } else if cwd_gone {
+            actions = actions
+                .push(action_button(
+                    "Recreate directory & resume",
+                    theme.yellow(),
+                    Event::ResumeChatRecreateDir(entry.id.clone()),
+                ))
+                .push(
+                    text("the recorded directory was deleted; resume only works from it")
+                        .size(font_small - 1.0)
+                        .color(theme.red()),
+                );
+        } else {
+            actions = actions.push(action_button(
+                "Resume as Tab",
+                theme.accent(),
+                Event::ResumeChatAsTab(entry.id.clone()),
+            ));
+            if entry.possibly_running() {
+                actions = actions.push(
+                    text("◐ transcript is still growing — may be running in a terminal GitTerm didn't start")
+                        .size(font_small - 1.0)
+                        .color(theme.yellow()),
+                );
+            } else {
+                actions = actions.push(
+                    text(format!(
+                        "runs {} in the recorded directory",
+                        entry.resume_command()
+                    ))
+                    .size(font_small - 1.0)
+                    .color(theme.overlay1()),
+                );
+            }
+        }
+
         let header = row![
             column![
                 text(entry.title.clone())
@@ -14473,12 +14689,13 @@ fi
                 meta,
                 text(format!(
                     "{}{}{}",
-                    if entry.dead_cwd { "⚠ " } else { "" },
+                    if cwd_gone { "⚠ " } else { "" },
                     entry.cwd.display(),
                     cwd_suffix
                 ))
                 .size(font_small)
                 .color(cwd_color),
+                actions,
             ]
             .spacing(6)
             .width(Length::Fill),
