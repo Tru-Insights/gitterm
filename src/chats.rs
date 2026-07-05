@@ -54,6 +54,12 @@ pub struct ChatIndexEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatBackend {
     Claude,
+    Codex,
+    Pi,
+}
+
+impl ChatBackend {
+    pub const ALL: [ChatBackend; 3] = [ChatBackend::Claude, ChatBackend::Codex, ChatBackend::Pi];
 }
 
 /// The three scope rings of the Chats panel. With only the local machine
@@ -96,6 +102,8 @@ impl ChatBackend {
     pub fn label(&self) -> &'static str {
         match self {
             ChatBackend::Claude => "claude",
+            ChatBackend::Codex => "codex",
+            ChatBackend::Pi => "pi",
         }
     }
 }
@@ -131,6 +139,10 @@ impl ChatIndexEntry {
     pub fn resume_command(&self) -> String {
         match self.backend {
             ChatBackend::Claude => format!("claude --resume {}", self.id),
+            ChatBackend::Codex => format!("codex resume {}", self.id),
+            // pi resumes a specific session via --session (`--resume` is
+            // the interactive picker).
+            ChatBackend::Pi => format!("pi --session {}", self.id),
         }
     }
 
@@ -357,6 +369,189 @@ fn index_transcript(path: &Path, backend: ChatBackend) -> Option<ChatIndexEntry>
     })
 }
 
+/// A codex `response_item` message: (is_user, text). Codex wraps turns as
+/// `{"type":"response_item","payload":{"type":"message","role":...,
+/// "content":[{"type":"input_text"|"output_text","text":...}]}}`.
+fn codex_message(value: &Value) -> Option<(bool, String)> {
+    if value.get("type")?.as_str()? != "response_item" {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type")?.as_str()? != "message" {
+        return None;
+    }
+    let is_user = match payload.get("role")?.as_str()? {
+        "user" => true,
+        "assistant" => false,
+        // developer/system carry instructions, not conversation.
+        _ => return None,
+    };
+    let text = payload
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|block| {
+            let kind = block.get("type")?.as_str()?;
+            (kind == "input_text" || kind == "output_text")
+                .then(|| block.get("text")?.as_str().map(str::to_string))?
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim();
+    (!text.is_empty()).then(|| (is_user, text.to_string()))
+}
+
+/// A pi `message` line: (is_user, text). Same content-block shape as
+/// claude, nested under `message`.
+fn pi_message(value: &Value) -> Option<(bool, String)> {
+    if value.get("type")?.as_str()? != "message" {
+        return None;
+    }
+    let message = value.get("message")?;
+    let is_user = match message.get("role")?.as_str()? {
+        "user" => true,
+        "assistant" => false,
+        _ => return None,
+    };
+    let text = match message.get("content")? {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| {
+                (block.get("type")?.as_str()? == "text")
+                    .then(|| block.get("text")?.as_str().map(str::to_string))?
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| (is_user, text.to_string()))
+}
+
+/// Index one codex rollout. Returns None for headless `codex exec` runs
+/// (originator carries "exec") and sessions with no real user message.
+fn index_codex_transcript(path: &Path) -> Option<ChatIndexEntry> {
+    let meta = std::fs::metadata(path).ok()?;
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file.take(HEAD_SCAN_BYTES));
+    let mut line = String::new();
+    let mut id = None;
+    let mut cwd: Option<PathBuf> = None;
+    let mut branch = None;
+    let mut title = None;
+    for _ in 0..HEAD_SCAN_LINES {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            let payload = value.get("payload")?;
+            if payload
+                .get("originator")
+                .and_then(Value::as_str)
+                .is_some_and(|originator| originator.contains("exec"))
+            {
+                return None;
+            }
+            id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            cwd = payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            branch = payload
+                .get("git")
+                .and_then(|git| git.get("branch"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        } else if title.is_none() {
+            if let Some((true, text)) = codex_message(&value) {
+                // Codex injects project docs as a plain user message
+                // ("# AGENTS.md instructions for <path>"); never a title.
+                if !is_synthetic_user_text(&text) && !text.starts_with("# AGENTS.md instructions") {
+                    title = Some(title_from_text(&text));
+                }
+            }
+        }
+        if id.is_some() && title.is_some() {
+            break;
+        }
+    }
+    let cwd = cwd?;
+    let dead_cwd = !cwd.exists();
+    // Detached HEAD records the literal branch name "HEAD" — not useful.
+    let branch = branch.filter(|branch| branch != "HEAD");
+    Some(ChatIndexEntry {
+        id: id?,
+        backend: ChatBackend::Codex,
+        path: path.to_path_buf(),
+        cwd,
+        repo_root: None,
+        is_worktree: false,
+        branch,
+        title: title?,
+        mtime: meta.modified().ok()?,
+        size: meta.len(),
+        dead_cwd,
+    })
+}
+
+/// Index one pi session file. Line 1 is
+/// `{"type":"session","id":...,"cwd":...}`; the title comes from the
+/// first real user message.
+fn index_pi_transcript(path: &Path) -> Option<ChatIndexEntry> {
+    let meta = std::fs::metadata(path).ok()?;
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file.take(HEAD_SCAN_BYTES));
+    let mut line = String::new();
+    let mut id = None;
+    let mut cwd: Option<PathBuf> = None;
+    let mut title = None;
+    for _ in 0..HEAD_SCAN_LINES {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session") {
+            id = value.get("id").and_then(Value::as_str).map(str::to_string);
+            cwd = value.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+        } else if title.is_none() {
+            if let Some((true, text)) = pi_message(&value) {
+                if !is_synthetic_user_text(&text) {
+                    title = Some(title_from_text(&text));
+                }
+            }
+        }
+        if id.is_some() && title.is_some() {
+            break;
+        }
+    }
+    let cwd = cwd?;
+    let dead_cwd = !cwd.exists();
+    Some(ChatIndexEntry {
+        id: id?,
+        backend: ChatBackend::Pi,
+        path: path.to_path_buf(),
+        cwd,
+        repo_root: None,
+        is_worktree: false,
+        branch: None,
+        title: title?,
+        mtime: meta.modified().ok()?,
+        size: meta.len(),
+        dead_cwd,
+    })
+}
+
 /// Resolved git identity of a cwd: (main-repo root, is_worktree).
 fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
     let out = gitterm::agentd::git::git_command()
@@ -384,24 +579,50 @@ fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
     Some((main_root, is_worktree))
 }
 
-/// Build the full local claude index. Blocking; run on a background Task.
-pub fn build_local_index() -> Vec<ChatIndexEntry> {
-    let projects = crate::config::claude_home_dir().join("projects");
-    let mut entries = Vec::new();
-    let Ok(slugs) = std::fs::read_dir(&projects) else {
-        return entries;
-    };
-    for slug in slugs.flatten() {
-        let Ok(files) = std::fs::read_dir(slug.path()) else {
+/// All .jsonl files up to `depth` directory levels below `root`
+/// (claude/pi: slug/file = 1; codex: YYYY/MM/DD/file = 3).
+fn jsonl_files_under(root: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut dirs = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, level)) = dirs.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                if let Some(entry) = index_transcript(&path, ChatBackend::Claude) {
-                    entries.push(entry);
+        for item in read.flatten() {
+            let path = item.path();
+            if path.is_dir() {
+                if level < depth {
+                    dirs.push((path, level + 1));
                 }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                out.push(path);
             }
+        }
+    }
+    out
+}
+
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Build the full local index across all backends. Blocking; run on a
+/// background Task.
+pub fn build_local_index() -> Vec<ChatIndexEntry> {
+    let mut entries = Vec::new();
+    for path in jsonl_files_under(&crate::config::claude_home_dir().join("projects"), 1) {
+        if let Some(entry) = index_transcript(&path, ChatBackend::Claude) {
+            entries.push(entry);
+        }
+    }
+    for path in jsonl_files_under(&home_dir().join(".codex").join("sessions"), 3) {
+        if let Some(entry) = index_codex_transcript(&path) {
+            entries.push(entry);
+        }
+    }
+    for path in jsonl_files_under(&home_dir().join(".pi").join("agent").join("sessions"), 1) {
+        if let Some(entry) = index_pi_transcript(&path) {
+            entries.push(entry);
         }
     }
 
@@ -425,31 +646,52 @@ pub fn build_local_index() -> Vec<ChatIndexEntry> {
 }
 
 /// Parse the preview tail for one chat. Blocking; run on a background Task.
-pub fn load_preview(path: &Path) -> ChatPreview {
+pub fn load_preview(path: &Path, backend: ChatBackend) -> ChatPreview {
     let Ok(lines) = read_tail_lines(path) else {
         return ChatPreview::default();
     };
     let mut messages = Vec::new();
     let mut message_count = None;
     for line in lines.iter().rev() {
-        let Ok(meta) = serde_json::from_str::<LineMeta>(line) else {
-            continue;
-        };
-        if message_count.is_none() {
-            message_count = meta.message_count;
-        }
-        if messages.len() < PREVIEW_MESSAGES && meta.is_real_message() {
-            if let Some(text) = meta.message_text() {
-                if !is_synthetic_user_text(&text) {
-                    messages.push(ChatPreviewMessage {
-                        is_user: meta.kind.as_deref() == Some("user"),
-                        text,
-                    });
+        match backend {
+            ChatBackend::Claude => {
+                let Ok(meta) = serde_json::from_str::<LineMeta>(line) else {
+                    continue;
+                };
+                if message_count.is_none() {
+                    message_count = meta.message_count;
+                }
+                if messages.len() < PREVIEW_MESSAGES && meta.is_real_message() {
+                    if let Some(text) = meta.message_text() {
+                        if !is_synthetic_user_text(&text) {
+                            messages.push(ChatPreviewMessage {
+                                is_user: meta.kind.as_deref() == Some("user"),
+                                text,
+                            });
+                        }
+                    }
+                }
+                if messages.len() >= PREVIEW_MESSAGES && message_count.is_some() {
+                    break;
                 }
             }
-        }
-        if messages.len() >= PREVIEW_MESSAGES && message_count.is_some() {
-            break;
+            ChatBackend::Codex | ChatBackend::Pi => {
+                if messages.len() >= PREVIEW_MESSAGES {
+                    break;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let parsed = match backend {
+                    ChatBackend::Codex => codex_message(&value),
+                    _ => pi_message(&value),
+                };
+                if let Some((is_user, text)) = parsed {
+                    if !is_synthetic_user_text(&text) {
+                        messages.push(ChatPreviewMessage { is_user, text });
+                    }
+                }
+            }
         }
     }
     messages.reverse();
@@ -545,6 +787,117 @@ mod tests {
         assert!(index_transcript(&path, ChatBackend::Claude).is_none());
     }
 
+    fn codex_meta_line(id: &str, cwd: &str, branch: &str, originator: &str) -> String {
+        serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": id, "cwd": cwd, "originator": originator,
+                        "git": {"branch": branch}}
+        })
+        .to_string()
+    }
+
+    fn codex_user_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": text}]}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn codex_index_reads_session_meta_and_first_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = codex_meta_line("019e-abc", "/tmp/x", "feat/thing", "codex-tui");
+        let dev = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "role": "developer",
+                        "content": [{"type": "input_text", "text": "<permissions instructions>"}]}
+        })
+        .to_string();
+        let user = codex_user_line("why is the backfill wrong");
+        let path = write_transcript(
+            dir.path(),
+            "rollout-x.jsonl",
+            &[meta.as_str(), dev.as_str(), user.as_str()],
+        );
+        let entry = index_codex_transcript(&path).unwrap();
+        assert_eq!(entry.id, "019e-abc");
+        assert_eq!(entry.backend, ChatBackend::Codex);
+        assert_eq!(entry.branch.as_deref(), Some("feat/thing"));
+        assert_eq!(entry.title, "why is the backfill wrong");
+        assert_eq!(entry.resume_command(), "codex resume 019e-abc");
+    }
+
+    #[test]
+    fn codex_index_skips_agents_md_instruction_message_for_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = codex_meta_line("019e-ghi", "/tmp/x", "HEAD", "codex-tui");
+        let docs = codex_user_line("# AGENTS.md instructions for /tmp/x\n...");
+        let real = codex_user_line("fix the login redirect");
+        let path = write_transcript(
+            dir.path(),
+            "rollout-docs.jsonl",
+            &[meta.as_str(), docs.as_str(), real.as_str()],
+        );
+        let entry = index_codex_transcript(&path).unwrap();
+        assert_eq!(entry.title, "fix the login redirect");
+        // Detached-HEAD "branch" is dropped rather than shown.
+        assert_eq!(entry.branch, None);
+    }
+
+    #[test]
+    fn codex_index_skips_exec_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = codex_meta_line("019e-def", "/tmp/x", "main", "codex-exec");
+        let user = codex_user_line("automated run");
+        let path = write_transcript(
+            dir.path(),
+            "rollout-exec.jsonl",
+            &[meta.as_str(), user.as_str()],
+        );
+        assert!(index_codex_transcript(&path).is_none());
+    }
+
+    #[test]
+    fn pi_index_reads_session_line_and_first_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = serde_json::json!({
+            "type": "session", "version": 3, "id": "019f-xyz", "cwd": "/tmp/y"
+        })
+        .to_string();
+        let user = serde_json::json!({
+            "type": "message",
+            "message": {"role": "user",
+                        "content": [{"type": "text", "text": "sketch the reattach plan"}]}
+        })
+        .to_string();
+        let path = write_transcript(
+            dir.path(),
+            "2026_019f-xyz.jsonl",
+            &[session.as_str(), user.as_str()],
+        );
+        let entry = index_pi_transcript(&path).unwrap();
+        assert_eq!(entry.id, "019f-xyz");
+        assert_eq!(entry.backend, ChatBackend::Pi);
+        assert_eq!(entry.title, "sketch the reattach plan");
+        assert_eq!(entry.resume_command(), "pi --session 019f-xyz");
+    }
+
+    #[test]
+    fn codex_preview_orders_tail_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![codex_meta_line("019e-p", "/tmp/x", "main", "codex-tui")];
+        for i in 0..12 {
+            lines.push(codex_user_line(&format!("turn {i}")));
+        }
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let path = write_transcript(dir.path(), "rollout-p.jsonl", &refs);
+        let preview = load_preview(&path, ChatBackend::Codex);
+        assert_eq!(preview.messages.len(), PREVIEW_MESSAGES);
+        assert_eq!(preview.messages.last().unwrap().text, "turn 11");
+    }
+
     #[test]
     fn long_titles_truncate() {
         let long = "x".repeat(200);
@@ -566,7 +919,7 @@ mod tests {
         );
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let path = write_transcript(dir.path(), "p.jsonl", &refs);
-        let preview = load_preview(&path);
+        let preview = load_preview(&path, ChatBackend::Claude);
         assert_eq!(preview.message_count, Some(40));
         assert_eq!(preview.messages.len(), PREVIEW_MESSAGES);
         assert_eq!(preview.messages.last().unwrap().text, "message 19");
