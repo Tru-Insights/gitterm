@@ -139,7 +139,7 @@ impl RemoteAgentBackend {
         let channel = connect_channel(&self.config.endpoint).await?;
         let mut client = GitTermAgentClient::new(channel);
         let mut request = Request::new(HandshakeRequest {
-            client_name: "GitTerm desktop".to_string(),
+            client_name: "GitTerm V4 desktop".to_string(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
         });

@@ -1,7 +1,7 @@
 //! Workspace sources.
 //!
 //! A workspace is backed by a source: the local filesystem or a remote
-//! `gitterm-agent`. UI code (Files, Git, Plans, agent launchers) talks to
+//! `gitterm-v4-agent`. UI code (Files, Git, Plans, agent launchers) talks to
 //! `WorkspaceSource` and renders what it returns. It must never branch on
 //! which kind of source it has — a missing feature is expressed through
 //! [`SourceCapabilities`], not location checks.
@@ -595,7 +595,7 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
-    /// End-to-end: a real gitterm-agent gRPC server, driven through
+    /// End-to-end: a real gitterm-v4-agent gRPC server, driven through
     /// WorkspaceSource exactly as the Files UI drives it — listing, entry
     /// paths, parent computation, and navigation into a subdirectory.
     #[tokio::test]

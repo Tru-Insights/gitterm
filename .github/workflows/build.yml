@@ -22,16 +22,16 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-            binary_name: gitterm
-            asset_name: gitterm-macos-aarch64
+            binary_name: gitterm-v4
+            asset_name: gitterm-v4-macos-aarch64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary_name: gitterm.exe
-            asset_name: gitterm-windows-x86_64.exe
+            binary_name: gitterm-v4.exe
+            asset_name: gitterm-v4-windows-x86_64.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary_name: gitterm
-            asset_name: gitterm-linux-x86_64
+            binary_name: gitterm-v4
+            asset_name: gitterm-v4-linux-x86_64
 
     steps:
     - uses: actions/checkout@v4
@@ -54,7 +54,7 @@ jobs:
       with:
         key: ${{ matrix.target }}
         cache-on-failure: true
-        shared-key: "gitterm-build"
+        shared-key: "gitterm-v4-build"
 
     - name: Install macOS dependencies
       if: matrix.os == 'macos-latest'
@@ -80,7 +80,7 @@ jobs:
         chmod +x scripts/bundle.sh
         scripts/bundle.sh
         cd target
-        zip -r GitTerm-${{ matrix.target }}.app.zip GitTerm.app
+        zip -r "GitTerm-V4-${{ matrix.target }}.app.zip" "GitTerm V4.app"
 
     - name: Upload binary
       uses: actions/upload-artifact@v4
@@ -88,7 +88,7 @@ jobs:
         name: ${{ matrix.asset_name }}
         path: |
           target/${{ matrix.target }}/release/${{ matrix.binary_name }}
-          target/GitTerm-${{ matrix.target }}.app.zip
+          target/GitTerm-V4-${{ matrix.target }}.app.zip
 
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
@@ -96,7 +96,7 @@ jobs:
       with:
         files: |
           target/${{ matrix.target }}/release/${{ matrix.binary_name }}
-          target/GitTerm-${{ matrix.target }}.app.zip
+          target/GitTerm-V4-${{ matrix.target }}.app.zip
         draft: false
         prerelease: false
       env:

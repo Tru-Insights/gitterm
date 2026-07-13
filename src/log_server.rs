@@ -4,6 +4,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use warp::Filter;
 
+const LOG_SERVER_BASE_PORT: u16 = 13_030;
+const LOG_SERVER_PORTS_PER_INSTANCE: u16 = 10;
+
 /// Snapshot of terminal content for a single tab
 #[derive(Clone)]
 pub struct TerminalSnapshot {
@@ -63,8 +66,8 @@ fn find_available_port() -> Option<u16> {
         .unwrap_or(0)
         .rem_euclid(100) as u16; // Limit to 100 to avoid going too high
 
-    let base_port = 3030 + (instance_id * 10);
-    let port_range = base_port..(base_port + 10);
+    let base_port = LOG_SERVER_BASE_PORT + (instance_id * LOG_SERVER_PORTS_PER_INSTANCE);
+    let port_range = base_port..(base_port + LOG_SERVER_PORTS_PER_INSTANCE);
 
     // Try instance-specific range first
     for port in port_range {
@@ -141,7 +144,7 @@ async fn handle_index(state: ServerState) -> Result<impl warp::Reply, warp::Reje
 <html>
 <head>
     <meta charset="utf-8">
-    <title>GitTerm Log Viewer</title>
+    <title>GitTerm V4 Log Viewer</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -184,7 +187,7 @@ async fn handle_index(state: ServerState) -> Result<impl warp::Reply, warp::Reje
     </style>
 </head>
 <body>
-    <h1>GitTerm Log Viewer</h1>
+    <h1>GitTerm V4 Log Viewer</h1>
     <p>Select a tab to view its terminal output:</p>
     <ul class="tab-list">
 "#,
@@ -228,7 +231,7 @@ async fn handle_tab(
 <html>
 <head>
     <meta charset="utf-8">
-    <title>{} - GitTerm Logs</title>
+    <title>{} - GitTerm V4 Logs</title>
     <style>
         body {{
             font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
@@ -430,7 +433,7 @@ async fn handle_file(
 <html>
 <head>
     <meta charset="utf-8">
-    <title>{} - GitTerm File Viewer</title>
+    <title>{} - GitTerm V4 File Viewer</title>
     <style>
         body {{
             font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
@@ -599,6 +602,15 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_server_port_range_does_not_overlap_v3() {
+        let v4_first = LOG_SERVER_BASE_PORT;
+        let v4_last = LOG_SERVER_BASE_PORT + (99 * LOG_SERVER_PORTS_PER_INSTANCE) + 9;
+        let v3_last = 3_030 + (99 * 10) + 9;
+        assert!(v4_first > v3_last);
+        assert_eq!(v4_last, 14_029);
+    }
 
     // === html_escape ===
 

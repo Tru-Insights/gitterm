@@ -25,9 +25,9 @@ cargo run
 ./scripts/bundle.sh
 ```
 
-This creates `target/GitTerm.app` which you can:
-- Copy to Applications: `cp -r target/GitTerm.app /Applications/`
-- Or open directly: `open target/GitTerm.app`
+This creates `target/GitTerm V4.app` which you can:
+- Copy to Applications: `cp -R "target/GitTerm V4.app" /Applications/`
+- Or open directly: `open "target/GitTerm V4.app"`
 
 ## Linux (Local Build)
 
@@ -72,7 +72,7 @@ cd gitterm
 cargo build --release --features stt
 ```
 
-Binary at: `target/release/gitterm`
+Binary at: `target/release/gitterm-v4`
 
 Feature flags:
 - `stt` — voice (whisper-rs + cpal). Required for shipping.
@@ -82,13 +82,13 @@ Feature flags:
 ### Running
 
 ```bash
-./target/release/gitterm
+./target/release/gitterm-v4
 ```
 
 ## Cross-Platform Builds (GitHub Actions)
 
 GitHub Actions builds run on:
-- Push to `master`
+- Push to `v4`
 - Tag push (e.g. `v1.0.0`) — also creates a Release with attached binaries
 - Manual workflow dispatch
 
@@ -136,7 +136,7 @@ git push origin master          # if it's not
    cargo build --release --target x86_64-pc-windows-gnu
    ```
 
-   Binary at: `target/x86_64-pc-windows-gnu/release/gitterm.exe`
+   Binary at: `target/x86_64-pc-windows-gnu/release/gitterm-v4.exe`
 
 ### Linux (from macOS)
 
@@ -151,7 +151,7 @@ git push origin master          # if it's not
    cargo build --release --target x86_64-unknown-linux-gnu
    ```
 
-   Binary at: `target/x86_64-unknown-linux-gnu/release/gitterm`
+   Binary at: `target/x86_64-unknown-linux-gnu/release/gitterm-v4`
 
 ## Dependencies
 
@@ -172,7 +172,7 @@ git push origin master          # if it's not
 
 ## Notes
 
-- The HTTP log server runs on `localhost:3030`
+- The HTTP log server uses the V4-only `localhost:13030-14029` range
 - All builds include the web-based log viewer
 - macOS builds include native menu bar integration
 - Windows/Linux builds use cross-platform menu fallbacks

@@ -1,8 +1,12 @@
-# GitTerm
+# GitTerm V4
 
 A Git status viewer with integrated terminal, built with Iced.
 
-![GitTerm](assets/icon.png)
+![GitTerm V4](assets/icon.png)
+
+GitTerm V4 is an isolated development lane for the next browser-aware GitTerm
+architecture. It uses its own configuration, application identity, local port
+range, helper state, and future Chrome profile so it can run alongside V3.
 
 ## Features
 
@@ -23,12 +27,12 @@ Download the latest release or build from source:
 ```bash
 cargo build --release
 ./scripts/bundle.sh
-open target/GitTerm.app
+open "target/GitTerm V4.app"
 ```
 
 ### Features Overview
 
-#### HTTP Log Server (localhost:3030, optional)
+#### HTTP Log Server (localhost:13030-14029, optional)
 - View all terminal logs in your browser
 - Perfect text selection and copy
 - Live search
@@ -86,7 +90,7 @@ Invoke-Expression (&starship init powershell)
 
 ### Agent Presets
 
-GitTerm ships with configurable AI coding agent presets. Option+click the `+` tab button to pick from your configured agents, or click `+` to launch the default. Presets are stored in `~/.config/gitterm/config.json`:
+GitTerm V4 ships with configurable AI coding agent presets. Option+click the `+` tab button to pick from your configured agents, or click `+` to launch the default. Presets are stored in `~/.config/gitterm-v4/config.json`:
 
 ```json
 {
@@ -138,6 +142,10 @@ cargo build --release
 # Create macOS app bundle
 ./scripts/bundle.sh
 ```
+
+V4 defaults to `~/.config/gitterm-v4`. Tests or temporary development
+instances can override that with an absolute `GITTERM_V4_CONFIG_DIR`; V3's
+`GITTERM_CONFIG_DIR` is intentionally ignored.
 
 ## License
 

@@ -10,9 +10,9 @@ conflict.
 
 ## Workflow Facts
 
-- Project: `gitterm-v2`
-- Default base branch: `master`
-- Protected branches: `master`
+- Project: `gitterm-v4`
+- Default base branch: `v4`
+- Protected branches: `v4`
 - Issue provider: `linear`
 - Issue key pattern: `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`
 - Issue required in commits: `true`
@@ -218,7 +218,7 @@ Agent memory is private runtime state, not repository source of truth.
 
 ### Project
 
-GitTerm v2 — a Rust desktop app: terminal multiplexer + git status viewer + file
+GitTerm V4 — a Rust desktop app: terminal multiplexer + git status viewer + file
 explorer + agent (Claude Code / pi) host, built with the
 [Iced](https://github.com/iced-rs/iced) v0.14 GUI framework. macOS-first;
 Windows CI exists.
@@ -243,12 +243,15 @@ Windows CI exists.
 
 ### Persistence
 
-- Config: `~/.config/gitterm/config.json` (global) +
-  `~/.config/gitterm/instance-<pid>/config.json` (per-instance). Per-instance
+- Config: `~/.config/gitterm-v4/config.json` (global) +
+  `~/.config/gitterm-v4/instance-<pid>/config.json` (per-instance). Per-instance
   values override globals.
-- Workspaces: `~/.config/gitterm/workspaces.json`.
+- Workspaces: `~/.config/gitterm-v4/workspaces.json`.
 - All paths resolved via `dirs::home_dir()` — on Windows that's
-  `%USERPROFILE%\.config\gitterm\`.
+  `%USERPROFILE%\.config\gitterm-v4\`.
+- V4 must remain runtime-isolated from V3: do not reuse V3 config paths,
+  bundle identifiers, app names, log-server port ranges, helper state, temporary
+  artifact names, or future browser profiles.
 
 ### Workspaces
 
@@ -273,7 +276,7 @@ Windows CI exists.
 - Release with voice: `cargo build --release --features stt` (the `stt` feature
   pulls `whisper-rs` + `cpal`).
 - macOS bundle: `cargo bundle --release --features stt` produces
-  `target/release/bundle/osx/GitTerm.app`. Install via `cp -R` to
+  `target/release/bundle/osx/GitTerm V4.app`. Install via `cp -R` to
   `/Applications/`.
 - Excalidraw is an optional feature: add `--features excalidraw` to enable.
 

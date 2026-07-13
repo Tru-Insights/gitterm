@@ -1,4 +1,4 @@
-# Architecture
+# GitTerm V4 Architecture
 
 This document describes the internal architecture of GitTerm for contributors and anyone looking to understand the codebase.
 
@@ -14,7 +14,7 @@ The entire application lives in a single crate (~3300 lines across 4 source file
 |--------|---------|
 | `src/main.rs` | Core application: UI layout, state management, event handling, git operations, terminal management |
 | `src/webview.rs` | Embedded WebView (via `wry`) for rendering markdown and Mermaid diagrams |
-| `src/log_server.rs` | HTTP server (via `warp`) on `localhost:3030` for browsing terminal output in a browser |
+| `src/log_server.rs` | HTTP server (via `warp`) in the V4-only `localhost:13030-14029` range |
 | `src/markdown.rs` | Markdown-to-HTML renderer (via `pulldown-cmark`) with Mermaid diagram support |
 | `build.rs` | Windows-only build script for embedding the app icon via `winres` |
 
@@ -26,7 +26,7 @@ The app follows Iced's Elm-inspired architecture: **State → View → Event →
 
 - **`App`** holds global state: tabs, active tab index, theme, font sizes, sidebar width, config, and a handle to the log server's shared state.
 - **`TabState`** holds per-tab state: the terminal instance, git status (staged/unstaged/untracked files), branch name, diff lines, file explorer state, file viewer state, search state, and the terminal title.
-- **`Config`** is the persistent configuration, serialized to `~/.config/gitterm/config.json`.
+- **`Config`** is the persistent configuration, serialized to `~/.config/gitterm-v4/config.json`.
 
 ### Event System
 
@@ -58,7 +58,7 @@ The terminal emulator is provided by a custom fork of [`iced_term`](https://gith
 
 GitTerm injects shell hooks so the terminal title reflects the current working directory:
 
-- **zsh**: Creates a custom `.zshrc` at `~/.config/gitterm/zsh/.zshrc` that installs a `precmd`/`chpwd` hook via `add-zsh-hook`. The `ZDOTDIR` environment variable redirects zsh to load this file before sourcing the user's normal config.
+- **zsh**: Creates a custom `.zshrc` at `~/.config/gitterm-v4/zsh/.zshrc` that installs a `precmd`/`chpwd` hook via `add-zsh-hook`. The `ZDOTDIR` environment variable redirects zsh to load this file before sourcing the user's normal config.
 - **bash**: Sets `PROMPT_COMMAND` to emit an OSC title escape sequence with `$PWD`.
 - **Windows**: No directory sync hooks currently; shells (PowerShell/cmd) are launched with inherited environment.
 
@@ -100,7 +100,7 @@ The WebView is shown/hidden as the user navigates between markdown files and oth
 
 ## HTTP Log Server (`log_server.rs`)
 
-A `warp` HTTP server runs on `localhost:3030` in a background Tokio task. It serves three routes:
+A `warp` HTTP server runs in the V4-only `localhost:13030-14029` range in a background Tokio task. It serves three routes:
 
 | Route | Content |
 |-------|---------|

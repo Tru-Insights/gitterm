@@ -1,9 +1,21 @@
 [package]
-name = "gitterm"
-version = "0.1.0"
+name = "gitterm-v4"
+version = "4.0.0"
 edition = "2021"
-default-run = "gitterm"
+default-run = "gitterm-v4"
 description = "A Git status viewer with integrated terminal, built with Iced"
+
+[lib]
+name = "gitterm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gitterm-v4"
+path = "src/main.rs"
+
+[[bin]]
+name = "gitterm-v4-agent"
+path = "src/bin/gitterm-agent/main.rs"
 
 [dependencies]
 iced = { version = "0.14", features = ["tokio", "image"] }
@@ -26,7 +38,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "process", "io-u
 tokio-stream = { version = "0.1", features = ["net"] }
 chrono = "0.4"
 libc = "0.2"
+base64 = "0.22"
+futures-util = "0.3"
+hyper = { version = "0.14", features = ["client", "http1", "tcp"] }
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
+tokio-tungstenite = "0.21"
+url = "2.5"
 whisper-rs = { version = "0.15", optional = true }
 cpal = { version = "0.15", optional = true }
 
@@ -36,11 +53,11 @@ stt = ["whisper-rs", "cpal"]
 excalidraw = []
 
 [package.metadata.bundle]
-name = "GitTerm"
-identifier = "com.cree8.gitterm"
+name = "GitTerm V4"
+identifier = "com.cree8.gitterm.v4"
 icon = ["assets/icon.icns"]
-version = "0.1.0"
-short_description = "A Git status viewer with integrated terminal"
+version = "4.0.0"
+short_description = "GitTerm V4 development environment"
 copyright = "Copyright 2025 Cree8"
 category = "Developer Tool"
 osx_minimum_system_version = "13.0"

@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>NSMicrophoneUsageDescription</key>
-    <string>GitTerm uses the microphone for speech-to-text input to the terminal.</string>
+    <string>GitTerm V4 uses the microphone for speech-to-text input to the terminal.</string>
     <key>LSMultipleInstancesProhibited</key>
     <false/>
 </dict>

@@ -2136,13 +2136,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitterm"
-version = "0.1.0"
+name = "gitterm-v4"
+version = "4.0.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "cpal",
  "dirs",
+ "futures-util",
  "git2",
+ "hyper 0.14.32",
  "iced",
  "iced_term",
  "libc",
@@ -2160,8 +2163,10 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tonic",
  "tonic-build",
+ "url",
  "uuid",
  "warp",
  "whisper-rs",

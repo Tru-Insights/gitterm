@@ -2,11 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [ master, main, v3 ]
+    branches: [ master, main, v3, v4 ]
   pull_request:
     # tracey/** covers stacked PRs whose base is another feature branch
     # (the v3 lane workflow); workflow_dispatch is the manual backstop.
-    branches: [ master, main, v3, 'tracey/**' ]
+    branches: [ master, main, v3, v4, 'tracey/**' ]
   workflow_dispatch:
 
 env:
@@ -37,7 +37,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         cache-on-failure: true
-        shared-key: "gitterm-ci"
+        shared-key: "gitterm-v4-ci"
 
     - name: Check formatting
       run: cargo fmt -- --check

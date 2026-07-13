@@ -15,7 +15,7 @@ impl AgentConfigFile {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".config")
-            .join("gitterm-agent")
+            .join("gitterm-v4-agent")
             .join("config.json")
     }
 

@@ -3,39 +3,44 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+pub const APP_NAME: &str = "GitTerm V4";
+pub const CONFIG_DIR_NAME: &str = "gitterm-v4";
+pub const CONFIG_DIR_ENV: &str = "GITTERM_V4_CONFIG_DIR";
+pub const INSTANCE_ID_ENV: &str = "GITTERM_V4_INSTANCE_ID";
+
 // Global instance ID for this process
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
-// Config directory override, read once from GITTERM_CONFIG_DIR
+// Config directory override, read once from GITTERM_V4_CONFIG_DIR
 static CONFIG_DIR_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Get or generate the unique instance ID for this GitTerm process
 pub fn instance_id() -> &'static str {
     INSTANCE_ID.get_or_init(|| {
         // Allow override via environment variable for testing
-        std::env::var("GITTERM_INSTANCE_ID").unwrap_or_else(|_| std::process::id().to_string())
+        std::env::var(INSTANCE_ID_ENV).unwrap_or_else(|_| std::process::id().to_string())
     })
 }
 
-/// The config directory override from GITTERM_CONFIG_DIR, if set.
+/// The config directory override from GITTERM_V4_CONFIG_DIR, if set.
 /// Dev/test instances set this so they can never read or write the
-/// real ~/.config/gitterm/* state of a running daily-driver instance.
+/// real ~/.config/gitterm-v4/* state of a running V4 instance.
 pub fn config_dir_override() -> Option<&'static PathBuf> {
     CONFIG_DIR_OVERRIDE
-        .get_or_init(|| resolve_config_dir_override(std::env::var_os("GITTERM_CONFIG_DIR")))
+        .get_or_init(|| resolve_config_dir_override(std::env::var_os(CONFIG_DIR_ENV)))
         .as_ref()
 }
 
 fn resolve_config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let raw = raw?;
     if raw.is_empty() {
-        eprintln!("GITTERM_CONFIG_DIR is set but empty; ignoring override");
+        eprintln!("{CONFIG_DIR_ENV} is set but empty; ignoring override");
         return None;
     }
     let path = PathBuf::from(raw);
     if path.is_relative() {
         eprintln!(
-            "GITTERM_CONFIG_DIR is relative ({}); ignoring override",
+            "{CONFIG_DIR_ENV} is relative ({}); ignoring override",
             path.display()
         );
         return None;
@@ -51,7 +56,7 @@ pub fn global_config_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
-        .join("gitterm")
+        .join(CONFIG_DIR_NAME)
 }
 
 /// Get the base config directory for this instance
@@ -61,13 +66,10 @@ pub fn instance_config_dir() -> PathBuf {
 
 /// Print instance info on startup
 pub fn print_instance_info() {
-    eprintln!("GitTerm instance: {}", instance_id());
+    eprintln!("{APP_NAME} instance: {}", instance_id());
     eprintln!("Config directory: {}", instance_config_dir().display());
     if let Some(dir) = config_dir_override() {
-        eprintln!(
-            "Config dir override (GITTERM_CONFIG_DIR): {}",
-            dir.display()
-        );
+        eprintln!("Config dir override ({CONFIG_DIR_ENV}): {}", dir.display());
     }
 }
 
@@ -88,6 +90,14 @@ mod tests {
         let dir = instance_config_dir();
         assert!(dir.to_string_lossy().contains("instance-"));
         assert!(dir.to_string_lossy().contains(instance_id()));
+    }
+
+    #[test]
+    fn default_config_dir_is_isolated_from_v3() {
+        let home = PathBuf::from("/test-home");
+        let path = home.join(".config").join(CONFIG_DIR_NAME);
+        assert_eq!(path, PathBuf::from("/test-home/.config/gitterm-v4"));
+        assert_ne!(path, PathBuf::from("/test-home/.config/gitterm"));
     }
 
     #[test]
@@ -120,7 +130,7 @@ pub fn cleanup_instance_config() {
     if instance_dir.exists() && instance_dir.to_string_lossy().contains(instance_id()) {
         let _ = std::fs::remove_dir_all(&instance_dir);
         eprintln!(
-            "GitTerm instance {} cleaned up config: {}",
+            "{APP_NAME} instance {} cleaned up config: {}",
             instance_id(),
             instance_dir.display()
         );
