@@ -98,7 +98,7 @@ pub struct NavigationResult {
 /// Role and text locators are semantic and preferred. CSS remains available
 /// as an explicit escape hatch. An action fails if the locator matches zero or
 /// multiple visible elements so it cannot silently operate on the wrong node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrowserLocator {
     Role {
@@ -174,7 +174,7 @@ pub struct BrowserActionTarget {
     pub y: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserViewport {
     pub width: u32,
@@ -226,7 +226,7 @@ impl BrowserViewport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserKey {
     Enter,
@@ -275,7 +275,14 @@ pub struct BrowserNetworkFailure {
     pub error_text: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserDiagnostics {
+    pub console_errors: Vec<BrowserConsoleError>,
+    pub failed_requests: Vec<BrowserNetworkFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserLoadingState {
     Loading,
@@ -293,7 +300,7 @@ impl BrowserLoadingState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrowserWaitCondition {
     Locator {
@@ -747,6 +754,63 @@ impl BrowserController {
         Ok(viewport)
     }
 
+    /// Scroll the page at the current viewport center using a CDP wheel event.
+    pub async fn scroll(&mut self, delta_x: f64, delta_y: f64) -> Result<()> {
+        const MAX_SCROLL_DELTA: f64 = 100_000.0;
+        if !delta_x.is_finite()
+            || !delta_y.is_finite()
+            || delta_x.abs() > MAX_SCROLL_DELTA
+            || delta_y.abs() > MAX_SCROLL_DELTA
+        {
+            return Err(BrowserControlError::new(format!(
+                "browser scroll deltas must be finite and between -{MAX_SCROLL_DELTA} and {MAX_SCROLL_DELTA}"
+            )));
+        }
+        let session = self.page_session().await?;
+        let result = session
+            .command(
+                "Runtime.evaluate",
+                json!({
+                    "expression": "({ x: window.innerWidth / 2, y: window.innerHeight / 2 })",
+                    "returnByValue": true
+                }),
+            )
+            .await?;
+        let center: ViewportCenter = serde_json::from_value(
+            result
+                .pointer("/result/value")
+                .cloned()
+                .ok_or_else(|| BrowserControlError::new("Chrome omitted viewport center data"))?,
+        )
+        .map_err(|error| {
+            BrowserControlError::new(format!(
+                "Chrome returned malformed viewport center data: {error}"
+            ))
+        })?;
+        session
+            .command(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseWheel",
+                    "x": center.x,
+                    "y": center.y,
+                    "deltaX": delta_x,
+                    "deltaY": delta_y
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn diagnostics(&mut self) -> Result<BrowserDiagnostics> {
+        let session = self.page_session().await?;
+        let (console_errors, failed_requests) = session.diagnostics().await;
+        Ok(BrowserDiagnostics {
+            console_errors,
+            failed_requests,
+        })
+    }
+
     /// Wait for page state with a bounded, explicit timeout.
     pub async fn wait_for(
         &mut self,
@@ -959,6 +1023,14 @@ impl BrowserControlService {
         self.controller.lock().await.resize(viewport).await
     }
 
+    pub async fn scroll(&self, delta_x: f64, delta_y: f64) -> Result<()> {
+        self.controller.lock().await.scroll(delta_x, delta_y).await
+    }
+
+    pub async fn diagnostics(&self) -> Result<BrowserDiagnostics> {
+        self.controller.lock().await.diagnostics().await
+    }
+
     pub async fn wait_for_ready(&self, max_wait: Duration) -> Result<()> {
         self.controller.lock().await.wait_for_ready(max_wait).await
     }
@@ -989,6 +1061,12 @@ struct SnapshotState {
     visible_text: String,
     interactive_elements: Vec<InteractiveElement>,
     viewport: BrowserViewport,
+}
+
+#[derive(Debug, Deserialize)]
+struct ViewportCenter {
+    x: f64,
+    y: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2309,6 +2387,14 @@ mod tests {
         assert!(BrowserViewport::mobile(390, 844, 5.0).validate().is_err());
     }
 
+    #[tokio::test]
+    async fn scroll_rejects_unbounded_or_non_finite_deltas_before_browser_access() {
+        let temp = tempdir().unwrap();
+        let mut controller = BrowserController::new(temp.path());
+        assert!(controller.scroll(f64::NAN, 0.0).await.is_err());
+        assert!(controller.scroll(0.0, 100_001.0).await.is_err());
+    }
+
     #[test]
     fn key_descriptors_include_expected_cdp_values() {
         let enter = key_descriptor(BrowserKey::Enter);
@@ -2455,6 +2541,9 @@ mod tests {
                         <script>
                             console.error('gitterm-console-smoke');
                             fetch('/missing-resource?token=must-not-leak');
+                            window.addEventListener('wheel', () => {
+                                document.getElementById('status').textContent = 'scrolled';
+                            }, { once: true });
                             setTimeout(() => { throw new Error('gitterm-uncaught-smoke'); }, 25);
                             setTimeout(() => {
                                 const delayed = document.createElement('p');
@@ -2539,6 +2628,18 @@ mod tests {
             .wait_for(
                 &BrowserWaitCondition::Locator {
                     locator: button.locator.clone(),
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        service.scroll(0.0, 400.0).await.unwrap();
+        service
+            .wait_for(
+                &BrowserWaitCondition::Text {
+                    text: "scrolled".to_string(),
+                    exact: true,
                 },
                 Duration::from_secs(1),
             )

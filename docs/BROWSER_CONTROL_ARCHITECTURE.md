@@ -115,6 +115,24 @@ worktree:
 6. Evaluate an optional extension adapter only after the dedicated-profile
    workflow has been used on real projects.
 
+## Phase 4 Integration
+
+GitTerm reserves an ephemeral `127.0.0.1` Streamable HTTP endpoint during app
+startup and protects every MCP request with a random per-process bearer token.
+The token remains in memory and is inherited only by local GitTerm terminals;
+it is not logged or written to a config file.
+
+When GitTerm launches a local Codex preset, it adds per-run `--config`
+overrides for the MCP URL, bearer-token environment variable, write-tool
+approval policy, and tool timeout. The persisted preset command remains
+unchanged, and GitTerm does not edit user or project Codex configuration.
+Remote-agent sessions do not receive the local browser endpoint.
+
+The MCP server exposes the initial tool surface plus
+`browser_disconnect`. Read-only annotations are limited to status, snapshot,
+wait, console, and network inspection; browser lifecycle and interaction tools
+are annotated as mutating.
+
 ## Acceptance Scenario
 
 From a Codex terminal in GitTerm, start a local application, ask Codex to open
