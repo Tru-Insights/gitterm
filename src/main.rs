@@ -43,6 +43,7 @@ mod theme;
 use gitterm::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake};
 use gitterm::browser_control::{
     BrowserControlService, BrowserLaunchOptions, BrowserState, BrowserStatus,
+    BrowserTelemetrySnapshot,
 };
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
@@ -3656,6 +3657,10 @@ pub enum Event {
     BrowserFocused(Result<(), String>),
     BrowserDisconnect,
     BrowserDisconnected(Result<(), String>),
+    BrowserTelemetryRefreshRequested,
+    BrowserTelemetryLoaded(BrowserTelemetrySnapshot),
+    BrowserEvidenceOpen,
+    BrowserEvidenceClose,
     // Speech-to-text events
     #[cfg(feature = "stt")]
     SttToggle,
@@ -3734,6 +3739,10 @@ struct App {
     browser_status_loading: bool,
     browser_error: Option<String>,
     browser_error_sticky: bool,
+    browser_telemetry: BrowserTelemetrySnapshot,
+    browser_telemetry_loading: bool,
+    browser_evidence_open: bool,
+    browser_evidence_handle: Option<image::Handle>,
     console_expanded: bool,
     console_height: f32,
     dragging_console_divider: bool,
@@ -5917,6 +5926,10 @@ impl App {
             browser_status_loading: false,
             browser_error,
             browser_error_sticky: false,
+            browser_telemetry: BrowserTelemetrySnapshot::default(),
+            browser_telemetry_loading: false,
+            browser_evidence_open: false,
+            browser_evidence_handle: None,
             console_expanded: config.console_expanded,
             console_height: config.console_height.clamp(32.0, 600.0),
             dragging_console_divider: false,
@@ -6303,6 +6316,7 @@ impl App {
         if let Some(server) = browser_mcp_server {
             startup_tasks.push(Task::perform(server.run(), Event::BrowserMcpStopped));
             startup_tasks.push(Task::done(Event::BrowserStatusRefreshRequested));
+            startup_tasks.push(Task::done(Event::BrowserTelemetryRefreshRequested));
         }
 
         // If the active tab on startup is an agent tab (restored from
@@ -6673,6 +6687,7 @@ impl App {
                 .to_string_lossy()
                 .into_owned();
             let gitterm_zshrc = format!("{gitterm_dir}/.zshrc");
+            let codex_zsh_integration = browser_mcp::codex_zsh_integration();
 
             let _ = std::fs::create_dir_all(&gitterm_dir);
             let zshrc_content = format!(
@@ -6685,6 +6700,7 @@ _gitterm_set_title
 [[ -f "{home}/.zshenv" ]] && source "{home}/.zshenv"
 [[ -f "{home}/.zprofile" ]] && source "{home}/.zprofile"
 [[ -f "{home}/.zshrc" ]] && source "{home}/.zshrc"
+{codex_zsh_integration}
 if [[ -n "$GITTERM_STARTUP_CMD" ]]; then
     _gitterm_cmd="$GITTERM_STARTUP_CMD"
     unset GITTERM_STARTUP_CMD
@@ -7537,6 +7553,20 @@ fi
         )
     }
 
+    fn request_browser_telemetry(&mut self) -> Task<Event> {
+        if self.browser_telemetry_loading {
+            return Task::none();
+        }
+        let Some(browser) = self.browser_service() else {
+            return Task::none();
+        };
+        self.browser_telemetry_loading = true;
+        Task::perform(
+            async move { browser.telemetry().await },
+            Event::BrowserTelemetryLoaded,
+        )
+    }
+
     fn subscription(&self) -> Subscription<Event> {
         let mut subs = vec![
             // Agent webview IPC bridge — drains the global mpsc into events.
@@ -7576,6 +7606,10 @@ fi
             subs.push(
                 iced::time::every(Duration::from_millis(1000))
                     .map(|_| Event::BrowserStatusRefreshRequested),
+            );
+            subs.push(
+                iced::time::every(Duration::from_millis(250))
+                    .map(|_| Event::BrowserTelemetryRefreshRequested),
             );
         }
 
@@ -7671,6 +7705,8 @@ fi
                 self.browser_action = None;
                 self.browser_error = Some(error);
                 self.browser_error_sticky = false;
+                self.browser_telemetry_loading = false;
+                self.browser_telemetry.active_agent_operation = None;
             }
             Event::BrowserStatusRefreshRequested => {
                 return self.request_browser_status();
@@ -7813,6 +7849,38 @@ fi
                         self.browser_error_sticky = true;
                     }
                 }
+            }
+            Event::BrowserTelemetryRefreshRequested => {
+                return self.request_browser_telemetry();
+            }
+            Event::BrowserTelemetryLoaded(telemetry) => {
+                self.browser_telemetry_loading = false;
+                let current_evidence_id = self
+                    .browser_telemetry
+                    .latest_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.id);
+                let next_evidence_id = telemetry
+                    .latest_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.id);
+                if next_evidence_id != current_evidence_id {
+                    self.browser_evidence_handle =
+                        telemetry.latest_evidence.as_ref().map(|evidence| {
+                            image::Handle::from_bytes(evidence.screenshot_png.as_ref().clone())
+                        });
+                }
+                self.browser_telemetry = telemetry;
+            }
+            Event::BrowserEvidenceOpen => {
+                if self.browser_telemetry.latest_evidence.is_some()
+                    && self.browser_evidence_handle.is_some()
+                {
+                    self.browser_evidence_open = true;
+                }
+            }
+            Event::BrowserEvidenceClose => {
+                self.browser_evidence_open = false;
             }
             Event::MainTerminalClicked => {
                 if self.bottom_panel_focused {
@@ -8932,6 +9000,14 @@ fi
             }
             Event::KeyPressed(key, modifiers) => {
                 self.current_modifiers = modifiers;
+
+                // Browser evidence: Escape closes, all other keys are consumed.
+                if self.browser_evidence_open {
+                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
+                        self.browser_evidence_open = false;
+                    }
+                    return Task::none();
+                }
 
                 // Workspace settings: Escape closes
                 if self.workspace_settings_open
@@ -11867,7 +11943,14 @@ fi
             .height(Length::Fill)
             .into();
 
-        if self.show_help {
+        if self.browser_evidence_open {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_browser_evidence())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.show_help {
             Stack::new()
                 .push(main_view)
                 .push(self.view_help_modal())
@@ -13216,6 +13299,200 @@ fi
             .into()
     }
 
+    fn view_browser_evidence(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let Some(evidence) = self.browser_telemetry.latest_evidence.as_ref() else {
+            return container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        };
+        let Some(handle) = self.browser_evidence_handle.as_ref() else {
+            return container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        };
+
+        let theme = &self.theme;
+        let background = theme.bg_surface();
+        let screenshot_background = theme.bg_base();
+        let border_color = theme.border();
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let mauve = theme.mauve();
+        let danger = theme.danger();
+        let backdrop_color = iced::Color {
+            a: 0.86,
+            ..theme.bg_crust()
+        };
+        let mono = iced::Font::with_name("Menlo");
+
+        let close = button(text("Close").size(10).color(text_secondary).font(mono))
+            .style(self.ghost_button_style())
+            .padding([4, 8])
+            .on_press(Event::BrowserEvidenceClose);
+        let header = row![
+            text("Latest browser evidence").size(16).color(text_primary),
+            iced::widget::Space::new().width(Length::Fill),
+            close
+        ]
+        .align_y(iced::Alignment::Center);
+
+        let age = evidence
+            .captured_at
+            .elapsed()
+            .map(|elapsed| format!("{}s ago", elapsed.as_secs()))
+            .unwrap_or_else(|_| "just now".to_string());
+        let viewport_kind = if evidence.viewport.mobile {
+            "mobile"
+        } else {
+            "desktop"
+        };
+        let metadata = row![
+            text(format!(
+                "{} × {} · {} · {}",
+                evidence.viewport.width, evidence.viewport.height, viewport_kind, age
+            ))
+            .size(10)
+            .color(text_secondary)
+            .font(mono),
+            iced::widget::Space::new().width(Length::Fill),
+            text(format!(
+                "{} console · {} network",
+                evidence.console_error_count, evidence.failed_request_count
+            ))
+            .size(10)
+            .color(
+                if evidence.console_error_count > 0 || evidence.failed_request_count > 0 {
+                    danger
+                } else {
+                    text_secondary
+                }
+            )
+            .font(mono)
+        ]
+        .align_y(iced::Alignment::Center);
+
+        let title = if evidence.title.trim().is_empty() {
+            "Untitled page"
+        } else {
+            evidence.title.as_str()
+        };
+        let url = evidence.display_url.as_deref().unwrap_or("URL unavailable");
+        let page_identity = column![
+            text(title).size(12).color(text_primary),
+            text(url)
+                .size(10)
+                .color(mauve)
+                .font(mono)
+                .width(Length::Fill)
+        ]
+        .spacing(3);
+
+        let mut details = Column::new()
+            .spacing(8)
+            .push(header)
+            .push(page_identity)
+            .push(metadata);
+        if let Some(outcome) = self
+            .browser_telemetry
+            .last_agent_operation
+            .as_ref()
+            .filter(|outcome| outcome.error.is_some())
+        {
+            details = details.push(
+                container(
+                    text(format!(
+                        "{} failed: {}",
+                        outcome.operation.active_label(),
+                        outcome.error.as_deref().unwrap_or("unknown browser error")
+                    ))
+                    .size(10)
+                    .color(danger)
+                    .font(mono),
+                )
+                .width(Length::Fill)
+                .padding([6, 8])
+                .style(move |_| container::Style {
+                    background: Some(theme.bg_overlay().into()),
+                    border: iced::Border {
+                        color: danger,
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                }),
+            );
+        }
+
+        let screenshot = image(handle.clone())
+            .content_fit(iced::ContentFit::Contain)
+            .width(Length::Fill)
+            .height(Length::Fill);
+        let screenshot_frame = container(screenshot)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(8)
+            .style(move |_| container::Style {
+                background: Some(screenshot_background.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 5.0.into(),
+                },
+                ..Default::default()
+            });
+
+        let card_width = (self.window_size.0 - 120.0).clamp(520.0, 1040.0);
+        let card_height = (self.window_size.1 - 100.0).clamp(420.0, 780.0);
+        let card = container(
+            column![details, screenshot_frame]
+                .spacing(12)
+                .height(Length::Fill),
+        )
+        .width(Length::Fixed(card_width))
+        .height(Length::Fixed(card_height))
+        .padding(16)
+        .style(move |_| container::Style {
+            background: Some(background.into()),
+            border: iced::Border {
+                color: border_color,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+                offset: iced::Vector::new(0.0, 6.0),
+                blur_radius: 24.0,
+            },
+            ..Default::default()
+        });
+
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(backdrop_color.into()),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Event::BrowserEvidenceClose);
+
+        Stack::new()
+            .push(backdrop)
+            .push(
+                container(card)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     fn browser_bar_button(
         &self,
         label: &'static str,
@@ -13258,7 +13535,7 @@ fi
             .as_ref()
             .is_some_and(|status| status.state == BrowserState::Running);
 
-        let (label, dot_color) = match state {
+        let (mut label, mut dot_color) = match state {
             BrowserBarState::Unavailable => (
                 self.browser_error.as_deref().map_or_else(
                     || "Browser unavailable".to_string(),
@@ -13289,6 +13566,24 @@ fi
                 self.theme.danger(),
             ),
         };
+
+        if self.browser_action.is_none()
+            && !matches!(state, BrowserBarState::Unavailable | BrowserBarState::Error)
+        {
+            if let Some(activity) = &self.browser_telemetry.active_agent_operation {
+                label = format!("Agent · {}", activity.operation.active_label());
+                dot_color = self.theme.mauve();
+            } else if let Some(outcome) = &self.browser_telemetry.last_agent_operation {
+                let elapsed = outcome.finished_at.elapsed().unwrap_or_default();
+                if outcome.error.is_some() && elapsed <= Duration::from_secs(8) {
+                    label = format!("Agent · {} failed", outcome.operation.active_label());
+                    dot_color = self.theme.danger();
+                } else if outcome.error.is_none() && elapsed <= Duration::from_secs(2) {
+                    label = format!("Agent · {}", outcome.operation.completed_label());
+                    dot_color = self.theme.success();
+                }
+            }
+        }
 
         let dot = container(iced::widget::Space::new().width(0).height(0))
             .width(Length::Fixed(6.0))
@@ -13341,6 +13636,13 @@ fi
                     Event::BrowserOpen,
                 ));
             }
+        }
+        if self.browser_telemetry.latest_evidence.is_some() {
+            content = content.push(self.browser_bar_button(
+                "Evidence",
+                self.theme.mauve(),
+                Event::BrowserEvidenceOpen,
+            ));
         }
 
         let background = self.theme.surface0();

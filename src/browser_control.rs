@@ -15,7 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -89,6 +89,114 @@ pub struct BrowserStatus {
     pub process_id: Option<u32>,
     pub target_id: Option<String>,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserOperation {
+    Status,
+    Open,
+    Navigate,
+    Snapshot,
+    Click,
+    Type,
+    Press,
+    Scroll,
+    Resize,
+    Reload,
+    Wait,
+    Console,
+    Network,
+    Disconnect,
+}
+
+impl BrowserOperation {
+    pub fn active_label(self) -> &'static str {
+        match self {
+            Self::Status => "Checking status",
+            Self::Open => "Opening browser",
+            Self::Navigate => "Navigating",
+            Self::Snapshot => "Capturing evidence",
+            Self::Click => "Clicking",
+            Self::Type => "Typing",
+            Self::Press => "Pressing key",
+            Self::Scroll => "Scrolling",
+            Self::Resize => "Resizing",
+            Self::Reload => "Reloading",
+            Self::Wait => "Waiting",
+            Self::Console => "Inspecting console",
+            Self::Network => "Inspecting network",
+            Self::Disconnect => "Disconnecting",
+        }
+    }
+
+    pub fn completed_label(self) -> &'static str {
+        match self {
+            Self::Status => "Status checked",
+            Self::Open => "Browser opened",
+            Self::Navigate => "Navigation complete",
+            Self::Snapshot => "Evidence captured",
+            Self::Click => "Click complete",
+            Self::Type => "Typing complete",
+            Self::Press => "Key pressed",
+            Self::Scroll => "Scroll complete",
+            Self::Resize => "Viewport resized",
+            Self::Reload => "Reload complete",
+            Self::Wait => "Wait complete",
+            Self::Console => "Console inspected",
+            Self::Network => "Network inspected",
+            Self::Disconnect => "Browser disconnected",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserOperationActivity {
+    pub id: u64,
+    pub operation: BrowserOperation,
+    pub started_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserOperationOutcome {
+    pub operation: BrowserOperation,
+    pub finished_at: SystemTime,
+    pub error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct BrowserEvidence {
+    pub id: u64,
+    pub title: String,
+    pub display_url: Option<String>,
+    pub viewport: BrowserViewport,
+    pub captured_at: SystemTime,
+    pub console_error_count: usize,
+    pub failed_request_count: usize,
+    pub screenshot_png: Arc<Vec<u8>>,
+}
+
+impl fmt::Debug for BrowserEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrowserEvidence")
+            .field("id", &self.id)
+            .field("title", &self.title)
+            .field("display_url", &self.display_url)
+            .field("viewport", &self.viewport)
+            .field("captured_at", &self.captured_at)
+            .field("console_error_count", &self.console_error_count)
+            .field("failed_request_count", &self.failed_request_count)
+            .field("screenshot_png_bytes", &self.screenshot_png.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BrowserTelemetrySnapshot {
+    pub revision: u64,
+    pub active_agent_operation: Option<BrowserOperationActivity>,
+    pub last_agent_operation: Option<BrowserOperationOutcome>,
+    pub latest_evidence: Option<BrowserEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1053,16 +1161,60 @@ fn stderr_suffix(stderr: &str) -> String {
 ///
 /// Every operation holds the same async mutex for its complete CDP sequence,
 /// preventing concurrent MCP/tool calls from interleaving input on the page.
+#[derive(Default)]
+struct BrowserTelemetryState {
+    next_activity_id: u64,
+    next_evidence_id: u64,
+    snapshot: BrowserTelemetrySnapshot,
+}
+
 #[derive(Clone)]
 pub struct BrowserControlService {
     controller: Arc<Mutex<BrowserController>>,
+    telemetry: Arc<Mutex<BrowserTelemetryState>>,
 }
 
 impl BrowserControlService {
     pub fn new(v4_global_config_dir: impl AsRef<Path>) -> Self {
         Self {
             controller: Arc::new(Mutex::new(BrowserController::new(v4_global_config_dir))),
+            telemetry: Arc::new(Mutex::new(BrowserTelemetryState::default())),
         }
+    }
+
+    pub async fn begin_agent_operation(&self, operation: BrowserOperation) -> u64 {
+        let mut telemetry = self.telemetry.lock().await;
+        telemetry.next_activity_id += 1;
+        let id = telemetry.next_activity_id;
+        telemetry.snapshot.revision += 1;
+        telemetry.snapshot.active_agent_operation = Some(BrowserOperationActivity {
+            id,
+            operation,
+            started_at: SystemTime::now(),
+        });
+        id
+    }
+
+    pub async fn finish_agent_operation(&self, id: u64, error: Option<String>) {
+        let mut telemetry = self.telemetry.lock().await;
+        let Some(active) = telemetry.snapshot.active_agent_operation.as_ref() else {
+            return;
+        };
+        if active.id != id {
+            return;
+        }
+        let operation = active.operation;
+        telemetry.snapshot.revision += 1;
+        telemetry.snapshot.active_agent_operation = None;
+        telemetry.snapshot.last_agent_operation = Some(BrowserOperationOutcome {
+            operation,
+            finished_at: SystemTime::now(),
+            error,
+        });
+    }
+
+    pub async fn telemetry(&self) -> BrowserTelemetrySnapshot {
+        self.telemetry.lock().await.snapshot.clone()
     }
 
     pub async fn profile_dir(&self) -> PathBuf {
@@ -1082,7 +1234,23 @@ impl BrowserControlService {
     }
 
     pub async fn snapshot(&self) -> Result<BrowserSnapshot> {
-        self.controller.lock().await.snapshot().await
+        let snapshot = self.controller.lock().await.snapshot().await?;
+        let mut telemetry = self.telemetry.lock().await;
+        telemetry.next_evidence_id += 1;
+        let id = telemetry.next_evidence_id;
+        telemetry.snapshot.revision += 1;
+        telemetry.snapshot.latest_evidence = Some(BrowserEvidence {
+            id,
+            title: snapshot.title.clone(),
+            display_url: sanitize_diagnostic_url(&snapshot.url),
+            viewport: snapshot.viewport,
+            captured_at: SystemTime::now(),
+            console_error_count: snapshot.console_errors.len(),
+            failed_request_count: snapshot.failed_requests.len(),
+            screenshot_png: Arc::new(snapshot.screenshot_png.clone()),
+        });
+        drop(telemetry);
+        Ok(snapshot)
     }
 
     pub async fn click(&self, locator: &BrowserLocator) -> Result<BrowserActionTarget> {
@@ -2617,6 +2785,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn agent_activity_tracks_active_and_failed_operations() {
+        let temp = tempdir().unwrap();
+        let service = BrowserControlService::new(temp.path());
+        let activity_id = service
+            .begin_agent_operation(BrowserOperation::Navigate)
+            .await;
+        let active = service.telemetry().await.active_agent_operation.unwrap();
+        assert_eq!(active.id, activity_id);
+        assert_eq!(active.operation, BrowserOperation::Navigate);
+
+        service
+            .finish_agent_operation(activity_id, Some("navigation failed".to_string()))
+            .await;
+        let telemetry = service.telemetry().await;
+        assert!(telemetry.active_agent_operation.is_none());
+        let outcome = telemetry.last_agent_operation.unwrap();
+        assert_eq!(outcome.operation, BrowserOperation::Navigate);
+        assert_eq!(outcome.error.as_deref(), Some("navigation failed"));
+    }
+
     #[test]
     fn parses_chrome_devtools_active_port_file() {
         let temp = tempdir().unwrap();
@@ -2974,6 +3163,13 @@ mod tests {
             .unwrap()
             .visible_text
             .contains("browser-control-ready"));
+
+        let telemetry = service.telemetry().await;
+        let evidence = telemetry.latest_evidence.unwrap();
+        assert_eq!(evidence.title, "GitTerm browser smoke");
+        assert_eq!(evidence.display_url.as_deref(), Some(url.as_str()));
+        assert_eq!(evidence.viewport, mobile);
+        assert!(evidence.screenshot_png.starts_with(b"\x89PNG\r\n\x1a\n"));
 
         let attached_service = BrowserControlService::new(&config_root);
         assert_eq!(

@@ -1,8 +1,8 @@
 //! Authenticated loopback MCP exposure for the GitTerm-owned browser controller.
 
 use crate::browser_control::{
-    BrowserControlService, BrowserKey, BrowserLaunchOptions, BrowserLocator, BrowserViewport,
-    BrowserWaitCondition,
+    BrowserControlService, BrowserKey, BrowserLaunchOptions, BrowserLocator, BrowserOperation,
+    BrowserViewport, BrowserWaitCondition,
 };
 use axum::{
     body::Body,
@@ -28,11 +28,13 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
+    future::Future,
     net::{Ipv4Addr, SocketAddrV4},
     path::Path,
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -95,6 +97,33 @@ pub fn configure_codex_command(command: &str, endpoint: &str) -> String {
     }
     configured.push_str(&trimmed[executable_end..]);
     configured
+}
+
+/// Define a session-local zsh wrapper so Codex launched manually from a
+/// GitTerm terminal receives the same ephemeral MCP configuration as a preset.
+/// The bearer token itself remains only in the inherited environment.
+pub fn codex_zsh_integration() -> String {
+    format!(
+        r#"if [[ -n "${{{url_env}:-}}" && -n "${{{token_env}:-}}" ]]; then
+    codex() {{
+        local arg
+        for arg in "$@"; do
+            if [[ "$arg" == mcp_servers.gitterm_browser.url=* ]]; then
+                command codex "$@"
+                return
+            fi
+        done
+        command codex \
+            --config "mcp_servers.gitterm_browser.url=${{{url_env}}}" \
+            --config "mcp_servers.gitterm_browser.bearer_token_env_var={token_env}" \
+            --config "mcp_servers.gitterm_browser.default_tools_approval_mode=writes" \
+            --config "mcp_servers.gitterm_browser.tool_timeout_sec=60" \
+            "$@"
+    }}
+fi"#,
+        url_env = BROWSER_MCP_URL_ENV,
+        token_env = BROWSER_MCP_TOKEN_ENV,
+    )
 }
 
 fn codex_config_overrides(endpoint: &str) -> [String; 4] {
@@ -203,11 +232,34 @@ async fn authenticate(
 #[derive(Clone)]
 struct BrowserMcpTools {
     browser: BrowserControlService,
+    agent_operation_lock: Arc<Mutex<()>>,
 }
 
 impl BrowserMcpTools {
     fn new(browser: BrowserControlService) -> Self {
-        Self { browser }
+        Self {
+            browser,
+            agent_operation_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    async fn run_agent_operation<T, Run, Operation>(
+        &self,
+        operation: BrowserOperation,
+        run: Run,
+    ) -> crate::browser_control::Result<T>
+    where
+        Run: FnOnce(BrowserControlService) -> Operation,
+        Operation: Future<Output = crate::browser_control::Result<T>>,
+    {
+        let _serial_operation = self.agent_operation_lock.lock().await;
+        let activity_id = self.browser.begin_agent_operation(operation).await;
+        let result = run(self.browser.clone()).await;
+        let error = result.as_ref().err().map(ToString::to_string);
+        self.browser
+            .finish_agent_operation(activity_id, error)
+            .await;
+        result
     }
 }
 
@@ -273,7 +325,12 @@ impl BrowserMcpTools {
         )
     )]
     async fn browser_status(&self) -> CallToolResult {
-        structured_browser_result(self.browser.status().await)
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Status, |browser| async move {
+                browser.status().await
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -286,7 +343,12 @@ impl BrowserMcpTools {
         )
     )]
     async fn browser_open(&self) -> CallToolResult {
-        structured_browser_result(self.browser.launch(BrowserLaunchOptions::default()).await)
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Open, |browser| async move {
+                browser.launch(BrowserLaunchOptions::default()).await
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -302,7 +364,12 @@ impl BrowserMcpTools {
         &self,
         Parameters(request): Parameters<NavigateRequest>,
     ) -> CallToolResult {
-        structured_browser_result(self.browser.navigate(&request.url).await)
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Navigate, |browser| async move {
+                browser.navigate(&request.url).await
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -315,7 +382,12 @@ impl BrowserMcpTools {
         )
     )]
     async fn browser_snapshot(&self) -> CallToolResult {
-        match self.browser.snapshot().await {
+        match self
+            .run_agent_operation(BrowserOperation::Snapshot, |browser| async move {
+                browser.snapshot().await
+            })
+            .await
+        {
             Ok(snapshot) => {
                 let structured = match serde_json::to_value(&snapshot) {
                     Ok(value) => value,
@@ -353,7 +425,12 @@ impl BrowserMcpTools {
         &self,
         Parameters(request): Parameters<LocatorRequest>,
     ) -> CallToolResult {
-        structured_browser_result(self.browser.click(&request.locator).await)
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Click, |browser| async move {
+                browser.click(&request.locator).await
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -367,9 +444,10 @@ impl BrowserMcpTools {
     )]
     async fn browser_type(&self, Parameters(request): Parameters<TypeRequest>) -> CallToolResult {
         structured_browser_result(
-            self.browser
-                .type_text(&request.locator, &request.text)
-                .await,
+            self.run_agent_operation(BrowserOperation::Type, |browser| async move {
+                browser.type_text(&request.locator, &request.text).await
+            })
+            .await,
         )
     }
 
@@ -383,7 +461,12 @@ impl BrowserMcpTools {
         )
     )]
     async fn browser_press(&self, Parameters(request): Parameters<PressRequest>) -> CallToolResult {
-        structured_browser_result(self.browser.press(request.key).await)
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Press, |browser| async move {
+                browser.press(request.key).await
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -399,7 +482,12 @@ impl BrowserMcpTools {
         &self,
         Parameters(request): Parameters<ScrollRequest>,
     ) -> CallToolResult {
-        structured_browser_result(self.browser.scroll(request.delta_x, request.delta_y).await)
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Scroll, |browser| async move {
+                browser.scroll(request.delta_x, request.delta_y).await
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -415,7 +503,12 @@ impl BrowserMcpTools {
         &self,
         Parameters(request): Parameters<ResizeRequest>,
     ) -> CallToolResult {
-        structured_browser_result(self.browser.resize(request.viewport).await)
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Resize, |browser| async move {
+                browser.resize(request.viewport).await
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -431,7 +524,12 @@ impl BrowserMcpTools {
         &self,
         Parameters(request): Parameters<ReloadRequest>,
     ) -> CallToolResult {
-        structured_browser_result(self.browser.reload(request.ignore_cache).await)
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Reload, |browser| async move {
+                browser.reload(request.ignore_cache).await
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -454,9 +552,12 @@ impl BrowserMcpTools {
             ));
         }
         structured_browser_result(
-            self.browser
-                .wait_for(&request.condition, Duration::from_millis(timeout_ms))
-                .await,
+            self.run_agent_operation(BrowserOperation::Wait, |browser| async move {
+                browser
+                    .wait_for(&request.condition, Duration::from_millis(timeout_ms))
+                    .await
+            })
+            .await,
         )
     }
 
@@ -470,7 +571,12 @@ impl BrowserMcpTools {
         )
     )]
     async fn browser_console(&self) -> CallToolResult {
-        match self.browser.diagnostics().await {
+        match self
+            .run_agent_operation(BrowserOperation::Console, |browser| async move {
+                browser.diagnostics().await
+            })
+            .await
+        {
             Ok(diagnostics) => structured_value(diagnostics.console_errors),
             Err(error) => tool_error(error),
         }
@@ -486,7 +592,12 @@ impl BrowserMcpTools {
         )
     )]
     async fn browser_network(&self) -> CallToolResult {
-        match self.browser.diagnostics().await {
+        match self
+            .run_agent_operation(BrowserOperation::Network, |browser| async move {
+                browser.diagnostics().await
+            })
+            .await
+        {
             Ok(diagnostics) => structured_value(diagnostics.failed_requests),
             Err(error) => tool_error(error),
         }
@@ -502,7 +613,12 @@ impl BrowserMcpTools {
         )
     )]
     async fn browser_disconnect(&self) -> CallToolResult {
-        structured_browser_result(self.browser.disconnect().await)
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Disconnect, |browser| async move {
+                browser.disconnect().await
+            })
+            .await,
+        )
     }
 }
 
@@ -515,7 +631,7 @@ impl ServerHandler for BrowserMcpTools {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Control only the visible Chrome window owned by GitTerm V4. Call browser_open before page operations. Prefer semantic role or text locators from browser_snapshot; CSS is an explicit fallback. Browser actions are serialized. Read-only inspection tools are browser_status, browser_snapshot, browser_wait_for, browser_console, and browser_network. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
+                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V4. Call browser_open before page operations. Prefer semantic role or text locators from browser_snapshot; CSS is an explicit fallback. Browser actions are serialized. Read-only inspection tools are browser_status, browser_snapshot, browser_wait_for, browser_console, and browser_network. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
             )
     }
 }
@@ -625,6 +741,32 @@ mod tests {
         assert!(configured.contains(BROWSER_MCP_TOKEN_ENV));
         assert_eq!(configure_codex_command("claude", endpoint), "claude");
         assert_eq!(configure_codex_command("pi", endpoint), "pi");
+    }
+
+    #[test]
+    fn manual_codex_zsh_launches_receive_ephemeral_browser_config() {
+        let integration = codex_zsh_integration();
+        assert!(integration.contains("codex()"));
+        assert!(integration.contains(BROWSER_MCP_URL_ENV));
+        assert!(integration.contains(BROWSER_MCP_TOKEN_ENV));
+        assert!(integration.contains("mcp_servers.gitterm_browser.url="));
+        assert!(integration.contains("command codex"));
+        assert!(!integration.contains("Bearer "));
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_publish_agent_operation_activity() {
+        let temp = tempdir().unwrap();
+        let browser = BrowserControlService::new(temp.path());
+        let tools = BrowserMcpTools::new(browser.clone());
+
+        let result = tools.browser_status().await;
+        assert!(!result.is_error.unwrap_or(false));
+        let telemetry = browser.telemetry().await;
+        assert!(telemetry.active_agent_operation.is_none());
+        let outcome = telemetry.last_agent_operation.unwrap();
+        assert_eq!(outcome.operation, BrowserOperation::Status);
+        assert!(outcome.error.is_none());
     }
 
     #[tokio::test]

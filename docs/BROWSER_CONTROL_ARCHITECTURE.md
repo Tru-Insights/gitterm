@@ -128,10 +128,28 @@ approval policy, and tool timeout. The persisted preset command remains
 unchanged, and GitTerm does not edit user or project Codex configuration.
 Remote-agent sessions do not receive the local browser endpoint.
 
+GitTerm's generated zsh integration applies the same overrides when a user
+starts `codex` manually from a local GitTerm terminal. The wrapper exists only
+inside that terminal environment and reads the endpoint and token from inherited
+environment variables, so the bearer token is still never written to disk.
+
 The MCP server exposes the initial tool surface plus
 `browser_disconnect`. Read-only annotations are limited to status, snapshot,
 wait, console, and network inspection; browser lifecycle and interaction tools
 are annotated as mutating.
+
+## Phase 5 Integration
+
+GitTerm's workspace bar reads shared in-memory browser telemetry so agent MCP
+operations are visible while they run and briefly after they complete. MCP tool
+calls are serialized before publishing activity, keeping the displayed
+operation aligned with the browser controller's action order.
+
+A successful browser snapshot retains only the latest PNG and its evidence
+metadata in process memory. The in-app evidence viewer shows the page title,
+sanitized URL, viewport, capture age, and diagnostic counts. Evidence is not
+written to disk or restored across app launches; recording, replay, and a
+persistent evidence history remain out of scope.
 
 ## Acceptance Scenario
 
