@@ -8,7 +8,7 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use hyper::{body::to_bytes, Client, Uri};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fmt;
@@ -27,6 +27,8 @@ use url::Url;
 const PROFILE_DIR_NAME: &str = "browser-profile";
 const DEVTOOLS_ACTIVE_PORT_FILE: &str = "DevToolsActivePort";
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const BROWSER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const STDERR_CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CHROME_STDERR_BYTES: usize = 16_384;
@@ -40,6 +42,9 @@ const MAX_DIAGNOSTIC_URL_CHARS: usize = 2_048;
 const MIN_VIEWPORT_DIMENSION: u32 = 200;
 const MAX_VIEWPORT_WIDTH: u32 = 7_680;
 const MAX_VIEWPORT_HEIGHT: u32 = 4_320;
+const BROWSER_PROFILE_NAME: &str = "GitTerm V4 Browser";
+// Catppuccin Mocha mauve (#cba6f7) encoded as Chrome's signed ARGB SkColor.
+const BROWSER_PROFILE_COLOR: i64 = -3_430_665;
 
 /// Optional explicit Chrome executable for installations outside standard
 /// platform locations.
@@ -354,6 +359,7 @@ impl Default for BrowserLaunchOptions {
 #[derive(Debug, Clone)]
 struct DevToolsEndpoint {
     port: u16,
+    browser_websocket_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,7 +408,7 @@ impl BrowserController {
     }
 
     pub async fn launch(&mut self, options: BrowserLaunchOptions) -> Result<BrowserStatus> {
-        let current = self.status()?;
+        let current = self.status().await?;
         if current.state == BrowserState::Running {
             return Ok(current);
         }
@@ -417,11 +423,9 @@ impl BrowserController {
         let active_port_path = self.profile_dir.join(DEVTOOLS_ACTIVE_PORT_FILE);
         if let Some(endpoint) = read_devtools_active_port(&active_port_path)? {
             if list_page_targets(endpoint.port).await.is_ok() {
-                return Err(BrowserControlError::new(format!(
-                    "the V4 browser profile {} is already controlled by another Chrome process on port {}",
-                    self.profile_dir.display(),
-                    endpoint.port
-                )));
+                self.endpoint = Some(endpoint);
+                self.last_exit = None;
+                return self.status_snapshot();
             }
             std::fs::remove_file(&active_port_path).map_err(|error| {
                 BrowserControlError::new(format!(
@@ -430,6 +434,8 @@ impl BrowserController {
                 ))
             })?;
         }
+
+        ensure_browser_profile_branding(&self.profile_dir)?;
 
         let executable = resolve_chrome_executable(options.executable.as_deref())?;
         let args = chrome_launch_args(&self.profile_dir);
@@ -464,7 +470,7 @@ impl BrowserController {
                 match list_page_targets(endpoint.port).await {
                     Ok(_) => {
                         self.endpoint = Some(endpoint);
-                        return self.status();
+                        return self.status().await;
                     }
                     Err(error) if Instant::now() < deadline => {
                         self.last_exit = Some(format!("waiting for DevTools: {error}"));
@@ -513,7 +519,7 @@ impl BrowserController {
         }
     }
 
-    pub fn status(&mut self) -> Result<BrowserStatus> {
+    fn status_snapshot(&mut self) -> Result<BrowserStatus> {
         if let Some(child) = self.child.as_mut() {
             if let Some(exit) = child.try_wait().map_err(|error| {
                 BrowserControlError::new(format!(
@@ -530,7 +536,7 @@ impl BrowserController {
             }
         }
 
-        let (state, detail) = if self.child.is_some() && self.endpoint.is_some() {
+        let (state, detail) = if self.endpoint.is_some() {
             (BrowserState::Running, None)
         } else if let Some(exit) = &self.last_exit {
             (BrowserState::Exited, Some(exit.clone()))
@@ -546,6 +552,28 @@ impl BrowserController {
             target_id: self.active_target_id.clone(),
             detail,
         })
+    }
+
+    /// Refresh process state and adopt a live DevTools endpoint left by
+    /// another GitTerm V4 instance using the shared persistent profile.
+    pub async fn status(&mut self) -> Result<BrowserStatus> {
+        let _ = self.status_snapshot()?;
+        if self.child.is_none() {
+            let active_port_path = self.profile_dir.join(DEVTOOLS_ACTIVE_PORT_FILE);
+            match read_devtools_active_port(&active_port_path)? {
+                Some(endpoint) if list_page_targets(endpoint.port).await.is_ok() => {
+                    self.endpoint = Some(endpoint);
+                    self.last_exit = None;
+                }
+                _ => {
+                    self.endpoint = None;
+                    self.active_target_id = None;
+                    self.active_viewport = None;
+                    self.session = None;
+                }
+            }
+        }
+        self.status_snapshot()
     }
 
     pub async fn navigate(&mut self, raw_url: &str) -> Result<NavigationResult> {
@@ -838,15 +866,67 @@ impl BrowserController {
         .await
     }
 
+    /// Bring the managed page target to the front of its Chrome window.
+    pub async fn focus(&mut self) -> Result<()> {
+        self.page_session()
+            .await?
+            .command("Page.bringToFront", json!({}))
+            .await?;
+        Ok(())
+    }
+
     pub async fn disconnect(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
-            child.kill().await.map_err(|error| {
+            child.start_kill().map_err(|error| {
                 BrowserControlError::new(format!(
                     "failed to terminate Chrome using V4 profile {}: {error}",
                     self.profile_dir.display()
                 ))
             })?;
-            let _ = child.wait().await;
+            timeout(BROWSER_SHUTDOWN_TIMEOUT, child.wait())
+                .await
+                .map_err(|_| {
+                    BrowserControlError::new(format!(
+                        "Chrome using V4 profile {} did not exit within {} seconds",
+                        self.profile_dir.display(),
+                        BROWSER_SHUTDOWN_TIMEOUT.as_secs()
+                    ))
+                })?
+                .map_err(|error| {
+                    BrowserControlError::new(format!(
+                        "failed while waiting for Chrome using V4 profile {} to exit: {error}",
+                        self.profile_dir.display()
+                    ))
+                })?;
+        } else if let Some(endpoint) = self.endpoint.clone() {
+            let websocket_url = format!(
+                "ws://127.0.0.1:{}{}",
+                endpoint.port, endpoint.browser_websocket_path
+            );
+            let session = CdpSession::connect(&websocket_url).await.map_err(|error| {
+                BrowserControlError::new(format!(
+                    "failed to connect to the existing V4 browser before disconnecting it: {error}"
+                ))
+            })?;
+            if let Err(error) = session.command("Browser.close", json!({})).await {
+                if list_page_targets(endpoint.port).await.is_ok() {
+                    return Err(BrowserControlError::new(format!(
+                        "failed to close the existing V4 browser on port {}: {error}",
+                        endpoint.port
+                    )));
+                }
+            }
+            let deadline = Instant::now() + BROWSER_SHUTDOWN_TIMEOUT;
+            while list_page_targets(endpoint.port).await.is_ok() {
+                if Instant::now() >= deadline {
+                    return Err(BrowserControlError::new(format!(
+                        "existing V4 browser on port {} did not close within {} seconds",
+                        endpoint.port,
+                        BROWSER_SHUTDOWN_TIMEOUT.as_secs()
+                    )));
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
         }
         let _ = self.finish_stderr_capture().await;
         self.session = None;
@@ -858,7 +938,7 @@ impl BrowserController {
     }
 
     fn running_endpoint(&mut self) -> Result<DevToolsEndpoint> {
-        let status = self.status()?;
+        let status = self.status_snapshot()?;
         if status.state != BrowserState::Running {
             return Err(BrowserControlError::new(format!(
                 "browser is not running for V4 profile {} (state: {:?})",
@@ -946,8 +1026,14 @@ impl BrowserController {
     }
 
     async fn finish_stderr_capture(&mut self) -> String {
-        if let Some(task) = self.stderr_task.take() {
-            let _ = task.await;
+        if let Some(mut task) = self.stderr_task.take() {
+            if timeout(STDERR_CAPTURE_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
         }
         String::from_utf8_lossy(&self.stderr_log.lock().await)
             .trim()
@@ -988,7 +1074,7 @@ impl BrowserControlService {
     }
 
     pub async fn status(&self) -> Result<BrowserStatus> {
-        self.controller.lock().await.status()
+        self.controller.lock().await.status().await
     }
 
     pub async fn navigate(&self, url: &str) -> Result<NavigationResult> {
@@ -1045,6 +1131,10 @@ impl BrowserControlService {
             .await
             .wait_for(condition, max_wait)
             .await
+    }
+
+    pub async fn focus(&self) -> Result<()> {
+        self.controller.lock().await.focus().await
     }
 
     pub async fn disconnect(&self) -> Result<()> {
@@ -1972,6 +2062,151 @@ fn executable_on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+fn ensure_browser_profile_branding(profile_dir: &Path) -> Result<()> {
+    let default_profile_dir = profile_dir.join("Default");
+    std::fs::create_dir_all(&default_profile_dir).map_err(|error| {
+        BrowserControlError::new(format!(
+            "failed to create the branded V4 Chrome profile directory {}: {error}",
+            default_profile_dir.display()
+        ))
+    })?;
+    let preferences_path = default_profile_dir.join("Preferences");
+    let mut preferences = match std::fs::read(&preferences_path) {
+        Ok(contents) => serde_json::from_slice::<Value>(&contents).map_err(|error| {
+            BrowserControlError::new(format!(
+                "failed to parse V4 Chrome preferences {} before applying browser branding: {error}",
+                preferences_path.display()
+            ))
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => {
+            return Err(BrowserControlError::new(format!(
+                "failed to read V4 Chrome preferences {} before applying browser branding: {error}",
+                preferences_path.display()
+            )))
+        }
+    };
+    let root = preferences.as_object_mut().ok_or_else(|| {
+        BrowserControlError::new(format!(
+            "V4 Chrome preferences {} must contain a JSON object",
+            preferences_path.display()
+        ))
+    })?;
+    object_preference(root, "profile")?.insert(
+        "name".to_string(),
+        Value::String(BROWSER_PROFILE_NAME.to_string()),
+    );
+    let browser_theme = object_preference(object_preference(root, "browser")?, "theme")?;
+    browser_theme.insert(
+        "user_color2".to_string(),
+        Value::Number(BROWSER_PROFILE_COLOR.into()),
+    );
+    browser_theme.insert("color_variant2".to_string(), Value::Number(1.into()));
+    object_preference(object_preference(root, "extensions")?, "theme")?.insert(
+        "id".to_string(),
+        Value::String("user_color_theme_id".to_string()),
+    );
+
+    let temporary_path = default_profile_dir.join("Preferences.gitterm-v4.tmp");
+    write_json_atomically(
+        &preferences_path,
+        &temporary_path,
+        &preferences,
+        "branded V4 Chrome preferences",
+    )?;
+
+    let local_state_path = profile_dir.join("Local State");
+    let mut local_state = match std::fs::read(&local_state_path) {
+        Ok(contents) => serde_json::from_slice::<Value>(&contents).map_err(|error| {
+            BrowserControlError::new(format!(
+                "failed to parse V4 Chrome Local State {} before applying browser branding: {error}",
+                local_state_path.display()
+            ))
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => {
+            return Err(BrowserControlError::new(format!(
+                "failed to read V4 Chrome Local State {} before applying browser branding: {error}",
+                local_state_path.display()
+            )))
+        }
+    };
+    let root = local_state.as_object_mut().ok_or_else(|| {
+        BrowserControlError::new(format!(
+            "V4 Chrome Local State {} must contain a JSON object",
+            local_state_path.display()
+        ))
+    })?;
+    let default_profile = object_preference(
+        object_preference(object_preference(root, "profile")?, "info_cache")?,
+        "Default",
+    )?;
+    default_profile.insert(
+        "name".to_string(),
+        Value::String(BROWSER_PROFILE_NAME.to_string()),
+    );
+    default_profile.insert("is_using_default_name".to_string(), Value::Bool(false));
+    let temporary_local_state_path = profile_dir.join("Local State.gitterm-v4.tmp");
+    write_json_atomically(
+        &local_state_path,
+        &temporary_local_state_path,
+        &local_state,
+        "branded V4 Chrome Local State",
+    )?;
+    Ok(())
+}
+
+fn write_json_atomically(
+    destination: &Path,
+    temporary: &Path,
+    value: &Value,
+    operation: &str,
+) -> Result<()> {
+    let encoded = serde_json::to_vec(value).map_err(|error| {
+        BrowserControlError::new(format!(
+            "failed to serialize {operation} {}: {error}",
+            destination.display()
+        ))
+    })?;
+    std::fs::write(temporary, encoded).map_err(|error| {
+        BrowserControlError::new(format!(
+            "failed to stage {operation} {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    #[cfg(target_os = "windows")]
+    if destination.exists() {
+        std::fs::remove_file(destination).map_err(|error| {
+            BrowserControlError::new(format!(
+                "failed to replace {operation} {}: {error}",
+                destination.display()
+            ))
+        })?;
+    }
+    std::fs::rename(temporary, destination).map_err(|error| {
+        BrowserControlError::new(format!(
+            "failed to install {operation} {}: {error}",
+            destination.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn object_preference<'a>(
+    parent: &'a mut Map<String, Value>,
+    key: &str,
+) -> Result<&'a mut Map<String, Value>> {
+    parent
+        .entry(key.to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            BrowserControlError::new(format!(
+                "V4 Chrome preference {key} must contain a JSON object"
+            ))
+        })
+}
+
 #[cfg(target_os = "macos")]
 fn platform_chrome_paths() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from(
@@ -2049,7 +2284,10 @@ fn read_devtools_active_port(path: &Path) -> Result<Option<DevToolsEndpoint>> {
             path.display()
         )));
     }
-    Ok(Some(DevToolsEndpoint { port }))
+    Ok(Some(DevToolsEndpoint {
+        port,
+        browser_websocket_path: browser_path.to_string(),
+    }))
 }
 
 async fn list_page_targets(port: u16) -> Result<Vec<DevToolsTarget>> {
@@ -2331,6 +2569,55 @@ mod tests {
     }
 
     #[test]
+    fn browser_profile_branding_is_distinct_and_preserves_existing_preferences() {
+        let temp = tempdir().unwrap();
+        let profile_dir = temp.path().join("browser-profile");
+        let default_dir = profile_dir.join("Default");
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::write(
+            default_dir.join("Preferences"),
+            br#"{"keep":{"existing":true},"profile":{"avatar_index":26}}"#,
+        )
+        .unwrap();
+        fs::write(
+            profile_dir.join("Local State"),
+            br#"{"keep":{"local":true},"profile":{"info_cache":{"Default":{"active_time":42}}}}"#,
+        )
+        .unwrap();
+
+        ensure_browser_profile_branding(&profile_dir).unwrap();
+
+        let preferences: Value =
+            serde_json::from_slice(&fs::read(default_dir.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(preferences["keep"]["existing"], true);
+        assert_eq!(preferences["profile"]["avatar_index"], 26);
+        assert_eq!(preferences["profile"]["name"], BROWSER_PROFILE_NAME);
+        assert_eq!(
+            preferences["browser"]["theme"]["user_color2"],
+            BROWSER_PROFILE_COLOR
+        );
+        assert_eq!(
+            preferences["extensions"]["theme"]["id"],
+            "user_color_theme_id"
+        );
+        let local_state: Value =
+            serde_json::from_slice(&fs::read(profile_dir.join("Local State")).unwrap()).unwrap();
+        assert_eq!(local_state["keep"]["local"], true);
+        assert_eq!(
+            local_state["profile"]["info_cache"]["Default"]["active_time"],
+            42
+        );
+        assert_eq!(
+            local_state["profile"]["info_cache"]["Default"]["name"],
+            BROWSER_PROFILE_NAME
+        );
+        assert_eq!(
+            local_state["profile"]["info_cache"]["Default"]["is_using_default_name"],
+            false
+        );
+    }
+
+    #[test]
     fn parses_chrome_devtools_active_port_file() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(DEVTOOLS_ACTIVE_PORT_FILE);
@@ -2562,7 +2849,8 @@ mod tests {
         });
 
         let temp = tempdir().unwrap();
-        let service = BrowserControlService::new(temp.path().join("gitterm-v4"));
+        let config_root = temp.path().join("gitterm-v4");
+        let service = BrowserControlService::new(&config_root);
         let status = service
             .launch(BrowserLaunchOptions::default())
             .await
@@ -2596,6 +2884,7 @@ mod tests {
             )
             .await
             .unwrap();
+        service.focus().await.unwrap();
         let target_id = service.status().await.unwrap().target_id.unwrap();
         let snapshot = service.snapshot().await.unwrap();
         assert_eq!(snapshot.url, url);
@@ -2686,8 +2975,18 @@ mod tests {
             .visible_text
             .contains("browser-control-ready"));
 
-        service.disconnect().await.unwrap();
-        assert_eq!(service.status().await.unwrap().state, BrowserState::Stopped);
+        let attached_service = BrowserControlService::new(&config_root);
+        assert_eq!(
+            attached_service.status().await.unwrap().state,
+            BrowserState::Running
+        );
+        attached_service.focus().await.unwrap();
+        attached_service.disconnect().await.unwrap();
+        assert_eq!(
+            attached_service.status().await.unwrap().state,
+            BrowserState::Stopped
+        );
+        drop(service);
         server.abort();
     }
 }

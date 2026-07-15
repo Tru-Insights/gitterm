@@ -41,6 +41,9 @@ mod tab;
 mod theme;
 
 use gitterm::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake};
+use gitterm::browser_control::{
+    BrowserControlService, BrowserLaunchOptions, BrowserState, BrowserStatus,
+};
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
@@ -3645,6 +3648,14 @@ pub enum Event {
     SyntectWarmupComplete,
     LoadingUiTick,
     BrowserMcpStopped(Result<(), String>),
+    BrowserStatusRefreshRequested,
+    BrowserStatusLoaded(Result<BrowserStatus, String>),
+    BrowserOpen,
+    BrowserOpened(Result<BrowserStatus, String>),
+    BrowserFocus,
+    BrowserFocused(Result<(), String>),
+    BrowserDisconnect,
+    BrowserDisconnected(Result<(), String>),
     // Speech-to-text events
     #[cfg(feature = "stt")]
     SttToggle,
@@ -3652,6 +3663,53 @@ pub enum Event {
     SttTranscriptReady(String),
     #[cfg(feature = "stt")]
     SttError(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserAction {
+    Opening,
+    Focusing,
+    Disconnecting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserBarState {
+    Unavailable,
+    Stopped,
+    Running,
+    Busy(BrowserAction),
+    Error,
+}
+
+fn browser_bar_state(
+    browser_available: bool,
+    status: Option<&BrowserStatus>,
+    action: Option<BrowserAction>,
+    error: Option<&str>,
+) -> BrowserBarState {
+    if !browser_available {
+        BrowserBarState::Unavailable
+    } else if let Some(action) = action {
+        BrowserBarState::Busy(action)
+    } else if error.is_some() {
+        BrowserBarState::Error
+    } else if status.is_some_and(|status| status.state == BrowserState::Running) {
+        BrowserBarState::Running
+    } else {
+        BrowserBarState::Stopped
+    }
+}
+
+fn compact_browser_error(error: &str) -> String {
+    const MAX_CHARS: usize = 40;
+    let first_line = error.lines().next().unwrap_or(error).trim();
+    let mut chars = first_line.chars();
+    let summary: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{summary}…")
+    } else {
+        summary
+    }
 }
 
 struct App {
@@ -3671,6 +3729,11 @@ struct App {
     log_server_state: log_server::ServerState,
     log_server_enabled: bool,
     browser_mcp: Option<BrowserMcpConnection>,
+    browser_status: Option<BrowserStatus>,
+    browser_action: Option<BrowserAction>,
+    browser_status_loading: bool,
+    browser_error: Option<String>,
+    browser_error_sticky: bool,
     console_expanded: bool,
     console_height: f32,
     dragging_console_divider: bool,
@@ -5793,23 +5856,23 @@ impl App {
     fn new() -> (Self, Task<Event>) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = Config::load();
-        let (browser_mcp, browser_mcp_server) = match browser_mcp::prepare(
-            config::global_config_dir(),
-        ) {
-            Ok((connection, server)) => {
-                eprintln!(
-                    "GitTerm V4 browser MCP reserved at {}",
-                    connection.endpoint()
-                );
-                (Some(connection), Some(server))
-            }
-            Err(error) => {
-                eprintln!(
-                        "GitTerm V4 browser MCP is unavailable: failed to reserve a loopback endpoint: {error}"
+        let (browser_mcp, browser_mcp_server, browser_error) =
+            match browser_mcp::prepare(config::global_config_dir()) {
+                Ok((connection, server)) => {
+                    eprintln!(
+                        "GitTerm V4 browser MCP reserved at {}",
+                        connection.endpoint()
                     );
-                (None, None)
-            }
-        };
+                    (Some(connection), Some(server), None)
+                }
+                Err(error) => {
+                    let message = format!(
+                        "failed to reserve the GitTerm V4 browser MCP loopback endpoint: {error}"
+                    );
+                    eprintln!("GitTerm V4 browser controls are unavailable: {message}");
+                    (None, None, Some(message))
+                }
+            };
 
         let theme = if config.theme == "light" {
             AppTheme::Light
@@ -5849,6 +5912,11 @@ impl App {
             log_server_state,
             log_server_enabled,
             browser_mcp,
+            browser_status: None,
+            browser_action: None,
+            browser_status_loading: false,
+            browser_error,
+            browser_error_sticky: false,
             console_expanded: config.console_expanded,
             console_height: config.console_height.clamp(32.0, 600.0),
             dragging_console_divider: false,
@@ -6234,6 +6302,7 @@ impl App {
         startup_tasks.push(app.refresh_files_for_active_tab());
         if let Some(server) = browser_mcp_server {
             startup_tasks.push(Task::perform(server.run(), Event::BrowserMcpStopped));
+            startup_tasks.push(Task::done(Event::BrowserStatusRefreshRequested));
         }
 
         // If the active tab on startup is an agent tab (restored from
@@ -7445,6 +7514,29 @@ fi
         }
     }
 
+    fn browser_service(&self) -> Option<BrowserControlService> {
+        self.browser_mcp.as_ref().map(BrowserMcpConnection::browser)
+    }
+
+    fn request_browser_status(&mut self) -> Task<Event> {
+        if self.browser_status_loading || self.browser_action.is_some() {
+            return Task::none();
+        }
+        let Some(browser) = self.browser_service() else {
+            return Task::none();
+        };
+        self.browser_status_loading = true;
+        Task::perform(
+            async move {
+                browser
+                    .status()
+                    .await
+                    .map_err(|error| format!("could not refresh managed browser status: {error}"))
+            },
+            Event::BrowserStatusLoaded,
+        )
+    }
+
     fn subscription(&self) -> Subscription<Event> {
         let mut subs = vec![
             // Agent webview IPC bridge — drains the global mpsc into events.
@@ -7479,6 +7571,13 @@ fi
                 _ => None,
             }),
         ];
+
+        if self.browser_mcp.is_some() {
+            subs.push(
+                iced::time::every(Duration::from_millis(1000))
+                    .map(|_| Event::BrowserStatusRefreshRequested),
+            );
+        }
 
         // Animation tick (~60fps) — when animating or waiting for swipe debounce
         if self.slide_animating || self.last_user_scroll.is_some() {
@@ -7560,13 +7659,160 @@ fi
         }
         match event {
             Event::BrowserMcpStopped(result) => {
-                match result {
-                    Ok(()) => eprintln!(
-                        "GitTerm V4 browser MCP server stopped before application shutdown"
-                    ),
-                    Err(error) => eprintln!("{error}"),
-                }
+                let error = match result {
+                    Ok(()) => "GitTerm V4 browser MCP server stopped before application shutdown"
+                        .to_string(),
+                    Err(error) => error,
+                };
+                eprintln!("{error}");
                 self.browser_mcp = None;
+                self.browser_status = None;
+                self.browser_status_loading = false;
+                self.browser_action = None;
+                self.browser_error = Some(error);
+                self.browser_error_sticky = false;
+            }
+            Event::BrowserStatusRefreshRequested => {
+                return self.request_browser_status();
+            }
+            Event::BrowserStatusLoaded(result) => {
+                self.browser_status_loading = false;
+                match result {
+                    Ok(status) => {
+                        self.browser_status = Some(status);
+                        if !self.browser_error_sticky {
+                            self.browser_error = None;
+                        }
+                    }
+                    Err(error) => {
+                        if self.browser_error.as_deref() != Some(error.as_str()) {
+                            eprintln!("{error}");
+                        }
+                        self.browser_error = Some(error);
+                        self.browser_error_sticky = false;
+                    }
+                }
+            }
+            Event::BrowserOpen => {
+                if self.browser_action.is_some() {
+                    return Task::none();
+                }
+                let Some(browser) = self.browser_service() else {
+                    self.browser_error = Some(
+                        "cannot open the managed browser because browser controls are unavailable"
+                            .to_string(),
+                    );
+                    return Task::none();
+                };
+                self.browser_action = Some(BrowserAction::Opening);
+                self.browser_error = None;
+                self.browser_error_sticky = false;
+                return Task::perform(
+                    async move {
+                        browser
+                            .launch(BrowserLaunchOptions::default())
+                            .await
+                            .map_err(|error| format!("could not open managed browser: {error}"))
+                    },
+                    Event::BrowserOpened,
+                );
+            }
+            Event::BrowserOpened(result) => {
+                self.browser_action = None;
+                match result {
+                    Ok(status) => {
+                        self.browser_status = Some(status);
+                        self.browser_error = None;
+                        self.browser_error_sticky = false;
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        self.browser_error = Some(error);
+                        self.browser_error_sticky = true;
+                    }
+                }
+            }
+            Event::BrowserFocus => {
+                if self.browser_action.is_some() {
+                    return Task::none();
+                }
+                let Some(browser) = self.browser_service() else {
+                    self.browser_error = Some(
+                        "cannot focus the managed browser because browser controls are unavailable"
+                            .to_string(),
+                    );
+                    return Task::none();
+                };
+                self.browser_action = Some(BrowserAction::Focusing);
+                self.browser_error = None;
+                self.browser_error_sticky = false;
+                return Task::perform(
+                    async move {
+                        browser
+                            .focus()
+                            .await
+                            .map_err(|error| format!("could not focus managed browser: {error}"))
+                    },
+                    Event::BrowserFocused,
+                );
+            }
+            Event::BrowserFocused(result) => {
+                self.browser_action = None;
+                match result {
+                    Ok(()) => {
+                        self.browser_error = None;
+                        self.browser_error_sticky = false;
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        self.browser_error = Some(error);
+                        self.browser_error_sticky = true;
+                    }
+                }
+            }
+            Event::BrowserDisconnect => {
+                if self.browser_action.is_some() {
+                    return Task::none();
+                }
+                let Some(browser) = self.browser_service() else {
+                    self.browser_error = Some(
+                        "cannot disconnect the managed browser because browser controls are unavailable"
+                            .to_string(),
+                    );
+                    return Task::none();
+                };
+                self.browser_action = Some(BrowserAction::Disconnecting);
+                self.browser_error = None;
+                self.browser_error_sticky = false;
+                return Task::perform(
+                    async move {
+                        tokio::time::timeout(Duration::from_secs(8), browser.disconnect())
+                            .await
+                            .map_err(|_| {
+                                "could not disconnect managed browser: operation timed out after 8 seconds"
+                                    .to_string()
+                            })?
+                            .map_err(|error| {
+                                format!("could not disconnect managed browser: {error}")
+                            })
+                    },
+                    Event::BrowserDisconnected,
+                );
+            }
+            Event::BrowserDisconnected(result) => {
+                self.browser_action = None;
+                match result {
+                    Ok(()) => {
+                        self.browser_error = None;
+                        self.browser_error_sticky = false;
+                        return Task::done(Event::BrowserStatusRefreshRequested);
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        self.browser_error = Some(error);
+                        self.browser_error_sticky = true;
+                    }
+                }
             }
             Event::MainTerminalClicked => {
                 if self.bottom_panel_focused {
@@ -12970,6 +13216,149 @@ fi
             .into()
     }
 
+    fn browser_bar_button(
+        &self,
+        label: &'static str,
+        color: iced::Color,
+        event: Event,
+    ) -> Element<'_, Event, Theme, iced::Renderer> {
+        let hover_bg = self.theme.surface1();
+        let border_color = self.theme.surface2();
+        button(
+            text(label)
+                .size(9)
+                .color(color)
+                .font(iced::Font::with_name("Menlo")),
+        )
+        .style(move |_theme, status| button::Style {
+            background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                .then_some(hover_bg.into()),
+            text_color: color,
+            border: iced::Border {
+                color: border_color,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        })
+        .padding([2, 6])
+        .on_press(event)
+        .into()
+    }
+
+    fn view_browser_controls(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let state = browser_bar_state(
+            self.browser_mcp.is_some(),
+            self.browser_status.as_ref(),
+            self.browser_action,
+            self.browser_error.as_deref(),
+        );
+        let is_running = self
+            .browser_status
+            .as_ref()
+            .is_some_and(|status| status.state == BrowserState::Running);
+
+        let (label, dot_color) = match state {
+            BrowserBarState::Unavailable => (
+                self.browser_error.as_deref().map_or_else(
+                    || "Browser unavailable".to_string(),
+                    |error| format!("Browser · {}", compact_browser_error(error)),
+                ),
+                self.theme.danger(),
+            ),
+            BrowserBarState::Stopped => ("Browser idle".to_string(), self.theme.overlay0()),
+            BrowserBarState::Running => ("Browser live".to_string(), self.theme.success()),
+            BrowserBarState::Busy(BrowserAction::Opening) => {
+                ("Opening browser…".to_string(), self.theme.warning())
+            }
+            BrowserBarState::Busy(BrowserAction::Focusing) => {
+                ("Focusing browser…".to_string(), self.theme.warning())
+            }
+            BrowserBarState::Busy(BrowserAction::Disconnecting) => {
+                ("Disconnecting…".to_string(), self.theme.warning())
+            }
+            BrowserBarState::Error => (
+                format!(
+                    "Browser · {}",
+                    compact_browser_error(
+                        self.browser_error
+                            .as_deref()
+                            .unwrap_or("browser operation failed")
+                    )
+                ),
+                self.theme.danger(),
+            ),
+        };
+
+        let dot = container(iced::widget::Space::new().width(0).height(0))
+            .width(Length::Fixed(6.0))
+            .height(Length::Fixed(6.0))
+            .style(move |_| container::Style {
+                background: Some(dot_color.into()),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let label_color = if matches!(state, BrowserBarState::Error | BrowserBarState::Unavailable)
+        {
+            self.theme.danger()
+        } else {
+            self.theme.text_secondary()
+        };
+        let mut content = Row::new()
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .push(dot)
+            .push(
+                text(label)
+                    .size(10)
+                    .color(label_color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+
+        if !matches!(
+            state,
+            BrowserBarState::Busy(_) | BrowserBarState::Unavailable
+        ) {
+            if is_running {
+                content = content
+                    .push(self.browser_bar_button(
+                        "Focus",
+                        self.theme.accent(),
+                        Event::BrowserFocus,
+                    ))
+                    .push(self.browser_bar_button(
+                        "Disconnect",
+                        self.theme.danger(),
+                        Event::BrowserDisconnect,
+                    ));
+            } else {
+                content = content.push(self.browser_bar_button(
+                    "Open",
+                    self.theme.accent(),
+                    Event::BrowserOpen,
+                ));
+            }
+        }
+
+        let background = self.theme.surface0();
+        let border_color = self.theme.surface1();
+        container(content)
+            .padding([3, 7])
+            .style(move |_| container::Style {
+                background: Some(background.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
     fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mut bar_row = Row::new().spacing(0).align_y(iced::Alignment::Center);
@@ -13329,10 +13718,25 @@ fi
         .padding([6, 10])
         .on_press(Event::ToggleHelp);
 
-        let bar_inner = row![scrollable_bar, help_btn]
-            .spacing(0)
-            .align_y(iced::Alignment::Center)
-            .width(Length::Fill);
+        let browser_controls = self.view_browser_controls();
+        let control_separator_color = theme.surface0();
+        let control_separator = container(iced::widget::Space::new().width(0).height(0))
+            .width(Length::Fixed(1.0))
+            .height(Length::Fixed(16.0))
+            .style(move |_| container::Style {
+                background: Some(control_separator_color.into()),
+                ..Default::default()
+            });
+
+        let bar_inner = row![
+            scrollable_bar,
+            control_separator,
+            container(browser_controls).padding([0, 6]),
+            help_btn
+        ]
+        .spacing(0)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill);
 
         let bar_container =
             container(bar_inner)
@@ -20152,6 +20556,53 @@ fi
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn test_browser_status(state: BrowserState) -> BrowserStatus {
+        BrowserStatus {
+            state,
+            profile_dir: PathBuf::from("/tmp/gitterm-v4/browser-profile"),
+            devtools_port: None,
+            process_id: None,
+            target_id: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn browser_bar_state_prioritizes_availability_actions_and_errors() {
+        let running = test_browser_status(BrowserState::Running);
+        assert_eq!(
+            browser_bar_state(true, Some(&running), None, None),
+            BrowserBarState::Running
+        );
+        assert_eq!(
+            browser_bar_state(
+                true,
+                Some(&running),
+                Some(BrowserAction::Disconnecting),
+                Some("old error")
+            ),
+            BrowserBarState::Busy(BrowserAction::Disconnecting)
+        );
+        assert_eq!(
+            browser_bar_state(true, Some(&running), None, Some("focus failed")),
+            BrowserBarState::Error
+        );
+        assert_eq!(
+            browser_bar_state(false, Some(&running), None, Some("server stopped")),
+            BrowserBarState::Unavailable
+        );
+    }
+
+    #[test]
+    fn browser_bar_compacts_long_errors_without_losing_operation_context() {
+        let error =
+            "could not focus managed browser: Chrome page target has no active DevTools session";
+        let summary = compact_browser_error(error);
+        assert!(summary.starts_with("could not focus managed browser"));
+        assert!(summary.ends_with('…'));
+        assert!(summary.chars().count() <= 41);
+    }
 
     fn test_remote_session() -> RemoteSessionDefinition {
         RemoteSessionDefinition {
