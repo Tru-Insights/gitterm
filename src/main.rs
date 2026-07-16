@@ -42,8 +42,8 @@ mod theme;
 
 use gitterm::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake};
 use gitterm::browser_control::{
-    BrowserControlService, BrowserLaunchOptions, BrowserState, BrowserStatus,
-    BrowserTelemetrySnapshot,
+    BrowserCaptureMode, BrowserControlService, BrowserEvidence, BrowserLaunchOptions, BrowserState,
+    BrowserStatus, BrowserTelemetrySnapshot,
 };
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
@@ -3717,6 +3717,41 @@ fn compact_browser_error(error: &str) -> String {
     }
 }
 
+fn paired_browser_evidence(evidence: &[BrowserEvidence]) -> Vec<&BrowserEvidence> {
+    let Some(anchor) = evidence.iter().max_by_key(|capture| capture.id) else {
+        return Vec::new();
+    };
+    let partner = evidence
+        .iter()
+        .filter(|capture| capture.target != anchor.target)
+        .filter(|capture| {
+            capture.label == anchor.label
+                && capture.capture_mode == anchor.capture_mode
+                && capture.viewport == anchor.viewport
+        })
+        .max_by_key(|capture| capture.id)
+        .or_else(|| {
+            evidence
+                .iter()
+                .filter(|capture| capture.target != anchor.target && capture.label == anchor.label)
+                .max_by_key(|capture| capture.id)
+        })
+        .or_else(|| {
+            evidence
+                .iter()
+                .filter(|capture| capture.target != anchor.target)
+                .max_by_key(|capture| capture.id)
+        });
+    let mut selected = evidence
+        .iter()
+        .filter(|capture| {
+            capture.id == anchor.id || partner.is_some_and(|item| item.id == capture.id)
+        })
+        .collect::<Vec<_>>();
+    selected.truncate(2);
+    selected
+}
+
 struct App {
     title: String,
     workspaces: Vec<Workspace>,
@@ -3742,7 +3777,7 @@ struct App {
     browser_telemetry: BrowserTelemetrySnapshot,
     browser_telemetry_loading: bool,
     browser_evidence_open: bool,
-    browser_evidence_handle: Option<image::Handle>,
+    browser_evidence_handles: HashMap<u64, image::Handle>,
     console_expanded: bool,
     console_height: f32,
     dragging_console_divider: bool,
@@ -5929,7 +5964,7 @@ impl App {
             browser_telemetry: BrowserTelemetrySnapshot::default(),
             browser_telemetry_loading: false,
             browser_evidence_open: false,
-            browser_evidence_handle: None,
+            browser_evidence_handles: HashMap::new(),
             console_expanded: config.console_expanded,
             console_height: config.console_height.clamp(32.0, 600.0),
             dragging_console_divider: false,
@@ -7855,26 +7890,25 @@ fi
             }
             Event::BrowserTelemetryLoaded(telemetry) => {
                 self.browser_telemetry_loading = false;
-                let current_evidence_id = self
-                    .browser_telemetry
-                    .latest_evidence
-                    .as_ref()
-                    .map(|evidence| evidence.id);
-                let next_evidence_id = telemetry
-                    .latest_evidence
-                    .as_ref()
-                    .map(|evidence| evidence.id);
-                if next_evidence_id != current_evidence_id {
-                    self.browser_evidence_handle =
-                        telemetry.latest_evidence.as_ref().map(|evidence| {
+                let retained_ids = telemetry
+                    .evidence
+                    .iter()
+                    .map(|evidence| evidence.id)
+                    .collect::<HashSet<_>>();
+                self.browser_evidence_handles
+                    .retain(|id, _| retained_ids.contains(id));
+                for evidence in &telemetry.evidence {
+                    self.browser_evidence_handles
+                        .entry(evidence.id)
+                        .or_insert_with(|| {
                             image::Handle::from_bytes(evidence.screenshot_png.as_ref().clone())
                         });
                 }
                 self.browser_telemetry = telemetry;
             }
             Event::BrowserEvidenceOpen => {
-                if self.browser_telemetry.latest_evidence.is_some()
-                    && self.browser_evidence_handle.is_some()
+                if !self.browser_telemetry.evidence.is_empty()
+                    && !self.browser_evidence_handles.is_empty()
                 {
                     self.browser_evidence_open = true;
                 }
@@ -13300,13 +13334,17 @@ fi
     }
 
     fn view_browser_evidence(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let Some(evidence) = self.browser_telemetry.latest_evidence.as_ref() else {
+        let selected = paired_browser_evidence(&self.browser_telemetry.evidence);
+        let Some(evidence) = selected.last().copied() else {
             return container(iced::widget::Space::new())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
         };
-        let Some(handle) = self.browser_evidence_handle.as_ref() else {
+        if selected
+            .iter()
+            .any(|capture| !self.browser_evidence_handles.contains_key(&capture.id))
+        {
             return container(iced::widget::Space::new())
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -13332,7 +13370,9 @@ fi
             .padding([4, 8])
             .on_press(Event::BrowserEvidenceClose);
         let header = row![
-            text("Latest browser evidence").size(16).color(text_primary),
+            text("Browser evidence comparison")
+                .size(16)
+                .color(text_primary),
             iced::widget::Space::new().width(Length::Fill),
             close
         ]
@@ -13373,15 +13413,16 @@ fi
         ]
         .align_y(iced::Alignment::Center);
 
-        let title = if evidence.title.trim().is_empty() {
-            "Untitled page"
-        } else {
-            evidence.title.as_str()
-        };
-        let url = evidence.display_url.as_deref().unwrap_or("URL unavailable");
         let page_identity = column![
-            text(title).size(12).color(text_primary),
-            text(url)
+            text(format!(
+                "{} · {} capture{} · memory only",
+                evidence.label,
+                selected.len(),
+                if selected.len() == 1 { "" } else { "s" }
+            ))
+            .size(12)
+            .color(text_primary),
+            text("Best-matching labels, capture modes, and viewports are paired automatically")
                 .size(10)
                 .color(mauve)
                 .font(mono)
@@ -13425,14 +13466,80 @@ fi
             );
         }
 
-        let screenshot = image(handle.clone())
-            .content_fit(iced::ContentFit::Contain)
-            .width(Length::Fill)
-            .height(Length::Fill);
-        let screenshot_frame = container(screenshot)
-            .width(Length::Fill)
+        let mut evidence_row = Row::new().spacing(12).height(Length::Fill);
+        for capture in selected {
+            let handle = self
+                .browser_evidence_handles
+                .get(&capture.id)
+                .expect("paired evidence handles were checked above")
+                .clone();
+            let capture_mode = match capture.capture_mode {
+                BrowserCaptureMode::Viewport => "viewport",
+                BrowserCaptureMode::FullPage => "full page",
+            };
+            let title = if capture.title.trim().is_empty() {
+                "Untitled page"
+            } else {
+                capture.title.as_str()
+            };
+            let url = capture.display_url.as_deref().unwrap_or("URL unavailable");
+            let diagnostics_color =
+                if capture.console_error_count > 0 || capture.failed_request_count > 0 {
+                    danger
+                } else {
+                    text_secondary
+                };
+            let pane_header = column![
+                row![
+                    text(capture.target.as_str())
+                        .size(12)
+                        .color(mauve)
+                        .font(mono),
+                    iced::widget::Space::new().width(Length::Fill),
+                    text(capture.label.as_str())
+                        .size(10)
+                        .color(text_secondary)
+                        .font(mono)
+                ]
+                .align_y(iced::Alignment::Center),
+                text(title).size(11).color(text_primary),
+                text(url)
+                    .size(9)
+                    .color(text_secondary)
+                    .font(mono)
+                    .width(Length::Fill),
+                row![
+                    text(format!(
+                        "{} × {} · {capture_mode}",
+                        capture.viewport.width, capture.viewport.height
+                    ))
+                    .size(9)
+                    .color(text_secondary)
+                    .font(mono),
+                    iced::widget::Space::new().width(Length::Fill),
+                    text(format!(
+                        "{} console · {} network",
+                        capture.console_error_count, capture.failed_request_count
+                    ))
+                    .size(9)
+                    .color(diagnostics_color)
+                    .font(mono)
+                ]
+                .align_y(iced::Alignment::Center)
+            ]
+            .spacing(4);
+            let screenshot = image(handle)
+                .content_fit(iced::ContentFit::Contain)
+                .width(Length::Fill)
+                .height(Length::Fill);
+            let pane = container(
+                column![pane_header, screenshot]
+                    .spacing(8)
+                    .height(Length::Fill),
+            )
+            .width(Length::FillPortion(1))
             .height(Length::Fill)
-            .padding(8)
+            .padding(10)
             .style(move |_| container::Style {
                 background: Some(screenshot_background.into()),
                 border: iced::Border {
@@ -13442,11 +13549,13 @@ fi
                 },
                 ..Default::default()
             });
+            evidence_row = evidence_row.push(pane);
+        }
 
-        let card_width = (self.window_size.0 - 120.0).clamp(520.0, 1040.0);
+        let card_width = (self.window_size.0 - 80.0).clamp(620.0, 1320.0);
         let card_height = (self.window_size.1 - 100.0).clamp(420.0, 780.0);
         let card = container(
-            column![details, screenshot_frame]
+            column![details, evidence_row]
                 .spacing(12)
                 .height(Length::Fill),
         )
@@ -20858,6 +20967,28 @@ fi
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Arc;
+
+    fn test_browser_evidence(
+        id: u64,
+        target: &str,
+        label: &str,
+        viewport: gitterm::browser_control::BrowserViewport,
+    ) -> BrowserEvidence {
+        BrowserEvidence {
+            id,
+            target: target.to_string(),
+            label: label.to_string(),
+            capture_mode: BrowserCaptureMode::Viewport,
+            title: target.to_string(),
+            display_url: Some(format!("https://example.com/{target}")),
+            viewport,
+            captured_at: std::time::SystemTime::now(),
+            console_error_count: 0,
+            failed_request_count: 0,
+            screenshot_png: Arc::new(vec![id as u8]),
+        }
+    }
 
     fn test_browser_status(state: BrowserState) -> BrowserStatus {
         BrowserStatus {
@@ -20866,6 +20997,7 @@ mod tests {
             devtools_port: None,
             process_id: None,
             target_id: None,
+            active_target: None,
             detail: None,
         }
     }
@@ -20894,6 +21026,21 @@ mod tests {
             browser_bar_state(false, Some(&running), None, Some("server stopped")),
             BrowserBarState::Unavailable
         );
+    }
+
+    #[test]
+    fn evidence_pairing_is_target_agnostic_and_prefers_matching_capture_context() {
+        let desktop = gitterm::browser_control::BrowserViewport::desktop(1_280, 720);
+        let evidence = vec![
+            test_browser_evidence(1, "design", "settings", desktop),
+            test_browser_evidence(2, "implementation", "other-route", desktop),
+            test_browser_evidence(3, "implementation", "settings", desktop),
+        ];
+        let pair = paired_browser_evidence(&evidence);
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[0].target, "design");
+        assert_eq!(pair[1].target, "implementation");
+        assert!(pair.iter().all(|capture| capture.label == "settings"));
     }
 
     #[test]
