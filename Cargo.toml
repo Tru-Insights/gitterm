@@ -52,7 +52,7 @@ whisper-rs = { version = "0.15", optional = true }
 cpal = { version = "0.15", optional = true }
 
 [features]
-default = []
+default = ["stt"]
 stt = ["whisper-rs", "cpal"]
 excalidraw = []
 

@@ -122,6 +122,20 @@ mod tests {
             Some(PathBuf::from("/tmp/gitterm-dev"))
         );
     }
+
+    #[cfg(feature = "stt")]
+    #[test]
+    fn stt_defaults_enabled_for_existing_and_new_configs() {
+        let mut serialized = serde_json::to_value(Config::default()).unwrap();
+        serialized.as_object_mut().unwrap().remove("stt_enabled");
+
+        let existing_config: Config = serde_json::from_value(serialized.clone()).unwrap();
+        assert!(existing_config.stt_enabled);
+
+        serialized["stt_enabled"] = serde_json::Value::Bool(false);
+        let explicitly_disabled: Config = serde_json::from_value(serialized).unwrap();
+        assert!(!explicitly_disabled.stt_enabled);
+    }
 }
 
 /// Clean up this instance's config directory on exit
@@ -221,7 +235,7 @@ pub fn default_remote_agents() -> Vec<RemoteAgentConfig> {
 
 #[cfg(feature = "stt")]
 fn default_stt_enabled() -> bool {
-    false
+    true
 }
 
 // Persistent configuration
