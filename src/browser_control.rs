@@ -7,7 +7,7 @@
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use hyper::{body::to_bytes, Client, Uri};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -40,6 +40,18 @@ const MAX_NETWORK_FAILURES: usize = 100;
 const MAX_TRACKED_REQUESTS: usize = 512;
 const MAX_DIAGNOSTIC_TEXT_CHARS: usize = 4_000;
 const MAX_DIAGNOSTIC_URL_CHARS: usize = 2_048;
+const MAX_DOM_OUTLINE_NODES: usize = 300;
+const MAX_DOM_SCANNED_ELEMENTS: usize = 5_000;
+const MAX_DOM_OUTLINE_DEPTH: usize = 16;
+const MAX_DOM_TEXT_CHARS: usize = 200;
+const MAX_DOM_FIELD_CHARS: usize = 500;
+const MAX_DOM_CLASSES: usize = 16;
+const MAX_NODE_ATTRIBUTES: usize = 50;
+const MAX_NODE_ATTRIBUTE_VALUE_CHARS: usize = 2_000;
+const MAX_STYLE_VALUE_CHARS: usize = 2_000;
+const MAX_OUTER_HTML_CHARS: usize = 10_000;
+const MAX_NODE_REF_CHARS: usize = 128;
+const MAX_LOCATOR_VALUE_CHARS: usize = 2_000;
 const MAX_BROWSER_TARGET_NAME_CHARS: usize = 32;
 const MAX_EVIDENCE_LABEL_CHARS: usize = 80;
 const MAX_RETAINED_EVIDENCE: usize = 6;
@@ -129,6 +141,8 @@ pub enum BrowserOperation {
     Wait,
     Console,
     Network,
+    Dom,
+    Styles,
     Disconnect,
 }
 
@@ -152,6 +166,8 @@ impl BrowserOperation {
             Self::Wait => "Waiting",
             Self::Console => "Inspecting console",
             Self::Network => "Inspecting network",
+            Self::Dom => "Inspecting page structure",
+            Self::Styles => "Inspecting node styles",
             Self::Disconnect => "Disconnecting",
         }
     }
@@ -175,6 +191,8 @@ impl BrowserOperation {
             Self::Wait => "Wait complete",
             Self::Console => "Console inspected",
             Self::Network => "Network inspected",
+            Self::Dom => "Page structure inspected",
+            Self::Styles => "Node styles inspected",
             Self::Disconnect => "Browser disconnected",
         }
     }
@@ -301,6 +319,11 @@ impl BrowserLocator {
                 "browser {kind} locator must not be empty"
             )));
         }
+        if value.chars().count() > MAX_LOCATOR_VALUE_CHARS {
+            return Err(BrowserControlError::new(format!(
+                "browser {kind} locator must not exceed {MAX_LOCATOR_VALUE_CHARS} characters"
+            )));
+        }
         if let Self::Role {
             name: Some(name), ..
         } = self
@@ -309,6 +332,11 @@ impl BrowserLocator {
                 return Err(BrowserControlError::new(
                     "browser role locator name must not be empty when provided",
                 ));
+            }
+            if name.chars().count() > MAX_LOCATOR_VALUE_CHARS {
+                return Err(BrowserControlError::new(format!(
+                    "browser role locator name must not exceed {MAX_LOCATOR_VALUE_CHARS} characters"
+                )));
             }
         }
         Ok(())
@@ -431,6 +459,102 @@ pub struct BrowserNetworkFailure {
 pub struct BrowserDiagnostics {
     pub console_errors: Vec<BrowserConsoleError>,
     pub failed_requests: Vec<BrowserNetworkFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserDomBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserDomNode {
+    pub node_ref: String,
+    pub parent_ref: Option<String>,
+    pub depth: usize,
+    pub tag: String,
+    pub id: Option<String>,
+    pub classes: Vec<String>,
+    pub role: Option<String>,
+    pub name: Option<String>,
+    pub text: Option<String>,
+    pub bounds: BrowserDomBounds,
+    pub disabled: bool,
+    pub expanded: Option<String>,
+    pub selected: Option<String>,
+    pub checked: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserDomOutline {
+    pub target: String,
+    pub document_id: String,
+    pub url: String,
+    pub title: String,
+    pub nodes: Vec<BrowserDomNode>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BrowserNodeSelector {
+    NodeRef { node_ref: String },
+    Locator { locator: BrowserLocator },
+}
+
+impl BrowserNodeSelector {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::NodeRef { node_ref }
+                if node_ref.trim().is_empty() || node_ref.chars().count() > MAX_NODE_REF_CHARS =>
+            {
+                Err(BrowserControlError::new(format!(
+                    "browser DOM node_ref must contain 1 to {MAX_NODE_REF_CHARS} characters"
+                )))
+            }
+            Self::NodeRef { .. } => Ok(()),
+            Self::Locator { locator } => locator.validate(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserDomAttribute {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserStyleProperty {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserNodeDetails {
+    pub target: String,
+    pub document_id: String,
+    pub node_ref: String,
+    pub tag: String,
+    pub id: Option<String>,
+    pub classes: Vec<String>,
+    pub role: Option<String>,
+    pub name: Option<String>,
+    pub text: Option<String>,
+    pub bounds: BrowserDomBounds,
+    pub attributes: Vec<BrowserDomAttribute>,
+    pub attributes_truncated: bool,
+    pub styles: Vec<BrowserStyleProperty>,
+    pub outer_html: String,
+    pub outer_html_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1087,6 +1211,50 @@ impl BrowserController {
         })
     }
 
+    pub async fn dom_outline(&mut self) -> Result<BrowserDomOutline> {
+        self.dom_outline_in(None).await
+    }
+
+    pub async fn dom_outline_in(&mut self, target: Option<&str>) -> Result<BrowserDomOutline> {
+        let target_name = self.target_name(target)?;
+        let expression = dom_outline_expression(&target_name)?;
+        let session = self.page_session_named(&target_name).await?;
+        let mut outline: BrowserDomOutline =
+            evaluate_by_value(session, &expression, "DOM outline").await?;
+        outline.url =
+            sanitize_diagnostic_url(&outline.url).unwrap_or_else(|| "URL unavailable".to_string());
+        Ok(outline)
+    }
+
+    pub async fn node_details(
+        &mut self,
+        selector: &BrowserNodeSelector,
+    ) -> Result<BrowserNodeDetails> {
+        self.node_details_in(None, selector).await
+    }
+
+    pub async fn node_details_in(
+        &mut self,
+        target: Option<&str>,
+        selector: &BrowserNodeSelector,
+    ) -> Result<BrowserNodeDetails> {
+        selector.validate()?;
+        let target_name = self.target_name(target)?;
+        let expression = node_details_expression(&target_name, selector)?;
+        let session = self.page_session_named(&target_name).await?;
+        let evaluation: NodeDetailsEvaluation =
+            evaluate_by_value(session, &expression, "DOM node details").await?;
+        if let Some(error) = evaluation.error {
+            return Err(BrowserControlError::new(error));
+        }
+        evaluation.details.ok_or_else(|| {
+            BrowserControlError::new(format!(
+                "browser node selector matched {} visible elements; expected exactly one",
+                evaluation.match_count
+            ))
+        })
+    }
+
     /// Wait for page state with a bounded, explicit timeout.
     pub async fn wait_for(
         &mut self,
@@ -1718,6 +1886,30 @@ impl BrowserControlService {
         self.controller.lock().await.diagnostics_in(target).await
     }
 
+    pub async fn dom_outline(&self) -> Result<BrowserDomOutline> {
+        self.controller.lock().await.dom_outline().await
+    }
+
+    pub async fn dom_outline_in(&self, target: Option<&str>) -> Result<BrowserDomOutline> {
+        self.controller.lock().await.dom_outline_in(target).await
+    }
+
+    pub async fn node_details(&self, selector: &BrowserNodeSelector) -> Result<BrowserNodeDetails> {
+        self.controller.lock().await.node_details(selector).await
+    }
+
+    pub async fn node_details_in(
+        &self,
+        target: Option<&str>,
+        selector: &BrowserNodeSelector,
+    ) -> Result<BrowserNodeDetails> {
+        self.controller
+            .lock()
+            .await
+            .node_details_in(target, selector)
+            .await
+    }
+
     pub async fn wait_for_ready(&self, max_wait: Duration) -> Result<()> {
         self.controller.lock().await.wait_for_ready(max_wait).await
     }
@@ -1797,6 +1989,14 @@ struct SnapshotState {
     visible_text: String,
     interactive_elements: Vec<InteractiveElement>,
     viewport: BrowserViewport,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeDetailsEvaluation {
+    error: Option<String>,
+    match_count: usize,
+    details: Option<BrowserNodeDetails>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3173,6 +3373,382 @@ fn locator_expression(locator: &BrowserLocator, preparation: LocatorPreparation)
         .replace("__PREPARATION__", &preparation_json))
 }
 
+async fn evaluate_by_value<T: DeserializeOwned>(
+    session: &CdpSession,
+    expression: &str,
+    operation: &str,
+) -> Result<T> {
+    let result = session
+        .command(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+        )
+        .await?;
+    if let Some(exception) = result
+        .pointer("/exceptionDetails/exception/description")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .pointer("/exceptionDetails/text")
+                .and_then(Value::as_str)
+        })
+    {
+        return Err(BrowserControlError::new(format!(
+            "Chrome failed while evaluating {operation}: {exception}"
+        )));
+    }
+    let value = result
+        .pointer("/result/value")
+        .cloned()
+        .ok_or_else(|| BrowserControlError::new(format!("Chrome omitted {operation} data")))?;
+    serde_json::from_value(value).map_err(|error| {
+        BrowserControlError::new(format!(
+            "Chrome returned malformed {operation} data: {error}"
+        ))
+    })
+}
+
+fn dom_outline_expression(target: &str) -> Result<String> {
+    let target = serde_json::to_string(target).map_err(|error| {
+        BrowserControlError::new(format!("failed to serialize browser target name: {error}"))
+    })?;
+    Ok(r#"(() => {
+        const target = __TARGET__;
+        const maxNodes = __MAX_NODES__;
+        const maxScanned = __MAX_SCANNED__;
+        const maxDepth = __MAX_DEPTH__;
+        const maxText = __MAX_TEXT__;
+        const maxField = __MAX_FIELD__;
+        const maxClasses = __MAX_CLASSES__;
+        const registryLimit = maxNodes * 4;
+        const registryKey = '__gittermV4DomInspectorRegistry';
+        const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+        const roleFor = (element) => {
+            const explicit = element.getAttribute('role');
+            if (explicit) return explicit;
+            const tag = element.tagName.toLowerCase();
+            if (tag === 'a' && element.hasAttribute('href')) return 'link';
+            if (tag === 'button') return 'button';
+            if (tag === 'textarea') return 'textbox';
+            if (tag === 'select') return element.multiple ? 'listbox' : 'combobox';
+            if (/^h[1-6]$/.test(tag)) return 'heading';
+            if (tag === 'nav') return 'navigation';
+            if (tag === 'main') return 'main';
+            if (tag === 'form') return 'form';
+            if (tag === 'table') return 'table';
+            if (tag === 'img') return 'img';
+            if (tag === 'input') {
+                const type = (element.type || 'text').toLowerCase();
+                if (type === 'checkbox') return 'checkbox';
+                if (type === 'radio') return 'radio';
+                if (type === 'range') return 'slider';
+                if (['button', 'submit', 'reset'].includes(type)) return 'button';
+                if (type !== 'hidden') return 'textbox';
+            }
+            return null;
+        };
+        const nameFor = (element) => {
+            const labelledBy = element.getAttribute('aria-labelledby');
+            const labelledText = labelledBy ? labelledBy.split(/\s+/).map((id) => document.getElementById(id)?.innerText || '').join(' ') : '';
+            const labelText = element.labels ? Array.from(element.labels).map((label) => label.innerText).join(' ') : '';
+            return normalize(element.getAttribute('aria-label') || labelledText || labelText ||
+                element.getAttribute('alt') || element.getAttribute('title') ||
+                element.getAttribute('placeholder') || '') || null;
+        };
+        const directText = (element) => normalize(Array.from(element.childNodes)
+            .filter((node) => node.nodeType === Node.TEXT_NODE)
+            .map((node) => node.textContent || '').join(' '));
+        const visible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none' &&
+                parseFloat(style.opacity || '1') > 0 && rect.width > 0 && rect.height > 0;
+        };
+        const semanticTags = new Set(['body', 'main', 'header', 'nav', 'aside', 'section', 'article',
+            'footer', 'form', 'dialog', 'details', 'summary', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+            'button', 'a', 'input', 'select', 'textarea', 'label', 'table', 'thead', 'tbody', 'tfoot',
+            'tr', 'th', 'td', 'ul', 'ol', 'li', 'img', 'svg', 'figure', 'figcaption']);
+        const meaningful = (element) => semanticTags.has(element.tagName.toLowerCase()) ||
+            Boolean(element.id || element.getAttribute('role') || directText(element));
+        let registry = globalThis[registryKey];
+        if (!registry || registry.document !== document) {
+            const documentId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+            registry = { document, documentId, nextId: 1, byNode: new WeakMap(), byRef: new Map() };
+            globalThis[registryKey] = registry;
+        }
+        const refFor = (element) => {
+            const existing = registry.byNode.get(element);
+            if (existing) return existing;
+            if (registry.byRef.size >= registryLimit) return null;
+            const nodeRef = `${registry.documentId}:node-${registry.nextId++}`;
+            registry.byNode.set(element, nodeRef);
+            registry.byRef.set(nodeRef, new WeakRef(element));
+            return nodeRef;
+        };
+        const nodes = [];
+        let truncated = false;
+        let scanned = 0;
+        const visit = (element, parentRef, depth, treeDepth) => {
+            scanned += 1;
+            if (scanned > maxScanned || treeDepth > maxDepth * 4) { truncated = true; return; }
+            if (nodes.length >= maxNodes) { truncated = true; return; }
+            if (depth > maxDepth) { truncated = true; return; }
+            if (!visible(element)) return;
+            let nextParent = parentRef;
+            let nextDepth = depth;
+            if (meaningful(element)) {
+                const nodeRef = refFor(element);
+                if (!nodeRef) { truncated = true; return; }
+                const rect = element.getBoundingClientRect();
+                const role = roleFor(element);
+                const name = nameFor(element);
+                const text = directText(element) || (['button', 'a', 'label', 'summary'].includes(element.tagName.toLowerCase()) ? normalize(element.innerText) : '');
+                nodes.push({
+                    nodeRef,
+                    parentRef,
+                    depth,
+                    tag: element.tagName.toLowerCase(),
+                    id: element.id ? element.id.slice(0, maxField) : null,
+                    classes: Array.from(element.classList || []).slice(0, maxClasses).map((value) => value.slice(0, maxField)),
+                    role: role ? role.slice(0, maxField) : null,
+                    name: name ? name.slice(0, maxText) : null,
+                    text: text ? text.slice(0, maxText) : null,
+                    bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                    disabled: Boolean(element.disabled) || element.getAttribute('aria-disabled') === 'true',
+                    expanded: element.getAttribute('aria-expanded')?.slice(0, maxField) || null,
+                    selected: element.getAttribute('aria-selected')?.slice(0, maxField) || null,
+                    checked: element.getAttribute('aria-checked')?.slice(0, maxField) || null
+                });
+                nextParent = nodeRef;
+                nextDepth = depth + 1;
+            }
+            for (const child of element.children) {
+                visit(child, nextParent, nextDepth, treeDepth + 1);
+                if (nodes.length >= maxNodes) { truncated = true; break; }
+            }
+        };
+        if (document.body) visit(document.body, null, 0, 0);
+        return { target, documentId: registry.documentId, url: window.location.href.slice(0, __MAX_URL__),
+            title: document.title.slice(0, maxField), nodes, truncated };
+    })()"#
+        .replace("__TARGET__", &target)
+        .replace("__MAX_NODES__", &MAX_DOM_OUTLINE_NODES.to_string())
+        .replace("__MAX_SCANNED__", &MAX_DOM_SCANNED_ELEMENTS.to_string())
+        .replace("__MAX_DEPTH__", &MAX_DOM_OUTLINE_DEPTH.to_string())
+        .replace("__MAX_TEXT__", &MAX_DOM_TEXT_CHARS.to_string())
+        .replace("__MAX_FIELD__", &MAX_DOM_FIELD_CHARS.to_string())
+        .replace("__MAX_URL__", &MAX_DIAGNOSTIC_URL_CHARS.to_string())
+        .replace("__MAX_CLASSES__", &MAX_DOM_CLASSES.to_string()))
+}
+
+fn node_details_expression(target: &str, selector: &BrowserNodeSelector) -> Result<String> {
+    let target = serde_json::to_string(target).map_err(|error| {
+        BrowserControlError::new(format!("failed to serialize browser target name: {error}"))
+    })?;
+    let selector = serde_json::to_string(selector).map_err(|error| {
+        BrowserControlError::new(format!(
+            "failed to serialize browser node selector: {error}"
+        ))
+    })?;
+    Ok(r#"(() => {
+        const target = __TARGET__;
+        const selector = __SELECTOR__;
+        const maxText = __MAX_TEXT__;
+        const maxField = __MAX_FIELD__;
+        const maxClasses = __MAX_CLASSES__;
+        const maxAttributes = __MAX_ATTRIBUTES__;
+        const maxAttributeValue = __MAX_ATTRIBUTE_VALUE__;
+        const maxStyleValue = __MAX_STYLE_VALUE__;
+        const maxOuterHtml = __MAX_OUTER_HTML__;
+        const registryKey = '__gittermV4DomInspectorRegistry';
+        const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+        const roleFor = (element) => {
+            const explicit = element.getAttribute('role');
+            if (explicit) return explicit;
+            const tag = element.tagName.toLowerCase();
+            if (tag === 'a' && element.hasAttribute('href')) return 'link';
+            if (tag === 'button') return 'button';
+            if (tag === 'textarea') return 'textbox';
+            if (tag === 'select') return element.multiple ? 'listbox' : 'combobox';
+            if (/^h[1-6]$/.test(tag)) return 'heading';
+            if (tag === 'input') {
+                const type = (element.type || 'text').toLowerCase();
+                if (type === 'checkbox') return 'checkbox';
+                if (type === 'radio') return 'radio';
+                if (type === 'range') return 'slider';
+                if (['button', 'submit', 'reset'].includes(type)) return 'button';
+                if (type !== 'hidden') return 'textbox';
+            }
+            return null;
+        };
+        const nameFor = (element) => {
+            const labelledBy = element.getAttribute('aria-labelledby');
+            const labelledText = labelledBy ? labelledBy.split(/\s+/).map((id) => document.getElementById(id)?.innerText || '').join(' ') : '';
+            const labelText = element.labels ? Array.from(element.labels).map((label) => label.innerText).join(' ') : '';
+            return normalize(element.getAttribute('aria-label') || labelledText || labelText ||
+                element.getAttribute('alt') || element.getAttribute('title') ||
+                element.getAttribute('placeholder') || element.innerText || element.value) || null;
+        };
+        const visible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none' &&
+                parseFloat(style.opacity || '1') > 0 && rect.width > 0 && rect.height > 0;
+        };
+        const textMatches = (actual, expected, exact) => {
+            const left = normalize(actual);
+            const right = normalize(expected);
+            return exact ? left === right : left.toLocaleLowerCase().includes(right.toLocaleLowerCase());
+        };
+        let registry = globalThis[registryKey];
+        if (!registry || registry.document !== document) {
+            const documentId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+            registry = { document, documentId, nextId: 1, byNode: new WeakMap(), byRef: new Map() };
+            globalThis[registryKey] = registry;
+        }
+        const refFor = (element) => {
+            const existing = registry.byNode.get(element);
+            if (existing) return existing;
+            const nodeRef = `${registry.documentId}:node-${registry.nextId++}`;
+            registry.byNode.set(element, nodeRef);
+            registry.byRef.set(nodeRef, new WeakRef(element));
+            return nodeRef;
+        };
+        let matches = [];
+        try {
+            if (selector.kind === 'node_ref') {
+                const element = registry.byRef.get(selector.node_ref)?.deref();
+                if (!element || !element.isConnected) {
+                    return { error: `DOM node reference '${selector.node_ref}' is stale or does not belong to the current document`, matchCount: 0, details: null };
+                }
+                matches = [element];
+            } else if (selector.kind === 'locator') {
+                const locator = selector.locator;
+                if (locator.kind === 'css') {
+                    matches = Array.from(document.querySelectorAll(locator.selector));
+                } else if (locator.kind === 'role') {
+                    matches = Array.from(document.querySelectorAll('a[href], button, input, select, textarea, [role], h1, h2, h3, h4, h5, h6'))
+                        .filter((element) => roleFor(element) === locator.role)
+                        .filter((element) => locator.name === null || textMatches(nameFor(element), locator.name, locator.exact));
+                } else if (locator.kind === 'text') {
+                    matches = Array.from(document.querySelectorAll('body *')).filter((element) => {
+                        if (!textMatches(element.innerText, locator.text, locator.exact)) return false;
+                        return !Array.from(element.children).some((child) => textMatches(child.innerText, locator.text, locator.exact));
+                    });
+                } else {
+                    return { error: `unsupported locator kind: ${locator.kind}`, matchCount: 0, details: null };
+                }
+            } else {
+                return { error: `unsupported node selector kind: ${selector.kind}`, matchCount: 0, details: null };
+            }
+        } catch (error) {
+            return { error: String(error), matchCount: 0, details: null };
+        }
+        matches = Array.from(new Set(matches)).filter(visible);
+        if (matches.length !== 1) return { error: null, matchCount: matches.length, details: null };
+        const element = matches[0];
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        const styleNames = ['display', 'position', 'top', 'right', 'bottom', 'left', 'z-index',
+            'box-sizing', 'overflow', 'overflow-x', 'overflow-y', 'flex-direction', 'flex-wrap',
+            'flex-grow', 'flex-shrink', 'flex-basis', 'justify-content', 'align-items', 'align-content',
+            'gap', 'row-gap', 'column-gap', 'grid-template-columns', 'grid-template-rows', 'grid-column',
+            'grid-row', 'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
+            'margin-top', 'margin-right', 'margin-bottom', 'margin-left', 'padding-top', 'padding-right',
+            'padding-bottom', 'padding-left', 'font-family', 'font-size', 'font-weight', 'font-style',
+            'line-height', 'letter-spacing', 'text-align', 'text-decoration', 'color', 'background-color',
+            'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
+            'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color',
+            'border-top-style', 'border-right-style', 'border-bottom-style', 'border-left-style',
+            'border-radius', 'box-shadow', 'opacity', 'visibility', 'transform'];
+        const sensitiveAttribute = /(^|[-_:])(password|passwd|secret|token|authorization|cookie|session|csrf|xsrf|api[-_]?key)([-_:]|$)/i;
+        const urlAttributes = new Set(['href', 'src', 'action', 'formaction', 'poster', 'cite']);
+        const sanitizeUrl = (value) => {
+            try {
+                const url = new URL(value, document.baseURI);
+                if (!['http:', 'https:'].includes(url.protocol)) return '[non-http URL omitted]';
+                url.username = '';
+                url.password = '';
+                url.search = '';
+                url.hash = '';
+                return url.toString();
+            } catch (_) {
+                return '[invalid URL omitted]';
+            }
+        };
+        const sanitizeAttributeValue = (owner, attribute) => {
+            const name = attribute.name.toLowerCase();
+            const tag = owner.tagName.toLowerCase();
+            const type = tag === 'input' ? (owner.getAttribute('type') || 'text').toLowerCase() : '';
+            if (sensitiveAttribute.test(name) ||
+                (name === 'value' && (tag === 'input' || tag === 'textarea')) ||
+                (name === 'value' && type === 'hidden')) return '[redacted]';
+            if (name === 'style') return '[inline style omitted; use computed styles]';
+            if (name === 'srcset') return '[source set omitted]';
+            if (urlAttributes.has(name)) return sanitizeUrl(attribute.value);
+            return attribute.value;
+        };
+        const allAttributes = Array.from(element.attributes);
+        const attributes = allAttributes.slice(0, maxAttributes).map((attribute) => ({
+            name: attribute.name.slice(0, maxField),
+            value: sanitizeAttributeValue(element, attribute).slice(0, maxAttributeValue)
+        }));
+        const styles = styleNames.map((name) => ({ name, value: style.getPropertyValue(name).slice(0, maxStyleValue) }));
+        const clone = element.cloneNode(true);
+        const originals = [element, ...element.querySelectorAll('*')];
+        const clones = [clone, ...clone.querySelectorAll('*')];
+        for (let index = 0; index < clones.length; index += 1) {
+            const original = originals[index];
+            const copy = clones[index];
+            for (const attribute of Array.from(copy.attributes)) {
+                const source = original.getAttributeNode(attribute.name) || attribute;
+                copy.setAttribute(attribute.name, sanitizeAttributeValue(original, source));
+            }
+            const tag = copy.tagName.toLowerCase();
+            const type = tag === 'input' ? (copy.getAttribute('type') || 'text').toLowerCase() : '';
+            if (tag === 'textarea' || (tag === 'input' && ['password', 'hidden'].includes(type))) {
+                copy.textContent = '[redacted]';
+                copy.setAttribute('value', '[redacted]');
+            }
+        }
+        const outer = clone.outerHTML || '';
+        return { error: null, matchCount: 1, details: {
+            target,
+            documentId: registry.documentId,
+            nodeRef: refFor(element),
+            tag: element.tagName.toLowerCase(),
+            id: element.id ? element.id.slice(0, maxField) : null,
+            classes: Array.from(element.classList || []).slice(0, maxClasses).map((value) => value.slice(0, maxField)),
+            role: roleFor(element)?.slice(0, maxField) || null,
+            name: nameFor(element)?.slice(0, maxText) || null,
+            text: element.matches('input[type="password" i], input[type="hidden" i]') ? null :
+                normalize(element.innerText || element.value || '').slice(0, maxText) || null,
+            bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            attributes,
+            attributesTruncated: allAttributes.length > maxAttributes,
+            styles,
+            outerHtml: outer.slice(0, maxOuterHtml),
+            outerHtmlTruncated: outer.length > maxOuterHtml
+        }};
+    })()"#
+        .replace("__TARGET__", &target)
+        .replace("__SELECTOR__", &selector)
+        .replace("__MAX_TEXT__", &MAX_DOM_TEXT_CHARS.to_string())
+        .replace("__MAX_FIELD__", &MAX_DOM_FIELD_CHARS.to_string())
+        .replace("__MAX_CLASSES__", &MAX_DOM_CLASSES.to_string())
+        .replace("__MAX_ATTRIBUTES__", &MAX_NODE_ATTRIBUTES.to_string())
+        .replace(
+            "__MAX_ATTRIBUTE_VALUE__",
+            &MAX_NODE_ATTRIBUTE_VALUE_CHARS.to_string(),
+        )
+        .replace("__MAX_STYLE_VALUE__", &MAX_STYLE_VALUE_CHARS.to_string())
+        .replace("__MAX_OUTER_HTML__", &MAX_OUTER_HTML_CHARS.to_string()))
+}
+
 fn snapshot_expression() -> String {
     r#"(() => {
             const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
@@ -3457,6 +4033,37 @@ mod tests {
     }
 
     #[test]
+    fn dom_inspection_expressions_are_bounded_and_serialize_selectors_safely() {
+        let outline = dom_outline_expression("design").unwrap();
+        assert!(outline.contains(&MAX_DOM_OUTLINE_NODES.to_string()));
+        assert!(outline.contains(&MAX_DOM_OUTLINE_DEPTH.to_string()));
+        assert!(outline.contains("documentId"));
+        assert!(outline.contains("new WeakRef"));
+        assert!(!outline.contains("__MAX_"));
+
+        let selector = BrowserNodeSelector::Locator {
+            locator: BrowserLocator::role("button", "Save \"quoted\" value"),
+        };
+        let details = node_details_expression("implementation", &selector).unwrap();
+        assert!(details.contains(r#"Save \"quoted\" value"#));
+        assert!(details.contains(&MAX_OUTER_HTML_CHARS.to_string()));
+        assert!(details.contains("grid-template-columns"));
+        assert!(!details.contains("__SELECTOR__"));
+        assert!(!details.contains("__MAX_"));
+
+        assert!(BrowserNodeSelector::NodeRef {
+            node_ref: String::new()
+        }
+        .validate()
+        .is_err());
+        assert!(BrowserNodeSelector::Locator {
+            locator: BrowserLocator::css("x".repeat(MAX_LOCATOR_VALUE_CHARS + 1))
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
     fn locators_validate_and_serialize_user_text_safely() {
         let locator = BrowserLocator::role("button", "Save \"quoted\" value");
         locator.validate().unwrap();
@@ -3621,8 +4228,10 @@ mod tests {
                     }
                     let body = r#"<!doctype html>
                         <title>GitTerm browser smoke</title>
+                        <style>#status { display: grid; gap: 12px; padding: 8px; color: rgb(10, 20, 30); }</style>
                         <main id="status">browser-control-ready</main>
                         <form onsubmit="event.preventDefault(); document.getElementById('status').textContent = 'submitted:' + document.getElementById('smoke-input').value">
+                            <input type="hidden" name="csrf-token" value="must-not-leak">
                             <label for="smoke-input">Smoke input</label>
                             <input id="smoke-input" name="smokeInput">
                             <button type="button" aria-label="Run smoke action" onclick="document.getElementById('status').textContent = 'clicked'">Run</button>
@@ -3787,6 +4396,78 @@ mod tests {
             .unwrap();
         assert_eq!(primary_capture.target, DEFAULT_BROWSER_TARGET_NAME);
         assert_eq!(primary_capture.capture_mode, BrowserCaptureMode::FullPage);
+
+        let outline = service
+            .dom_outline_in(Some(DEFAULT_BROWSER_TARGET_NAME))
+            .await
+            .unwrap();
+        assert_eq!(outline.target, DEFAULT_BROWSER_TARGET_NAME);
+        assert!(!outline.document_id.is_empty());
+        assert!(outline.nodes.len() <= MAX_DOM_OUTLINE_NODES);
+        let status_node = outline
+            .nodes
+            .iter()
+            .find(|node| node.id.as_deref() == Some("status"))
+            .unwrap();
+        assert_eq!(status_node.tag, "main");
+        assert_eq!(status_node.role.as_deref(), Some("main"));
+        let status_ref = status_node.node_ref.clone();
+        let details = service
+            .node_details_in(
+                Some(DEFAULT_BROWSER_TARGET_NAME),
+                &BrowserNodeSelector::NodeRef {
+                    node_ref: status_ref.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(details.node_ref, status_ref);
+        assert!(details.outer_html.contains("id=\"status\""));
+        assert!(details
+            .styles
+            .iter()
+            .any(|property| property.name == "display" && property.value == "grid"));
+        assert!(details
+            .styles
+            .iter()
+            .any(|property| property.name == "gap" && property.value == "12px"));
+        let button_details = service
+            .node_details_in(
+                Some(DEFAULT_BROWSER_TARGET_NAME),
+                &BrowserNodeSelector::Locator {
+                    locator: BrowserLocator::role("button", "Run smoke action"),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(button_details.tag, "button");
+        assert_eq!(button_details.name.as_deref(), Some("Run smoke action"));
+        let form_details = service
+            .node_details_in(
+                Some(DEFAULT_BROWSER_TARGET_NAME),
+                &BrowserNodeSelector::Locator {
+                    locator: BrowserLocator::css("form"),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(form_details.outer_html.contains("[redacted]"));
+        assert!(!form_details.outer_html.contains("must-not-leak"));
+        service
+            .reload_in(Some(DEFAULT_BROWSER_TARGET_NAME), false)
+            .await
+            .unwrap();
+        let stale_error = service
+            .node_details_in(
+                Some(DEFAULT_BROWSER_TARGET_NAME),
+                &BrowserNodeSelector::NodeRef {
+                    node_ref: status_ref,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(stale_error.to_string().contains("stale"));
+
         service.open_target("implementation", &url).await.unwrap();
         service
             .wait_for_ready_in(Some("implementation"), Duration::from_secs(5))
