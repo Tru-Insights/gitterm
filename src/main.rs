@@ -127,6 +127,51 @@ fn agent_ipc_stream() -> impl iced::futures::Stream<Item = Event> + Send + 'stat
     stream.map(Event::AgentWebviewIpc)
 }
 
+#[derive(Clone)]
+struct BrowserTelemetrySubscriptionData {
+    id: u64,
+    browser: BrowserControlService,
+    changes: tokio::sync::watch::Receiver<u64>,
+}
+
+impl BrowserTelemetrySubscriptionData {
+    fn new(browser: BrowserControlService) -> Self {
+        Self {
+            id: browser.telemetry_subscription_id(),
+            changes: browser.telemetry_changes(),
+            browser,
+        }
+    }
+}
+
+impl Hash for BrowserTelemetrySubscriptionData {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+fn browser_telemetry_stream(
+    data: &BrowserTelemetrySubscriptionData,
+) -> iced::futures::stream::BoxStream<'static, Event> {
+    use iced::futures::{SinkExt, StreamExt};
+
+    let browser = data.browser.clone();
+    let mut changes = data.changes.clone();
+    iced::stream::channel(8, async move |mut output| {
+        while changes.changed().await.is_ok() {
+            let telemetry = browser.telemetry().await;
+            if output
+                .send(Event::BrowserTelemetryLoaded(telemetry))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .boxed()
+}
+
 /// Embedded HTML scaffold for the agent chat surface (Step 4 of TRU-29).
 const AGENT_CHAT_HTML: &str = include_str!("../assets/agent_chat.html");
 
@@ -3657,7 +3702,6 @@ pub enum Event {
     BrowserFocused(Result<(), String>),
     BrowserDisconnect,
     BrowserDisconnected(Result<(), String>),
-    BrowserTelemetryRefreshRequested,
     BrowserTelemetryLoaded(BrowserTelemetrySnapshot),
     BrowserEvidenceOpen,
     BrowserEvidenceClose,
@@ -3775,7 +3819,6 @@ struct App {
     browser_error: Option<String>,
     browser_error_sticky: bool,
     browser_telemetry: BrowserTelemetrySnapshot,
-    browser_telemetry_loading: bool,
     browser_evidence_open: bool,
     browser_evidence_handles: HashMap<u64, image::Handle>,
     console_expanded: bool,
@@ -3940,6 +3983,14 @@ const GIT_POLL_SLOW_INTERVAL_MS: u64 = 15000;
 const GIT_POLL_IDLE_INTERVAL_MS: u64 = 30000;
 const GIT_POLL_NON_REPO_INTERVAL_MS: u64 = 20000;
 const GIT_WORKTREES_POLL_INTERVAL_MS: u64 = 15000;
+
+fn terminal_event_should_redraw(
+    window_focused: bool,
+    visible_terminal_id: Option<usize>,
+    event_terminal_id: usize,
+) -> bool {
+    window_focused && visible_terminal_id == Some(event_terminal_id)
+}
 
 fn expand_home_path(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -4463,11 +4514,13 @@ impl App {
     /// Focus the active main tab terminal (unfocusing bottom panel terminal)
     fn focus_main_terminal(&mut self) -> Task<Event> {
         self.bottom_panel_focused = false;
-        if let Some(ws) = self.active_workspace() {
-            if let Some(tab) = ws.active_tab() {
-                if let Some(term) = tab.terminal() {
-                    return TerminalView::focus(term.widget_id().clone());
-                }
+        if let Some(tab) = self
+            .active_workspace_mut()
+            .and_then(Workspace::active_tab_mut)
+        {
+            if let Some(term) = tab.terminal_mut() {
+                term.sync_and_redraw();
+                return TerminalView::focus(term.widget_id().clone());
             }
         }
         Task::none()
@@ -4476,17 +4529,61 @@ impl App {
     /// Focus a bottom panel terminal (unfocusing main tab terminal)
     fn focus_bottom_terminal(&mut self, idx: usize) -> Task<Event> {
         self.bottom_panel_focused = true;
-        if let Some(ws) = self.active_workspace() {
-            if let Some(bt) = ws.bottom_terminals.get(idx) {
-                if let Some(term) = &bt.terminal {
-                    return TerminalView::focus(term.widget_id().clone());
-                }
+        if let Some(bt) = self
+            .active_workspace_mut()
+            .and_then(|ws| ws.bottom_terminals.get_mut(idx))
+        {
+            if let Some(term) = &mut bt.terminal {
+                term.sync_and_redraw();
+                return TerminalView::focus(term.widget_id().clone());
             }
         }
         Task::none()
     }
 
-    fn scroll_to_active_tab(&self) -> Task<Event> {
+    fn visible_main_terminal_id(&self) -> Option<usize> {
+        self.active_tab()
+            .filter(|tab| tab.terminal().is_some())
+            .map(|tab| tab.id)
+    }
+
+    fn visible_bottom_terminal_id(&self) -> Option<usize> {
+        if !self.console_expanded {
+            return None;
+        }
+        let workspace = self.active_workspace()?;
+        let BottomPanelTab::Terminal(idx) = workspace.active_bottom_tab else {
+            return None;
+        };
+        workspace
+            .bottom_terminals
+            .get(idx)
+            .map(|terminal| terminal.id)
+    }
+
+    fn sync_visible_terminals(&mut self) {
+        let console_expanded = self.console_expanded;
+        let Some(workspace) = self.active_workspace_mut() else {
+            return;
+        };
+        if let Some(terminal) = workspace.active_tab_mut().and_then(TabState::terminal_mut) {
+            terminal.sync_and_redraw();
+        }
+        if console_expanded {
+            if let BottomPanelTab::Terminal(idx) = workspace.active_bottom_tab {
+                if let Some(terminal) = workspace
+                    .bottom_terminals
+                    .get_mut(idx)
+                    .and_then(|bottom| bottom.terminal.as_mut())
+                {
+                    terminal.sync_and_redraw();
+                }
+            }
+        }
+    }
+
+    fn scroll_to_active_tab(&mut self) -> Task<Event> {
+        self.sync_visible_terminals();
         let active_tab = self.active_workspace().map(|ws| ws.active_tab).unwrap_or(0);
         let target_x = (active_tab as f32 * ESTIMATED_TAB_WIDTH).max(0.0);
         iced::advanced::widget::operate(iced::advanced::widget::operation::scrollable::scroll_to(
@@ -4686,7 +4783,7 @@ impl App {
         term: &mut iced_term::Terminal,
         cmd: iced_term::backend::Command,
         context: &str,
-        window_focused: bool,
+        redraw: bool,
     ) -> iced_term::actions::Action {
         // Stamp the watchdog with the specific backend-command kind. The
         // generic dispatcher heartbeat skips `Event::Terminal` (it fires at
@@ -4708,11 +4805,12 @@ impl App {
         };
         heartbeat(&format!("Backend:{}:{}", cmd_name, context));
         let started = Instant::now();
-        let action = if window_focused {
+        let action = if redraw {
             term.handle(iced_term::Command::ProxyToBackend(cmd))
         } else {
-            // Skip expensive sync/redraw when window is not visible.
-            // Avoids font cache cold-start stalls during sleep/wake cycles.
+            // Hidden terminals still parse output and update backend state,
+            // but defer font synchronization and canvas invalidation until
+            // their surface becomes visible.
             term.handle_no_redraw(iced_term::Command::ProxyToBackend(cmd))
         };
         let elapsed = started.elapsed();
@@ -5962,7 +6060,6 @@ impl App {
             browser_error,
             browser_error_sticky: false,
             browser_telemetry: BrowserTelemetrySnapshot::default(),
-            browser_telemetry_loading: false,
             browser_evidence_open: false,
             browser_evidence_handles: HashMap::new(),
             console_expanded: config.console_expanded,
@@ -6351,7 +6448,6 @@ impl App {
         if let Some(server) = browser_mcp_server {
             startup_tasks.push(Task::perform(server.run(), Event::BrowserMcpStopped));
             startup_tasks.push(Task::done(Event::BrowserStatusRefreshRequested));
-            startup_tasks.push(Task::done(Event::BrowserTelemetryRefreshRequested));
         }
 
         // If the active tab on startup is an agent tab (restored from
@@ -7276,6 +7372,7 @@ fi
                 .is_some_and(|session| session.session_name == session_name)
         }) {
             self.active_workspace_idx = idx;
+            self.sync_visible_terminals();
             self.mark_workspaces_dirty();
             self.sync_plans_dir();
             let viewport_width = self.content_viewport_width();
@@ -7588,20 +7685,6 @@ fi
         )
     }
 
-    fn request_browser_telemetry(&mut self) -> Task<Event> {
-        if self.browser_telemetry_loading {
-            return Task::none();
-        }
-        let Some(browser) = self.browser_service() else {
-            return Task::none();
-        };
-        self.browser_telemetry_loading = true;
-        Task::perform(
-            async move { browser.telemetry().await },
-            Event::BrowserTelemetryLoaded,
-        )
-    }
-
     fn subscription(&self) -> Subscription<Event> {
         let mut subs = vec![
             // Agent webview IPC bridge — drains the global mpsc into events.
@@ -7642,10 +7725,12 @@ fi
                 iced::time::every(Duration::from_millis(1000))
                     .map(|_| Event::BrowserStatusRefreshRequested),
             );
-            subs.push(
-                iced::time::every(Duration::from_millis(250))
-                    .map(|_| Event::BrowserTelemetryRefreshRequested),
-            );
+            if let Some(browser) = self.browser_service() {
+                subs.push(Subscription::run_with(
+                    BrowserTelemetrySubscriptionData::new(browser),
+                    browser_telemetry_stream,
+                ));
+            }
         }
 
         // Animation tick (~60fps) — when animating or waiting for swipe debounce
@@ -7740,7 +7825,6 @@ fi
                 self.browser_action = None;
                 self.browser_error = Some(error);
                 self.browser_error_sticky = false;
-                self.browser_telemetry_loading = false;
                 self.browser_telemetry.active_agent_operation = None;
             }
             Event::BrowserStatusRefreshRequested => {
@@ -7885,11 +7969,7 @@ fi
                     }
                 }
             }
-            Event::BrowserTelemetryRefreshRequested => {
-                return self.request_browser_telemetry();
-            }
             Event::BrowserTelemetryLoaded(telemetry) => {
-                self.browser_telemetry_loading = false;
                 let retained_ids = telemetry
                     .evidence
                     .iter()
@@ -7927,7 +8007,11 @@ fi
                 }
             }
             Event::Terminal(tab_id, iced_term::Event::BackendCall(_, cmd)) => {
-                let focused = self.window_focused;
+                let redraw = terminal_event_should_redraw(
+                    self.window_focused,
+                    self.visible_main_terminal_id(),
+                    tab_id,
+                );
                 // Main terminal received input — it has focus
                 if matches!(&cmd, iced_term::backend::Command::Write(_)) {
                     self.bottom_panel_focused = false;
@@ -7988,7 +8072,7 @@ fi
                             term,
                             cmd,
                             "main_terminal_event",
-                            focused,
+                            redraw,
                         ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
@@ -8815,7 +8899,11 @@ fi
                 }
             }
             Event::BottomTerminalEvent(id, iced_term::Event::BackendCall(_, cmd)) => {
-                let focused = self.window_focused;
+                let redraw = terminal_event_should_redraw(
+                    self.window_focused,
+                    self.visible_bottom_terminal_id(),
+                    id,
+                );
                 // Bottom terminal received input — it has focus
                 if matches!(&cmd, iced_term::backend::Command::Write(_)) {
                     self.bottom_panel_focused = true;
@@ -8850,7 +8938,7 @@ fi
                             term,
                             cmd,
                             "bottom_terminal_event",
-                            focused,
+                            redraw,
                         ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
@@ -10206,21 +10294,9 @@ fi
             Event::WindowFocused => {
                 self.window_focused = true;
 
-                // Sync all terminals that may have been updated while unfocused
-                for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
-                    if let Some(term) = tab.terminal_mut() {
-                        term.sync_and_redraw();
-                    }
-                }
-                for bt in self
-                    .workspaces
-                    .iter_mut()
-                    .flat_map(|ws| ws.bottom_terminals.iter_mut())
-                {
-                    if let Some(term) = &mut bt.terminal {
-                        term.sync_and_redraw();
-                    }
-                }
+                // Hidden terminals kept parsing output without clearing their
+                // canvas caches. Only surfaces that can now be seen need sync.
+                self.sync_visible_terminals();
 
                 // Detect wake from sleep: if the last heartbeat was long ago,
                 // the system likely slept. Reset git polling and trigger refresh.
@@ -10929,6 +11005,7 @@ fi
 
                     // Update active workspace immediately (tab bar + console switch instantly)
                     self.active_workspace_idx = idx;
+                    self.sync_visible_terminals();
                     self.mark_workspaces_dirty();
                     self.sync_plans_dir();
 
@@ -11044,6 +11121,7 @@ fi
                         let nearest = nearest.min(self.workspaces.len().saturating_sub(1));
                         if nearest != self.active_workspace_idx {
                             self.active_workspace_idx = nearest;
+                            self.sync_visible_terminals();
                             self.mark_workspaces_dirty();
                             self.hide_webview_for_non_agent();
                             self.editing_console_command = None;
@@ -11090,6 +11168,7 @@ fi
                     if self.active_workspace_idx >= self.workspaces.len() {
                         self.active_workspace_idx = self.workspaces.len() - 1;
                     }
+                    self.sync_visible_terminals();
                     self.mark_workspaces_dirty();
                     self.mark_log_server_dirty();
                     self.sync_plans_dir();
@@ -21000,6 +21079,14 @@ mod tests {
             active_target: None,
             detail: None,
         }
+    }
+
+    #[test]
+    fn terminal_redraw_is_limited_to_the_visible_focused_surface() {
+        assert!(terminal_event_should_redraw(true, Some(7), 7));
+        assert!(!terminal_event_should_redraw(true, Some(7), 8));
+        assert!(!terminal_event_should_redraw(false, Some(7), 7));
+        assert!(!terminal_event_should_redraw(true, None, 7));
     }
 
     #[test]
