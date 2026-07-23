@@ -3629,6 +3629,7 @@ pub enum Event {
     BottomTerminalAdd,
     BottomTerminalClose(usize),
     BottomTerminalEvent(usize, iced_term::Event),
+    TerminalRedrawTick,
     // Console editor (selectable output)
     ConsoleEditorAction(text_editor::Action),
     // Console search
@@ -3893,6 +3894,7 @@ struct App {
     chat_preview: Option<(String, chats::ChatPreview)>,
     // Track whether the window has focus (skip terminal processing when unfocused)
     window_focused: bool,
+    terminal_redraws: TerminalRedrawQueue,
     // Track whether the bottom panel terminal has focus (vs main tab terminal)
     bottom_panel_focused: bool,
     /// Configs for workspaces that were closed but whose settings (env, color, etc.)
@@ -3983,13 +3985,44 @@ const GIT_POLL_SLOW_INTERVAL_MS: u64 = 15000;
 const GIT_POLL_IDLE_INTERVAL_MS: u64 = 30000;
 const GIT_POLL_NON_REPO_INTERVAL_MS: u64 = 20000;
 const GIT_WORKTREES_POLL_INTERVAL_MS: u64 = 15000;
+const TERMINAL_REDRAW_INTERVAL_MS: u64 = 33;
 
-fn terminal_event_should_redraw(
+fn terminal_event_should_queue_redraw(
     window_focused: bool,
     visible_terminal_id: Option<usize>,
     event_terminal_id: usize,
 ) -> bool {
     window_focused && visible_terminal_id == Some(event_terminal_id)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TerminalRedrawQueue {
+    main: bool,
+    bottom: bool,
+}
+
+impl TerminalRedrawQueue {
+    fn queue_main(&mut self) {
+        self.main = true;
+    }
+
+    fn queue_bottom(&mut self) {
+        self.bottom = true;
+    }
+
+    fn is_pending(&self) -> bool {
+        self.main || self.bottom
+    }
+
+    fn take(&mut self) -> (bool, bool) {
+        let pending = (self.main, self.bottom);
+        *self = Self::default();
+        pending
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 fn expand_home_path(path: &str) -> PathBuf {
@@ -4562,6 +4595,7 @@ impl App {
     }
 
     fn sync_visible_terminals(&mut self) {
+        self.terminal_redraws.clear();
         let console_expanded = self.console_expanded;
         let Some(workspace) = self.active_workspace_mut() else {
             return;
@@ -4570,6 +4604,33 @@ impl App {
             terminal.sync_and_redraw();
         }
         if console_expanded {
+            if let BottomPanelTab::Terminal(idx) = workspace.active_bottom_tab {
+                if let Some(terminal) = workspace
+                    .bottom_terminals
+                    .get_mut(idx)
+                    .and_then(|bottom| bottom.terminal.as_mut())
+                {
+                    terminal.sync_and_redraw();
+                }
+            }
+        }
+    }
+
+    fn sync_pending_terminal_redraws(&mut self) {
+        let (main_pending, bottom_pending) = self.terminal_redraws.take();
+        if !self.window_focused {
+            return;
+        }
+        let console_expanded = self.console_expanded;
+        let Some(workspace) = self.active_workspace_mut() else {
+            return;
+        };
+        if main_pending {
+            if let Some(terminal) = workspace.active_tab_mut().and_then(TabState::terminal_mut) {
+                terminal.sync_and_redraw();
+            }
+        }
+        if bottom_pending && console_expanded {
             if let BottomPanelTab::Terminal(idx) = workspace.active_bottom_tab {
                 if let Some(terminal) = workspace
                     .bottom_terminals
@@ -6096,6 +6157,7 @@ impl App {
             remote_sessions_error: None,
             remote_sessions_loaded_at: None,
             window_focused: true,
+            terminal_redraws: TerminalRedrawQueue::default(),
             bottom_panel_focused: false,
             closed_workspace_configs: Vec::new(),
             workspaces_dirty: false,
@@ -7733,6 +7795,15 @@ fi
             }
         }
 
+        // Coalesce rapid PTY output into at most one expensive terminal grid
+        // sync per frame. Backend events are still parsed immediately.
+        if self.terminal_redraws.is_pending() {
+            subs.push(
+                iced::time::every(Duration::from_millis(TERMINAL_REDRAW_INTERVAL_MS))
+                    .map(|_| Event::TerminalRedrawTick),
+            );
+        }
+
         // Animation tick (~60fps) — when animating or waiting for swipe debounce
         if self.slide_animating || self.last_user_scroll.is_some() {
             subs.push(
@@ -7794,7 +7865,9 @@ fi
     fn update(&mut self, event: Event) -> Task<Event> {
         // Heartbeat for freeze watchdog — skip high-frequency terminal events
         match &event {
-            Event::Terminal(_, _) | Event::BottomTerminalEvent(_, _) => {}
+            Event::Terminal(_, _)
+            | Event::BottomTerminalEvent(_, _)
+            | Event::TerminalRedrawTick => {}
             Event::CheckMenu => {
                 heartbeat("CheckMenu");
             }
@@ -7996,6 +8069,9 @@ fi
             Event::BrowserEvidenceClose => {
                 self.browser_evidence_open = false;
             }
+            Event::TerminalRedrawTick => {
+                self.sync_pending_terminal_redraws();
+            }
             Event::MainTerminalClicked => {
                 if self.bottom_panel_focused {
                     return self.focus_main_terminal();
@@ -8007,7 +8083,7 @@ fi
                 }
             }
             Event::Terminal(tab_id, iced_term::Event::BackendCall(_, cmd)) => {
-                let redraw = terminal_event_should_redraw(
+                let queue_redraw = terminal_event_should_queue_redraw(
                     self.window_focused,
                     self.visible_main_terminal_id(),
                     tab_id,
@@ -8049,6 +8125,7 @@ fi
                     }
                 }
                 let mut pending_task: Option<Task<Event>> = None;
+                let mut terminal_handled = false;
                 let tab_workspace_is_remote = self.tab_belongs_to_remote_workspace(tab_id);
                 if let Some(tab) = self
                     .workspaces
@@ -8068,11 +8145,12 @@ fi
                         }
                     }
                     if let Some(term) = tab.terminal_mut() {
+                        terminal_handled = true;
                         match Self::handle_terminal_backend_command(
                             term,
                             cmd,
                             "main_terminal_event",
-                            redraw,
+                            false,
                         ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
@@ -8147,6 +8225,9 @@ fi
                             _ => {}
                         }
                     }
+                }
+                if terminal_handled && queue_redraw {
+                    self.terminal_redraws.queue_main();
                 }
                 self.mark_log_server_dirty();
                 if let Some(task) = pending_task {
@@ -8899,7 +8980,7 @@ fi
                 }
             }
             Event::BottomTerminalEvent(id, iced_term::Event::BackendCall(_, cmd)) => {
-                let redraw = terminal_event_should_redraw(
+                let queue_redraw = terminal_event_should_queue_redraw(
                     self.window_focused,
                     self.visible_bottom_terminal_id(),
                     id,
@@ -8927,6 +9008,7 @@ fi
                         }
                     }
                 }
+                let mut terminal_handled = false;
                 if let Some(bt) = self
                     .workspaces
                     .iter_mut()
@@ -8934,11 +9016,12 @@ fi
                     .find(|bt| bt.id == id)
                 {
                     if let Some(term) = &mut bt.terminal {
+                        terminal_handled = true;
                         match Self::handle_terminal_backend_command(
                             term,
                             cmd,
                             "bottom_terminal_event",
-                            redraw,
+                            false,
                         ) {
                             iced_term::actions::Action::Shutdown => {}
                             iced_term::actions::Action::ChangeTitle(title) => {
@@ -8966,6 +9049,9 @@ fi
                             _ => {}
                         }
                     }
+                }
+                if terminal_handled && queue_redraw {
+                    self.terminal_redraws.queue_bottom();
                 }
             }
             Event::OpenFolder => {
@@ -10290,6 +10376,7 @@ fi
             }
             Event::WindowUnfocused => {
                 self.window_focused = false;
+                self.terminal_redraws.clear();
             }
             Event::WindowFocused => {
                 self.window_focused = true;
@@ -21083,10 +21170,22 @@ mod tests {
 
     #[test]
     fn terminal_redraw_is_limited_to_the_visible_focused_surface() {
-        assert!(terminal_event_should_redraw(true, Some(7), 7));
-        assert!(!terminal_event_should_redraw(true, Some(7), 8));
-        assert!(!terminal_event_should_redraw(false, Some(7), 7));
-        assert!(!terminal_event_should_redraw(true, None, 7));
+        assert!(terminal_event_should_queue_redraw(true, Some(7), 7));
+        assert!(!terminal_event_should_queue_redraw(true, Some(7), 8));
+        assert!(!terminal_event_should_queue_redraw(false, Some(7), 7));
+        assert!(!terminal_event_should_queue_redraw(true, None, 7));
+    }
+
+    #[test]
+    fn terminal_redraw_queue_coalesces_repeated_output_per_surface() {
+        let mut redraws = TerminalRedrawQueue::default();
+        redraws.queue_main();
+        redraws.queue_main();
+        redraws.queue_bottom();
+
+        assert!(redraws.is_pending());
+        assert_eq!(redraws.take(), (true, true));
+        assert!(!redraws.is_pending());
     }
 
     #[test]
