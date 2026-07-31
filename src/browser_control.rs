@@ -31,6 +31,7 @@ const BROWSER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const STDERR_CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const TARGET_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CHROME_STDERR_BYTES: usize = 16_384;
 const MAX_VISIBLE_TEXT_BYTES: usize = 100_000;
 const MAX_INTERACTIVE_ELEMENTS: usize = 500;
@@ -39,10 +40,17 @@ const MAX_NETWORK_FAILURES: usize = 100;
 const MAX_TRACKED_REQUESTS: usize = 512;
 const MAX_DIAGNOSTIC_TEXT_CHARS: usize = 4_000;
 const MAX_DIAGNOSTIC_URL_CHARS: usize = 2_048;
+const MAX_BROWSER_TARGET_NAME_CHARS: usize = 32;
+const MAX_EVIDENCE_LABEL_CHARS: usize = 80;
+const MAX_RETAINED_EVIDENCE: usize = 6;
+const MAX_FULL_PAGE_CAPTURE_WIDTH: f64 = 7_680.0;
+const MAX_FULL_PAGE_CAPTURE_HEIGHT: f64 = 20_000.0;
+const MAX_FULL_PAGE_CAPTURE_PIXELS: f64 = 100_000_000.0;
 const MIN_VIEWPORT_DIMENSION: u32 = 200;
 const MAX_VIEWPORT_WIDTH: u32 = 7_680;
 const MAX_VIEWPORT_HEIGHT: u32 = 4_320;
 const BROWSER_PROFILE_NAME: &str = "GitTerm V4 Browser";
+const DEFAULT_BROWSER_TARGET_NAME: &str = "primary";
 // Catppuccin Mocha mauve (#cba6f7) encoded as Chrome's signed ARGB SkColor.
 const BROWSER_PROFILE_COLOR: i64 = -3_430_665;
 
@@ -88,13 +96,28 @@ pub struct BrowserStatus {
     pub devtools_port: Option<u16>,
     pub process_id: Option<u32>,
     pub target_id: Option<String>,
+    pub active_target: Option<String>,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTargetInfo {
+    pub name: String,
+    pub target_id: String,
+    pub url: String,
+    pub title: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserOperation {
     Status,
     Open,
+    Targets,
+    TargetOpen,
+    TargetFocus,
+    TargetClose,
     Navigate,
     Snapshot,
     Click,
@@ -114,6 +137,10 @@ impl BrowserOperation {
         match self {
             Self::Status => "Checking status",
             Self::Open => "Opening browser",
+            Self::Targets => "Listing browser targets",
+            Self::TargetOpen => "Opening browser target",
+            Self::TargetFocus => "Focusing browser target",
+            Self::TargetClose => "Closing browser target",
             Self::Navigate => "Navigating",
             Self::Snapshot => "Capturing evidence",
             Self::Click => "Clicking",
@@ -133,6 +160,10 @@ impl BrowserOperation {
         match self {
             Self::Status => "Status checked",
             Self::Open => "Browser opened",
+            Self::Targets => "Browser targets listed",
+            Self::TargetOpen => "Browser target opened",
+            Self::TargetFocus => "Browser target focused",
+            Self::TargetClose => "Browser target closed",
             Self::Navigate => "Navigation complete",
             Self::Snapshot => "Evidence captured",
             Self::Click => "Click complete",
@@ -166,6 +197,9 @@ pub struct BrowserOperationOutcome {
 #[derive(Clone)]
 pub struct BrowserEvidence {
     pub id: u64,
+    pub target: String,
+    pub label: String,
+    pub capture_mode: BrowserCaptureMode,
     pub title: String,
     pub display_url: Option<String>,
     pub viewport: BrowserViewport,
@@ -180,6 +214,9 @@ impl fmt::Debug for BrowserEvidence {
         formatter
             .debug_struct("BrowserEvidence")
             .field("id", &self.id)
+            .field("target", &self.target)
+            .field("label", &self.label)
+            .field("capture_mode", &self.capture_mode)
             .field("title", &self.title)
             .field("display_url", &self.display_url)
             .field("viewport", &self.viewport)
@@ -197,6 +234,7 @@ pub struct BrowserTelemetrySnapshot {
     pub active_agent_operation: Option<BrowserOperationActivity>,
     pub last_agent_operation: Option<BrowserOperationOutcome>,
     pub latest_evidence: Option<BrowserEvidence>,
+    pub evidence: Vec<BrowserEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -437,6 +475,8 @@ pub enum BrowserWaitCondition {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserSnapshot {
+    pub target: String,
+    pub capture_mode: BrowserCaptureMode,
     pub url: String,
     pub title: String,
     pub loading_state: String,
@@ -447,6 +487,13 @@ pub struct BrowserSnapshot {
     pub failed_requests: Vec<BrowserNetworkFailure>,
     #[serde(skip_serializing)]
     pub screenshot_png: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserCaptureMode {
+    Viewport,
+    FullPage,
 }
 
 #[derive(Debug, Clone)]
@@ -470,13 +517,23 @@ struct DevToolsEndpoint {
     browser_websocket_path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DevToolsTarget {
     id: String,
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    title: String,
     web_socket_debugger_url: Option<String>,
+}
+
+struct ManagedBrowserTarget {
+    target_id: String,
+    viewport: Option<BrowserViewport>,
+    session: Option<CdpSession>,
 }
 
 /// Owns one visible Chrome process and its dedicated GitTerm V4 profile.
@@ -488,9 +545,8 @@ pub struct BrowserController {
     profile_dir: PathBuf,
     child: Option<Child>,
     endpoint: Option<DevToolsEndpoint>,
-    active_target_id: Option<String>,
-    active_viewport: Option<BrowserViewport>,
-    session: Option<CdpSession>,
+    active_target_name: Option<String>,
+    targets: HashMap<String, ManagedBrowserTarget>,
     last_exit: Option<String>,
     stderr_log: Arc<Mutex<Vec<u8>>>,
     stderr_task: Option<JoinHandle<()>>,
@@ -502,9 +558,8 @@ impl BrowserController {
             profile_dir: browser_profile_dir(v4_global_config_dir.as_ref()),
             child: None,
             endpoint: None,
-            active_target_id: None,
-            active_viewport: None,
-            session: None,
+            active_target_name: None,
+            targets: HashMap::new(),
             last_exit: None,
             stderr_log: Arc::new(Mutex::new(Vec::new())),
             stderr_task: None,
@@ -567,9 +622,7 @@ impl BrowserController {
         })?;
         self.start_stderr_capture(stderr).await;
         self.child = Some(child);
-        self.active_target_id = None;
-        self.active_viewport = None;
-        self.session = None;
+        self.clear_targets();
         self.last_exit = None;
 
         let deadline = Instant::now() + options.startup_timeout;
@@ -603,8 +656,7 @@ impl BrowserController {
                     let stderr = self.finish_stderr_capture().await;
                     self.child = None;
                     self.endpoint = None;
-                    self.active_target_id = None;
-                    self.active_viewport = None;
+                    self.clear_targets();
                     self.last_exit = Some(exit.to_string());
                     return Err(BrowserControlError::new(format!(
                         "Chrome exited before publishing its DevTools endpoint: {exit}{}",
@@ -637,9 +689,7 @@ impl BrowserController {
             })? {
                 self.child = None;
                 self.endpoint = None;
-                self.active_target_id = None;
-                self.active_viewport = None;
-                self.session = None;
+                self.clear_targets();
                 self.last_exit = Some(exit.to_string());
             }
         }
@@ -652,12 +702,18 @@ impl BrowserController {
             (BrowserState::Stopped, None)
         };
 
+        let target_id = self
+            .active_target_name
+            .as_ref()
+            .and_then(|name| self.targets.get(name))
+            .map(|target| target.target_id.clone());
         Ok(BrowserStatus {
             state,
             profile_dir: self.profile_dir.clone(),
             devtools_port: self.endpoint.as_ref().map(|endpoint| endpoint.port),
             process_id: self.child.as_ref().and_then(Child::id),
-            target_id: self.active_target_id.clone(),
+            target_id,
+            active_target: self.active_target_name.clone(),
             detail,
         })
     }
@@ -675,9 +731,7 @@ impl BrowserController {
                 }
                 _ => {
                     self.endpoint = None;
-                    self.active_target_id = None;
-                    self.active_viewport = None;
-                    self.session = None;
+                    self.clear_targets();
                 }
             }
         }
@@ -685,8 +739,17 @@ impl BrowserController {
     }
 
     pub async fn navigate(&mut self, raw_url: &str) -> Result<NavigationResult> {
+        self.navigate_in(None, raw_url).await
+    }
+
+    pub async fn navigate_in(
+        &mut self,
+        target: Option<&str>,
+        raw_url: &str,
+    ) -> Result<NavigationResult> {
         let url = validate_navigation_url(raw_url)?;
-        let session = self.page_session().await?;
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
         let result = session
             .command("Page.navigate", json!({ "url": url.as_str() }))
             .await?;
@@ -716,7 +779,16 @@ impl BrowserController {
     }
 
     pub async fn snapshot(&mut self) -> Result<BrowserSnapshot> {
-        let session = self.page_session().await?;
+        self.snapshot_in(None, BrowserCaptureMode::Viewport).await
+    }
+
+    pub async fn snapshot_in(
+        &mut self,
+        target: Option<&str>,
+        capture_mode: BrowserCaptureMode,
+    ) -> Result<BrowserSnapshot> {
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
 
         let page_state = session
             .command(
@@ -736,11 +808,16 @@ impl BrowserController {
             BrowserControlError::new(format!("Chrome returned malformed snapshot data: {error}"))
         })?;
 
+        let screenshot_params = match capture_mode {
+            BrowserCaptureMode::Viewport => {
+                json!({ "format": "png", "captureBeyondViewport": false })
+            }
+            BrowserCaptureMode::FullPage => {
+                full_page_capture_params(session, state.viewport.device_scale_factor).await?
+            }
+        };
         let screenshot = session
-            .command(
-                "Page.captureScreenshot",
-                json!({ "format": "png", "captureBeyondViewport": false }),
-            )
+            .command("Page.captureScreenshot", screenshot_params)
             .await?;
         let encoded_png = screenshot
             .get("data")
@@ -754,14 +831,21 @@ impl BrowserController {
                 ))
             })?;
         let (console_errors, failed_requests) = session.diagnostics().await;
+        let viewport = self
+            .targets
+            .get(&target_name)
+            .and_then(|target| target.viewport)
+            .unwrap_or(state.viewport);
 
         Ok(BrowserSnapshot {
+            target: target_name,
+            capture_mode,
             url: state.url,
             title: state.title,
             loading_state: state.loading_state,
             visible_text: state.visible_text,
             interactive_elements: state.interactive_elements,
-            viewport: self.active_viewport.unwrap_or(state.viewport),
+            viewport,
             console_errors,
             failed_requests,
             screenshot_png,
@@ -770,7 +854,16 @@ impl BrowserController {
 
     /// Click one strictly located visible element using CDP mouse events.
     pub async fn click(&mut self, locator: &BrowserLocator) -> Result<BrowserActionTarget> {
-        let session = self.page_session().await?;
+        self.click_in(None, locator).await
+    }
+
+    pub async fn click_in(
+        &mut self,
+        target: Option<&str>,
+        locator: &BrowserLocator,
+    ) -> Result<BrowserActionTarget> {
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
         let target = resolve_locator(session, locator, LocatorPreparation::Point).await?;
         session
             .command(
@@ -817,7 +910,17 @@ impl BrowserController {
         locator: &BrowserLocator,
         text: &str,
     ) -> Result<BrowserActionTarget> {
-        let session = self.page_session().await?;
+        self.type_text_in(None, locator, text).await
+    }
+
+    pub async fn type_text_in(
+        &mut self,
+        target: Option<&str>,
+        locator: &BrowserLocator,
+        text: &str,
+    ) -> Result<BrowserActionTarget> {
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
         let target = resolve_locator(session, locator, LocatorPreparation::ReplaceText).await?;
         session
             .command("Input.insertText", json!({ "text": text }))
@@ -827,8 +930,13 @@ impl BrowserController {
 
     /// Press one supported non-text key against the currently focused element.
     pub async fn press(&mut self, key: BrowserKey) -> Result<()> {
+        self.press_in(None, key).await
+    }
+
+    pub async fn press_in(&mut self, target: Option<&str>, key: BrowserKey) -> Result<()> {
         let descriptor = key_descriptor(key);
-        let session = self.page_session().await?;
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
         let mut key_down = json!({
             "type": if descriptor.text.is_some() { "keyDown" } else { "rawKeyDown" },
             "key": descriptor.key,
@@ -858,7 +966,12 @@ impl BrowserController {
 
     /// Reload the current page and wait for a new document to finish loading.
     pub async fn reload(&mut self, ignore_cache: bool) -> Result<()> {
-        let session = self.page_session().await?;
+        self.reload_in(None, ignore_cache).await
+    }
+
+    pub async fn reload_in(&mut self, target: Option<&str>, ignore_cache: bool) -> Result<()> {
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
         let previous_time_origin = page_time_origin(session).await?;
         session
             .command("Page.reload", json!({ "ignoreCache": ignore_cache }))
@@ -873,8 +986,17 @@ impl BrowserController {
 
     /// Apply responsive device metrics to the controlled page target.
     pub async fn resize(&mut self, viewport: BrowserViewport) -> Result<BrowserViewport> {
+        self.resize_in(None, viewport).await
+    }
+
+    pub async fn resize_in(
+        &mut self,
+        target: Option<&str>,
+        viewport: BrowserViewport,
+    ) -> Result<BrowserViewport> {
         let viewport = viewport.validate()?;
-        let session = self.page_session().await?;
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
         session
             .command(
                 "Emulation.setDeviceMetricsOverride",
@@ -886,12 +1008,24 @@ impl BrowserController {
                 }),
             )
             .await?;
-        self.active_viewport = Some(viewport);
+        self.targets
+            .get_mut(&target_name)
+            .ok_or_else(|| browser_target_not_found(&target_name))?
+            .viewport = Some(viewport);
         Ok(viewport)
     }
 
     /// Scroll the page at the current viewport center using a CDP wheel event.
     pub async fn scroll(&mut self, delta_x: f64, delta_y: f64) -> Result<()> {
+        self.scroll_in(None, delta_x, delta_y).await
+    }
+
+    pub async fn scroll_in(
+        &mut self,
+        target: Option<&str>,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> Result<()> {
         const MAX_SCROLL_DELTA: f64 = 100_000.0;
         if !delta_x.is_finite()
             || !delta_y.is_finite()
@@ -902,7 +1036,8 @@ impl BrowserController {
                 "browser scroll deltas must be finite and between -{MAX_SCROLL_DELTA} and {MAX_SCROLL_DELTA}"
             )));
         }
-        let session = self.page_session().await?;
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
         let result = session
             .command(
                 "Runtime.evaluate",
@@ -939,7 +1074,12 @@ impl BrowserController {
     }
 
     pub async fn diagnostics(&mut self) -> Result<BrowserDiagnostics> {
-        let session = self.page_session().await?;
+        self.diagnostics_in(None).await
+    }
+
+    pub async fn diagnostics_in(&mut self, target: Option<&str>) -> Result<BrowserDiagnostics> {
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
         let (console_errors, failed_requests) = session.diagnostics().await;
         Ok(BrowserDiagnostics {
             console_errors,
@@ -953,19 +1093,38 @@ impl BrowserController {
         condition: &BrowserWaitCondition,
         max_wait: Duration,
     ) -> Result<()> {
+        self.wait_for_in(None, condition, max_wait).await
+    }
+
+    pub async fn wait_for_in(
+        &mut self,
+        target: Option<&str>,
+        condition: &BrowserWaitCondition,
+        max_wait: Duration,
+    ) -> Result<()> {
         if max_wait.is_zero() {
             return Err(BrowserControlError::new(
                 "browser wait timeout must be greater than zero",
             ));
         }
         validate_wait_condition(condition)?;
-        let session = self.page_session().await?;
+        let target_name = self.target_name(target)?;
+        let session = self.page_session_named(&target_name).await?;
         wait_for_condition(session, condition, max_wait).await
     }
 
     /// Wait until the current document reports a complete loading state.
     pub async fn wait_for_ready(&mut self, max_wait: Duration) -> Result<()> {
-        self.wait_for(
+        self.wait_for_ready_in(None, max_wait).await
+    }
+
+    pub async fn wait_for_ready_in(
+        &mut self,
+        target: Option<&str>,
+        max_wait: Duration,
+    ) -> Result<()> {
+        self.wait_for_in(
+            target,
             &BrowserWaitCondition::LoadingState {
                 state: BrowserLoadingState::Complete,
             },
@@ -976,10 +1135,145 @@ impl BrowserController {
 
     /// Bring the managed page target to the front of its Chrome window.
     pub async fn focus(&mut self) -> Result<()> {
-        self.page_session()
+        let target = self.target_name(None)?;
+        self.focus_target(&target).await
+    }
+
+    pub async fn open_target(&mut self, name: &str, raw_url: &str) -> Result<BrowserTargetInfo> {
+        let name = validate_browser_target_name(name)?.to_string();
+        let url = validate_navigation_url(raw_url)?;
+        if self.targets.contains_key(&name) {
+            return Err(BrowserControlError::new(format!(
+                "browser target '{name}' already exists"
+            )));
+        }
+        let session = self.browser_session().await?;
+        let result = session
+            .command("Target.createTarget", json!({ "url": url.as_str() }))
+            .await?;
+        let target_id = result
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserControlError::new("Target.createTarget omitted its targetId"))?
+            .to_string();
+        self.targets.insert(
+            name.clone(),
+            ManagedBrowserTarget {
+                target_id: target_id.clone(),
+                viewport: None,
+                session: None,
+            },
+        );
+        self.active_target_name = Some(name.clone());
+        let deadline = Instant::now() + TARGET_STARTUP_TIMEOUT;
+        loop {
+            match self.focus_target(&name).await {
+                Ok(()) => break,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(25)).await,
+                Err(error) => {
+                    let cleanup = match session
+                        .command("Target.closeTarget", json!({ "targetId": target_id }))
+                        .await
+                    {
+                        Ok(result)
+                            if result.get("success").and_then(Value::as_bool) == Some(true) =>
+                        {
+                            "the incomplete target was closed".to_string()
+                        }
+                        Ok(_) => "Chrome did not close the incomplete target".to_string(),
+                        Err(cleanup_error) => {
+                            format!("closing the incomplete target also failed: {cleanup_error}")
+                        }
+                    };
+                    self.targets.remove(&name);
+                    self.active_target_name = self.targets.keys().min().cloned();
+                    return Err(BrowserControlError::new(format!(
+                        "created browser target '{name}' but could not initialize it within {} seconds: {error}; {cleanup}",
+                        TARGET_STARTUP_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+        }
+        Ok(BrowserTargetInfo {
+            name,
+            target_id,
+            url: url.into(),
+            title: String::new(),
+            active: true,
+        })
+    }
+
+    pub async fn targets(&mut self) -> Result<Vec<BrowserTargetInfo>> {
+        let endpoint = self.running_endpoint()?;
+        let mut live_targets = list_page_targets(endpoint.port).await?;
+        self.targets.retain(|_, managed| {
+            live_targets
+                .iter()
+                .any(|target| target.id == managed.target_id && target.kind == "page")
+        });
+        if self.targets.is_empty() {
+            self.active_target_name = None;
+            self.page_session_named(DEFAULT_BROWSER_TARGET_NAME).await?;
+            live_targets = list_page_targets(endpoint.port).await?;
+        } else if self
+            .active_target_name
+            .as_ref()
+            .is_some_and(|name| !self.targets.contains_key(name))
+        {
+            self.active_target_name = self.targets.keys().min().cloned();
+        }
+        let active = self.active_target_name.as_deref();
+        let mut result = self
+            .targets
+            .iter()
+            .filter_map(|(name, managed)| {
+                live_targets
+                    .iter()
+                    .find(|target| target.id == managed.target_id && target.kind == "page")
+                    .map(|target| BrowserTargetInfo {
+                        name: name.clone(),
+                        target_id: target.id.clone(),
+                        url: target.url.clone(),
+                        title: target.title.clone(),
+                        active: active == Some(name.as_str()),
+                    })
+            })
+            .collect::<Vec<_>>();
+        result.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(result)
+    }
+
+    pub async fn focus_target(&mut self, name: &str) -> Result<()> {
+        let name = validate_browser_target_name(name)?.to_string();
+        self.page_session_named(&name)
             .await?
             .command("Page.bringToFront", json!({}))
             .await?;
+        self.active_target_name = Some(name);
+        Ok(())
+    }
+
+    pub async fn close_target(&mut self, name: &str) -> Result<()> {
+        let name = validate_browser_target_name(name)?.to_string();
+        let target_id = self
+            .targets
+            .get(&name)
+            .ok_or_else(|| browser_target_not_found(&name))?
+            .target_id
+            .clone();
+        let session = self.browser_session().await?;
+        let result = session
+            .command("Target.closeTarget", json!({ "targetId": target_id }))
+            .await?;
+        if result.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(BrowserControlError::new(format!(
+                "Chrome did not close browser target '{name}'"
+            )));
+        }
+        self.targets.remove(&name);
+        if self.active_target_name.as_deref() == Some(name.as_str()) {
+            self.active_target_name = self.targets.keys().min().cloned();
+        }
         Ok(())
     }
 
@@ -1037,10 +1331,8 @@ impl BrowserController {
             }
         }
         let _ = self.finish_stderr_capture().await;
-        self.session = None;
         self.endpoint = None;
-        self.active_target_id = None;
-        self.active_viewport = None;
+        self.clear_targets();
         self.last_exit = None;
         Ok(())
     }
@@ -1059,46 +1351,92 @@ impl BrowserController {
             .ok_or_else(|| BrowserControlError::new("running browser has no DevTools endpoint"))
     }
 
-    async fn page_session(&mut self) -> Result<&CdpSession> {
+    fn target_name(&self, target: Option<&str>) -> Result<String> {
+        match target {
+            Some(name) => Ok(validate_browser_target_name(name)?.to_string()),
+            None => Ok(self
+                .active_target_name
+                .clone()
+                .unwrap_or_else(|| DEFAULT_BROWSER_TARGET_NAME.to_string())),
+        }
+    }
+
+    async fn browser_session(&mut self) -> Result<CdpSession> {
         let endpoint = self.running_endpoint()?;
-        let targets = list_page_targets(endpoint.port).await?;
-        let target = self
-            .active_target_id
+        let websocket_url = format!(
+            "ws://127.0.0.1:{}{}",
+            endpoint.port, endpoint.browser_websocket_path
+        );
+        CdpSession::connect(&websocket_url).await
+    }
+
+    async fn page_session_named(&mut self, name: &str) -> Result<&CdpSession> {
+        let name = validate_browser_target_name(name)?.to_string();
+        let endpoint = self.running_endpoint()?;
+        let live_targets = list_page_targets(endpoint.port).await?;
+        let mapped_target_id = self
+            .targets
+            .get(&name)
+            .map(|target| target.target_id.clone());
+        let target = mapped_target_id
             .as_deref()
-            .and_then(|active_id| {
-                targets.iter().find(|target| {
-                    target.id == active_id
+            .and_then(|target_id| {
+                live_targets.iter().find(|target| {
+                    target.id == target_id
                         && target.kind == "page"
                         && target.web_socket_debugger_url.is_some()
                 })
             })
             .or_else(|| {
-                targets.iter().find(|target| {
-                    target.kind == "page" && target.web_socket_debugger_url.is_some()
-                })
+                (name == DEFAULT_BROWSER_TARGET_NAME && mapped_target_id.is_none()).then(|| {
+                    live_targets.iter().find(|target| {
+                        target.kind == "page"
+                            && target.web_socket_debugger_url.is_some()
+                            && !self
+                                .targets
+                                .values()
+                                .any(|managed| managed.target_id == target.id)
+                    })
+                })?
             })
-            .ok_or_else(|| BrowserControlError::new("Chrome has no controllable page target"))?;
+            .cloned()
+            .ok_or_else(|| browser_target_not_found(&name))?;
         let target_id = target.id.clone();
         let websocket_url = target.web_socket_debugger_url.clone().ok_or_else(|| {
             BrowserControlError::new("Chrome page target did not expose a WebSocket debugger URL")
         })?;
-        let needs_session = self.active_target_id.as_deref() != Some(target_id.as_str())
-            || self.session.as_ref().is_none_or(CdpSession::is_finished);
+        let managed = self
+            .targets
+            .entry(name.clone())
+            .or_insert_with(|| ManagedBrowserTarget {
+                target_id: target_id.clone(),
+                viewport: None,
+                session: None,
+            });
+        let needs_session = managed.target_id != target_id
+            || managed.session.as_ref().is_none_or(CdpSession::is_finished);
         if needs_session {
-            self.session = None;
-            self.active_target_id = None;
-            self.active_viewport = None;
             let session = CdpSession::connect(&websocket_url).await?;
             session.command("Page.enable", json!({})).await?;
             session.command("Runtime.enable", json!({})).await?;
             session.command("Log.enable", json!({})).await?;
             session.command("Network.enable", json!({})).await?;
-            self.active_target_id = Some(target_id);
-            self.session = Some(session);
+            managed.target_id = target_id;
+            managed.viewport = None;
+            managed.session = Some(session);
         }
-        self.session.as_ref().ok_or_else(|| {
-            BrowserControlError::new("Chrome page target has no active DevTools session")
-        })
+        self.active_target_name = Some(name.clone());
+        self.targets
+            .get(&name)
+            .and_then(|managed| managed.session.as_ref())
+            .ok_or_else(|| {
+                BrowserControlError::new("Chrome page target has no active DevTools session")
+            })
+    }
+
+    fn clear_targets(&mut self) {
+        self.active_target_name = None;
+        self.targets.clear();
     }
 
     async fn terminate_child(&mut self) -> String {
@@ -1107,9 +1445,7 @@ impl BrowserController {
             let _ = child.wait().await;
         }
         self.endpoint = None;
-        self.active_target_id = None;
-        self.active_viewport = None;
-        self.session = None;
+        self.clear_targets();
         self.finish_stderr_capture().await
     }
 
@@ -1233,14 +1569,37 @@ impl BrowserControlService {
         self.controller.lock().await.navigate(url).await
     }
 
+    pub async fn navigate_in(&self, target: Option<&str>, url: &str) -> Result<NavigationResult> {
+        self.controller.lock().await.navigate_in(target, url).await
+    }
+
     pub async fn snapshot(&self) -> Result<BrowserSnapshot> {
-        let snapshot = self.controller.lock().await.snapshot().await?;
+        self.capture(None, "Snapshot", BrowserCaptureMode::Viewport)
+            .await
+    }
+
+    pub async fn capture(
+        &self,
+        target: Option<&str>,
+        label: &str,
+        capture_mode: BrowserCaptureMode,
+    ) -> Result<BrowserSnapshot> {
+        let label = validate_evidence_label(label)?.to_string();
+        let snapshot = self
+            .controller
+            .lock()
+            .await
+            .snapshot_in(target, capture_mode)
+            .await?;
         let mut telemetry = self.telemetry.lock().await;
         telemetry.next_evidence_id += 1;
         let id = telemetry.next_evidence_id;
         telemetry.snapshot.revision += 1;
-        telemetry.snapshot.latest_evidence = Some(BrowserEvidence {
+        let evidence = BrowserEvidence {
             id,
+            target: snapshot.target.clone(),
+            label,
+            capture_mode: snapshot.capture_mode,
             title: snapshot.title.clone(),
             display_url: sanitize_diagnostic_url(&snapshot.url),
             viewport: snapshot.viewport,
@@ -1248,13 +1607,38 @@ impl BrowserControlService {
             console_error_count: snapshot.console_errors.len(),
             failed_request_count: snapshot.failed_requests.len(),
             screenshot_png: Arc::new(snapshot.screenshot_png.clone()),
-        });
+        };
+        retain_browser_evidence(&mut telemetry.snapshot, evidence);
         drop(telemetry);
         Ok(snapshot)
     }
 
+    pub async fn targets(&self) -> Result<Vec<BrowserTargetInfo>> {
+        self.controller.lock().await.targets().await
+    }
+
+    pub async fn open_target(&self, name: &str, url: &str) -> Result<BrowserTargetInfo> {
+        self.controller.lock().await.open_target(name, url).await
+    }
+
+    pub async fn focus_target(&self, name: &str) -> Result<()> {
+        self.controller.lock().await.focus_target(name).await
+    }
+
+    pub async fn close_target(&self, name: &str) -> Result<()> {
+        self.controller.lock().await.close_target(name).await
+    }
+
     pub async fn click(&self, locator: &BrowserLocator) -> Result<BrowserActionTarget> {
         self.controller.lock().await.click(locator).await
+    }
+
+    pub async fn click_in(
+        &self,
+        target: Option<&str>,
+        locator: &BrowserLocator,
+    ) -> Result<BrowserActionTarget> {
+        self.controller.lock().await.click_in(target, locator).await
     }
 
     pub async fn type_text(
@@ -1265,28 +1649,85 @@ impl BrowserControlService {
         self.controller.lock().await.type_text(locator, text).await
     }
 
+    pub async fn type_text_in(
+        &self,
+        target: Option<&str>,
+        locator: &BrowserLocator,
+        text: &str,
+    ) -> Result<BrowserActionTarget> {
+        self.controller
+            .lock()
+            .await
+            .type_text_in(target, locator, text)
+            .await
+    }
+
     pub async fn press(&self, key: BrowserKey) -> Result<()> {
         self.controller.lock().await.press(key).await
+    }
+
+    pub async fn press_in(&self, target: Option<&str>, key: BrowserKey) -> Result<()> {
+        self.controller.lock().await.press_in(target, key).await
     }
 
     pub async fn reload(&self, ignore_cache: bool) -> Result<()> {
         self.controller.lock().await.reload(ignore_cache).await
     }
 
+    pub async fn reload_in(&self, target: Option<&str>, ignore_cache: bool) -> Result<()> {
+        self.controller
+            .lock()
+            .await
+            .reload_in(target, ignore_cache)
+            .await
+    }
+
     pub async fn resize(&self, viewport: BrowserViewport) -> Result<BrowserViewport> {
         self.controller.lock().await.resize(viewport).await
+    }
+
+    pub async fn resize_in(
+        &self,
+        target: Option<&str>,
+        viewport: BrowserViewport,
+    ) -> Result<BrowserViewport> {
+        self.controller
+            .lock()
+            .await
+            .resize_in(target, viewport)
+            .await
     }
 
     pub async fn scroll(&self, delta_x: f64, delta_y: f64) -> Result<()> {
         self.controller.lock().await.scroll(delta_x, delta_y).await
     }
 
+    pub async fn scroll_in(&self, target: Option<&str>, delta_x: f64, delta_y: f64) -> Result<()> {
+        self.controller
+            .lock()
+            .await
+            .scroll_in(target, delta_x, delta_y)
+            .await
+    }
+
     pub async fn diagnostics(&self) -> Result<BrowserDiagnostics> {
         self.controller.lock().await.diagnostics().await
     }
 
+    pub async fn diagnostics_in(&self, target: Option<&str>) -> Result<BrowserDiagnostics> {
+        self.controller.lock().await.diagnostics_in(target).await
+    }
+
     pub async fn wait_for_ready(&self, max_wait: Duration) -> Result<()> {
         self.controller.lock().await.wait_for_ready(max_wait).await
+    }
+
+    pub async fn wait_for_ready_in(&self, target: Option<&str>, max_wait: Duration) -> Result<()> {
+        self.controller
+            .lock()
+            .await
+            .wait_for_ready_in(target, max_wait)
+            .await
     }
 
     pub async fn wait_for(
@@ -1301,6 +1742,19 @@ impl BrowserControlService {
             .await
     }
 
+    pub async fn wait_for_in(
+        &self,
+        target: Option<&str>,
+        condition: &BrowserWaitCondition,
+        max_wait: Duration,
+    ) -> Result<()> {
+        self.controller
+            .lock()
+            .await
+            .wait_for_in(target, condition, max_wait)
+            .await
+    }
+
     pub async fn focus(&self) -> Result<()> {
         self.controller.lock().await.focus().await
     }
@@ -1308,6 +1762,30 @@ impl BrowserControlService {
     pub async fn disconnect(&self) -> Result<()> {
         self.controller.lock().await.disconnect().await
     }
+}
+
+fn retain_browser_evidence(snapshot: &mut BrowserTelemetrySnapshot, evidence: BrowserEvidence) {
+    if let Some(index) = snapshot.evidence.iter().position(|retained| {
+        retained.target == evidence.target
+            && retained.label == evidence.label
+            && retained.capture_mode == evidence.capture_mode
+            && retained.viewport == evidence.viewport
+    }) {
+        snapshot.evidence[index] = evidence.clone();
+    } else {
+        snapshot.evidence.push(evidence.clone());
+    }
+    if snapshot.evidence.len() > MAX_RETAINED_EVIDENCE {
+        if let Some((oldest, _)) = snapshot
+            .evidence
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, retained)| retained.id)
+        {
+            snapshot.evidence.remove(oldest);
+        }
+    }
+    snapshot.latest_evidence = Some(evidence);
 }
 
 #[derive(Debug, Deserialize)]
@@ -2484,6 +2962,87 @@ async fn list_page_targets(port: u16) -> Result<Vec<DevToolsTarget>> {
     })
 }
 
+fn validate_browser_target_name(name: &str) -> Result<&str> {
+    if name.is_empty() || name.chars().count() > MAX_BROWSER_TARGET_NAME_CHARS {
+        return Err(BrowserControlError::new(format!(
+            "browser target names must contain 1 to {MAX_BROWSER_TARGET_NAME_CHARS} characters"
+        )));
+    }
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase())
+        || !chars.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '_')
+        })
+    {
+        return Err(BrowserControlError::new(
+            "browser target names must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_'",
+        ));
+    }
+    Ok(name)
+}
+
+fn validate_evidence_label(label: &str) -> Result<&str> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_EVIDENCE_LABEL_CHARS {
+        return Err(BrowserControlError::new(format!(
+            "browser evidence labels must contain 1 to {MAX_EVIDENCE_LABEL_CHARS} characters"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(BrowserControlError::new(
+            "browser evidence labels cannot contain control characters",
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn browser_target_not_found(name: &str) -> BrowserControlError {
+    BrowserControlError::new(format!(
+        "browser target '{name}' does not exist; open it first or list the available targets"
+    ))
+}
+
+async fn full_page_capture_params(session: &CdpSession, device_scale_factor: f64) -> Result<Value> {
+    let metrics = session.command("Page.getLayoutMetrics", json!({})).await?;
+    let width = metrics
+        .pointer("/contentSize/width")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| BrowserControlError::new("Page.getLayoutMetrics omitted content width"))?;
+    let height = metrics
+        .pointer("/contentSize/height")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| BrowserControlError::new("Page.getLayoutMetrics omitted content height"))?;
+    if !width.is_finite()
+        || !height.is_finite()
+        || !device_scale_factor.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || device_scale_factor <= 0.0
+    {
+        return Err(BrowserControlError::new(format!(
+            "Chrome returned invalid full-page dimensions {width}x{height} at {device_scale_factor}x scale"
+        )));
+    }
+    let encoded_pixels = width * height * device_scale_factor * device_scale_factor;
+    if width > MAX_FULL_PAGE_CAPTURE_WIDTH
+        || height > MAX_FULL_PAGE_CAPTURE_HEIGHT
+        || encoded_pixels > MAX_FULL_PAGE_CAPTURE_PIXELS
+    {
+        return Err(BrowserControlError::new(format!(
+            "full-page capture {width:.0}x{height:.0} exceeds the safe evidence limit"
+        )));
+    }
+    Ok(json!({
+        "format": "png",
+        "captureBeyondViewport": true,
+        "clip": { "x": 0, "y": 0, "width": width, "height": height, "scale": 1 }
+    }))
+}
+
 fn validate_navigation_url(raw_url: &str) -> Result<Url> {
     let url = Url::parse(raw_url).map_err(|error| {
         BrowserControlError::new(format!("browser navigation URL is invalid: {error}"))
@@ -2833,6 +3392,60 @@ mod tests {
     }
 
     #[test]
+    fn named_targets_and_evidence_labels_are_strict_and_generic() {
+        for name in ["design", "implementation", "before", "after", "site-a"] {
+            assert_eq!(validate_browser_target_name(name).unwrap(), name);
+        }
+        for name in ["", "Portal", "1target", "target space", "target/route"] {
+            assert!(
+                validate_browser_target_name(name).is_err(),
+                "accepted {name:?}"
+            );
+        }
+        assert_eq!(
+            validate_evidence_label("  account settings / desktop  ").unwrap(),
+            "account settings / desktop"
+        );
+        assert!(validate_evidence_label("\n").is_err());
+        assert!(validate_evidence_label("route\u{0000}").is_err());
+    }
+
+    #[test]
+    fn evidence_retention_replaces_matching_target_labels_and_stays_bounded() {
+        let mut telemetry = BrowserTelemetrySnapshot::default();
+        let evidence = |id: u64, target: String| BrowserEvidence {
+            id,
+            target,
+            label: "account-settings".to_string(),
+            capture_mode: BrowserCaptureMode::Viewport,
+            title: "Settings".to_string(),
+            display_url: Some("https://example.com/settings".to_string()),
+            viewport: BrowserViewport::desktop(1_280, 720),
+            captured_at: SystemTime::now(),
+            console_error_count: 0,
+            failed_request_count: 0,
+            screenshot_png: Arc::new(vec![id as u8]),
+        };
+        for id in 1..=7 {
+            retain_browser_evidence(&mut telemetry, evidence(id, format!("target-{id}")));
+        }
+        assert_eq!(telemetry.evidence.len(), MAX_RETAINED_EVIDENCE);
+        assert!(telemetry.evidence.iter().all(|capture| capture.id != 1));
+
+        retain_browser_evidence(&mut telemetry, evidence(8, "target-2".to_string()));
+        assert_eq!(telemetry.evidence.len(), MAX_RETAINED_EVIDENCE);
+        assert_eq!(
+            telemetry
+                .evidence
+                .iter()
+                .filter(|capture| capture.target == "target-2")
+                .count(),
+            1
+        );
+        assert_eq!(telemetry.latest_evidence.unwrap().id, 8);
+    }
+
+    #[test]
     fn snapshot_expression_includes_bounded_page_state() {
         let expression = snapshot_expression();
         assert!(expression.contains("visibleText"));
@@ -3164,12 +3777,59 @@ mod tests {
             .visible_text
             .contains("browser-control-ready"));
 
+        let primary_capture = service
+            .capture(
+                Some(DEFAULT_BROWSER_TARGET_NAME),
+                "smoke-route",
+                BrowserCaptureMode::FullPage,
+            )
+            .await
+            .unwrap();
+        assert_eq!(primary_capture.target, DEFAULT_BROWSER_TARGET_NAME);
+        assert_eq!(primary_capture.capture_mode, BrowserCaptureMode::FullPage);
+        service.open_target("implementation", &url).await.unwrap();
+        service
+            .wait_for_ready_in(Some("implementation"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        service
+            .resize_in(Some("implementation"), mobile)
+            .await
+            .unwrap();
+        service
+            .capture(
+                Some("implementation"),
+                "smoke-route",
+                BrowserCaptureMode::FullPage,
+            )
+            .await
+            .unwrap();
+        let targets = service.targets().await.unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().any(|target| target.name == "primary"));
+        assert!(targets
+            .iter()
+            .any(|target| target.name == "implementation" && target.active));
+
         let telemetry = service.telemetry().await;
-        let evidence = telemetry.latest_evidence.unwrap();
+        let evidence = telemetry.latest_evidence.as_ref().unwrap();
         assert_eq!(evidence.title, "GitTerm browser smoke");
         assert_eq!(evidence.display_url.as_deref(), Some(url.as_str()));
         assert_eq!(evidence.viewport, mobile);
         assert!(evidence.screenshot_png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let paired = telemetry
+            .evidence
+            .iter()
+            .filter(|capture| capture.label == "smoke-route")
+            .collect::<Vec<_>>();
+        assert_eq!(paired.len(), 2);
+        assert_ne!(paired[0].target, paired[1].target);
+
+        service.close_target("implementation").await.unwrap();
+        service
+            .focus_target(DEFAULT_BROWSER_TARGET_NAME)
+            .await
+            .unwrap();
 
         let attached_service = BrowserControlService::new(&config_root);
         assert_eq!(

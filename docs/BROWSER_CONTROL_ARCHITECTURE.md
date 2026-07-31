@@ -7,6 +7,16 @@ and operate while debugging local applications. The user and Codex must be able
 to see the same page, click around, reproduce responsive bugs, inspect browser
 diagnostics, change code, reload, and verify the result.
 
+The primary post-MVP target is the
+[source-backed reference-to-Portal implementation workflow](../.plans/browser-reference-implementation-workflow.md):
+an agent reads an available reference site's source to identify the exact
+approved components, compares the rendered reference and Portal routes, updates
+Portal using those components, and iterates with paired browser evidence.
+That is the first acceptance case; the browser layer itself supports arbitrary
+named source/destination or before/after targets. Workflow orchestration and
+design-system provenance belong in a reusable agent skill rather than a
+Portal-specific Rust workflow.
+
 ## Product Boundary
 
 GitTerm V4 remains the host application and Codex remains the terminal agent.
@@ -79,6 +89,19 @@ The first usable slice should provide:
 - `browser_wait_for`
 - `browser_console`
 - `browser_network`
+- `browser_disconnect`
+
+The source-to-destination slice extends that backward-compatible surface with:
+
+- `browser_targets`
+- `browser_target_open`
+- `browser_target_focus`
+- `browser_target_close`
+- `browser_capture`
+- `browser_target_diagnostics`
+
+Existing operations accept an optional named target. Calls that omit it retain
+the original single-active-target behavior.
 
 `browser_snapshot` should combine a PNG screenshot with URL, title, loading
 state, visible text, interactive elements, accessibility information, recent
@@ -112,7 +135,10 @@ worktree:
    endpoint managed by GitTerm.
 5. Add GitTerm UI for browser status, open/focus/disconnect, and evidence
    screenshots or recordings.
-6. Evaluate an optional extension adapter only after the dedicated-profile
+6. Add the source-backed reference-to-Portal workflow: named targets, paired
+   evidence, DOM and computed-style inspection, deeper console/network
+   diagnostics, and explicit read-only access to reference source.
+7. Evaluate an optional extension adapter only after the dedicated-profile
    workflow has been used on real projects.
 
 ## Phase 4 Integration
@@ -145,11 +171,14 @@ operations are visible while they run and briefly after they complete. MCP tool
 calls are serialized before publishing activity, keeping the displayed
 operation aligned with the browser controller's action order.
 
-A successful browser snapshot retains only the latest PNG and its evidence
-metadata in process memory. The in-app evidence viewer shows the page title,
-sanitized URL, viewport, capture age, and diagnostic counts. Evidence is not
-written to disk or restored across app launches; recording, replay, and a
-persistent evidence history remain out of scope.
+A successful browser capture retains a small bounded set of labeled PNGs and
+metadata in process memory. Recapturing the same target, label, capture mode,
+and viewport replaces that entry without discarding evidence for other targets.
+The in-app evidence workbench pairs the best matching captures from two targets
+and shows target identity, label, page title, sanitized URL, viewport, capture
+mode, and diagnostic counts. Evidence is not written to disk or restored across
+app launches; recording, replay, and a persistent evidence history remain out
+of scope.
 
 ## Acceptance Scenario
 

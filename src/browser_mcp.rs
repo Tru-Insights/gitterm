@@ -1,8 +1,8 @@
 //! Authenticated loopback MCP exposure for the GitTerm-owned browser controller.
 
 use crate::browser_control::{
-    BrowserControlService, BrowserKey, BrowserLaunchOptions, BrowserLocator, BrowserOperation,
-    BrowserViewport, BrowserWaitCondition,
+    BrowserCaptureMode, BrowserControlService, BrowserKey, BrowserLaunchOptions, BrowserLocator,
+    BrowserOperation, BrowserSnapshot, BrowserViewport, BrowserWaitCondition,
 };
 use axum::{
     body::Body,
@@ -265,18 +265,24 @@ impl BrowserMcpTools {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NavigateRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
     /// An absolute HTTP or HTTPS URL.
     url: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LocatorRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
     /// A strict semantic or CSS locator that must match exactly one visible element.
     locator: BrowserLocator,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TypeRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
     /// A strict locator for one editable visible element.
     locator: BrowserLocator,
     /// Replacement text to enter.
@@ -285,11 +291,15 @@ struct TypeRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PressRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
     key: BrowserKey,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ScrollRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
     #[serde(default)]
     delta_x: f64,
     delta_y: f64,
@@ -297,20 +307,50 @@ struct ScrollRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ResizeRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
     viewport: BrowserViewport,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReloadRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
     #[serde(default)]
     ignore_cache: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
     condition: BrowserWaitCondition,
     /// Maximum wait in milliseconds. Defaults to 10000 and is capped at 60000.
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct OpenTargetRequest {
+    /// Stable lowercase name such as `design`, `implementation`, or `before`.
+    name: String,
+    /// Initial absolute HTTP or HTTPS URL.
+    url: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TargetRequest {
+    target: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CaptureRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
+    /// Short evidence purpose shared across captures that should be compared.
+    label: String,
+    /// Capture the complete document instead of only the current viewport.
+    #[serde(default)]
+    full_page: bool,
 }
 
 #[tool_router]
@@ -352,6 +392,87 @@ impl BrowserMcpTools {
     }
 
     #[tool(
+        description = "List the arbitrary named page targets managed by GitTerm, including the active target.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn browser_targets(&self) -> CallToolResult {
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Targets, |browser| async move {
+                browser.targets().await
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Open and name an independent page target for source/target, before/after, or other comparison workflows.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_target_open(
+        &self,
+        Parameters(request): Parameters<OpenTargetRequest>,
+    ) -> CallToolResult {
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::TargetOpen, |browser| async move {
+                browser.open_target(&request.name, &request.url).await
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Focus one named page target and make it the default for calls that omit target.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn browser_target_focus(
+        &self,
+        Parameters(request): Parameters<TargetRequest>,
+    ) -> CallToolResult {
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::TargetFocus, |browser| async move {
+                browser.focus_target(&request.target).await
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Close one named page target without disconnecting the remaining GitTerm browser targets.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_target_close(
+        &self,
+        Parameters(request): Parameters<TargetRequest>,
+    ) -> CallToolResult {
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::TargetClose, |browser| async move {
+                browser.close_target(&request.target).await
+            })
+            .await,
+        )
+    }
+
+    #[tool(
         description = "Navigate the controlled browser to an absolute HTTP or HTTPS URL.",
         annotations(
             read_only_hint = false,
@@ -366,7 +487,9 @@ impl BrowserMcpTools {
     ) -> CallToolResult {
         structured_browser_result(
             self.run_agent_operation(BrowserOperation::Navigate, |browser| async move {
-                browser.navigate(&request.url).await
+                browser
+                    .navigate_in(request.target.as_deref(), &request.url)
+                    .await
             })
             .await,
         )
@@ -388,26 +511,38 @@ impl BrowserMcpTools {
             })
             .await
         {
-            Ok(snapshot) => {
-                let structured = match serde_json::to_value(&snapshot) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return tool_error(format!(
-                            "failed to serialize browser snapshot state: {error}"
-                        ));
-                    }
-                };
-                let text = serde_json::to_string_pretty(&structured)
-                    .unwrap_or_else(|_| structured.to_string());
-                let image =
-                    base64::engine::general_purpose::STANDARD.encode(&snapshot.screenshot_png);
-                let mut result = CallToolResult::success(vec![
-                    ContentBlock::text(text),
-                    ContentBlock::image(image, "image/png"),
-                ]);
-                result.structured_content = Some(structured);
-                result
-            }
+            Ok(snapshot) => snapshot_result(snapshot),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Capture labeled viewport or full-page evidence for a named target and retain it in GitTerm's bounded memory-only comparison set.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_capture(
+        &self,
+        Parameters(request): Parameters<CaptureRequest>,
+    ) -> CallToolResult {
+        let capture_mode = if request.full_page {
+            BrowserCaptureMode::FullPage
+        } else {
+            BrowserCaptureMode::Viewport
+        };
+        match self
+            .run_agent_operation(BrowserOperation::Snapshot, |browser| async move {
+                browser
+                    .capture(request.target.as_deref(), &request.label, capture_mode)
+                    .await
+            })
+            .await
+        {
+            Ok(snapshot) => snapshot_result(snapshot),
             Err(error) => tool_error(error),
         }
     }
@@ -427,7 +562,9 @@ impl BrowserMcpTools {
     ) -> CallToolResult {
         structured_browser_result(
             self.run_agent_operation(BrowserOperation::Click, |browser| async move {
-                browser.click(&request.locator).await
+                browser
+                    .click_in(request.target.as_deref(), &request.locator)
+                    .await
             })
             .await,
         )
@@ -445,7 +582,9 @@ impl BrowserMcpTools {
     async fn browser_type(&self, Parameters(request): Parameters<TypeRequest>) -> CallToolResult {
         structured_browser_result(
             self.run_agent_operation(BrowserOperation::Type, |browser| async move {
-                browser.type_text(&request.locator, &request.text).await
+                browser
+                    .type_text_in(request.target.as_deref(), &request.locator, &request.text)
+                    .await
             })
             .await,
         )
@@ -463,7 +602,9 @@ impl BrowserMcpTools {
     async fn browser_press(&self, Parameters(request): Parameters<PressRequest>) -> CallToolResult {
         structured_browser_result(
             self.run_agent_operation(BrowserOperation::Press, |browser| async move {
-                browser.press(request.key).await
+                browser
+                    .press_in(request.target.as_deref(), request.key)
+                    .await
             })
             .await,
         )
@@ -484,7 +625,9 @@ impl BrowserMcpTools {
     ) -> CallToolResult {
         structured_browser_result(
             self.run_agent_operation(BrowserOperation::Scroll, |browser| async move {
-                browser.scroll(request.delta_x, request.delta_y).await
+                browser
+                    .scroll_in(request.target.as_deref(), request.delta_x, request.delta_y)
+                    .await
             })
             .await,
         )
@@ -505,7 +648,9 @@ impl BrowserMcpTools {
     ) -> CallToolResult {
         structured_browser_result(
             self.run_agent_operation(BrowserOperation::Resize, |browser| async move {
-                browser.resize(request.viewport).await
+                browser
+                    .resize_in(request.target.as_deref(), request.viewport)
+                    .await
             })
             .await,
         )
@@ -526,7 +671,9 @@ impl BrowserMcpTools {
     ) -> CallToolResult {
         structured_browser_result(
             self.run_agent_operation(BrowserOperation::Reload, |browser| async move {
-                browser.reload(request.ignore_cache).await
+                browser
+                    .reload_in(request.target.as_deref(), request.ignore_cache)
+                    .await
             })
             .await,
         )
@@ -554,7 +701,11 @@ impl BrowserMcpTools {
         structured_browser_result(
             self.run_agent_operation(BrowserOperation::Wait, |browser| async move {
                 browser
-                    .wait_for(&request.condition, Duration::from_millis(timeout_ms))
+                    .wait_for_in(
+                        request.target.as_deref(),
+                        &request.condition,
+                        Duration::from_millis(timeout_ms),
+                    )
                     .await
             })
             .await,
@@ -604,6 +755,27 @@ impl BrowserMcpTools {
     }
 
     #[tool(
+        description = "Return isolated recent console errors and failed requests for one named browser target.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_target_diagnostics(
+        &self,
+        Parameters(request): Parameters<TargetRequest>,
+    ) -> CallToolResult {
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Console, |browser| async move {
+                browser.diagnostics_in(Some(&request.target)).await
+            })
+            .await,
+        )
+    }
+
+    #[tool(
         description = "Immediately disconnect and terminate the GitTerm-owned visible Chrome process.",
         annotations(
             read_only_hint = false,
@@ -631,7 +803,7 @@ impl ServerHandler for BrowserMcpTools {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V4. Call browser_open before page operations. Prefer semantic role or text locators from browser_snapshot; CSS is an explicit fallback. Browser actions are serialized. Read-only inspection tools are browser_status, browser_snapshot, browser_wait_for, browser_console, and browser_network. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
+                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V4. Call browser_open before page operations. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Prefer semantic role or text locators from browser_snapshot; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
             )
     }
 }
@@ -643,6 +815,25 @@ fn structured_browser_result<T: Serialize>(
         Ok(value) => structured_value(value),
         Err(error) => tool_error(error),
     }
+}
+
+fn snapshot_result(snapshot: BrowserSnapshot) -> CallToolResult {
+    let structured = match serde_json::to_value(&snapshot) {
+        Ok(value) => value,
+        Err(error) => {
+            return tool_error(format!(
+                "failed to serialize browser snapshot state: {error}"
+            ));
+        }
+    };
+    let text = serde_json::to_string_pretty(&structured).unwrap_or_else(|_| structured.to_string());
+    let image = base64::engine::general_purpose::STANDARD.encode(&snapshot.screenshot_png);
+    let mut result = CallToolResult::success(vec![
+        ContentBlock::text(text),
+        ContentBlock::image(image, "image/png"),
+    ]);
+    result.structured_content = Some(structured);
+    result
 }
 
 fn structured_value<T: Serialize>(value: T) -> CallToolResult {
@@ -692,13 +883,16 @@ mod tests {
         let routes = BrowserMcpTools::tool_router();
         let listed = routes.list_all();
         let find = |name: &str| routes.get(name).unwrap_or_else(|| panic!("missing {name}"));
-        assert_eq!(listed.len(), 14);
+        assert_eq!(listed.len(), 20);
         for name in [
             "browser_status",
+            "browser_targets",
             "browser_snapshot",
+            "browser_capture",
             "browser_wait_for",
             "browser_console",
             "browser_network",
+            "browser_target_diagnostics",
         ] {
             assert_eq!(
                 find(name)
@@ -711,6 +905,9 @@ mod tests {
         }
         for name in [
             "browser_open",
+            "browser_target_open",
+            "browser_target_focus",
+            "browser_target_close",
             "browser_navigate",
             "browser_click",
             "browser_type",
@@ -793,11 +990,19 @@ mod tests {
             .expect("authorized MCP initialization timed out")
             .expect("authorized MCP initialization failed");
         let tools = client.list_tools(Default::default()).await.unwrap();
-        assert_eq!(tools.tools.len(), 14);
+        assert_eq!(tools.tools.len(), 20);
         assert!(tools
             .tools
             .iter()
             .any(|tool| tool.name == "browser_snapshot"));
+        assert!(tools
+            .tools
+            .iter()
+            .any(|tool| tool.name == "browser_target_open"));
+        assert!(tools
+            .tools
+            .iter()
+            .any(|tool| tool.name == "browser_capture"));
         client.cancel().await.unwrap();
 
         drop(connection);
