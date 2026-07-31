@@ -9,19 +9,19 @@ use futures_util::{SinkExt, StreamExt};
 use hyper::{body::to_bytes, Client, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Instant};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 use url::Url;
 
 const PROFILE_DIR_NAME: &str = "browser-profile";
@@ -32,6 +32,11 @@ const DEFAULT_PAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CHROME_STDERR_BYTES: usize = 16_384;
 const MAX_VISIBLE_TEXT_BYTES: usize = 100_000;
 const MAX_INTERACTIVE_ELEMENTS: usize = 500;
+const MAX_CONSOLE_ERRORS: usize = 100;
+const MAX_NETWORK_FAILURES: usize = 100;
+const MAX_TRACKED_REQUESTS: usize = 512;
+const MAX_DIAGNOSTIC_TEXT_CHARS: usize = 4_000;
+const MAX_DIAGNOSTIC_URL_CHARS: usize = 2_048;
 const MIN_VIEWPORT_DIMENSION: u32 = 200;
 const MAX_VIEWPORT_WIDTH: u32 = 7_680;
 const MAX_VIEWPORT_HEIGHT: u32 = 4_320;
@@ -252,6 +257,63 @@ pub struct InteractiveElement {
     pub locator: BrowserLocator,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserConsoleError {
+    pub source: String,
+    pub text: String,
+    pub url: Option<String>,
+    pub line_number: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserNetworkFailure {
+    pub url: String,
+    pub method: Option<String>,
+    pub status: Option<u16>,
+    pub error_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserLoadingState {
+    Loading,
+    Interactive,
+    Complete,
+}
+
+impl BrowserLoadingState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Loading => "loading",
+            Self::Interactive => "interactive",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BrowserWaitCondition {
+    Locator {
+        locator: BrowserLocator,
+    },
+    Text {
+        text: String,
+        #[serde(default)]
+        exact: bool,
+    },
+    Url {
+        url: String,
+        #[serde(default)]
+        exact: bool,
+    },
+    LoadingState {
+        state: BrowserLoadingState,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserSnapshot {
@@ -261,6 +323,8 @@ pub struct BrowserSnapshot {
     pub visible_text: String,
     pub interactive_elements: Vec<InteractiveElement>,
     pub viewport: BrowserViewport,
+    pub console_errors: Vec<BrowserConsoleError>,
+    pub failed_requests: Vec<BrowserNetworkFailure>,
     #[serde(skip_serializing)]
     pub screenshot_png: Vec<u8>,
 }
@@ -305,6 +369,7 @@ pub struct BrowserController {
     endpoint: Option<DevToolsEndpoint>,
     active_target_id: Option<String>,
     active_viewport: Option<BrowserViewport>,
+    session: Option<CdpSession>,
     last_exit: Option<String>,
     stderr_log: Arc<Mutex<Vec<u8>>>,
     stderr_task: Option<JoinHandle<()>>,
@@ -318,6 +383,7 @@ impl BrowserController {
             endpoint: None,
             active_target_id: None,
             active_viewport: None,
+            session: None,
             last_exit: None,
             stderr_log: Arc::new(Mutex::new(Vec::new())),
             stderr_task: None,
@@ -382,6 +448,7 @@ impl BrowserController {
         self.child = Some(child);
         self.active_target_id = None;
         self.active_viewport = None;
+        self.session = None;
         self.last_exit = None;
 
         let deadline = Instant::now() + options.startup_timeout;
@@ -451,6 +518,7 @@ impl BrowserController {
                 self.endpoint = None;
                 self.active_target_id = None;
                 self.active_viewport = None;
+                self.session = None;
                 self.last_exit = Some(exit.to_string());
             }
         }
@@ -475,7 +543,7 @@ impl BrowserController {
 
     pub async fn navigate(&mut self, raw_url: &str) -> Result<NavigationResult> {
         let url = validate_navigation_url(raw_url)?;
-        let mut session = self.page_session().await?;
+        let session = self.page_session().await?;
         let result = session
             .command("Page.navigate", json!({ "url": url.as_str() }))
             .await?;
@@ -505,9 +573,7 @@ impl BrowserController {
     }
 
     pub async fn snapshot(&mut self) -> Result<BrowserSnapshot> {
-        let mut session = self.page_session().await?;
-        session.command("Page.enable", json!({})).await?;
-        session.command("Runtime.enable", json!({})).await?;
+        let session = self.page_session().await?;
 
         let page_state = session
             .command(
@@ -544,6 +610,7 @@ impl BrowserController {
                     "Page.captureScreenshot returned invalid base64 PNG data: {error}"
                 ))
             })?;
+        let (console_errors, failed_requests) = session.diagnostics().await;
 
         Ok(BrowserSnapshot {
             url: state.url,
@@ -552,14 +619,16 @@ impl BrowserController {
             visible_text: state.visible_text,
             interactive_elements: state.interactive_elements,
             viewport: self.active_viewport.unwrap_or(state.viewport),
+            console_errors,
+            failed_requests,
             screenshot_png,
         })
     }
 
     /// Click one strictly located visible element using CDP mouse events.
     pub async fn click(&mut self, locator: &BrowserLocator) -> Result<BrowserActionTarget> {
-        let mut session = self.page_session().await?;
-        let target = resolve_locator(&mut session, locator, LocatorPreparation::Point).await?;
+        let session = self.page_session().await?;
+        let target = resolve_locator(session, locator, LocatorPreparation::Point).await?;
         session
             .command(
                 "Input.dispatchMouseEvent",
@@ -605,9 +674,8 @@ impl BrowserController {
         locator: &BrowserLocator,
         text: &str,
     ) -> Result<BrowserActionTarget> {
-        let mut session = self.page_session().await?;
-        let target =
-            resolve_locator(&mut session, locator, LocatorPreparation::ReplaceText).await?;
+        let session = self.page_session().await?;
+        let target = resolve_locator(session, locator, LocatorPreparation::ReplaceText).await?;
         session
             .command("Input.insertText", json!({ "text": text }))
             .await?;
@@ -617,7 +685,7 @@ impl BrowserController {
     /// Press one supported non-text key against the currently focused element.
     pub async fn press(&mut self, key: BrowserKey) -> Result<()> {
         let descriptor = key_descriptor(key);
-        let mut session = self.page_session().await?;
+        let session = self.page_session().await?;
         let mut key_down = json!({
             "type": if descriptor.text.is_some() { "keyDown" } else { "rawKeyDown" },
             "key": descriptor.key,
@@ -647,15 +715,13 @@ impl BrowserController {
 
     /// Reload the current page and wait for a new document to finish loading.
     pub async fn reload(&mut self, ignore_cache: bool) -> Result<()> {
-        let mut session = self.page_session().await?;
-        session.command("Page.enable", json!({})).await?;
-        session.command("Runtime.enable", json!({})).await?;
-        let previous_time_origin = page_time_origin(&mut session).await?;
+        let session = self.page_session().await?;
+        let previous_time_origin = page_time_origin(session).await?;
         session
             .command("Page.reload", json!({ "ignoreCache": ignore_cache }))
             .await?;
         wait_for_document_ready(
-            &mut session,
+            session,
             Some(previous_time_origin),
             DEFAULT_PAGE_WAIT_TIMEOUT,
         )
@@ -665,7 +731,7 @@ impl BrowserController {
     /// Apply responsive device metrics to the controlled page target.
     pub async fn resize(&mut self, viewport: BrowserViewport) -> Result<BrowserViewport> {
         let viewport = viewport.validate()?;
-        let mut session = self.page_session().await?;
+        let session = self.page_session().await?;
         session
             .command(
                 "Emulation.setDeviceMetricsOverride",
@@ -681,16 +747,31 @@ impl BrowserController {
         Ok(viewport)
     }
 
-    /// Wait until the current document reports a complete loading state.
-    pub async fn wait_for_ready(&mut self, max_wait: Duration) -> Result<()> {
+    /// Wait for page state with a bounded, explicit timeout.
+    pub async fn wait_for(
+        &mut self,
+        condition: &BrowserWaitCondition,
+        max_wait: Duration,
+    ) -> Result<()> {
         if max_wait.is_zero() {
             return Err(BrowserControlError::new(
-                "browser readiness timeout must be greater than zero",
+                "browser wait timeout must be greater than zero",
             ));
         }
-        let mut session = self.page_session().await?;
-        session.command("Runtime.enable", json!({})).await?;
-        wait_for_document_ready(&mut session, None, max_wait).await
+        validate_wait_condition(condition)?;
+        let session = self.page_session().await?;
+        wait_for_condition(session, condition, max_wait).await
+    }
+
+    /// Wait until the current document reports a complete loading state.
+    pub async fn wait_for_ready(&mut self, max_wait: Duration) -> Result<()> {
+        self.wait_for(
+            &BrowserWaitCondition::LoadingState {
+                state: BrowserLoadingState::Complete,
+            },
+            max_wait,
+        )
+        .await
     }
 
     pub async fn disconnect(&mut self) -> Result<()> {
@@ -704,6 +785,7 @@ impl BrowserController {
             let _ = child.wait().await;
         }
         let _ = self.finish_stderr_capture().await;
+        self.session = None;
         self.endpoint = None;
         self.active_target_id = None;
         self.active_viewport = None;
@@ -725,7 +807,7 @@ impl BrowserController {
             .ok_or_else(|| BrowserControlError::new("running browser has no DevTools endpoint"))
     }
 
-    async fn page_session(&mut self) -> Result<CdpSession> {
+    async fn page_session(&mut self) -> Result<&CdpSession> {
         let endpoint = self.running_endpoint()?;
         let targets = list_page_targets(endpoint.port).await?;
         let target = self
@@ -744,14 +826,27 @@ impl BrowserController {
                 })
             })
             .ok_or_else(|| BrowserControlError::new("Chrome has no controllable page target"))?;
-        if self.active_target_id.as_deref() != Some(target.id.as_str()) {
-            self.active_target_id = Some(target.id.clone());
-            self.active_viewport = None;
-        }
-        let websocket_url = target.web_socket_debugger_url.as_deref().ok_or_else(|| {
+        let target_id = target.id.clone();
+        let websocket_url = target.web_socket_debugger_url.clone().ok_or_else(|| {
             BrowserControlError::new("Chrome page target did not expose a WebSocket debugger URL")
         })?;
-        CdpSession::connect(websocket_url).await
+        let needs_session = self.active_target_id.as_deref() != Some(target_id.as_str())
+            || self.session.as_ref().is_none_or(CdpSession::is_finished);
+        if needs_session {
+            self.session = None;
+            self.active_target_id = None;
+            self.active_viewport = None;
+            let session = CdpSession::connect(&websocket_url).await?;
+            session.command("Page.enable", json!({})).await?;
+            session.command("Runtime.enable", json!({})).await?;
+            session.command("Log.enable", json!({})).await?;
+            session.command("Network.enable", json!({})).await?;
+            self.active_target_id = Some(target_id);
+            self.session = Some(session);
+        }
+        self.session.as_ref().ok_or_else(|| {
+            BrowserControlError::new("Chrome page target has no active DevTools session")
+        })
     }
 
     async fn terminate_child(&mut self) -> String {
@@ -762,6 +857,7 @@ impl BrowserController {
         self.endpoint = None;
         self.active_target_id = None;
         self.active_viewport = None;
+        self.session = None;
         self.finish_stderr_capture().await
     }
 
@@ -867,6 +963,18 @@ impl BrowserControlService {
         self.controller.lock().await.wait_for_ready(max_wait).await
     }
 
+    pub async fn wait_for(
+        &self,
+        condition: &BrowserWaitCondition,
+        max_wait: Duration,
+    ) -> Result<()> {
+        self.controller
+            .lock()
+            .await
+            .wait_for(condition, max_wait)
+            .await
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
         self.controller.lock().await.disconnect().await
     }
@@ -885,6 +993,7 @@ struct SnapshotState {
 
 #[derive(Debug, Clone, Copy)]
 enum LocatorPreparation {
+    ResolveOnly,
     Point,
     ReplaceText,
 }
@@ -892,6 +1001,7 @@ enum LocatorPreparation {
 impl LocatorPreparation {
     fn as_str(self) -> &'static str {
         match self {
+            Self::ResolveOnly => "resolve_only",
             Self::Point => "point",
             Self::ReplaceText => "replace_text",
         }
@@ -918,7 +1028,7 @@ struct ResolvedActionTarget {
 }
 
 async fn resolve_locator(
-    session: &mut CdpSession,
+    session: &CdpSession,
     locator: &BrowserLocator,
     preparation: LocatorPreparation,
 ) -> Result<BrowserActionTarget> {
@@ -976,7 +1086,7 @@ async fn resolve_locator(
     })
 }
 
-async fn page_time_origin(session: &mut CdpSession) -> Result<f64> {
+async fn page_time_origin(session: &CdpSession) -> Result<f64> {
     let result = session
         .command(
             "Runtime.evaluate",
@@ -1000,7 +1110,7 @@ struct DocumentReadyState {
 }
 
 async fn wait_for_document_ready(
-    session: &mut CdpSession,
+    session: &CdpSession,
     previous_time_origin: Option<f64>,
     max_wait: Duration,
 ) -> Result<()> {
@@ -1049,6 +1159,156 @@ async fn wait_for_document_ready(
         }
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WaitEvaluation {
+    matched: bool,
+    detail: String,
+}
+
+fn validate_wait_condition(condition: &BrowserWaitCondition) -> Result<()> {
+    match condition {
+        BrowserWaitCondition::Locator { locator } => locator.validate(),
+        BrowserWaitCondition::Text { text, .. } => BrowserLocator::Text {
+            text: text.clone(),
+            exact: false,
+        }
+        .validate(),
+        BrowserWaitCondition::Url { url, .. } if url.trim().is_empty() => Err(
+            BrowserControlError::new("browser URL wait value must not be empty"),
+        ),
+        _ => Ok(()),
+    }
+}
+
+async fn wait_for_condition(
+    session: &CdpSession,
+    condition: &BrowserWaitCondition,
+    max_wait: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + max_wait;
+    loop {
+        let detail = match evaluate_wait_condition(session, condition).await {
+            Ok(evaluation) if evaluation.matched => return Ok(()),
+            Ok(evaluation) => evaluation.detail,
+            Err(error) => format!("last CDP error: {error}"),
+        };
+        if Instant::now() >= deadline {
+            return Err(BrowserControlError::new(format!(
+                "browser wait condition was not met within {} ms ({detail})",
+                max_wait.as_millis()
+            )));
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn evaluate_wait_condition(
+    session: &CdpSession,
+    condition: &BrowserWaitCondition,
+) -> Result<WaitEvaluation> {
+    if let BrowserWaitCondition::Locator { locator } = condition {
+        return evaluate_locator_wait(session, locator).await;
+    }
+    if let BrowserWaitCondition::Text { text, exact } = condition {
+        return evaluate_locator_wait(
+            session,
+            &BrowserLocator::Text {
+                text: text.clone(),
+                exact: *exact,
+            },
+        )
+        .await;
+    }
+
+    let expression = match condition {
+        BrowserWaitCondition::Url { url, exact } => {
+            let expected = serde_json::to_string(url).map_err(|error| {
+                BrowserControlError::new(format!("failed to serialize browser wait URL: {error}"))
+            })?;
+            format!(
+                "(() => {{ const actual = window.location.href; const expected = {expected}; return {{ matched: {} ? actual === expected : actual.includes(expected), detail: actual }}; }})()",
+                exact
+            )
+        }
+        BrowserWaitCondition::LoadingState { state } => {
+            let expected = serde_json::to_string(state.as_str()).map_err(|error| {
+                BrowserControlError::new(format!(
+                    "failed to serialize browser loading state: {error}"
+                ))
+            })?;
+            format!(
+                "(() => {{ const actual = document.readyState; return {{ matched: actual === {expected}, detail: `last loading state: ${{actual}}` }}; }})()"
+            )
+        }
+        BrowserWaitCondition::Locator { .. } | BrowserWaitCondition::Text { .. } => {
+            unreachable!("locator waits are handled before expression generation")
+        }
+    };
+    let result = session
+        .command(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true
+            }),
+        )
+        .await?;
+    let value = result
+        .pointer("/result/value")
+        .cloned()
+        .ok_or_else(|| BrowserControlError::new("Chrome omitted browser wait condition data"))?;
+    let mut evaluation: WaitEvaluation = serde_json::from_value(value).map_err(|error| {
+        BrowserControlError::new(format!(
+            "Chrome returned malformed browser wait condition data: {error}"
+        ))
+    })?;
+    if matches!(condition, BrowserWaitCondition::Url { .. }) {
+        evaluation.detail = sanitize_diagnostic_url(&evaluation.detail)
+            .map(|url| format!("last URL: {url}"))
+            .unwrap_or_else(|| "last URL was not an HTTP(S) page".to_string());
+    }
+    Ok(evaluation)
+}
+
+async fn evaluate_locator_wait(
+    session: &CdpSession,
+    locator: &BrowserLocator,
+) -> Result<WaitEvaluation> {
+    let expression = locator_expression(locator, LocatorPreparation::ResolveOnly)?;
+    let result = session
+        .command(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+        )
+        .await?;
+    let value = result
+        .pointer("/result/value")
+        .cloned()
+        .ok_or_else(|| BrowserControlError::new("Chrome omitted browser locator wait data"))?;
+    let resolution: LocatorResolution = serde_json::from_value(value).map_err(|error| {
+        BrowserControlError::new(format!(
+            "Chrome returned malformed browser locator wait data: {error}"
+        ))
+    })?;
+    if let Some(error) = resolution.error {
+        return Err(BrowserControlError::new(format!(
+            "browser locator wait could not be evaluated: {error}"
+        )));
+    }
+    Ok(WaitEvaluation {
+        matched: resolution.match_count == 1,
+        detail: format!(
+            "last locator match count: {} (expected exactly 1)",
+            resolution.match_count
+        ),
+    })
 }
 
 struct KeyDescriptor {
@@ -1147,9 +1407,61 @@ fn key_descriptor(key: BrowserKey) -> KeyDescriptor {
     }
 }
 
+struct CdpRequest {
+    method: String,
+    params: Value,
+    reply: oneshot::Sender<Result<Value>>,
+}
+
+struct PendingCdpCommand {
+    method: String,
+    reply: oneshot::Sender<Result<Value>>,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedRequest {
+    url: String,
+    method: String,
+}
+
+#[derive(Debug, Default)]
+struct BrowserDiagnosticState {
+    console_errors: VecDeque<BrowserConsoleError>,
+    failed_requests: VecDeque<BrowserNetworkFailure>,
+    requests: HashMap<String, TrackedRequest>,
+    request_order: VecDeque<String>,
+}
+
+impl BrowserDiagnosticState {
+    fn push_console_error(&mut self, error: BrowserConsoleError) {
+        push_bounded(&mut self.console_errors, error, MAX_CONSOLE_ERRORS);
+    }
+
+    fn push_network_failure(&mut self, failure: BrowserNetworkFailure) {
+        push_bounded(&mut self.failed_requests, failure, MAX_NETWORK_FAILURES);
+    }
+
+    fn track_request(&mut self, request_id: String, request: TrackedRequest) {
+        if !self.requests.contains_key(&request_id) {
+            self.request_order.push_back(request_id.clone());
+        }
+        self.requests.insert(request_id, request);
+        while self.request_order.len() > MAX_TRACKED_REQUESTS {
+            if let Some(expired) = self.request_order.pop_front() {
+                self.requests.remove(&expired);
+            }
+        }
+    }
+
+    fn finish_request(&mut self, request_id: &str) -> Option<TrackedRequest> {
+        self.requests.remove(request_id)
+    }
+}
+
 struct CdpSession {
-    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    next_id: u64,
+    requests: mpsc::UnboundedSender<CdpRequest>,
+    diagnostics: Arc<Mutex<BrowserDiagnosticState>>,
+    worker: JoinHandle<()>,
 }
 
 impl CdpSession {
@@ -1166,56 +1478,351 @@ impl CdpSession {
                     "failed to connect to Chrome DevTools at {websocket_url}: {error}"
                 ))
             })?;
-        Ok(Self { socket, next_id: 1 })
+        let (requests, receiver) = mpsc::unbounded_channel();
+        let diagnostics = Arc::new(Mutex::new(BrowserDiagnosticState::default()));
+        let worker_diagnostics = Arc::clone(&diagnostics);
+        let worker = tokio::spawn(async move {
+            run_cdp_session(socket, receiver, worker_diagnostics).await;
+        });
+        Ok(Self {
+            requests,
+            diagnostics,
+            worker,
+        })
     }
 
-    async fn command(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = json!({ "id": id, "method": method, "params": params });
-        self.socket
-            .send(Message::Text(request.to_string()))
-            .await
-            .map_err(|error| {
-                BrowserControlError::new(format!("failed to send CDP command {method}: {error}"))
-            })?;
+    fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
 
-        let response = timeout(CDP_COMMAND_TIMEOUT, async {
-            while let Some(message) = self.socket.next().await {
-                let message = message.map_err(|error| {
-                    BrowserControlError::new(format!(
-                        "failed while reading CDP command {method}: {error}"
-                    ))
-                })?;
-                let Message::Text(text) = message else {
-                    continue;
+    async fn command(&self, method: &str, params: Value) -> Result<Value> {
+        let (reply, response) = oneshot::channel();
+        self.requests
+            .send(CdpRequest {
+                method: method.to_string(),
+                params,
+                reply,
+            })
+            .map_err(|_| {
+                BrowserControlError::new(format!(
+                    "Chrome DevTools connection closed before CDP command {method}"
+                ))
+            })?;
+        timeout(CDP_COMMAND_TIMEOUT, response)
+            .await
+            .map_err(|_| BrowserControlError::new(format!("CDP command {method} timed out")))?
+            .map_err(|_| {
+                BrowserControlError::new(format!(
+                    "Chrome DevTools connection closed during CDP command {method}"
+                ))
+            })?
+    }
+
+    async fn diagnostics(&self) -> (Vec<BrowserConsoleError>, Vec<BrowserNetworkFailure>) {
+        let diagnostics = self.diagnostics.lock().await;
+        (
+            diagnostics.console_errors.iter().cloned().collect(),
+            diagnostics.failed_requests.iter().cloned().collect(),
+        )
+    }
+}
+
+impl Drop for CdpSession {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
+
+async fn run_cdp_session<S>(
+    mut socket: WebSocketStream<S>,
+    mut requests: mpsc::UnboundedReceiver<CdpRequest>,
+    diagnostics: Arc<Mutex<BrowserDiagnosticState>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut next_id = 1_u64;
+    let mut pending = HashMap::<u64, PendingCdpCommand>::new();
+    let terminal_error = loop {
+        tokio::select! {
+            request = requests.recv() => {
+                let Some(request) = request else {
+                    break "Chrome DevTools command channel closed".to_string();
                 };
-                let value: Value = serde_json::from_str(&text).map_err(|error| {
-                    BrowserControlError::new(format!(
-                        "Chrome returned malformed JSON for CDP command {method}: {error}"
-                    ))
-                })?;
-                if value.get("id").and_then(Value::as_u64) == Some(id) {
-                    return Ok(value);
+                let id = next_id;
+                next_id += 1;
+                let method = request.method.clone();
+                let message = json!({ "id": id, "method": method, "params": request.params });
+                if let Err(error) = socket.send(Message::Text(message.to_string())).await {
+                    let detail = format!("failed to send CDP command {}: {error}", request.method);
+                    let _ = request.reply.send(Err(BrowserControlError::new(detail.clone())));
+                    break detail;
+                }
+                pending.insert(id, PendingCdpCommand { method: request.method, reply: request.reply });
+            }
+            message = socket.next() => {
+                let Some(message) = message else {
+                    break "Chrome closed the DevTools connection".to_string();
+                };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => break format!("failed while reading Chrome DevTools: {error}"),
+                };
+                match message {
+                    Message::Text(text) => {
+                        let value: Value = match serde_json::from_str(&text) {
+                            Ok(value) => value,
+                            Err(error) => break format!("Chrome returned malformed CDP JSON: {error}"),
+                        };
+                        if let Some(id) = value.get("id").and_then(Value::as_u64) {
+                            if let Some(command) = pending.remove(&id) {
+                                let result = cdp_response_result(&command.method, &value);
+                                let _ = command.reply.send(result);
+                            }
+                        } else if value.get("method").is_some() {
+                            record_cdp_event(&diagnostics, &value).await;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        if let Err(error) = socket.send(Message::Pong(payload)).await {
+                            break format!("failed to reply to Chrome DevTools ping: {error}");
+                        }
+                    }
+                    Message::Close(_) => break "Chrome closed the DevTools connection".to_string(),
+                    _ => {}
                 }
             }
-            Err(BrowserControlError::new(format!(
-                "Chrome closed the DevTools connection during CDP command {method}"
-            )))
-        })
-        .await
-        .map_err(|_| BrowserControlError::new(format!("CDP command {method} timed out")))??;
-
-        if let Some(error) = response.get("error") {
-            return Err(BrowserControlError::new(format!(
-                "CDP command {method} failed: {error}"
-            )));
         }
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| BrowserControlError::new(format!("CDP command {method} omitted result")))
+    };
+
+    for (_, command) in pending {
+        let _ = command.reply.send(Err(BrowserControlError::new(format!(
+            "CDP command {} failed: {terminal_error}",
+            command.method
+        ))));
     }
+}
+
+fn cdp_response_result(method: &str, response: &Value) -> Result<Value> {
+    if let Some(error) = response.get("error") {
+        return Err(BrowserControlError::new(format!(
+            "CDP command {method} failed: {error}"
+        )));
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| BrowserControlError::new(format!("CDP command {method} omitted result")))
+}
+
+async fn record_cdp_event(diagnostics: &Mutex<BrowserDiagnosticState>, event: &Value) {
+    let Some(method) = event.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let params = event.get("params").unwrap_or(&Value::Null);
+    let mut diagnostics = diagnostics.lock().await;
+    match method {
+        "Runtime.consoleAPICalled" => {
+            let kind = params
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !matches!(kind, "error" | "assert") {
+                return;
+            }
+            let text = params
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|arguments| {
+                    arguments
+                        .iter()
+                        .filter_map(remote_object_text)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| kind.to_string());
+            let frame = params
+                .pointer("/stackTrace/callFrames/0")
+                .unwrap_or(&Value::Null);
+            diagnostics.push_console_error(BrowserConsoleError {
+                source: "console".to_string(),
+                text: bounded_text(&text),
+                url: frame
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .and_then(sanitize_diagnostic_url),
+                line_number: frame.get("lineNumber").and_then(Value::as_u64),
+            });
+        }
+        "Runtime.exceptionThrown" => {
+            let details = params.get("exceptionDetails").unwrap_or(&Value::Null);
+            let text = details
+                .get("exception")
+                .and_then(remote_object_text)
+                .or_else(|| {
+                    details
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "uncaught exception".to_string());
+            diagnostics.push_console_error(BrowserConsoleError {
+                source: "exception".to_string(),
+                text: bounded_text(&text),
+                url: details
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .and_then(sanitize_diagnostic_url),
+                line_number: details.get("lineNumber").and_then(Value::as_u64),
+            });
+        }
+        "Log.entryAdded" => {
+            let entry = params.get("entry").unwrap_or(&Value::Null);
+            if entry.get("level").and_then(Value::as_str) != Some("error") {
+                return;
+            }
+            diagnostics.push_console_error(BrowserConsoleError {
+                source: entry
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("log")
+                    .to_string(),
+                text: bounded_text(
+                    entry
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("browser log error"),
+                ),
+                url: entry
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .and_then(sanitize_diagnostic_url),
+                line_number: entry.get("lineNumber").and_then(Value::as_u64),
+            });
+        }
+        "Network.requestWillBeSent" => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            let request = params.get("request").unwrap_or(&Value::Null);
+            let Some(url) = request
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(sanitize_diagnostic_url)
+            else {
+                return;
+            };
+            diagnostics.track_request(
+                request_id.to_string(),
+                TrackedRequest {
+                    url,
+                    method: request
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("GET")
+                        .to_string(),
+                },
+            );
+        }
+        "Network.responseReceived" => {
+            let Some(status) = params
+                .pointer("/response/status")
+                .and_then(Value::as_f64)
+                .filter(|status| *status >= 400.0 && *status <= u16::MAX as f64)
+                .map(|status| status as u16)
+            else {
+                return;
+            };
+            let request_id = params.get("requestId").and_then(Value::as_str);
+            let tracked = request_id.and_then(|id| diagnostics.requests.get(id).cloned());
+            let url = tracked
+                .as_ref()
+                .map(|request| request.url.clone())
+                .or_else(|| {
+                    params
+                        .pointer("/response/url")
+                        .and_then(Value::as_str)
+                        .and_then(sanitize_diagnostic_url)
+                });
+            if let Some(url) = url {
+                diagnostics.push_network_failure(BrowserNetworkFailure {
+                    url,
+                    method: tracked.map(|request| request.method),
+                    status: Some(status),
+                    error_text: params
+                        .pointer("/response/statusText")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                        .map(bounded_text),
+                });
+            }
+        }
+        "Network.loadingFailed" => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            if let Some(request) = diagnostics.finish_request(request_id) {
+                diagnostics.push_network_failure(BrowserNetworkFailure {
+                    url: request.url,
+                    method: Some(request.method),
+                    status: None,
+                    error_text: params
+                        .get("errorText")
+                        .and_then(Value::as_str)
+                        .map(bounded_text),
+                });
+            }
+        }
+        "Network.loadingFinished" => {
+            if let Some(request_id) = params.get("requestId").and_then(Value::as_str) {
+                diagnostics.finish_request(request_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remote_object_text(object: &Value) -> Option<String> {
+    if let Some(value) = object.get("value") {
+        return match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Null => Some("null".to_string()),
+            value => Some(value.to_string()),
+        };
+    }
+    object
+        .get("description")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("unserializableValue").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn sanitize_diagnostic_url(raw_url: &str) -> Option<String> {
+    let mut url = Url::parse(raw_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(
+        url.to_string()
+            .chars()
+            .take(MAX_DIAGNOSTIC_URL_CHARS)
+            .collect(),
+    )
+}
+
+fn bounded_text(text: &str) -> String {
+    text.chars().take(MAX_DIAGNOSTIC_TEXT_CHARS).collect()
+}
+
+fn push_bounded<T>(items: &mut VecDeque<T>, item: T, capacity: usize) {
+    if items.len() == capacity {
+        items.pop_front();
+    }
+    items.push_back(item);
 }
 
 fn browser_profile_dir(v4_global_config_dir: &Path) -> PathBuf {
@@ -1502,7 +2109,7 @@ fn locator_expression(locator: &BrowserLocator, preparation: LocatorPreparation)
                 selection.removeAllRanges();
                 selection.addRange(range);
             }
-        } else {
+        } else if (preparation === 'point') {
             element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
         }
         const rect = element.getBoundingClientRect();
@@ -1714,6 +2321,102 @@ mod tests {
         assert_eq!(escape.text, None);
     }
 
+    #[test]
+    fn diagnostic_urls_remove_credentials_query_and_fragment() {
+        assert_eq!(
+            sanitize_diagnostic_url(
+                "https://user:password@example.com/private/path?token=secret#fragment"
+            )
+            .as_deref(),
+            Some("https://example.com/private/path")
+        );
+        assert!(sanitize_diagnostic_url("data:text/plain,secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn cdp_events_capture_bounded_sanitized_failures() {
+        let diagnostics = Mutex::new(BrowserDiagnosticState::default());
+        for index in 0..=MAX_CONSOLE_ERRORS {
+            record_cdp_event(
+                &diagnostics,
+                &json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "params": {
+                        "type": "error",
+                        "args": [{ "value": format!("console-{index}") }]
+                    }
+                }),
+            )
+            .await;
+        }
+        record_cdp_event(
+            &diagnostics,
+            &json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "request-1",
+                    "request": {
+                        "url": "https://example.com/failure?token=secret",
+                        "method": "POST"
+                    }
+                }
+            }),
+        )
+        .await;
+        record_cdp_event(
+            &diagnostics,
+            &json!({
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "request-1",
+                    "response": {
+                        "url": "https://example.com/failure?token=secret",
+                        "status": 503,
+                        "statusText": "Unavailable"
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let diagnostics = diagnostics.lock().await;
+        assert_eq!(diagnostics.console_errors.len(), MAX_CONSOLE_ERRORS);
+        assert_eq!(
+            diagnostics.console_errors.front().unwrap().text,
+            "console-1"
+        );
+        assert_eq!(diagnostics.failed_requests.len(), 1);
+        assert_eq!(
+            diagnostics.failed_requests[0],
+            BrowserNetworkFailure {
+                url: "https://example.com/failure".to_string(),
+                method: Some("POST".to_string()),
+                status: Some(503),
+                error_text: Some("Unavailable".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn wait_conditions_reject_empty_values() {
+        assert!(validate_wait_condition(&BrowserWaitCondition::Text {
+            text: " ".to_string(),
+            exact: false,
+        })
+        .is_err());
+        assert!(validate_wait_condition(&BrowserWaitCondition::Url {
+            url: String::new(),
+            exact: true,
+        })
+        .is_err());
+        assert!(
+            validate_wait_condition(&BrowserWaitCondition::LoadingState {
+                state: BrowserLoadingState::Complete,
+            })
+            .is_ok()
+        );
+    }
+
     #[tokio::test]
     #[ignore = "launches a visible local Chrome instance"]
     async fn visible_chrome_status_navigate_snapshot_smoke() {
@@ -1724,7 +2427,23 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 tokio::spawn(async move {
                     let mut request = [0_u8; 2048];
-                    let _ = socket.read(&mut request).await.unwrap();
+                    let request_size = socket.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..request_size]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    if path.starts_with("/missing-resource") {
+                        let body = "intentional browser smoke failure";
+                        let response = format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                        return;
+                    }
                     let body = r#"<!doctype html>
                         <title>GitTerm browser smoke</title>
                         <main id="status">browser-control-ready</main>
@@ -1732,7 +2451,17 @@ mod tests {
                             <label for="smoke-input">Smoke input</label>
                             <input id="smoke-input" name="smokeInput">
                             <button type="button" aria-label="Run smoke action" onclick="document.getElementById('status').textContent = 'clicked'">Run</button>
-                        </form>"#;
+                        </form>
+                        <script>
+                            console.error('gitterm-console-smoke');
+                            fetch('/missing-resource?token=must-not-leak');
+                            setTimeout(() => { throw new Error('gitterm-uncaught-smoke'); }, 25);
+                            setTimeout(() => {
+                                const delayed = document.createElement('p');
+                                delayed.textContent = 'delayed-ready';
+                                document.body.appendChild(delayed);
+                            }, 150);
+                        </script>"#;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -1758,11 +2487,44 @@ mod tests {
             .wait_for_ready(Duration::from_secs(5))
             .await
             .unwrap();
+        service
+            .wait_for(
+                &BrowserWaitCondition::Text {
+                    text: "delayed-ready".to_string(),
+                    exact: true,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        service
+            .wait_for(
+                &BrowserWaitCondition::Url {
+                    url: url.clone(),
+                    exact: true,
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
         let target_id = service.status().await.unwrap().target_id.unwrap();
         let snapshot = service.snapshot().await.unwrap();
         assert_eq!(snapshot.url, url);
         assert_eq!(snapshot.title, "GitTerm browser smoke");
         assert!(snapshot.screenshot_png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(snapshot
+            .console_errors
+            .iter()
+            .any(|error| error.text.contains("gitterm-console-smoke")));
+        assert!(snapshot
+            .console_errors
+            .iter()
+            .any(|error| error.text.contains("gitterm-uncaught-smoke")));
+        assert!(snapshot.failed_requests.iter().any(|failure| {
+            failure.url == format!("http://{address}/missing-resource")
+                && failure.status == Some(503)
+                && !failure.url.contains("token")
+        }));
         let button = snapshot
             .interactive_elements
             .iter()
@@ -1773,6 +2535,15 @@ mod tests {
             button.locator,
             BrowserLocator::role("button", "Run smoke action")
         );
+        service
+            .wait_for(
+                &BrowserWaitCondition::Locator {
+                    locator: button.locator.clone(),
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
 
         let mobile = BrowserViewport::mobile(390, 844, 3.0);
         service.resize(mobile).await.unwrap();
