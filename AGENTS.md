@@ -273,9 +273,9 @@ Windows CI exists.
 ### Build & Bundling
 
 - Debug: `cargo run` (the configured `dev` command). Log server defaults on.
-- Release with voice: `cargo build --release --features stt` (the `stt` feature
-  pulls `whisper-rs` + `cpal`).
-- macOS bundle: `cargo bundle --release --features stt` produces
+- Voice is enabled by default (the `stt` default feature pulls `whisper-rs` +
+  `cpal`). Use `--no-default-features` only for a build without voice.
+- macOS bundle: `cargo bundle --release` produces
   `target/release/bundle/osx/GitTerm V4.app`. Install via `cp -R` to
   `/Applications/`.
 - Excalidraw is an optional feature: add `--features excalidraw` to enable.

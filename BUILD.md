@@ -69,7 +69,7 @@ GitTerm depends on a custom `iced_term` fork that needs to be cloned alongside i
 git clone https://github.com/Tru-Insights/gitterm.git
 git clone https://github.com/Tru-Insights/iced_term.git iced_term_fork
 cd gitterm
-cargo build --release --features stt
+cargo build --release
 ```
 
 Binary at: `target/release/gitterm-v4`
