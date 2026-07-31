@@ -2,7 +2,7 @@
 
 use crate::browser_control::{
     BrowserCaptureMode, BrowserControlService, BrowserKey, BrowserLaunchOptions, BrowserLocator,
-    BrowserOperation, BrowserSnapshot, BrowserViewport, BrowserWaitCondition,
+    BrowserNodeSelector, BrowserOperation, BrowserSnapshot, BrowserViewport, BrowserWaitCondition,
 };
 use axum::{
     body::Body,
@@ -351,6 +351,20 @@ struct CaptureRequest {
     /// Capture the complete document instead of only the current viewport.
     #[serde(default)]
     full_page: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DomOutlineRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct NodeInspectRequest {
+    /// Named browser target. Omit to use the active target.
+    target: Option<String>,
+    /// A document-scoped node reference from browser_dom_outline or a strict locator.
+    selector: BrowserNodeSelector,
 }
 
 #[tool_router]
@@ -776,6 +790,50 @@ impl BrowserMcpTools {
     }
 
     #[tool(
+        description = "Return a bounded structural outline of meaningful visible DOM nodes for one named target, with document-scoped node references, hierarchy, bounds, and accessibility state.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_dom_outline(
+        &self,
+        Parameters(request): Parameters<DomOutlineRequest>,
+    ) -> CallToolResult {
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Dom, |browser| async move {
+                browser.dom_outline_in(request.target.as_deref()).await
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Inspect one DOM node by a document-scoped node reference or strict locator, returning bounded layout, computed styles, attributes, accessibility identity, and outerHTML.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_node_inspect(
+        &self,
+        Parameters(request): Parameters<NodeInspectRequest>,
+    ) -> CallToolResult {
+        structured_browser_result(
+            self.run_agent_operation(BrowserOperation::Styles, |browser| async move {
+                browser
+                    .node_details_in(request.target.as_deref(), &request.selector)
+                    .await
+            })
+            .await,
+        )
+    }
+
+    #[tool(
         description = "Immediately disconnect and terminate the GitTerm-owned visible Chrome process.",
         annotations(
             read_only_hint = false,
@@ -803,7 +861,7 @@ impl ServerHandler for BrowserMcpTools {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V4. Call browser_open before page operations. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Prefer semantic role or text locators from browser_snapshot; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
+                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V4. Call browser_open before page operations. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Use browser_dom_outline for bounded page structure, then browser_node_inspect with its document-scoped node_ref for layout and computed styles; node references become stale after navigation. Prefer semantic role or text locators; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
             )
     }
 }
@@ -883,7 +941,7 @@ mod tests {
         let routes = BrowserMcpTools::tool_router();
         let listed = routes.list_all();
         let find = |name: &str| routes.get(name).unwrap_or_else(|| panic!("missing {name}"));
-        assert_eq!(listed.len(), 20);
+        assert_eq!(listed.len(), 22);
         for name in [
             "browser_status",
             "browser_targets",
@@ -893,6 +951,8 @@ mod tests {
             "browser_console",
             "browser_network",
             "browser_target_diagnostics",
+            "browser_dom_outline",
+            "browser_node_inspect",
         ] {
             assert_eq!(
                 find(name)
@@ -990,7 +1050,7 @@ mod tests {
             .expect("authorized MCP initialization timed out")
             .expect("authorized MCP initialization failed");
         let tools = client.list_tools(Default::default()).await.unwrap();
-        assert_eq!(tools.tools.len(), 20);
+        assert_eq!(tools.tools.len(), 22);
         assert!(tools
             .tools
             .iter()
@@ -1003,6 +1063,14 @@ mod tests {
             .tools
             .iter()
             .any(|tool| tool.name == "browser_capture"));
+        assert!(tools
+            .tools
+            .iter()
+            .any(|tool| tool.name == "browser_dom_outline"));
+        assert!(tools
+            .tools
+            .iter()
+            .any(|tool| tool.name == "browser_node_inspect"));
         client.cancel().await.unwrap();
 
         drop(connection);

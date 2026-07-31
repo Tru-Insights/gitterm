@@ -99,6 +99,8 @@ The source-to-destination slice extends that backward-compatible surface with:
 - `browser_target_close`
 - `browser_capture`
 - `browser_target_diagnostics`
+- `browser_dom_outline`
+- `browser_node_inspect`
 
 Existing operations accept an optional named target. Calls that omit it retain
 the original single-active-target behavior.
@@ -179,6 +181,22 @@ and shows target identity, label, page title, sanitized URL, viewport, capture
 mode, and diagnostic counts. Evidence is not written to disk or restored across
 app launches; recording, replay, and a persistent evidence history remain out
 of scope.
+
+## Phase 6 Structural Inspection
+
+`browser_dom_outline` returns at most 300 meaningful visible nodes to a maximum
+depth of 16. Each node includes its nearest retained parent, document-scoped
+node reference, semantic identity, bounded text/classes, accessibility state,
+and viewport bounds. References remain stable only for the current document and
+fail loudly after navigation or reload.
+
+`browser_node_inspect` accepts either one of those references or a strict
+semantic/CSS locator. It returns a fixed allowlist of layout, flex, grid,
+spacing, typography, color, border, shadow, visibility, and transform styles,
+plus at most 50 sanitized attributes and a 10,000-character sanitized
+`outerHTML` excerpt. Password and hidden-input values, token-like attributes,
+inline styles, source sets, and URL credentials/query/fragment data are omitted
+or redacted. The tool does not expose arbitrary JavaScript evaluation.
 
 ## Acceptance Scenario
 

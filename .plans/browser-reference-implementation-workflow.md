@@ -152,6 +152,11 @@ Provide a bounded structural outline containing:
 
 Do not dump an unbounded raw DOM into the agent context.
 
+The first implementation caps outlines at 300 visible meaningful nodes and 16
+retained levels. Node references are stable only within their current document;
+navigation or reload makes them stale and follow-up inspection must fail rather
+than resolve a different element.
+
 ### 4. Targeted Layout And Style Inspection
 
 For a selected node or strict locator, return a bounded set of implementation
@@ -165,6 +170,10 @@ details:
 - relevant attributes and a capped `outerHTML` excerpt.
 
 The tool must not expose unrestricted JavaScript evaluation.
+The first implementation returns a fixed computed-style allowlist, at most 50
+sanitized attributes, and a 10,000-character sanitized `outerHTML` excerpt.
+Sensitive form values and token-like attributes are redacted, and URL
+attributes omit credentials, query strings, and fragments.
 
 ### 5. Console Inspection
 
