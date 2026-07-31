@@ -48,6 +48,7 @@ pub struct BrowserMcpConnection {
     endpoint: String,
     token: String,
     cancellation: CancellationToken,
+    browser: BrowserControlService,
 }
 
 impl BrowserMcpConnection {
@@ -60,6 +61,14 @@ impl BrowserMcpConnection {
             (BROWSER_MCP_URL_ENV.to_string(), self.endpoint.clone()),
             (BROWSER_MCP_TOKEN_ENV.to_string(), self.token.clone()),
         ]
+    }
+
+    /// Shared browser access for GitTerm UI controls.
+    ///
+    /// MCP tools and the UI clone this same service, whose controller mutex
+    /// serializes complete browser operations.
+    pub fn browser(&self) -> BrowserControlService {
+        self.browser.clone()
     }
 
     /// Per-run Codex overrides avoid modifying global or project config files.
@@ -127,6 +136,7 @@ pub fn prepare(
             endpoint,
             token: token.clone(),
             cancellation: cancellation.clone(),
+            browser: browser.clone(),
         },
         BrowserMcpServer {
             listener,
