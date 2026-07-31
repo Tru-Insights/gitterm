@@ -41,6 +41,7 @@ mod tab;
 mod theme;
 
 use gitterm::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake};
+use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{
@@ -3643,6 +3644,7 @@ pub enum Event {
     LogServerSyncComplete,
     SyntectWarmupComplete,
     LoadingUiTick,
+    BrowserMcpStopped(Result<(), String>),
     // Speech-to-text events
     #[cfg(feature = "stt")]
     SttToggle,
@@ -3668,6 +3670,7 @@ struct App {
     window_size: (f32, f32),
     log_server_state: log_server::ServerState,
     log_server_enabled: bool,
+    browser_mcp: Option<BrowserMcpConnection>,
     console_expanded: bool,
     console_height: f32,
     dragging_console_divider: bool,
@@ -5790,6 +5793,23 @@ impl App {
     fn new() -> (Self, Task<Event>) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = Config::load();
+        let (browser_mcp, browser_mcp_server) = match browser_mcp::prepare(
+            config::global_config_dir(),
+        ) {
+            Ok((connection, server)) => {
+                eprintln!(
+                    "GitTerm V4 browser MCP reserved at {}",
+                    connection.endpoint()
+                );
+                (Some(connection), Some(server))
+            }
+            Err(error) => {
+                eprintln!(
+                        "GitTerm V4 browser MCP is unavailable: failed to reserve a loopback endpoint: {error}"
+                    );
+                (None, None)
+            }
+        };
 
         let theme = if config.theme == "light" {
             AppTheme::Light
@@ -5828,6 +5848,7 @@ impl App {
             window_size: (1400.0, 800.0), // Initial size, updated on resize
             log_server_state,
             log_server_enabled,
+            browser_mcp,
             console_expanded: config.console_expanded,
             console_height: config.console_height.clamp(32.0, 600.0),
             dragging_console_divider: false,
@@ -6211,6 +6232,9 @@ impl App {
         }
         startup_tasks.push(app.ensure_active_remote_agent_connection(false));
         startup_tasks.push(app.refresh_files_for_active_tab());
+        if let Some(server) = browser_mcp_server {
+            startup_tasks.push(Task::perform(server.run(), Event::BrowserMcpStopped));
+        }
 
         // If the active tab on startup is an agent tab (restored from
         // workspaces.json), dispatch its activation so the webview gets
@@ -6538,12 +6562,17 @@ impl App {
 
         env.insert("GITTERM_PRECMD".to_string(), "1".to_string());
 
-        if let Some(cmd) = startup_command {
-            env.insert("GITTERM_STARTUP_CMD".to_string(), cmd.to_string());
-        }
-
         for (key, value) in extra_env {
             env.insert(key.to_string(), value.to_string());
+        }
+
+        let runtime_startup_command = startup_command.map(|command| {
+            env.get(browser_mcp::BROWSER_MCP_URL_ENV)
+                .map(|endpoint| browser_mcp::configure_codex_command(command, endpoint))
+                .unwrap_or_else(|| command.to_string())
+        });
+        if let Some(command) = &runtime_startup_command {
+            env.insert("GITTERM_STARTUP_CMD".to_string(), command.clone());
         }
 
         env.insert("CLAUDECODE".to_string(), String::new());
@@ -6554,7 +6583,7 @@ impl App {
         let is_windows = cfg!(target_os = "windows");
 
         let args = if is_windows {
-            if let Some(cmd) = startup_command {
+            if let Some(cmd) = runtime_startup_command.as_deref() {
                 let lower = shell.to_lowercase();
                 if lower.contains("powershell") || lower.contains("pwsh") {
                     vec![
@@ -6668,7 +6697,7 @@ fi
             .map(|s| s.to_string())
             .or_else(|| self.active_workspace().map(|ws| ws.name.clone()));
         let global_ws_path = config::global_config_dir().join("workspaces.json");
-        let extra_env: Vec<(String, String)> = ws_name
+        let mut extra_env: Vec<(String, String)> = ws_name
             .and_then(|name| {
                 std::fs::read_to_string(&global_ws_path)
                     .ok()
@@ -6677,6 +6706,9 @@ fi
             })
             .map(|cfg| cfg.env.into_iter().collect())
             .unwrap_or_default();
+        if let Some(connection) = &self.browser_mcp {
+            extra_env.extend(connection.terminal_environment());
+        }
         let extra_env_refs: Vec<(&str, &str)> = extra_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -6710,7 +6742,7 @@ fi
     fn create_bottom_terminal(&mut self, cwd: PathBuf) -> BottomTerminal {
         let ws_name = self.active_workspace().map(|ws| ws.name.clone());
         let global_ws_path = config::global_config_dir().join("workspaces.json");
-        let extra_env: Vec<(String, String)> = ws_name
+        let mut extra_env: Vec<(String, String)> = ws_name
             .and_then(|name| {
                 std::fs::read_to_string(&global_ws_path)
                     .ok()
@@ -6719,6 +6751,9 @@ fi
             })
             .map(|cfg| cfg.env.into_iter().collect())
             .unwrap_or_default();
+        if let Some(connection) = &self.browser_mcp {
+            extra_env.extend(connection.terminal_environment());
+        }
         let extra_env_refs: Vec<(&str, &str)> = extra_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -7524,6 +7559,15 @@ fi
             }
         }
         match event {
+            Event::BrowserMcpStopped(result) => {
+                match result {
+                    Ok(()) => eprintln!(
+                        "GitTerm V4 browser MCP server stopped before application shutdown"
+                    ),
+                    Err(error) => eprintln!("{error}"),
+                }
+                self.browser_mcp = None;
+            }
             Event::MainTerminalClicked => {
                 if self.bottom_panel_focused {
                     return self.focus_main_terminal();
@@ -11460,6 +11504,16 @@ fi
         let scrollback = self.scrollback_lines;
         let theme = self.theme;
         let font_size = self.terminal_font_size;
+        let browser_environment = self
+            .browser_mcp
+            .as_ref()
+            .map(BrowserMcpConnection::terminal_environment)
+            .map(|environment| environment.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let browser_environment_refs: Vec<(&str, &str)> = browser_environment
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
         let mut recreated_main = 0usize;
         let mut recreated_bottom = 0usize;
 
@@ -11470,7 +11524,7 @@ fi
                 scrollback,
                 &theme,
                 font_size,
-                &[],
+                &browser_environment_refs,
             );
             if let Ok(mut terminal) = iced_term::Terminal::new(tab.id as u64, settings) {
                 terminal.handle(iced_term::Command::AddBindings(
@@ -11491,7 +11545,7 @@ fi
                     scrollback,
                     &theme,
                     font_size,
-                    &[],
+                    &browser_environment_refs,
                 );
                 bt.terminal = iced_term::Terminal::new(bt.id as u64, settings)
                     .ok()
