@@ -14,11 +14,12 @@ use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
@@ -43,6 +44,7 @@ const MAX_DIAGNOSTIC_URL_CHARS: usize = 2_048;
 const MAX_DOM_OUTLINE_NODES: usize = 300;
 const MAX_DOM_SCANNED_ELEMENTS: usize = 5_000;
 const MAX_DOM_OUTLINE_DEPTH: usize = 16;
+static NEXT_BROWSER_CONTROL_SERVICE_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_DOM_TEXT_CHARS: usize = 200;
 const MAX_DOM_FIELD_CHARS: usize = 500;
 const MAX_DOM_CLASSES: usize = 16;
@@ -1674,16 +1676,33 @@ struct BrowserTelemetryState {
 
 #[derive(Clone)]
 pub struct BrowserControlService {
+    id: u64,
     controller: Arc<Mutex<BrowserController>>,
     telemetry: Arc<Mutex<BrowserTelemetryState>>,
+    telemetry_revision: watch::Sender<u64>,
 }
 
 impl BrowserControlService {
     pub fn new(v4_global_config_dir: impl AsRef<Path>) -> Self {
+        let (telemetry_revision, _) = watch::channel(0);
         Self {
+            id: NEXT_BROWSER_CONTROL_SERVICE_ID.fetch_add(1, Ordering::Relaxed),
             controller: Arc::new(Mutex::new(BrowserController::new(v4_global_config_dir))),
             telemetry: Arc::new(Mutex::new(BrowserTelemetryState::default())),
+            telemetry_revision,
         }
+    }
+
+    /// Subscribe to telemetry revisions. Receivers wake only when browser
+    /// activity or retained evidence changes, avoiding UI polling while idle.
+    pub fn telemetry_changes(&self) -> watch::Receiver<u64> {
+        self.telemetry_revision.subscribe()
+    }
+
+    /// Stable identity for consumers that retain one telemetry subscription
+    /// per service instance.
+    pub fn telemetry_subscription_id(&self) -> u64 {
+        self.id
     }
 
     pub async fn begin_agent_operation(&self, operation: BrowserOperation) -> u64 {
@@ -1696,6 +1715,9 @@ impl BrowserControlService {
             operation,
             started_at: SystemTime::now(),
         });
+        let revision = telemetry.snapshot.revision;
+        drop(telemetry);
+        self.telemetry_revision.send_replace(revision);
         id
     }
 
@@ -1715,6 +1737,9 @@ impl BrowserControlService {
             finished_at: SystemTime::now(),
             error,
         });
+        let revision = telemetry.snapshot.revision;
+        drop(telemetry);
+        self.telemetry_revision.send_replace(revision);
     }
 
     pub async fn telemetry(&self) -> BrowserTelemetrySnapshot {
@@ -1777,7 +1802,9 @@ impl BrowserControlService {
             screenshot_png: Arc::new(snapshot.screenshot_png.clone()),
         };
         retain_browser_evidence(&mut telemetry.snapshot, evidence);
+        let revision = telemetry.snapshot.revision;
         drop(telemetry);
+        self.telemetry_revision.send_replace(revision);
         Ok(snapshot)
     }
 
@@ -3924,9 +3951,14 @@ mod tests {
     async fn agent_activity_tracks_active_and_failed_operations() {
         let temp = tempdir().unwrap();
         let service = BrowserControlService::new(temp.path());
+        let mut telemetry_changes = service.telemetry_changes();
+        assert_eq!(*telemetry_changes.borrow(), 0);
+
         let activity_id = service
             .begin_agent_operation(BrowserOperation::Navigate)
             .await;
+        telemetry_changes.changed().await.unwrap();
+        assert_eq!(*telemetry_changes.borrow_and_update(), 1);
         let active = service.telemetry().await.active_agent_operation.unwrap();
         assert_eq!(active.id, activity_id);
         assert_eq!(active.operation, BrowserOperation::Navigate);
@@ -3934,6 +3966,8 @@ mod tests {
         service
             .finish_agent_operation(activity_id, Some("navigation failed".to_string()))
             .await;
+        telemetry_changes.changed().await.unwrap();
+        assert_eq!(*telemetry_changes.borrow_and_update(), 2);
         let telemetry = service.telemetry().await;
         assert!(telemetry.active_agent_operation.is_none());
         let outcome = telemetry.last_agent_operation.unwrap();
