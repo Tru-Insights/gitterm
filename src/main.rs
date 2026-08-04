@@ -2103,6 +2103,94 @@ fn detect_run_command(dir: &PathBuf) -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttentionReason {
+    HumanInputRequired,
+    AgentFailed,
+    CompletedUnread,
+}
+
+impl AttentionReason {
+    fn priority(self) -> u8 {
+        match self {
+            Self::HumanInputRequired => 0,
+            Self::AgentFailed => 1,
+            Self::CompletedUnread => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::HumanInputRequired => "Input or approval needed",
+            Self::AgentFailed => "Agent failed",
+            Self::CompletedUnread => "Ready to review",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::HumanInputRequired => "●",
+            Self::AgentFailed => "!",
+            Self::CompletedUnread => "✓",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TabAttention {
+    reason: AttentionReason,
+    since: Instant,
+}
+
+impl TabAttention {
+    fn new(reason: AttentionReason) -> Self {
+        Self {
+            reason,
+            since: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AttentionItem {
+    tab_id: usize,
+    workspace_name: String,
+    machine_name: String,
+    tab_name: String,
+    attention: TabAttention,
+}
+
+fn format_attention_age(since: Instant, now: Instant) -> String {
+    let elapsed = now.saturating_duration_since(since);
+    if elapsed.as_secs() < 60 {
+        "now".to_string()
+    } else if elapsed.as_secs() < 60 * 60 {
+        format!("{}m", elapsed.as_secs() / 60)
+    } else if elapsed.as_secs() < 24 * 60 * 60 {
+        format!("{}h", elapsed.as_secs() / (60 * 60))
+    } else {
+        format!("{}d", elapsed.as_secs() / (24 * 60 * 60))
+    }
+}
+
+fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
+    title
+        .starts_with('✳')
+        .then_some(AttentionReason::HumanInputRequired)
+}
+
+fn agent_event_attention_reason(event: &tab::AgentEvent) -> Option<AttentionReason> {
+    match event {
+        tab::AgentEvent::Result(_) => Some(AttentionReason::CompletedUnread),
+        tab::AgentEvent::Other(value) => match value.get("type").and_then(|value| value.as_str()) {
+            Some("done") => Some(AttentionReason::CompletedUnread),
+            Some("error" | "failed") => Some(AttentionReason::AgentFailed),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 // Tab state. Tab-kind data structures live in `src/tab/mod.rs`; the heavy `impl TabState`
 // methods (load_file, fetch_status, fetch_diff, fetch_claude_config, fetch_agent_activity, etc.)
 // stay here because they reference too many in-binary helpers, constants, and macros.
@@ -2151,8 +2239,8 @@ struct TabState {
     files: FilesState,
     // Search state
     search: SearchState,
-    // Attention: true when terminal title starts with "*" (e.g. Claude Code waiting for input)
-    needs_attention: bool,
+    // One canonical attention state, fed by terminal-title adapters and native agent events.
+    attention: Option<TabAttention>,
     // Claude config tree view
     claude_config: ClaudeConfig,
     // Agent activity sidebar state (shared across tab kinds — see AgentActivityState).
@@ -2215,7 +2303,7 @@ impl TabState {
             search: SearchState::default(),
             selected_chat_id: None,
             chat_session_id: None,
-            needs_attention: false,
+            attention: None,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
             is_git_repo,
@@ -2271,6 +2359,32 @@ impl TabState {
             TabKind::Terminal(tt) => tt.terminal_title = title,
             TabKind::Agent(_) => {}
         }
+    }
+
+    fn set_attention(&mut self, reason: AttentionReason) {
+        if self
+            .attention
+            .is_none_or(|attention| attention.reason != reason)
+        {
+            self.attention = Some(TabAttention::new(reason));
+        }
+    }
+
+    fn clear_attention(&mut self, reason: AttentionReason) {
+        if self
+            .attention
+            .is_some_and(|attention| attention.reason == reason)
+        {
+            self.attention = None;
+        }
+    }
+
+    fn needs_attention(&self) -> bool {
+        self.attention.is_some()
+    }
+
+    fn mark_visited(&mut self) {
+        self.clear_attention(AttentionReason::CompletedUnread);
     }
 
     /// The startup command requested when this tab was created (e.g. "claude").
@@ -3233,11 +3347,18 @@ impl Workspace {
     }
 
     fn attention_count(&self) -> usize {
-        self.tabs.iter().filter(|t| t.needs_attention).count()
+        self.tabs.iter().filter(|tab| tab.needs_attention()).count()
     }
 
     fn has_attention(&self) -> bool {
-        self.tabs.iter().any(|t| t.needs_attention)
+        self.tabs.iter().any(TabState::needs_attention)
+    }
+
+    fn highest_priority_attention(&self) -> Option<AttentionReason> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.attention.map(|attention| attention.reason))
+            .min_by_key(|reason| reason.priority())
     }
 }
 
@@ -3585,6 +3706,9 @@ pub enum Event {
     // Attention system events
     AttentionPulseTick,
     AttentionJumpNext,
+    AttentionViewToggle,
+    AttentionViewClose,
+    AttentionItemSelect(usize),
     // Launch agent preset by index
     AgentActivityLoaded(usize, Result<agent::AgentActivity, String>),
     AgentConversationLoaded(usize, agent::Conversation),
@@ -3841,6 +3965,7 @@ struct App {
     edge_peek_right: bool,
     // Attention pulse animation (toggles every 500ms)
     attention_pulse_bright: bool,
+    attention_view_open: bool,
     // Track modifier state for filtering terminal writes
     current_modifiers: Modifiers,
     // Help modal
@@ -6124,6 +6249,7 @@ impl App {
             edge_peek_left: false,
             edge_peek_right: false,
             attention_pulse_bright: false,
+            attention_view_open: false,
             current_modifiers: Modifiers::empty(),
             show_help: false,
             workspace_settings_open: false,
@@ -7686,8 +7812,69 @@ fi
         )
     }
 
-    fn any_tab_needs_attention(&self) -> bool {
-        self.workspaces.iter().any(|ws| ws.has_attention())
+    fn any_tab_requires_attention_pulse(&self) -> bool {
+        self.workspaces.iter().any(|workspace| {
+            workspace.tabs.iter().any(|tab| {
+                tab.attention.is_some_and(|attention| {
+                    attention.reason == AttentionReason::HumanInputRequired
+                })
+            })
+        })
+    }
+
+    fn attention_items(&self) -> Vec<AttentionItem> {
+        let mut items = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                let machine_name = match &workspace.location {
+                    WorkspaceLocation::Local { .. } => "Local".to_string(),
+                    WorkspaceLocation::RemoteAgent { remote_id, .. } => self
+                        .remote_agent_config_by_id(remote_id)
+                        .map(|agent| agent.name.clone())
+                        .unwrap_or_else(|| remote_id.clone()),
+                    WorkspaceLocation::LegacyRemoteSession { session_name, .. } => {
+                        session_name.clone()
+                    }
+                };
+                workspace.tabs.iter().filter_map(move |tab| {
+                    let attention = tab.attention?;
+                    let tab_name = tab
+                        .terminal_title()
+                        .unwrap_or(tab.repo_name.as_str())
+                        .trim_start_matches('✳')
+                        .trim()
+                        .to_string();
+                    Some(AttentionItem {
+                        tab_id: tab.id,
+                        workspace_name: workspace.name.clone(),
+                        machine_name: machine_name.clone(),
+                        tab_name,
+                        attention,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by_key(|item| (item.attention.reason.priority(), item.attention.since));
+        items
+    }
+
+    fn restore_webview_after_attention(&mut self) -> Task<Event> {
+        if self.webview_kind == WebviewKind::Agent {
+            if let Some(tab_id) = self
+                .active_tab()
+                .filter(|tab| matches!(tab.kind, TabKind::Agent(_)))
+                .map(|tab| tab.id)
+            {
+                return self.show_agent_webview(tab_id);
+            }
+        } else if matches!(
+            self.webview_kind,
+            WebviewKind::Static | WebviewKind::PlansViewer
+        ) {
+            webview::set_visible(true);
+        }
+        Task::none()
     }
 
     fn title(&self) -> String {
@@ -7799,12 +7986,13 @@ fi
             );
         }
 
-        // Attention pulse (500ms toggle) — when any tab needs attention or STT recording
+        // Pulse only unresolved human requests (plus STT recording). Completed and
+        // failed indicators stay static, avoiding an idle redraw subscription.
         #[cfg(feature = "stt")]
         let stt_recording = self.stt_recording;
         #[cfg(not(feature = "stt"))]
         let stt_recording = false;
-        if self.any_tab_needs_attention() || stt_recording {
+        if self.any_tab_requires_attention_pulse() || stt_recording {
             subs.push(
                 iced::time::every(Duration::from_millis(500)).map(|_| Event::AttentionPulseTick),
             );
@@ -8121,11 +8309,10 @@ fi
                     .flat_map(|ws| ws.tabs.iter_mut())
                     .find(|t| t.id == tab_id)
                 {
-                    // Clear attention on user keyboard input (Write), not on process output (ProcessAlacrittyEvent)
+                    // Typing is a response to a terminal-reported input request. Other
+                    // attention reasons remain until their underlying state resolves.
                     if matches!(&cmd, iced_term::backend::Command::Write(_)) {
-                        if tab.needs_attention {
-                            tab.needs_attention = false;
-                        }
+                        tab.clear_attention(AttentionReason::HumanInputRequired);
                         // Reset git poll to fast when user is actively typing
                         if tab.git_poll_interval_ms > GIT_POLL_FAST_INTERVAL_MS {
                             tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
@@ -8144,8 +8331,13 @@ fi
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 // Set tab-specific title
                                 tab.set_terminal_title(Some(title.clone()));
-                                // Detect attention: Claude Code sets "✳" (U+2733) prefix when waiting for input
-                                tab.needs_attention = title.starts_with('✳');
+                                // Compatibility adapter: Claude Code prefixes its title with
+                                // "✳" (U+2733) while waiting for input or approval.
+                                if let Some(reason) = terminal_title_attention_reason(&title) {
+                                    tab.set_attention(reason);
+                                } else {
+                                    tab.clear_attention(AttentionReason::HumanInputRequired);
+                                }
 
                                 // Try to sync sidebar directory from terminal title
                                 if !tab_workspace_is_remote {
@@ -8443,6 +8635,7 @@ fi
                 if let Some(ws) = self.active_workspace_mut() {
                     if idx < ws.tabs.len() {
                         ws.active_tab = idx;
+                        ws.tabs[idx].mark_visited();
                         self.mark_workspaces_dirty();
                     }
                 }
@@ -8623,6 +8816,7 @@ fi
                         if t.id != tab_id {
                             continue;
                         }
+                        t.attention = None;
                         let repo_path = t.repo_path.clone();
                         let Some(session) = t.agent_session_mut() else {
                             eprintln!("AgentSubmitPrompt: tab {} is not an agent tab", tab_id);
@@ -8681,10 +8875,14 @@ fi
                 // currently visible, also push the event live for rendering.
                 let is_active_in_webview = self.webview_kind == WebviewKind::Agent
                     && self.webview_agent_tab_id == Some(tab_id);
+                let attention_reason = agent_event_attention_reason(&ev);
                 for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
                             if let Some(session) = t.agent_session_mut() {
+                                if matches!(&ev, tab::AgentEvent::Result(_)) {
+                                    session.state = tab::AgentSessionState::Idle;
+                                }
                                 // Heuristic state transition until typed parser
                                 // lands (Step 9): `done`/`stopped` sentinels
                                 // flip back to Idle/Stopped.
@@ -8694,6 +8892,10 @@ fi
                                             session.state = tab::AgentSessionState::Idle;
                                         } else if t == "stopped" {
                                             session.state = tab::AgentSessionState::Stopped;
+                                        } else if t == "error" || t == "failed" {
+                                            session.state = tab::AgentSessionState::Errored(
+                                                "Agent reported an error".to_string(),
+                                            );
                                         }
                                     }
                                 }
@@ -8701,6 +8903,13 @@ fi
                                     push_agent_event_to_webview(&ev);
                                 }
                                 session.conversation.push(ev);
+                            }
+                            match attention_reason {
+                                Some(AttentionReason::CompletedUnread) if is_active_in_webview => {
+                                    t.attention = None;
+                                }
+                                Some(reason) => t.set_attention(reason),
+                                None => {}
                             }
                             return Task::none();
                         }
@@ -9205,6 +9414,14 @@ fi
                     return Task::none();
                 }
 
+                // Attention flyout: Escape closes, all other keys are consumed.
+                if self.attention_view_open {
+                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
+                        return self.update(Event::AttentionViewClose);
+                    }
+                    return Task::none();
+                }
+
                 // Workspace settings: Escape closes
                 if self.workspace_settings_open
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
@@ -9334,6 +9551,10 @@ fi
                     // Search shortcuts
                     if modifiers.command() {
                         if let Key::Character(c) = key.as_ref() {
+                            // Cmd+Shift+A - Toggle the global attention view
+                            if (c == "a" || c == "A") && modifiers.shift() {
+                                return Task::done(Event::AttentionViewToggle);
+                            }
                             // Cmd+F - Toggle search
                             if c == "f" {
                                 return Task::done(Event::ToggleSearch);
@@ -11687,6 +11908,38 @@ fi
             Event::AttentionPulseTick => {
                 self.attention_pulse_bright = !self.attention_pulse_bright;
             }
+            Event::AttentionViewToggle => {
+                self.attention_view_open = !self.attention_view_open;
+                if self.attention_view_open {
+                    webview::set_visible(false);
+                    return Task::none();
+                }
+                return self.restore_webview_after_attention();
+            }
+            Event::AttentionViewClose => {
+                if self.attention_view_open {
+                    self.attention_view_open = false;
+                    return self.restore_webview_after_attention();
+                }
+            }
+            Event::AttentionItemSelect(tab_id) => {
+                let target =
+                    self.workspaces
+                        .iter()
+                        .enumerate()
+                        .find_map(|(workspace_idx, workspace)| {
+                            workspace
+                                .tabs
+                                .iter()
+                                .position(|tab| tab.id == tab_id)
+                                .map(|tab_idx| (workspace_idx, tab_idx))
+                        });
+                self.attention_view_open = false;
+                if let Some((workspace_idx, tab_idx)) = target {
+                    return self.focus_workspace_tab(workspace_idx, tab_idx);
+                }
+                return self.restore_webview_after_attention();
+            }
             Event::AttentionJumpNext => {
                 // Round-robin search for next tab needing attention
                 let ws_count = self.workspaces.len();
@@ -11707,7 +11960,7 @@ fi
                     // upper bound to prevent infinite loop
                     if let Some(ws) = self.workspaces.get(ws_idx) {
                         if tab_idx < ws.tabs.len() {
-                            if ws.tabs[tab_idx].needs_attention {
+                            if ws.tabs[tab_idx].needs_attention() {
                                 // Found one — switch to it
                                 if ws_idx != self.active_workspace_idx {
                                     // Animate workspace switch
@@ -12157,6 +12410,13 @@ fi
             Stack::new()
                 .push(main_view)
                 .push(self.view_browser_evidence())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.attention_view_open {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_attention_panel())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -12844,6 +13104,7 @@ fi
         content_col = content_col.push(section_header("Navigation"));
         content_col = content_col.push(shortcut_row("Ctrl + 1-9", "Switch workspace"));
         content_col = content_col.push(shortcut_row("Cmd + 1-9", "Switch tab"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + A", "Open attention view"));
         content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to attention tab"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + W", "Close workspace"));
         content_col = content_col.push(shortcut_row("Cmd + B", "Toggle sidebar"));
@@ -13996,17 +14257,18 @@ fi
 
             let attn_count = ws.attention_count();
             let has_attention = attn_count > 0;
+            let attention_reason = ws.highest_priority_attention();
             let has_error = ws.console.status == ConsoleStatus::Error;
 
             // Colored dot before name — override for attention/error
-            let dot_color = if has_error {
+            let dot_color = if has_error || attention_reason == Some(AttentionReason::AgentFailed) {
                 theme.danger()
+            } else if attention_reason == Some(AttentionReason::CompletedUnread) {
+                theme.success()
+            } else if has_attention && pulse_bright {
+                theme.peach()
             } else if has_attention {
-                if pulse_bright {
-                    theme.peach()
-                } else {
-                    theme.warning()
-                }
+                theme.warning()
             } else if is_active {
                 ws_color
             } else {
@@ -14078,7 +14340,11 @@ fi
                     }),
                 );
             } else if has_attention {
-                let badge_bg = theme.peach();
+                let badge_bg = match attention_reason {
+                    Some(AttentionReason::AgentFailed) => theme.danger(),
+                    Some(AttentionReason::CompletedUnread) => theme.success(),
+                    _ => theme.peach(),
+                };
                 let badge_text_color = theme.bg_crust();
                 btn_content = btn_content.push(
                     container(
@@ -14315,10 +14581,54 @@ fi
                 ..Default::default()
             });
 
+        let attention_count = self
+            .workspaces
+            .iter()
+            .map(Workspace::attention_count)
+            .sum::<usize>();
+        let attention_reason = self
+            .workspaces
+            .iter()
+            .filter_map(Workspace::highest_priority_attention)
+            .min_by_key(|reason| reason.priority());
+        let attention_color = match attention_reason {
+            Some(AttentionReason::HumanInputRequired) => {
+                if self.attention_pulse_bright {
+                    theme.peach()
+                } else {
+                    theme.warning()
+                }
+            }
+            Some(AttentionReason::AgentFailed) => theme.danger(),
+            Some(AttentionReason::CompletedUnread) => theme.success(),
+            None => theme.overlay0(),
+        };
+        let attention_hover = theme.surface0();
+        let attention_active = self.attention_view_open;
+        let attention_btn = button(
+            text(format!("⚡ {attention_count}"))
+                .size(11)
+                .color(attention_color)
+                .font(iced::Font::with_name("Menlo")),
+        )
+        .style(move |_theme, status| button::Style {
+            background: if attention_active || matches!(status, button::Status::Hovered) {
+                Some(attention_hover.into())
+            } else {
+                Some(iced::Color::TRANSPARENT.into())
+            },
+            text_color: attention_color,
+            border: iced::Border::default(),
+            ..Default::default()
+        })
+        .padding([6, 10])
+        .on_press(Event::AttentionViewToggle);
+
         let bar_inner = row![
             scrollable_bar,
             control_separator,
             container(browser_controls).padding([0, 6]),
+            attention_btn,
             help_btn
         ]
         .spacing(0)
@@ -14336,6 +14646,210 @@ fi
         column![top_border, bar_container].into()
     }
 
+    fn view_attention_panel(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let bg = theme.bg_surface();
+        let row_bg = theme.bg_base();
+        let hover_bg = theme.surface0();
+        let border_color = theme.border();
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let mono = iced::Font::with_name("Menlo");
+        let items = self.attention_items();
+        let item_count = items.len();
+
+        let close_btn = button(text("×").size(font + 2.0).color(text_secondary))
+            .style(move |_theme, status| button::Style {
+                background: matches!(status, button::Status::Hovered).then_some(hover_bg.into()),
+                text_color: text_secondary,
+                border: iced::Border::default(),
+                ..Default::default()
+            })
+            .padding([2, 7])
+            .on_press(Event::AttentionViewClose);
+
+        let header = column![
+            row![
+                text("Attention")
+                    .size(font + 1.0)
+                    .color(text_primary)
+                    .font(mono),
+                iced::widget::Space::new().width(Length::Fill),
+                close_btn,
+            ]
+            .align_y(iced::Alignment::Center),
+            text(if item_count == 1 {
+                "1 item needs you".to_string()
+            } else {
+                format!("{item_count} items need you")
+            })
+            .size(font_small)
+            .color(text_secondary),
+        ]
+        .spacing(2);
+
+        let mut item_list = Column::new().spacing(5).width(Length::Fill);
+        if items.is_empty() {
+            item_list =
+                item_list.push(
+                    container(
+                        column![
+                        text("You're caught up")
+                            .size(font)
+                            .color(text_primary)
+                            .font(mono),
+                        text("Input requests, failures, and completed agent work will appear here.")
+                            .size(font_small)
+                            .color(text_secondary),
+                    ]
+                        .spacing(6),
+                    )
+                    .padding([24, 10]),
+                );
+        } else {
+            let now = Instant::now();
+            let mut actionable_heading_added = false;
+            let mut review_heading_added = false;
+            for item in items {
+                let reason = item.attention.reason;
+                if reason == AttentionReason::CompletedUnread {
+                    if !review_heading_added {
+                        item_list = item_list.push(
+                            text("READY TO REVIEW")
+                                .size(font_small - 1.0)
+                                .color(text_muted)
+                                .font(mono),
+                        );
+                        review_heading_added = true;
+                    }
+                } else if !actionable_heading_added {
+                    item_list = item_list.push(
+                        text("NEEDS YOU")
+                            .size(font_small - 1.0)
+                            .color(text_muted)
+                            .font(mono),
+                    );
+                    actionable_heading_added = true;
+                }
+
+                let reason_color = match reason {
+                    AttentionReason::HumanInputRequired => theme.warning(),
+                    AttentionReason::AgentFailed => theme.danger(),
+                    AttentionReason::CompletedUnread => theme.success(),
+                };
+                let age = format_attention_age(item.attention.since, now);
+                let location = format!("{} · {}", item.machine_name, item.workspace_name);
+                let tab_name = if item.tab_name.chars().count() > 44 {
+                    format!("{}…", truncate_str(&item.tab_name, 43))
+                } else {
+                    item.tab_name
+                };
+
+                let status_line = row![
+                    text(reason.icon()).size(font_small).color(reason_color),
+                    text(reason.label())
+                        .size(font_small)
+                        .color(reason_color)
+                        .font(mono),
+                    iced::widget::Space::new().width(Length::Fill),
+                    text(age).size(font_small).color(text_muted).font(mono),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
+
+                let item_button = button(
+                    column![
+                        status_line,
+                        text(tab_name).size(font).color(text_primary).font(mono),
+                        text(location).size(font_small).color(text_secondary),
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                )
+                .style(move |_theme, status| button::Style {
+                    background: Some(
+                        if matches!(status, button::Status::Hovered) {
+                            hover_bg
+                        } else {
+                            row_bg
+                        }
+                        .into(),
+                    ),
+                    text_color: text_primary,
+                    border: iced::Border {
+                        color: border_color,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([8, 10])
+                .width(Length::Fill)
+                .on_press(Event::AttentionItemSelect(item.tab_id));
+                item_list = item_list.push(item_button);
+            }
+        }
+
+        let separator = container(iced::widget::Space::new().height(0))
+            .width(Length::Fill)
+            .height(Length::Fixed(1.0))
+            .style(move |_| container::Style {
+                background: Some(border_color.into()),
+                ..Default::default()
+            });
+        let panel = container(
+            column![
+                header,
+                separator,
+                scrollable(item_list.padding([4, 0])).height(Length::Fixed(340.0)),
+            ]
+            .spacing(10),
+        )
+        .width(Length::Fixed(390.0))
+        .padding(14)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            border: iced::Border {
+                color: border_color,
+                width: 1.0,
+                radius: 9.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 16.0,
+            },
+            ..Default::default()
+        });
+
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Event::AttentionViewClose);
+
+        Stack::new()
+            .push(backdrop)
+            .push(
+                container(panel)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::Alignment::End)
+                    .align_y(iced::Alignment::End)
+                    .padding(iced::Padding {
+                        top: 0.0,
+                        right: 12.0,
+                        bottom: 40.0,
+                        left: 0.0,
+                    }),
+            )
+            .into()
+    }
+
     fn view_spine(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let pulse_bright = self.attention_pulse_bright;
@@ -14347,6 +14861,7 @@ fi
             let inactive_color = theme.surface2();
 
             let has_attention = ws.has_attention();
+            let attention_reason = ws.highest_priority_attention();
             let has_error = ws.console.status == ConsoleStatus::Error;
 
             // Larger dot for attention/error when inactive
@@ -14359,14 +14874,16 @@ fi
             };
 
             // Color: error (red) > attention (pulsing amber) > active (ws color) > inactive
-            let dot_color = if has_error && !is_active {
+            let dot_color = if (has_error || attention_reason == Some(AttentionReason::AgentFailed))
+                && !is_active
+            {
                 theme.danger()
+            } else if attention_reason == Some(AttentionReason::CompletedUnread) && !is_active {
+                theme.success()
+            } else if has_attention && !is_active && pulse_bright {
+                theme.peach()
             } else if has_attention && !is_active {
-                if pulse_bright {
-                    theme.peach()
-                } else {
-                    theme.warning()
-                }
+                theme.warning()
             } else if is_active {
                 ws_color
             } else {
@@ -14479,7 +14996,8 @@ fi
 
         for (idx, tab) in tabs.iter().enumerate() {
             let is_active = idx == active_tab_idx;
-            let has_attention = tab.needs_attention;
+            let attention_reason = tab.attention.map(|attention| attention.reason);
+            let has_attention = attention_reason.is_some();
 
             // Determine if this is a Claude Code tab
             let display_title = if workspace_is_remote {
@@ -14490,23 +15008,25 @@ fi
             let is_claude = display_title.to_lowercase().contains("claude");
 
             // Icon prefix — attention overrides normal icon
-            let (icon_str, icon_color) = if has_attention {
-                let attn_color = if pulse_bright {
-                    theme.peach()
-                } else {
-                    theme.warning()
-                };
-                ("● ", attn_color)
-            } else if is_claude {
-                ("✦ ", theme.peach())
-            } else {
-                ("▶ ", theme.success())
+            let (icon_str, icon_color) = match attention_reason {
+                Some(AttentionReason::HumanInputRequired) => (
+                    "● ",
+                    if pulse_bright {
+                        theme.peach()
+                    } else {
+                        theme.warning()
+                    },
+                ),
+                Some(AttentionReason::AgentFailed) => ("! ", theme.danger()),
+                Some(AttentionReason::CompletedUnread) => ("✓ ", theme.success()),
+                None if is_claude => ("✦ ", theme.peach()),
+                None => ("▶ ", theme.success()),
             };
 
             // Tab label - strip leading "*" when attention (redundant with visual indicator),
             // shorten path-like titles to last component, truncate at 20 chars
             let display = if has_attention {
-                display_title.trim_start_matches('*').trim_start()
+                display_title.trim_start_matches(['*', '✳']).trim_start()
             } else {
                 display_title
             };
@@ -14534,20 +15054,23 @@ fi
             let hover_bg = theme.surface0();
 
             // Attention background colors
-            let attn_bg_color = if pulse_bright {
-                iced::Color {
-                    a: 0.20,
-                    ..theme.peach()
-                }
-            } else {
-                iced::Color {
-                    a: 0.12,
-                    ..theme.peach()
-                }
+            let attention_base_color = match attention_reason {
+                Some(AttentionReason::AgentFailed) => theme.danger(),
+                Some(AttentionReason::CompletedUnread) => theme.success(),
+                _ => theme.peach(),
+            };
+            let attn_bg_color = iced::Color {
+                a: if attention_reason == Some(AttentionReason::HumanInputRequired) && pulse_bright
+                {
+                    0.20
+                } else {
+                    0.12
+                },
+                ..attention_base_color
             };
             let attn_border_color = iced::Color {
                 a: 0.5,
-                ..theme.peach()
+                ..attention_base_color
             };
 
             // Build tab content: icon + label + shortcut
@@ -21172,6 +21695,78 @@ mod tests {
             active_target: None,
             detail: None,
         }
+    }
+
+    #[test]
+    fn terminal_title_adapter_only_marks_explicit_human_attention() {
+        assert_eq!(
+            terminal_title_attention_reason("✳ Claude Code"),
+            Some(AttentionReason::HumanInputRequired)
+        );
+        assert_eq!(terminal_title_attention_reason("Claude Code"), None);
+        assert_eq!(terminal_title_attention_reason("* shell"), None);
+    }
+
+    #[test]
+    fn native_agent_events_map_to_semantic_attention() {
+        assert_eq!(
+            agent_event_attention_reason(&tab::AgentEvent::Result(serde_json::json!({}))),
+            Some(AttentionReason::CompletedUnread)
+        );
+        assert_eq!(
+            agent_event_attention_reason(&tab::AgentEvent::Other(
+                serde_json::json!({ "type": "failed" })
+            )),
+            Some(AttentionReason::AgentFailed)
+        );
+        assert_eq!(
+            agent_event_attention_reason(&tab::AgentEvent::AssistantText("working".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn attention_priority_keeps_human_requests_ahead_of_failures_and_reviews() {
+        assert!(
+            AttentionReason::HumanInputRequired.priority()
+                < AttentionReason::AgentFailed.priority()
+        );
+        assert!(
+            AttentionReason::AgentFailed.priority() < AttentionReason::CompletedUnread.priority()
+        );
+    }
+
+    #[test]
+    fn attention_age_uses_compact_stable_buckets() {
+        let now = Instant::now();
+        assert_eq!(format_attention_age(now, now), "now");
+        assert_eq!(
+            format_attention_age(now - Duration::from_secs(90), now),
+            "1m"
+        );
+        assert_eq!(
+            format_attention_age(now - Duration::from_secs(2 * 60 * 60), now),
+            "2h"
+        );
+        assert_eq!(
+            format_attention_age(now - Duration::from_secs(3 * 24 * 60 * 60), now),
+            "3d"
+        );
+    }
+
+    #[test]
+    fn visiting_only_clears_completed_attention() {
+        let mut tab = TabState::new(1, PathBuf::from("/tmp"));
+        tab.set_attention(AttentionReason::CompletedUnread);
+        tab.mark_visited();
+        assert!(!tab.needs_attention());
+
+        tab.set_attention(AttentionReason::HumanInputRequired);
+        tab.mark_visited();
+        assert_eq!(
+            tab.attention.map(|attention| attention.reason),
+            Some(AttentionReason::HumanInputRequired)
+        );
     }
 
     #[test]
