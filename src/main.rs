@@ -496,7 +496,7 @@ struct MenuIds {
     increase_ui_font: muda::MenuId,
     decrease_ui_font: muda::MenuId,
     toggle_theme: muda::MenuId,
-    toggle_log_server: muda::MenuId,
+    toggle_terminal_log_mirroring: muda::MenuId,
     clear_terminal: muda::MenuId,
     open_plans_viewer: muda::MenuId,
 }
@@ -588,8 +588,8 @@ fn setup_menu_bar() {
             muda::accelerator::Code::KeyT,
         )),
     );
-    let toggle_log_server = MenuItem::new(
-        "Toggle Local Log Server",
+    let toggle_terminal_log_mirroring = MenuItem::new(
+        "Toggle Terminal Log Mirroring",
         true,
         Some(Accelerator::new(
             Some(muda::accelerator::Modifiers::META | muda::accelerator::Modifiers::SHIFT),
@@ -611,7 +611,7 @@ fn setup_menu_bar() {
             &ui_font_menu,
             &PredefinedMenuItem::separator(),
             &toggle_theme,
-            &toggle_log_server,
+            &toggle_terminal_log_mirroring,
             &PredefinedMenuItem::separator(),
             &open_plans_viewer,
         ])
@@ -638,7 +638,7 @@ fn setup_menu_bar() {
         increase_ui_font: increase_ui_font.id().clone(),
         decrease_ui_font: decrease_ui_font.id().clone(),
         toggle_theme: toggle_theme.id().clone(),
-        toggle_log_server: toggle_log_server.id().clone(),
+        toggle_terminal_log_mirroring: toggle_terminal_log_mirroring.id().clone(),
         clear_terminal: clear_terminal.id().clone(),
         open_plans_viewer: open_plans_viewer.id().clone(),
     });
@@ -3498,9 +3498,10 @@ pub enum Event {
     CloseFileView,
     CopyFileContent,
     OpenFileInBrowser,
+    FileBrowserSnapshotReady(usize),
     // Theme
     ToggleTheme,
-    ToggleLogServer,
+    ToggleTerminalLogMirroring,
     // Font size - Terminal
     IncreaseTerminalFont,
     DecreaseTerminalFont,
@@ -3691,7 +3692,8 @@ pub enum Event {
     FileLoaded(FileLoadSnapshot),
     FileViewScrolled(usize, scrollable::Viewport),
     FileSyntaxHighlighted(FileSyntaxSnapshot),
-    LogServerSyncComplete,
+    TerminalMirrorSyncComplete,
+    TerminalMirrorCleared,
     SyntectWarmupComplete,
     LoadingUiTick,
     BrowserMcpStopped(Result<(), String>),
@@ -3812,7 +3814,7 @@ struct App {
     show_hidden: bool,
     window_size: (f32, f32),
     log_server_state: log_server::ServerState,
-    log_server_enabled: bool,
+    terminal_log_mirroring_enabled: bool,
     browser_mcp: Option<BrowserMcpConnection>,
     browser_status: Option<BrowserStatus>,
     browser_action: Option<BrowserAction>,
@@ -3902,12 +3904,12 @@ struct App {
     closed_workspace_configs: Vec<WorkspaceConfig>,
     workspaces_dirty: bool,
     next_workspace_save_at: Option<Instant>,
-    log_server_dirty: bool,
-    next_log_server_sync_at: Instant,
+    terminal_mirror_dirty: bool,
+    next_terminal_mirror_sync_at: Instant,
     next_perf_report_at: Instant,
-    log_server_sync_in_flight: bool,
-    log_server_sync_queued: bool,
-    last_log_server_snapshot_hash: Option<u64>,
+    terminal_mirror_sync_in_flight: bool,
+    terminal_mirror_sync_queued: bool,
+    last_terminal_mirror_snapshot_hash: Option<u64>,
     // Speech-to-text state
     #[cfg(feature = "stt")]
     stt_enabled: bool,
@@ -4682,7 +4684,7 @@ impl App {
             show_hidden: self.show_hidden,
             console_height: self.console_height,
             console_expanded: self.console_expanded,
-            log_server_enabled: self.log_server_enabled,
+            terminal_log_mirroring_enabled: self.terminal_log_mirroring_enabled,
             #[cfg(feature = "stt")]
             stt_enabled: self.stt_enabled,
             #[cfg(feature = "stt")]
@@ -4911,63 +4913,74 @@ impl App {
         }
     }
 
-    fn set_log_server_enabled(&mut self, enabled: bool) {
-        if self.log_server_enabled == enabled {
-            return;
+    fn clear_terminal_mirror(&self) -> Task<Event> {
+        let state = self.log_server_state.clone();
+        Task::perform(
+            async move {
+                state.terminals.write().await.clear();
+            },
+            |_| Event::TerminalMirrorCleared,
+        )
+    }
+
+    fn set_terminal_log_mirroring_enabled(&mut self, enabled: bool) -> Task<Event> {
+        if self.terminal_log_mirroring_enabled == enabled {
+            return Task::none();
         }
 
-        self.log_server_enabled = enabled;
+        self.terminal_log_mirroring_enabled = enabled;
 
         if enabled {
-            self.last_log_server_snapshot_hash = None;
-            self.log_server_dirty = true;
-            self.log_server_sync_queued = false;
-            self.next_log_server_sync_at = Instant::now();
-            self.start_log_server();
+            self.last_terminal_mirror_snapshot_hash = None;
+            self.terminal_mirror_dirty = true;
+            self.terminal_mirror_sync_queued = false;
+            self.next_terminal_mirror_sync_at = Instant::now();
         } else {
-            self.log_server_state.shutdown.notify_one();
-            if let Ok(mut port) = self.log_server_state.bound_port.lock() {
-                *port = None;
-            }
-            self.log_server_dirty = false;
-            self.log_server_sync_in_flight = false;
-            self.log_server_sync_queued = false;
-            self.last_log_server_snapshot_hash = None;
+            self.terminal_mirror_dirty = false;
+            self.terminal_mirror_sync_in_flight = false;
+            self.terminal_mirror_sync_queued = false;
+            self.last_terminal_mirror_snapshot_hash = None;
         }
 
         self.save_config();
+
+        if enabled {
+            Task::none()
+        } else {
+            self.clear_terminal_mirror()
+        }
     }
 
     fn mark_log_server_dirty(&mut self) {
-        if self.log_server_enabled {
-            self.log_server_dirty = true;
+        if self.terminal_log_mirroring_enabled {
+            self.terminal_mirror_dirty = true;
         }
     }
 
     fn queue_log_server_sync(&mut self) -> Task<Event> {
-        if !self.log_server_enabled {
-            self.log_server_dirty = false;
-            self.log_server_sync_queued = false;
-            self.next_log_server_sync_at =
+        if !self.terminal_log_mirroring_enabled {
+            self.terminal_mirror_dirty = false;
+            self.terminal_mirror_sync_queued = false;
+            self.next_terminal_mirror_sync_at =
                 Instant::now() + Duration::from_millis(LOG_SERVER_SYNC_INTERVAL_MS);
             return Task::none();
         }
 
-        if self.log_server_sync_in_flight {
-            self.log_server_sync_queued = true;
+        if self.terminal_mirror_sync_in_flight {
+            self.terminal_mirror_sync_queued = true;
             return Task::none();
         }
 
         // If the localhost log server is still starting, retry soon.
         if self.log_server_state.base_url().is_none() {
-            self.log_server_dirty = true;
-            self.next_log_server_sync_at =
+            self.terminal_mirror_dirty = true;
+            self.next_terminal_mirror_sync_at =
                 Instant::now() + Duration::from_millis(LOG_SERVER_STARTUP_RETRY_MS);
             return Task::none();
         }
 
-        self.log_server_dirty = false;
-        self.next_log_server_sync_at =
+        self.terminal_mirror_dirty = false;
+        self.next_terminal_mirror_sync_at =
             Instant::now() + Duration::from_millis(LOG_SERVER_SYNC_INTERVAL_MS);
 
         // PERFORMANCE: Terminal content extraction (get_all_text) is expensive — it
@@ -4983,13 +4996,12 @@ impl App {
 
         let state = self.log_server_state.clone();
         let mut terminal_snapshots = std::collections::HashMap::new();
-        let mut file_snapshots = std::collections::HashMap::new();
         let mut terminal_bytes = 0usize;
-        let mut file_bytes = 0usize;
         let mut snapshot_hasher = DefaultHasher::new();
         let mut budget_exceeded = false;
 
-        // Collect terminal content and file content from all tabs across all workspaces
+        // Collect terminal content from all tabs across all workspaces. File
+        // previews are captured only when the user chooses View in Browser.
         for tab in self.workspaces.iter().flat_map(|ws| ws.tabs.iter()) {
             tab.id.hash(&mut snapshot_hasher);
 
@@ -5014,25 +5026,6 @@ impl App {
             } else {
                 false.hash(&mut snapshot_hasher);
             }
-
-            // If tab is viewing a file, add it to file snapshots
-            if let Some(fv) = tab.file_viewer() {
-                if !fv.file_content.is_empty() {
-                    true.hash(&mut snapshot_hasher);
-                    file_bytes += fv.file_content.len();
-                    fv.path.to_string_lossy().hash(&mut snapshot_hasher);
-                    fv.file_content.hash(&mut snapshot_hasher);
-                    let snapshot = log_server::FileSnapshot {
-                        file_path: fv.path.to_string_lossy().to_string(),
-                        content: fv.file_content.clone(),
-                    };
-                    file_snapshots.insert(tab.id, snapshot);
-                } else {
-                    false.hash(&mut snapshot_hasher);
-                }
-            } else {
-                false.hash(&mut snapshot_hasher);
-            }
         }
 
         if budget_exceeded {
@@ -5043,24 +5036,21 @@ impl App {
         }
 
         let snapshot_hash = snapshot_hasher.finish();
-        if self.last_log_server_snapshot_hash == Some(snapshot_hash) {
+        if self.last_terminal_mirror_snapshot_hash == Some(snapshot_hash) {
             perf_log!(
-                "log_sync skip unchanged terminals={} files={} collect_took={}ms",
+                "terminal_mirror skip unchanged terminals={} collect_took={}ms",
                 terminal_snapshots.len(),
-                file_snapshots.len(),
                 started.elapsed().as_millis()
             );
             return Task::none();
         }
-        self.last_log_server_snapshot_hash = Some(snapshot_hash);
-        self.log_server_sync_in_flight = true;
+        self.last_terminal_mirror_snapshot_hash = Some(snapshot_hash);
+        self.terminal_mirror_sync_in_flight = true;
 
         perf_log!(
-            "log_sync terminals={} files={} term_bytes={}KB file_bytes={}KB collect_took={}ms",
+            "terminal_mirror terminals={} term_bytes={}KB collect_took={}ms",
             terminal_snapshots.len(),
-            file_snapshots.len(),
             terminal_bytes / 1024,
-            file_bytes / 1024,
             started.elapsed().as_millis()
         );
 
@@ -5068,10 +5058,8 @@ impl App {
             async move {
                 let mut terminals = state.terminals.write().await;
                 *terminals = terminal_snapshots;
-                let mut files = state.files.write().await;
-                *files = file_snapshots;
             },
-            |_| Event::LogServerSyncComplete,
+            |_| Event::TerminalMirrorSyncComplete,
         )
     }
 
@@ -6089,7 +6077,7 @@ impl App {
         } else {
             (config.terminal_font_size, config.ui_font_size)
         };
-        let log_server_enabled = config.log_server_enabled;
+        let terminal_log_mirroring_enabled = config.terminal_log_mirroring_enabled;
 
         // Initialize log server state
         let log_server_state = log_server::ServerState::new();
@@ -6113,7 +6101,7 @@ impl App {
             show_hidden: config.show_hidden,
             window_size: (1400.0, 800.0), // Initial size, updated on resize
             log_server_state,
-            log_server_enabled,
+            terminal_log_mirroring_enabled,
             browser_mcp,
             browser_status: None,
             browser_action: None,
@@ -6162,12 +6150,12 @@ impl App {
             closed_workspace_configs: Vec::new(),
             workspaces_dirty: false,
             next_workspace_save_at: None,
-            log_server_dirty: log_server_enabled,
-            next_log_server_sync_at: Instant::now(),
+            terminal_mirror_dirty: terminal_log_mirroring_enabled,
+            next_terminal_mirror_sync_at: Instant::now(),
             next_perf_report_at: Instant::now() + Duration::from_millis(PERF_REPORT_INTERVAL_MS),
-            log_server_sync_in_flight: false,
-            log_server_sync_queued: false,
-            last_log_server_snapshot_hash: None,
+            terminal_mirror_sync_in_flight: false,
+            terminal_mirror_sync_queued: false,
+            last_terminal_mirror_snapshot_hash: None,
             // Speech-to-text
             #[cfg(feature = "stt")]
             stt_enabled: config.stt_enabled,
@@ -6478,9 +6466,9 @@ impl App {
             app.workspaces.push(workspace);
         }
 
-        if app.log_server_enabled {
-            app.start_log_server();
-        }
+        // The localhost content server backs Plans, Docs, and on-demand browser
+        // previews. Terminal history mirroring is controlled independently.
+        app.start_log_server();
         app.sync_plans_dir();
         app.register_remote_agent_connection_defaults();
 
@@ -8319,7 +8307,7 @@ fi
                 }
 
                 // Throttled/queued log server sync
-                if self.log_server_dirty && now >= self.next_log_server_sync_at {
+                if self.terminal_mirror_dirty && now >= self.next_terminal_mirror_sync_at {
                     tasks.push(self.queue_log_server_sync());
                 }
 
@@ -8368,9 +8356,9 @@ fi
                         } else if event.id == ids.toggle_theme {
                             freeze_debug!("dispatching native menu: toggle_theme");
                             return self.update(Event::ToggleTheme);
-                        } else if event.id == ids.toggle_log_server {
-                            freeze_debug!("dispatching native menu: toggle_log_server");
-                            return self.update(Event::ToggleLogServer);
+                        } else if event.id == ids.toggle_terminal_log_mirroring {
+                            freeze_debug!("dispatching native menu: toggle_terminal_log_mirroring");
+                            return self.update(Event::ToggleTerminalLogMirroring);
                         } else if event.id == ids.clear_terminal {
                             freeze_debug!("dispatching native menu: clear_terminal");
                             return self.update(Event::ClearTerminal);
@@ -10109,18 +10097,38 @@ fi
                 }
             }
             Event::OpenFileInBrowser => {
-                self.mark_log_server_dirty();
-                if let Some(tab) = self.active_tab() {
-                    if tab
-                        .file_viewer()
-                        .map(|fv| !fv.file_content.is_empty())
-                        .unwrap_or(false)
-                    {
-                        if let Some(base_url) = self.log_server_state.base_url() {
-                            let url = format!("{}/file/{}", base_url, tab.id);
-                            let _ = std::process::Command::new("open").arg(&url).spawn();
-                        }
+                let Some((tab_id, snapshot)) = self.active_tab().and_then(|tab| {
+                    let viewer = tab.file_viewer()?;
+                    if viewer.file_content.is_empty() {
+                        return None;
                     }
+                    Some((
+                        tab.id,
+                        log_server::FileSnapshot {
+                            file_path: viewer.path.to_string_lossy().to_string(),
+                            content: viewer.file_content.clone(),
+                        },
+                    ))
+                }) else {
+                    return Task::none();
+                };
+                let state = self.log_server_state.clone();
+                return Task::perform(
+                    async move {
+                        state.files.write().await.insert(tab_id, snapshot);
+                        tab_id
+                    },
+                    Event::FileBrowserSnapshotReady,
+                );
+            }
+            Event::FileBrowserSnapshotReady(tab_id) => {
+                if let Some(base_url) = self.log_server_state.base_url() {
+                    let url = format!("{}/file/{}", base_url, tab_id);
+                    if let Err(error) = std::process::Command::new("open").arg(&url).spawn() {
+                        eprintln!("Failed to open file preview in browser ({url}): {error}");
+                    }
+                } else {
+                    eprintln!("Cannot open file preview: local content server is not running");
                 }
             }
             Event::ToggleTheme => {
@@ -10156,9 +10164,9 @@ fi
                     }
                 }
             }
-            Event::ToggleLogServer => {
-                let enabled = !self.log_server_enabled;
-                self.set_log_server_enabled(enabled);
+            Event::ToggleTerminalLogMirroring => {
+                let enabled = !self.terminal_log_mirroring_enabled;
+                return self.set_terminal_log_mirroring_enabled(enabled);
             }
             Event::IncreaseTerminalFont => {
                 let new_size = (self.terminal_font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE);
@@ -10937,16 +10945,20 @@ fi
                     }
                 }
             }
-            Event::LogServerSyncComplete => {
-                self.log_server_sync_in_flight = false;
-                if self.log_server_sync_queued {
-                    self.log_server_sync_queued = false;
-                    self.log_server_dirty = true;
+            Event::TerminalMirrorSyncComplete => {
+                self.terminal_mirror_sync_in_flight = false;
+                if !self.terminal_log_mirroring_enabled {
+                    return self.clear_terminal_mirror();
                 }
-                if self.log_server_dirty {
-                    return self.queue_log_server_sync();
+                if self.terminal_mirror_sync_queued {
+                    self.terminal_mirror_sync_queued = false;
+                    self.terminal_mirror_dirty = true;
                 }
+                // Never immediately rescan here. Output that arrived while a
+                // snapshot was being published stays dirty until the existing
+                // throttle deadline, preventing a self-sustaining scan loop.
             }
+            Event::TerminalMirrorCleared => {}
             Event::SyntectWarmupComplete => {}
             Event::LoadingUiTick => {}
             #[cfg(feature = "stt")]
@@ -11836,9 +11848,7 @@ fi
         plan: Option<String>,
     ) -> Task<Event> {
         let Some(base_url) = self.log_server_state.base_url() else {
-            eprintln!(
-                "[plans-viewer] cannot open: log server not running (View → Toggle Local Log Server)"
-            );
+            eprintln!("[plans-viewer] cannot open: local content server is not running");
             return Task::none();
         };
         let theme_str = match self.theme {
@@ -20837,24 +20847,20 @@ fi
             } else {
                 btn_color
             };
-            let log_server_status = if self.log_server_enabled {
-                if self.log_server_state.base_url().is_some() {
-                    ("Logs:on", theme.success())
-                } else {
-                    ("Logs:...", theme.warning())
-                }
+            let terminal_mirror_status = if self.terminal_log_mirroring_enabled {
+                ("Mirror:on", theme.success())
             } else {
-                ("Logs:off", theme.overlay0())
+                ("Mirror:off", theme.overlay0())
             };
             let log_toggle_btn = button(
-                text(log_server_status.0)
+                text(terminal_mirror_status.0)
                     .size(11)
-                    .color(log_server_status.1)
+                    .color(terminal_mirror_status.1)
                     .font(iced::Font::with_name("Menlo")),
             )
             .style(action_btn_style)
             .padding([2, 6])
-            .on_press(Event::ToggleLogServer);
+            .on_press(Event::ToggleTerminalLogMirroring);
             let search_btn = button(text("\u{2315}").size(12).color(search_icon_color))
                 .style(action_btn_style)
                 .padding([2, 6])
