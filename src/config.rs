@@ -123,6 +123,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_log_mirroring_is_opt_in() {
+        let mut serialized = serde_json::to_value(Config::default()).unwrap();
+        let object = serialized.as_object_mut().unwrap();
+        object.remove("terminal_log_mirroring_enabled");
+        // The retired setting controlled the whole local content server. It
+        // must not silently opt existing users into expensive history scans.
+        object.insert("log_server_enabled".into(), serde_json::Value::Bool(true));
+
+        let existing_config: Config = serde_json::from_value(serialized.clone()).unwrap();
+        assert!(!existing_config.terminal_log_mirroring_enabled);
+
+        serialized["terminal_log_mirroring_enabled"] = serde_json::Value::Bool(true);
+        let explicitly_enabled: Config = serde_json::from_value(serialized).unwrap();
+        assert!(explicitly_enabled.terminal_log_mirroring_enabled);
+    }
+
     #[cfg(feature = "stt")]
     #[test]
     fn stt_defaults_enabled_for_existing_and_new_configs() {
@@ -213,10 +230,6 @@ fn default_console_expanded() -> bool {
     true
 }
 
-fn default_log_server_enabled() -> bool {
-    true
-}
-
 fn default_remote_session_shell() -> String {
     "/bin/zsh".to_string()
 }
@@ -259,8 +272,10 @@ pub struct Config {
     pub console_height: f32,
     #[serde(default = "default_console_expanded")]
     pub console_expanded: bool,
-    #[serde(default = "default_log_server_enabled")]
-    pub log_server_enabled: bool,
+    /// Whether full terminal scrollback is mirrored into the local HTTP viewer.
+    /// This is intentionally opt-in because collecting long histories is expensive.
+    #[serde(default)]
+    pub terminal_log_mirroring_enabled: bool,
     #[cfg(feature = "stt")]
     #[serde(default = "default_stt_enabled")]
     pub stt_enabled: bool,
@@ -369,7 +384,7 @@ impl Default for Config {
             show_hidden: true,
             console_height: 200.0,
             console_expanded: true,
-            log_server_enabled: true,
+            terminal_log_mirroring_enabled: false,
             #[cfg(feature = "stt")]
             stt_enabled: true,
             #[cfg(feature = "stt")]
