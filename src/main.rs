@@ -2259,7 +2259,6 @@ struct NewTaskForm {
     objective: String,
     issue_key: String,
     base_reference: String,
-    preset_idx: usize,
     stopping_boundary: StoppingBoundary,
     submitting: bool,
     error: Option<String>,
@@ -2273,7 +2272,6 @@ pub struct PendingTaskLaunch {
     title: String,
     objective: String,
     issue_key: Option<String>,
-    preset_idx: usize,
     stopping_boundary: StoppingBoundary,
     resolved_worktree_path: Option<PathBuf>,
     request: PrepareTaskWorktreeRequest,
@@ -2349,6 +2347,8 @@ struct TabState {
     chat_session_id: Option<String>,
     // Durable task this tab views or runs. The task survives tab closure.
     task_id: Option<String>,
+    // Durable identity of this child session inside its task.
+    task_session_id: Option<String>,
     is_git_repo: bool,
 }
 
@@ -2401,6 +2401,7 @@ impl TabState {
             selected_chat_id: None,
             chat_session_id: None,
             task_id: None,
+            task_session_id: None,
             attention: None,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
@@ -3460,13 +3461,26 @@ impl Workspace {
     }
 }
 
-fn find_task_tab_in_workspaces(workspaces: &[Workspace], task_id: &str) -> Option<(usize, usize)> {
-    workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
-        ws.tabs
-            .iter()
-            .position(|tab| tab.task_id.as_deref() == Some(task_id))
-            .map(|tab_idx| (ws_idx, tab_idx))
-    })
+fn task_tab_indices(workspace: &Workspace, task_id: &str) -> Vec<usize> {
+    workspace
+        .tabs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tab)| (tab.task_id.as_deref() == Some(task_id)).then_some(index))
+        .collect()
+}
+
+fn find_task_session_tab(workspaces: &[Workspace], session_id: &str) -> Option<(usize, usize)> {
+    workspaces
+        .iter()
+        .enumerate()
+        .find_map(|(ws_idx, workspace)| {
+            workspace
+                .tabs
+                .iter()
+                .position(|tab| tab.task_session_id.as_deref() == Some(session_id))
+                .map(|tab_idx| (ws_idx, tab_idx))
+        })
 }
 
 fn compute_word_diff(old_text: &str, new_text: &str) -> Vec<InlineChange> {
@@ -3726,13 +3740,17 @@ pub enum Event {
     TaskObjectiveChanged(String),
     TaskIssueChanged(String),
     TaskBaseChanged(String),
-    TaskPresetSelected(usize),
     TaskStoppingBoundarySelected(StoppingBoundary),
     TaskCreateSubmit,
     TaskMetadataResolved(PendingTaskLaunch, Result<ResolvedTaskPreparation, String>),
     TaskWorktreePrepared(PendingTaskLaunch, Result<PreparedTaskWorktree, String>),
     TaskSelected(String),
-    TaskResumeAsTab(String),
+    TaskContextBack,
+    TaskOverview,
+    TaskChildAdd(String),
+    TaskChildLaunchPreset(String, usize),
+    TaskChildLaunchTerminal(String),
+    TaskFocusSession(String),
     TaskShowArchived(bool),
     TaskTabCloseCancel,
     TaskTabStopAndClose,
@@ -4995,6 +5013,7 @@ impl App {
                         agent_config: tab.agent_session().map(|s| s.config.clone()),
                         chat_session_id: tab.chat_session_id.clone(),
                         task_id: tab.task_id.clone(),
+                        task_session_id: tab.task_session_id.clone(),
                     })
                     .collect(),
                 run_command: ws.console.run_command.clone(),
@@ -5537,8 +5556,62 @@ impl App {
         })
     }
 
-    fn find_task_tab(&self, task_id: &str) -> Option<(usize, usize)> {
-        find_task_tab_in_workspaces(&self.workspaces, task_id)
+    fn active_task_context_id(&self) -> Option<&str> {
+        let tab = self.active_tab()?;
+        if tab.sidebar_mode == SidebarMode::Tasks {
+            self.selected_task_id.as_deref().or(tab.task_id.as_deref())
+        } else {
+            tab.task_id.as_deref()
+        }
+    }
+
+    fn task_session_count(&self, task_id: &str) -> usize {
+        self.workspaces
+            .iter()
+            .map(|workspace| task_tab_indices(workspace, task_id).len())
+            .sum()
+    }
+
+    fn enter_task_context(&mut self, task_id: &str) -> Task<Event> {
+        let Some(task) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id))
+            .cloned()
+        else {
+            self.task_ui_error = Some(format!("Task {task_id} is not available"));
+            return Task::none();
+        };
+        let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
+            self.task_ui_error =
+                Some("Remote task contexts require the later remote-executor slice".to_string());
+            return Task::none();
+        };
+        let workspace_idx =
+            self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
+        let overview_tab = self.workspaces[workspace_idx]
+            .tabs
+            .iter()
+            .position(|tab| tab.task_id.is_none());
+        let overview_tab = if let Some(index) = overview_tab {
+            index
+        } else {
+            let workspace_name = self.workspaces[workspace_idx].name.clone();
+            let workspace_dir = self.workspaces[workspace_idx].dir.clone();
+            let tab = self.create_tab_for_workspace(workspace_dir, None, Some(&workspace_name));
+            self.workspaces[workspace_idx].tabs.push(tab);
+            self.workspaces[workspace_idx].tabs.len() - 1
+        };
+        self.active_workspace_idx = workspace_idx;
+        self.workspaces[workspace_idx].active_tab = overview_tab;
+        self.workspaces[workspace_idx].tabs[overview_tab].sidebar_mode = SidebarMode::Tasks;
+        self.selected_task_id = Some(task_id.to_string());
+        self.task_ui_error = None;
+        self.hide_webview_for_non_agent();
+        self.mark_workspaces_dirty();
+        self.sync_plans_dir();
+        self.snap_slide_to_active_workspace();
+        self.scroll_to_active_tab()
     }
 
     fn record_task_ui_error(&mut self, task_id: &str, detail: String) {
@@ -5554,18 +5627,7 @@ impl App {
         }
     }
 
-    fn open_task_as_tab(&mut self, task_id: &str) -> Task<Event> {
-        if let Some((workspace_idx, tab_idx)) = self.find_task_tab(task_id) {
-            if let Some(tab) = self
-                .workspaces
-                .get_mut(workspace_idx)
-                .and_then(|workspace| workspace.tabs.get_mut(tab_idx))
-            {
-                tab.sidebar_mode = SidebarMode::Git;
-            }
-            return self.focus_workspace_tab(workspace_idx, tab_idx);
-        }
-
+    fn launch_task_child(&mut self, task_id: &str, preset_idx: Option<usize>) -> Task<Event> {
         let Some(task) = self
             .task_store
             .as_ref()
@@ -5590,24 +5652,23 @@ impl App {
             ));
             return Task::none();
         }
-        let HarnessKind::TerminalPreset { preset_name } = &task.harness.kind else {
-            self.task_ui_error = Some(format!(
-                "Task {} uses a native harness that this launch sheet cannot resume yet",
-                task.title
-            ));
-            return Task::none();
-        };
-        let Some(command) = self
-            .agent_presets
-            .iter()
-            .find(|preset| preset.name == *preset_name)
-            .map(|preset| preset.command.clone())
-        else {
-            self.record_task_ui_error(
-                task_id,
-                format!("Harness preset {preset_name:?} is no longer configured"),
-            );
-            return Task::none();
+        let (command, child_label, harness) = if let Some(index) = preset_idx {
+            let Some(preset) = self.agent_presets.get(index) else {
+                self.task_ui_error = Some("The selected agent preset is unavailable".to_string());
+                return Task::none();
+            };
+            (
+                Some(preset.command.clone()),
+                preset.name.clone(),
+                Some(HarnessSelection {
+                    kind: HarnessKind::TerminalPreset {
+                        preset_name: preset.name.clone(),
+                    },
+                    model: None,
+                }),
+            )
+        } else {
+            (None, "Terminal".to_string(), None)
         };
         let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
             self.task_ui_error =
@@ -5617,11 +5678,8 @@ impl App {
         let workspace_idx =
             self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
         let workspace_name = self.workspaces[workspace_idx].name.clone();
-        let mut tab = self.create_tab_for_workspace(
-            worktree_path.clone(),
-            Some(command),
-            Some(&workspace_name),
-        );
+        let mut tab =
+            self.create_tab_for_workspace(worktree_path.clone(), command, Some(&workspace_name));
         if tab.terminal().is_none() {
             self.record_task_ui_error(
                 task_id,
@@ -5634,13 +5692,25 @@ impl App {
         }
         tab.set_local_dir(worktree_path);
         tab.task_id = Some(task_id.to_string());
-        tab.repo_name = task.title.clone();
+        tab.task_session_id = Some(uuid::Uuid::new_v4().to_string());
+        tab.repo_name = format!("{child_label} · {}", task.title);
         tab.sidebar_mode = SidebarMode::Git;
         self.workspaces[workspace_idx].tabs.push(tab);
         self.workspaces[workspace_idx].active_tab = self.workspaces[workspace_idx].tabs.len() - 1;
         let tab_idx = self.workspaces[workspace_idx].active_tab;
         self.selected_task_id = Some(task_id.to_string());
         self.task_ui_error = None;
+        if let Some(harness) = harness {
+            if let Some(store) = self.task_store.as_mut() {
+                if let Some(mut record) = store.get(task_id).cloned() {
+                    record.harness = Some(harness);
+                    record.updated_at = chrono::Utc::now().to_rfc3339();
+                    if let Err(error) = store.replace(record) {
+                        self.task_store_error = Some(error.to_string());
+                    }
+                }
+            }
+        }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.focus_workspace_tab(workspace_idx, tab_idx)
@@ -6811,6 +6881,10 @@ impl App {
                         if let Some(task_id) = &tab_config.task_id {
                             if let Some(tab) = workspace.tabs.last_mut() {
                                 tab.task_id = Some(task_id.clone());
+                                tab.task_session_id = tab_config
+                                    .task_session_id
+                                    .clone()
+                                    .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
                             }
                         }
                     }
@@ -9975,7 +10049,12 @@ fi
                         // Option+Shift+1 through 9 launches agent preset by index
                         if let Ok(num) = c.parse::<usize>() {
                             if num >= 1 && num <= self.agent_presets.len() {
-                                return Task::done(Event::LaunchAgentPreset(num - 1));
+                                return Task::done(self.active_task_context_id().map_or(
+                                    Event::LaunchAgentPreset(num - 1),
+                                    |task_id| {
+                                        Event::TaskChildLaunchPreset(task_id.to_string(), num - 1)
+                                    },
+                                ));
                             }
                         }
                     }
@@ -10009,10 +10088,15 @@ fi
                                 return Task::done(Event::DecreaseTerminalFont);
                             }
                         } else if let Ok(num) = c.parse::<usize>() {
-                            let tab_count =
-                                self.active_workspace().map(|ws| ws.tabs.len()).unwrap_or(0);
-                            if (1..=9).contains(&num) && num <= tab_count {
-                                return Task::done(Event::TabSelect(num - 1));
+                            let visible_indices =
+                                self.active_workspace().map_or_else(Vec::new, |workspace| {
+                                    self.active_task_context_id().map_or_else(
+                                        || (0..workspace.tabs.len()).collect(),
+                                        |task_id| task_tab_indices(workspace, task_id),
+                                    )
+                                });
+                            if (1..=9).contains(&num) && num <= visible_indices.len() {
+                                return Task::done(Event::TabSelect(visible_indices[num - 1]));
                             }
                         }
                     }
@@ -10074,7 +10158,6 @@ fi
                     } else {
                         tab.branch_name.clone()
                     },
-                    preset_idx: 0,
                     stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
                     submitting: false,
                     error: None,
@@ -10113,12 +10196,6 @@ fi
                     form.error = None;
                 }
             }
-            Event::TaskPresetSelected(index) => {
-                if let Some(form) = self.new_task_form.as_mut().filter(|form| !form.submitting) {
-                    form.preset_idx = index;
-                    form.error = None;
-                }
-            }
             Event::TaskStoppingBoundarySelected(boundary) => {
                 if let Some(form) = self.new_task_form.as_mut().filter(|form| !form.submitting) {
                     form.stopping_boundary = boundary;
@@ -10148,8 +10225,6 @@ fi
                     .is_some_and(|key| !is_linear_issue_key(key))
                 {
                     Some("Linear issue must look like TRU-105".to_string())
-                } else if self.agent_presets.get(form.preset_idx).is_none() {
-                    Some("Choose a configured harness preset".to_string())
                 } else {
                     None
                 };
@@ -10172,7 +10247,6 @@ fi
                     title,
                     objective,
                     issue_key,
-                    preset_idx: form.preset_idx,
                     stopping_boundary: form.stopping_boundary,
                     resolved_worktree_path: None,
                     request: request.clone(),
@@ -10198,13 +10272,6 @@ fi
                         return Task::none();
                     }
                 };
-                let Some(preset) = self.agent_presets.get(pending.preset_idx) else {
-                    if let Some(form) = self.new_task_form.as_mut() {
-                        form.submitting = false;
-                        form.error = Some("The selected harness preset was removed".to_string());
-                    }
-                    return Task::none();
-                };
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 let mut record = TaskRecord::new_draft(
                     NewTaskRecord {
@@ -10226,12 +10293,7 @@ fi
                         base: resolved.base.clone(),
                         branch: resolved.proposal.branch.clone(),
                         executor: ExecutorTarget::Local,
-                        harness: HarnessSelection {
-                            kind: HarnessKind::TerminalPreset {
-                                preset_name: preset.name.clone(),
-                            },
-                            model: None,
-                        },
+                        harness: None,
                         stopping_boundary: pending.stopping_boundary,
                     },
                     timestamp.clone(),
@@ -10273,7 +10335,7 @@ fi
                         )
                     });
                     match persisted {
-                        Some(Ok(())) => return self.open_task_as_tab(&pending.task_id),
+                        Some(Ok(())) => return self.enter_task_context(&pending.task_id),
                         Some(Err(error)) => {
                             let message = error.to_string();
                             eprintln!("GitTerm V5 could not save prepared task: {message}");
@@ -10306,11 +10368,66 @@ fi
                 }
             },
             Event::TaskSelected(task_id) => {
-                self.selected_task_id = Some(task_id);
+                return self.enter_task_context(&task_id);
             }
-            Event::TaskResumeAsTab(task_id) => {
-                self.selected_task_id = Some(task_id.clone());
-                return self.open_task_as_tab(&task_id);
+            Event::TaskContextBack => {
+                self.tab_picker_visible = false;
+                self.selected_task_id = None;
+                let Some(workspace_idx) = self
+                    .workspaces
+                    .get(self.active_workspace_idx)
+                    .map(|_| self.active_workspace_idx)
+                else {
+                    return Task::none();
+                };
+                let ordinary_tab = self.workspaces[workspace_idx]
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.task_id.is_none());
+                let tab_idx = if let Some(index) = ordinary_tab {
+                    index
+                } else {
+                    let workspace_name = self.workspaces[workspace_idx].name.clone();
+                    let workspace_dir = self.workspaces[workspace_idx].dir.clone();
+                    let tab =
+                        self.create_tab_for_workspace(workspace_dir, None, Some(&workspace_name));
+                    self.workspaces[workspace_idx].tabs.push(tab);
+                    self.workspaces[workspace_idx].tabs.len() - 1
+                };
+                self.workspaces[workspace_idx].active_tab = tab_idx;
+                self.workspaces[workspace_idx].tabs[tab_idx].sidebar_mode = SidebarMode::Git;
+                self.mark_workspaces_dirty();
+                return self.update(Event::TabSelect(tab_idx));
+            }
+            Event::TaskOverview => {
+                let task_id = self.active_task_context_id().map(str::to_string);
+                if let Some(task_id) = task_id {
+                    return self.enter_task_context(&task_id);
+                }
+            }
+            Event::TaskChildAdd(task_id) => {
+                self.selected_task_id = Some(task_id);
+                self.tab_picker_visible = true;
+            }
+            Event::TaskChildLaunchPreset(task_id, preset_idx) => {
+                self.tab_picker_visible = false;
+                return self.launch_task_child(&task_id, Some(preset_idx));
+            }
+            Event::TaskChildLaunchTerminal(task_id) => {
+                self.tab_picker_visible = false;
+                return self.launch_task_child(&task_id, None);
+            }
+            Event::TaskFocusSession(session_id) => {
+                let Some((workspace_idx, tab_idx)) =
+                    find_task_session_tab(&self.workspaces, &session_id)
+                else {
+                    self.task_ui_error = Some(format!(
+                        "Task session {} is no longer open",
+                        session_id.chars().take(8).collect::<String>()
+                    ));
+                    return Task::none();
+                };
+                return self.focus_workspace_tab(workspace_idx, tab_idx);
             }
             Event::TaskShowArchived(show_archived) => {
                 self.task_show_archived = show_archived;
@@ -10340,8 +10457,22 @@ fi
                 self.workspaces[prompt.workspace_idx]
                     .tabs
                     .remove(prompt.tab_idx);
+                let sibling =
+                    task_tab_indices(&self.workspaces[prompt.workspace_idx], &prompt.task_id)
+                        .into_iter()
+                        .next();
                 let workspace = &mut self.workspaces[prompt.workspace_idx];
-                workspace.active_tab = workspace.active_tab.min(workspace.tabs.len() - 1);
+                if let Some(sibling) = sibling {
+                    workspace.active_tab = sibling;
+                } else {
+                    workspace.active_tab = workspace
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.task_id.is_none())
+                        .unwrap_or(0);
+                    workspace.tabs[workspace.active_tab].sidebar_mode = SidebarMode::Tasks;
+                    self.selected_task_id = Some(prompt.task_id);
+                }
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
                 return self.scroll_to_active_tab();
@@ -13587,6 +13718,7 @@ fi
         let text_secondary = theme.text_secondary();
         let hover_bg = theme.surface0();
         let mono = iced::Font::with_name("Menlo");
+        let task_context_id = self.active_task_context_id().map(str::to_string);
 
         let picker_row = |label: String,
                           desc: String,
@@ -13631,7 +13763,24 @@ fi
             .into()
         };
 
-        let mut items = Column::new().spacing(0).width(Length::Fixed(240.0));
+        let mut items = Column::new().spacing(0).width(Length::Fixed(260.0));
+        if let Some(task_id) = task_context_id.as_deref() {
+            let task_title = self
+                .task_store
+                .as_ref()
+                .and_then(|store| store.get(task_id))
+                .map(|task| task.title.as_str())
+                .unwrap_or("Task");
+            items = items.push(
+                column![
+                    text("ADD TO TASK").size(9).color(theme.accent()).font(mono),
+                    text(task_title).size(12).color(text_primary).font(mono),
+                    text("AGENTS").size(9).color(text_secondary).font(mono),
+                ]
+                .spacing(3)
+                .padding([7, 10]),
+            );
+        }
         for (idx, preset) in self.agent_presets.iter().enumerate() {
             let icon = if preset.icon.is_empty() {
                 preset.name.chars().next().unwrap_or('?').to_string()
@@ -13639,31 +13788,55 @@ fi
                 preset.icon.clone()
             };
             let accent = preset.color.color(theme);
+            let launch_event = task_context_id
+                .as_ref()
+                .map_or(Event::LaunchAgentPreset(idx), |task_id| {
+                    Event::TaskChildLaunchPreset(task_id.clone(), idx)
+                });
             items = items.push(picker_row(
                 preset.name.clone(),
                 preset.command.clone(),
                 icon.clone(),
                 accent,
-                Event::LaunchAgentPreset(idx),
+                launch_event,
             ));
             // Add resume row if the preset has a resume command
-            if let Some(resume_cmd) = &preset.resume_command {
-                items = items.push(picker_row(
-                    format!("{} (resume)", preset.name),
-                    resume_cmd.clone(),
-                    "\u{21ba}".to_string(), // ↺ symbol
-                    accent,
-                    Event::ResumeAgentPreset(idx),
-                ));
+            if task_context_id.is_none() {
+                if let Some(resume_cmd) = &preset.resume_command {
+                    items = items.push(picker_row(
+                        format!("{} (resume)", preset.name),
+                        resume_cmd.clone(),
+                        "\u{21ba}".to_string(), // ↺ symbol
+                        accent,
+                        Event::ResumeAgentPreset(idx),
+                    ));
+                }
             }
         }
+        if task_context_id.is_some() {
+            items = items.push(
+                container(text("TOOLS").size(9).color(text_secondary).font(mono)).padding(
+                    iced::Padding {
+                        top: 8.0,
+                        right: 10.0,
+                        bottom: 3.0,
+                        left: 10.0,
+                    },
+                ),
+            );
+        }
         // Always add plain terminal at the bottom
+        let terminal_event = task_context_id
+            .as_ref()
+            .map_or(Event::NewPlainTab, |task_id| {
+                Event::TaskChildLaunchTerminal(task_id.clone())
+            });
         items = items.push(picker_row(
             "Terminal".to_string(),
             "Plain shell".to_string(),
             "\u{25b8}".to_string(),
             text_secondary,
-            Event::NewPlainTab,
+            terminal_event,
         ));
 
         let picker_menu = container(items)
@@ -15616,12 +15789,13 @@ fi
 
     fn view_tab_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
+        let task_context_id = self.active_task_context_id().map(str::to_string);
 
         // === Left section: scrollable tabs ===
         let mut tabs_row = Row::new().spacing(2);
 
         // Left edge peek indicator
-        if self.edge_peek_left {
+        if task_context_id.is_none() && self.edge_peek_left {
             if let Some(left_ws) = self
                 .workspaces
                 .get(self.active_workspace_idx.wrapping_sub(1))
@@ -15644,20 +15818,95 @@ fi
             }
         }
 
-        let (tabs, active_tab_idx, workspace_is_remote) = if let Some(ws) = self.active_workspace()
-        {
-            (
-                ws.tabs.as_slice(),
-                ws.active_tab,
-                self.workspace_has_remote_identity(ws),
-            )
-        } else {
-            (&[] as &[TabState], 0, false)
-        };
+        let (tabs, active_tab_idx, workspace_is_remote, visible_indices) =
+            if let Some(ws) = self.active_workspace() {
+                let visible_indices = task_context_id.as_deref().map_or_else(
+                    || (0..ws.tabs.len()).collect(),
+                    |task_id| task_tab_indices(ws, task_id),
+                );
+                (
+                    ws.tabs.as_slice(),
+                    ws.active_tab,
+                    self.workspace_has_remote_identity(ws),
+                    visible_indices,
+                )
+            } else {
+                (&[] as &[TabState], 0, false, Vec::new())
+            };
+
+        if let Some(task_id) = task_context_id.as_deref() {
+            let text_muted = theme.text_muted();
+            let text_primary = theme.text_primary();
+            let accent = theme.accent();
+            let surface0 = theme.surface0();
+            let mono = iced::Font::with_name("Menlo");
+            let title = self
+                .task_store
+                .as_ref()
+                .and_then(|store| store.get(task_id))
+                .map(|task| task.title.as_str())
+                .unwrap_or("Task");
+            let back = button(text("‹ Workspace").size(11).color(text_muted).font(mono))
+                .style(move |_, status| button::Style {
+                    background: matches!(status, button::Status::Hovered)
+                        .then_some(surface0.into()),
+                    text_color: text_muted,
+                    ..Default::default()
+                })
+                .padding([4, 7])
+                .on_press(Event::TaskContextBack);
+            let marker = container(iced::widget::Space::new())
+                .width(Length::Fixed(3.0))
+                .height(Length::Fixed(22.0))
+                .style(move |_| container::Style {
+                    background: Some(accent.into()),
+                    border: iced::Border {
+                        radius: 2.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            let task_label = column![
+                text("TASK").size(9).color(accent).font(mono),
+                text(title).size(12).color(text_primary).font(mono),
+            ]
+            .spacing(0);
+            let overview_active = self
+                .active_tab()
+                .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Tasks);
+            let overview = button(text("Overview").size(12).font(mono))
+                .style(move |_, status| button::Style {
+                    background: if overview_active {
+                        Some(theme.bg_base().into())
+                    } else if matches!(status, button::Status::Hovered) {
+                        Some(surface0.into())
+                    } else {
+                        None
+                    },
+                    text_color: if overview_active {
+                        text_primary
+                    } else {
+                        text_muted
+                    },
+                    border: iced::Border {
+                        radius: 5.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .padding([4, 9])
+                .on_press(Event::TaskOverview);
+            tabs_row = tabs_row
+                .push(back)
+                .push(marker)
+                .push(container(task_label).padding([0, 7]))
+                .push(overview);
+        }
 
         let pulse_bright = self.attention_pulse_bright;
 
-        for (idx, tab) in tabs.iter().enumerate() {
+        for (visible_position, idx) in visible_indices.into_iter().enumerate() {
+            let tab = &tabs[idx];
             let is_active = idx == active_tab_idx;
             let attention_reason = tab.attention.map(|attention| attention.reason);
             let has_attention = attention_reason.is_some();
@@ -15746,9 +15995,9 @@ fi
                     .font(iced::Font::with_name("Menlo")),
             );
 
-            if idx < 9 {
+            if visible_position < 9 {
                 tab_content = tab_content.push(
-                    text(format!(" \u{2318}{}", idx + 1))
+                    text(format!(" \u{2318}{}", visible_position + 1))
                         .size(10)
                         .color(theme.surface2())
                         .font(iced::Font::with_name("Menlo")),
@@ -15817,10 +16066,11 @@ fi
             );
         }
 
-        let sessions_supported = self
-            .source_for_active_tab()
-            .map(|source| source.capabilities().sessions)
-            .unwrap_or(false);
+        let sessions_supported = task_context_id.is_some()
+            || self
+                .source_for_active_tab()
+                .map(|source| source.capabilities().sessions)
+                .unwrap_or(false);
         if sessions_supported {
             // Add tab button
             let add_color = theme.overlay0();
@@ -15839,7 +16089,9 @@ fi
                     }
                 })
                 .padding([4, 8])
-                .on_press(if self.agent_presets.is_empty() {
+                .on_press(if let Some(task_id) = task_context_id.clone() {
+                    Event::TaskChildAdd(task_id)
+                } else if self.agent_presets.is_empty() {
                     Event::NewPlainTab
                 } else {
                     Event::LaunchAgentPreset(0)
@@ -15947,7 +16199,7 @@ fi
         }
 
         // Right edge peek indicator
-        if self.edge_peek_right {
+        if task_context_id.is_none() && self.edge_peek_right {
             if let Some(right_ws) = self.workspaces.get(self.active_workspace_idx + 1) {
                 let ws_color = right_ws.color.color(theme);
                 let peek_btn = button(
@@ -17095,7 +17347,7 @@ fi
                     );
                 }
 
-                let live = self.find_task_tab(&task.task_id).is_some();
+                let session_count = self.task_session_count(&task.task_id);
                 let selected = self.selected_task_id.as_deref() == Some(task.task_id.as_str());
                 let state_color = match task.lifecycle {
                     TaskLifecycle::Preparing | TaskLifecycle::Queued => theme.warning(),
@@ -17112,8 +17364,8 @@ fi
                     .map(|issue| issue.key.as_str())
                     .unwrap_or("local");
                 let meta = format!("{} · {}", issue, task.branch);
-                let status = if live {
-                    format!("● {}", task_lifecycle_label(task.lifecycle))
+                let status = if session_count > 0 {
+                    format!("{session_count} sessions")
                 } else {
                     task_lifecycle_label(task.lifecycle).to_string()
                 };
@@ -17211,29 +17463,14 @@ fi
             ]
             .spacing(12)
         };
-        let live = self.find_task_tab(&task.task_id).is_some();
-        let can_resume = live
-            || (task.worktree.state == TaskWorktreeState::Ready
-                && task.worktree.path.is_some()
-                && matches!(
-                    task.lifecycle,
-                    TaskLifecycle::Ready
-                        | TaskLifecycle::Running
-                        | TaskLifecycle::WaitingForInput
-                        | TaskLifecycle::Stopped
-                        | TaskLifecycle::Interrupted
-                        | TaskLifecycle::Failed
-                        | TaskLifecycle::Completed
-                ));
-        let action_label = if live {
-            "Go to session"
-        } else {
-            "Resume as tab"
-        };
-        let action = button(text(action_label).size(12).font(mono))
+        let session_count = self.task_session_count(&task.task_id);
+        let can_add_session = task.worktree.state == TaskWorktreeState::Ready
+            && task.worktree.path.is_some()
+            && task.lifecycle != TaskLifecycle::Archived;
+        let action = button(text("+ Add session").size(12).font(mono))
             .style(self.ghost_button_style())
             .padding([6, 12])
-            .on_press_maybe(can_resume.then(|| Event::TaskResumeAsTab(task.task_id.clone())));
+            .on_press_maybe(can_add_session.then(|| Event::TaskChildAdd(task.task_id.clone())));
         let short_commit = task.base.commit.chars().take(10).collect::<String>();
         let worktree = task
             .worktree
@@ -17268,13 +17505,53 @@ fi
             ))
             .push(value_row("BRANCH", task.branch.clone()))
             .push(value_row("WORKTREE", worktree))
-            .push(value_row("HARNESS", task_harness_label(&task.harness.kind)))
+            .push(value_row("SESSIONS", session_count.to_string()))
             .push(value_row(
                 "STOP WHEN",
                 stopping_boundary_label(task.stopping_boundary).to_string(),
             ));
         if let Some(error) = &task.last_error {
             details = details.push(value_row("LAST ERROR", error.clone()));
+        }
+        if let Some(harness) = &task.harness {
+            details = details.push(value_row("LAST AGENT", task_harness_label(&harness.kind)));
+        }
+
+        let mut sessions = Column::new().spacing(5);
+        if let Some(workspace) = self.active_workspace() {
+            for index in task_tab_indices(workspace, &task.task_id) {
+                let tab = &workspace.tabs[index];
+                let session = tab
+                    .task_session_id
+                    .as_deref()
+                    .map(|id| id.chars().take(8).collect::<String>())
+                    .unwrap_or_else(|| "legacy".to_string());
+                sessions = sessions.push(
+                    button(
+                        row![
+                            text(tab.repo_name.as_str())
+                                .size(12)
+                                .color(text_primary)
+                                .font(mono)
+                                .width(Length::Fill),
+                            text(session).size(10).color(text_muted).font(mono),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .style(self.ghost_button_style())
+                    .padding([6, 9])
+                    .width(Length::Fill)
+                    .on_press_maybe(tab.task_session_id.clone().map(Event::TaskFocusSession)),
+                );
+            }
+        }
+        if session_count == 0 {
+            sessions = sessions.push(
+                text("No sessions yet. Add an agent or terminal to begin.")
+                    .size(11)
+                    .color(text_muted),
+            );
         }
 
         let content = column![
@@ -17283,7 +17560,11 @@ fi
                     text(&task.title).size(20).color(text_primary),
                     text(format!(
                         "{}  {}",
-                        if live { "● LIVE" } else { "○ DETACHED" },
+                        if session_count > 0 {
+                            "◆ TASK"
+                        } else {
+                            "◇ TASK"
+                        },
                         task_lifecycle_label(task.lifecycle).to_uppercase()
                     ))
                     .size(10)
@@ -17304,6 +17585,8 @@ fi
                     ..Default::default()
                 }),
             details,
+            text("CHILD TABS").size(10).color(text_muted).font(mono),
+            sessions,
         ]
         .spacing(18)
         .padding(32)
@@ -17392,42 +17675,6 @@ fi
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "—".to_string());
 
-        let mut presets = Row::new().spacing(6);
-        for (index, preset) in self.agent_presets.iter().enumerate() {
-            let selected = index == form.preset_idx;
-            presets = presets.push(
-                button(text(&preset.name).size(11).font(mono))
-                    .style(move |_, status| button::Style {
-                        background: Some(
-                            if selected {
-                                accent
-                            } else if matches!(status, button::Status::Hovered) {
-                                theme.surface0()
-                            } else {
-                                iced::Color::TRANSPARENT
-                            }
-                            .into(),
-                        ),
-                        text_color: if selected { bg_base } else { text_secondary },
-                        border: iced::Border {
-                            color: if selected { accent } else { border },
-                            width: 1.0,
-                            radius: 3.0.into(),
-                        },
-                        ..Default::default()
-                    })
-                    .padding([4, 9])
-                    .on_press(Event::TaskPresetSelected(index)),
-            );
-        }
-        if self.agent_presets.is_empty() {
-            presets = presets.push(
-                text("No terminal harness presets configured")
-                    .size(11)
-                    .color(danger),
-            );
-        }
-
         let mut boundaries = Row::new().spacing(6);
         for boundary in [
             StoppingBoundary::PlanOnly,
@@ -17514,8 +17761,6 @@ fi
                 ]
                 .spacing(8),
             )
-            .push(text("HARNESS PRESET").size(10).color(text_muted).font(mono))
-            .push(presets)
             .push(
                 text("STOPPING BOUNDARY")
                     .size(10)
@@ -23115,29 +23360,27 @@ mod tests {
     }
 
     #[test]
-    fn task_tab_registry_finds_one_live_view_across_workspaces() {
-        let mut first = Workspace::new(
-            "First".to_string(),
-            PathBuf::from("/first"),
+    fn task_context_supports_multiple_distinct_child_sessions() {
+        let mut workspace = Workspace::new(
+            "GitTerm".to_string(),
+            PathBuf::from("/repo"),
             WorkspaceColor::Blue,
         );
-        first.tabs.push(TabState::new(1, PathBuf::from("/first")));
+        for (id, session_id) in [(1, "session-1"), (2, "session-2")] {
+            let mut task_tab = TabState::new(id, PathBuf::from("/worktree"));
+            task_tab.task_id = Some("task-105".to_string());
+            task_tab.task_session_id = Some(session_id.to_string());
+            workspace.tabs.push(task_tab);
+        }
 
-        let mut second = Workspace::new(
-            "Second".to_string(),
-            PathBuf::from("/second"),
-            WorkspaceColor::Green,
-        );
-        let mut task_tab = TabState::new(2, PathBuf::from("/worktree"));
-        task_tab.task_id = Some("task-105".to_string());
-        second.tabs.push(task_tab);
+        assert_eq!(task_tab_indices(&workspace, "task-105"), vec![0, 1]);
 
-        let workspaces = vec![first, second];
+        let workspaces = vec![workspace];
         assert_eq!(
-            find_task_tab_in_workspaces(&workspaces, "task-105"),
-            Some((1, 0))
+            find_task_session_tab(&workspaces, "session-2"),
+            Some((0, 1))
         );
-        assert_eq!(find_task_tab_in_workspaces(&workspaces, "missing"), None);
+        assert_eq!(find_task_session_tab(&workspaces, "missing"), None);
     }
 
     #[test]

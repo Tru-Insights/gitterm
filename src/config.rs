@@ -145,10 +145,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(linked.task_id.as_deref(), Some("task-1"));
+        assert_eq!(linked.task_session_id, None);
         assert_eq!(
             serde_json::to_value(linked).unwrap()["task_id"],
             serde_json::json!("task-1")
         );
+
+        let session: WorkspaceTabConfig = serde_json::from_value(serde_json::json!({
+            "dir": "/worktrees/task-1",
+            "task_id": "task-1",
+            "task_session_id": "session-1"
+        }))
+        .unwrap();
+        assert_eq!(session.task_session_id.as_deref(), Some("session-1"));
     }
 
     #[test]
@@ -624,6 +633,10 @@ pub struct WorkspaceTabConfig {
     /// Durable task owned by this view. Closing the tab does not remove the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Durable identity for this child view inside a task. Several tabs may
+    /// share one task id; this id distinguishes their sessions across restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

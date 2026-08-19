@@ -71,15 +71,47 @@ process may stop when GitTerm exits, but the task, worktree, branch, and harness
 session remain resumable. A remote `agentd` session continues while the desktop
 is disconnected.
 
+### A task contains its own tab set
+
+The visible hierarchy is:
+
+```text
+Workspace
+  -> Task
+      -> agent session tab (Claude, Codex, Pi, Cursor, or another preset)
+      -> plain terminal tab
+      -> Plan view
+      -> Pull Request view
+```
+
+Workspace tabs remain valid for ad hoc repository work. Entering a task changes
+the top tab bar into that task's context: a back-to-workspace control, the task
+identity, its child tabs, and a task-scoped `+` launcher. The first implementation
+may store terminal widgets in the workspace's existing flat tab vector, but the
+product contract and navigation treat every tab carrying the same `task_id` as
+a child of that task.
+
+The task owns the objective, branch, and worktree. A child agent session owns
+its harness and model selection. Creating a task must not permanently bind it to
+one harness, and a task may retain multiple Claude, Codex, Pi, terminal, or
+future view tabs. Session identity, rather than task identity, is the uniqueness
+boundary for restoring or focusing a live child tab.
+
+Multiple child tabs may remain open and resumable. The execution policy still
+guards concurrent mutation of the shared worktree; multiple visible tabs do not
+imply that autonomous writers should run concurrently without an explicit
+policy.
+
 ### Sprite is the worker metaphor, not another MVP record
 
 "Sprite" is GitTerm product language for an autonomous worker assigned to a
 task. It was chosen as a more appropriate metaphor than "minion."
 
 For the first implementation, Sprite is not a separate top-level navigation
-object or persistence table. The assigned harness/session is the task's worker.
-If multi-worker tasks become real, a durable worker identity can be introduced
-from evidence rather than assumed now.
+object or persistence table. Each agent-session child tab is one worker view and
+its execution attempt carries the harness/session identity. A durable worker
+identity can still be introduced later if continuity across several attempts
+proves useful.
 
 Fly.io's `sprites.dev` is unrelated infrastructure. GitTerm does not need Fly
 for this design. If supported someday, it would be one executor runtime and
@@ -133,7 +165,7 @@ state, credentials, or machine resources. Task execution therefore also needs:
 |---|---|---|
 | Workspace | A project context on one machine | Long-lived |
 | Task | A bounded objective and its delivery lifecycle | Until archived |
-| Sprite | Human-facing name for the assigned autonomous worker | One execution at a time initially |
+| Sprite | Human-facing name for an autonomous worker session inside a task | One execution attempt |
 | Execution attempt | One launch or resume of a task's worker | Until completion, failure, or stop |
 | Tab | A view into a terminal, agent session, task, document, or browser | Open/close freely |
 | Executor | The machine/runtime that performs an attempt | Selected per attempt |
@@ -147,20 +179,20 @@ records.
 ### Create and run a local task
 
 From an active workspace, the user chooses **New Task** or asks an agent to
-create one. The launch sheet shows:
+create one. The task sheet shows:
 
 - title/objective;
 - optional Linear or GitHub issue;
 - repository and exact base ref;
 - proposed branch and worktree;
-- harness/profile and model;
 - executor (`This Mac` initially);
 - stopping boundary, such as plan only, implement until tests pass, or prepare
   a draft PR.
 
-Starting the task creates the worktree, opens or focuses its linked tab, and
-starts the selected harness there. The new task appears in the cross-workspace
-task view immediately.
+Creating the task prepares its worktree and enters the empty task context. The
+task-scoped `+` launcher then starts Claude, Codex, Pi, a custom harness preset,
+or a plain terminal in that worktree. The sheet may offer an optional initial
+agent shortcut later, but task creation itself remains harness-neutral.
 
 ### Observe progress without reading raw commands
 
@@ -185,8 +217,9 @@ The existing cross-workspace Attention view should consume task state alongside
 tab attention. It answers "what needs me now?" and remains a filtered view.
 
 The Tasks view answers "what exists and what is it doing?" It includes running,
-quiet, completed, stopped, and archived work. Selecting a task focuses its live
-tab or opens its task detail if no tab is attached.
+quiet, completed, stopped, and archived work. Selecting a task enters its task
+context: an overview plus every open child agent, terminal, plan, or review
+view associated with that task.
 
 Initial attention reasons:
 
@@ -227,7 +260,7 @@ TaskRecord
   task branch
   worktree location (source-native path)
   executor target
-  harness/profile selection
+  optional last/default harness selection as a launch convenience
   stopping boundary
   lifecycle state
   attention state
@@ -238,9 +271,10 @@ TaskRecord
   archive state
 ```
 
-An execution attempt records the executor, start/end time, session reference,
-result, and failure context. Only one attempt may actively mutate a task
-worktree at a time.
+An execution attempt records the executor, harness/model, start/end time,
+session reference, result, and failure context. Only one attempt may actively
+mutate a task worktree at a time unless a later explicit concurrency policy
+allows more.
 
 The initial lifecycle vocabulary should remain explicit and small:
 
@@ -367,9 +401,10 @@ process survival.
    **Plan only** and **Prepare a draft PR**.
 5. Completed tasks archive and clean up manually. Merge detection may suggest
    cleanup later, but never performs it automatically.
-6. Closing a live task tab prompts the user to keep the view open or stop the
-   run. V5 will not hide a live process behind a closed tab while process
-   ownership still lives in `TabState`.
+6. Closing a live task child tab prompts the user to keep the view open or stop
+   that session. Other child tabs and the durable task remain intact. V5 will
+   not hide a live process behind a closed tab while process ownership still
+   lives in `TabState`.
 7. The first launch paths are configured terminal-backed harnesses plus the
    existing native Claude and Pi tabs where their session contracts fit.
    Named shell/test profiles remain deferred until local task execution works.

@@ -1,6 +1,6 @@
 # GitTerm V5 Task and Sprite Implementation Plan
 
-**Status:** Slices 0-3 complete; minimal Tasks UI next
+**Status:** Slices 0-4 complete; Slice 5 lifecycle and attention next
 
 **Captured:** 2026-08-19
 
@@ -74,13 +74,15 @@ Tasks:
   `~/.config/gitterm-v5/worktrees`.
 - [x] Choose the initial branch-name template:
   `task/<issue-or-task-id>-<slug>`.
-- [x] Confirm the first supported launch paths:
+- [x] Confirm the first supported child-tab launch paths:
   - terminal-backed configured harnesses;
   - native Claude/Pi agent tabs where appropriate;
   - named shell/test profiles deferred until local task execution works.
 - [x] Default the stopping boundary to **Implement until tests pass**, with
   **Plan only** and **Prepare a draft PR** as initial alternatives.
-- [x] Keep archive/cleanup manual and prompt before closing a live task tab.
+- [x] Keep archive/cleanup manual and prompt before closing a live task child tab.
+- [x] Confirm the visible hierarchy is Workspace -> Task -> child tabs. Harness
+  and model selection belong to each child session, not permanently to the task.
 - [x] Create the Linear issue breakdown and use focused implementation branches
   based on `v5` when a slice is ready to commit and publish.
 
@@ -176,39 +178,42 @@ Exit gate:
 - A task can move `draft -> preparing -> ready` with a valid isolated branch and
   worktree, and failures leave no ambiguous repository state.
 
-## Slice 4 - Minimal Tasks UI and Task-Linked Tabs
+## Slice 4 - Minimal Tasks UI and Task Child Tabs
 
-**Goal:** Create a task from the active workspace, open its actual session, and
-return to it later.
+**Goal:** Create a task from the active workspace, enter its nested context,
+open one or more task-scoped sessions, and return to them later.
 
 Tasks:
 
-- Add the chosen all-tasks surface with cross-workspace grouping and basic
+- [x] Add the chosen all-tasks surface with cross-workspace grouping and basic
   filters.
-- Add **New Task** from the active workspace.
-- Launch sheet fields: objective/title, optional issue, base ref, proposed
-  branch/worktree, harness profile, and local executor.
-- Create the task and worktree asynchronously with visible preparation steps.
-- Add `task_id` to persisted tab configuration.
-- Open the selected existing terminal-backed or native agent launch path in the
-  task worktree.
-- Enforce one live task tab per task; selecting the task focuses that tab across
-  workspaces.
-- If no tab is open, show task details and a **Resume as Tab** action.
-- Keep ordinary non-task tabs unchanged.
+- [x] Add **New Task** from the active workspace.
+- [x] Task sheet fields: objective/title, optional issue, base ref, proposed
+  branch/worktree, stopping boundary, and local executor. It is harness-neutral.
+- [x] Create the task and worktree asynchronously with visible preparation steps.
+- [x] Add `task_id` and durable task-session identity to persisted tab configuration.
+- [x] Enter a task context whose top bar shows only that task's child tabs plus a
+  task-scoped `+` launcher and an explicit back-to-workspace action.
+- [x] Launch configured terminal-backed harnesses and plain terminals as sibling
+  child tabs in the task worktree. Each launch chooses its own harness.
+- [x] Focus/restore by task-session identity; do not enforce one tab per task.
+- [x] If no child tab is open, show task details and an invitation to add the first
+  agent or terminal.
+- [x] Keep ordinary non-task tabs unchanged.
 
 Tests:
 
 - task-tab association persists through workspace save/restore;
-- selecting a task focuses the existing tab instead of duplicating it;
-- closing a view retains the task record and worktree;
+- multiple child tabs for one task persist and remain independently addressable;
+- focusing a known session never duplicates that session;
+- closing one child view retains the task, worktree, and sibling views;
 - task creation failures surface without opening a misleading tab;
 - local and remote workspace identities cannot be confused.
 
 Manual verification:
 
-- Create two tasks from one repository, run different harnesses, switch
-  workspaces, and return to each live session.
+- Create one task, add Claude/Codex/Pi or terminal child tabs, switch between the
+  task and ordinary workspace tabs, then return to each live child session.
 
 Exit gate:
 

@@ -39,7 +39,10 @@ pub struct TaskRecord {
     pub branch: String,
     pub worktree: TaskWorktree,
     pub executor: ExecutorTarget,
-    pub harness: HarnessSelection,
+    /// Last/default launch choice. The actual harness belongs to each execution
+    /// attempt or child tab; tasks created without a session leave this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessSelection>,
     pub stopping_boundary: StoppingBoundary,
     pub lifecycle: TaskLifecycle,
     pub attention: TaskAttention,
@@ -99,7 +102,7 @@ pub struct NewTaskRecord {
     pub base: GitBase,
     pub branch: String,
     pub executor: ExecutorTarget,
-    pub harness: HarnessSelection,
+    pub harness: Option<HarnessSelection>,
     pub stopping_boundary: StoppingBoundary,
 }
 
@@ -287,6 +290,8 @@ pub struct TaskAttention {
 pub struct TaskExecutionAttempt {
     pub attempt_id: String,
     pub executor: ExecutorTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessSelection>,
     pub state: AttemptState,
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -672,6 +677,7 @@ impl TaskStore {
         }
         task.active_attempt_id = Some(attempt.attempt_id.clone());
         task.executor = attempt.executor.clone();
+        task.harness = attempt.harness.clone();
         task.attempts.push(attempt);
         task.lifecycle = lifecycle;
         task.last_error = None;
@@ -1010,12 +1016,12 @@ mod tests {
                 },
                 branch: format!("task/{task_id}-durable-tasks"),
                 executor: ExecutorTarget::Local,
-                harness: HarnessSelection {
+                harness: Some(HarnessSelection {
                     kind: HarnessKind::TerminalPreset {
                         preset_name: "Codex".to_string(),
                     },
                     model: Some("gpt-5.6".to_string()),
-                },
+                }),
                 stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
             },
             "2026-08-19T08:00:00Z",
@@ -1026,6 +1032,12 @@ mod tests {
         TaskExecutionAttempt {
             attempt_id: attempt_id.to_string(),
             executor,
+            harness: Some(HarnessSelection {
+                kind: HarnessKind::TerminalPreset {
+                    preset_name: "Codex".to_string(),
+                },
+                model: Some("gpt-5.6".to_string()),
+            }),
             state: AttemptState::Running,
             started_at: "2026-08-19T08:01:00Z".to_string(),
             ended_at: None,
@@ -1172,6 +1184,27 @@ mod tests {
         store.insert(task.clone()).unwrap();
         let reloaded = TaskStore::load(path).unwrap();
         assert_eq!(reloaded.tasks(), &[task]);
+    }
+
+    #[test]
+    fn task_harness_is_optional_without_breaking_existing_records() {
+        let legacy_task = sample_task("legacy-task");
+        let legacy_json = serde_json::to_value(&legacy_task).unwrap();
+        let decoded_legacy: TaskRecord = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(decoded_legacy.harness, legacy_task.harness);
+
+        let mut task_without_session = serde_json::to_value(sample_task("new-task")).unwrap();
+        task_without_session
+            .as_object_mut()
+            .unwrap()
+            .remove("harness");
+        let decoded_without_session: TaskRecord =
+            serde_json::from_value(task_without_session).unwrap();
+        assert_eq!(decoded_without_session.harness, None);
+        assert!(
+            serde_json::to_value(decoded_without_session).unwrap()["harness"].is_null(),
+            "a task with no child session should not persist a task-level harness"
+        );
     }
 
     #[test]
