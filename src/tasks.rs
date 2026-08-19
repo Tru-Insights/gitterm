@@ -43,6 +43,8 @@ pub struct TaskRecord {
     pub stopping_boundary: StoppingBoundary,
     pub lifecycle: TaskLifecycle,
     pub attention: TaskAttention,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
     #[serde(default)]
     pub attempts: Vec<TaskExecutionAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,6 +77,7 @@ impl TaskRecord {
             stopping_boundary: input.stopping_boundary,
             lifecycle: TaskLifecycle::Draft,
             attention: TaskAttention::default(),
+            last_error: None,
             attempts: Vec::new(),
             active_attempt_id: None,
             changes: ChangedFilesSummary::default(),
@@ -98,6 +101,14 @@ pub struct NewTaskRecord {
     pub executor: ExecutorTarget,
     pub harness: HarnessSelection,
     pub stopping_boundary: StoppingBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedWorktreePreparation {
+    pub repository: RepositoryIdentity,
+    pub base: GitBase,
+    pub branch: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,6 +516,98 @@ impl TaskStore {
         self.replace(task)
     }
 
+    pub fn begin_worktree_preparation(
+        &mut self,
+        task_id: &str,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "begin worktree preparation in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        task.lifecycle = TaskLifecycle::Preparing;
+        task.worktree = TaskWorktree {
+            state: TaskWorktreeState::Preparing,
+            path: None,
+        };
+        task.last_error = None;
+        task.attention = TaskAttention::default();
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
+    pub fn complete_worktree_preparation(
+        &mut self,
+        task_id: &str,
+        prepared: CompletedWorktreePreparation,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        if !prepared.path.is_absolute() {
+            return Err(TaskStoreError::new(
+                "complete worktree preparation in",
+                &self.path,
+                format!(
+                    "task {task_id} prepared worktree path {} is not absolute",
+                    prepared.path.display()
+                ),
+            ));
+        }
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "complete worktree preparation in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        task.repository = prepared.repository;
+        task.base = prepared.base;
+        task.branch = prepared.branch;
+        task.worktree = TaskWorktree {
+            state: TaskWorktreeState::Ready,
+            path: Some(prepared.path),
+        };
+        task.lifecycle = TaskLifecycle::Ready;
+        task.last_error = None;
+        task.attention = TaskAttention::default();
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
+    pub fn fail_worktree_preparation(
+        &mut self,
+        task_id: &str,
+        detail: String,
+        cleanup_path: Option<PathBuf>,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "fail worktree preparation in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        task.worktree = TaskWorktree {
+            state: if cleanup_path.is_some() {
+                TaskWorktreeState::CleanupRequired
+            } else {
+                TaskWorktreeState::Unprepared
+            },
+            path: cleanup_path,
+        };
+        task.lifecycle = TaskLifecycle::Failed;
+        task.last_error = Some(detail);
+        task.attention = TaskAttention {
+            reason: Some(TaskAttentionReason::ExecutionFailed),
+            unread: true,
+        };
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
     pub fn begin_attempt(
         &mut self,
         task_id: &str,
@@ -549,6 +652,7 @@ impl TaskStore {
         task.executor = attempt.executor.clone();
         task.attempts.push(attempt);
         task.lifecycle = lifecycle;
+        task.last_error = None;
         task.updated_at = timestamp.to_string();
         self.replace(task)
     }
@@ -575,6 +679,8 @@ impl TaskStore {
                 reason: Some(TaskAttentionReason::ExecutionFailed),
                 unread: true,
             };
+            task.last_error =
+                Some("GitTerm restarted while this local execution was active".to_string());
             reconciled += 1;
         }
         if reconciled > 0 {
@@ -752,6 +858,21 @@ fn validate_task(task: &TaskRecord) -> Result<(), String> {
             "task {} has archived_at but is not archived",
             task.task_id
         ));
+    }
+    match (&task.worktree.state, &task.worktree.path) {
+        (TaskWorktreeState::Ready, None) => {
+            return Err(format!(
+                "task {} has a ready worktree without a path",
+                task.task_id
+            ));
+        }
+        (TaskWorktreeState::Unprepared, Some(_)) => {
+            return Err(format!(
+                "task {} has an unprepared worktree with a path",
+                task.task_id
+            ));
+        }
+        _ => {}
     }
     let mut attempt_ids = HashSet::new();
     let mut active_attempts = Vec::new();
@@ -1241,6 +1362,71 @@ mod tests {
         let error = store.archive("task-1", "2026-08-19T10:00:00Z").unwrap_err();
         assert!(error.to_string().contains("cannot transition"));
         assert_eq!(store.tasks()[0].lifecycle, TaskLifecycle::Running);
+    }
+
+    #[test]
+    fn persists_worktree_preparation_success_and_failure_transitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let ready_worktree = temp.path().join("worktrees").join("ready-task");
+        let failed_worktree = temp.path().join("worktrees").join("failed-task");
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("ready-task")).unwrap();
+        store.insert(sample_task("failed-task")).unwrap();
+
+        store
+            .begin_worktree_preparation("ready-task", "2026-08-19T08:01:00Z")
+            .unwrap();
+        store
+            .complete_worktree_preparation(
+                "ready-task",
+                CompletedWorktreePreparation {
+                    repository: RepositoryIdentity {
+                        common_dir: PathBuf::from("/repo/.git"),
+                        remote_url: None,
+                    },
+                    base: GitBase {
+                        reference: "main".to_string(),
+                        commit: "fedcba9876543210".to_string(),
+                    },
+                    branch: "task/ready-task-prepared".to_string(),
+                    path: ready_worktree.clone(),
+                },
+                "2026-08-19T08:02:00Z",
+            )
+            .unwrap();
+
+        store
+            .begin_worktree_preparation("failed-task", "2026-08-19T08:03:00Z")
+            .unwrap();
+        store
+            .fail_worktree_preparation(
+                "failed-task",
+                "git worktree add failed".to_string(),
+                Some(failed_worktree),
+                "2026-08-19T08:04:00Z",
+            )
+            .unwrap();
+
+        let reloaded = TaskStore::load(path).unwrap();
+        let ready = reloaded.get("ready-task").unwrap();
+        assert_eq!(ready.lifecycle, TaskLifecycle::Ready);
+        assert_eq!(ready.worktree.state, TaskWorktreeState::Ready);
+        assert_eq!(
+            ready.worktree.path.as_deref(),
+            Some(ready_worktree.as_path())
+        );
+        let failed = reloaded.get("failed-task").unwrap();
+        assert_eq!(failed.lifecycle, TaskLifecycle::Failed);
+        assert_eq!(failed.worktree.state, TaskWorktreeState::CleanupRequired);
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("git worktree add failed")
+        );
+        assert_eq!(
+            failed.attention.reason,
+            Some(TaskAttentionReason::ExecutionFailed)
+        );
     }
 
     #[test]

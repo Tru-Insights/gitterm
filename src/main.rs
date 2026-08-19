@@ -3934,6 +3934,7 @@ struct App {
     // while this slice establishes startup durability only.
     _task_store: Option<TaskStore>,
     _task_store_error: Option<String>,
+    task_worktree_root: PathBuf,
     theme: AppTheme,
     terminal_font_size: f32,
     ui_font_size: f32,
@@ -4822,6 +4823,7 @@ impl App {
             stt_model_path: None,
             agent_presets: self.agent_presets.clone(),
             quick_commands: self.quick_commands.clone(),
+            task_worktree_root: self.task_worktree_root.clone(),
         };
         config.save();
         let elapsed = started.elapsed();
@@ -6252,6 +6254,7 @@ impl App {
             next_tab_id: 0,
             _task_store: task_store,
             _task_store_error: task_store_error,
+            task_worktree_root: config.task_worktree_root.clone(),
             theme,
             terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),

@@ -114,6 +114,26 @@ mod tests {
     }
 
     #[test]
+    fn task_worktree_root_defaults_beneath_the_v5_config_root() {
+        let root = PathBuf::from("/test-home/.config/gitterm-v5");
+        assert_eq!(
+            task_worktree_root_for_config_root(&root),
+            PathBuf::from("/test-home/.config/gitterm-v5/worktrees")
+        );
+
+        let mut serialized = serde_json::to_value(Config::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("task_worktree_root");
+        let existing_config: Config = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            existing_config.task_worktree_root,
+            default_task_worktree_root()
+        );
+    }
+
+    #[test]
     fn test_resolve_config_dir_override_unset() {
         assert_eq!(resolve_config_dir_override(None), None);
     }
@@ -219,6 +239,14 @@ fn default_agent_presets() -> Vec<AgentPreset> {
     ]
 }
 
+pub fn default_task_worktree_root() -> PathBuf {
+    task_worktree_root_for_config_root(&global_config_dir())
+}
+
+pub fn task_worktree_root_for_config_root(config_root: &Path) -> PathBuf {
+    config_root.join("worktrees")
+}
+
 fn default_terminal_font() -> f32 {
     14.0
 }
@@ -299,6 +327,8 @@ pub struct Config {
     pub agent_presets: Vec<AgentPreset>,
     #[serde(default)]
     pub quick_commands: Vec<QuickCommand>,
+    #[serde(default = "default_task_worktree_root")]
+    pub task_worktree_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +434,7 @@ impl Default for Config {
             stt_model_path: None,
             agent_presets: default_agent_presets(),
             quick_commands: Vec::new(),
+            task_worktree_root: default_task_worktree_root(),
         }
     }
 }

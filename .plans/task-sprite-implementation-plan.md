@@ -1,6 +1,6 @@
 # GitTerm V5 Task and Sprite Implementation Plan
 
-**Status:** Slices 0-1 complete; durable task foundation ready
+**Status:** Slices 0-3 complete; minimal Tasks UI next
 
 **Captured:** 2026-08-19
 
@@ -106,18 +106,18 @@ src/main.rs                  # App registry/load wiring
 
 Tasks:
 
-- Add versioned `TaskRecord`, `TaskExecutionAttempt`, lifecycle, executor, issue,
+- [x] Add versioned `TaskRecord`, `TaskExecutionAttempt`, lifecycle, executor, issue,
   repository, worktree, harness, and attention types.
-- Store task metadata separately from `workspaces.json`.
-- Use atomic replacement for writes; report serialization, write, and corrupt
+- [x] Store task metadata separately from `workspaces.json`.
+- [x] Use atomic replacement for writes; report serialization, write, and corrupt
   file failures with the exact path and operation.
-- Serialize durable transitions only, not terminal output or high-frequency
+- [x] Serialize durable transitions only, not terminal output or high-frequency
   progress events.
-- Load tasks during app startup without opening their workspaces or spawning
+- [x] Load tasks during app startup without opening their workspaces or spawning
   processes.
-- Reconcile persisted `preparing`/`running` local attempts to an explicit
+- [x] Reconcile persisted `preparing`/`running` local attempts to an explicit
   interrupted/resumable state after app restart.
-- Add create/update/archive APIs with one active attempt per task.
+- [x] Add create/update/archive APIs with one active attempt per task.
 
 Tests:
 
@@ -149,17 +149,17 @@ src/main.rs
 
 Tasks:
 
-- Resolve repository top-level, common directory, origin URL when present,
+- [x] Resolve repository top-level, common directory, origin URL when present,
   current branch, and exact base commit.
-- Generate a unique task branch and worktree path from validated task metadata.
-- Run `git worktree add` with structured arguments off the Iced update thread.
-- Reject collisions, non-repositories, missing base commits, and unsafe paths
+- [x] Generate a unique task branch and worktree path from validated task metadata.
+- [x] Run `git worktree add` with structured arguments off the Iced update thread.
+- [x] Reject collisions, non-repositories, missing base commits, and unsafe paths
   with actionable context.
-- Roll back only artifacts created by the failed preparation attempt.
-- Record the exact base commit and final canonical worktree path after success.
-- Add guarded cleanup inspection: running process, dirty state, ahead/unpushed
+- [x] Roll back only artifacts created by the failed preparation attempt.
+- [x] Record the exact base commit and final canonical worktree path after success.
+- [x] Add guarded cleanup inspection: running process, dirty state, ahead/unpushed
   commits, existing PR, and worktree registration.
-- Do not implement automatic destructive cleanup.
+- [x] Do not implement automatic destructive cleanup.
 
 Tests using temporary Git repositories:
 
