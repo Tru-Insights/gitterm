@@ -14,6 +14,8 @@ pub enum SidebarMode {
     /// Read-only browser over harness conversations (claude transcripts),
     /// scoped to the active workspace by default. TRU-78.
     Chats,
+    /// Durable cross-workspace task registry and launch surface.
+    Tasks,
     /// Lists persistent remote tmux sessions reachable over SSH.
     Remote,
 }

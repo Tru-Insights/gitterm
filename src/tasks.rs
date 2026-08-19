@@ -608,6 +608,28 @@ impl TaskStore {
         self.replace(task)
     }
 
+    pub fn record_resumable_error(
+        &mut self,
+        task_id: &str,
+        detail: String,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "record resumable error in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        task.last_error = Some(detail);
+        task.attention = TaskAttention {
+            reason: Some(TaskAttentionReason::ExecutionFailed),
+            unread: true,
+        };
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
     pub fn begin_attempt(
         &mut self,
         task_id: &str,

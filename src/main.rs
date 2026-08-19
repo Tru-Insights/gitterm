@@ -47,7 +47,16 @@ use gitterm::browser_control::{
 };
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
-use gitterm::tasks::{TaskStore, TaskStoreError};
+use gitterm::task_worktree::{
+    prepare_task_worktree, resolve_task_preparation, suggested_task_branch,
+    suggested_task_worktree_path, PrepareTaskWorktreeRequest, PreparedTaskWorktree,
+    ResolvedTaskPreparation,
+};
+use gitterm::tasks::{
+    ExecutorTarget, HarnessKind, HarnessSelection, IssueProvider, IssueReference, NewTaskRecord,
+    StoppingBoundary, TaskLifecycle, TaskRecord, TaskStore, TaskStoreError, TaskWorktree,
+    TaskWorktreeState, WorkspaceIdentity as TaskWorkspaceIdentity, WorkspaceLocationIdentity,
+};
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{
     AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
@@ -2192,6 +2201,91 @@ fn agent_event_attention_reason(event: &tab::AgentEvent) -> Option<AttentionReas
     }
 }
 
+fn is_linear_issue_key(value: &str) -> bool {
+    let Some((team, number)) = value.split_once('-') else {
+        return false;
+    };
+    (2..=10).contains(&team.len())
+        && team
+            .bytes()
+            .next()
+            .is_some_and(|character| character.is_ascii_uppercase())
+        && team
+            .bytes()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
+        && (1..=7).contains(&number.len())
+        && number.bytes().all(|character| character.is_ascii_digit())
+}
+
+fn task_lifecycle_label(lifecycle: TaskLifecycle) -> &'static str {
+    match lifecycle {
+        TaskLifecycle::Draft => "draft",
+        TaskLifecycle::Preparing => "preparing",
+        TaskLifecycle::Ready => "ready",
+        TaskLifecycle::Queued => "queued",
+        TaskLifecycle::Running => "running",
+        TaskLifecycle::WaitingForInput => "waiting",
+        TaskLifecycle::Completed => "completed",
+        TaskLifecycle::Failed => "failed",
+        TaskLifecycle::Stopped => "stopped",
+        TaskLifecycle::Interrupted => "interrupted",
+        TaskLifecycle::Archived => "archived",
+    }
+}
+
+fn stopping_boundary_label(boundary: StoppingBoundary) -> &'static str {
+    match boundary {
+        StoppingBoundary::PlanOnly => "Plan only",
+        StoppingBoundary::ImplementUntilTestsPass => "Tests pass",
+        StoppingBoundary::PrepareDraftPr => "Draft PR",
+    }
+}
+
+fn task_harness_label(harness: &HarnessKind) -> String {
+    match harness {
+        HarnessKind::TerminalPreset { preset_name } => preset_name.clone(),
+        HarnessKind::NativeClaude => "Native Claude".to_string(),
+        HarnessKind::NativePi => "Native Pi".to_string(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NewTaskForm {
+    task_id: String,
+    workspace_name: String,
+    workspace_dir: PathBuf,
+    repository_path: PathBuf,
+    title: String,
+    objective: String,
+    issue_key: String,
+    base_reference: String,
+    preset_idx: usize,
+    stopping_boundary: StoppingBoundary,
+    submitting: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingTaskLaunch {
+    task_id: String,
+    workspace_name: String,
+    workspace_dir: PathBuf,
+    title: String,
+    objective: String,
+    issue_key: Option<String>,
+    preset_idx: usize,
+    stopping_boundary: StoppingBoundary,
+    resolved_worktree_path: Option<PathBuf>,
+    request: PrepareTaskWorktreeRequest,
+}
+
+#[derive(Debug, Clone)]
+struct TaskTabClosePrompt {
+    workspace_idx: usize,
+    tab_idx: usize,
+    task_id: String,
+}
+
 // Tab state. Tab-kind data structures live in `src/tab/mod.rs`; the heavy `impl TabState`
 // methods (load_file, fetch_status, fetch_diff, fetch_claude_config, fetch_agent_activity, etc.)
 // stay here because they reference too many in-binary helpers, constants, and macros.
@@ -2253,6 +2347,8 @@ struct TabState {
     // Chats resume flow and by picker launches with a pre-assigned id;
     // persisted so the registry rule survives restarts.
     chat_session_id: Option<String>,
+    // Durable task this tab views or runs. The task survives tab closure.
+    task_id: Option<String>,
     is_git_repo: bool,
 }
 
@@ -2304,6 +2400,7 @@ impl TabState {
             search: SearchState::default(),
             selected_chat_id: None,
             chat_session_id: None,
+            task_id: None,
             attention: None,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
@@ -3363,6 +3460,15 @@ impl Workspace {
     }
 }
 
+fn find_task_tab_in_workspaces(workspaces: &[Workspace], task_id: &str) -> Option<(usize, usize)> {
+    workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
+        ws.tabs
+            .iter()
+            .position(|tab| tab.task_id.as_deref() == Some(task_id))
+            .map(|tab_idx| (ws_idx, tab_idx))
+    })
+}
+
 fn compute_word_diff(old_text: &str, new_text: &str) -> Vec<InlineChange> {
     let diff = TextDiff::from_words(old_text, new_text);
     diff.iter_all_changes()
@@ -3614,6 +3720,22 @@ pub enum Event {
     // Sidebar
     ToggleSidebar,
     SetSidebarMode(SidebarMode),
+    TaskCreateOpen,
+    TaskCreateCancel,
+    TaskTitleChanged(String),
+    TaskObjectiveChanged(String),
+    TaskIssueChanged(String),
+    TaskBaseChanged(String),
+    TaskPresetSelected(usize),
+    TaskStoppingBoundarySelected(StoppingBoundary),
+    TaskCreateSubmit,
+    TaskMetadataResolved(PendingTaskLaunch, Result<ResolvedTaskPreparation, String>),
+    TaskWorktreePrepared(PendingTaskLaunch, Result<PreparedTaskWorktree, String>),
+    TaskSelected(String),
+    TaskResumeAsTab(String),
+    TaskShowArchived(bool),
+    TaskTabCloseCancel,
+    TaskTabStopAndClose,
     NavigateDir(SourcePath),
     NavigateUp,
     ViewFile(SourcePath),
@@ -3929,12 +4051,15 @@ struct App {
     workspaces: Vec<Workspace>,
     active_workspace_idx: usize,
     next_tab_id: usize,
-    // Loaded independently of workspaces. Slice 4 will expose these through
-    // the Tasks sidebar; the leading underscores avoid dead-code warnings
-    // while this slice establishes startup durability only.
-    _task_store: Option<TaskStore>,
-    _task_store_error: Option<String>,
+    // Durable task registry and cross-workspace Tasks UI state.
+    task_store: Option<TaskStore>,
+    task_store_error: Option<String>,
+    task_ui_error: Option<String>,
     task_worktree_root: PathBuf,
+    selected_task_id: Option<String>,
+    task_show_archived: bool,
+    new_task_form: Option<NewTaskForm>,
+    task_tab_close_prompt: Option<TaskTabClosePrompt>,
     theme: AppTheme,
     terminal_font_size: f32,
     ui_font_size: f32,
@@ -4869,6 +4994,7 @@ impl App {
                         },
                         agent_config: tab.agent_session().map(|s| s.config.clone()),
                         chat_session_id: tab.chat_session_id.clone(),
+                        task_id: tab.task_id.clone(),
                     })
                     .collect(),
                 run_command: ws.console.run_command.clone(),
@@ -5411,6 +5537,115 @@ impl App {
         })
     }
 
+    fn find_task_tab(&self, task_id: &str) -> Option<(usize, usize)> {
+        find_task_tab_in_workspaces(&self.workspaces, task_id)
+    }
+
+    fn record_task_ui_error(&mut self, task_id: &str, detail: String) {
+        self.task_ui_error = Some(detail.clone());
+        if let Some(store) = self.task_store.as_mut() {
+            if let Err(error) =
+                store.record_resumable_error(task_id, detail, &chrono::Utc::now().to_rfc3339())
+            {
+                let message = error.to_string();
+                eprintln!("GitTerm V5 could not persist the task error: {message}");
+                self.task_store_error = Some(message);
+            }
+        }
+    }
+
+    fn open_task_as_tab(&mut self, task_id: &str) -> Task<Event> {
+        if let Some((workspace_idx, tab_idx)) = self.find_task_tab(task_id) {
+            if let Some(tab) = self
+                .workspaces
+                .get_mut(workspace_idx)
+                .and_then(|workspace| workspace.tabs.get_mut(tab_idx))
+            {
+                tab.sidebar_mode = SidebarMode::Git;
+            }
+            return self.focus_workspace_tab(workspace_idx, tab_idx);
+        }
+
+        let Some(task) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id))
+            .cloned()
+        else {
+            self.task_ui_error = Some(format!("Task {task_id} is not available"));
+            return Task::none();
+        };
+        let Some(worktree_path) = task.worktree.path.clone() else {
+            self.task_ui_error = Some(format!(
+                "Task {} has no prepared worktree to resume",
+                task.title
+            ));
+            return Task::none();
+        };
+        if task.worktree.state != TaskWorktreeState::Ready || !worktree_path.is_dir() {
+            self.task_ui_error = Some(format!(
+                "Task {} worktree is not ready at {}",
+                task.title,
+                worktree_path.display()
+            ));
+            return Task::none();
+        }
+        let HarnessKind::TerminalPreset { preset_name } = &task.harness.kind else {
+            self.task_ui_error = Some(format!(
+                "Task {} uses a native harness that this launch sheet cannot resume yet",
+                task.title
+            ));
+            return Task::none();
+        };
+        let Some(command) = self
+            .agent_presets
+            .iter()
+            .find(|preset| preset.name == *preset_name)
+            .map(|preset| preset.command.clone())
+        else {
+            self.record_task_ui_error(
+                task_id,
+                format!("Harness preset {preset_name:?} is no longer configured"),
+            );
+            return Task::none();
+        };
+        let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
+            self.task_ui_error =
+                Some("Remote task tabs require the later remote-executor slice".to_string());
+            return Task::none();
+        };
+        let workspace_idx =
+            self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
+        let workspace_name = self.workspaces[workspace_idx].name.clone();
+        let mut tab = self.create_tab_for_workspace(
+            worktree_path.clone(),
+            Some(command),
+            Some(&workspace_name),
+        );
+        if tab.terminal().is_none() {
+            self.record_task_ui_error(
+                task_id,
+                format!(
+                    "Prepared {}, but the harness terminal could not start",
+                    worktree_path.display()
+                ),
+            );
+            return Task::none();
+        }
+        tab.set_local_dir(worktree_path);
+        tab.task_id = Some(task_id.to_string());
+        tab.repo_name = task.title.clone();
+        tab.sidebar_mode = SidebarMode::Git;
+        self.workspaces[workspace_idx].tabs.push(tab);
+        self.workspaces[workspace_idx].active_tab = self.workspaces[workspace_idx].tabs.len() - 1;
+        let tab_idx = self.workspaces[workspace_idx].active_tab;
+        self.selected_task_id = Some(task_id.to_string());
+        self.task_ui_error = None;
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.focus_workspace_tab(workspace_idx, tab_idx)
+    }
+
     /// Focus a specific tab, switching workspaces first when needed
     /// (the Chats panel's Go-to-Tab, which may jump workspaces).
     fn focus_workspace_tab(&mut self, ws_idx: usize, tab_idx: usize) -> Task<Event> {
@@ -5534,9 +5769,17 @@ impl App {
                 WorkspaceColor::next_available(&used_colors),
             )
         };
+        let reopened_dir = workspace.dir.clone();
         self.workspaces.push(workspace);
-        self.active_workspace_idx = self.workspaces.len() - 1;
         self.normalize_workspace_order();
+        self.active_workspace_idx = self
+            .workspaces
+            .iter()
+            .position(|workspace| {
+                matches!(workspace.location, WorkspaceLocation::Local { .. })
+                    && paths_equal(&workspace.dir, &reopened_dir)
+            })
+            .expect("the just-opened local workspace remains after ordering");
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.sync_plans_dir();
@@ -6252,9 +6495,14 @@ impl App {
             workspaces: Vec::new(),
             active_workspace_idx: 0,
             next_tab_id: 0,
-            _task_store: task_store,
-            _task_store_error: task_store_error,
+            task_store,
+            task_store_error,
+            task_ui_error: None,
             task_worktree_root: config.task_worktree_root.clone(),
+            selected_task_id: None,
+            task_show_archived: false,
+            new_task_form: None,
+            task_tab_close_prompt: None,
             theme,
             terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
@@ -6558,6 +6806,11 @@ impl App {
                         if let Some(session_id) = &tab_config.chat_session_id {
                             if let Some(tab) = workspace.tabs.last_mut() {
                                 tab.chat_session_id = Some(session_id.clone());
+                            }
+                        }
+                        if let Some(task_id) = &tab_config.task_id {
+                            if let Some(tab) = workspace.tabs.last_mut() {
+                                tab.task_id = Some(task_id.clone());
                             }
                         }
                     }
@@ -8708,6 +8961,18 @@ fi
                 return Task::batch([scroll_task, refresh_worktrees_task]);
             }
             Event::TabClose(idx) => {
+                if let Some(task_id) = self
+                    .active_workspace()
+                    .and_then(|workspace| workspace.tabs.get(idx))
+                    .and_then(|tab| tab.task_id.clone())
+                {
+                    self.task_tab_close_prompt = Some(TaskTabClosePrompt {
+                        workspace_idx: self.active_workspace_idx,
+                        tab_idx: idx,
+                        task_id,
+                    });
+                    return Task::none();
+                }
                 // Hide WebView when closing tabs
                 self.hide_webview_for_non_agent();
                 if let Some(ws) = self.active_workspace_mut() {
@@ -9507,6 +9772,20 @@ fi
                     return self.update(Event::ClosePlansViewer);
                 }
 
+                if self.task_tab_close_prompt.is_some() {
+                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
+                        self.task_tab_close_prompt = None;
+                    }
+                    return Task::none();
+                }
+
+                if let Some(form) = self.new_task_form.as_ref() {
+                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) && !form.submitting {
+                        self.new_task_form = None;
+                    }
+                    return Task::none();
+                }
+
                 // Help modal: Escape or Cmd+/ closes, all other keys consumed while open
                 if self.show_help {
                     match key.as_ref() {
@@ -9747,6 +10026,326 @@ fi
                     webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
                 }
             }
+            Event::TaskCreateOpen => {
+                self.task_ui_error = None;
+                if self.task_store.is_none() {
+                    self.task_ui_error = Some(
+                        self.task_store_error
+                            .clone()
+                            .unwrap_or_else(|| "The task store is unavailable".to_string()),
+                    );
+                    return Task::none();
+                }
+                let Some(workspace) = self.active_workspace() else {
+                    self.task_ui_error =
+                        Some("Open a local workspace before creating a task".to_string());
+                    return Task::none();
+                };
+                if !matches!(workspace.location, WorkspaceLocation::Local { .. }) {
+                    self.task_ui_error = Some(
+                        "Local task creation is available only from a workspace on this Mac"
+                            .to_string(),
+                    );
+                    return Task::none();
+                }
+                let Some(tab) = workspace.active_tab() else {
+                    self.task_ui_error =
+                        Some("Open a repository tab before creating a task".to_string());
+                    return Task::none();
+                };
+                if !tab.is_git_repo {
+                    self.task_ui_error = Some(format!(
+                        "{} is not a Git repository",
+                        tab.repo_path.display()
+                    ));
+                    return Task::none();
+                }
+                let task_id = format!("task-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+                self.new_task_form = Some(NewTaskForm {
+                    task_id,
+                    workspace_name: workspace.name.clone(),
+                    workspace_dir: workspace.dir.clone(),
+                    repository_path: tab.repo_path.clone(),
+                    title: String::new(),
+                    objective: String::new(),
+                    issue_key: String::new(),
+                    base_reference: if tab.branch_name.trim().is_empty() {
+                        "HEAD".to_string()
+                    } else {
+                        tab.branch_name.clone()
+                    },
+                    preset_idx: 0,
+                    stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+                    submitting: false,
+                    error: None,
+                });
+            }
+            Event::TaskCreateCancel => {
+                if !self
+                    .new_task_form
+                    .as_ref()
+                    .is_some_and(|form| form.submitting)
+                {
+                    self.new_task_form = None;
+                }
+            }
+            Event::TaskTitleChanged(value) => {
+                if let Some(form) = self.new_task_form.as_mut().filter(|form| !form.submitting) {
+                    form.title = value;
+                    form.error = None;
+                }
+            }
+            Event::TaskObjectiveChanged(value) => {
+                if let Some(form) = self.new_task_form.as_mut().filter(|form| !form.submitting) {
+                    form.objective = value;
+                    form.error = None;
+                }
+            }
+            Event::TaskIssueChanged(value) => {
+                if let Some(form) = self.new_task_form.as_mut().filter(|form| !form.submitting) {
+                    form.issue_key = value;
+                    form.error = None;
+                }
+            }
+            Event::TaskBaseChanged(value) => {
+                if let Some(form) = self.new_task_form.as_mut().filter(|form| !form.submitting) {
+                    form.base_reference = value;
+                    form.error = None;
+                }
+            }
+            Event::TaskPresetSelected(index) => {
+                if let Some(form) = self.new_task_form.as_mut().filter(|form| !form.submitting) {
+                    form.preset_idx = index;
+                    form.error = None;
+                }
+            }
+            Event::TaskStoppingBoundarySelected(boundary) => {
+                if let Some(form) = self.new_task_form.as_mut().filter(|form| !form.submitting) {
+                    form.stopping_boundary = boundary;
+                    form.error = None;
+                }
+            }
+            Event::TaskCreateSubmit => {
+                let Some(form) = self.new_task_form.as_mut() else {
+                    return Task::none();
+                };
+                if form.submitting {
+                    return Task::none();
+                }
+                let title = form.title.trim().to_string();
+                let objective = form.objective.trim().to_string();
+                let issue_key =
+                    (!form.issue_key.trim().is_empty()).then(|| form.issue_key.trim().to_string());
+                let base_reference = form.base_reference.trim().to_string();
+                let error = if title.is_empty() {
+                    Some("Title is required".to_string())
+                } else if objective.is_empty() {
+                    Some("Objective is required".to_string())
+                } else if base_reference.is_empty() {
+                    Some("Base reference is required".to_string())
+                } else if issue_key
+                    .as_deref()
+                    .is_some_and(|key| !is_linear_issue_key(key))
+                {
+                    Some("Linear issue must look like TRU-105".to_string())
+                } else if self.agent_presets.get(form.preset_idx).is_none() {
+                    Some("Choose a configured harness preset".to_string())
+                } else {
+                    None
+                };
+                if let Some(error) = error {
+                    form.error = Some(error);
+                    return Task::none();
+                }
+                let request = PrepareTaskWorktreeRequest {
+                    repository_path: form.repository_path.clone(),
+                    worktree_root: self.task_worktree_root.clone(),
+                    task_id: form.task_id.clone(),
+                    title: title.clone(),
+                    issue_key: issue_key.clone(),
+                    base_reference: base_reference.clone(),
+                };
+                let pending = PendingTaskLaunch {
+                    task_id: form.task_id.clone(),
+                    workspace_name: form.workspace_name.clone(),
+                    workspace_dir: form.workspace_dir.clone(),
+                    title,
+                    objective,
+                    issue_key,
+                    preset_idx: form.preset_idx,
+                    stopping_boundary: form.stopping_boundary,
+                    resolved_worktree_path: None,
+                    request: request.clone(),
+                };
+                form.submitting = true;
+                form.error = None;
+                return Task::perform(resolve_task_preparation(request), move |result| {
+                    Event::TaskMetadataResolved(pending, result.map_err(|error| error.to_string()))
+                });
+            }
+            Event::TaskMetadataResolved(mut pending, result) => {
+                let resolved = match result {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        if let Some(form) = self
+                            .new_task_form
+                            .as_mut()
+                            .filter(|form| form.task_id == pending.task_id)
+                        {
+                            form.submitting = false;
+                            form.error = Some(error);
+                        }
+                        return Task::none();
+                    }
+                };
+                let Some(preset) = self.agent_presets.get(pending.preset_idx) else {
+                    if let Some(form) = self.new_task_form.as_mut() {
+                        form.submitting = false;
+                        form.error = Some("The selected harness preset was removed".to_string());
+                    }
+                    return Task::none();
+                };
+                let timestamp = chrono::Utc::now().to_rfc3339();
+                let mut record = TaskRecord::new_draft(
+                    NewTaskRecord {
+                        task_id: pending.task_id.clone(),
+                        title: pending.title.clone(),
+                        objective: pending.objective.clone(),
+                        workspace: TaskWorkspaceIdentity {
+                            name: pending.workspace_name.clone(),
+                            location: WorkspaceLocationIdentity::Local {
+                                directory: pending.workspace_dir.clone(),
+                            },
+                        },
+                        repository: resolved.repository.identity.clone(),
+                        issue: pending.issue_key.as_ref().map(|key| IssueReference {
+                            provider: IssueProvider::Linear,
+                            key: key.clone(),
+                            url: None,
+                        }),
+                        base: resolved.base.clone(),
+                        branch: resolved.proposal.branch.clone(),
+                        executor: ExecutorTarget::Local,
+                        harness: HarnessSelection {
+                            kind: HarnessKind::TerminalPreset {
+                                preset_name: preset.name.clone(),
+                            },
+                            model: None,
+                        },
+                        stopping_boundary: pending.stopping_boundary,
+                    },
+                    timestamp.clone(),
+                );
+                record.lifecycle = TaskLifecycle::Preparing;
+                record.worktree = TaskWorktree {
+                    state: TaskWorktreeState::Preparing,
+                    path: None,
+                };
+                pending.resolved_worktree_path = Some(resolved.proposal.path.clone());
+                let Some(store) = self.task_store.as_mut() else {
+                    return Task::none();
+                };
+                if let Err(error) = store.insert(record) {
+                    if let Some(form) = self.new_task_form.as_mut() {
+                        form.submitting = false;
+                        form.error = Some(error.to_string());
+                    }
+                    return Task::none();
+                }
+                self.selected_task_id = Some(pending.task_id.clone());
+                self.new_task_form = None;
+                self.task_ui_error = None;
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.sidebar_mode = SidebarMode::Tasks;
+                }
+                let request = pending.request.clone();
+                return Task::perform(prepare_task_worktree(request), move |result| {
+                    Event::TaskWorktreePrepared(pending, result.map_err(|error| error.to_string()))
+                });
+            }
+            Event::TaskWorktreePrepared(pending, result) => match result {
+                Ok(prepared) => {
+                    let persisted = self.task_store.as_mut().map(|store| {
+                        store.complete_worktree_preparation(
+                            &pending.task_id,
+                            prepared.into(),
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                    });
+                    match persisted {
+                        Some(Ok(())) => return self.open_task_as_tab(&pending.task_id),
+                        Some(Err(error)) => {
+                            let message = error.to_string();
+                            eprintln!("GitTerm V5 could not save prepared task: {message}");
+                            self.task_store_error = Some(message);
+                        }
+                        None => {
+                            self.task_store_error =
+                                Some("The task store became unavailable".to_string());
+                        }
+                    }
+                }
+                Err(error) => {
+                    let cleanup_path = if error.contains("rollback requires attention") {
+                        pending.resolved_worktree_path.filter(|path| path.exists())
+                    } else {
+                        None
+                    };
+                    let persisted = self.task_store.as_mut().map(|store| {
+                        store.fail_worktree_preparation(
+                            &pending.task_id,
+                            error.clone(),
+                            cleanup_path,
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                    });
+                    if let Some(Err(store_error)) = persisted {
+                        self.task_store_error = Some(store_error.to_string());
+                    }
+                    self.task_ui_error = Some(error);
+                }
+            },
+            Event::TaskSelected(task_id) => {
+                self.selected_task_id = Some(task_id);
+            }
+            Event::TaskResumeAsTab(task_id) => {
+                self.selected_task_id = Some(task_id.clone());
+                return self.open_task_as_tab(&task_id);
+            }
+            Event::TaskShowArchived(show_archived) => {
+                self.task_show_archived = show_archived;
+            }
+            Event::TaskTabCloseCancel => {
+                self.task_tab_close_prompt = None;
+            }
+            Event::TaskTabStopAndClose => {
+                let Some(prompt) = self.task_tab_close_prompt.take() else {
+                    return Task::none();
+                };
+                let valid = self
+                    .workspaces
+                    .get(prompt.workspace_idx)
+                    .and_then(|workspace| workspace.tabs.get(prompt.tab_idx))
+                    .is_some_and(|tab| tab.task_id.as_deref() == Some(&prompt.task_id));
+                if !valid {
+                    return Task::none();
+                }
+                if self.workspaces[prompt.workspace_idx].tabs.len() == 1 {
+                    let workspace_name = self.workspaces[prompt.workspace_idx].name.clone();
+                    let workspace_dir = self.workspaces[prompt.workspace_idx].dir.clone();
+                    let replacement =
+                        self.create_tab_for_workspace(workspace_dir, None, Some(&workspace_name));
+                    self.workspaces[prompt.workspace_idx].tabs.push(replacement);
+                }
+                self.workspaces[prompt.workspace_idx]
+                    .tabs
+                    .remove(prompt.tab_idx);
+                let workspace = &mut self.workspaces[prompt.workspace_idx];
+                workspace.active_tab = workspace.active_tab.min(workspace.tabs.len() - 1);
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
+                return self.scroll_to_active_tab();
+            }
             Event::SetSidebarMode(mode) => {
                 let active_source = self.source_for_active_tab().ok();
                 let active_caps = active_source
@@ -9894,6 +10493,17 @@ fi
                                 tab.diff_syntax_notice = None;
                                 tab.sidebar_mode = mode;
                                 return self.refresh_chat_index_if_stale();
+                            }
+                            SidebarMode::Tasks => {
+                                tab.agent_sidebar.selected_capture_idx = None;
+                                tab.agent_sidebar.conversation = None;
+                                tab.close_file_viewer();
+                                tab.selected_file = None;
+                                tab.diff_lines.clear();
+                                tab.diff_load_in_progress = false;
+                                tab.diff_load_started_at = None;
+                                tab.diff_syntax_lines = None;
+                                tab.diff_syntax_notice = None;
                             }
                             SidebarMode::Remote => {
                                 // Switching to Remote mode - clear local file/git detail panes.
@@ -12456,6 +13066,20 @@ fi
             Stack::new()
                 .push(main_view)
                 .push(self.view_attention_panel())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.task_tab_close_prompt.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_task_tab_close_modal())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.new_task_form.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_new_task_modal())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -15399,6 +16023,8 @@ fi
                 // open — also keeps the terminal out of the widget tree so
                 // typing in the chats search can never leak into the PTY.
                 freeze_time!("view_chat_preview", { self.view_chat_preview(tab) })
+            } else if tab.sidebar_mode == SidebarMode::Tasks {
+                freeze_time!("view_task_detail", { self.view_task_detail() })
             } else if tab.viewing_file_path().is_some() {
                 freeze_time!("view_file_content", { self.view_file_content(tab) })
             } else if tab.selected_file.is_some() {
@@ -15930,6 +16556,9 @@ fi
             SidebarMode::Chats => {
                 freeze_time!("view_chats_sidebar", { self.view_chats_sidebar(tab) })
             }
+            SidebarMode::Tasks => {
+                freeze_time!("view_tasks_sidebar", { self.view_tasks_sidebar() })
+            }
             SidebarMode::Remote => {
                 freeze_time!("view_remote_sidebar", { self.view_remote_sidebar() })
             }
@@ -16003,6 +16632,7 @@ fi
         let mut modes = vec![
             ("\u{2387}", SidebarMode::Git),    // ⎇ branch symbol
             ("\u{1F4C1}", SidebarMode::Files), // 📁 folder
+            ("\u{25C8}", SidebarMode::Tasks),  // ◈ task dispatch
             ("\u{2726}", SidebarMode::Claude), // ✦ sparkle
         ];
         if workspace_is_remote {
@@ -16173,6 +16803,7 @@ fi
 
         let git_active = tab.sidebar_mode == SidebarMode::Git;
         let files_active = tab.sidebar_mode == SidebarMode::Files;
+        let tasks_active = tab.sidebar_mode == SidebarMode::Tasks;
         let claude_active = tab.sidebar_mode == SidebarMode::Claude;
         let workspace_is_remote = self.active_workspace_is_remote();
         let remote_active = workspace_is_remote && tab.sidebar_mode == SidebarMode::Remote;
@@ -16223,6 +16854,17 @@ fi
             text("Files").size(font).color(files_text_color).into(),
             files_active,
             Event::SetSidebarMode(SidebarMode::Files),
+        );
+
+        let tasks_text_color = if tasks_active {
+            theme.text_primary()
+        } else {
+            theme.overlay1()
+        };
+        let tasks_tab = self.view_sidebar_tab(
+            text("Tasks").size(font).color(tasks_text_color).into(),
+            tasks_active,
+            Event::SetSidebarMode(SidebarMode::Tasks),
         );
 
         // Agent tab (was "Claude" — same SidebarMode::Claude variant, shows skills/plugins/hooks)
@@ -16281,6 +16923,7 @@ fi
             .spacing(0)
             .push(git_tab)
             .push(files_tab)
+            .push(tasks_tab)
             .push(agent_tab)
             .push(chats_tab)
             .push(plans_tab);
@@ -16318,6 +16961,710 @@ fi
             });
 
         column![tab_row, separator].into()
+    }
+
+    fn view_tasks_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let accent = theme.accent();
+        let border = theme.border();
+        let surface0 = theme.surface0();
+
+        let new_task = button(text("+ New task").size(font_small).font(mono))
+            .style(self.ghost_button_style())
+            .padding([4, 8])
+            .on_press(Event::TaskCreateOpen);
+        let header = row![
+            text("TASKS").size(font).color(text_primary).font(mono),
+            iced::widget::Space::new().width(Length::Fill),
+            new_task,
+        ]
+        .align_y(iced::Alignment::Center);
+
+        let filter_button = |label: &'static str, archived: bool| {
+            let active = self.task_show_archived == archived;
+            button(text(label).size(font_small).font(mono))
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if active {
+                            surface0
+                        } else if matches!(status, button::Status::Hovered) {
+                            theme.bg_overlay()
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: if active { text_primary } else { text_muted },
+                    border: iced::Border {
+                        color: if active { accent } else { border },
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([3, 9])
+                .on_press(Event::TaskShowArchived(archived))
+        };
+
+        let mut content = Column::new().spacing(8).padding(8).push(header).push(
+            row![
+                filter_button("Active", false),
+                filter_button("Archived", true)
+            ]
+            .spacing(6),
+        );
+
+        if let Some(error) = self
+            .task_store_error
+            .as_ref()
+            .or(self.task_ui_error.as_ref())
+        {
+            let danger = theme.danger();
+            content = content.push(
+                container(text(error).size(font_small).color(danger))
+                    .padding(8)
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(iced::Color { a: 0.1, ..danger }.into()),
+                        border: iced::Border {
+                            color: danger,
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        let mut tasks: Vec<&TaskRecord> = self
+            .task_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .tasks()
+                    .iter()
+                    .filter(|task| {
+                        (task.lifecycle == TaskLifecycle::Archived) == self.task_show_archived
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        tasks.sort_by(|left, right| {
+            left.workspace
+                .name
+                .to_lowercase()
+                .cmp(&right.workspace.name.to_lowercase())
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+
+        if tasks.is_empty() {
+            content = content.push(
+                container(
+                    column![
+                        text(if self.task_show_archived {
+                            "No archived tasks"
+                        } else {
+                            "No active tasks"
+                        })
+                        .size(font)
+                        .color(text_secondary),
+                        text("Create one from the repository in this workspace.")
+                            .size(font_small)
+                            .color(text_muted),
+                    ]
+                    .spacing(4),
+                )
+                .padding([16, 8]),
+            );
+        } else {
+            let mut current_workspace: Option<&str> = None;
+            for task in tasks {
+                if current_workspace != Some(task.workspace.name.as_str()) {
+                    current_workspace = Some(task.workspace.name.as_str());
+                    content = content.push(
+                        text(task.workspace.name.to_uppercase())
+                            .size(10)
+                            .color(text_muted)
+                            .font(mono),
+                    );
+                }
+
+                let live = self.find_task_tab(&task.task_id).is_some();
+                let selected = self.selected_task_id.as_deref() == Some(task.task_id.as_str());
+                let state_color = match task.lifecycle {
+                    TaskLifecycle::Preparing | TaskLifecycle::Queued => theme.warning(),
+                    TaskLifecycle::Ready | TaskLifecycle::Completed => theme.success(),
+                    TaskLifecycle::Running | TaskLifecycle::WaitingForInput => accent,
+                    TaskLifecycle::Failed | TaskLifecycle::Interrupted => theme.danger(),
+                    TaskLifecycle::Archived | TaskLifecycle::Stopped | TaskLifecycle::Draft => {
+                        text_muted
+                    }
+                };
+                let issue = task
+                    .issue
+                    .as_ref()
+                    .map(|issue| issue.key.as_str())
+                    .unwrap_or("local");
+                let meta = format!("{} · {}", issue, task.branch);
+                let status = if live {
+                    format!("● {}", task_lifecycle_label(task.lifecycle))
+                } else {
+                    task_lifecycle_label(task.lifecycle).to_string()
+                };
+                let strip = container(iced::widget::Space::new())
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(state_color.into()),
+                        ..Default::default()
+                    });
+                let copy = column![
+                    row![
+                        text(&task.title)
+                            .size(font)
+                            .color(text_primary)
+                            .width(Length::Fill),
+                        text(status).size(10).color(state_color).font(mono),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                    text(meta).size(10).color(text_muted).font(mono),
+                ]
+                .spacing(3)
+                .padding([7, 8]);
+                let task_id = task.task_id.clone();
+                let task_button = button(row![strip, copy].spacing(0))
+                    .padding(0)
+                    .width(Length::Fill)
+                    .style(move |_, status| button::Style {
+                        background: Some(
+                            if selected {
+                                surface0
+                            } else if matches!(status, button::Status::Hovered) {
+                                theme.bg_overlay()
+                            } else {
+                                iced::Color::TRANSPARENT
+                            }
+                            .into(),
+                        ),
+                        border: iced::Border {
+                            color: if selected { accent } else { border },
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .on_press(Event::TaskSelected(task_id));
+                content = content.push(task_button);
+            }
+        }
+
+        scrollable(content).height(Length::Fill).into()
+    }
+
+    fn view_task_detail(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let accent = theme.accent();
+        let bg = theme.bg_base();
+        let border = theme.border();
+
+        let selected = self.selected_task_id.as_deref().and_then(|task_id| {
+            self.task_store
+                .as_ref()
+                .and_then(|store| store.get(task_id))
+        });
+        let Some(task) = selected else {
+            return container(
+                column![
+                    text("Task dispatch").size(18).color(text_primary),
+                    text("Select a task to inspect its launch contract.")
+                        .size(12)
+                        .color(text_muted),
+                ]
+                .spacing(8),
+            )
+            .padding(32)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into();
+        };
+
+        let value_row = |label: &'static str, value: String| {
+            row![
+                container(text(label).size(11).color(text_muted).font(mono))
+                    .width(Length::Fixed(130.0)),
+                text(value).size(12).color(text_secondary).font(mono),
+            ]
+            .spacing(12)
+        };
+        let live = self.find_task_tab(&task.task_id).is_some();
+        let can_resume = live
+            || (task.worktree.state == TaskWorktreeState::Ready
+                && task.worktree.path.is_some()
+                && matches!(
+                    task.lifecycle,
+                    TaskLifecycle::Ready
+                        | TaskLifecycle::Running
+                        | TaskLifecycle::WaitingForInput
+                        | TaskLifecycle::Stopped
+                        | TaskLifecycle::Interrupted
+                        | TaskLifecycle::Failed
+                        | TaskLifecycle::Completed
+                ));
+        let action_label = if live {
+            "Go to session"
+        } else {
+            "Resume as tab"
+        };
+        let action = button(text(action_label).size(12).font(mono))
+            .style(self.ghost_button_style())
+            .padding([6, 12])
+            .on_press_maybe(can_resume.then(|| Event::TaskResumeAsTab(task.task_id.clone())));
+        let short_commit = task.base.commit.chars().take(10).collect::<String>();
+        let worktree = task
+            .worktree
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Not prepared".to_string());
+        let issue = task
+            .issue
+            .as_ref()
+            .map(|issue| issue.key.clone())
+            .unwrap_or_else(|| "None".to_string());
+        let state_color = match task.lifecycle {
+            TaskLifecycle::Failed | TaskLifecycle::Interrupted => theme.danger(),
+            TaskLifecycle::Preparing | TaskLifecycle::Queued => theme.warning(),
+            TaskLifecycle::Running | TaskLifecycle::WaitingForInput => accent,
+            TaskLifecycle::Ready | TaskLifecycle::Completed => theme.success(),
+            _ => text_muted,
+        };
+
+        let mut details = Column::new()
+            .spacing(9)
+            .push(value_row(
+                "STATE",
+                task_lifecycle_label(task.lifecycle).to_string(),
+            ))
+            .push(value_row("WORKSPACE", task.workspace.name.clone()))
+            .push(value_row("ISSUE", issue))
+            .push(value_row(
+                "BASE",
+                format!("{} @ {}", task.base.reference, short_commit),
+            ))
+            .push(value_row("BRANCH", task.branch.clone()))
+            .push(value_row("WORKTREE", worktree))
+            .push(value_row("HARNESS", task_harness_label(&task.harness.kind)))
+            .push(value_row(
+                "STOP WHEN",
+                stopping_boundary_label(task.stopping_boundary).to_string(),
+            ));
+        if let Some(error) = &task.last_error {
+            details = details.push(value_row("LAST ERROR", error.clone()));
+        }
+
+        let content = column![
+            row![
+                column![
+                    text(&task.title).size(20).color(text_primary),
+                    text(format!(
+                        "{}  {}",
+                        if live { "● LIVE" } else { "○ DETACHED" },
+                        task_lifecycle_label(task.lifecycle).to_uppercase()
+                    ))
+                    .size(10)
+                    .color(state_color)
+                    .font(mono),
+                ]
+                .spacing(5)
+                .width(Length::Fill),
+                action,
+            ]
+            .align_y(iced::Alignment::Center),
+            text(&task.objective).size(13).color(text_secondary),
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fixed(1.0))
+                .style(move |_| container::Style {
+                    background: Some(border.into()),
+                    ..Default::default()
+                }),
+            details,
+        ]
+        .spacing(18)
+        .padding(32)
+        .max_width(900);
+
+        container(scrollable(content))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_new_task_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let Some(form) = &self.new_task_form else {
+            return container(iced::widget::Space::new()).into();
+        };
+        let mono = iced::Font::with_name("Menlo");
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let bg_surface = theme.bg_surface();
+        let bg_base = theme.bg_base();
+        let bg_crust = theme.bg_crust();
+        let border = theme.border();
+        let accent = theme.accent();
+        let danger = theme.danger();
+        let input_style = move |_: &Theme, _: text_input::Status| text_input::Style {
+            background: bg_base.into(),
+            border: iced::Border {
+                color: border,
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            icon: iced::Color::TRANSPARENT,
+            placeholder: text_muted,
+            value: text_primary,
+            selection: accent,
+        };
+        let title = text_input("Short outcome", &form.title)
+            .on_input(Event::TaskTitleChanged)
+            .on_submit(Event::TaskCreateSubmit)
+            .padding([6, 8])
+            .size(12)
+            .font(mono)
+            .style(input_style);
+        let objective = text_input("What should the agent accomplish?", &form.objective)
+            .on_input(Event::TaskObjectiveChanged)
+            .on_submit(Event::TaskCreateSubmit)
+            .padding([6, 8])
+            .size(12)
+            .font(mono)
+            .style(input_style);
+        let issue = text_input("TRU-105 (optional)", &form.issue_key)
+            .on_input(Event::TaskIssueChanged)
+            .on_submit(Event::TaskCreateSubmit)
+            .padding([6, 8])
+            .size(12)
+            .font(mono)
+            .style(input_style);
+        let base = text_input("branch, tag, or SHA", &form.base_reference)
+            .on_input(Event::TaskBaseChanged)
+            .on_submit(Event::TaskCreateSubmit)
+            .padding([6, 8])
+            .size(12)
+            .font(mono)
+            .style(input_style);
+        let branch = suggested_task_branch(
+            &form.task_id,
+            (!form.issue_key.trim().is_empty()).then_some(form.issue_key.trim()),
+            &form.title,
+        );
+        let branch_label = branch.clone().unwrap_or_else(|| "—".to_string());
+        let path_label = branch
+            .as_deref()
+            .and_then(|branch| {
+                suggested_task_worktree_path(
+                    &form.repository_path,
+                    &self.task_worktree_root,
+                    branch,
+                )
+            })
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "—".to_string());
+
+        let mut presets = Row::new().spacing(6);
+        for (index, preset) in self.agent_presets.iter().enumerate() {
+            let selected = index == form.preset_idx;
+            presets = presets.push(
+                button(text(&preset.name).size(11).font(mono))
+                    .style(move |_, status| button::Style {
+                        background: Some(
+                            if selected {
+                                accent
+                            } else if matches!(status, button::Status::Hovered) {
+                                theme.surface0()
+                            } else {
+                                iced::Color::TRANSPARENT
+                            }
+                            .into(),
+                        ),
+                        text_color: if selected { bg_base } else { text_secondary },
+                        border: iced::Border {
+                            color: if selected { accent } else { border },
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .padding([4, 9])
+                    .on_press(Event::TaskPresetSelected(index)),
+            );
+        }
+        if self.agent_presets.is_empty() {
+            presets = presets.push(
+                text("No terminal harness presets configured")
+                    .size(11)
+                    .color(danger),
+            );
+        }
+
+        let mut boundaries = Row::new().spacing(6);
+        for boundary in [
+            StoppingBoundary::PlanOnly,
+            StoppingBoundary::ImplementUntilTestsPass,
+            StoppingBoundary::PrepareDraftPr,
+        ] {
+            let selected = boundary == form.stopping_boundary;
+            boundaries = boundaries.push(
+                button(text(stopping_boundary_label(boundary)).size(11).font(mono))
+                    .style(move |_, status| button::Style {
+                        background: Some(
+                            if selected {
+                                accent
+                            } else if matches!(status, button::Status::Hovered) {
+                                theme.surface0()
+                            } else {
+                                iced::Color::TRANSPARENT
+                            }
+                            .into(),
+                        ),
+                        text_color: if selected { bg_base } else { text_secondary },
+                        border: iced::Border {
+                            color: if selected { accent } else { border },
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .padding([4, 9])
+                    .on_press(Event::TaskStoppingBoundarySelected(boundary)),
+            );
+        }
+
+        let cancel = button(text("Cancel").size(12).font(mono))
+            .style(self.ghost_button_style())
+            .padding([5, 12])
+            .on_press_maybe((!form.submitting).then_some(Event::TaskCreateCancel));
+        let create = button(
+            text(if form.submitting {
+                "Checking repository…"
+            } else {
+                "Create task"
+            })
+            .size(12)
+            .font(mono),
+        )
+        .style(self.ghost_button_style())
+        .padding([5, 12])
+        .on_press_maybe((!form.submitting).then_some(Event::TaskCreateSubmit));
+
+        let mut body = Column::new()
+            .spacing(10)
+            .push(
+                row![
+                    column![
+                        text("New task").size(17).color(text_primary),
+                        text(format!("{} · This Mac", form.workspace_name))
+                            .size(10)
+                            .color(text_muted)
+                            .font(mono),
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                    text(&form.task_id).size(10).color(text_muted).font(mono),
+                ]
+                .align_y(iced::Alignment::Center),
+            )
+            .push(column![text("TITLE").size(10).color(text_muted).font(mono), title].spacing(4))
+            .push(
+                column![
+                    text("OBJECTIVE").size(10).color(text_muted).font(mono),
+                    objective
+                ]
+                .spacing(4),
+            )
+            .push(
+                row![
+                    column![
+                        text("LINEAR ISSUE").size(10).color(text_muted).font(mono),
+                        issue
+                    ]
+                    .spacing(4),
+                    column![text("BASE").size(10).color(text_muted).font(mono), base].spacing(4)
+                ]
+                .spacing(8),
+            )
+            .push(text("HARNESS PRESET").size(10).color(text_muted).font(mono))
+            .push(presets)
+            .push(
+                text("STOPPING BOUNDARY")
+                    .size(10)
+                    .color(text_muted)
+                    .font(mono),
+            )
+            .push(boundaries)
+            .push(
+                container(
+                    column![
+                        text(format!("BRANCH     {branch_label}"))
+                            .size(10)
+                            .color(text_secondary)
+                            .font(mono),
+                        text(format!("WORKTREE   {path_label}"))
+                            .size(10)
+                            .color(text_secondary)
+                            .font(mono),
+                    ]
+                    .spacing(4),
+                )
+                .padding(8)
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(bg_base.into()),
+                    border: iced::Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                    ..Default::default()
+                }),
+            );
+        if let Some(error) = &form.error {
+            body = body.push(text(error).size(11).color(danger));
+        }
+        body = body.push(
+            row![
+                iced::widget::Space::new().width(Length::Fill),
+                cancel,
+                create
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        );
+
+        let card = container(body.padding([22, 26]))
+            .width(Length::Fixed(620.0))
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 7.0.into(),
+                },
+                ..Default::default()
+            });
+        let backdrop = iced::Color {
+            a: 0.82,
+            ..bg_crust
+        };
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    fn view_task_tab_close_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let bg_surface = theme.bg_surface();
+        let bg_crust = theme.bg_crust();
+        let border = theme.border();
+        let danger = theme.danger();
+        let task_title = self
+            .task_tab_close_prompt
+            .as_ref()
+            .and_then(|prompt| {
+                self.task_store
+                    .as_ref()
+                    .and_then(|store| store.get(&prompt.task_id))
+            })
+            .map(|task| task.title.as_str())
+            .unwrap_or("this task");
+        let stop = button(
+            text("Stop terminal and close")
+                .size(12)
+                .color(danger)
+                .font(mono),
+        )
+        .style(self.ghost_button_style())
+        .padding([5, 12])
+        .on_press(Event::TaskTabStopAndClose);
+        let keep = button(text("Keep open").size(12).font(mono))
+            .style(self.ghost_button_style())
+            .padding([5, 12])
+            .on_press(Event::TaskTabCloseCancel);
+        let body = column![
+            text("Task session is still attached").size(16).color(text_primary),
+            text(format!("“{task_title}” is running in this terminal tab."))
+                .size(12)
+                .color(text_secondary),
+            text("Closing stops the terminal process. The task record and worktree remain available to resume.")
+                .size(11)
+                .color(text_muted),
+            row![iced::widget::Space::new().width(Length::Fill), keep, stop]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+        ]
+        .spacing(12)
+        .padding([22, 26]);
+        let card = container(body)
+            .width(Length::Fixed(510.0))
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 7.0.into(),
+                },
+                ..Default::default()
+            });
+        let backdrop = iced::Color {
+            a: 0.82,
+            ..bg_crust
+        };
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop.into()),
+            ..Default::default()
+        })
+        .into()
     }
 
     fn view_remote_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -21744,6 +23091,53 @@ mod tests {
         );
         assert_eq!(terminal_title_attention_reason("Claude Code"), None);
         assert_eq!(terminal_title_attention_reason("* shell"), None);
+    }
+
+    #[test]
+    fn linear_issue_key_validation_matches_repository_policy() {
+        for valid in ["TRU-105", "AB2-1", "PROJECT123-7654321"] {
+            assert!(is_linear_issue_key(valid), "expected {valid} to be valid");
+        }
+        for invalid in [
+            "TRU",
+            "T-1",
+            "tru-105",
+            "TRU-",
+            "TRU-12345678",
+            "TRU-10A",
+            "TRU-1-extra",
+        ] {
+            assert!(
+                !is_linear_issue_key(invalid),
+                "expected {invalid} to be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn task_tab_registry_finds_one_live_view_across_workspaces() {
+        let mut first = Workspace::new(
+            "First".to_string(),
+            PathBuf::from("/first"),
+            WorkspaceColor::Blue,
+        );
+        first.tabs.push(TabState::new(1, PathBuf::from("/first")));
+
+        let mut second = Workspace::new(
+            "Second".to_string(),
+            PathBuf::from("/second"),
+            WorkspaceColor::Green,
+        );
+        let mut task_tab = TabState::new(2, PathBuf::from("/worktree"));
+        task_tab.task_id = Some("task-105".to_string());
+        second.tabs.push(task_tab);
+
+        let workspaces = vec![first, second];
+        assert_eq!(
+            find_task_tab_in_workspaces(&workspaces, "task-105"),
+            Some((1, 0))
+        );
+        assert_eq!(find_task_tab_in_workspaces(&workspaces, "missing"), None);
     }
 
     #[test]

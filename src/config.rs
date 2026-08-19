@@ -134,6 +134,24 @@ mod tests {
     }
 
     #[test]
+    fn workspace_tab_task_link_is_optional_and_round_trips() {
+        let existing: WorkspaceTabConfig =
+            serde_json::from_value(serde_json::json!({ "dir": "/repo" })).unwrap();
+        assert_eq!(existing.task_id, None);
+
+        let linked: WorkspaceTabConfig = serde_json::from_value(serde_json::json!({
+            "dir": "/worktrees/task-1",
+            "task_id": "task-1"
+        }))
+        .unwrap();
+        assert_eq!(linked.task_id.as_deref(), Some("task-1"));
+        assert_eq!(
+            serde_json::to_value(linked).unwrap()["task_id"],
+            serde_json::json!("task-1")
+        );
+    }
+
+    #[test]
     fn test_resolve_config_dir_override_unset() {
         assert_eq!(resolve_config_dir_override(None), None);
     }
@@ -603,6 +621,9 @@ pub struct WorkspaceTabConfig {
     /// conversation registry rule (TRU-78) and survives restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_session_id: Option<String>,
+    /// Durable task owned by this view. Closing the tab does not remove the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

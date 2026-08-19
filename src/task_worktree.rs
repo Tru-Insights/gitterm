@@ -37,6 +37,13 @@ pub struct PreparedTaskWorktree {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTaskPreparation {
+    pub repository: ResolvedRepository,
+    pub base: GitBase,
+    pub proposal: TaskWorktreeProposal,
+}
+
 impl From<PreparedTaskWorktree> for CompletedWorktreePreparation {
     fn from(prepared: PreparedTaskWorktree) -> Self {
         Self {
@@ -80,7 +87,7 @@ impl CleanupInspection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaskWorktreeError {
     operation: &'static str,
     path: PathBuf,
@@ -265,25 +272,23 @@ pub fn propose_task_worktree(
             "configured worktree root must be an absolute path",
         ));
     }
-    let identifier = issue_key.unwrap_or(task_id);
-    let identifier = slug(identifier, true, 48);
-    let title_slug = slug(title, false, 48);
-    if identifier.is_empty() {
-        return Err(TaskWorktreeError::new(
+    let branch = suggested_task_branch(task_id, issue_key, title).ok_or_else(|| {
+        TaskWorktreeError::new(
             "propose",
             worktree_root,
-            "issue key or task id does not contain a usable branch identifier",
-        ));
-    }
-    if title_slug.is_empty() {
-        return Err(TaskWorktreeError::new(
-            "propose",
-            worktree_root,
-            "task title does not contain a usable branch slug",
-        ));
-    }
-    let branch_suffix = format!("{identifier}-{title_slug}");
-    let branch = format!("task/{branch_suffix}");
+            "issue key, task id, or title does not contain a usable branch value",
+        )
+    })?;
+    let branch_suffix = branch
+        .strip_prefix("task/")
+        .ok_or_else(|| {
+            TaskWorktreeError::new(
+                "propose",
+                worktree_root,
+                "generated task branch is missing its task/ prefix",
+            )
+        })?
+        .to_string();
     validate_branch(&repository.top_level, &branch)?;
 
     let repository_name = repository
@@ -305,6 +310,30 @@ pub fn propose_task_worktree(
     })
 }
 
+pub fn suggested_task_branch(
+    task_id: &str,
+    issue_key: Option<&str>,
+    title: &str,
+) -> Option<String> {
+    let identifier = slug(issue_key.unwrap_or(task_id), true, 48);
+    let title = slug(title, false, 48);
+    (!identifier.is_empty() && !title.is_empty()).then(|| format!("task/{identifier}-{title}"))
+}
+
+pub fn suggested_task_worktree_path(
+    repository_path: &Path,
+    worktree_root: &Path,
+    branch: &str,
+) -> Option<PathBuf> {
+    let repository_name = repository_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| slug(name, false, 48))
+        .filter(|name| !name.is_empty())?;
+    let suffix = branch.strip_prefix("task/")?;
+    Some(worktree_root.join(repository_name).join(suffix))
+}
+
 pub async fn prepare_task_worktree(
     request: PrepareTaskWorktreeRequest,
 ) -> Result<PreparedTaskWorktree, TaskWorktreeError> {
@@ -314,6 +343,37 @@ pub async fn prepare_task_worktree(
         .map_err(|error| {
             TaskWorktreeError::new("join preparation worker", error_path, error.to_string())
         })?
+}
+
+pub async fn resolve_task_preparation(
+    request: PrepareTaskWorktreeRequest,
+) -> Result<ResolvedTaskPreparation, TaskWorktreeError> {
+    let error_path = request.repository_path.clone();
+    tokio::task::spawn_blocking(move || resolve_task_preparation_blocking(&request))
+        .await
+        .map_err(|error| {
+            TaskWorktreeError::new("join resolution worker", error_path, error.to_string())
+        })?
+}
+
+pub fn resolve_task_preparation_blocking(
+    request: &PrepareTaskWorktreeRequest,
+) -> Result<ResolvedTaskPreparation, TaskWorktreeError> {
+    let repository = resolve_repository(&request.repository_path)?;
+    let base = resolve_base(&repository, &request.base_reference)?;
+    let proposal = propose_task_worktree(
+        &repository,
+        &request.worktree_root,
+        &request.task_id,
+        request.issue_key.as_deref(),
+        &request.title,
+    )?;
+    reject_collisions(&repository, &proposal)?;
+    Ok(ResolvedTaskPreparation {
+        repository,
+        base,
+        proposal,
+    })
 }
 
 pub fn prepare_task_worktree_blocking(
@@ -329,16 +389,10 @@ fn prepare_task_worktree_with<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
-    let repository = resolve_repository(&request.repository_path)?;
-    let base = resolve_base(&repository, &request.base_reference)?;
-    let proposal = propose_task_worktree(
-        &repository,
-        &request.worktree_root,
-        &request.task_id,
-        request.issue_key.as_deref(),
-        &request.title,
-    )?;
-    reject_collisions(&repository, &proposal)?;
+    let resolved = resolve_task_preparation_blocking(request)?;
+    let repository = resolved.repository;
+    let base = resolved.base;
+    let proposal = resolved.proposal;
     if request.worktree_root.starts_with(&repository.top_level) {
         return Err(TaskWorktreeError::new(
             "validate worktree root",
