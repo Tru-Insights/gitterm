@@ -47,6 +47,7 @@ use gitterm::browser_control::{
 };
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
+use gitterm::tasks::{TaskStore, TaskStoreError};
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{
     AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
@@ -3928,6 +3929,11 @@ struct App {
     workspaces: Vec<Workspace>,
     active_workspace_idx: usize,
     next_tab_id: usize,
+    // Loaded independently of workspaces. Slice 4 will expose these through
+    // the Tasks sidebar; the leading underscores avoid dead-code warnings
+    // while this slice establishes startup durability only.
+    _task_store: Option<TaskStore>,
+    _task_store_error: Option<String>,
     theme: AppTheme,
     terminal_font_size: f32,
     ui_font_size: f32,
@@ -6168,10 +6174,38 @@ impl App {
     }
 }
 
+fn load_task_store_for_startup(
+    path: PathBuf,
+    timestamp: &str,
+) -> Result<(TaskStore, usize), TaskStoreError> {
+    let mut store = TaskStore::load(path)?;
+    let reconciled = store.reconcile_after_restart(timestamp)?;
+    Ok((store, reconciled))
+}
+
 impl App {
     fn new() -> (Self, Task<Event>) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = Config::load();
+        let task_store_path = TaskStore::path_for_config_root(&config::global_config_dir());
+        let (task_store, task_store_error) = match load_task_store_for_startup(
+            task_store_path,
+            &chrono::Utc::now().to_rfc3339(),
+        ) {
+            Ok((store, reconciled)) => {
+                if reconciled > 0 {
+                    eprintln!(
+                        "GitTerm V5 marked {reconciled} local task execution(s) interrupted after restart"
+                    );
+                }
+                (Some(store), None)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                eprintln!("GitTerm V5 tasks are unavailable: {message}");
+                (None, Some(message))
+            }
+        };
         let (browser_mcp, browser_mcp_server, browser_error) =
             match browser_mcp::prepare(config::global_config_dir(), config::instance_id()) {
                 Ok((connection, server)) => {
@@ -6216,6 +6250,8 @@ impl App {
             workspaces: Vec::new(),
             active_workspace_idx: 0,
             next_tab_id: 0,
+            _task_store: task_store,
+            _task_store_error: task_store_error,
             theme,
             terminal_font_size: terminal_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
             ui_font_size: ui_font.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
