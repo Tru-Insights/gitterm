@@ -1,8 +1,8 @@
 [package]
-name = "gitterm-v4"
-version = "4.0.0"
+name = "gitterm-v5"
+version = "5.0.0"
 edition = "2021"
-default-run = "gitterm-v4"
+default-run = "gitterm-v5"
 description = "A Git status viewer with integrated terminal, built with Iced"
 
 [lib]
@@ -10,11 +10,11 @@ name = "gitterm"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gitterm-v4"
+name = "gitterm-v5"
 path = "src/main.rs"
 
 [[bin]]
-name = "gitterm-v4-agent"
+name = "gitterm-v5-agent"
 path = "src/bin/gitterm-agent/main.rs"
 
 [dependencies]
@@ -57,11 +57,11 @@ stt = ["whisper-rs", "cpal"]
 excalidraw = []
 
 [package.metadata.bundle]
-name = "GitTerm V4"
-identifier = "com.cree8.gitterm.v4"
+name = "GitTerm V5"
+identifier = "com.cree8.gitterm.v5"
 icon = ["assets/icon.icns"]
-version = "4.0.0"
-short_description = "GitTerm V4 development environment"
+version = "5.0.0"
+short_description = "GitTerm V5 development environment"
 copyright = "Copyright 2025 Cree8"
 category = "Developer Tool"
 osx_minimum_system_version = "13.0"

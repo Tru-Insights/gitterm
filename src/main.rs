@@ -505,7 +505,7 @@ fn setup_menu_bar() {
     // Create native macOS menu bar
     let menu = Menu::new();
 
-    // App menu (GitTerm V4)
+    // App menu (GitTerm V5)
     let app_menu = Submenu::new(config::APP_NAME, true);
     app_menu
         .append_items(&[
@@ -4256,7 +4256,7 @@ fn remote_agent_id_slug(name: &str) -> String {
     }
 }
 
-/// Store a pasted token under ~/.config/gitterm-v4/tokens/<id>.token and
+/// Store a pasted token under ~/.config/gitterm-v5/tokens/<id>.token and
 /// return the path. Owner-only permissions on unix.
 fn write_remote_agent_token(remote_id: &str, token: &str) -> std::io::Result<PathBuf> {
     let dir = config::global_config_dir().join("tokens");
@@ -4941,7 +4941,7 @@ impl App {
         ws_file.save();
     }
 
-    /// Load workspace profiles from ~/.config/gitterm-v4/profiles.json
+    /// Load workspace profiles from ~/.config/gitterm-v5/profiles.json
     /// Returns a map of profile_name -> env vars
     fn load_profiles() -> Option<HashMap<String, HashMap<String, String>>> {
         let path = config::global_config_dir().join("profiles.json");
@@ -6173,19 +6173,19 @@ impl App {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = Config::load();
         let (browser_mcp, browser_mcp_server, browser_error) =
-            match browser_mcp::prepare(config::global_config_dir()) {
+            match browser_mcp::prepare(config::global_config_dir(), config::instance_id()) {
                 Ok((connection, server)) => {
                     eprintln!(
-                        "GitTerm V4 browser MCP reserved at {}",
+                        "GitTerm V5 browser MCP reserved at {}",
                         connection.endpoint()
                     );
                     (Some(connection), Some(server), None)
                 }
                 Err(error) => {
                     let message = format!(
-                        "failed to reserve the GitTerm V4 browser MCP loopback endpoint: {error}"
+                        "failed to reserve the GitTerm V5 browser MCP loopback endpoint: {error}"
                     );
-                    eprintln!("GitTerm V4 browser controls are unavailable: {message}");
+                    eprintln!("GitTerm V5 browser controls are unavailable: {message}");
                     (None, None, Some(message))
                 }
             };
@@ -6209,9 +6209,9 @@ impl App {
 
         let mut app = Self {
             title: if config::config_dir_override().is_some() {
-                format!("{} Dev", config::APP_NAME)
+                format!("{} (isolated config)", config::WINDOW_TITLE)
             } else {
-                String::from(config::APP_NAME)
+                String::from(config::WINDOW_TITLE)
             },
             workspaces: Vec::new(),
             active_workspace_idx: 0,
@@ -6852,7 +6852,7 @@ impl App {
         )
     }
 
-    /// The local attach command for a remote session: the gitterm-v4-agent
+    /// The local attach command for a remote session: the gitterm-v5-agent
     /// binary next to the running executable (or on PATH) bridging stdio
     /// to the AttachTerminal stream.
     fn remote_session_attach_command(&self, session_id: &str) -> Option<String> {
@@ -6864,10 +6864,10 @@ impl App {
         };
         let agent_bin = std::env::current_exe()
             .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("gitterm-v4-agent")))
+            .and_then(|exe| exe.parent().map(|dir| dir.join("gitterm-v5-agent")))
             .filter(|path| path.exists())
             .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "gitterm-v4-agent".to_string());
+            .unwrap_or_else(|| "gitterm-v5-agent".to_string());
         Some(format!(
             "{} attach --endpoint {} --token-ref {} --session {}",
             shell_quote(&agent_bin),
@@ -8063,7 +8063,7 @@ fi
         match event {
             Event::BrowserMcpStopped(result) => {
                 let error = match result {
-                    Ok(()) => "GitTerm V4 browser MCP server stopped before application shutdown"
+                    Ok(()) => "GitTerm V5 browser MCP server stopped before application shutdown"
                         .to_string(),
                     Err(error) => error,
                 };
@@ -8924,7 +8924,7 @@ fi
                 let model = std::env::var("PI_MODEL")
                     .unwrap_or_else(|_| "openai-codex/gpt-5.4".to_string());
                 let session_path =
-                    format!("/tmp/gitterm-v4-agent-debug-{}.jsonl", std::process::id());
+                    format!("/tmp/gitterm-v5-agent-debug-{}.jsonl", std::process::id());
                 let config = tab::AgentBackendConfig::Pi {
                     model,
                     session_path: Some(session_path),
@@ -10521,7 +10521,7 @@ fi
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| "preview".to_string());
                         let temp_path =
-                            temp_dir.join(format!("gitterm-v4-{}_preview.html", file_name));
+                            temp_dir.join(format!("gitterm-v5-{}_preview.html", file_name));
 
                         if std::fs::write(&temp_path, html).is_ok() {
                             // Open in default browser
@@ -12519,7 +12519,7 @@ fi
         }
         items = items.push(entry(
             "Connect Remote Host…".to_string(),
-            "Add a gitterm-v4-agent endpoint".to_string(),
+            "Add a gitterm-v5-agent endpoint".to_string(),
             Event::RemoteConnectOpen,
         ));
 
@@ -12560,7 +12560,7 @@ fi
     }
 
     /// "Connect Remote Host" form: writes an entry into remote-agents.json
-    /// (token stored under ~/.config/gitterm-v4/tokens/) and shows live
+    /// (token stored under ~/.config/gitterm-v5/tokens/) and shows live
     /// handshake feedback after Connect.
     fn view_remote_connect_form(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
@@ -12633,7 +12633,7 @@ fi
             true,
         );
         let token_hint = text(
-            "Stored in ~/.config/gitterm-v4/tokens/. Or paste a ref: \
+            "Stored in ~/.config/gitterm-v5/tokens/. Or paste a ref: \
              env:VAR, file:~/path, keychain:service/account",
         )
         .size(10)
@@ -12713,7 +12713,7 @@ fi
 
         let card_content = column![
             text("Connect Remote Host").size(14).color(text_primary),
-            text("Adds a gitterm-v4-agent host to remote-agents.json")
+            text("Adds a gitterm-v5-agent host to remote-agents.json")
                 .size(11)
                 .color(text_muted),
             container(iced::widget::Space::new()).height(Length::Fixed(8.0)),
@@ -21688,7 +21688,7 @@ mod tests {
     fn test_browser_status(state: BrowserState) -> BrowserStatus {
         BrowserStatus {
             state,
-            profile_dir: PathBuf::from("/tmp/gitterm-v4/browser-profile"),
+            profile_dir: PathBuf::from("/tmp/gitterm-v5/browser-profile"),
             devtools_port: None,
             process_id: None,
             target_id: None,

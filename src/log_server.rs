@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use warp::Filter;
 
-const LOG_SERVER_BASE_PORT: u16 = 13_030;
+const LOG_SERVER_BASE_PORT: u16 = 23_030;
 const LOG_SERVER_PORTS_PER_INSTANCE: u16 = 10;
 
 /// Snapshot of terminal content for a single tab
@@ -144,7 +144,7 @@ async fn handle_index(state: ServerState) -> Result<impl warp::Reply, warp::Reje
 <html>
 <head>
     <meta charset="utf-8">
-    <title>GitTerm V4 Log Viewer</title>
+    <title>GitTerm V5 Log Viewer</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -187,7 +187,7 @@ async fn handle_index(state: ServerState) -> Result<impl warp::Reply, warp::Reje
     </style>
 </head>
 <body>
-    <h1>GitTerm V4 Log Viewer</h1>
+    <h1>GitTerm V5 Log Viewer</h1>
     <p>Select a tab to view its terminal output:</p>
     <ul class="tab-list">
 "#,
@@ -231,7 +231,7 @@ async fn handle_tab(
 <html>
 <head>
     <meta charset="utf-8">
-    <title>{} - GitTerm V4 Logs</title>
+    <title>{} - GitTerm V5 Logs</title>
     <style>
         body {{
             font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
@@ -433,7 +433,7 @@ async fn handle_file(
 <html>
 <head>
     <meta charset="utf-8">
-    <title>{} - GitTerm V4 File Viewer</title>
+    <title>{} - GitTerm V5 File Viewer</title>
     <style>
         body {{
             font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
@@ -604,12 +604,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_server_port_range_does_not_overlap_v3() {
-        let v4_first = LOG_SERVER_BASE_PORT;
-        let v4_last = LOG_SERVER_BASE_PORT + (99 * LOG_SERVER_PORTS_PER_INSTANCE) + 9;
-        let v3_last = 3_030 + (99 * 10) + 9;
-        assert!(v4_first > v3_last);
-        assert_eq!(v4_last, 14_029);
+    fn log_server_port_range_does_not_overlap_earlier_versions() {
+        let v5_first = LOG_SERVER_BASE_PORT;
+        let v5_last = LOG_SERVER_BASE_PORT + (99 * LOG_SERVER_PORTS_PER_INSTANCE) + 9;
+        let v4_last = 13_030 + (99 * 10) + 9;
+        assert!(v5_first > v4_last);
+        assert_eq!(v5_last, 24_029);
     }
 
     // === html_escape ===

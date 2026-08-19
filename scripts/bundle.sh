@@ -1,10 +1,10 @@
 #!/bin/bash
-# Creates an isolated macOS .app bundle for GitTerm V4
+# Creates an isolated macOS .app bundle for GitTerm V5
 
 set -e
 
-APP_NAME="GitTerm V4"
-BUNDLE_ID="com.cree8.gitterm.v4"
+APP_NAME="GitTerm V5"
+BUNDLE_ID="com.cree8.gitterm.v5"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_DIR/target/release"
@@ -19,7 +19,7 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
 # Copy binary with a different name so the launcher script can call it directly
-cp "$BUILD_DIR/gitterm-v4" "$APP_DIR/Contents/MacOS/gitterm-v4-bin"
+cp "$BUILD_DIR/gitterm-v5" "$APP_DIR/Contents/MacOS/gitterm-v5-bin"
 
 # Create launcher script as the app executable — bypasses Launch Services
 # deduplication so each double-click spawns a fresh process
@@ -29,7 +29,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # Spawn binary detached so launcher exits immediately.
 # macOS then sees no running process for this bundle, allowing
 # subsequent double-clicks to spawn additional instances.
-nohup "$DIR/gitterm-v4-bin" "$@" >/dev/null 2>&1 &
+nohup "$DIR/gitterm-v5-bin" "$@" >/dev/null 2>&1 &
 disown
 exit 0
 LAUNCHER
@@ -51,9 +51,9 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>
-    <string>4.0.0</string>
+    <string>5.0.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>4.0.0</string>
+    <string>5.0.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
@@ -69,7 +69,7 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>LSMultipleInstancesProhibited</key>
     <false/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>GitTerm V4 uses the microphone for speech-to-text input to the terminal.</string>
+    <string>GitTerm V5 uses the microphone for speech-to-text input to the terminal.</string>
 </dict>
 </plist>
 EOF

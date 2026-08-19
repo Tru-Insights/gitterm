@@ -7,15 +7,15 @@ use gitterm::agentd::server::{self, AgentServerConfig};
 #[cfg(unix)]
 mod attach;
 
-const DEFAULT_ADDR: &str = "127.0.0.1:8777";
-const AGENT_ADDR_ENV: &str = "GITTERM_V4_AGENT_ADDR";
-const AGENT_TOKEN_ENV: &str = "GITTERM_V4_AGENT_TOKEN";
-const AGENT_NAME_ENV: &str = "GITTERM_V4_AGENT_NAME";
+const DEFAULT_ADDR: &str = "127.0.0.1:8787";
+const AGENT_ADDR_ENV: &str = "GITTERM_V5_AGENT_ADDR";
+const AGENT_TOKEN_ENV: &str = "GITTERM_V5_AGENT_TOKEN";
+const AGENT_NAME_ENV: &str = "GITTERM_V5_AGENT_NAME";
 
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
-        eprintln!("gitterm-v4-agent: {err}");
+        eprintln!("gitterm-v5-agent: {err}");
         std::process::exit(1);
     }
 }
@@ -26,7 +26,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some("serve") => {
             let config = parse_serve_config(args)?;
             eprintln!(
-                "gitterm-v4-agent serving {} as {}",
+                "gitterm-v5-agent serving {} as {}",
                 config.bind_addr, config.agent_name
             );
             server::serve(config).await
@@ -103,25 +103,39 @@ fn next_arg(
 fn hostname_fallback() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "gitterm-v4-agent".to_string())
+        .unwrap_or_else(|_| "gitterm-v5-agent".to_string())
 }
 
 fn print_usage() {
     eprintln!(
         "Usage:
-  gitterm-v4-agent serve [--addr HOST:PORT] [--token TOKEN] [--name NAME]
-  gitterm-v4-agent attach --endpoint URL --token-ref REF --session ID
-  gitterm-v4-agent sessions --endpoint URL --token-ref REF [--workspace ID]
-  gitterm-v4-agent start --endpoint URL --token-ref REF --workspace ID --cwd DIR [--kind K] --cmd CMD
-  gitterm-v4-agent stop --endpoint URL --token-ref REF --session ID
+  gitterm-v5-agent serve [--addr HOST:PORT] [--token TOKEN] [--name NAME]
+  gitterm-v5-agent attach --endpoint URL --token-ref REF --session ID
+  gitterm-v5-agent sessions --endpoint URL --token-ref REF [--workspace ID]
+  gitterm-v5-agent start --endpoint URL --token-ref REF --workspace ID --cwd DIR [--kind K] --cmd CMD
+  gitterm-v5-agent stop --endpoint URL --token-ref REF --session ID
 
 Environment:
   {AGENT_ADDR_ENV}    default: {DEFAULT_ADDR}
   {AGENT_TOKEN_ENV}   required unless --token is passed
-  {AGENT_NAME_ENV}    default: HOSTNAME/COMPUTERNAME/gitterm-v4-agent
+  {AGENT_NAME_ENV}    default: HOSTNAME/COMPUTERNAME/gitterm-v5-agent
 
 Config:
-  ~/.config/gitterm-v4-agent/config.json may set bind_addr and agent_name.
+  ~/.config/gitterm-v5-agent/config.json may set bind_addr and agent_name.
   Tokens are intentionally supplied by env/CLI in this skeleton."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_endpoint_and_environment_are_v5_only() {
+        assert_eq!(DEFAULT_ADDR, "127.0.0.1:8787");
+        assert_ne!(DEFAULT_ADDR, "127.0.0.1:8777");
+        assert!(AGENT_ADDR_ENV.starts_with("GITTERM_V5_"));
+        assert!(AGENT_TOKEN_ENV.starts_with("GITTERM_V5_"));
+        assert!(AGENT_NAME_ENV.starts_with("GITTERM_V5_"));
+    }
 }

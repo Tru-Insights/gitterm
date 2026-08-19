@@ -25,9 +25,9 @@ cargo run
 ./scripts/bundle.sh
 ```
 
-This creates `target/GitTerm V4.app` which you can:
-- Copy to Applications: `cp -R "target/GitTerm V4.app" /Applications/`
-- Or open directly: `open "target/GitTerm V4.app"`
+This creates `target/GitTerm V5.app` which you can:
+- Copy to Applications: `cp -R "target/GitTerm V5.app" /Applications/`
+- Or open directly: `open "target/GitTerm V5.app"`
 
 ## Linux (Local Build)
 
@@ -72,7 +72,7 @@ cd gitterm
 cargo build --release
 ```
 
-Binary at: `target/release/gitterm-v4`
+Binary at: `target/release/gitterm-v5`
 
 Feature flags:
 - `stt` — voice (whisper-rs + cpal). Required for shipping.
@@ -82,13 +82,13 @@ Feature flags:
 ### Running
 
 ```bash
-./target/release/gitterm-v4
+./target/release/gitterm-v5
 ```
 
 ## Cross-Platform Builds (GitHub Actions)
 
 GitHub Actions builds run on:
-- Push to `v4`
+- Push to `v5`
 - Tag push (e.g. `v1.0.0`) — also creates a Release with attached binaries
 - Manual workflow dispatch
 
@@ -136,7 +136,7 @@ git push origin master          # if it's not
    cargo build --release --target x86_64-pc-windows-gnu
    ```
 
-   Binary at: `target/x86_64-pc-windows-gnu/release/gitterm-v4.exe`
+   Binary at: `target/x86_64-pc-windows-gnu/release/gitterm-v5.exe`
 
 ### Linux (from macOS)
 
@@ -151,7 +151,7 @@ git push origin master          # if it's not
    cargo build --release --target x86_64-unknown-linux-gnu
    ```
 
-   Binary at: `target/x86_64-unknown-linux-gnu/release/gitterm-v4`
+   Binary at: `target/x86_64-unknown-linux-gnu/release/gitterm-v5`
 
 ## Dependencies
 
@@ -172,7 +172,9 @@ git push origin master          # if it's not
 
 ## Notes
 
-- The HTTP log server uses the V4-only `localhost:13030-14029` range
+- The HTTP log server uses the V5-only `localhost:23030-24029` range
+- The browser MCP uses the adjacent V5-only `localhost:24030-25029` range
+- `gitterm-v5-agent` defaults to the V5-only `127.0.0.1:8787` endpoint
 - All builds include the web-based log viewer
 - macOS builds include native menu bar integration
 - Windows/Linux builds use cross-platform menu fallbacks

@@ -1,3 +1,3 @@
-pub mod v1 {
-    tonic::include_proto!("gitterm.agent.v1");
+pub mod v5 {
+    tonic::include_proto!("gitterm.agent.v5");
 }

@@ -1,12 +1,13 @@
-# GitTerm V4
+# GitTerm V5
 
 A Git status viewer with integrated terminal, built with Iced.
 
-![GitTerm V4](assets/icon.png)
+![GitTerm V5](assets/icon.png)
 
-GitTerm V4 is an isolated development lane for the next browser-aware GitTerm
+GitTerm V5 is an isolated development lane for the next browser-aware GitTerm
 architecture. It uses its own configuration, application identity, local port
-range, helper state, and future Chrome profile so it can run alongside V3.
+range, helper state, and Chrome profile so it can run alongside the V4 daily
+driver without reading or mutating V4 state.
 
 ## Features
 
@@ -27,12 +28,12 @@ Download the latest release or build from source:
 ```bash
 cargo build --release
 ./scripts/bundle.sh
-open "target/GitTerm V4.app"
+open "target/GitTerm V5.app"
 ```
 
 ### Features Overview
 
-#### HTTP Log Server (localhost:13030-14029, optional)
+#### HTTP Log Server (localhost:23030-24029, optional)
 - View all terminal logs in your browser
 - Perfect text selection and copy
 - Live search
@@ -90,7 +91,7 @@ Invoke-Expression (&starship init powershell)
 
 ### Agent Presets
 
-GitTerm V4 ships with configurable AI coding agent presets. Option+click the `+` tab button to pick from your configured agents, or click `+` to launch the default. Presets are stored in `~/.config/gitterm-v4/config.json`:
+GitTerm V5 ships with configurable AI coding agent presets. Option+click the `+` tab button to pick from your configured agents, or click `+` to launch the default. Presets are stored in `~/.config/gitterm-v5/config.json`:
 
 ```json
 {
@@ -143,9 +144,11 @@ cargo build --release
 ./scripts/bundle.sh
 ```
 
-V4 defaults to `~/.config/gitterm-v4`. Tests or temporary development
-instances can override that with an absolute `GITTERM_V4_CONFIG_DIR`; V3's
-`GITTERM_CONFIG_DIR` is intentionally ignored.
+V5 defaults to `~/.config/gitterm-v5`. Tests or temporary development
+instances can override that with an absolute `GITTERM_V5_CONFIG_DIR`; V4's
+`GITTERM_V4_CONFIG_DIR` and earlier `GITTERM_CONFIG_DIR` are intentionally
+ignored. The browser MCP reserves ports 24030-25029, and the remote helper
+defaults to `127.0.0.1:8787`.
 
 ## License
 

@@ -6,13 +6,13 @@ use std::time::Duration;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Request;
 
-use super::protocol::v1::git_term_agent_client::GitTermAgentClient;
-use super::protocol::v1::GitDiffRequest;
-use super::protocol::v1::GitStatusRequest;
-use super::protocol::v1::HandshakeRequest;
-use super::protocol::v1::ListDirRequest;
-use super::protocol::v1::ReadFileRequest;
-use super::protocol::v1::{
+use super::protocol::v5::git_term_agent_client::GitTermAgentClient;
+use super::protocol::v5::GitDiffRequest;
+use super::protocol::v5::GitStatusRequest;
+use super::protocol::v5::HandshakeRequest;
+use super::protocol::v5::ListDirRequest;
+use super::protocol::v5::ReadFileRequest;
+use super::protocol::v5::{
     terminal_input, AttachRequest, ChatEntry, ChatPreviewRequest, EnvVar, ListChatsRequest,
     ListSessionsRequest, Resize, StartSessionRequest, StopSessionRequest, TerminalInput,
 };
@@ -139,7 +139,7 @@ impl RemoteAgentBackend {
         let channel = connect_channel(&self.config.endpoint).await?;
         let mut client = GitTermAgentClient::new(channel);
         let mut request = Request::new(HandshakeRequest {
-            client_name: "GitTerm V4 desktop".to_string(),
+            client_name: "GitTerm V5 desktop".to_string(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
         });
@@ -283,7 +283,7 @@ impl RemoteAgentBackend {
             .map_err(|err| RemoteAgentClientError::new(format!("git_status failed: {err:?}")))?
             .into_inner();
 
-        let map = |file: super::protocol::v1::GitFileStatus| RemoteAgentGitFile {
+        let map = |file: super::protocol::v5::GitFileStatus| RemoteAgentGitFile {
             path: file.path,
             status: file.status,
             is_staged: file.is_staged,
@@ -329,7 +329,7 @@ impl RemoteAgentBackend {
             .map_err(|err| RemoteAgentClientError::new(format!("git_diff failed: {err:?}")))?
             .into_inner();
 
-        use super::protocol::v1::GitDiffLineKind;
+        use super::protocol::v5::GitDiffLineKind;
         let lines = response
             .lines
             .into_iter()
@@ -537,7 +537,7 @@ impl RemoteAgentBackend {
             .map_err(|err| RemoteAgentClientError::new(format!("attach_terminal failed: {err:?}")))?
             .into_inner();
 
-        use super::protocol::v1::terminal_output;
+        use super::protocol::v5::terminal_output;
         let output = stream.map(|item| {
             item.map_err(|err| RemoteAgentClientError::new(format!("attach stream: {err:?}")))
                 .map(|out| match out.output {
@@ -581,7 +581,7 @@ fn chat_entry_from_proto(entry: ChatEntry) -> Option<crate::chats::ChatIndexEntr
     })
 }
 
-fn session_from_proto(session: super::protocol::v1::Session) -> RemoteAgentSession {
+fn session_from_proto(session: super::protocol::v5::Session) -> RemoteAgentSession {
     RemoteAgentSession {
         session_id: session.session_id,
         workspace_id: session.workspace_id,
@@ -741,7 +741,7 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
-    use super::super::protocol::v1::git_term_agent_server::GitTermAgentServer;
+    use super::super::protocol::v5::git_term_agent_server::GitTermAgentServer;
     use super::super::server::{is_authorized_metadata, GitTermAgentService};
 
     #[test]

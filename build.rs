@@ -29,9 +29,9 @@ fn main() {
 }
 
 fn compile_agent_protos() {
-    let proto_file = "proto/gitterm/agent/v1/agent.proto";
+    let proto_file = "proto/gitterm/agent/v5/agent.proto";
     println!("cargo:rerun-if-changed={proto_file}");
-    println!("cargo:rerun-if-changed=proto/gitterm/agent/v1");
+    println!("cargo:rerun-if-changed=proto/gitterm/agent/v5");
 
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
     std::env::set_var("PROTOC", protoc);

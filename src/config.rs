@@ -1,17 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub const APP_NAME: &str = "GitTerm V4";
-pub const CONFIG_DIR_NAME: &str = "gitterm-v4";
-pub const CONFIG_DIR_ENV: &str = "GITTERM_V4_CONFIG_DIR";
-pub const INSTANCE_ID_ENV: &str = "GITTERM_V4_INSTANCE_ID";
+pub const APP_NAME: &str = "GitTerm V5";
+pub const WINDOW_TITLE: &str = "GitTerm V5 Development";
+pub const CONFIG_DIR_NAME: &str = "gitterm-v5";
+pub const CONFIG_DIR_ENV: &str = "GITTERM_V5_CONFIG_DIR";
+pub const INSTANCE_ID_ENV: &str = "GITTERM_V5_INSTANCE_ID";
 
 // Global instance ID for this process
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
-// Config directory override, read once from GITTERM_V4_CONFIG_DIR
+// Config directory override, read once from GITTERM_V5_CONFIG_DIR
 static CONFIG_DIR_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Get or generate the unique instance ID for this GitTerm process
@@ -22,9 +23,9 @@ pub fn instance_id() -> &'static str {
     })
 }
 
-/// The config directory override from GITTERM_V4_CONFIG_DIR, if set.
+/// The config directory override from GITTERM_V5_CONFIG_DIR, if set.
 /// Dev/test instances set this so they can never read or write the
-/// real ~/.config/gitterm-v4/* state of a running V4 instance.
+/// real ~/.config/gitterm-v5/* state of a running V5 instance.
 pub fn config_dir_override() -> Option<&'static PathBuf> {
     CONFIG_DIR_OVERRIDE
         .get_or_init(|| resolve_config_dir_override(std::env::var_os(CONFIG_DIR_ENV)))
@@ -53,10 +54,11 @@ pub fn global_config_dir() -> PathBuf {
     if let Some(dir) = config_dir_override() {
         return dir.clone();
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join(CONFIG_DIR_NAME)
+    default_config_dir(&dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+}
+
+fn default_config_dir(home: &Path) -> PathBuf {
+    home.join(".config").join(CONFIG_DIR_NAME)
 }
 
 /// Get the base config directory for this instance
@@ -93,11 +95,22 @@ mod tests {
     }
 
     #[test]
-    fn default_config_dir_is_isolated_from_v3() {
+    fn default_config_dir_is_isolated_from_earlier_versions() {
         let home = PathBuf::from("/test-home");
-        let path = home.join(".config").join(CONFIG_DIR_NAME);
-        assert_eq!(path, PathBuf::from("/test-home/.config/gitterm-v4"));
+        let path = default_config_dir(&home);
+        assert_eq!(path, PathBuf::from("/test-home/.config/gitterm-v5"));
+        assert_ne!(path, PathBuf::from("/test-home/.config/gitterm-v4"));
         assert_ne!(path, PathBuf::from("/test-home/.config/gitterm"));
+    }
+
+    #[test]
+    fn runtime_identity_environment_is_v5_only() {
+        assert_eq!(APP_NAME, "GitTerm V5");
+        assert_eq!(WINDOW_TITLE, "GitTerm V5 Development");
+        assert_eq!(CONFIG_DIR_ENV, "GITTERM_V5_CONFIG_DIR");
+        assert_eq!(INSTANCE_ID_ENV, "GITTERM_V5_INSTANCE_ID");
+        assert_ne!(CONFIG_DIR_ENV, "GITTERM_V4_CONFIG_DIR");
+        assert_ne!(INSTANCE_ID_ENV, "GITTERM_V4_INSTANCE_ID");
     }
 
     #[test]
