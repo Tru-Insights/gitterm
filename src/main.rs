@@ -24515,18 +24515,42 @@ fi
                 total_files, tab.staged.len(), tab.unstaged.len(), tab.untracked.len());
         }
 
+        // Toggle and the selection panel stay pinned above the scrollable so
+        // selecting a row never scrolls the list away from the clicked item.
+        let mut header = Column::new().spacing(8).padding(iced::Padding {
+            top: 8.0,
+            right: 8.0,
+            bottom: 0.0,
+            left: 8.0,
+        });
+        header = header.push(self.view_git_mode_toggle(tab));
+        if matches!(tab.git_view_mode, GitViewMode::Worktrees) && self.git_source_matches(tab) {
+            if let Some(actions) = self.view_git_selection_actions(tab) {
+                header = header.push(actions);
+            }
+        }
+
         let mut content = Column::new().spacing(8).padding(8);
-        content = content.push(self.view_git_mode_toggle(tab));
 
         content = match tab.git_view_mode {
             GitViewMode::Changes => self.append_git_changes(content, tab, show_loading),
             GitViewMode::Worktrees => self.append_git_worktrees(content, tab),
         };
 
-        scrollable(content)
-            .height(Length::Fill)
-            .width(Length::Fill)
-            .into()
+        column![
+            header,
+            scrollable(content).height(Length::Fill).width(Length::Fill)
+        ]
+        .spacing(0)
+        .into()
+    }
+
+    fn git_source_matches(&self, tab: &TabState) -> bool {
+        self.active_workspace().is_some_and(|workspace| {
+            tab.worktrees_repo_path
+                .as_ref()
+                .is_some_and(|path| paths_equal(path, &workspace.dir))
+        })
     }
 
     fn view_git_mode_toggle<'a>(
@@ -24731,11 +24755,7 @@ fi
     ) -> Column<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
-        let source_matches = self.active_workspace().is_some_and(|workspace| {
-            tab.worktrees_repo_path
-                .as_ref()
-                .is_some_and(|path| paths_equal(path, &workspace.dir))
-        });
+        let source_matches = self.git_source_matches(tab);
         let worktrees = if source_matches {
             tab.worktrees.as_slice()
         } else {
@@ -24758,12 +24778,6 @@ fi
         if let Some(error) = &tab.worktrees_error {
             if source_matches && worktrees.is_empty() {
                 content = content.push(text(error).size(font).color(theme.text_secondary()));
-            }
-        }
-
-        if source_matches {
-            if let Some(actions) = self.view_git_selection_actions(tab) {
-                content = content.push(actions);
             }
         }
 
@@ -24850,11 +24864,6 @@ fi
         let font_small = self.ui_font_small();
         let panel_bg = theme.bg_base();
         let border_color = theme.surface1();
-        let title = worktree
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| worktree.path.display().to_string());
         let branch = self.worktree_branch_label(worktree);
         let path_display = self.compact_path_display(&worktree.path);
 
@@ -24865,7 +24874,7 @@ fi
         let mut actions = Row::new().spacing(6).align_y(iced::Alignment::Center);
         if worktree.is_git_repo && !worktree.is_prunable {
             actions = actions.push(
-                button(text("Open Terminal").size(font_small))
+                button(text(self.open_worktree_label(&worktree.path)).size(font_small))
                     .style(self.ghost_button_style())
                     .padding([3, 8])
                     .on_press(Event::OpenWorktree(worktree.path.clone())),
@@ -24926,13 +24935,10 @@ fi
 
         let mut info = column![
             text("Selected worktree").size(10).color(theme.overlay0()),
-            text(title)
+            text(branch)
                 .size(font)
                 .color(theme.text_primary())
                 .font(iced::Font::with_name("Menlo")),
-            text(format!("branch: {}", branch))
-                .size(font_small)
-                .color(theme.text_secondary()),
             text(path_display).size(font_small).color(theme.overlay1()),
         ]
         .spacing(4);
@@ -25003,7 +25009,7 @@ fi
                     .color(theme.overlay1()),
             );
             actions = actions.push(
-                button(text("Open Terminal").size(font_small))
+                button(text(self.open_worktree_label(path)).size(font_small))
                     .style(self.ghost_button_style())
                     .padding([3, 8])
                     .on_press(Event::OpenWorktree(path.clone())),
@@ -25039,6 +25045,23 @@ fi
                 ..Default::default()
             })
             .into()
+    }
+
+    /// Label for the open-worktree action: `Event::OpenWorktree` focuses an
+    /// existing tab at the path when one exists and only creates a terminal
+    /// otherwise, so the button must say which of the two will happen.
+    fn open_worktree_label(&self, path: &Path) -> &'static str {
+        let has_tab = self.active_workspace().is_some_and(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .any(|tab| paths_equal(&tab.repo_path, path) || paths_equal(&tab.current_dir, path))
+        });
+        if has_tab {
+            "Go to session"
+        } else {
+            "Open Terminal"
+        }
     }
 
     fn worktree_branch_label(&self, worktree: &GitWorktreeEntry) -> String {
@@ -25179,11 +25202,8 @@ fi
         let font = self.ui_font();
         let font_small = self.ui_font_small();
         let changes = worktree.total_changes();
-        let worktree_name = worktree
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| worktree.path.display().to_string());
+        // Lead with the branch: it is the identity people recognize. The
+        // checkout directory is secondary detail on the path line.
         let branch = self.worktree_branch_label(worktree);
 
         let status_label = if worktree.is_prunable {
@@ -25223,7 +25243,7 @@ fi
             .align_y(iced::Alignment::Center)
             .push(text(marker).size(font).color(icon_color))
             .push(
-                text(worktree_name)
+                text(branch)
                     .size(font)
                     .color(branch_color)
                     .font(iced::Font::with_name("Menlo"))
@@ -25265,7 +25285,7 @@ fi
 
         let path_display = self.compact_path_display(&worktree.path);
         let mut detail = Row::new().spacing(6).align_y(iced::Alignment::Center).push(
-            text(format!("branch: {}", branch))
+            text(path_display)
                 .size(font_small)
                 .color(theme.overlay1())
                 .width(Length::Fill),
@@ -25280,10 +25300,6 @@ fi
                 .color(theme.overlay0()),
             );
         }
-        let path_row = text(path_display)
-            .size(font_small)
-            .color(theme.overlay0())
-            .width(Length::Fill);
 
         let row_bg = if is_selected {
             Some(theme.surface1())
@@ -25294,7 +25310,7 @@ fi
         };
         let border_color = theme.accent();
         let border_width = if is_selected { 1.0 } else { 0.0 };
-        let content = container(column![top, detail, path_row].spacing(2))
+        let content = container(column![top, detail].spacing(2))
             .padding([6, 8])
             .width(Length::Fill)
             .style(move |_| container::Style {
