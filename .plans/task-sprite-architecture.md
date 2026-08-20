@@ -4,7 +4,13 @@
 
 **Captured:** 2026-08-19
 
-**Related:** `chats-panel.md`, `remote-gitterm-agent-architecture.md`
+**Related:** `task-navigation-design-brief.md`, `chats-panel.md`,
+`remote-gitterm-agent-architecture.md`
+
+The durable hierarchy in this document remains the product contract. Its exact
+navigation presentation has been reopened for experience design; see
+`task-navigation-design-brief.md`. References below to the first implemented
+task tab treatment describe the prototype, not a final layout decision.
 
 ## Intent
 
@@ -71,7 +77,7 @@ process may stop when GitTerm exits, but the task, worktree, branch, and harness
 session remain resumable. A remote `agentd` session continues while the desktop
 is disconnected.
 
-### A task contains its own tab set
+### A task contains its own session and view set
 
 The visible hierarchy is:
 
@@ -84,12 +90,12 @@ Workspace
       -> Pull Request view
 ```
 
-Workspace tabs remain valid for ad hoc repository work. Entering a task changes
-the top tab bar into that task's context: a back-to-workspace control, the task
-identity, its child tabs, and a task-scoped `+` launcher. The first implementation
-may store terminal widgets in the workspace's existing flat tab vector, but the
-product contract and navigation treat every tab carrying the same `task_id` as
-a child of that task.
+Workspace sessions remain valid for ad hoc repository work. The first
+implementation entered a task by replacing the top tab bar with a task context,
+but that presentation is now one of several alternatives under design review.
+The durable contract is independent of the visual treatment: every tab carrying
+the same `task_id` is a child view of that task, and managed task worktrees do
+not become peer workspaces in navigation.
 
 The task owns the objective, branch, and worktree. A child agent session owns
 its harness and model selection. Creating a task must not permanently bind it to
@@ -169,6 +175,37 @@ state, credentials, or machine resources. Task execution therefore also needs:
 | Execution attempt | One launch or resume of a task's worker | Until completion, failure, or stop |
 | Tab | A view into a terminal, agent session, task, document, or browser | Open/close freely |
 | Executor | The machine/runtime that performs an attempt | Selected per attempt |
+
+### Coordinator sessions use the same task control plane
+
+A coordinator is a session role, not a Pi-, Codex-, or Claude-specific entity.
+Any harness that can reach GitTerm's authenticated task-control MCP may list,
+inspect, create, and launch durable tasks. GitTerm remains the sole owner of the
+task store, worktree provisioning, tab registry, and lifecycle state; agents do
+not edit those files or reconstruct that state themselves.
+
+The first contract deliberately separates task creation from session launch.
+It also reports whether the stored objective was actually submitted to the
+harness. Arbitrary configured commands do not share a safe prompt-input
+contract, so GitTerm must not claim a worker has started the objective merely
+because its terminal opened.
+
+Future cross-harness communication should pass through GitTerm rather than
+connecting harnesses directly. MCP supplies coordinator-facing operations such
+as handoff, message, and wait. A standard session transport such as
+[Agent Client Protocol](https://agentclientprotocol.com/get-started/architecture)
+can later let GitTerm prompt and observe compatible workers, with explicit
+harness adapters for other processes. Handoff packets and artifacts remain
+durable task data so communication survives session restarts.
+
+Each task also owns durable child-session history. A task session has a
+GitTerm identity and may link to a native Claude, Codex, or Pi conversation
+reference. Closing a tab removes only the view; the task can later resume the
+exact conversation through the Chats index. Continuing with a different
+harness creates a new task session in the same worktree and carries a compact
+task handoff containing the latest summary, decisions, next steps, and blockers.
+Transcripts remain in their native harness stores and are never copied into
+`tasks.json`.
 
 Execution attempts are an internal durability concept. The normal interface
 should say "Run," "Resume," or "Retry," not force the user to manage attempt
@@ -265,7 +302,8 @@ TaskRecord
   lifecycle state
   attention state
   active/latest execution attempt
-  harness conversation/session reference
+  durable child-session history and harness conversation references
+  latest compact cross-harness handoff
   changed-file and verification summary
   optional commit and PR references
   archive state

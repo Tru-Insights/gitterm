@@ -1,6 +1,6 @@
 # GitTerm V5 Task and Sprite Implementation Plan
 
-**Status:** Slices 0-4 complete; Slice 5 lifecycle and attention next
+**Status:** Slices 0-4B complete; Slice 5 lifecycle and attention next
 
 **Captured:** 2026-08-19
 
@@ -49,7 +49,7 @@ Assigned identities:
 | App / bundle | `GitTerm V5` / `com.cree8.gitterm.v5` |
 | Desktop state root | `~/.config/gitterm-v5` |
 | Helper state / service / token identity | `~/.config/gitterm-v5-agent` / `com.cree8.gitterm.v5.agent` / `gitterm-v5-agent` |
-| Log server / browser MCP | `localhost:23030-24029` / `localhost:24030-25029` |
+| Log server / browser MCP / task MCP | `localhost:23030-24029` / `localhost:24030-25029` / `localhost:25030-26029` |
 | Remote helper endpoint | `127.0.0.1:8787` |
 | Remote helper wire namespace | `gitterm.agent.v5.GitTermAgent` |
 | Browser / temporary state | `<desktop-root>/browser-profile` / `gitterm-v5-*` |
@@ -219,6 +219,82 @@ Exit gate:
 
 - The first end-to-end local workflow is usable without Docker or GitHub-hosted
   execution.
+
+## Slice 4A - Generic Agent Task Control (TRU-106)
+
+**Goal:** Let a coordinator session use the same durable task and worktree
+workflow as the UI without making GitTerm depend on one harness.
+
+Tasks:
+
+- [x] Add a V5-isolated authenticated task-control MCP endpoint.
+- [x] Route every operation through the Iced event loop; do not give the MCP
+  server independent ownership of `tasks.json` or visible tabs.
+- [x] Expose `task_list`, `task_get`, `task_create`, `task_create_batch`, and
+  `task_launch_session`.
+- [x] Keep batch creation sequential and return explicit per-item partial
+  failures.
+- [x] Create agent-requested tasks in the background without stealing focus
+  from the coordinator session.
+- [x] Inject ephemeral task MCP configuration into Codex presets and manual
+  Codex launches without modifying persisted user/project configuration.
+- [x] Verify a real coordinator creates a task and launches a configured child
+  session through the MCP endpoint.
+
+Boundaries:
+
+- Session launch opens the selected harness or terminal but does not claim the
+  stored objective was submitted. Automatic prompt delivery requires a tested
+  adapter or a standard session transport such as ACP.
+- Pi, Claude, and other harnesses inherit connection environment variables but
+  need their own MCP/session adapter before GitTerm can advertise automatic
+  attachment.
+- Cross-harness handoff, messaging, waiting, lifecycle automation, and writer
+  leases remain later slices built on this control plane.
+
+Exit gate:
+
+- A generic Codex coordinator can create independent background tasks and open
+  their worker sessions, while the same GitTerm-owned command bridge remains
+  transport-neutral for later harness adapters.
+
+## Slice 4B - Task Conversation Continuity and Handoffs
+
+**Goal:** Let task work survive closed tabs and move between harnesses without
+copying native transcripts into GitTerm.
+
+Tasks:
+
+- [x] Persist independent child-session history on each task, separate from the
+  single-writer execution-attempt lifecycle.
+- [x] Link task sessions to native Claude, Codex, and Pi conversation IDs found
+  by the existing Chats index in the task worktree.
+- [x] Pre-assign Claude conversation IDs at launch and persist a resume command
+  so restart reconnects instead of recreating the session.
+- [x] Show resumable conversation history in task details and focus an existing
+  tab rather than duplicating a live conversation.
+- [x] Replace the generic add-session action with **Continue with…**; copy a
+  structured task briefing before opening the harness picker.
+- [x] Add `task_update_handoff` so coordinators and compatible workers can
+  persist a compact summary, decisions, next steps, and blockers.
+- [x] Keep session history and handoffs additive so existing `tasks.json`
+  records load with empty defaults.
+
+Boundaries:
+
+- Same-harness continuation resumes the exact native conversation. A different
+  harness starts a new conversation in the same worktree and receives the
+  copied task briefing; arbitrary terminal presets still do not have a safe
+  automatic prompt-submission contract.
+- Native transcripts remain owned by Claude, Codex, and Pi. GitTerm stores only
+  stable references and compact handoffs.
+- The local Chats index supplies conversation discovery. Remote resume remains
+  part of the remote-executor work.
+
+Exit gate:
+
+- A task with no open child tabs can resume a prior local harness conversation,
+  or continue in a different configured harness with durable handoff context.
 
 ## Slice 5 - Lifecycle, Progress, and Attention
 

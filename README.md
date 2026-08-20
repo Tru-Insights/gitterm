@@ -147,8 +147,8 @@ cargo build --release
 V5 defaults to `~/.config/gitterm-v5`. Tests or temporary development
 instances can override that with an absolute `GITTERM_V5_CONFIG_DIR`; V4's
 `GITTERM_V4_CONFIG_DIR` and earlier `GITTERM_CONFIG_DIR` are intentionally
-ignored. The browser MCP reserves ports 24030-25029, and the remote helper
-defaults to `127.0.0.1:8787`.
+ignored. The browser MCP reserves ports 24030-25029, the task-control MCP uses
+25030-26029, and the remote helper defaults to `127.0.0.1:8787`.
 
 ## License
 

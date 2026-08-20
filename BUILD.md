@@ -174,6 +174,7 @@ git push origin master          # if it's not
 
 - The HTTP log server uses the V5-only `localhost:23030-24029` range
 - The browser MCP uses the adjacent V5-only `localhost:24030-25029` range
+- The task-control MCP uses the V5-only `localhost:25030-26029` range
 - `gitterm-v5-agent` defaults to the V5-only `127.0.0.1:8787` endpoint
 - All builds include the web-based log viewer
 - macOS builds include native menu bar integration

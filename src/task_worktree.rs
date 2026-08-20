@@ -6,6 +6,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+/// Internal request marker for the product default: prefer `develop`, then
+/// `main`, and fall back to the current branch only when neither exists.
+pub const DEFAULT_TASK_BASE: &str = "__gitterm_default_task_base__";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRepository {
     pub top_level: PathBuf,
@@ -42,6 +46,19 @@ pub struct ResolvedTaskPreparation {
     pub repository: ResolvedRepository,
     pub base: GitBase,
     pub proposal: TaskWorktreeProposal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptWorktreeRequest {
+    pub repository_path: PathBuf,
+    pub worktree_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedWorktreeResolution {
+    pub repository: ResolvedRepository,
+    pub base: GitBase,
+    pub branch: String,
 }
 
 impl From<PreparedTaskWorktree> for CompletedWorktreePreparation {
@@ -360,7 +377,21 @@ pub fn resolve_task_preparation_blocking(
     request: &PrepareTaskWorktreeRequest,
 ) -> Result<ResolvedTaskPreparation, TaskWorktreeError> {
     let repository = resolve_repository(&request.repository_path)?;
-    let base = resolve_base(&repository, &request.base_reference)?;
+    let base = if request.base_reference == DEFAULT_TASK_BASE {
+        let preferred = ["develop", "main"]
+            .into_iter()
+            .find_map(|reference| resolve_base(&repository, reference).ok());
+        if let Some(base) = preferred {
+            base
+        } else {
+            resolve_base(
+                &repository,
+                repository.current_branch.as_deref().unwrap_or("HEAD"),
+            )?
+        }
+    } else {
+        resolve_base(&repository, &request.base_reference)?
+    };
     let proposal = propose_task_worktree(
         &repository,
         &request.worktree_root,
@@ -374,6 +405,133 @@ pub fn resolve_task_preparation_blocking(
         base,
         proposal,
     })
+}
+
+pub fn resolve_worktree_adoption_blocking(
+    request: &AdoptWorktreeRequest,
+) -> Result<AdoptedWorktreeResolution, TaskWorktreeError> {
+    let repository = resolve_repository(&request.repository_path)?;
+    let registered = registered_worktrees(&repository.top_level)?
+        .iter()
+        .any(|path| paths_equal(path, &request.worktree_path));
+    if !registered {
+        return Err(TaskWorktreeError::new(
+            "adopt worktree",
+            &request.worktree_path,
+            "path is not a registered worktree of this repository",
+        ));
+    }
+    let branch_output = git_command()
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(&request.worktree_path)
+        .output()
+        .map_err(|error| {
+            TaskWorktreeError::new(
+                "read worktree branch",
+                &request.worktree_path,
+                error.to_string(),
+            )
+        })?;
+    if !branch_output.status.success() {
+        return Err(TaskWorktreeError::new(
+            "adopt worktree",
+            &request.worktree_path,
+            "worktree is on a detached HEAD; check out a branch before adopting it",
+        ));
+    }
+    let branch = stdout_text(
+        &branch_output,
+        &request.worktree_path,
+        "read worktree branch",
+    )?
+    .trim()
+    .to_string();
+    if branch.is_empty() {
+        return Err(TaskWorktreeError::new(
+            "adopt worktree",
+            &request.worktree_path,
+            "worktree branch name is empty",
+        ));
+    }
+    let base = infer_adoption_base(&repository, &branch)?;
+    Ok(AdoptedWorktreeResolution {
+        repository,
+        base,
+        branch,
+    })
+}
+
+/// Off-thread wrapper over [`resolve_worktree_adoption_blocking`] for UI callers.
+pub async fn resolve_worktree_adoption(
+    request: AdoptWorktreeRequest,
+) -> Result<AdoptedWorktreeResolution, TaskWorktreeError> {
+    let error_path = request.repository_path.clone();
+    tokio::task::spawn_blocking(move || resolve_worktree_adoption_blocking(&request))
+        .await
+        .map_err(|error| {
+            TaskWorktreeError::new("join adoption worker", error_path, error.to_string())
+        })?
+}
+
+/// Prefer the remote default branch, then the product defaults, then the main
+/// checkout's branch; a branch can never be its own base. The recorded base
+/// commit is the fork point when one exists — for a pre-existing branch that
+/// is the honest anchor for "what changed" comparisons.
+fn infer_adoption_base(
+    repository: &ResolvedRepository,
+    branch: &str,
+) -> Result<GitBase, TaskWorktreeError> {
+    let origin_head = git_command()
+        .args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .current_dir(&repository.top_level)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut candidates: Vec<String> = Vec::new();
+    candidates.extend(origin_head);
+    candidates.push("develop".to_string());
+    candidates.push("main".to_string());
+    if let Some(current) = &repository.current_branch {
+        candidates.push(current.clone());
+    }
+    let mut base = None;
+    for reference in candidates {
+        if reference == branch || reference.strip_prefix("origin/") == Some(branch) {
+            continue;
+        }
+        if let Ok(resolved) = resolve_base(repository, &reference) {
+            base = Some(resolved);
+            break;
+        }
+    }
+    let mut base = base.ok_or_else(|| {
+        TaskWorktreeError::new(
+            "infer adoption base",
+            &repository.top_level,
+            format!("no base branch could be resolved for {branch}"),
+        )
+    })?;
+    let merge_base_output = git_command()
+        .args(["merge-base", &base.commit, branch])
+        .current_dir(&repository.top_level)
+        .output();
+    if let Ok(output) = merge_base_output {
+        if output.status.success() {
+            let fork_point = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !fork_point.is_empty() {
+                base.commit = fork_point;
+            }
+        }
+    }
+    Ok(base)
 }
 
 pub fn prepare_task_worktree_blocking(
@@ -466,6 +624,122 @@ where
         branch: proposal.branch,
         path,
     })
+}
+
+/// Off-thread wrapper over [`inspect_cleanup`] for UI callers.
+pub async fn inspect_task_cleanup(
+    repository_path: PathBuf,
+    worktree_path: PathBuf,
+    branch: String,
+    base_commit: String,
+    context: CleanupContext,
+) -> Result<CleanupInspection, TaskWorktreeError> {
+    let error_path = repository_path.clone();
+    tokio::task::spawn_blocking(move || {
+        inspect_cleanup(
+            &repository_path,
+            &worktree_path,
+            &branch,
+            &base_commit,
+            &context,
+        )
+    })
+    .await
+    .map_err(|error| {
+        TaskWorktreeError::new(
+            "join cleanup inspection worker",
+            error_path,
+            error.to_string(),
+        )
+    })?
+}
+
+/// Removes a task's managed worktree. Callers must run [`inspect_cleanup`]
+/// first and only proceed when `safe_to_remove()`; this function additionally
+/// refuses (git rejects removal of dirty trees without `--force`) as a second
+/// line of defense. The task branch is deliberately left in place — removal
+/// deletes the working copy, never history.
+pub fn remove_task_worktree_blocking(
+    repository_path: &Path,
+    worktree_path: &Path,
+    force: bool,
+) -> Result<(), TaskWorktreeError> {
+    let repository = resolve_repository(repository_path)?;
+    let registered = registered_worktrees(&repository.top_level)?
+        .iter()
+        .any(|path| paths_equal(path, worktree_path));
+    if !registered {
+        return Err(TaskWorktreeError::new(
+            "remove worktree",
+            worktree_path,
+            "path is not a registered worktree of this repository",
+        ));
+    }
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    let output = git_command()
+        .args(args)
+        .arg(worktree_path)
+        .current_dir(&repository.top_level)
+        .output()
+        .map_err(|error| {
+            TaskWorktreeError::new("remove worktree", worktree_path, error.to_string())
+        })?;
+    if !output.status.success() {
+        return Err(command_failure("remove worktree", worktree_path, &output));
+    }
+    Ok(())
+}
+
+/// Off-thread wrapper over [`remove_task_worktree_blocking`] for UI callers.
+pub async fn remove_task_worktree(
+    repository_path: PathBuf,
+    worktree_path: PathBuf,
+    force: bool,
+) -> Result<(), TaskWorktreeError> {
+    let error_path = repository_path.clone();
+    tokio::task::spawn_blocking(move || {
+        remove_task_worktree_blocking(&repository_path, &worktree_path, force)
+    })
+    .await
+    .map_err(|error| {
+        TaskWorktreeError::new(
+            "join worktree removal worker",
+            error_path,
+            error.to_string(),
+        )
+    })?
+}
+
+pub fn prune_worktrees_blocking(repository_path: &Path) -> Result<(), TaskWorktreeError> {
+    let repository = resolve_repository(repository_path)?;
+    let output = git_command()
+        .args(["worktree", "prune"])
+        .current_dir(&repository.top_level)
+        .output()
+        .map_err(|error| {
+            TaskWorktreeError::new("prune worktrees", &repository.top_level, error.to_string())
+        })?;
+    if !output.status.success() {
+        return Err(command_failure(
+            "prune worktrees",
+            &repository.top_level,
+            &output,
+        ));
+    }
+    Ok(())
+}
+
+/// Off-thread wrapper over [`prune_worktrees_blocking`] for UI callers.
+pub async fn prune_worktrees(repository_path: PathBuf) -> Result<(), TaskWorktreeError> {
+    let error_path = repository_path.clone();
+    tokio::task::spawn_blocking(move || prune_worktrees_blocking(&repository_path))
+        .await
+        .map_err(|error| {
+            TaskWorktreeError::new("join worktree prune worker", error_path, error.to_string())
+        })?
 }
 
 pub fn inspect_cleanup(
@@ -1158,6 +1432,36 @@ mod tests {
             main_head_before
         );
         assert!(git_stdout(&repository.path, &["status", "--porcelain"]).is_empty());
+    }
+
+    #[test]
+    fn default_base_prefers_develop_over_main_and_the_current_branch() {
+        let repository = TestRepository::new();
+        git_ok(
+            &repository.path,
+            &["branch", "develop", &repository.initial_commit],
+        );
+        let main_head = repository.commit_file("main-only.txt", "main\n", "Advance main");
+        assert_ne!(main_head, repository.initial_commit);
+        let request =
+            repository.request("default-develop", None, "Prefer develop", DEFAULT_TASK_BASE);
+
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+
+        assert_eq!(resolved.base.reference, "develop");
+        assert_eq!(resolved.base.commit, repository.initial_commit);
+    }
+
+    #[test]
+    fn default_base_uses_main_when_develop_does_not_exist() {
+        let repository = TestRepository::new();
+        let request =
+            repository.request("default-main", None, "Fall back to main", DEFAULT_TASK_BASE);
+
+        let resolved = resolve_task_preparation_blocking(&request).unwrap();
+
+        assert_eq!(resolved.base.reference, "main");
+        assert_eq!(resolved.base.commit, repository.initial_commit);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

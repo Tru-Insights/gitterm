@@ -31,6 +31,8 @@ pub struct TaskRecord {
     pub objective: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<TaskCreator>,
     pub workspace: WorkspaceIdentity,
     pub repository: RepositoryIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -47,9 +49,16 @@ pub struct TaskRecord {
     pub lifecycle: TaskLifecycle,
     pub attention: TaskAttention,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<TaskHandoff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default)]
     pub attempts: Vec<TaskExecutionAttempt>,
+    /// Durable child-session history for this task. Unlike execution attempts,
+    /// several sessions may belong to one task (for example an implementation
+    /// agent, a review agent, and a terminal).
+    #[serde(default)]
+    pub sessions: Vec<TaskSessionRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_attempt_id: Option<String>,
     pub changes: ChangedFilesSummary,
@@ -69,6 +78,7 @@ impl TaskRecord {
             objective: input.objective,
             created_at: timestamp.clone(),
             updated_at: timestamp,
+            created_by: None,
             workspace: input.workspace,
             repository: input.repository,
             issue: input.issue,
@@ -80,8 +90,10 @@ impl TaskRecord {
             stopping_boundary: input.stopping_boundary,
             lifecycle: TaskLifecycle::Draft,
             attention: TaskAttention::default(),
+            handoff: None,
             last_error: None,
             attempts: Vec::new(),
+            sessions: Vec::new(),
             active_attempt_id: None,
             changes: ChangedFilesSummary::default(),
             verification: VerificationSummary::default(),
@@ -89,6 +101,23 @@ impl TaskRecord {
             archived_at: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCreatorKind {
+    Manual,
+    Coordinator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCreator {
+    pub kind: TaskCreatorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_label: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +230,59 @@ pub struct HarnessSelection {
     pub kind: HarnessKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessConversationBackend {
+    Claude,
+    Codex,
+    Pi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessConversationRef {
+    pub backend: HarnessConversationBackend,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSessionRecord {
+    /// GitTerm-owned identity for this child view. It remains stable when the
+    /// underlying harness conversation is closed and later resumed.
+    pub task_session_id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<HarnessConversationRef>,
+    #[serde(default)]
+    pub objective_delivery: ObjectiveDeliveryState,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveDeliveryState {
+    #[default]
+    Unknown,
+    NotDelivered,
+    Delivered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskHandoff {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by_session_id: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -635,6 +717,60 @@ impl TaskStore {
         self.replace(task)
     }
 
+    pub fn upsert_session(
+        &mut self,
+        task_id: &str,
+        session: TaskSessionRecord,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "record session in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        if session.harness.is_some() {
+            task.harness = session.harness.clone();
+        }
+        if let Some(existing) = task
+            .sessions
+            .iter_mut()
+            .find(|existing| existing.task_session_id == session.task_session_id)
+        {
+            *existing = session;
+        } else {
+            task.sessions.push(session);
+        }
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
+    pub fn update_handoff(
+        &mut self,
+        task_id: &str,
+        handoff: TaskHandoff,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "update handoff in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        if handoff.summary.trim().is_empty() {
+            return Err(TaskStoreError::new(
+                "update handoff in",
+                &self.path,
+                format!("task {task_id} handoff summary is empty"),
+            ));
+        }
+        task.handoff = Some(handoff);
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
     pub fn begin_attempt(
         &mut self,
         task_id: &str,
@@ -982,6 +1118,55 @@ fn validate_task(task: &TaskRecord) -> Result<(), String> {
         }
         _ => unreachable!("more than one active attempt was rejected above"),
     }
+    let mut task_session_ids = HashSet::new();
+    let mut conversation_ids = HashSet::new();
+    for session in &task.sessions {
+        if session.task_session_id.trim().is_empty() {
+            return Err(format!("task {} has an empty session id", task.task_id));
+        }
+        if session.label.trim().is_empty() {
+            return Err(format!(
+                "task {} session {} has an empty label",
+                task.task_id, session.task_session_id
+            ));
+        }
+        if session.created_at.trim().is_empty() || session.updated_at.trim().is_empty() {
+            return Err(format!(
+                "task {} session {} has an empty timestamp",
+                task.task_id, session.task_session_id
+            ));
+        }
+        if !task_session_ids.insert(session.task_session_id.as_str()) {
+            return Err(format!(
+                "task {} has duplicate session id {}",
+                task.task_id, session.task_session_id
+            ));
+        }
+        if let Some(conversation) = &session.conversation {
+            if conversation.session_id.trim().is_empty() {
+                return Err(format!(
+                    "task {} session {} has an empty harness conversation id",
+                    task.task_id, session.task_session_id
+                ));
+            }
+            if !conversation_ids.insert((conversation.backend, conversation.session_id.as_str())) {
+                return Err(format!(
+                    "task {} links the same {:?} conversation {} more than once",
+                    task.task_id, conversation.backend, conversation.session_id
+                ));
+            }
+        }
+    }
+    if task
+        .handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.summary.trim().is_empty())
+    {
+        return Err(format!(
+            "task {} has an empty handoff summary",
+            task.task_id
+        ));
+    }
     Ok(())
 }
 
@@ -1068,6 +1253,123 @@ mod tests {
     }
 
     #[test]
+    fn older_task_records_default_to_empty_session_history() {
+        let mut value = serde_json::to_value(sample_task("task-1")).unwrap();
+        value.as_object_mut().unwrap().remove("sessions");
+
+        let decoded: TaskRecord = serde_json::from_value(value).unwrap();
+
+        assert!(decoded.sessions.is_empty());
+    }
+
+    #[test]
+    fn older_records_default_creator_and_objective_delivery_metadata() {
+        let mut task = sample_task("task-1");
+        task.created_by = Some(TaskCreator {
+            kind: TaskCreatorKind::Coordinator,
+            session_id: Some("coordinator-1".to_string()),
+            harness_label: Some("Codex".to_string()),
+            created_at: "2026-08-19T08:00:00Z".to_string(),
+        });
+        task.sessions.push(TaskSessionRecord {
+            task_session_id: "task-session-1".to_string(),
+            label: "Claude implementation".to_string(),
+            harness: None,
+            conversation: None,
+            objective_delivery: ObjectiveDeliveryState::Delivered,
+            created_at: "2026-08-19T08:01:00Z".to_string(),
+            updated_at: "2026-08-19T08:01:00Z".to_string(),
+        });
+        let mut value = serde_json::to_value(task).unwrap();
+        let task = value.as_object_mut().unwrap();
+        task.remove("created_by");
+        task["sessions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("objective_delivery");
+
+        let decoded: TaskRecord = serde_json::from_value(value).unwrap();
+
+        assert_eq!(decoded.created_by, None);
+        assert_eq!(
+            decoded.sessions[0].objective_delivery,
+            ObjectiveDeliveryState::Unknown
+        );
+    }
+
+    #[test]
+    fn task_session_history_round_trips_native_conversation_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        let session = TaskSessionRecord {
+            task_session_id: "task-session-1".to_string(),
+            label: "Codex implementation".to_string(),
+            harness: Some(HarnessSelection {
+                kind: HarnessKind::TerminalPreset {
+                    preset_name: "Codex".to_string(),
+                },
+                model: Some("gpt-5.6".to_string()),
+            }),
+            conversation: Some(HarnessConversationRef {
+                backend: HarnessConversationBackend::Codex,
+                session_id: "codex-chat-1".to_string(),
+            }),
+            objective_delivery: ObjectiveDeliveryState::Delivered,
+            created_at: "2026-08-19T08:01:00Z".to_string(),
+            updated_at: "2026-08-19T08:01:00Z".to_string(),
+        };
+
+        store
+            .upsert_session("task-1", session.clone(), "2026-08-19T08:01:00Z")
+            .unwrap();
+
+        let reloaded = TaskStore::load(path).unwrap();
+        assert_eq!(reloaded.get("task-1").unwrap().sessions, vec![session]);
+        assert_eq!(
+            reloaded
+                .get("task-1")
+                .unwrap()
+                .harness
+                .as_ref()
+                .map(|harness| &harness.kind),
+            Some(&HarnessKind::TerminalPreset {
+                preset_name: "Codex".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn task_handoff_round_trips_compact_cross_harness_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        let handoff = TaskHandoff {
+            summary: "Implementation is complete; review remains".to_string(),
+            decisions: vec!["Keep the task store as the only writer".to_string()],
+            next_steps: vec!["Run the all-features gate".to_string()],
+            blockers: Vec::new(),
+            updated_by_session_id: None,
+            updated_at: "2026-08-19T09:00:00Z".to_string(),
+        };
+
+        store
+            .update_handoff("task-1", handoff.clone(), "2026-08-19T09:00:00Z")
+            .unwrap();
+
+        assert_eq!(
+            TaskStore::load(path)
+                .unwrap()
+                .get("task-1")
+                .unwrap()
+                .handoff,
+            Some(handoff)
+        );
+    }
+
+    #[test]
     fn round_trips_task_records_and_every_enum_variant() {
         let lifecycle = vec![
             TaskLifecycle::Draft,
@@ -1132,6 +1434,11 @@ mod tests {
             VerificationState::Failed,
         ];
         let issue_providers = vec![IssueProvider::Linear, IssueProvider::GitHub];
+        let conversation_backends = vec![
+            HarnessConversationBackend::Claude,
+            HarnessConversationBackend::Codex,
+            HarnessConversationBackend::Pi,
+        ];
         let workspace_locations = vec![
             WorkspaceLocationIdentity::Local {
                 directory: PathBuf::from("/local/repo"),
@@ -1152,6 +1459,7 @@ mod tests {
             verification_states.clone(),
             issue_providers.clone(),
             workspace_locations.clone(),
+            conversation_backends.clone(),
         ))
         .unwrap();
         let decoded: (
@@ -1165,6 +1473,7 @@ mod tests {
             Vec<VerificationState>,
             Vec<IssueProvider>,
             Vec<WorkspaceLocationIdentity>,
+            Vec<HarnessConversationBackend>,
         ) = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.0, lifecycle);
         assert_eq!(decoded.1, attempts);
@@ -1176,6 +1485,7 @@ mod tests {
         assert_eq!(decoded.7, verification_states);
         assert_eq!(decoded.8, issue_providers);
         assert_eq!(decoded.9, workspace_locations);
+        assert_eq!(decoded.10, conversation_backends);
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(TASKS_FILE_NAME);
