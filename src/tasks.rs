@@ -417,6 +417,22 @@ impl AttemptState {
             Self::Interrupted => TaskLifecycle::Interrupted,
         }
     }
+
+    /// The attempt state a task lifecycle maps back onto. `Draft`, `Ready`,
+    /// and `Archived` describe the task between runs, not a run itself.
+    fn for_lifecycle(lifecycle: TaskLifecycle) -> Option<Self> {
+        match lifecycle {
+            TaskLifecycle::Preparing => Some(Self::Preparing),
+            TaskLifecycle::Queued => Some(Self::Queued),
+            TaskLifecycle::Running => Some(Self::Running),
+            TaskLifecycle::WaitingForInput => Some(Self::WaitingForInput),
+            TaskLifecycle::Completed => Some(Self::Completed),
+            TaskLifecycle::Failed => Some(Self::Failed),
+            TaskLifecycle::Stopped => Some(Self::Stopped),
+            TaskLifecycle::Interrupted => Some(Self::Interrupted),
+            TaskLifecycle::Draft | TaskLifecycle::Ready | TaskLifecycle::Archived => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -819,6 +835,129 @@ impl TaskStore {
         task.last_error = None;
         task.updated_at = timestamp.to_string();
         self.replace(task)
+    }
+
+    /// Apply a lifecycle observation derived from a live session (harness
+    /// stream state, terminal-title heuristics, session end). Unlike
+    /// `replace`, a signal may hop through an unobserved `Running`: an agent
+    /// asking for input — or erroring — from a `Ready` task necessarily ran
+    /// first, even if the start itself was never observed. From a state that
+    /// already records an outcome (`Failed`, `Stopped`, ...), only a *live*
+    /// signal may hop (the session demonstrably resumed); an outcome signal
+    /// gets no hop there, so a worse outcome (`Failed`) is never overwritten
+    /// by a later `Completed` from a sibling session. Attempt records are
+    /// maintained alongside: entering an active state opens (or updates) the
+    /// active attempt, an outcome closes it. Invalid signals are errors for
+    /// the caller to log — never silently applied.
+    ///
+    /// Returns whether the record changed.
+    pub fn record_lifecycle_signal(
+        &mut self,
+        task_id: &str,
+        target: TaskLifecycle,
+        last_error: Option<String>,
+        timestamp: &str,
+    ) -> Result<bool, TaskStoreError> {
+        let Some(index) = self
+            .document
+            .tasks
+            .iter()
+            .position(|task| task.task_id == task_id)
+        else {
+            return Err(TaskStoreError::new(
+                "record lifecycle signal in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            ));
+        };
+        let current = self.document.tasks[index].lifecycle;
+        if current == target && last_error.is_none() {
+            return Ok(false);
+        }
+        let direct = current.can_transition_to(target);
+        let current_is_outcome = matches!(
+            current,
+            TaskLifecycle::Completed
+                | TaskLifecycle::Failed
+                | TaskLifecycle::Stopped
+                | TaskLifecycle::Interrupted
+        );
+        let via_running = (target.is_active() || !current_is_outcome)
+            && current.can_transition_to(TaskLifecycle::Running)
+            && TaskLifecycle::Running.can_transition_to(target);
+        if !(direct || via_running) {
+            return Err(TaskStoreError::new(
+                "record lifecycle signal in",
+                &self.path,
+                format!(
+                    "task {task_id} session signal cannot transition {current:?} to {target:?}"
+                ),
+            ));
+        }
+        let mut candidate = self.document.clone();
+        let task = &mut candidate.tasks[index];
+        task.lifecycle = target;
+        if let Some(state) = AttemptState::for_lifecycle(target) {
+            let active_index = task.attempts.iter().position(|item| item.state.is_active());
+            match (state.is_active(), active_index) {
+                (true, Some(existing)) => {
+                    task.attempts[existing].state = state;
+                }
+                (true, None) => {
+                    let attempt_id = uuid::Uuid::new_v4().simple().to_string();
+                    task.attempts.push(TaskExecutionAttempt {
+                        attempt_id: attempt_id.clone(),
+                        executor: task.executor.clone(),
+                        harness: task.harness.clone(),
+                        state,
+                        started_at: timestamp.to_string(),
+                        ended_at: None,
+                        session_ref: None,
+                        failure: None,
+                    });
+                    task.active_attempt_id = Some(attempt_id);
+                }
+                (false, Some(existing)) => {
+                    let attempt = &mut task.attempts[existing];
+                    attempt.state = state;
+                    attempt.ended_at = Some(timestamp.to_string());
+                    if state == AttemptState::Failed {
+                        attempt.failure = last_error.clone();
+                    }
+                    task.active_attempt_id = None;
+                }
+                (false, None) if current != target => {
+                    // The hop case: the run happened unobserved and is already
+                    // over. Record it as an attempt that started and ended at
+                    // the moment we learned about it.
+                    task.attempts.push(TaskExecutionAttempt {
+                        attempt_id: uuid::Uuid::new_v4().simple().to_string(),
+                        executor: task.executor.clone(),
+                        harness: task.harness.clone(),
+                        state,
+                        started_at: timestamp.to_string(),
+                        ended_at: Some(timestamp.to_string()),
+                        session_ref: None,
+                        failure: (state == AttemptState::Failed)
+                            .then(|| last_error.clone())
+                            .flatten(),
+                    });
+                }
+                (false, None) => {}
+            }
+        }
+        if let Some(detail) = last_error {
+            task.last_error = Some(detail);
+        }
+        if target == TaskLifecycle::Failed {
+            task.attention = TaskAttention {
+                reason: Some(TaskAttentionReason::ExecutionFailed),
+                unread: true,
+            };
+        }
+        task.updated_at = timestamp.to_string();
+        self.commit_candidate(candidate)?;
+        Ok(true)
     }
 
     pub fn reconcile_after_restart(&mut self, timestamp: &str) -> Result<usize, TaskStoreError> {
@@ -1791,6 +1930,168 @@ mod tests {
         assert_eq!(
             failed.attention.reason,
             Some(TaskAttentionReason::ExecutionFailed)
+        );
+    }
+
+    #[test]
+    fn lifecycle_signal_hops_through_running_into_active_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        make_ready(&mut store, "task-1");
+
+        // A waiting signal from a Ready task means the session ran first even
+        // though the start itself was never observed.
+        let changed = store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::WaitingForInput,
+                None,
+                "2026-08-19T08:05:00Z",
+            )
+            .unwrap();
+        assert!(changed);
+        let task = store.get("task-1").unwrap();
+        assert_eq!(task.lifecycle, TaskLifecycle::WaitingForInput);
+        assert_eq!(task.updated_at, "2026-08-19T08:05:00Z");
+        // The signal opened an attempt record for the run it implies.
+        assert_eq!(task.attempts.len(), 1);
+        assert_eq!(task.attempts[0].state, AttemptState::WaitingForInput);
+        assert_eq!(
+            task.active_attempt_id.as_deref(),
+            Some(task.attempts[0].attempt_id.as_str())
+        );
+    }
+
+    #[test]
+    fn lifecycle_signal_never_hops_between_terminal_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        make_ready(&mut store, "task-1");
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Failed,
+                Some("agent reported an error".to_string()),
+                "2026-08-19T08:05:00Z",
+            )
+            .unwrap();
+
+        // A later completion from a sibling session must not launder the
+        // failure into success.
+        let error = store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Completed,
+                None,
+                "2026-08-19T08:06:00Z",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("Failed"), "{error}");
+        let task = store.get("task-1").unwrap();
+        assert_eq!(task.lifecycle, TaskLifecycle::Failed);
+        assert_eq!(task.last_error.as_deref(), Some("agent reported an error"));
+        assert_eq!(
+            task.attention.reason,
+            Some(TaskAttentionReason::ExecutionFailed)
+        );
+        assert!(task.attention.unread);
+    }
+
+    #[test]
+    fn lifecycle_signal_same_state_is_a_noop_without_detail() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        make_ready(&mut store, "task-1");
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Running,
+                None,
+                "2026-08-19T08:05:00Z",
+            )
+            .unwrap();
+
+        let changed = store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Running,
+                None,
+                "2026-08-19T08:06:00Z",
+            )
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(
+            store.get("task-1").unwrap().updated_at,
+            "2026-08-19T08:05:00Z"
+        );
+    }
+
+    #[test]
+    fn lifecycle_signal_rejects_states_that_never_ran() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+
+        // Draft tasks have no worktree and no session; every session signal
+        // against one is a wiring bug worth surfacing.
+        let error = store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Running,
+                None,
+                "2026-08-19T08:05:00Z",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("Draft"), "{error}");
+        assert_eq!(store.get("task-1").unwrap().lifecycle, TaskLifecycle::Draft);
+    }
+
+    #[test]
+    fn lifecycle_signal_resumes_interrupted_tasks_into_waiting() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        make_ready(&mut store, "task-1");
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Running,
+                None,
+                "2026-08-19T08:05:00Z",
+            )
+            .unwrap();
+        store
+            .reconcile_after_restart("2026-08-19T08:06:00Z")
+            .unwrap();
+        assert_eq!(
+            store.get("task-1").unwrap().lifecycle,
+            TaskLifecycle::Interrupted
+        );
+
+        // A restored session (claude --resume) that shows its prompt again is
+        // genuinely alive and waiting.
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::WaitingForInput,
+                None,
+                "2026-08-19T08:07:00Z",
+            )
+            .unwrap();
+        let task = store.get("task-1").unwrap();
+        assert_eq!(task.lifecycle, TaskLifecycle::WaitingForInput);
+        // The interrupted attempt stays closed as history; the resume opened
+        // a fresh one.
+        assert_eq!(task.attempts.len(), 2);
+        assert_eq!(task.attempts[0].state, AttemptState::Interrupted);
+        assert!(task.attempts[0].ended_at.is_some());
+        assert_eq!(task.attempts[1].state, AttemptState::WaitingForInput);
+        assert_eq!(
+            task.active_attempt_id.as_deref(),
+            Some(task.attempts[1].attempt_id.as_str())
         );
     }
 

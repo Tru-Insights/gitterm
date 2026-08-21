@@ -2229,6 +2229,39 @@ fn format_attention_age(since: Instant, now: Instant) -> String {
     }
 }
 
+/// The outcome a finished task session implies: the lifecycle it ends in,
+/// plus failure detail for the task's `last_error` when there is any.
+type TaskSessionOutcome = (TaskLifecycle, Option<String>);
+
+/// What a task-linked session is observably doing right now, from harness
+/// signals only (agent stream state, terminal-title heuristics, launch and
+/// exit of the harness process). Ephemeral view state — the durable record
+/// is the task's persisted lifecycle. `None` means no live execution signal:
+/// an open shell with nothing observably running claims nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskSessionLiveState {
+    Working,
+    AwaitingInput,
+}
+
+/// Aggregate the live states of every session linked to one task into a
+/// single lifecycle observation. A session awaiting input outranks work in
+/// progress — the human is the blocker; work elsewhere doesn't unblock it.
+/// No live signal at all yields None: the caller falls back to the ending
+/// session's own outcome, or leaves the durable lifecycle untouched.
+fn aggregate_task_live_states(
+    states: impl Iterator<Item = TaskSessionLiveState>,
+) -> Option<TaskLifecycle> {
+    let mut working = false;
+    for state in states {
+        match state {
+            TaskSessionLiveState::AwaitingInput => return Some(TaskLifecycle::WaitingForInput),
+            TaskSessionLiveState::Working => working = true,
+        }
+    }
+    working.then_some(TaskLifecycle::Running)
+}
+
 fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
     title
         .starts_with('✳')
@@ -2602,6 +2635,9 @@ struct TabState {
     task_id: Option<String>,
     // Durable identity of this child session inside its task.
     task_session_id: Option<String>,
+    // Live execution signal for the task session this tab hosts; None when
+    // nothing is observably running (or the tab is not task-linked).
+    task_live_state: Option<TaskSessionLiveState>,
     is_git_repo: bool,
 }
 
@@ -2655,6 +2691,7 @@ impl TabState {
             chat_session_id: None,
             task_id: None,
             task_session_id: None,
+            task_live_state: None,
             attention: None,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
@@ -6043,6 +6080,35 @@ impl App {
         task.attention.reason.is_some() || task.attention.unread
     }
 
+    /// Fold a session observation into the task's durable lifecycle. Callers
+    /// update the signalling tab's `task_live_state` first; the aggregate over
+    /// every linked session then decides. `ended` carries the outcome of a
+    /// session that just finished (completed/failed/stopped) — it only sets
+    /// the lifecycle when no other live session keeps the task active, but
+    /// its failure detail is recorded either way.
+    fn apply_task_session_signal(&mut self, task_id: &str, ended: Option<TaskSessionOutcome>) {
+        let live = aggregate_task_live_states(
+            self.workspaces
+                .iter()
+                .flat_map(|workspace| workspace.tabs.iter())
+                .filter(|tab| tab.task_id.as_deref() == Some(task_id))
+                .filter_map(|tab| tab.task_live_state),
+        );
+        let (target, detail) = match (live, ended) {
+            (Some(state), ended) => (state, ended.and_then(|(_, detail)| detail)),
+            (None, Some((state, detail))) => (state, detail),
+            (None, None) => return,
+        };
+        let Some(store) = self.task_store.as_mut() else {
+            return;
+        };
+        if let Err(error) =
+            store.record_lifecycle_signal(task_id, target, detail, &chrono::Utc::now().to_rfc3339())
+        {
+            eprintln!("GitTerm V5 dropped a task lifecycle signal: {error}");
+        }
+    }
+
     fn task_sort_bucket(task: &TaskRecord) -> u8 {
         if Self::task_needs_attention(task) {
             0
@@ -6548,12 +6614,17 @@ impl App {
         }
 
         let resume = self.resume_chat_as_tab(chat_id.to_string(), false);
+        let mut resumed_live = false;
         if let Some(tab) = self
             .active_tab_mut()
             .filter(|tab| tab.chat_session_id.as_deref() == Some(chat_id))
         {
             tab.task_id = Some(task_id.to_string());
             tab.task_session_id = Some(session.task_session_id);
+            // The resume command relaunches the harness process; the session
+            // is live again from here (the ✳ title flips it to waiting).
+            tab.task_live_state = Some(TaskSessionLiveState::Working);
+            resumed_live = true;
             tab.repo_name = format!(
                 "{} · {}",
                 conversation_backend_label(
@@ -6568,6 +6639,9 @@ impl App {
             self.selected_task_id = Some(task_id.to_string());
             self.task_ui_error = None;
             self.mark_workspaces_dirty();
+        }
+        if resumed_live {
+            self.apply_task_session_signal(task_id, None);
         }
         resume
     }
@@ -6810,6 +6884,9 @@ impl App {
             }
             None => (None, None),
         };
+        // A preset child starts its harness process right away — the session
+        // is observably live from launch. A plain terminal claims nothing.
+        let launched_agent = command.is_some();
         let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
             return Err("Remote task sessions require the later remote-executor slice".to_string());
         };
@@ -6834,6 +6911,9 @@ impl App {
         tab.task_id = Some(task_id.to_string());
         let session_id = uuid::Uuid::new_v4().to_string();
         tab.task_session_id = Some(session_id.clone());
+        if launched_agent {
+            tab.task_live_state = Some(TaskSessionLiveState::Working);
+        }
         tab.chat_session_id = chat_session_id.clone();
         if let Some(chat_session_id) = &chat_session_id {
             // The terminal is already running the new-session command. Persist
@@ -6883,6 +6963,9 @@ impl App {
         }
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
+        if launched_agent {
+            self.apply_task_session_signal(task_id, None);
+        }
         let session = serde_json::json!({
             "task_id": task_id,
             "session_id": session_id,
@@ -10275,6 +10358,9 @@ fi
                 }
                 let mut pending_task: Option<Task<Event>> = None;
                 let mut terminal_handled = false;
+                // Task lifecycle signal captured inside the tab borrow and
+                // applied after it ends: (task_id, ended-session outcome).
+                let mut task_signal: Option<(String, Option<TaskSessionOutcome>)> = None;
                 let tab_workspace_is_remote = self.tab_belongs_to_remote_workspace(tab_id);
                 if let Some(tab) = self
                     .workspaces
@@ -10300,7 +10386,15 @@ fi
                             "main_terminal_event",
                             false,
                         ) {
-                            iced_term::actions::Action::Shutdown => {}
+                            iced_term::actions::Action::Shutdown => {
+                                // The terminal's child exited. A task session
+                                // that was observably live ended without
+                                // reporting an outcome: stopped, not failed.
+                                task_signal =
+                                    tab.task_live_state.take().and(tab.task_id.clone()).map(
+                                        |task_id| (task_id, Some((TaskLifecycle::Stopped, None))),
+                                    );
+                            }
                             iced_term::actions::Action::ChangeTitle(title) => {
                                 // Set tab-specific title
                                 tab.set_terminal_title(Some(title.clone()));
@@ -10310,6 +10404,25 @@ fi
                                     tab.set_attention(reason);
                                 } else {
                                     tab.clear_attention(AttentionReason::HumanInputRequired);
+                                }
+                                if let Some(task_id) = tab.task_id.clone() {
+                                    let live = if terminal_title_attention_reason(&title).is_some()
+                                    {
+                                        Some(TaskSessionLiveState::AwaitingInput)
+                                    } else if tab.task_live_state
+                                        == Some(TaskSessionLiveState::AwaitingInput)
+                                    {
+                                        // The ✳ cleared: the harness took the
+                                        // input and went back to work. A title
+                                        // change alone proves nothing more.
+                                        Some(TaskSessionLiveState::Working)
+                                    } else {
+                                        tab.task_live_state
+                                    };
+                                    if live != tab.task_live_state {
+                                        tab.task_live_state = live;
+                                        task_signal = Some((task_id, None));
+                                    }
                                 }
 
                                 // Try to sync sidebar directory from terminal title
@@ -10378,6 +10491,9 @@ fi
                             _ => {}
                         }
                     }
+                }
+                if let Some((task_id, ended)) = task_signal {
+                    self.apply_task_session_signal(&task_id, ended);
                 }
                 if terminal_handled && queue_redraw {
                     self.terminal_redraws.queue_main();
@@ -10851,6 +10967,7 @@ fi
                     "type": "user_prompt",
                     "text": prompt,
                 }));
+                let mut task_started: Option<String> = None;
                 'outer_submit: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id != tab_id {
@@ -10858,6 +10975,7 @@ fi
                         }
                         t.attention = None;
                         let repo_path = t.repo_path.clone();
+                        let tab_task_id = t.task_id.clone();
                         let Some(session) = t.agent_session_mut() else {
                             eprintln!("AgentSubmitPrompt: tab {} is not an agent tab", tab_id);
                             return Task::none();
@@ -10869,16 +10987,27 @@ fi
                             bridge = handle.take_event_receiver();
                             session.task_handle = Some(handle);
                         }
+                        let mut submitted = false;
                         if let Some(handle) = session.task_handle.as_ref() {
                             if let Err(e) = handle.submit_prompt(prompt.clone()) {
                                 eprintln!("AgentSubmitPrompt failed: {}", e);
                             } else {
                                 session.state = tab::AgentSessionState::Streaming;
+                                submitted = true;
                             }
                         }
                         session.conversation.push(echo.clone());
+                        if submitted {
+                            if let Some(task_id) = tab_task_id {
+                                t.task_live_state = Some(TaskSessionLiveState::Working);
+                                task_started = Some(task_id);
+                            }
+                        }
                         break 'outer_submit;
                     }
+                }
+                if let Some(task_id) = task_started {
+                    self.apply_task_session_signal(&task_id, None);
                 }
                 // Also push the echo into the webview if this tab is the one
                 // currently rendered there.
@@ -10895,7 +11024,8 @@ fi
                 return Task::none();
             }
             Event::AgentStopRequested(tab_id) => {
-                for ws in &mut self.workspaces {
+                let mut task_signal: Option<String> = None;
+                'outer_stop: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
                             if let Some(session) = t.agent_session_mut() {
@@ -10903,10 +11033,16 @@ fi
                                     handle.request_stop();
                                 }
                                 session.state = tab::AgentSessionState::Stopped;
+                                if t.task_live_state.take().is_some() {
+                                    task_signal = t.task_id.clone();
+                                }
                             }
-                            return Task::none();
+                            break 'outer_stop;
                         }
                     }
+                }
+                if let Some(task_id) = task_signal {
+                    self.apply_task_session_signal(&task_id, Some((TaskLifecycle::Stopped, None)));
                 }
                 return Task::none();
             }
@@ -10916,12 +11052,17 @@ fi
                 let is_active_in_webview = self.webview_kind == WebviewKind::Agent
                     && self.webview_agent_tab_id == Some(tab_id);
                 let attention_reason = agent_event_attention_reason(&ev);
-                for ws in &mut self.workspaces {
+                let mut task_signal: Option<(String, Option<TaskSessionOutcome>)> = None;
+                'outer_event: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
+                            // The agent session's own end states translate
+                            // directly into task session outcomes.
+                            let mut session_ended: Option<TaskSessionOutcome> = None;
                             if let Some(session) = t.agent_session_mut() {
                                 if matches!(&ev, tab::AgentEvent::Result(_)) {
                                     session.state = tab::AgentSessionState::Idle;
+                                    session_ended = Some((TaskLifecycle::Completed, None));
                                 }
                                 // Heuristic state transition until typed parser
                                 // lands (Step 9): `done`/`stopped` sentinels
@@ -10930,12 +11071,18 @@ fi
                                     if let Some(t) = value.get("type").and_then(|v| v.as_str()) {
                                         if t == "done" {
                                             session.state = tab::AgentSessionState::Idle;
+                                            session_ended = Some((TaskLifecycle::Completed, None));
                                         } else if t == "stopped" {
                                             session.state = tab::AgentSessionState::Stopped;
+                                            session_ended = Some((TaskLifecycle::Stopped, None));
                                         } else if t == "error" || t == "failed" {
                                             session.state = tab::AgentSessionState::Errored(
                                                 "Agent reported an error".to_string(),
                                             );
+                                            session_ended = Some((
+                                                TaskLifecycle::Failed,
+                                                Some("Agent reported an error".to_string()),
+                                            ));
                                         }
                                     }
                                 }
@@ -10944,6 +11091,12 @@ fi
                                 }
                                 session.conversation.push(ev);
                             }
+                            if let Some(ended) = session_ended {
+                                t.task_live_state = None;
+                                if let Some(task_id) = t.task_id.clone() {
+                                    task_signal = Some((task_id, Some(ended)));
+                                }
+                            }
                             match attention_reason {
                                 Some(AttentionReason::CompletedUnread) if is_active_in_webview => {
                                     t.attention = None;
@@ -10951,9 +11104,12 @@ fi
                                 Some(reason) => t.set_attention(reason),
                                 None => {}
                             }
-                            return Task::none();
+                            break 'outer_event;
                         }
                     }
+                }
+                if let Some((task_id, ended)) = task_signal {
+                    self.apply_task_session_signal(&task_id, ended);
                 }
                 return Task::none();
             }
@@ -12767,6 +12923,10 @@ fi
                 if !valid {
                     return Task::none();
                 }
+                let closed_live_session = self.workspaces[prompt.workspace_idx].tabs
+                    [prompt.tab_idx]
+                    .task_live_state
+                    .is_some();
                 if self.workspaces[prompt.workspace_idx].tabs.len() == 1 {
                     let workspace_name = self.workspaces[prompt.workspace_idx].name.clone();
                     let workspace_dir = self.workspaces[prompt.workspace_idx].dir.clone();
@@ -12777,6 +12937,10 @@ fi
                 self.workspaces[prompt.workspace_idx]
                     .tabs
                     .remove(prompt.tab_idx);
+                self.apply_task_session_signal(
+                    &prompt.task_id,
+                    closed_live_session.then_some((TaskLifecycle::Stopped, None)),
+                );
                 let sibling =
                     task_tab_indices(&self.workspaces[prompt.workspace_idx], &prompt.task_id)
                         .into_iter()
@@ -26756,6 +26920,25 @@ mod tests {
         );
         assert_eq!(terminal_title_attention_reason("Claude Code"), None);
         assert_eq!(terminal_title_attention_reason("* shell"), None);
+    }
+
+    #[test]
+    fn task_live_state_aggregation_lets_waiting_outrank_working() {
+        assert_eq!(aggregate_task_live_states(std::iter::empty()), None);
+        assert_eq!(
+            aggregate_task_live_states([TaskSessionLiveState::Working].into_iter()),
+            Some(TaskLifecycle::Running)
+        );
+        assert_eq!(
+            aggregate_task_live_states(
+                [
+                    TaskSessionLiveState::Working,
+                    TaskSessionLiveState::AwaitingInput,
+                ]
+                .into_iter()
+            ),
+            Some(TaskLifecycle::WaitingForInput)
+        );
     }
 
     #[test]
