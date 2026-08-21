@@ -10686,21 +10686,12 @@ fi
                             tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
                             tab.git_unchanged_streak = 0;
                         }
-                    }
-                    // Hot path: PTY output proves the task session is alive.
-                    // A bare Instant stamp only — persistence happens on the
-                    // Tick debounce, never per output chunk.
-                    if tab.task_id.is_some()
-                        && matches!(&cmd, iced_term::backend::Command::ProcessAlacrittyEvent(_))
-                    {
-                        tab.task_last_activity = Some(Instant::now());
-                        // Output is also proof of life for harnesses that
-                        // never speak the ✳ title convention (Codex): a task
-                        // the restart reconciliation left Interrupted whose
-                        // relaunched session tab is visibly producing output
-                        // resumes into Running. Only from Interrupted — an
-                        // observed live state must never be overridden by
-                        // mere output (✳ redraws are output too).
+                        // A keystroke into an Interrupted task's session is the
+                        // user resuming it. Deliberately input, not output —
+                        // relaunch banners and TUI redraws are output, and they
+                        // would wipe the calm "Interrupted · resume" state the
+                        // instant the app restarts. Only from Interrupted: an
+                        // observed live state is never overridden here.
                         if tab.task_live_state.is_none() {
                             let interrupted = tab.task_id.as_deref().is_some_and(|task_id| {
                                 self.task_store
@@ -10715,6 +10706,14 @@ fi
                                 task_signal = tab.task_id.clone().map(|task_id| (task_id, None));
                             }
                         }
+                    }
+                    // Hot path: PTY output proves the task session is alive.
+                    // A bare Instant stamp only — persistence happens on the
+                    // Tick debounce, never per output chunk.
+                    if tab.task_id.is_some()
+                        && matches!(&cmd, iced_term::backend::Command::ProcessAlacrittyEvent(_))
+                    {
+                        tab.task_last_activity = Some(Instant::now());
                     }
                     if let Some(term) = tab.terminal_mut() {
                         terminal_handled = true;
