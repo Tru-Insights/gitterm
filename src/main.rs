@@ -5070,7 +5070,7 @@ impl App {
         let border_color = self.theme.overlay0();
         let hover_bg = self.theme.bg_overlay();
         let text_color = self.theme.text_primary();
-        let text_muted = self.theme.overlay1();
+        let text_muted = self.theme.text_secondary();
         move |_theme, status| {
             let (bg, tc) = match status {
                 button::Status::Hovered => (Some(hover_bg.into()), text_color),
@@ -15992,7 +15992,7 @@ fi
                 radius: 3.0.into(),
             },
             icon: iced::Color::TRANSPARENT,
-            placeholder: theme.overlay0(),
+            placeholder: theme.text_muted(),
             value: text_primary,
             selection: accent,
         };
@@ -17010,7 +17010,7 @@ fi
                 radius: 3.0.into(),
             },
             icon: iced::Color::TRANSPARENT,
-            placeholder: theme.overlay0(),
+            placeholder: theme.text_muted(),
             value: text_primary,
             selection: accent,
         };
@@ -17166,7 +17166,7 @@ fi
                     Some(RemoteAgentConnectionStatus::Connected(_)) => ("●", theme.green()),
                     Some(RemoteAgentConnectionStatus::Connecting) => ("◐", theme.yellow()),
                     Some(RemoteAgentConnectionStatus::Error(_)) => ("○", theme.red()),
-                    _ => ("○", theme.overlay0()),
+                    _ => ("○", theme.text_muted()),
                 };
                 (name, Some(status))
             }
@@ -17174,13 +17174,13 @@ fi
             Some((_, rest)) => (rest.to_string(), None),
         };
         let label_color = if key == "local" {
-            theme.overlay1()
+            theme.text_secondary()
         } else {
             theme.accent()
         };
         let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center);
         if collapsed {
-            content = content.push(text("▸").size(9).color(theme.overlay0()));
+            content = content.push(text("▸").size(9).color(theme.text_muted()));
         }
         content = content.push(
             text(name.to_uppercase())
@@ -17195,7 +17195,7 @@ fi
             content = content.push(
                 text(format!("×{count}"))
                     .size(9)
-                    .color(theme.overlay0())
+                    .color(theme.text_muted())
                     .font(iced::Font::with_name("Menlo")),
             );
         }
@@ -17229,8 +17229,8 @@ fi
             Some(("agent", remote_id)) => Event::RemoteWorkspaceBrowse(remote_id.to_string()),
             _ => return None,
         };
-        let color = self.theme.overlay0();
-        let hover = self.theme.overlay1();
+        let color = self.theme.text_muted();
+        let hover = self.theme.text_secondary();
         Some(
             button(
                 text("+")
@@ -17334,7 +17334,7 @@ fi
                 }
             ))
             .size(font_small - 1.0)
-            .color(theme.overlay1()),
+            .color(theme.text_secondary()),
         );
         card_col = card_col.push(item(
             if folded {
@@ -17731,7 +17731,7 @@ fi
                 ),
                 self.theme.danger(),
             ),
-            BrowserBarState::Stopped => ("Browser idle".to_string(), self.theme.overlay0()),
+            BrowserBarState::Stopped => ("Browser idle".to_string(), self.theme.text_muted()),
             BrowserBarState::Running => ("Browser live".to_string(), self.theme.success()),
             BrowserBarState::Busy(BrowserAction::Opening) => {
                 ("Opening browser…".to_string(), self.theme.warning())
@@ -17937,7 +17937,7 @@ fi
 
             // Gear icon button for active workspace settings
             if is_active {
-                let gear_color = theme.overlay0();
+                let gear_color = theme.text_muted();
                 let gear_hover = theme.text_secondary();
                 let gear_btn = button(
                     text("⚙")
@@ -18125,8 +18125,8 @@ fi
         }
 
         // "+ workspace" button at the end
-        let ws_add_color = theme.overlay0();
-        let ws_add_hover = theme.overlay1();
+        let ws_add_color = theme.text_muted();
+        let ws_add_hover = theme.text_secondary();
         let ws_add_btn = button(
             text("+ workspace")
                 .size(11)
@@ -18190,8 +18190,8 @@ fi
             });
 
         // Help button (?) pinned to the right
-        let help_color = theme.overlay0();
-        let help_hover = theme.overlay1();
+        let help_color = theme.text_muted();
+        let help_hover = theme.text_secondary();
         let help_btn = button(
             text("?")
                 .size(11)
@@ -18243,7 +18243,7 @@ fi
             }
             Some(AttentionReason::AgentFailed) => theme.danger(),
             Some(AttentionReason::CompletedUnread) => theme.success(),
-            None => theme.overlay0(),
+            None => theme.text_muted(),
         };
         let attention_hover = theme.surface0();
         let attention_active = self.attention_view_open;
@@ -18519,33 +18519,27 @@ fi
         row![spine_content, border_line].into()
     }
 
-    /// Per-workspace indicator dots (active / attention / error) shared by the
-    /// empty-workspace spine and the sidebar icon rail.
+    /// Per-workspace spine buttons: the 2-char workspace abbreviation in a
+    /// state color (error > attention > active > inactive). Bare indicator
+    /// dots proved invisible on the dark crust — the abbreviation gives the
+    /// spine an identity you can actually read and click.
     fn view_workspace_dot_column(&self) -> Column<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let pulse_bright = self.attention_pulse_bright;
-        let mut dots = Column::new().spacing(8).align_x(iced::Alignment::Center);
+        let mono = iced::Font::with_name("Menlo");
+        let mut chips = Column::new().spacing(4).align_x(iced::Alignment::Center);
 
         for (idx, ws) in self.workspaces.iter().enumerate() {
             let is_active = idx == self.active_workspace_idx;
             let ws_color = ws.color.color(theme);
-            let inactive_color = theme.surface2();
 
             let has_attention = ws.has_attention();
             let attention_reason = ws.highest_priority_attention();
             let has_error = ws.console.status == ConsoleStatus::Error;
 
-            // Larger dot for attention/error when inactive
-            let (dot_w, dot_h) = if is_active {
-                (4.0, 18.0)
-            } else if has_attention || has_error {
-                (6.0, 6.0)
-            } else {
-                (4.0, 4.0)
-            };
-
             // Color: error (red) > attention (pulsing amber) > active (ws color) > inactive
-            let dot_color = if (has_error || attention_reason == Some(AttentionReason::AgentFailed))
+            let text_color = if (has_error
+                || attention_reason == Some(AttentionReason::AgentFailed))
                 && !is_active
             {
                 theme.danger()
@@ -18558,48 +18552,46 @@ fi
             } else if is_active {
                 ws_color
             } else {
-                inactive_color
+                theme.subtext0()
             };
 
-            let dot = container(iced::widget::Space::new().width(0).height(0))
-                .width(Length::Fixed(dot_w))
-                .height(Length::Fixed(dot_h))
-                .style(move |_| container::Style {
-                    background: Some(dot_color.into()),
-                    border: iced::Border {
-                        radius: 2.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                });
-
+            let active_bg = theme.surface0();
             let hover_bg = theme.surface0();
-            let dot_btn = button(
-                container(dot)
-                    .width(Length::Fixed(SPINE_WIDTH - 1.0))
-                    .center_x(Length::Fixed(SPINE_WIDTH - 1.0))
-                    .center_y(Length::Shrink),
+            let chip_btn = button(
+                container(
+                    text(ws.abbrev.as_str())
+                        .size(10)
+                        .font(mono)
+                        .color(text_color),
+                )
+                .width(Length::Fixed(SPINE_WIDTH - 1.0))
+                .center_x(Length::Fixed(SPINE_WIDTH - 1.0)),
             )
             .style(move |_theme, status| {
-                let bg = if matches!(status, button::Status::Hovered) {
+                let bg = if is_active {
+                    active_bg
+                } else if matches!(status, button::Status::Hovered) {
                     hover_bg
                 } else {
                     iced::Color::TRANSPARENT
                 };
                 button::Style {
                     background: Some(bg.into()),
-                    border: iced::Border::default(),
-                    text_color: iced::Color::WHITE,
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    text_color,
                     ..Default::default()
                 }
             })
-            .padding([4, 0])
+            .padding([6, 0])
             .on_press(Event::WorkspaceSelect(idx));
 
-            dots = dots.push(dot_btn);
+            chips = chips.push(chip_btn);
         }
 
-        dots
+        chips
     }
 
     fn view_tab_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -18922,7 +18914,7 @@ fi
                 .on_press(Event::TabSelect(idx));
 
             // Close button
-            let close_color = theme.overlay0();
+            let close_color = theme.text_muted();
             let close_hover = theme.text_primary();
             let close_btn = button(text("\u{00d7}").size(14).color(close_color))
                 .style(move |_theme, status| {
@@ -18950,7 +18942,7 @@ fi
         let sessions_supported = self.active_workspace().is_some();
         if sessions_supported {
             // Add tab button
-            let add_color = theme.overlay0();
+            let add_color = theme.text_muted();
             let add_hover = theme.text_primary();
             let add_label = if task_context_id.is_some() && visible_session_count == 0 {
                 "Start with ▾"
@@ -19032,7 +19024,7 @@ fi
             .unwrap_or_default();
         let branch_copy = text(format!("⎇ {branch}"))
             .size(11)
-            .color(theme.overlay0())
+            .color(theme.text_muted())
             .font(iced::Font::with_name("Menlo"));
         let strip = row![
             container(stamp_row).padding(iced::Padding {
@@ -19232,7 +19224,7 @@ fi
             .push(
                 text(&session.host.ssh_target)
                     .size(font_small)
-                    .color(theme.overlay1())
+                    .color(theme.text_secondary())
                     .font(iced::Font::with_name("Menlo")),
             )
             .push(
@@ -19312,7 +19304,7 @@ fi
             .push(
                 text("Agent connection for this workspace.")
                     .size(font_small)
-                    .color(theme.overlay1()),
+                    .color(theme.text_secondary()),
             );
 
         if let Some(actions) = self.view_remote_agent_session_actions(ws) {
@@ -19422,7 +19414,7 @@ fi
             }
             Some(RemoteAgentConnectionStatus::Disconnected) | None => (
                 "disconnected".to_string(),
-                theme.overlay1(),
+                theme.text_secondary(),
                 "No active connection".to_string(),
             ),
         };
@@ -19471,10 +19463,10 @@ fi
                     .color(theme.text_secondary())
                     .font(iced::Font::with_name("Menlo")),
             )
-            .push(text(detail).size(font_small).color(theme.overlay1()));
+            .push(text(detail).size(font_small).color(theme.text_secondary()));
 
         if let Some(last_line) = last_line {
-            details = details.push(text(last_line).size(10).color(theme.overlay0()));
+            details = details.push(text(last_line).size(10).color(theme.text_muted()));
         }
 
         let actions = row![button(text("Reconnect").size(font_small))
@@ -21501,7 +21493,7 @@ fi
             content = content.push(
                 text(format!("Updated {}s ago", loaded_at.elapsed().as_secs()))
                     .size(10)
-                    .color(theme.overlay0()),
+                    .color(theme.text_muted()),
             );
         }
 
@@ -21517,7 +21509,7 @@ fi
             content = content.push(
                 text("Use the workspace bar to open a mac-mini:* workspace.")
                     .size(font_small)
-                    .color(theme.overlay1()),
+                    .color(theme.text_secondary()),
             );
             return scrollable(content)
                 .height(Length::Fill)
@@ -21570,7 +21562,7 @@ fi
                 (format!("attached {}", entry.attached), theme.accent())
             }
             Some(_) => ("running".to_string(), theme.success()),
-            None => ("not running".to_string(), theme.overlay1()),
+            None => ("not running".to_string(), theme.text_secondary()),
         };
         let status_bg = iced::Color {
             a: 0.16,
@@ -21608,15 +21600,19 @@ fi
             .push(
                 text(&session.remote_dir)
                     .size(font_small)
-                    .color(theme.overlay1()),
+                    .color(theme.text_secondary()),
             )
-            .push(text(&session.session_name).size(10).color(theme.overlay0()));
+            .push(
+                text(&session.session_name)
+                    .size(10)
+                    .color(theme.text_muted()),
+            );
 
         if let Some(entry) = runtime {
             detail = detail.push(
                 text(format!("windows: {}", entry.windows))
                     .size(10)
-                    .color(theme.overlay0()),
+                    .color(theme.text_muted()),
             );
         }
 
@@ -21629,7 +21625,7 @@ fi
             detail = detail.push(
                 text(format!("{} - {}", codex_status, codex_command))
                     .size(10)
-                    .color(theme.overlay0()),
+                    .color(theme.text_muted()),
             );
         }
 
@@ -21644,7 +21640,7 @@ fi
             detail = detail.push(
                 text(format!("{} - {}", claude_status, claude_command))
                     .size(10)
-                    .color(theme.overlay0()),
+                    .color(theme.text_muted()),
             );
         }
 
@@ -21923,7 +21919,7 @@ fi
         let input_bg = theme.bg_crust();
         let input_border = theme.surface1();
         let input_text = theme.text_primary();
-        let input_placeholder = theme.overlay0();
+        let input_placeholder = theme.text_muted();
         let input_selection = theme.accent();
         let search = text_input("search conversations…", &self.chat_query)
             .on_input(Event::ChatsQueryChanged)
@@ -21952,7 +21948,7 @@ fi
             let color = if active {
                 theme.text_primary()
             } else {
-                theme.overlay1()
+                theme.text_secondary()
             };
             button(text(label).size(font_small - 1.0).color(color))
                 .style(move |_theme, _status| button::Style {
@@ -21985,7 +21981,7 @@ fi
                 let color = if active {
                     theme.text_primary()
                 } else {
-                    theme.overlay1()
+                    theme.text_secondary()
                 };
                 let mut content = Row::new().spacing(4).align_y(iced::Alignment::Center);
                 if let Some(dot) = dot {
@@ -22119,13 +22115,16 @@ fi
                             }
                             Some(state) if state.error.is_some() => {
                                 if state.entries.is_empty() {
-                                    ("○ unreachable".to_string(), theme.overlay0())
+                                    ("○ unreachable".to_string(), theme.text_muted())
                                 } else {
-                                    ("○ unreachable · cached index".to_string(), theme.overlay0())
+                                    (
+                                        "○ unreachable · cached index".to_string(),
+                                        theme.text_muted(),
+                                    )
                                 }
                             }
                             Some(_) => ("● connected".to_string(), theme.green()),
-                            None => ("○ not yet synced".to_string(), theme.overlay0()),
+                            None => ("○ not yet synced".to_string(), theme.text_muted()),
                         };
                         (name, status, color)
                     }
@@ -22134,7 +22133,7 @@ fi
                 let mut header = Row::new()
                     .spacing(8)
                     .align_y(iced::Alignment::Center)
-                    .push(text(chevron).size(10).color(theme.overlay1()))
+                    .push(text(chevron).size(10).color(theme.text_secondary()))
                     .push(
                         text(label.to_uppercase())
                             .size(10)
@@ -22189,7 +22188,7 @@ fi
                     row![
                         text(group_name.to_uppercase())
                             .size(10)
-                            .color(theme.overlay0()),
+                            .color(theme.text_muted()),
                         text(format!("{}", entries.len()))
                             .size(10)
                             .color(theme.text_muted()),
@@ -22208,7 +22207,7 @@ fi
                         meta = meta.push(
                             text(branch.clone())
                                 .size(font_small - 1.0)
-                                .color(theme.overlay1()),
+                                .color(theme.text_secondary()),
                         );
                     }
                     if live_ids.contains(entry.id.as_str()) {
@@ -22446,7 +22445,7 @@ fi
         let cwd_color = if cwd_gone {
             theme.red()
         } else {
-            theme.overlay1()
+            theme.text_secondary()
         };
         let cwd_suffix = if cwd_gone {
             " — directory no longer exists"
@@ -22484,7 +22483,7 @@ fi
                 .push(
                     text("already open in a session — one process per conversation")
                         .size(font_small - 1.0)
-                        .color(theme.overlay1()),
+                        .color(theme.text_secondary()),
                 );
         } else if is_remote && machine_unreachable {
             actions = actions.push(
@@ -22493,7 +22492,7 @@ fi
                     machine_name.as_deref().unwrap_or("machine")
                 ))
                 .size(font_small - 1.0)
-                .color(theme.overlay1()),
+                .color(theme.text_secondary()),
             );
         } else if cwd_gone && is_remote {
             actions = actions.push(
@@ -22533,7 +22532,7 @@ fi
                         entry.resume_command()
                     ))
                     .size(font_small - 1.0)
-                    .color(theme.overlay1()),
+                    .color(theme.text_secondary()),
                 );
             } else {
                 actions = actions.push(
@@ -22542,7 +22541,7 @@ fi
                         entry.resume_command()
                     ))
                     .size(font_small - 1.0)
-                    .color(theme.overlay1()),
+                    .color(theme.text_secondary()),
                 );
             }
         }
@@ -22565,7 +22564,7 @@ fi
             ]
             .spacing(6)
             .width(Length::Fill),
-            button(text("✕").size(font).color(theme.overlay1()))
+            button(text("✕").size(font).color(theme.text_secondary()))
                 .style(self.ghost_button_style())
                 .padding([2, 8])
                 .on_press(Event::CloseChatPreview),
@@ -22588,7 +22587,7 @@ fi
                         body = body.push(
                             text(format!("— {} earlier messages —", count - shown))
                                 .size(font_small)
-                                .color(theme.overlay0()),
+                                .color(theme.text_muted()),
                         );
                     }
                 }
@@ -22625,7 +22624,7 @@ fi
                 body = body.push(
                     text("end of transcript · read-only preview (resume lands in slice 2)")
                         .size(font_small - 1.0)
-                        .color(theme.overlay0()),
+                        .color(theme.text_muted()),
                 );
             }
         }
@@ -22743,7 +22742,11 @@ fi
                 workspace_dir.join("docs"),
             ),
         ] {
-            list = list.push(text(label.to_uppercase()).size(10).color(theme.overlay0()));
+            list = list.push(
+                text(label.to_uppercase())
+                    .size(10)
+                    .color(theme.text_muted()),
+            );
 
             let entries = collect_entries(&dir);
             if entries.is_empty() {
@@ -22876,14 +22879,14 @@ fi
                 container(
                     text(format!("{} commits", git_count))
                         .size(font_small)
-                        .color(theme.overlay1()),
+                        .color(theme.text_secondary()),
                 )
                 .padding([2, 8])
                 .style(move |_| container::Style {
                     background: Some(
                         iced::Color {
                             a: 0.12,
-                            ..theme.overlay1()
+                            ..theme.text_secondary()
                         }
                         .into(),
                     ),
@@ -23038,7 +23041,7 @@ fi
         let hash_color = if is_live {
             theme.blue()
         } else {
-            theme.overlay0()
+            theme.text_muted()
         };
         badges_row = badges_row.push(text(capture.short_hash()).size(font_tiny).color(hash_color));
 
@@ -23052,14 +23055,14 @@ fi
                 } else if name.contains("haiku") || name.contains("gpt") {
                     theme.green()
                 } else {
-                    theme.overlay1()
+                    theme.text_secondary()
                 };
                 // Short name: "opus-4-6" from "claude-opus-4-6"
                 let short = name.split('/').next_back().unwrap_or(name);
                 let short = short.strip_prefix("claude-").unwrap_or(short);
                 (short, color)
             } else {
-                ("unknown", theme.overlay1())
+                ("unknown", theme.text_secondary())
             };
             badges_row = badges_row.push(
                 container(text(model_name).size(font_tiny).color(model_badge_color))
@@ -23092,7 +23095,7 @@ fi
             );
         } else {
             // Git badge for reconstructed
-            let git_color = theme.overlay1();
+            let git_color = theme.text_secondary();
             badges_row = badges_row.push(
                 container(text("git").size(font_tiny).color(git_color))
                     .padding([1, 5])
@@ -23112,13 +23115,13 @@ fi
             // Diff summary
             let diff = capture.diff_summary();
             if !diff.is_empty() {
-                badges_row = badges_row.push(text(diff).size(font_tiny).color(theme.overlay0()));
+                badges_row = badges_row.push(text(diff).size(font_tiny).color(theme.text_muted()));
             }
         }
 
         // Timestamp pushed to the right
         badges_row = badges_row.push(iced::widget::Space::new().width(Length::Fill));
-        badges_row = badges_row.push(text(time_display).size(font_tiny).color(theme.overlay0()));
+        badges_row = badges_row.push(text(time_display).size(font_tiny).color(theme.text_muted()));
 
         entry_content = entry_content.push(badges_row);
 
@@ -23357,7 +23360,7 @@ fi
                         let result_color = if *is_error {
                             theme.red()
                         } else {
-                            theme.overlay1()
+                            theme.text_secondary()
                         };
                         let prefix = if *is_error { "✗ " } else { "" };
                         let bg = if *is_error {
@@ -23394,7 +23397,7 @@ fi
                     }
                 }
                 agent::ConversationEntry::Thinking { text: think_text } => {
-                    let think_color = theme.overlay0();
+                    let think_color = theme.text_muted();
                     let display: String = if think_text.len() > 300 {
                         format!("💭 {}…", truncate_str(think_text, 297))
                     } else {
@@ -23485,7 +23488,7 @@ fi
             "settings",
             &config.settings,
             config.expanded.contains("settings"),
-            theme.overlay1(),
+            theme.text_secondary(),
             &config.selected_item,
         ));
 
@@ -24760,7 +24763,7 @@ fi
         let active_bg = theme.surface1();
         let hover_bg = theme.surface0();
         let text_active = theme.text_primary();
-        let text_inactive = theme.overlay1();
+        let text_inactive = theme.text_secondary();
         let text_color = if active { text_active } else { text_inactive };
 
         button(text(label).size(font).color(text_color))
@@ -24856,7 +24859,7 @@ fi
         if !tab.staged.is_empty() {
             content = content.push(
                 row![
-                    text("S T A G E D").size(10).color(theme.overlay0()),
+                    text("S T A G E D").size(10).color(theme.text_muted()),
                     text(format!("{}", tab.staged.len()))
                         .size(10)
                         .color(theme.success()),
@@ -24871,7 +24874,7 @@ fi
         if !tab.unstaged.is_empty() {
             content = content.push(
                 row![
-                    text("U N S T A G E D").size(10).color(theme.overlay0()),
+                    text("U N S T A G E D").size(10).color(theme.text_muted()),
                     text(format!("{}", tab.unstaged.len()))
                         .size(10)
                         .color(theme.warning()),
@@ -24886,7 +24889,7 @@ fi
         if !tab.untracked.is_empty() {
             content = content.push(
                 row![
-                    text("U N T R A C K E D").size(10).color(theme.overlay0()),
+                    text("U N T R A C K E D").size(10).color(theme.text_muted()),
                     text(format!("{}", tab.untracked.len()))
                         .size(10)
                         .color(theme.text_secondary()),
@@ -24950,7 +24953,7 @@ fi
         if !worktrees.is_empty() {
             content = content.push(
                 row![
-                    text("W O R K T R E E S").size(10).color(theme.overlay0()),
+                    text("W O R K T R E E S").size(10).color(theme.text_muted()),
                     text(format!("{}", worktrees.len()))
                         .size(10)
                         .color(theme.accent()),
@@ -24983,7 +24986,7 @@ fi
         if !branches.is_empty() {
             content = content.push(
                 row![
-                    text("B R A N C H E S").size(10).color(theme.overlay0()),
+                    text("B R A N C H E S").size(10).color(theme.text_muted()),
                     text(format!("{}", branches.len()))
                         .size(10)
                         .color(theme.accent()),
@@ -25048,16 +25051,20 @@ fi
         } else {
             let disabled_bg = theme.surface0();
             actions = actions.push(
-                container(text("Unavailable").size(font_small).color(theme.overlay1()))
-                    .padding([3, 8])
-                    .style(move |_| container::Style {
-                        background: Some(disabled_bg.into()),
-                        border: iced::Border {
-                            radius: 6.0.into(),
-                            ..Default::default()
-                        },
+                container(
+                    text("Unavailable")
+                        .size(font_small)
+                        .color(theme.text_secondary()),
+                )
+                .padding([3, 8])
+                .style(move |_| container::Style {
+                    background: Some(disabled_bg.into()),
+                    border: iced::Border {
+                        radius: 6.0.into(),
                         ..Default::default()
-                    }),
+                    },
+                    ..Default::default()
+                }),
             );
         }
         if !worktree.is_current && managed_task.is_none() {
@@ -25100,12 +25107,14 @@ fi
         }
 
         let mut info = column![
-            text("Selected worktree").size(10).color(theme.overlay0()),
+            text("Selected worktree").size(10).color(theme.text_muted()),
             text(branch)
                 .size(font)
                 .color(theme.text_primary())
                 .font(iced::Font::with_name("Menlo")),
-            text(path_display).size(font_small).color(theme.overlay1()),
+            text(path_display)
+                .size(font_small)
+                .color(theme.text_secondary()),
         ]
         .spacing(4);
         if let Some(task) = managed_task {
@@ -25158,7 +25167,7 @@ fi
 
         let mut content = Column::new()
             .spacing(4)
-            .push(text("Selected branch").size(10).color(theme.overlay0()))
+            .push(text("Selected branch").size(10).color(theme.text_muted()))
             .push(
                 text(&branch.name)
                     .size(font)
@@ -25172,7 +25181,7 @@ fi
             content = content.push(
                 text(self.compact_path_display(path))
                     .size(font_small)
-                    .color(theme.overlay1()),
+                    .color(theme.text_secondary()),
             );
             actions = actions.push(
                 button(text(self.open_worktree_label(path)).size(font_small))
@@ -25183,16 +25192,20 @@ fi
         } else {
             let disabled_bg = theme.surface0();
             actions = actions.push(
-                container(text("No worktree").size(font_small).color(theme.overlay1()))
-                    .padding([3, 8])
-                    .style(move |_| container::Style {
-                        background: Some(disabled_bg.into()),
-                        border: iced::Border {
-                            radius: 6.0.into(),
-                            ..Default::default()
-                        },
+                container(
+                    text("No worktree")
+                        .size(font_small)
+                        .color(theme.text_secondary()),
+                )
+                .padding([3, 8])
+                .style(move |_| container::Style {
+                    background: Some(disabled_bg.into()),
+                    border: iced::Border {
+                        radius: 6.0.into(),
                         ..Default::default()
-                    }),
+                    },
+                    ..Default::default()
+                }),
             );
         }
 
@@ -25271,7 +25284,7 @@ fi
         } else if is_checked_out {
             theme.accent()
         } else {
-            theme.overlay1()
+            theme.text_secondary()
         };
         let name_color = if branch.is_current {
             theme.text_primary()
@@ -25335,7 +25348,9 @@ fi
         let content = container(
             column![
                 top,
-                text(detail_text).size(font_small).color(theme.overlay1())
+                text(detail_text)
+                    .size(font_small)
+                    .color(theme.text_secondary())
             ]
             .spacing(2),
         )
@@ -25391,7 +25406,7 @@ fi
         let icon_color = if worktree.is_current {
             theme.mauve()
         } else {
-            theme.overlay1()
+            theme.text_secondary()
         };
         let branch_color = if worktree.is_current {
             theme.text_primary()
@@ -25453,7 +25468,7 @@ fi
         let mut detail = Row::new().spacing(6).align_y(iced::Alignment::Center).push(
             text(path_display)
                 .size(font_small)
-                .color(theme.overlay1())
+                .color(theme.text_secondary())
                 .width(Length::Fill),
         );
         if changes > 0 {
@@ -25463,7 +25478,7 @@ fi
                     worktree.staged_count, worktree.unstaged_count, worktree.untracked_count
                 ))
                 .size(10)
-                .color(theme.overlay0()),
+                .color(theme.text_muted()),
             );
         }
 
@@ -26154,7 +26169,7 @@ fi
         } else {
             "\u{25B6}"
         };
-        let chevron_color = theme.overlay0();
+        let chevron_color = theme.text_muted();
         let chevron_btn = button(text(chevron).size(10).color(chevron_color))
             .style(|_theme, _status| button::Style {
                 background: Some(iced::Color::TRANSPARENT.into()),
@@ -26168,7 +26183,7 @@ fi
         let dot_color = match console.status {
             ConsoleStatus::Running => theme.success(),
             ConsoleStatus::Error => theme.danger(),
-            ConsoleStatus::Stopped | ConsoleStatus::NoneConfigured => theme.overlay0(),
+            ConsoleStatus::Stopped | ConsoleStatus::NoneConfigured => theme.text_muted(),
         };
         let status_dot = container(iced::widget::Space::new())
             .width(Length::Fixed(6.0))
@@ -26185,7 +26200,7 @@ fi
         let console_label_color = if console_is_active {
             theme.text_primary()
         } else {
-            theme.overlay1()
+            theme.text_secondary()
         };
         let console_tab_bg = if console_is_active {
             theme.bg_overlay()
@@ -26255,7 +26270,7 @@ fi
             let label_color = if is_active {
                 theme.text_primary()
             } else {
-                theme.overlay1()
+                theme.text_secondary()
             };
             let tab_bg = if is_active {
                 theme.bg_overlay()
@@ -26269,7 +26284,7 @@ fi
                 iced::Color::TRANSPARENT
             };
 
-            let close_color = theme.overlay0();
+            let close_color = theme.text_muted();
             let close_hover = theme.text_primary();
             let close_btn = button(text("\u{00D7}").size(12).color(close_color))
                 .style(move |_theme, status| {
@@ -26339,7 +26354,7 @@ fi
         }
 
         // "+" button to add terminal
-        let plus_color = theme.overlay1();
+        let plus_color = theme.text_secondary();
         let plus_hover_bg = theme.surface0();
         let plus_btn = button(text("+").size(14).color(plus_color))
             .style(move |_theme, status| {
@@ -26426,7 +26441,7 @@ fi
                                 radius: 3.0.into(),
                             },
                             icon: iced::Color::TRANSPARENT,
-                            placeholder: theme.overlay0(),
+                            placeholder: theme.text_muted(),
                             value: theme.text_primary(),
                             selection: theme.accent(),
                         })
@@ -26439,7 +26454,7 @@ fi
                     let name_color = if console.run_command.is_some() {
                         theme.text_primary()
                     } else {
-                        theme.overlay0()
+                        theme.text_muted()
                     };
                     let hover_bg = theme.surface0();
                     button(
@@ -26472,10 +26487,10 @@ fi
             let uptime = console.uptime_string();
             let uptime_label = text(uptime)
                 .size(11)
-                .color(theme.overlay0())
+                .color(theme.text_muted())
                 .font(iced::Font::with_name("Menlo"));
 
-            let btn_color = theme.overlay1();
+            let btn_color = theme.text_secondary();
             let hover_bg = theme.surface0();
             let action_btn_style = move |_theme: &Theme, status: button::Status| {
                 let bg = if matches!(status, button::Status::Hovered) {
@@ -26590,7 +26605,7 @@ fi
             let terminal_mirror_status = if self.terminal_log_mirroring_enabled {
                 ("Mirror:on", theme.success())
             } else {
-                ("Mirror:off", theme.overlay0())
+                ("Mirror:off", theme.text_muted())
             };
             let log_toggle_btn = button(
                 text(terminal_mirror_status.0)
@@ -26659,7 +26674,7 @@ fi
             return container(
                 text(hint)
                     .size(13)
-                    .color(theme.overlay0())
+                    .color(theme.text_muted())
                     .font(iced::Font::with_name("Menlo")),
             )
             .width(Length::Fill)
@@ -26735,12 +26750,12 @@ fi
             if !console.search_query.is_empty() && console.matching_line_count() == 0 {
                 theme.danger()
             } else {
-                theme.overlay1()
+                theme.text_secondary()
             };
 
         let match_label = text(match_display).size(font).color(match_text_color);
 
-        let close_color = theme.overlay1();
+        let close_color = theme.text_secondary();
         let hover_bg = theme.surface0();
         let close_btn = button(text("\u{2715}").size(12).color(close_color))
             .style(move |_theme, status| {
