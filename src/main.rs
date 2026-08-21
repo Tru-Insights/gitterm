@@ -18519,27 +18519,31 @@ fi
         row![spine_content, border_line].into()
     }
 
-    /// Per-workspace spine buttons: the 2-char workspace abbreviation in a
-    /// state color (error > attention > active > inactive). Bare indicator
-    /// dots proved invisible on the dark crust — the abbreviation gives the
-    /// spine an identity you can actually read and click.
     fn view_workspace_dot_column(&self) -> Column<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let pulse_bright = self.attention_pulse_bright;
-        let mono = iced::Font::with_name("Menlo");
-        let mut chips = Column::new().spacing(4).align_x(iced::Alignment::Center);
+        let mut dots = Column::new().spacing(8).align_x(iced::Alignment::Center);
 
         for (idx, ws) in self.workspaces.iter().enumerate() {
             let is_active = idx == self.active_workspace_idx;
             let ws_color = ws.color.color(theme);
+            let inactive_color = theme.surface2();
 
             let has_attention = ws.has_attention();
             let attention_reason = ws.highest_priority_attention();
             let has_error = ws.console.status == ConsoleStatus::Error;
 
+            // Larger dot for attention/error when inactive
+            let (dot_w, dot_h) = if is_active {
+                (4.0, 18.0)
+            } else if has_attention || has_error {
+                (6.0, 6.0)
+            } else {
+                (4.0, 4.0)
+            };
+
             // Color: error (red) > attention (pulsing amber) > active (ws color) > inactive
-            let text_color = if (has_error
-                || attention_reason == Some(AttentionReason::AgentFailed))
+            let dot_color = if (has_error || attention_reason == Some(AttentionReason::AgentFailed))
                 && !is_active
             {
                 theme.danger()
@@ -18552,46 +18556,48 @@ fi
             } else if is_active {
                 ws_color
             } else {
-                theme.subtext0()
+                inactive_color
             };
 
-            let active_bg = theme.surface0();
+            let dot = container(iced::widget::Space::new().width(0).height(0))
+                .width(Length::Fixed(dot_w))
+                .height(Length::Fixed(dot_h))
+                .style(move |_| container::Style {
+                    background: Some(dot_color.into()),
+                    border: iced::Border {
+                        radius: 2.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+
             let hover_bg = theme.surface0();
-            let chip_btn = button(
-                container(
-                    text(ws.abbrev.as_str())
-                        .size(10)
-                        .font(mono)
-                        .color(text_color),
-                )
-                .width(Length::Fixed(SPINE_WIDTH - 1.0))
-                .center_x(Length::Fixed(SPINE_WIDTH - 1.0)),
+            let dot_btn = button(
+                container(dot)
+                    .width(Length::Fixed(SPINE_WIDTH - 1.0))
+                    .center_x(Length::Fixed(SPINE_WIDTH - 1.0))
+                    .center_y(Length::Shrink),
             )
             .style(move |_theme, status| {
-                let bg = if is_active {
-                    active_bg
-                } else if matches!(status, button::Status::Hovered) {
+                let bg = if matches!(status, button::Status::Hovered) {
                     hover_bg
                 } else {
                     iced::Color::TRANSPARENT
                 };
                 button::Style {
                     background: Some(bg.into()),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        ..Default::default()
-                    },
-                    text_color,
+                    border: iced::Border::default(),
+                    text_color: iced::Color::WHITE,
                     ..Default::default()
                 }
             })
-            .padding([6, 0])
+            .padding([4, 0])
             .on_press(Event::WorkspaceSelect(idx));
 
-            chips = chips.push(chip_btn);
+            dots = dots.push(dot_btn);
         }
 
-        chips
+        dots
     }
 
     fn view_tab_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
