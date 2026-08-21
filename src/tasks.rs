@@ -946,6 +946,7 @@ impl TaskStore {
                 (false, None) => {}
             }
         }
+        let has_new_detail = last_error.is_some();
         if let Some(detail) = last_error {
             task.last_error = Some(detail);
         }
@@ -954,6 +955,15 @@ impl TaskStore {
                 reason: Some(TaskAttentionReason::ExecutionFailed),
                 unread: true,
             };
+        } else if target.is_active() {
+            // The task is observably running again, so any failure/outcome
+            // attention from a previous attempt is superseded — otherwise the
+            // rail keeps shouting "Failed" over a healthy resumed session.
+            // The old detail stays recorded on the closed attempt's `failure`.
+            task.attention = TaskAttention::default();
+            if !has_new_detail {
+                task.last_error = None;
+            }
         }
         task.updated_at = timestamp.to_string();
         self.commit_candidate(candidate)?;
@@ -2092,6 +2102,15 @@ mod tests {
         assert_eq!(
             task.active_attempt_id.as_deref(),
             Some(task.attempts[1].attempt_id.as_str())
+        );
+        // The interruption's attention and error are superseded by the live
+        // resume — the failure detail survives on the closed attempt.
+        assert_eq!(task.attention.reason, None);
+        assert!(!task.attention.unread);
+        assert_eq!(task.last_error, None);
+        assert_eq!(
+            task.attempts[0].failure.as_deref(),
+            Some("GitTerm restarted while this local execution was active")
         );
     }
 
