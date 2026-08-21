@@ -17892,7 +17892,7 @@ fi
             let text_color = if is_active {
                 ws_color
             } else {
-                theme.overlay0()
+                theme.subtext0()
             };
             let active_bg = theme.bg_base();
             let hover_bg = theme.surface0();
@@ -18841,7 +18841,7 @@ fi
             let text_color = if is_active {
                 theme.text_primary()
             } else {
-                theme.overlay1()
+                theme.subtext0()
             };
             let active_bg = theme.bg_base();
             let hover_bg = theme.surface0();
@@ -19587,7 +19587,7 @@ fi
         let text_color = if is_active {
             theme.text_primary()
         } else {
-            theme.overlay1()
+            theme.subtext0()
         };
         let underline_color = if is_active {
             theme.accent()
@@ -19645,10 +19645,12 @@ fi
         let _agent_active = tab.sidebar_mode == SidebarMode::Agent;
 
         // Git tab label with optional badge
+        // Inactive nav items use subtext0, not the overlay tier: overlay grays
+        // sit too close to the dark surface for small text to stay readable.
         let git_text_color = if git_active {
             theme.text_primary()
         } else {
-            theme.overlay1()
+            theme.subtext0()
         };
         let mut git_label: Row<'_, Event, Theme, iced::Renderer> =
             Row::new().spacing(4).align_y(iced::Alignment::Center);
@@ -19683,7 +19685,7 @@ fi
         let files_text_color = if files_active {
             theme.text_primary()
         } else {
-            theme.overlay1()
+            theme.subtext0()
         };
         let files_tab = self.view_sidebar_tab(
             text("Files").size(font).color(files_text_color).into(),
@@ -19694,7 +19696,7 @@ fi
         let tasks_text_color = if tasks_active {
             theme.text_primary()
         } else {
-            theme.overlay1()
+            theme.subtext0()
         };
         let tasks_tab = self.view_sidebar_tab(
             text("Tasks").size(font).color(tasks_text_color).into(),
@@ -19706,7 +19708,7 @@ fi
         let agent_text_color = if claude_active {
             theme.text_primary()
         } else {
-            theme.overlay1()
+            theme.subtext0()
         };
         let agent_tab = self.view_sidebar_tab(
             text("Agent").size(font).color(agent_text_color).into(),
@@ -19718,7 +19720,7 @@ fi
         let border_color = theme.surface0();
 
         // Collapse chevron (same style as console toggle)
-        let chevron_color = theme.overlay0();
+        let chevron_color = theme.subtext0();
         let collapse_chevron = button(
             text("\u{25C0}").size(10).color(chevron_color), // ◀ left-pointing
         )
@@ -19734,7 +19736,7 @@ fi
         let plans_text_color = if plans_active {
             theme.text_primary()
         } else {
-            theme.overlay1()
+            theme.subtext0()
         };
         let plans_tab = self.view_sidebar_tab(
             text("Plans").size(font).color(plans_text_color).into(),
@@ -19746,7 +19748,7 @@ fi
         let chats_text_color = if chats_active {
             theme.text_primary()
         } else {
-            theme.overlay1()
+            theme.subtext0()
         };
         let chats_tab = self.view_sidebar_tab(
             text("Chats").size(font).color(chats_text_color).into(),
@@ -19767,7 +19769,7 @@ fi
             let remote_text_color = if remote_active {
                 theme.text_primary()
             } else {
-                theme.overlay1()
+                theme.subtext0()
             };
             let remote_tab = self.view_sidebar_tab(
                 text("Remote").size(font).color(remote_text_color).into(),
@@ -19976,7 +19978,7 @@ fi
             let text_color = if is_active {
                 theme.text_primary()
             } else {
-                theme.overlay1()
+                theme.subtext0()
             };
             let accent = theme.accent();
             let hover_bg = theme.surface0();
@@ -20062,7 +20064,7 @@ fi
         rail_col = rail_col.push(iced::widget::Space::new().height(Length::Fill));
 
         // Expand chevron at bottom
-        let chevron_color = theme.overlay0();
+        let chevron_color = theme.subtext0();
         let hover_bg = theme.surface0();
         let expand_btn = button(
             container(text("\u{25B6}").size(10).color(chevron_color))
