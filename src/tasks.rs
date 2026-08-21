@@ -1087,6 +1087,41 @@ impl TaskStore {
         Ok(true)
     }
 
+    /// The user explicitly dismissed the task's attention from the inbox:
+    /// drop the reason and the unread badge outright, state-backed or not.
+    /// Stronger than [`Self::acknowledge_attention`] — a dismissal is a
+    /// deliberate "stop flagging this"; the underlying lifecycle still tells
+    /// the truth in the task rail. Returns `Ok(false)` without touching the
+    /// file when there is nothing to dismiss.
+    pub fn dismiss_attention(
+        &mut self,
+        task_id: &str,
+        timestamp: &str,
+    ) -> Result<bool, TaskStoreError> {
+        let Some(index) = self
+            .document
+            .tasks
+            .iter()
+            .position(|task| task.task_id == task_id)
+        else {
+            return Err(TaskStoreError::new(
+                "dismiss attention in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            ));
+        };
+        let current = &self.document.tasks[index];
+        if current.attention.reason.is_none() && !current.attention.unread {
+            return Ok(false);
+        }
+        let mut candidate = self.document.clone();
+        let task = &mut candidate.tasks[index];
+        task.attention = TaskAttention::default();
+        task.updated_at = timestamp.to_string();
+        self.commit_candidate(candidate)?;
+        Ok(true)
+    }
+
     pub fn reconcile_after_restart(&mut self, timestamp: &str) -> Result<usize, TaskStoreError> {
         let mut candidate = self.document.clone();
         let mut reconciled = 0;
@@ -2332,6 +2367,45 @@ mod tests {
             Some(TaskAttentionReason::ExecutionFailed)
         );
         assert!(!task.attention.unread);
+    }
+
+    #[test]
+    fn dismissing_attention_drops_even_state_backed_reasons() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        make_ready(&mut store, "task-1");
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Running,
+                None,
+                "2026-08-19T08:05:00Z",
+            )
+            .unwrap();
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Failed,
+                Some("agent reported an error".to_string()),
+                "2026-08-19T08:06:00Z",
+            )
+            .unwrap();
+        // A visit keeps a failure reason; an explicit dismissal drops it —
+        // the lifecycle still says Failed, so the rail stays truthful.
+        assert!(store
+            .dismiss_attention("task-1", "2026-08-19T08:07:00Z")
+            .unwrap());
+        let task = store.get("task-1").unwrap();
+        assert_eq!(task.attention, TaskAttention::default());
+        assert_eq!(task.lifecycle, TaskLifecycle::Failed);
+        // Dismissing again is a no-op that leaves the file untouched.
+        let before = std::fs::read(&path).unwrap();
+        assert!(!store
+            .dismiss_attention("task-1", "2026-08-19T08:08:00Z")
+            .unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]

@@ -2212,7 +2212,7 @@ impl TabAttention {
 
 /// Where an attention inbox row leads when selected.
 #[derive(Debug, Clone)]
-enum AttentionTarget {
+pub enum AttentionTarget {
     Tab(usize),
     Task(String),
 }
@@ -4207,6 +4207,7 @@ pub enum Event {
     AttentionViewClose,
     AttentionItemSelect(usize),
     AttentionTaskSelect(String),
+    AttentionDismiss(AttentionTarget),
     // Launch agent preset by index
     AgentActivityLoaded(usize, Result<agent::AgentActivity, String>),
     AgentConversationLoaded(usize, agent::Conversation),
@@ -6181,6 +6182,21 @@ impl App {
     fn acknowledge_active_task_attention(&mut self) {
         if let Some(task_id) = self.active_task_context_id().map(str::to_string) {
             self.acknowledge_task_attention(&task_id);
+        }
+    }
+
+    /// The user dismissed the task's inbox row: drop its attention outright,
+    /// state-backed reasons included — the lifecycle still tells the truth
+    /// in the task rail.
+    fn dismiss_task_attention(&mut self, task_id: &str) {
+        let Some(store) = self.task_store.as_mut() else {
+            return;
+        };
+        if store.get(task_id).is_none() {
+            return;
+        }
+        if let Err(error) = store.dismiss_attention(task_id, &chrono::Utc::now().to_rfc3339()) {
+            eprintln!("GitTerm V5 dropped a task attention dismissal: {error}");
         }
     }
 
@@ -15704,6 +15720,25 @@ fi
                 self.attention_view_open = false;
                 return self.enter_task_context(&task_id);
             }
+            Event::AttentionDismiss(target) => {
+                // The panel stays open — dismissing several rows in a row is
+                // the whole point of a manual dismiss control.
+                match target {
+                    AttentionTarget::Tab(tab_id) => {
+                        if let Some(tab) = self
+                            .workspaces
+                            .iter_mut()
+                            .flat_map(|ws| ws.tabs.iter_mut())
+                            .find(|t| t.id == tab_id)
+                        {
+                            tab.attention = None;
+                        }
+                    }
+                    AttentionTarget::Task(task_id) => {
+                        self.dismiss_task_attention(&task_id);
+                    }
+                }
+            }
             Event::AttentionJumpNext => {
                 // Round-robin search for next tab needing attention
                 let ws_count = self.workspaces.len();
@@ -18832,6 +18867,7 @@ fi
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
 
+                let dismiss_target = item.target.clone();
                 let item_button = button(
                     column![
                         status_line,
@@ -18864,7 +18900,37 @@ fi
                     AttentionTarget::Tab(tab_id) => Event::AttentionItemSelect(tab_id),
                     AttentionTarget::Task(task_id) => Event::AttentionTaskSelect(task_id),
                 });
-                item_list = item_list.push(item_button);
+                // A sibling, not a nested button — dismiss clears the row
+                // without visiting it.
+                let dismiss_button = button(text("✕").size(font_small).font(mono))
+                    .style(move |_theme, status| button::Style {
+                        background: Some(
+                            if matches!(status, button::Status::Hovered) {
+                                hover_bg
+                            } else {
+                                row_bg
+                            }
+                            .into(),
+                        ),
+                        text_color: if matches!(status, button::Status::Hovered) {
+                            text_primary
+                        } else {
+                            text_muted
+                        },
+                        border: iced::Border {
+                            color: border_color,
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .padding([8, 8])
+                    .on_press(Event::AttentionDismiss(dismiss_target));
+                item_list = item_list.push(
+                    row![item_button, dismiss_button]
+                        .spacing(4)
+                        .align_y(iced::Alignment::Center),
+                );
             }
         }
 
