@@ -6199,11 +6199,22 @@ impl App {
             TaskLifecycle::Ready => "Session open · delivery unknown".to_string(),
             TaskLifecycle::Queued => "Briefed".to_string(),
             TaskLifecycle::Running => {
-                let elapsed = Self::task_active_elapsed_minutes(task);
-                elapsed.map_or_else(
-                    || "Working".to_string(),
-                    |minutes| format!("Working · {minutes}m"),
-                )
+                // A silent session must not read as unqualified progress —
+                // some harnesses (Codex) never signal "waiting for input",
+                // so "Working" would otherwise stand forever over a session
+                // that is actually waiting on the user.
+                let quiet_minutes = self
+                    .task_activity_elapsed_secs(task)
+                    .filter(|secs| *secs >= TASK_PROGRESS_STALE_SECS)
+                    .map(|secs| secs / 60);
+                if let Some(quiet) = quiet_minutes {
+                    format!("Working · quiet {quiet}m")
+                } else {
+                    Self::task_active_elapsed_minutes(task).map_or_else(
+                        || "Working".to_string(),
+                        |minutes| format!("Working · {minutes}m"),
+                    )
+                }
             }
             TaskLifecycle::WaitingForInput => "Needs you — input required".to_string(),
             TaskLifecycle::Completed => "Done · review".to_string(),
