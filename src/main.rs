@@ -59,11 +59,11 @@ use gitterm::task_worktree::{
     ResolvedTaskPreparation, DEFAULT_TASK_BASE,
 };
 use gitterm::tasks::{
-    CompletedWorktreePreparation, ExecutorTarget, HarnessConversationBackend,
+    ChangedFilesSummary, CompletedWorktreePreparation, ExecutorTarget, HarnessConversationBackend,
     HarnessConversationRef, HarnessKind, HarnessSelection, IssueProvider, IssueReference,
     NewTaskRecord, ObjectiveDeliveryState, StoppingBoundary, TaskAttentionReason, TaskCreator,
-    TaskCreatorKind, TaskHandoff, TaskLifecycle, TaskRecord, TaskSessionRecord, TaskStore,
-    TaskStoreError, TaskWorktree, TaskWorktreeState, VerificationState,
+    TaskCreatorKind, TaskHandoff, TaskLifecycle, TaskProgress, TaskRecord, TaskSessionRecord,
+    TaskStore, TaskStoreError, TaskWorktree, TaskWorktreeState, VerificationState,
     WorkspaceIdentity as TaskWorkspaceIdentity, WorkspaceLocationIdentity,
 };
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
@@ -2570,6 +2570,16 @@ struct UnmanagedWorktreeOp {
     offer_force: bool,
 }
 
+/// Un-flushed progress capture for one task. Phase and update line mirror
+/// `tasks::TaskProgress`; changed-file counts ride along so worktree snapshots
+/// and session events share one flush path (the Tick debounce).
+#[derive(Debug, Clone, Default)]
+struct PendingTaskProgress {
+    phase: Option<String>,
+    last_update_line: Option<String>,
+    changes: Option<ChangedFilesSummary>,
+}
+
 // Tab state. Tab-kind data structures live in `src/tab/mod.rs`; the heavy `impl TabState`
 // methods (load_file, fetch_status, fetch_diff, fetch_claude_config, fetch_agent_activity, etc.)
 // stay here because they reference too many in-binary helpers, constants, and macros.
@@ -2638,6 +2648,9 @@ struct TabState {
     // Live execution signal for the task session this tab hosts; None when
     // nothing is observably running (or the tab is not task-linked).
     task_live_state: Option<TaskSessionLiveState>,
+    // Last PTY output instant for task-linked tabs. Stamped on the terminal
+    // hot path, so it must stay a bare Instant — no string or store work.
+    task_last_activity: Option<Instant>,
     is_git_repo: bool,
 }
 
@@ -2692,6 +2705,7 @@ impl TabState {
             task_id: None,
             task_session_id: None,
             task_live_state: None,
+            task_last_activity: None,
             attention: None,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
@@ -4398,6 +4412,11 @@ struct App {
     // Last-focused session tab (stable tab id) per task, so re-entering a task
     // context lands in the session you left, not the Overview.
     task_last_session_tab: HashMap<String, usize>,
+    // Progress capture per task, fed by low-frequency session events (agent
+    // events, worktree snapshots) and flushed to the store on the Tick
+    // cadence. Rendering reads this before the stored snapshot — it is
+    // always at least as fresh.
+    task_progress_pending: HashMap<String, PendingTaskProgress>,
     new_task_form: Option<NewTaskForm>,
     task_tab_close_prompt: Option<TaskTabClosePrompt>,
     task_worktree_delete_prompt: Option<TaskWorktreeDeletePrompt>,
@@ -4606,6 +4625,9 @@ const GIT_POLL_SLOW_INTERVAL_MS: u64 = 15000;
 const GIT_POLL_IDLE_INTERVAL_MS: u64 = 30000;
 const GIT_POLL_NON_REPO_INTERVAL_MS: u64 = 20000;
 const GIT_WORKTREES_POLL_INTERVAL_MS: u64 = 15000;
+// An active task whose session has been quiet this long stops implying
+// progress and shows "no activity since …" instead.
+const TASK_PROGRESS_STALE_SECS: i64 = 120;
 const TERMINAL_REDRAW_INTERVAL_MS: u64 = 33;
 
 fn terminal_event_should_queue_redraw(
@@ -6253,6 +6275,145 @@ impl App {
                     .num_minutes()
                     .max(0)
             })
+    }
+
+    /// First non-empty line of a session-reported blob, capped to one
+    /// presentable row. The store's `last_update_line` is pre-truncated here
+    /// so readers never re-derive it.
+    fn task_progress_line(raw: &str) -> Option<String> {
+        const MAX_CHARS: usize = 120;
+        let line = raw.lines().find(|line| !line.trim().is_empty())?.trim();
+        if line.chars().count() <= MAX_CHARS {
+            return Some(line.to_string());
+        }
+        let truncated: String = line.chars().take(MAX_CHARS).collect();
+        Some(format!("{}…", truncated.trim_end()))
+    }
+
+    /// Seconds since the task's execution was last heard from. Live tab
+    /// stamps win (always fresher); the stored snapshot covers sessions that
+    /// are no longer open in a tab.
+    fn task_activity_elapsed_secs(&self, task: &TaskRecord) -> Option<i64> {
+        let live = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .filter(|tab| tab.task_id.as_deref() == Some(task.task_id.as_str()))
+            .filter_map(|tab| tab.task_last_activity)
+            .map(|stamp| i64::try_from(stamp.elapsed().as_secs()).unwrap_or(i64::MAX))
+            .min();
+        live.or_else(|| {
+            let raw = task.progress.as_ref()?.last_activity_at.as_deref()?;
+            let stamp = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+            Some(
+                chrono::Utc::now()
+                    .signed_duration_since(stamp.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    .max(0),
+            )
+        })
+    }
+
+    /// Merged progress field for rendering: un-flushed capture first, then
+    /// the stored snapshot.
+    fn task_progress_field<T: Clone>(
+        &self,
+        task: &TaskRecord,
+        pending_field: impl Fn(&PendingTaskProgress) -> Option<T>,
+        stored_field: impl Fn(&TaskProgress) -> Option<T>,
+    ) -> Option<T> {
+        self.task_progress_pending
+            .get(&task.task_id)
+            .and_then(pending_field)
+            .or_else(|| task.progress.as_ref().and_then(stored_field))
+    }
+
+    /// Changed-file counts for rendering: un-flushed snapshot first, then the
+    /// stored one (only if it has ever actually been checked).
+    fn task_changes_view(&self, task: &TaskRecord) -> Option<ChangedFilesSummary> {
+        self.task_progress_pending
+            .get(&task.task_id)
+            .and_then(|pending| pending.changes.clone())
+            .or_else(|| {
+                task.changes
+                    .checked_at
+                    .is_some()
+                    .then(|| task.changes.clone())
+            })
+    }
+
+    /// Flush pending progress capture and live activity stamps into the task
+    /// store. Runs on the Tick cadence; activity is persisted at minute
+    /// granularity and the store no-ops on identical snapshots, so output
+    /// spam costs at most one write per minute.
+    fn flush_task_progress(&mut self) {
+        let Some(store) = self.task_store.as_ref() else {
+            return;
+        };
+        let mut activity: HashMap<String, Instant> = HashMap::new();
+        for tab in self.workspaces.iter().flat_map(|ws| ws.tabs.iter()) {
+            if let (Some(task_id), Some(stamp)) = (tab.task_id.as_deref(), tab.task_last_activity) {
+                let entry = activity.entry(task_id.to_string()).or_insert(stamp);
+                if stamp > *entry {
+                    *entry = stamp;
+                }
+            }
+        }
+        let now = chrono::Utc::now();
+        let mut updates: Vec<(String, TaskProgress, Option<ChangedFilesSummary>)> = Vec::new();
+        for task in store.tasks() {
+            let pending = self.task_progress_pending.get(&task.task_id);
+            let stamp = activity.get(&task.task_id);
+            if pending.is_none() && stamp.is_none() {
+                continue;
+            }
+            let stored = task.progress.clone().unwrap_or_default();
+            // Minute granularity, and monotonic against the stored value —
+            // sub-second jitter in `elapsed()` must not flip a minute
+            // boundary back and forth and defeat the no-op guard.
+            let last_activity_at = stamp
+                .map(|stamp| {
+                    let wall = now
+                        - chrono::Duration::seconds(
+                            i64::try_from(stamp.elapsed().as_secs()).unwrap_or(0),
+                        );
+                    let coarse = wall.format("%Y-%m-%dT%H:%M:00+00:00").to_string();
+                    match &stored.last_activity_at {
+                        Some(previous) if previous.as_str() >= coarse.as_str() => previous.clone(),
+                        _ => coarse,
+                    }
+                })
+                .or_else(|| stored.last_activity_at.clone());
+            let progress = TaskProgress {
+                phase: pending
+                    .and_then(|entry| entry.phase.clone())
+                    .or(stored.phase),
+                last_update_line: pending
+                    .and_then(|entry| entry.last_update_line.clone())
+                    .or(stored.last_update_line),
+                last_activity_at,
+            };
+            // Persist counts only when they moved — `checked_at` alone
+            // refreshes every poll and must not force a rewrite.
+            let changes = pending
+                .and_then(|entry| entry.changes.clone())
+                .filter(|summary| {
+                    summary.changed != task.changes.changed || summary.staged != task.changes.staged
+                });
+            updates.push((task.task_id.clone(), progress, changes));
+        }
+        if updates.is_empty() {
+            return;
+        }
+        let timestamp = now.to_rfc3339();
+        let Some(store) = self.task_store.as_mut() else {
+            return;
+        };
+        for (task_id, progress, changes) in updates {
+            if let Err(error) = store.update_progress(&task_id, progress, changes, &timestamp) {
+                eprintln!("GitTerm V5 dropped a task progress update: {error}");
+            }
+        }
     }
 
     fn task_creator_copy(task: &TaskRecord) -> String {
@@ -7995,6 +8156,7 @@ impl App {
             task_switcher_selection: None,
             task_context_mru: VecDeque::from([None]),
             task_last_session_tab: HashMap::new(),
+            task_progress_pending: HashMap::new(),
             new_task_form: None,
             task_tab_close_prompt: None,
             task_worktree_delete_prompt: None,
@@ -10378,6 +10540,14 @@ fi
                             tab.git_unchanged_streak = 0;
                         }
                     }
+                    // Hot path: PTY output proves the task session is alive.
+                    // A bare Instant stamp only — persistence happens on the
+                    // Tick debounce, never per output chunk.
+                    if tab.task_id.is_some()
+                        && matches!(&cmd, iced_term::backend::Command::ProcessAlacrittyEvent(_))
+                    {
+                        tab.task_last_activity = Some(Instant::now());
+                    }
                     if let Some(term) = tab.terminal_mut() {
                         terminal_handled = true;
                         match Self::handle_terminal_backend_command(
@@ -10406,6 +10576,23 @@ fi
                                     tab.clear_attention(AttentionReason::HumanInputRequired);
                                 }
                                 if let Some(task_id) = tab.task_id.clone() {
+                                    // Progress capture: the title is the
+                                    // session's own latest self-description
+                                    // (Claude Code writes its topic there).
+                                    // cwd-style titles from plain shells are
+                                    // not progress.
+                                    let update_line = title.trim_start_matches('✳').trim();
+                                    if !update_line.is_empty()
+                                        && !update_line.starts_with('/')
+                                        && !update_line.starts_with('~')
+                                    {
+                                        if let Some(line) = Self::task_progress_line(update_line) {
+                                            self.task_progress_pending
+                                                .entry(task_id.clone())
+                                                .or_default()
+                                                .last_update_line = Some(line);
+                                        }
+                                    }
                                     let live = if terminal_title_attention_reason(&title).is_some()
                                     {
                                         Some(TaskSessionLiveState::AwaitingInput)
@@ -10599,6 +10786,10 @@ fi
                 if workspace_dirty {
                     self.mark_workspaces_dirty();
                 }
+
+                // Debounced task progress persistence (no-ops unless a
+                // snapshot actually changed).
+                self.flush_task_progress();
 
                 // Debounced workspace persistence
                 let now = Instant::now();
@@ -11052,10 +11243,28 @@ fi
                 let is_active_in_webview = self.webview_kind == WebviewKind::Agent
                     && self.webview_agent_tab_id == Some(tab_id);
                 let attention_reason = agent_event_attention_reason(&ev);
+                // Progress capture: what the session last said it was doing.
+                // Only meaningful events feed this — streaming deltas don't.
+                let progress_note: Option<(Option<String>, Option<String>)> = match &ev {
+                    tab::AgentEvent::ToolCallStart { name, .. } => {
+                        Some((Some(format!("Running {name}")), None))
+                    }
+                    tab::AgentEvent::AssistantThinking(_) => {
+                        Some((Some("Thinking".to_string()), None))
+                    }
+                    tab::AgentEvent::AssistantText(text) => Self::task_progress_line(text)
+                        .map(|line| (Some("Responding".to_string()), Some(line))),
+                    _ => None,
+                };
+                let mut progress_task: Option<String> = None;
                 let mut task_signal: Option<(String, Option<TaskSessionOutcome>)> = None;
                 'outer_event: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
+                            if t.task_id.is_some() {
+                                t.task_last_activity = Some(Instant::now());
+                                progress_task = t.task_id.clone();
+                            }
                             // The agent session's own end states translate
                             // directly into task session outcomes.
                             let mut session_ended: Option<TaskSessionOutcome> = None;
@@ -11106,6 +11315,15 @@ fi
                             }
                             break 'outer_event;
                         }
+                    }
+                }
+                if let (Some(task_id), Some((phase, line))) = (progress_task, progress_note) {
+                    let entry = self.task_progress_pending.entry(task_id).or_default();
+                    if phase.is_some() {
+                        entry.phase = phase;
+                    }
+                    if line.is_some() {
+                        entry.last_update_line = line;
                     }
                 }
                 if let Some((task_id, ended)) = task_signal {
@@ -14163,6 +14381,33 @@ fi
                 {
                     self.rail_worktrees = snapshot.worktrees.clone();
                     self.rail_worktrees_repo_path = Some(snapshot.repo_path.clone());
+                }
+                // Changed-file counts for managed task worktrees ride the same
+                // snapshot; they persist on the progress flush debounce.
+                if snapshot.is_git_repo {
+                    let checked_at = chrono::Utc::now().to_rfc3339();
+                    let changed: Vec<(String, ChangedFilesSummary)> = snapshot
+                        .worktrees
+                        .iter()
+                        .filter_map(|entry| {
+                            let task = self.worktree_task(&entry.path)?;
+                            let summary = ChangedFilesSummary {
+                                changed: u32::try_from(
+                                    entry.unstaged_count + entry.untracked_count,
+                                )
+                                .unwrap_or(u32::MAX),
+                                staged: u32::try_from(entry.staged_count).unwrap_or(u32::MAX),
+                                checked_at: Some(checked_at.clone()),
+                            };
+                            Some((task.task_id.clone(), summary))
+                        })
+                        .collect();
+                    for (task_id, summary) in changed {
+                        self.task_progress_pending
+                            .entry(task_id)
+                            .or_default()
+                            .changes = Some(summary);
+                    }
                 }
                 if let Some(form) = self
                     .new_task_form
@@ -20354,7 +20599,7 @@ fi
             } else {
                 format!("{state} · {glyphs}")
             };
-            let row_copy = column![
+            let mut row_copy = column![
                 title_row,
                 text(state)
                     .size(10)
@@ -20364,9 +20609,32 @@ fi
                         text_muted
                     })
                     .font(mono),
-            ]
-            .spacing(3)
-            .padding([7, 8]);
+            ];
+            // Third line: the session's own latest update while the task is
+            // active — or an honest staleness marker when it has gone quiet.
+            if !compact && task.lifecycle.is_active() {
+                let progress_line = match self.task_activity_elapsed_secs(task) {
+                    Some(secs) if secs >= TASK_PROGRESS_STALE_SECS => {
+                        let since =
+                            (chrono::Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339();
+                        Some(format!(
+                            "no activity since {}",
+                            Self::friendly_timestamp(&since)
+                        ))
+                    }
+                    _ => self
+                        .task_progress_field(
+                            task,
+                            |pending| pending.last_update_line.clone(),
+                            |stored| stored.last_update_line.clone(),
+                        )
+                        .map(|line| Self::task_state_detail(&line)),
+                };
+                if let Some(line) = progress_line {
+                    row_copy = row_copy.push(text(line).size(9).color(text_muted).font(mono));
+                }
+            }
+            let row_copy = row_copy.spacing(3).padding([7, 8]);
             let created_recently = chrono::DateTime::parse_from_rfc3339(&task.created_at)
                 .ok()
                 .map(|created| {
@@ -20647,29 +20915,53 @@ fi
             details = details.push(value_row("LAST AGENT", task_harness_label(&harness.kind)));
         }
         if task.lifecycle.is_active() {
-            let phase = match task.lifecycle {
-                TaskLifecycle::Preparing => "Preparing",
-                TaskLifecycle::Queued => "Briefed",
-                TaskLifecycle::Running => "Working",
-                TaskLifecycle::WaitingForInput => "Waiting for input",
-                _ => "Active",
+            // Session-reported phase when the session has said anything;
+            // lifecycle-derived otherwise.
+            let phase = self
+                .task_progress_field(
+                    task,
+                    |pending| pending.phase.clone(),
+                    |stored| stored.phase.clone(),
+                )
+                .unwrap_or_else(|| {
+                    match task.lifecycle {
+                        TaskLifecycle::Preparing => "Preparing",
+                        TaskLifecycle::Queued => "Briefed",
+                        TaskLifecycle::Running => "Working",
+                        TaskLifecycle::WaitingForInput => "Waiting for input",
+                        _ => "Active",
+                    }
+                    .to_string()
+                });
+            details = details.push(value_row("PHASE", phase));
+            let latest_update = self
+                .task_progress_field(
+                    task,
+                    |pending| pending.last_update_line.clone(),
+                    |stored| stored.last_update_line.clone(),
+                )
+                .unwrap_or_else(|| Self::friendly_timestamp(&task.updated_at));
+            details = details.push(value_row("LATEST UPDATE", latest_update));
+            let last_activity = match self.task_activity_elapsed_secs(task) {
+                Some(secs) => {
+                    let since = (chrono::Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339();
+                    let friendly = Self::friendly_timestamp(&since);
+                    if secs >= TASK_PROGRESS_STALE_SECS {
+                        format!("no activity since {friendly}")
+                    } else {
+                        friendly
+                    }
+                }
+                None => "Not observed yet".to_string(),
             };
-            details = details.push(value_row("PHASE", phase.to_string()));
-            details = details.push(value_row(
-                "LATEST UPDATE",
-                Self::friendly_timestamp(&task.updated_at),
-            ));
+            details = details.push(value_row("LAST ACTIVITY", last_activity));
             if let Some(minutes) = Self::task_active_elapsed_minutes(task) {
                 details = details.push(value_row("ELAPSED", format!("{minutes}m")));
             }
-            let changed_files = if task.changes.checked_at.is_some() {
-                format!(
-                    "{} changed · {} staged",
-                    task.changes.changed, task.changes.staged
-                )
-            } else {
-                "Not checked yet".to_string()
-            };
+            let changed_files = self.task_changes_view(task).map_or_else(
+                || "Not checked yet".to_string(),
+                |summary| format!("{} changed · {} staged", summary.changed, summary.staged),
+            );
             details = details.push(value_row("CHANGED FILES", changed_files));
             let verification = match task.verification.state {
                 VerificationState::Unknown => "Unknown",

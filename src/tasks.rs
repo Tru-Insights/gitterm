@@ -61,6 +61,10 @@ pub struct TaskRecord {
     pub sessions: Vec<TaskSessionRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_attempt_id: Option<String>,
+    /// Coarse progress snapshot for the rail/overview, flushed on a debounce —
+    /// in-memory UI state is always fresher than this while the app runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TaskProgress>,
     pub changes: ChangedFilesSummary,
     pub verification: VerificationSummary,
     pub delivery: DeliveryState,
@@ -95,6 +99,7 @@ impl TaskRecord {
             attempts: Vec::new(),
             sessions: Vec::new(),
             active_attempt_id: None,
+            progress: None,
             changes: ChangedFilesSummary::default(),
             verification: VerificationSummary::default(),
             delivery: DeliveryState::default(),
@@ -443,6 +448,25 @@ pub struct ChangedFilesSummary {
     pub staged: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<String>,
+}
+
+/// Coarse, honest progress for a task's current run: what the session last
+/// said it was doing and when it was last heard from. Elapsed time derives
+/// from the active attempt's `started_at`, so it is not stored here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskProgress {
+    /// Short label for what the session is doing right now (a tool name,
+    /// "Responding", …). `None` means nothing richer than the lifecycle is
+    /// known — render the lifecycle-derived phase instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Last meaningful line the session produced (single line, pre-truncated
+    /// by the writer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update_line: Option<String>,
+    /// RFC3339 wall-clock time of the last observed session activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -964,6 +988,48 @@ impl TaskStore {
             if !has_new_detail {
                 task.last_error = None;
             }
+        }
+        task.updated_at = timestamp.to_string();
+        self.commit_candidate(candidate)?;
+        Ok(true)
+    }
+
+    /// Persist a progress snapshot (and optionally refreshed changed-file
+    /// counts). Returns `Ok(false)` without touching the file when nothing
+    /// differs — callers flush on a timer and must be able to fire this
+    /// repeatedly without churning `tasks.json`.
+    pub fn update_progress(
+        &mut self,
+        task_id: &str,
+        progress: TaskProgress,
+        changes: Option<ChangedFilesSummary>,
+        timestamp: &str,
+    ) -> Result<bool, TaskStoreError> {
+        let Some(index) = self
+            .document
+            .tasks
+            .iter()
+            .position(|task| task.task_id == task_id)
+        else {
+            return Err(TaskStoreError::new(
+                "update progress in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            ));
+        };
+        let current = &self.document.tasks[index];
+        let progress_unchanged = current.progress.as_ref() == Some(&progress);
+        let changes_unchanged = changes
+            .as_ref()
+            .is_none_or(|summary| *summary == current.changes);
+        if progress_unchanged && changes_unchanged {
+            return Ok(false);
+        }
+        let mut candidate = self.document.clone();
+        let task = &mut candidate.tasks[index];
+        task.progress = Some(progress);
+        if let Some(summary) = changes {
+            task.changes = summary;
         }
         task.updated_at = timestamp.to_string();
         self.commit_candidate(candidate)?;
@@ -2112,6 +2178,90 @@ mod tests {
             task.attempts[0].failure.as_deref(),
             Some("GitTerm restarted while this local execution was active")
         );
+    }
+
+    #[test]
+    fn update_progress_persists_snapshot_and_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+
+        let progress = TaskProgress {
+            phase: Some("Running tests".to_string()),
+            last_update_line: Some("cargo test --features excalidraw".to_string()),
+            last_activity_at: Some("2026-08-19T08:10:00Z".to_string()),
+        };
+        let changes = ChangedFilesSummary {
+            changed: 3,
+            staged: 1,
+            checked_at: Some("2026-08-19T08:10:00Z".to_string()),
+        };
+        let wrote = store
+            .update_progress(
+                "task-1",
+                progress.clone(),
+                Some(changes.clone()),
+                "2026-08-19T08:10:05Z",
+            )
+            .unwrap();
+        assert!(wrote);
+
+        let reloaded = TaskStore::load(&path).unwrap();
+        let task = reloaded.get("task-1").unwrap();
+        assert_eq!(task.progress.as_ref(), Some(&progress));
+        assert_eq!(task.changes, changes);
+        assert_eq!(task.updated_at, "2026-08-19T08:10:05Z");
+    }
+
+    #[test]
+    fn update_progress_is_a_no_op_when_nothing_differs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+
+        let progress = TaskProgress {
+            phase: Some("Editing".to_string()),
+            last_update_line: None,
+            last_activity_at: Some("2026-08-19T08:10:00Z".to_string()),
+        };
+        assert!(store
+            .update_progress("task-1", progress.clone(), None, "2026-08-19T08:10:05Z")
+            .unwrap());
+        let bytes_after_first = fs::read(&path).unwrap();
+
+        // Same snapshot again — the flush timer will do this constantly, and it
+        // must not rewrite the file or bump updated_at.
+        assert!(!store
+            .update_progress("task-1", progress.clone(), None, "2026-08-19T08:15:00Z")
+            .unwrap());
+        assert_eq!(fs::read(&path).unwrap(), bytes_after_first);
+
+        // Unchanged progress but fresh change counts still writes.
+        let changes = ChangedFilesSummary {
+            changed: 2,
+            staged: 0,
+            checked_at: Some("2026-08-19T08:16:00Z".to_string()),
+        };
+        assert!(store
+            .update_progress("task-1", progress, Some(changes), "2026-08-19T08:16:00Z")
+            .unwrap());
+    }
+
+    #[test]
+    fn update_progress_rejects_unknown_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        let error = store
+            .update_progress(
+                "missing",
+                TaskProgress::default(),
+                None,
+                "2026-08-19T08:10:00Z",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("does not exist"));
     }
 
     #[test]
