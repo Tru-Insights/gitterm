@@ -2167,11 +2167,14 @@ enum AttentionReason {
 }
 
 impl AttentionReason {
+    /// Rank on the shared inbox scale: 0 input needed · 1 failed ·
+    /// 2 interrupted (task-only) · 3 ready to review. Failures outrank
+    /// completions by construction.
     fn priority(self) -> u8 {
         match self {
             Self::HumanInputRequired => 0,
             Self::AgentFailed => 1,
-            Self::CompletedUnread => 2,
+            Self::CompletedUnread => 3,
         }
     }
 
@@ -2207,17 +2210,30 @@ impl TabAttention {
     }
 }
 
+/// Where an attention inbox row leads when selected.
 #[derive(Debug, Clone)]
-struct AttentionItem {
-    tab_id: usize,
-    workspace_name: String,
-    machine_name: String,
-    tab_name: String,
-    attention: TabAttention,
+enum AttentionTarget {
+    Tab(usize),
+    Task(String),
 }
 
-fn format_attention_age(since: Instant, now: Instant) -> String {
-    let elapsed = now.saturating_duration_since(since);
+/// One row in the attention inbox: a session tab's live attention, or a
+/// task whose durable attention no open tab is already surfacing.
+#[derive(Debug, Clone)]
+struct AttentionItem {
+    target: AttentionTarget,
+    workspace_name: String,
+    machine_name: String,
+    title: String,
+    /// The shared inbox scale — see [`AttentionReason::priority`].
+    priority: u8,
+    icon: &'static str,
+    label: &'static str,
+    age_secs: u64,
+}
+
+fn format_attention_age(elapsed_secs: u64) -> String {
+    let elapsed = Duration::from_secs(elapsed_secs);
     if elapsed.as_secs() < 60 {
         "now".to_string()
     } else if elapsed.as_secs() < 60 * 60 {
@@ -2266,6 +2282,20 @@ fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
     title
         .starts_with('✳')
         .then_some(AttentionReason::HumanInputRequired)
+}
+
+/// Inbox presentation for a task attention reason on the shared priority
+/// scale: (priority, icon, label).
+fn task_attention_presentation(reason: TaskAttentionReason) -> (u8, &'static str, &'static str) {
+    match reason {
+        TaskAttentionReason::RequiresInput => (0, "●", "Input or approval needed"),
+        TaskAttentionReason::RemoteUnavailable => (0, "●", "Remote unavailable"),
+        TaskAttentionReason::ExecutionFailed => (1, "!", "Task failed"),
+        TaskAttentionReason::Interrupted => (2, "○", "Interrupted · resume"),
+        TaskAttentionReason::CompletedUnread | TaskAttentionReason::ReadyForReview => {
+            (3, "✓", "Ready to review")
+        }
+    }
 }
 
 fn agent_event_attention_reason(event: &tab::AgentEvent) -> Option<AttentionReason> {
@@ -4176,6 +4206,7 @@ pub enum Event {
     AttentionViewToggle,
     AttentionViewClose,
     AttentionItemSelect(usize),
+    AttentionTaskSelect(String),
     // Launch agent preset by index
     AgentActivityLoaded(usize, Result<agent::AgentActivity, String>),
     AgentConversationLoaded(usize, agent::Conversation),
@@ -6131,6 +6162,28 @@ impl App {
         }
     }
 
+    /// Visiting a task acknowledges its attention (the unread badge, and a
+    /// completed-review flag) in the store. Fired on explicit visits and on
+    /// every Tick for whichever task context is active — merely seeing the
+    /// rail never acknowledges anything.
+    fn acknowledge_task_attention(&mut self, task_id: &str) {
+        let Some(store) = self.task_store.as_mut() else {
+            return;
+        };
+        if store.get(task_id).is_none() {
+            return;
+        }
+        if let Err(error) = store.acknowledge_attention(task_id, &chrono::Utc::now().to_rfc3339()) {
+            eprintln!("GitTerm V5 dropped a task attention acknowledgement: {error}");
+        }
+    }
+
+    fn acknowledge_active_task_attention(&mut self) {
+        if let Some(task_id) = self.active_task_context_id().map(str::to_string) {
+            self.acknowledge_task_attention(&task_id);
+        }
+    }
+
     fn task_sort_bucket(task: &TaskRecord) -> u8 {
         if Self::task_needs_attention(task) {
             0
@@ -6164,6 +6217,7 @@ impl App {
                     "Failed · {}",
                     Self::task_state_detail(task.last_error.as_deref().unwrap_or("agent stopped"))
                 ),
+                TaskAttentionReason::Interrupted => "Interrupted · resume".to_string(),
                 TaskAttentionReason::CompletedUnread | TaskAttentionReason::ReadyForReview => {
                     "Done · review".to_string()
                 }
@@ -6956,6 +7010,7 @@ impl App {
         }
         self.selected_task_id = Some(task_id.to_string());
         self.remember_task_context(Some(task_id.to_string()));
+        self.acknowledge_task_attention(task_id);
         self.task_ui_error = None;
         // An agent session's webview is its primary surface — show it when we
         // land on one; otherwise drop any webview left over from before.
@@ -9862,7 +9917,34 @@ fi
         })
     }
 
+    /// Tasks whose open session tabs already surface live attention — their
+    /// tab rows are the more precise inbox entries for the same thing.
+    fn task_ids_with_tab_attention(&self) -> HashSet<&str> {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .filter(|tab| tab.attention.is_some())
+            .filter_map(|tab| tab.task_id.as_deref())
+            .collect()
+    }
+
+    /// Attention reasons of the tasks that reach the inbox as their own rows.
+    fn rail_only_task_attention_reasons(&self) -> Vec<TaskAttentionReason> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let tabbed = self.task_ids_with_tab_attention();
+        store
+            .tasks()
+            .iter()
+            .filter(|task| task.lifecycle != TaskLifecycle::Archived)
+            .filter(|task| !tabbed.contains(task.task_id.as_str()))
+            .filter_map(|task| task.attention.reason)
+            .collect()
+    }
+
     fn attention_items(&self) -> Vec<AttentionItem> {
+        let now = Instant::now();
         let mut items = self
             .workspaces
             .iter()
@@ -9879,23 +9961,77 @@ fi
                 };
                 workspace.tabs.iter().filter_map(move |tab| {
                     let attention = tab.attention?;
-                    let tab_name = tab
+                    let title = tab
                         .terminal_title()
                         .unwrap_or(tab.repo_name.as_str())
                         .trim_start_matches('✳')
                         .trim()
                         .to_string();
                     Some(AttentionItem {
-                        tab_id: tab.id,
+                        target: AttentionTarget::Tab(tab.id),
                         workspace_name: workspace.name.clone(),
                         machine_name: machine_name.clone(),
-                        tab_name,
-                        attention,
+                        title,
+                        priority: attention.reason.priority(),
+                        icon: attention.reason.icon(),
+                        label: attention.reason.label(),
+                        age_secs: now.saturating_duration_since(attention.since).as_secs(),
                     })
                 })
             })
             .collect::<Vec<_>>();
-        items.sort_by_key(|item| (item.attention.reason.priority(), item.attention.since));
+        // Tasks with durable attention join the inbox unless one of their
+        // open session tabs is already surfacing live attention — then the
+        // tab row above is the more precise entry for the same thing.
+        if let Some(store) = self.task_store.as_ref() {
+            let tabbed_task_ids = self.task_ids_with_tab_attention();
+            for task in store.tasks() {
+                if task.lifecycle == TaskLifecycle::Archived
+                    || tabbed_task_ids.contains(task.task_id.as_str())
+                {
+                    continue;
+                }
+                let Some(reason) = task.attention.reason else {
+                    continue;
+                };
+                let (priority, icon, label) = task_attention_presentation(reason);
+                let age_secs = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
+                    .ok()
+                    .map(|updated| {
+                        chrono::Utc::now()
+                            .signed_duration_since(updated.with_timezone(&chrono::Utc))
+                            .num_seconds()
+                            .max(0) as u64
+                    })
+                    .unwrap_or(0);
+                let machine_name = match &task.workspace.location {
+                    WorkspaceLocationIdentity::Local { .. } => "Local".to_string(),
+                    WorkspaceLocationIdentity::RemoteAgent { remote_id, .. } => self
+                        .remote_agent_config_by_id(remote_id)
+                        .map(|agent| agent.name.clone())
+                        .unwrap_or_else(|| remote_id.clone()),
+                };
+                let title = match &task.issue {
+                    Some(issue) => format!("{} {}", issue.key, task.title),
+                    None => task.title.clone(),
+                };
+                items.push(AttentionItem {
+                    target: AttentionTarget::Task(task.task_id.clone()),
+                    workspace_name: task.workspace.name.clone(),
+                    machine_name,
+                    title,
+                    priority,
+                    icon,
+                    label,
+                    age_secs,
+                });
+            }
+        }
+        items.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then(right.age_secs.cmp(&left.age_secs))
+        });
         items
     }
 
@@ -10822,6 +10958,10 @@ fi
                 // Debounced task progress persistence (no-ops unless a
                 // snapshot actually changed).
                 self.flush_task_progress();
+                // The task the user is looking at counts as read — covers
+                // completion arriving while its context is already focused,
+                // and focusing a session tab through ordinary tab switching.
+                self.acknowledge_active_task_attention();
 
                 // Debounced workspace persistence
                 let now = Instant::now();
@@ -15561,6 +15701,10 @@ fi
                 }
                 return self.restore_webview_after_attention();
             }
+            Event::AttentionTaskSelect(task_id) => {
+                self.attention_view_open = false;
+                return self.enter_task_context(&task_id);
+            }
             Event::AttentionJumpNext => {
                 // Round-robin search for next tab needing attention
                 let ws_count = self.workspaces.len();
@@ -18500,26 +18644,35 @@ fi
                 ..Default::default()
             });
 
+        let rail_task_reasons = self.rail_only_task_attention_reasons();
         let attention_count = self
             .workspaces
             .iter()
             .map(Workspace::attention_count)
-            .sum::<usize>();
-        let attention_reason = self
+            .sum::<usize>()
+            + rail_task_reasons.len();
+        let attention_priority = self
             .workspaces
             .iter()
             .filter_map(Workspace::highest_priority_attention)
-            .min_by_key(|reason| reason.priority());
-        let attention_color = match attention_reason {
-            Some(AttentionReason::HumanInputRequired) => {
+            .map(AttentionReason::priority)
+            .chain(
+                rail_task_reasons
+                    .iter()
+                    .map(|reason| task_attention_presentation(*reason).0),
+            )
+            .min();
+        let attention_color = match attention_priority {
+            Some(0) => {
                 if self.attention_pulse_bright {
                     theme.peach()
                 } else {
                     theme.warning()
                 }
             }
-            Some(AttentionReason::AgentFailed) => theme.danger(),
-            Some(AttentionReason::CompletedUnread) => theme.success(),
+            Some(1) => theme.danger(),
+            Some(2) => theme.peach(),
+            Some(_) => theme.success(),
             None => theme.text_muted(),
         };
         let attention_hover = theme.surface0();
@@ -18629,12 +18782,12 @@ fi
                     .padding([24, 10]),
                 );
         } else {
-            let now = Instant::now();
             let mut actionable_heading_added = false;
             let mut review_heading_added = false;
             for item in items {
-                let reason = item.attention.reason;
-                if reason == AttentionReason::CompletedUnread {
+                // Items arrive priority-sorted, so review rows (the highest
+                // priority value) always trail the actionable ones.
+                if item.priority == 3 {
                     if !review_heading_added {
                         item_list = item_list.push(
                             text("READY TO REVIEW")
@@ -18654,22 +18807,23 @@ fi
                     actionable_heading_added = true;
                 }
 
-                let reason_color = match reason {
-                    AttentionReason::HumanInputRequired => theme.warning(),
-                    AttentionReason::AgentFailed => theme.danger(),
-                    AttentionReason::CompletedUnread => theme.success(),
+                let reason_color = match item.priority {
+                    0 => theme.warning(),
+                    1 => theme.danger(),
+                    2 => theme.peach(),
+                    _ => theme.success(),
                 };
-                let age = format_attention_age(item.attention.since, now);
+                let age = format_attention_age(item.age_secs);
                 let location = format!("{} · {}", item.machine_name, item.workspace_name);
-                let tab_name = if item.tab_name.chars().count() > 44 {
-                    format!("{}…", truncate_str(&item.tab_name, 43))
+                let tab_name = if item.title.chars().count() > 44 {
+                    format!("{}…", truncate_str(&item.title, 43))
                 } else {
-                    item.tab_name
+                    item.title
                 };
 
                 let status_line = row![
-                    text(reason.icon()).size(font_small).color(reason_color),
-                    text(reason.label())
+                    text(item.icon).size(font_small).color(reason_color),
+                    text(item.label)
                         .size(font_small)
                         .color(reason_color)
                         .font(mono),
@@ -18707,7 +18861,10 @@ fi
                 })
                 .padding([8, 10])
                 .width(Length::Fill)
-                .on_press(Event::AttentionItemSelect(item.tab_id));
+                .on_press(match item.target {
+                    AttentionTarget::Tab(tab_id) => Event::AttentionItemSelect(tab_id),
+                    AttentionTarget::Task(task_id) => Event::AttentionTaskSelect(task_id),
+                });
                 item_list = item_list.push(item_button);
             }
         }
@@ -20214,6 +20371,7 @@ fi
                             let (priority, color) = match task.attention.reason {
                                 Some(TaskAttentionReason::ExecutionFailed) => (0, theme.danger()),
                                 Some(TaskAttentionReason::RequiresInput)
+                                | Some(TaskAttentionReason::Interrupted)
                                 | Some(TaskAttentionReason::RemoteUnavailable) => {
                                     (1, theme.peach())
                                 }
@@ -20221,6 +20379,9 @@ fi
                                 | Some(TaskAttentionReason::ReadyForReview) => (2, theme.green()),
                                 None if task.lifecycle == TaskLifecycle::Failed => {
                                     (0, theme.danger())
+                                }
+                                None if task.lifecycle == TaskLifecycle::Interrupted => {
+                                    (1, theme.peach())
                                 }
                                 None if task.lifecycle.is_active() => (3, theme.blue()),
                                 _ => return None,
@@ -20591,6 +20752,7 @@ fi
             let state_color = match task.attention.reason {
                 Some(TaskAttentionReason::ExecutionFailed) => theme.danger(),
                 Some(TaskAttentionReason::RequiresInput)
+                | Some(TaskAttentionReason::Interrupted)
                 | Some(TaskAttentionReason::RemoteUnavailable) => theme.peach(),
                 Some(TaskAttentionReason::CompletedUnread)
                 | Some(TaskAttentionReason::ReadyForReview) => theme.success(),
@@ -20598,7 +20760,9 @@ fi
                     TaskLifecycle::Preparing | TaskLifecycle::Queued => theme.yellow(),
                     TaskLifecycle::Ready => theme.green(),
                     TaskLifecycle::Running | TaskLifecycle::WaitingForInput => theme.blue(),
-                    TaskLifecycle::Failed | TaskLifecycle::Interrupted => theme.danger(),
+                    TaskLifecycle::Failed => theme.danger(),
+                    // Interrupted is a calm resumable state, not a failure.
+                    TaskLifecycle::Interrupted => theme.peach(),
                     TaskLifecycle::Completed => theme.success(),
                     _ => text_muted,
                 },
@@ -27468,20 +27632,10 @@ mod tests {
 
     #[test]
     fn attention_age_uses_compact_stable_buckets() {
-        let now = Instant::now();
-        assert_eq!(format_attention_age(now, now), "now");
-        assert_eq!(
-            format_attention_age(now - Duration::from_secs(90), now),
-            "1m"
-        );
-        assert_eq!(
-            format_attention_age(now - Duration::from_secs(2 * 60 * 60), now),
-            "2h"
-        );
-        assert_eq!(
-            format_attention_age(now - Duration::from_secs(3 * 24 * 60 * 60), now),
-            "3d"
-        );
+        assert_eq!(format_attention_age(0), "now");
+        assert_eq!(format_attention_age(90), "1m");
+        assert_eq!(format_attention_age(2 * 60 * 60), "2h");
+        assert_eq!(format_attention_age(3 * 24 * 60 * 60), "3d");
     }
 
     #[test]

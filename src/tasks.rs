@@ -360,6 +360,9 @@ impl TaskLifecycle {
 pub enum TaskAttentionReason {
     RequiresInput,
     ExecutionFailed,
+    /// A GitTerm restart cut the local execution short. Calmer than a real
+    /// failure: the worktree is intact and the session can simply resume.
+    Interrupted,
     CompletedUnread,
     ReadyForReview,
     RemoteUnavailable,
@@ -979,6 +982,15 @@ impl TaskStore {
                 reason: Some(TaskAttentionReason::ExecutionFailed),
                 unread: true,
             };
+        } else if target == TaskLifecycle::Completed && current != target {
+            // Completion is attention until the task is visited — the visit
+            // (not a glance at the rail) acknowledges it. The current==target
+            // guard keeps a repeated completion signal from re-marking a task
+            // the user already read.
+            task.attention = TaskAttention {
+                reason: Some(TaskAttentionReason::CompletedUnread),
+                unread: true,
+            };
         } else if target.is_active() {
             // The task is observably running again, so any failure/outcome
             // attention from a previous attempt is superseded — otherwise the
@@ -1036,6 +1048,45 @@ impl TaskStore {
         Ok(true)
     }
 
+    /// The user visited the task: clear the unread badge, and drop a
+    /// `CompletedUnread` reason entirely — completion attention exists only
+    /// until it is seen. State-backed reasons (a failure, an interruption)
+    /// survive the visit; they clear when the underlying state resolves.
+    /// Returns `Ok(false)` without touching the file when nothing changes —
+    /// callers fire this on every visit and periodic tick.
+    pub fn acknowledge_attention(
+        &mut self,
+        task_id: &str,
+        timestamp: &str,
+    ) -> Result<bool, TaskStoreError> {
+        let Some(index) = self
+            .document
+            .tasks
+            .iter()
+            .position(|task| task.task_id == task_id)
+        else {
+            return Err(TaskStoreError::new(
+                "acknowledge attention in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            ));
+        };
+        let current = &self.document.tasks[index];
+        let clear_reason = current.attention.reason == Some(TaskAttentionReason::CompletedUnread);
+        if !current.attention.unread && !clear_reason {
+            return Ok(false);
+        }
+        let mut candidate = self.document.clone();
+        let task = &mut candidate.tasks[index];
+        task.attention.unread = false;
+        if clear_reason {
+            task.attention.reason = None;
+        }
+        task.updated_at = timestamp.to_string();
+        self.commit_candidate(candidate)?;
+        Ok(true)
+    }
+
     pub fn reconcile_after_restart(&mut self, timestamp: &str) -> Result<usize, TaskStoreError> {
         let mut candidate = self.document.clone();
         let mut reconciled = 0;
@@ -1055,7 +1106,7 @@ impl TaskStore {
             task.lifecycle = TaskLifecycle::Interrupted;
             task.updated_at = timestamp.to_string();
             task.attention = TaskAttention {
-                reason: Some(TaskAttentionReason::ExecutionFailed),
+                reason: Some(TaskAttentionReason::Interrupted),
                 unread: true,
             };
             task.last_error =
@@ -1637,6 +1688,7 @@ mod tests {
         let attention_reasons = vec![
             TaskAttentionReason::RequiresInput,
             TaskAttentionReason::ExecutionFailed,
+            TaskAttentionReason::Interrupted,
             TaskAttentionReason::CompletedUnread,
             TaskAttentionReason::ReadyForReview,
             TaskAttentionReason::RemoteUnavailable,
@@ -1815,6 +1867,13 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("GitTerm restarted"));
+        // A routine restart is an interruption, not a failure — it must not
+        // wear failure-red attention.
+        assert_eq!(
+            task.attention.reason,
+            Some(TaskAttentionReason::Interrupted)
+        );
+        assert!(task.attention.unread);
     }
 
     #[test]
@@ -2178,6 +2237,101 @@ mod tests {
             task.attempts[0].failure.as_deref(),
             Some("GitTerm restarted while this local execution was active")
         );
+    }
+
+    #[test]
+    fn completion_signal_marks_the_task_completed_unread() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        make_ready(&mut store, "task-1");
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Running,
+                None,
+                "2026-08-19T08:05:00Z",
+            )
+            .unwrap();
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Completed,
+                None,
+                "2026-08-19T08:10:00Z",
+            )
+            .unwrap();
+        let task = store.get("task-1").unwrap();
+        assert_eq!(
+            task.attention.reason,
+            Some(TaskAttentionReason::CompletedUnread)
+        );
+        assert!(task.attention.unread);
+    }
+
+    #[test]
+    fn acknowledging_attention_clears_completion_but_keeps_state_backed_reasons() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        make_ready(&mut store, "task-1");
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Running,
+                None,
+                "2026-08-19T08:05:00Z",
+            )
+            .unwrap();
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Completed,
+                None,
+                "2026-08-19T08:10:00Z",
+            )
+            .unwrap();
+        assert!(store
+            .acknowledge_attention("task-1", "2026-08-19T08:11:00Z")
+            .unwrap());
+        let task = store.get("task-1").unwrap();
+        assert_eq!(task.attention.reason, None);
+        assert!(!task.attention.unread);
+        // Acknowledging an already-read task is a no-op that leaves the file
+        // untouched — callers fire it on every visit and periodic tick.
+        let before = std::fs::read(&path).unwrap();
+        assert!(!store
+            .acknowledge_attention("task-1", "2026-08-19T08:12:00Z")
+            .unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // A failure reason survives the visit — only its unread badge clears.
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Running,
+                None,
+                "2026-08-19T08:13:00Z",
+            )
+            .unwrap();
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Failed,
+                Some("agent reported an error".to_string()),
+                "2026-08-19T08:14:00Z",
+            )
+            .unwrap();
+        assert!(store
+            .acknowledge_attention("task-1", "2026-08-19T08:15:00Z")
+            .unwrap());
+        let task = store.get("task-1").unwrap();
+        assert_eq!(
+            task.attention.reason,
+            Some(TaskAttentionReason::ExecutionFailed)
+        );
+        assert!(!task.attention.unread);
     }
 
     #[test]
