@@ -10558,6 +10558,27 @@ fi
                         && matches!(&cmd, iced_term::backend::Command::ProcessAlacrittyEvent(_))
                     {
                         tab.task_last_activity = Some(Instant::now());
+                        // Output is also proof of life for harnesses that
+                        // never speak the ✳ title convention (Codex): a task
+                        // the restart reconciliation left Interrupted whose
+                        // relaunched session tab is visibly producing output
+                        // resumes into Running. Only from Interrupted — an
+                        // observed live state must never be overridden by
+                        // mere output (✳ redraws are output too).
+                        if tab.task_live_state.is_none() {
+                            let interrupted = tab.task_id.as_deref().is_some_and(|task_id| {
+                                self.task_store
+                                    .as_ref()
+                                    .and_then(|store| store.get(task_id))
+                                    .is_some_and(|task| {
+                                        task.lifecycle == TaskLifecycle::Interrupted
+                                    })
+                            });
+                            if interrupted {
+                                tab.task_live_state = Some(TaskSessionLiveState::Working);
+                                task_signal = tab.task_id.clone().map(|task_id| (task_id, None));
+                            }
+                        }
                     }
                     if let Some(term) = tab.terminal_mut() {
                         terminal_handled = true;
