@@ -6873,6 +6873,30 @@ impl App {
             ));
             return Task::none();
         };
+        // Claude ids are preassigned at launch but the transcript is only
+        // written on the first message — a session that never got one has
+        // nothing to resume. Unlink the phantom ref instead of letting
+        // `claude --resume` error in the tab.
+        let is_phantom_claude = session.conversation.as_ref().is_some_and(|conversation| {
+            conversation.backend == HarnessConversationBackend::Claude
+                && !chats::claude_session_exists(&conversation.session_id)
+        });
+        if is_phantom_claude {
+            session.conversation = None;
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            session.updated_at = timestamp.clone();
+            if let Some(store) = self.task_store.as_mut() {
+                if let Err(error) = store.upsert_session(task_id, session, &timestamp) {
+                    self.task_ui_error = Some(error.to_string());
+                    return Task::none();
+                }
+            }
+            self.task_ui_error = Some(
+                "This Claude session has no recorded history — it never received a message. Launch a new session instead."
+                    .to_string(),
+            );
+            return Task::none();
+        }
         let Some(worktree_path) = task.worktree.path.as_ref() else {
             self.task_ui_error = Some(format!("Task {} has no prepared worktree", task.title));
             return Task::none();
@@ -8426,7 +8450,7 @@ impl App {
         let config = Config::load();
         let task_commands = init_task_control_channel();
         let task_store_path = TaskStore::path_for_config_root(&config::global_config_dir());
-        let (task_store, task_store_error) = match load_task_store_for_startup(
+        let (mut task_store, task_store_error) = match load_task_store_for_startup(
             task_store_path,
             &chrono::Utc::now().to_rfc3339(),
         ) {
@@ -8444,6 +8468,41 @@ impl App {
                 (None, Some(message))
             }
         };
+        // Claude conversation ids are preassigned at launch, but Claude Code
+        // only writes the transcript once the session receives a message.
+        // Drop refs whose transcript never materialized so Resume and startup
+        // reconnect don't run `claude --resume` against a phantom id.
+        if let Some(store) = task_store.as_mut() {
+            let phantom_tasks: Vec<TaskRecord> = store
+                .tasks()
+                .iter()
+                .filter(|task| {
+                    task.sessions.iter().any(|session| {
+                        session.conversation.as_ref().is_some_and(|conversation| {
+                            conversation.backend == HarnessConversationBackend::Claude
+                                && !chats::claude_session_exists(&conversation.session_id)
+                        })
+                    })
+                })
+                .cloned()
+                .collect();
+            for mut task in phantom_tasks {
+                for session in &mut task.sessions {
+                    let phantom = session.conversation.as_ref().is_some_and(|conversation| {
+                        conversation.backend == HarnessConversationBackend::Claude
+                            && !chats::claude_session_exists(&conversation.session_id)
+                    });
+                    if phantom {
+                        session.conversation = None;
+                    }
+                }
+                if let Err(error) = store.replace(task) {
+                    eprintln!(
+                        "GitTerm V5 could not prune a phantom Claude conversation ref: {error}"
+                    );
+                }
+            }
+        }
         // Tasks left Queued by a previous run rejoin the launch queue in
         // dispatch order; the preset comes from the recorded harness, falling
         // back to the first configured preset.
@@ -8836,22 +8895,47 @@ impl App {
                         if startup_command.is_some() {
                             let conversation = tab_config.task_id.as_ref().and_then(|task_id| {
                                 let task = app.task_store.as_ref()?.get(task_id)?;
-                                task.sessions
-                                    .iter()
-                                    .find(|session| {
-                                        Some(&session.task_session_id)
-                                            == tab_config.task_session_id.as_ref()
-                                    })
+                                let own_session = task.sessions.iter().find(|session| {
+                                    Some(&session.task_session_id)
+                                        == tab_config.task_session_id.as_ref()
+                                });
+                                own_session
                                     .and_then(|session| session.conversation.as_ref())
                                     .or_else(|| {
                                         // pi/codex conversations are linked to
                                         // synthetic session records by the
                                         // Chats sync; fall back to the task's
-                                        // latest, matching the Resume verb.
-                                        task.sessions
-                                            .iter()
-                                            .rev()
-                                            .find_map(|session| session.conversation.as_ref())
+                                        // latest conversation of this tab's own
+                                        // backend, so a Codex tab never
+                                        // relaunches another session's Claude
+                                        // resume.
+                                        let own_backend = own_session.and_then(|session| {
+                                            match session
+                                                .harness
+                                                .as_ref()
+                                                .map(|harness| &harness.kind)
+                                            {
+                                                Some(HarnessKind::TerminalPreset {
+                                                    preset_name,
+                                                }) => app
+                                                    .agent_presets
+                                                    .iter()
+                                                    .find(|preset| &preset.name == preset_name)
+                                                    .and_then(preset_conversation_backend),
+                                                Some(HarnessKind::NativeClaude) => {
+                                                    Some(HarnessConversationBackend::Claude)
+                                                }
+                                                Some(HarnessKind::NativePi) => {
+                                                    Some(HarnessConversationBackend::Pi)
+                                                }
+                                                None => None,
+                                            }
+                                        })?;
+                                        task.sessions.iter().rev().find_map(|session| {
+                                            session.conversation.as_ref().filter(|conversation| {
+                                                conversation.backend == own_backend
+                                            })
+                                        })
                                     })
                             });
                             if let Some(conversation) = conversation {
@@ -8870,6 +8954,21 @@ impl App {
                                 }
                                 startup_command = Some(command);
                                 chat_session_id = Some(conversation.session_id.clone());
+                            } else if let Some(session_id) = startup_command
+                                .as_deref()
+                                .and_then(|command| command.strip_prefix("claude --resume "))
+                                .map(str::trim)
+                            {
+                                // A persisted resume against a Claude session
+                                // that never received a message (the transcript
+                                // is only written on first message) errors on
+                                // launch; start a fresh session instead.
+                                if !session_id.contains(char::is_whitespace)
+                                    && !chats::claude_session_exists(session_id)
+                                {
+                                    startup_command = Some("claude".to_string());
+                                    chat_session_id = None;
+                                }
                             }
                         }
                         match (

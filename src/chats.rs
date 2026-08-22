@@ -639,6 +639,19 @@ fn claude_home_dir() -> PathBuf {
     home_dir().join(".claude")
 }
 
+/// Whether a Claude session transcript exists on this machine. Claude
+/// Code writes `<projects>/<cwd-slug>/<session-id>.jsonl` on the first
+/// message, so a preassigned session id may never materialize on disk.
+pub fn claude_session_exists(session_id: &str) -> bool {
+    let file_name = format!("{session_id}.jsonl");
+    let Ok(entries) = std::fs::read_dir(claude_home_dir().join("projects")) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.path().join(&file_name).is_file())
+}
+
 /// Build the full local index across all backends. Blocking; run on a
 /// background Task.
 pub fn build_local_index() -> Vec<ChatIndexEntry> {
