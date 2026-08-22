@@ -4094,6 +4094,13 @@ pub enum Event {
     TaskChildLaunchTerminal(String),
     TaskFocusSession(String),
     TaskResumeConversation(String, String),
+    /// Stop every open session of a task and record it Stopped.
+    TaskStop(String),
+    /// Resume a stopped/interrupted task: back into its last conversation,
+    /// or the Continue picker when none is resumable.
+    TaskResume(String),
+    /// Route into the task-scoped Git changes view (the task worktree).
+    TaskReviewChanges(String),
     TaskRailFilterSelected(TaskRailFilter),
     TaskArchive(String),
     TaskSwitcherOpen,
@@ -6109,6 +6116,20 @@ impl App {
             .iter()
             .map(|workspace| task_tab_indices(workspace, task_id).len())
             .sum()
+    }
+
+    /// First open session tab of a task, searched across every workspace —
+    /// task sessions can live outside the workspace being looked at.
+    fn first_open_task_tab(&self, task_id: &str) -> Option<(usize, usize)> {
+        self.workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(workspace_idx, workspace)| {
+                task_tab_indices(workspace, task_id)
+                    .into_iter()
+                    .next()
+                    .map(|tab_idx| (workspace_idx, tab_idx))
+            })
     }
 
     fn task_belongs_to_workspace(&self, task: &TaskRecord, workspace: &Workspace) -> bool {
@@ -12869,6 +12890,83 @@ fi
             }
             Event::TaskResumeConversation(task_id, chat_id) => {
                 return self.resume_task_conversation(&task_id, &chat_id);
+            }
+            Event::TaskStop(task_id) => {
+                // Close every open session tab of the task, in any workspace,
+                // then record the task Stopped. The PTY children die with
+                // their tabs; the worktree and conversations stay resumable.
+                for workspace_idx in 0..self.workspaces.len() {
+                    while let Some(tab_idx) = self.workspaces[workspace_idx]
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.task_id.as_deref() == Some(task_id.as_str()))
+                    {
+                        if self.workspaces[workspace_idx].tabs.len() == 1 {
+                            let workspace_name = self.workspaces[workspace_idx].name.clone();
+                            let workspace_dir = self.workspaces[workspace_idx].dir.clone();
+                            let replacement = self.create_tab_for_workspace(
+                                workspace_dir,
+                                None,
+                                Some(&workspace_name),
+                            );
+                            self.workspaces[workspace_idx].tabs.push(replacement);
+                        }
+                        self.workspaces[workspace_idx].tabs.remove(tab_idx);
+                        let workspace = &mut self.workspaces[workspace_idx];
+                        if workspace.active_tab >= workspace.tabs.len() {
+                            workspace.active_tab = workspace.tabs.len() - 1;
+                        }
+                    }
+                }
+                self.apply_task_session_signal(&task_id, Some((TaskLifecycle::Stopped, None)));
+                self.selected_task_id = Some(task_id);
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
+                return self.scroll_to_active_tab();
+            }
+            Event::TaskResume(task_id) => {
+                // Prefer resuming the most recent recorded conversation —
+                // that lands back inside the worktree session with context.
+                // Without one, fall through to the Continue picker.
+                let conversation = self
+                    .task_store
+                    .as_ref()
+                    .and_then(|store| store.get(&task_id))
+                    .and_then(|task| {
+                        task.sessions.iter().rev().find_map(|session| {
+                            session
+                                .conversation
+                                .as_ref()
+                                .map(|conversation| conversation.session_id.clone())
+                        })
+                    });
+                return match conversation {
+                    Some(chat_id) => self.resume_task_conversation(&task_id, &chat_id),
+                    None => self.update(Event::TaskChildAdd(task_id)),
+                };
+            }
+            Event::TaskReviewChanges(task_id) => {
+                // The Git changes sidebar is scoped by the tab it sits on, so
+                // reviewing means landing on a tab inside the task worktree.
+                // Use an open session tab when there is one; otherwise open a
+                // plain terminal child in the worktree first.
+                let focus = match self.first_open_task_tab(&task_id) {
+                    Some((workspace_idx, tab_idx)) => {
+                        self.focus_workspace_tab(workspace_idx, tab_idx)
+                    }
+                    None => match self.try_launch_task_child(&task_id, None, true) {
+                        Ok((focus, _session)) => focus,
+                        Err(error) => {
+                            self.record_task_ui_error(&task_id, error);
+                            return Task::none();
+                        }
+                    },
+                };
+                return Task::batch([
+                    focus,
+                    self.update(Event::SetSidebarMode(SidebarMode::Git)),
+                    self.update(Event::SetGitViewMode(GitViewMode::Changes)),
+                ]);
             }
             Event::TaskRailFilterSelected(filter) => {
                 self.task_rail_filter = filter;
@@ -21354,32 +21452,54 @@ fi
                     .into()
             };
 
-        let first_open_session = self.active_workspace().and_then(|workspace| {
-            task_tab_indices(workspace, &task.task_id)
-                .into_iter()
-                .next()
-                .map(|index| (index, workspace.tabs[index].task_session_id.clone()))
-        });
+        // State-appropriate verbs: each appears only where it can act.
+        let first_open_session =
+            self.first_open_task_tab(&task.task_id)
+                .map(|(workspace_idx, tab_idx)| {
+                    self.workspaces[workspace_idx].tabs[tab_idx]
+                        .task_session_id
+                        .clone()
+                });
         let mut verbs = Row::new().spacing(10).push(action);
-        if let Some((tab_index, session_id)) = first_open_session {
-            if task.lifecycle.is_active() {
-                if let Some(session_id) = session_id {
-                    verbs = verbs.push(
-                        button(text("Go to session").size(12).font(mono))
-                            .style(button::secondary)
-                            .padding([7, 12])
-                            .on_press(Event::TaskFocusSession(session_id)),
-                    );
-                }
-            }
-            // Routes through the TabClose intercept, which raises the
-            // existing stop-confirmation modal for task sessions.
+        if can_add_session
+            && matches!(
+                task.lifecycle,
+                TaskLifecycle::Stopped | TaskLifecycle::Interrupted
+            )
+        {
+            verbs = verbs.push(
+                button(text("▸ Resume").size(12).font(mono))
+                    .style(button::secondary)
+                    .padding([7, 12])
+                    .on_press(Event::TaskResume(task.task_id.clone())),
+            );
+        }
+        if let Some(session_id) = first_open_session.clone().flatten() {
+            verbs = verbs.push(
+                button(text("Go to session").size(12).font(mono))
+                    .style(button::secondary)
+                    .padding([7, 12])
+                    .on_press(Event::TaskFocusSession(session_id)),
+            );
+        }
+        if task.worktree.state == TaskWorktreeState::Ready
+            && task.worktree.path.is_some()
+            && task.lifecycle != TaskLifecycle::Archived
+        {
+            verbs = verbs.push(
+                button(text("Review changes").size(12).font(mono))
+                    .style(button::secondary)
+                    .padding([7, 12])
+                    .on_press(Event::TaskReviewChanges(task.task_id.clone())),
+            );
+        }
+        if task.lifecycle.is_active() && first_open_session.is_some() {
             let danger = theme.danger();
             verbs = verbs.push(
-                button(text("■ Stop agent").size(12).font(mono).color(danger))
+                button(text("■ Stop").size(12).font(mono).color(danger))
                     .style(self.ghost_button_style())
                     .padding([7, 12])
-                    .on_press(Event::TabClose(tab_index)),
+                    .on_press(Event::TaskStop(task.task_id.clone())),
             );
         }
         verbs = verbs.push(archive);
