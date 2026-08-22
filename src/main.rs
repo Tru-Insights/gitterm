@@ -8050,6 +8050,29 @@ impl App {
         }
     }
 
+    /// Glyph-and-color identity for a harness, taken from the user's agent
+    /// preset — the same icon and accent the launch picker shows — so the
+    /// harness looks identical everywhere. Falls back to the Chats palette
+    /// for a backend no configured preset covers.
+    fn backend_badge(&self, backend: HarnessConversationBackend) -> (String, iced::Color) {
+        if let Some(preset) = self
+            .agent_presets
+            .iter()
+            .find(|preset| preset_conversation_backend(preset) == Some(backend))
+        {
+            let icon = if preset.icon.is_empty() {
+                preset.name.chars().next().unwrap_or('?').to_string()
+            } else {
+                preset.icon.clone()
+            };
+            return (icon, preset.color.color(&self.theme));
+        }
+        (
+            conversation_backend_glyph(backend).to_string(),
+            self.chat_backend_color(conversation_chat_backend(backend)),
+        )
+    }
+
     fn request_git_worktrees(tab_id: usize, repo_path: PathBuf) -> Task<Event> {
         Self::request_workspace_git_worktrees(WorkspaceGitWorktreesRequest {
             backend: WorkspaceBackendRef::Local {
@@ -21338,18 +21361,18 @@ fi
             };
             let issue = task.issue.as_ref().map(|issue| issue.key.as_str());
             let backends = self.task_backends(task);
-            // The leading dot is harness identity, colored exactly like the
-            // Chats list (newest session wins when a task mixed harnesses).
-            // Lifecycle color lives on the state text below, never here —
-            // the two palettes share hues, so one dot must not serve both.
-            let backend_dot = backends
+            // The leading glyph is harness identity — the preset's own icon
+            // and accent, the same badge the launch picker shows (last
+            // touched session wins when a task mixed harnesses). Lifecycle
+            // color lives on the state text below, never here.
+            let (badge_glyph, badge_color) = backends
                 .first()
-                .map(|backend| self.chat_backend_color(conversation_chat_backend(*backend)))
-                .unwrap_or(text_muted);
+                .map(|backend| self.backend_badge(*backend))
+                .unwrap_or_else(|| ("\u{25b8}".to_string(), text_muted));
             let mut title_row = Row::new()
                 .spacing(7)
                 .align_y(iced::Alignment::Center)
-                .push(text("●").size(9).color(backend_dot))
+                .push(text(badge_glyph).size(11).color(badge_color).font(mono))
                 .push(
                     text(issue.unwrap_or(task.title.as_str()))
                         .size(12)
@@ -21380,16 +21403,12 @@ fi
                     .font(mono),
             );
             // Every distinct harness the task has run, for mixed-harness
-            // tasks whose dot can only carry one.
+            // tasks whose title badge can only carry one.
             if backends.len() > 1 {
                 state_row = state_row.push(text("·").size(10).color(text_muted).font(mono));
                 for backend in backends {
-                    state_row = state_row.push(
-                        text(conversation_backend_glyph(backend))
-                            .size(10)
-                            .color(self.chat_backend_color(conversation_chat_backend(backend)))
-                            .font(mono),
-                    );
+                    let (glyph, color) = self.backend_badge(backend);
+                    state_row = state_row.push(text(glyph).size(10).color(color).font(mono));
                 }
             }
             let mut row_copy = column![title_row, state_row];
@@ -21806,15 +21825,14 @@ fi
             resumable_count += 1;
             let open = self.find_chat_tab(&conversation.session_id).is_some();
             let backend = conversation_backend_label(conversation.backend);
+            let (badge_glyph, badge_color) = self.backend_badge(conversation.backend);
             let short_id = conversation.session_id.chars().take(8).collect::<String>();
             history = history.push(
                 button(
                     row![
                         column![
                             row![
-                                text("●").size(8).color(self.chat_backend_color(
-                                    conversation_chat_backend(conversation.backend)
-                                )),
+                                text(badge_glyph).size(11).color(badge_color).font(mono),
                                 text(format!("{backend} · {}", session.label))
                                     .size(12)
                                     .color(text_primary)
