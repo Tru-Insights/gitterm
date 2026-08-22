@@ -734,6 +734,23 @@ impl TaskStore {
         self.replace(task)
     }
 
+    /// Clear a task's worktree record after cleanup removed the working copy.
+    /// Sessions and their conversation references are deliberately untouched —
+    /// transcripts must stay auditable after the working copy is gone, and a
+    /// re-prepared worktree makes them resumable again.
+    pub fn clear_worktree(&mut self, task_id: &str, timestamp: &str) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "clear worktree in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        task.worktree = TaskWorktree::default();
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
     pub fn fail_worktree_preparation(
         &mut self,
         task_id: &str,
@@ -1759,6 +1776,60 @@ mod tests {
             .record_delivery("task-missing", delivery, "2026-08-22T12:00:00Z")
             .unwrap_err();
         assert!(error.to_string().contains("task-missing"));
+    }
+
+    #[test]
+    fn clearing_the_worktree_preserves_conversation_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        store
+            .begin_worktree_preparation("task-1", "2026-08-22T08:59:00Z")
+            .unwrap();
+        store
+            .complete_worktree_preparation(
+                "task-1",
+                CompletedWorktreePreparation {
+                    repository: RepositoryIdentity {
+                        common_dir: PathBuf::from("/repo with spaces/gitterm-v5/.git"),
+                        remote_url: None,
+                    },
+                    base: GitBase {
+                        reference: "v5".to_string(),
+                        commit: "0123456789abcdef".to_string(),
+                    },
+                    branch: "task/task-1-durable-tasks".to_string(),
+                    path: temp.path().join("worktrees").join("task-1"),
+                },
+                "2026-08-22T09:00:00Z",
+            )
+            .unwrap();
+        let session = TaskSessionRecord {
+            task_session_id: "task-session-1".to_string(),
+            label: "Codex implementation".to_string(),
+            harness: None,
+            conversation: Some(HarnessConversationRef {
+                backend: HarnessConversationBackend::Codex,
+                session_id: "codex-chat-1".to_string(),
+            }),
+            objective_delivery: ObjectiveDeliveryState::Delivered,
+            created_at: "2026-08-22T09:01:00Z".to_string(),
+            updated_at: "2026-08-22T09:01:00Z".to_string(),
+        };
+        store
+            .upsert_session("task-1", session.clone(), "2026-08-22T09:01:00Z")
+            .unwrap();
+
+        store
+            .clear_worktree("task-1", "2026-08-22T10:00:00Z")
+            .unwrap();
+
+        let reloaded = TaskStore::load(&path).unwrap();
+        let task = reloaded.get("task-1").unwrap();
+        assert_eq!(task.worktree, TaskWorktree::default());
+        assert_eq!(task.sessions, vec![session]);
+        assert_eq!(task.updated_at, "2026-08-22T10:00:00Z");
     }
 
     #[test]

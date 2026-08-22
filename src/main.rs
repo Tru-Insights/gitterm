@@ -13998,18 +13998,13 @@ fi
             Event::TaskWorktreeDeleteCompleted(task_id, result) => match result {
                 Ok(()) => {
                     let timestamp = chrono::Utc::now().to_rfc3339();
+                    // clear_worktree resets only the worktree record — the
+                    // task's sessions and conversation references survive so
+                    // transcripts stay auditable after cleanup.
                     let updated = match self.task_store.as_mut() {
-                        Some(store) => match store.get(&task_id).cloned() {
-                            Some(mut task) => {
-                                task.worktree = TaskWorktree {
-                                    state: TaskWorktreeState::Unprepared,
-                                    path: None,
-                                };
-                                task.updated_at = timestamp;
-                                store.replace(task).map_err(|error| error.to_string())
-                            }
-                            None => Err(format!("task {task_id} is no longer in the task store")),
-                        },
+                        Some(store) => store
+                            .clear_worktree(&task_id, &timestamp)
+                            .map_err(|error| error.to_string()),
                         None => Err("GitTerm's task store is unavailable".to_string()),
                     };
                     match updated {
@@ -22283,6 +22278,9 @@ fi
 
         let mut history = Column::new().spacing(5);
         let mut resumable_count = 0usize;
+        // Without a prepared worktree the references stay visible for audit,
+        // but there is nowhere to resume into until one is prepared again.
+        let worktree_ready = task.worktree.path.is_some();
         for session in &task.sessions {
             let Some(conversation) = &session.conversation else {
                 continue;
@@ -22309,10 +22307,22 @@ fi
                         ]
                         .spacing(2)
                         .width(Length::Fill),
-                        text(if open { "Open" } else { "Resume" })
-                            .size(10)
-                            .color(if open { accent } else { text_secondary })
-                            .font(mono),
+                        text(if open {
+                            "Open"
+                        } else if worktree_ready {
+                            "Resume"
+                        } else {
+                            "Transcript kept"
+                        })
+                        .size(10)
+                        .color(if open {
+                            accent
+                        } else if worktree_ready {
+                            text_secondary
+                        } else {
+                            text_muted
+                        })
+                        .font(mono),
                     ]
                     .spacing(8)
                     .align_y(iced::Alignment::Center),
@@ -22320,10 +22330,12 @@ fi
                 .style(self.ghost_button_style())
                 .padding([6, 9])
                 .width(Length::Fill)
-                .on_press(Event::TaskResumeConversation(
-                    task.task_id.clone(),
-                    conversation.session_id.clone(),
-                )),
+                .on_press_maybe((open || worktree_ready).then(|| {
+                    Event::TaskResumeConversation(
+                        task.task_id.clone(),
+                        conversation.session_id.clone(),
+                    )
+                })),
             );
         }
         if resumable_count == 0 {
