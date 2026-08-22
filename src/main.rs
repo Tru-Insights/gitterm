@@ -6372,12 +6372,16 @@ impl App {
         }
     }
 
-    /// Distinct harness backends across a task's recorded sessions, newest
-    /// first. Read from the record rather than open tabs so a stopped task
-    /// keeps its harness identity in the rail.
+    /// Distinct harness backends across a task's recorded sessions, most
+    /// recently touched first — launching or resuming a session moves its
+    /// backend to the front, so the rail dot tracks what the user last
+    /// opened. Read from the record rather than open tabs so a stopped
+    /// task keeps its harness identity in the rail.
     fn task_backends(&self, task: &TaskRecord) -> Vec<HarnessConversationBackend> {
+        let mut sessions: Vec<&TaskSessionRecord> = task.sessions.iter().collect();
+        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         let mut backends = Vec::new();
-        for session in task.sessions.iter().rev() {
+        for session in sessions {
             let backend = session
                 .conversation
                 .as_ref()
