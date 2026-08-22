@@ -117,6 +117,19 @@ impl ChatBackend {
             ChatBackend::Pi => "pi",
         }
     }
+
+    /// Shell command that resumes conversation `id` using harness
+    /// launch command `base`. Must run in the conversation's recorded
+    /// cwd.
+    pub fn resume_command(&self, base: &str, id: &str) -> String {
+        match self {
+            ChatBackend::Claude => format!("{base} --resume {id}"),
+            ChatBackend::Codex => format!("{base} resume {id}"),
+            // pi resumes a specific session via --session (`--resume`
+            // is the interactive picker).
+            ChatBackend::Pi => format!("{base} --session {id}"),
+        }
+    }
 }
 
 impl ChatIndexEntry {
@@ -155,13 +168,7 @@ impl ChatIndexEntry {
     /// remote machines resolve the binary through the remote's
     /// session_commands map (agent daemons run with a minimal PATH).
     pub fn resume_command_with(&self, base: &str) -> String {
-        match self.backend {
-            ChatBackend::Claude => format!("{base} --resume {}", self.id),
-            ChatBackend::Codex => format!("{base} resume {}", self.id),
-            // pi resumes a specific session via --session (`--resume` is
-            // the interactive picker).
-            ChatBackend::Pi => format!("{base} --session {}", self.id),
-        }
+        self.backend.resume_command(base, &self.id)
     }
 
     /// The transcript was modified moments ago yet no GitTerm tab owns

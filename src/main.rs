@@ -2416,6 +2416,19 @@ fn conversation_backend_label(backend: HarnessConversationBackend) -> &'static s
     }
 }
 
+/// Shell command that reopens a recorded task conversation with its
+/// full history. Derived from the task store alone — the Chats index
+/// is only built when the Chats panel opens, so resume must not
+/// depend on it.
+fn conversation_resume_command(conversation: &HarnessConversationRef) -> String {
+    let backend = match conversation.backend {
+        HarnessConversationBackend::Claude => chats::ChatBackend::Claude,
+        HarnessConversationBackend::Codex => chats::ChatBackend::Codex,
+        HarnessConversationBackend::Pi => chats::ChatBackend::Pi,
+    };
+    backend.resume_command(backend.label(), &conversation.session_id)
+}
+
 fn preset_conversation_backend(preset: &AgentPreset) -> Option<HarnessConversationBackend> {
     let name = preset.name.to_lowercase();
     let executable = preset
@@ -6845,25 +6858,33 @@ impl App {
             self.task_ui_error = Some(format!("Task {} has no prepared worktree", task.title));
             return Task::none();
         };
-        let Some((remote_id, entry)) = self.find_chat_entry(chat_id) else {
+        if !worktree_path.is_dir() {
             self.task_ui_error = Some(format!(
-                "Conversation {chat_id} is not in the current Chats index; refresh Chats and try again"
-            ));
-            return Task::none();
-        };
-        if remote_id.is_some() {
-            self.task_ui_error = Some(
-                "Remote task conversation resume requires the remote-executor slice".to_string(),
-            );
-            return Task::none();
-        }
-        if entry.cwd != *worktree_path {
-            self.task_ui_error = Some(format!(
-                "Refusing to resume conversation {chat_id}: its recorded directory {} does not match task worktree {}",
-                entry.cwd.display(),
+                "Task {} worktree is gone at {}",
+                task.title,
                 worktree_path.display()
             ));
             return Task::none();
+        }
+        // The task record alone is enough to resume; the Chats index is
+        // consulted only when it happens to be loaded, to catch a
+        // conversation that lives on a remote machine or moved directory.
+        if let Some((remote_id, entry)) = self.find_chat_entry(chat_id) {
+            if remote_id.is_some() {
+                self.task_ui_error = Some(
+                    "Remote task conversation resume requires the remote-executor slice"
+                        .to_string(),
+                );
+                return Task::none();
+            }
+            if entry.cwd != *worktree_path {
+                self.task_ui_error = Some(format!(
+                    "Refusing to resume conversation {chat_id}: its recorded directory {} does not match task worktree {}",
+                    entry.cwd.display(),
+                    worktree_path.display()
+                ));
+                return Task::none();
+            }
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
         session.updated_at = timestamp.clone();
@@ -6873,6 +6894,10 @@ impl App {
                 return Task::none();
             }
         }
+
+        let conversation = session.conversation.clone().expect("matched conversation");
+        let command = conversation_resume_command(&conversation);
+        let backend_label = conversation_backend_label(conversation.backend);
 
         if let Some((workspace_idx, tab_idx)) = self.find_chat_tab(chat_id) {
             if self.workspaces[workspace_idx].tabs[tab_idx]
@@ -6888,52 +6913,57 @@ impl App {
             let tab = &mut self.workspaces[workspace_idx].tabs[tab_idx];
             tab.task_id = Some(task_id.to_string());
             tab.task_session_id = Some(session.task_session_id);
-            tab.repo_name = format!(
-                "{} · {}",
-                conversation_backend_label(
-                    session
-                        .conversation
-                        .as_ref()
-                        .expect("matched conversation")
-                        .backend
-                ),
-                task.title
-            );
+            // The open tab already carries this conversation; persist the
+            // resume command so an app restart reopens it instead of
+            // launching a fresh harness.
+            tab.set_startup_command(Some(command));
+            tab.repo_name = format!("{backend_label} · {}", task.title);
             self.mark_workspaces_dirty();
             return self.focus_workspace_tab(workspace_idx, tab_idx);
         }
 
-        let resume = self.resume_chat_as_tab(chat_id.to_string(), false);
-        let mut resumed_live = false;
-        if let Some(tab) = self
-            .active_tab_mut()
-            .filter(|tab| tab.chat_session_id.as_deref() == Some(chat_id))
-        {
-            tab.task_id = Some(task_id.to_string());
-            tab.task_session_id = Some(session.task_session_id);
-            // The resume command relaunches the harness process; the session
-            // is live again from here (the ✳ title flips it to waiting).
-            tab.task_live_state = Some(TaskSessionLiveState::Working);
-            resumed_live = true;
-            tab.repo_name = format!(
-                "{} · {}",
-                conversation_backend_label(
-                    session
-                        .conversation
-                        .as_ref()
-                        .expect("matched conversation")
-                        .backend
-                ),
-                task.title
+        let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
+            self.task_ui_error = Some(
+                "Remote task conversation resume requires the remote-executor slice".to_string(),
             );
-            self.selected_task_id = Some(task_id.to_string());
-            self.task_ui_error = None;
-            self.mark_workspaces_dirty();
+            return Task::none();
+        };
+        let workspace_idx =
+            self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
+        let workspace_name = self.workspaces[workspace_idx].name.clone();
+        let mut tab = self.create_tab_for_workspace(
+            worktree_path.clone(),
+            Some(command.clone()),
+            Some(&workspace_name),
+        );
+        if tab.terminal().is_none() {
+            self.task_ui_error = Some(format!(
+                "Could not start a terminal in {}",
+                worktree_path.display()
+            ));
+            return Task::none();
         }
-        if resumed_live {
-            self.apply_task_session_signal(task_id, None);
-        }
-        resume
+        tab.set_local_dir(worktree_path.clone());
+        tab.task_id = Some(task_id.to_string());
+        tab.task_session_id = Some(session.task_session_id);
+        // The resume command relaunches the harness process; the session
+        // is live again from here (the ✳ title flips it to waiting).
+        tab.task_live_state = Some(TaskSessionLiveState::Working);
+        tab.chat_session_id = Some(chat_id.to_string());
+        // Persist the resume command so an app restart reopens this
+        // conversation instead of launching a fresh harness.
+        tab.set_startup_command(Some(command));
+        tab.repo_name = format!("{backend_label} · {}", task.title);
+        tab.sidebar_mode = SidebarMode::Tasks;
+        self.workspaces[workspace_idx].tabs.push(tab);
+        let tab_idx = self.workspaces[workspace_idx].tabs.len() - 1;
+        self.workspaces[workspace_idx].active_tab = tab_idx;
+        self.selected_task_id = Some(task_id.to_string());
+        self.task_ui_error = None;
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.apply_task_session_signal(task_id, None);
+        self.focus_workspace_tab(workspace_idx, tab_idx)
     }
 
     fn pending_task_from_control(
