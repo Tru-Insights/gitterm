@@ -813,6 +813,31 @@ impl TaskStore {
         self.replace(task)
     }
 
+    /// Record what a task has delivered (latest commit, discovered PR).
+    /// Unchanged state is a no-op — discovery runs on every overview visit,
+    /// and rewriting an identical record would churn `updated_at` (which
+    /// drives rail ordering) and the on-disk file for nothing.
+    pub fn record_delivery(
+        &mut self,
+        task_id: &str,
+        delivery: DeliveryState,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "record delivery in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        if task.delivery == delivery {
+            return Ok(());
+        }
+        task.delivery = delivery;
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
     pub fn update_handoff(
         &mut self,
         task_id: &str,
@@ -1676,6 +1701,38 @@ mod tests {
                 preset_name: "Codex".to_string()
             })
         );
+    }
+
+    #[test]
+    fn recorded_delivery_survives_reload_and_unchanged_writes_are_no_ops() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        let delivery = DeliveryState {
+            commit_sha: Some("bafc5f5757b0265cb89a50a64fd539089b4265ab".to_string()),
+            pr_url: Some("https://github.com/o/r/pull/30".to_string()),
+            pr_number: Some(30),
+        };
+
+        store
+            .record_delivery("task-1", delivery.clone(), "2026-08-22T10:00:00Z")
+            .unwrap();
+        // Re-recording identical state must not churn updated_at — discovery
+        // runs on every overview visit and updated_at drives rail ordering.
+        store
+            .record_delivery("task-1", delivery.clone(), "2026-08-22T11:00:00Z")
+            .unwrap();
+
+        let reloaded = TaskStore::load(&path).unwrap();
+        let task = reloaded.get("task-1").unwrap();
+        assert_eq!(task.delivery, delivery);
+        assert_eq!(task.updated_at, "2026-08-22T10:00:00Z");
+
+        let error = store
+            .record_delivery("task-missing", delivery, "2026-08-22T12:00:00Z")
+            .unwrap_err();
+        assert!(error.to_string().contains("task-missing"));
     }
 
     #[test]

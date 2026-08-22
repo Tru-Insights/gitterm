@@ -104,6 +104,24 @@ impl CleanupInspection {
     }
 }
 
+/// A pull request found for a task branch during delivery discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredPullRequest {
+    pub url: String,
+    pub number: u64,
+    pub head_sha: String,
+    pub is_draft: bool,
+}
+
+/// Snapshot of what a task worktree has delivered: its current HEAD and any
+/// open pull request for its branch. Discovery only reads state — it never
+/// pushes or publishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryDiscovery {
+    pub local_head: String,
+    pub pull_request: Option<DiscoveredPullRequest>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskWorktreeError {
     operation: &'static str,
@@ -652,6 +670,114 @@ pub async fn inspect_task_cleanup(
             error.to_string(),
         )
     })?
+}
+
+/// Off-thread wrapper over [`discover_delivery_blocking`] for UI callers.
+pub async fn discover_task_delivery(
+    worktree_path: PathBuf,
+    branch: String,
+) -> Result<DeliveryDiscovery, TaskWorktreeError> {
+    let error_path = worktree_path.clone();
+    tokio::task::spawn_blocking(move || discover_delivery_blocking(&worktree_path, &branch))
+        .await
+        .map_err(|error| {
+            TaskWorktreeError::new(
+                "join delivery discovery worker",
+                error_path,
+                error.to_string(),
+            )
+        })?
+}
+
+fn discover_delivery_blocking(
+    worktree_path: &Path,
+    branch: &str,
+) -> Result<DeliveryDiscovery, TaskWorktreeError> {
+    let operation = "read task worktree head";
+    let output = run_git(worktree_path, operation, &["rev-parse", "HEAD"])?;
+    let local_head = stdout_text(&output, worktree_path, operation)?
+        .trim()
+        .to_string();
+    let pull_request = lookup_branch_pull_request(worktree_path, branch)?;
+    Ok(DeliveryDiscovery {
+        local_head,
+        pull_request,
+    })
+}
+
+/// Asks the `gh` CLI for an open pull request whose head is `branch`, run from
+/// the worktree so gh resolves the repository from its origin. Returns Ok(None)
+/// when no open PR exists; a merged or closed PR is deliberately not reported —
+/// callers keep their last-known record instead.
+fn lookup_branch_pull_request(
+    worktree_path: &Path,
+    branch: &str,
+) -> Result<Option<DiscoveredPullRequest>, TaskWorktreeError> {
+    let operation = "look up task pull request";
+    // The app may be Finder-launched with a minimal PATH, so fall back to the
+    // standard Homebrew/Intel install locations before giving up.
+    for candidate in ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
+        let result = std::process::Command::new(candidate)
+            .args([
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--json",
+                "url,number,headRefOid,isDraft",
+                "--limit",
+                "1",
+            ])
+            .current_dir(worktree_path)
+            .output();
+        let output = match result {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(TaskWorktreeError::new(
+                    operation,
+                    worktree_path,
+                    error.to_string(),
+                ))
+            }
+            Ok(output) => output,
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(TaskWorktreeError::new(
+                operation,
+                worktree_path,
+                format!("gh exited with status {}: {stderr}", output.status),
+            ));
+        }
+        let stdout = stdout_text(&output, worktree_path, operation)?;
+        return parse_pull_request_rows(stdout)
+            .map_err(|detail| TaskWorktreeError::new(operation, worktree_path, detail));
+    }
+    Err(TaskWorktreeError::new(
+        operation,
+        worktree_path,
+        "gh CLI not found on PATH, /opt/homebrew/bin, or /usr/local/bin",
+    ))
+}
+
+fn parse_pull_request_rows(json: &str) -> Result<Option<DiscoveredPullRequest>, String> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        url: String,
+        number: u64,
+        #[serde(rename = "headRefOid")]
+        head_ref_oid: String,
+        #[serde(rename = "isDraft")]
+        is_draft: bool,
+    }
+    let rows: Vec<Row> =
+        serde_json::from_str(json).map_err(|error| format!("unexpected gh output: {error}"))?;
+    Ok(rows.into_iter().next().map(|row| DiscoveredPullRequest {
+        url: row.url,
+        number: row.number,
+        head_sha: row.head_ref_oid,
+        is_draft: row.is_draft,
+    }))
 }
 
 /// Removes a task's managed worktree. Callers must run [`inspect_cleanup`]
@@ -1689,5 +1815,29 @@ mod tests {
             repository.initial_commit
         );
         assert!(git_stdout(&repository.path, &["status", "--porcelain"]).is_empty());
+    }
+
+    #[test]
+    fn parse_pull_request_rows_reads_gh_fields() {
+        let json = r#"[{"url":"https://github.com/o/r/pull/30","number":30,
+            "headRefOid":"bafc5f5757b0265cb89a50a64fd539089b4265ab","isDraft":true}]"#;
+
+        let parsed = parse_pull_request_rows(json).unwrap().unwrap();
+
+        assert_eq!(parsed.url, "https://github.com/o/r/pull/30");
+        assert_eq!(parsed.number, 30);
+        assert_eq!(parsed.head_sha, "bafc5f5757b0265cb89a50a64fd539089b4265ab");
+        assert!(parsed.is_draft);
+    }
+
+    #[test]
+    fn parse_pull_request_rows_empty_means_no_open_pull_request() {
+        assert_eq!(parse_pull_request_rows("[]").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_pull_request_rows_rejects_malformed_output() {
+        let error = parse_pull_request_rows("not json").unwrap_err();
+        assert!(error.contains("unexpected gh output"));
     }
 }

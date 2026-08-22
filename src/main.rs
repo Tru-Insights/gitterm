@@ -52,19 +52,19 @@ use gitterm::task_mcp::{
     TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
 };
 use gitterm::task_worktree::{
-    inspect_task_cleanup, prepare_task_worktree, prune_worktrees, remove_task_worktree,
-    resolve_task_preparation, resolve_worktree_adoption, suggested_task_branch,
-    suggested_task_worktree_path, AdoptWorktreeRequest, AdoptedWorktreeResolution, CleanupContext,
-    CleanupInspection, CleanupRisk, PrepareTaskWorktreeRequest, PreparedTaskWorktree,
-    ResolvedTaskPreparation, DEFAULT_TASK_BASE,
+    discover_task_delivery, inspect_task_cleanup, prepare_task_worktree, prune_worktrees,
+    remove_task_worktree, resolve_task_preparation, resolve_worktree_adoption,
+    suggested_task_branch, suggested_task_worktree_path, AdoptWorktreeRequest,
+    AdoptedWorktreeResolution, CleanupContext, CleanupInspection, CleanupRisk, DeliveryDiscovery,
+    PrepareTaskWorktreeRequest, PreparedTaskWorktree, ResolvedTaskPreparation, DEFAULT_TASK_BASE,
 };
 use gitterm::tasks::{
-    ChangedFilesSummary, CompletedWorktreePreparation, ExecutorTarget, HarnessConversationBackend,
-    HarnessConversationRef, HarnessKind, HarnessSelection, IssueProvider, IssueReference,
-    NewTaskRecord, ObjectiveDeliveryState, StoppingBoundary, TaskAttentionReason, TaskCreator,
-    TaskCreatorKind, TaskHandoff, TaskLifecycle, TaskProgress, TaskRecord, TaskSessionRecord,
-    TaskStore, TaskStoreError, TaskWorktree, TaskWorktreeState, VerificationState,
-    WorkspaceIdentity as TaskWorkspaceIdentity, WorkspaceLocationIdentity,
+    ChangedFilesSummary, CompletedWorktreePreparation, DeliveryState, ExecutorTarget,
+    HarnessConversationBackend, HarnessConversationRef, HarnessKind, HarnessSelection,
+    IssueProvider, IssueReference, NewTaskRecord, ObjectiveDeliveryState, StoppingBoundary,
+    TaskAttentionReason, TaskCreator, TaskCreatorKind, TaskHandoff, TaskLifecycle, TaskProgress,
+    TaskRecord, TaskSessionRecord, TaskStore, TaskStoreError, TaskWorktree, TaskWorktreeState,
+    VerificationState, WorkspaceIdentity as TaskWorkspaceIdentity, WorkspaceLocationIdentity,
 };
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{
@@ -4143,6 +4143,8 @@ pub enum Event {
     TaskReviewChanges(String),
     /// Take a queued task back out of the launch queue, returning it to Ready.
     TaskQueueCancel(String),
+    /// Result of an async delivery probe (worktree HEAD + open PR lookup).
+    TaskDeliveryDiscovered(String, Result<DeliveryDiscovery, String>),
     TaskRailFilterSelected(TaskRailFilter),
     TaskArchive(String),
     /// Archive every failed task in the active workspace in one click.
@@ -4506,6 +4508,10 @@ struct App {
     // order and the chosen preset within a run, and is rebuilt from the
     // store on startup.
     task_launch_queue: Vec<QueuedTaskLaunch>,
+    // Freshest delivery probe per task (worktree HEAD vs PR head). The store
+    // keeps the durable facts; this carries the live comparison that says
+    // whether the recorded PR is behind local work.
+    task_delivery_probe: HashMap<String, DeliveryDiscovery>,
     new_task_form: Option<NewTaskForm>,
     task_tab_close_prompt: Option<TaskTabClosePrompt>,
     task_worktree_delete_prompt: Option<TaskWorktreeDeletePrompt>,
@@ -7293,6 +7299,62 @@ impl App {
         self.local_slot_holders().len()
     }
 
+    /// Kick off an async delivery probe (worktree HEAD + open-PR lookup) for
+    /// a task with a prepared local worktree; a no-op Task otherwise.
+    /// Discovery only reads state — publishing stays behind explicit actions.
+    fn probe_task_delivery(&self, task_id: &str) -> Task<Event> {
+        let Some(task) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id))
+        else {
+            return Task::none();
+        };
+        let Some(worktree_path) = task.worktree.path.clone() else {
+            return Task::none();
+        };
+        if !matches!(
+            task.workspace.location,
+            WorkspaceLocationIdentity::Local { .. }
+        ) {
+            return Task::none();
+        }
+        let branch = task.branch.clone();
+        let task_id = task_id.to_string();
+        Task::perform(
+            discover_task_delivery(worktree_path, branch),
+            move |result| {
+                Event::TaskDeliveryDiscovered(task_id, result.map_err(|error| error.to_string()))
+            },
+        )
+    }
+
+    /// Overview copy for the DELIVERY row; None until anything is recorded.
+    /// "Behind local work" comes from this session's probe — the store holds
+    /// the facts, the probe holds the live PR-head vs worktree-HEAD compare.
+    fn task_delivery_copy(&self, task: &TaskRecord) -> Option<String> {
+        let delivery = &task.delivery;
+        let probe = self.task_delivery_probe.get(&task.task_id);
+        if let (Some(url), Some(number)) = (delivery.pr_url.as_ref(), delivery.pr_number) {
+            let mut copy = format!("PR #{number}");
+            if let Some(pr) = probe.and_then(|probe| probe.pull_request.as_ref()) {
+                if pr.is_draft {
+                    copy.push_str(" · draft");
+                }
+                if probe.is_some_and(|probe| pr.head_sha != probe.local_head) {
+                    copy.push_str(" · behind local work");
+                }
+            }
+            copy.push_str(&format!(" · {url}"));
+            Some(copy)
+        } else if let Some(commit) = delivery.commit_sha.as_ref() {
+            let short: String = commit.chars().take(10).collect();
+            Some(format!("{short} · no PR"))
+        } else {
+            None
+        }
+    }
+
     /// 1-based place in the launch queue, for "Queued · #N" copy.
     fn queued_task_position(&self, task_id: &str) -> Option<usize> {
         self.task_launch_queue
@@ -8693,6 +8755,7 @@ impl App {
             task_last_session_tab: HashMap::new(),
             task_progress_pending: HashMap::new(),
             task_launch_queue,
+            task_delivery_probe: HashMap::new(),
             new_task_form: None,
             task_tab_close_prompt: None,
             task_worktree_delete_prompt: None,
@@ -13369,7 +13432,10 @@ fi
                 self.task_rail_pinned = true;
                 self.task_rows_seen.insert(task_id.clone());
                 self.remember_task_context(Some(task_id.clone()));
-                return self.enter_task_context(&task_id);
+                return Task::batch([
+                    self.probe_task_delivery(&task_id),
+                    self.enter_task_context(&task_id),
+                ]);
             }
             Event::TaskContextBack => {
                 self.tab_picker_visible = false;
@@ -13558,8 +13624,44 @@ fi
                     focus,
                     self.update(Event::SetSidebarMode(SidebarMode::Git)),
                     self.update(Event::SetGitViewMode(GitViewMode::Changes)),
+                    self.probe_task_delivery(&task_id),
                 ]);
             }
+            Event::TaskDeliveryDiscovered(task_id, result) => match result {
+                Ok(discovery) => {
+                    let Some(store) = self.task_store.as_mut() else {
+                        return Task::none();
+                    };
+                    let Some(existing) = store.get(&task_id).map(|task| task.delivery.clone())
+                    else {
+                        return Task::none();
+                    };
+                    // gh only reports open PRs; keep the last-known record
+                    // when none is found — a merged or closed PR still
+                    // matters to cleanup guards and the audit trail.
+                    let delivery = DeliveryState {
+                        commit_sha: Some(discovery.local_head.clone()),
+                        pr_url: discovery
+                            .pull_request
+                            .as_ref()
+                            .map(|pr| pr.url.clone())
+                            .or(existing.pr_url),
+                        pr_number: discovery
+                            .pull_request
+                            .as_ref()
+                            .map(|pr| pr.number)
+                            .or(existing.pr_number),
+                    };
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    if let Err(error) = store.record_delivery(&task_id, delivery, &timestamp) {
+                        self.task_ui_error = Some(error.to_string());
+                    }
+                    self.task_delivery_probe.insert(task_id, discovery);
+                }
+                Err(error) => {
+                    self.task_ui_error = Some(error);
+                }
+            },
             Event::TaskQueueCancel(task_id) => {
                 self.task_launch_queue
                     .retain(|entry| entry.task_id != task_id);
@@ -21929,6 +22031,9 @@ fi
             if !holders.is_empty() {
                 details = details.push(value_row("WAITING ON", holders.join(" · ")));
             }
+        }
+        if let Some(delivery) = self.task_delivery_copy(task) {
+            details = details.push(value_row("DELIVERY", delivery));
         }
         details = details
             .push(value_row("ISSUE", issue))
