@@ -705,6 +705,70 @@ fn discover_delivery_blocking(
     })
 }
 
+/// Pushes a task branch to origin (setting upstream on first push) and
+/// re-reads delivery state so the caller gets a fresh snapshot in one trip.
+/// Explicit invocation only — nothing in discovery calls this.
+pub async fn push_task_branch(
+    worktree_path: PathBuf,
+    branch: String,
+) -> Result<DeliveryDiscovery, TaskWorktreeError> {
+    let error_path = worktree_path.clone();
+    tokio::task::spawn_blocking(move || {
+        run_git(
+            &worktree_path,
+            "push task branch",
+            &["push", "--set-upstream", "origin", &branch],
+        )?;
+        discover_delivery_blocking(&worktree_path, &branch)
+    })
+    .await
+    .map_err(|error| TaskWorktreeError::new("join push worker", error_path, error.to_string()))?
+}
+
+/// Pushes the branch, opens a draft pull request via `gh pr create`, and
+/// re-reads delivery state so the new PR lands in the same snapshot shape as
+/// discovery. Draft is not optional — review-readiness belongs to /pr-ready,
+/// never to local intent.
+pub async fn open_task_draft_pr(
+    worktree_path: PathBuf,
+    branch: String,
+    base: String,
+    title: String,
+    body: String,
+) -> Result<DeliveryDiscovery, TaskWorktreeError> {
+    let error_path = worktree_path.clone();
+    tokio::task::spawn_blocking(move || {
+        run_git(
+            &worktree_path,
+            "push task branch",
+            &["push", "--set-upstream", "origin", &branch],
+        )?;
+        run_gh(
+            &worktree_path,
+            "open draft pull request",
+            &[
+                "pr", "create", "--draft", "--head", &branch, "--base", &base, "--title", &title,
+                "--body", &body,
+            ],
+        )?;
+        discover_delivery_blocking(&worktree_path, &branch)
+    })
+    .await
+    .map_err(|error| {
+        TaskWorktreeError::new("join draft PR worker", error_path, error.to_string())
+    })?
+}
+
+/// The branch name `gh pr create --base` expects: a stored base reference may
+/// carry a remote or full-ref prefix, but the GitHub API wants the bare name.
+pub fn pr_base_branch(reference: &str) -> &str {
+    reference
+        .strip_prefix("refs/remotes/origin/")
+        .or_else(|| reference.strip_prefix("refs/heads/"))
+        .or_else(|| reference.strip_prefix("origin/"))
+        .unwrap_or(reference)
+}
+
 /// Asks the `gh` CLI for an open pull request whose head is `branch`, run from
 /// the worktree so gh resolves the repository from its origin. Returns Ok(None)
 /// when no open PR exists; a merged or closed PR is deliberately not reported —
@@ -714,21 +778,39 @@ fn lookup_branch_pull_request(
     branch: &str,
 ) -> Result<Option<DiscoveredPullRequest>, TaskWorktreeError> {
     let operation = "look up task pull request";
-    // The app may be Finder-launched with a minimal PATH, so fall back to the
-    // standard Homebrew/Intel install locations before giving up.
+    let output = run_gh(
+        worktree_path,
+        operation,
+        &[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--json",
+            "url,number,headRefOid,isDraft",
+            "--limit",
+            "1",
+        ],
+    )?;
+    let stdout = stdout_text(&output, worktree_path, operation)?;
+    parse_pull_request_rows(stdout)
+        .map_err(|detail| TaskWorktreeError::new(operation, worktree_path, detail))
+}
+
+/// Runs the `gh` CLI in a worktree, surfacing nonzero exits with stderr. The
+/// app may be Finder-launched with a minimal PATH, so fall back to the
+/// standard Homebrew/Intel install locations before giving up. stdin is null
+/// so gh can never stall waiting for interactive input.
+fn run_gh(
+    worktree_path: &Path,
+    operation: &'static str,
+    arguments: &[&str],
+) -> Result<Output, TaskWorktreeError> {
     for candidate in ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
         let result = std::process::Command::new(candidate)
-            .args([
-                "pr",
-                "list",
-                "--head",
-                branch,
-                "--json",
-                "url,number,headRefOid,isDraft",
-                "--limit",
-                "1",
-            ])
+            .args(arguments)
             .current_dir(worktree_path)
+            .stdin(std::process::Stdio::null())
             .output();
         let output = match result {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -749,9 +831,7 @@ fn lookup_branch_pull_request(
                 format!("gh exited with status {}: {stderr}", output.status),
             ));
         }
-        let stdout = stdout_text(&output, worktree_path, operation)?;
-        return parse_pull_request_rows(stdout)
-            .map_err(|detail| TaskWorktreeError::new(operation, worktree_path, detail));
+        return Ok(output);
     }
     Err(TaskWorktreeError::new(
         operation,
@@ -1839,5 +1919,13 @@ mod tests {
     fn parse_pull_request_rows_rejects_malformed_output() {
         let error = parse_pull_request_rows("not json").unwrap_err();
         assert!(error.contains("unexpected gh output"));
+    }
+
+    #[test]
+    fn pr_base_branch_strips_remote_and_ref_prefixes() {
+        assert_eq!(pr_base_branch("v5"), "v5");
+        assert_eq!(pr_base_branch("origin/v5"), "v5");
+        assert_eq!(pr_base_branch("refs/heads/v5"), "v5");
+        assert_eq!(pr_base_branch("refs/remotes/origin/v5"), "v5");
     }
 }

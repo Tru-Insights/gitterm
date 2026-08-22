@@ -106,6 +106,32 @@ impl TaskRecord {
             archived_at: None,
         }
     }
+
+    /// Title and body for this task's draft pull request. The linked issue
+    /// key prefixes the title unless the title already carries it (repo
+    /// convention: commits and PRs carry an issue key), and the body links
+    /// back to the issue so review lands with its context.
+    pub fn draft_pr_copy(&self) -> (String, String) {
+        let title = match &self.issue {
+            Some(issue) if !self.title.starts_with(&issue.key) => {
+                format!("{}: {}", issue.key, self.title)
+            }
+            _ => self.title.clone(),
+        };
+        let mut body = self.objective.trim().to_string();
+        if let Some(issue) = &self.issue {
+            let line = match &issue.url {
+                Some(url) => format!("Linked issue: [{}]({url})", issue.key),
+                None => format!("Linked issue: {}", issue.key),
+            };
+            if body.is_empty() {
+                body = line;
+            } else {
+                body = format!("{body}\n\n{line}");
+            }
+        }
+        (title, body)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1733,6 +1759,32 @@ mod tests {
             .record_delivery("task-missing", delivery, "2026-08-22T12:00:00Z")
             .unwrap_err();
         assert!(error.to_string().contains("task-missing"));
+    }
+
+    #[test]
+    fn draft_pr_copy_prefixes_issue_key_and_links_the_issue() {
+        let task = sample_task("task-1");
+
+        let (title, body) = task.draft_pr_copy();
+
+        assert_eq!(title, "TRU-104: Add durable tasks");
+        assert_eq!(
+            body,
+            "Persist task state without opening a workspace\n\n\
+             Linked issue: [TRU-104](https://linear.app/example/TRU-104)"
+        );
+    }
+
+    #[test]
+    fn draft_pr_copy_without_issue_uses_title_and_objective_as_is() {
+        let mut task = sample_task("task-1");
+        task.issue = None;
+        task.title = "TRU-104: Already prefixed".to_string();
+
+        let (title, body) = task.draft_pr_copy();
+
+        assert_eq!(title, "TRU-104: Already prefixed");
+        assert_eq!(body, "Persist task state without opening a workspace");
     }
 
     #[test]

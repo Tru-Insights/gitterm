@@ -52,11 +52,12 @@ use gitterm::task_mcp::{
     TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
 };
 use gitterm::task_worktree::{
-    discover_task_delivery, inspect_task_cleanup, prepare_task_worktree, prune_worktrees,
-    remove_task_worktree, resolve_task_preparation, resolve_worktree_adoption,
-    suggested_task_branch, suggested_task_worktree_path, AdoptWorktreeRequest,
-    AdoptedWorktreeResolution, CleanupContext, CleanupInspection, CleanupRisk, DeliveryDiscovery,
-    PrepareTaskWorktreeRequest, PreparedTaskWorktree, ResolvedTaskPreparation, DEFAULT_TASK_BASE,
+    discover_task_delivery, inspect_task_cleanup, open_task_draft_pr, pr_base_branch,
+    prepare_task_worktree, prune_worktrees, push_task_branch, remove_task_worktree,
+    resolve_task_preparation, resolve_worktree_adoption, suggested_task_branch,
+    suggested_task_worktree_path, AdoptWorktreeRequest, AdoptedWorktreeResolution, CleanupContext,
+    CleanupInspection, CleanupRisk, DeliveryDiscovery, PrepareTaskWorktreeRequest,
+    PreparedTaskWorktree, ResolvedTaskPreparation, DEFAULT_TASK_BASE,
 };
 use gitterm::tasks::{
     ChangedFilesSummary, CompletedWorktreePreparation, DeliveryState, ExecutorTarget,
@@ -2630,6 +2631,22 @@ struct TaskWorktreeDeletePrompt {
     error: Option<String>,
 }
 
+/// Which explicit publish action a task overview verb kicked off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskPublishAction {
+    PushBranch,
+    OpenDraftPr,
+}
+
+/// Confirmation gate for publishing a task that has no linked issue —
+/// commits and PRs in this repo are expected to carry an issue key, so the
+/// flow warns and requires an explicit continue instead of proceeding.
+#[derive(Debug, Clone)]
+struct TaskPublishPrompt {
+    task_id: String,
+    action: TaskPublishAction,
+}
+
 /// In-flight adopt/remove state for one unmanaged worktree, keyed by its path.
 /// `offer_force` flips on when git refused a removal because the worktree is
 /// dirty — git's own refusal is the safety check, and Force is the override.
@@ -4145,6 +4162,15 @@ pub enum Event {
     TaskQueueCancel(String),
     /// Result of an async delivery probe (worktree HEAD + open PR lookup).
     TaskDeliveryDiscovered(String, Result<DeliveryDiscovery, String>),
+    /// Explicitly push the task branch to origin.
+    TaskPushBranch(String),
+    /// Explicitly open a draft pull request for the task branch.
+    TaskOpenDraftPr(String),
+    /// Continue a publish action past the no-linked-issue warning.
+    TaskPublishConfirm,
+    TaskPublishCancel,
+    /// A push or draft-PR action finished; carries the fresh delivery snapshot.
+    TaskPublishCompleted(String, Result<DeliveryDiscovery, String>),
     TaskRailFilterSelected(TaskRailFilter),
     TaskArchive(String),
     /// Archive every failed task in the active workspace in one click.
@@ -4512,6 +4538,10 @@ struct App {
     // keeps the durable facts; this carries the live comparison that says
     // whether the recorded PR is behind local work.
     task_delivery_probe: HashMap<String, DeliveryDiscovery>,
+    // Tasks with a push/draft-PR action in flight; gates the publish verbs
+    // so a double-click can't race two pushes.
+    task_publish_busy: HashSet<String>,
+    task_publish_prompt: Option<TaskPublishPrompt>,
     new_task_form: Option<NewTaskForm>,
     task_tab_close_prompt: Option<TaskTabClosePrompt>,
     task_worktree_delete_prompt: Option<TaskWorktreeDeletePrompt>,
@@ -7355,6 +7385,65 @@ impl App {
         }
     }
 
+    /// Route a publish verb: warn first when the task has no linked issue
+    /// (commits and PRs here carry an issue key), otherwise start the work.
+    fn request_task_publish(&mut self, task_id: &str, action: TaskPublishAction) -> Task<Event> {
+        let Some(task) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id))
+        else {
+            return Task::none();
+        };
+        if task.issue.is_none() {
+            self.task_publish_prompt = Some(TaskPublishPrompt {
+                task_id: task_id.to_string(),
+                action,
+            });
+            return Task::none();
+        }
+        self.start_task_publish(task_id, action)
+    }
+
+    /// Kick off the actual push or draft-PR work for a task. Both finish with
+    /// a fresh delivery snapshot so the overview reflects the result at once.
+    fn start_task_publish(&mut self, task_id: &str, action: TaskPublishAction) -> Task<Event> {
+        let Some(task) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id))
+        else {
+            return Task::none();
+        };
+        let Some(worktree_path) = task.worktree.path.clone() else {
+            return Task::none();
+        };
+        if self.task_publish_busy.contains(task_id) {
+            return Task::none();
+        }
+        let branch = task.branch.clone();
+        let completed = {
+            let task_id = task_id.to_string();
+            move |result: Result<DeliveryDiscovery, gitterm::task_worktree::TaskWorktreeError>| {
+                Event::TaskPublishCompleted(task_id, result.map_err(|error| error.to_string()))
+            }
+        };
+        self.task_publish_busy.insert(task_id.to_string());
+        match action {
+            TaskPublishAction::PushBranch => {
+                Task::perform(push_task_branch(worktree_path, branch), completed)
+            }
+            TaskPublishAction::OpenDraftPr => {
+                let base = pr_base_branch(&task.base.reference).to_string();
+                let (title, body) = task.draft_pr_copy();
+                Task::perform(
+                    open_task_draft_pr(worktree_path, branch, base, title, body),
+                    completed,
+                )
+            }
+        }
+    }
+
     /// 1-based place in the launch queue, for "Queued · #N" copy.
     fn queued_task_position(&self, task_id: &str) -> Option<usize> {
         self.task_launch_queue
@@ -8756,6 +8845,8 @@ impl App {
             task_progress_pending: HashMap::new(),
             task_launch_queue,
             task_delivery_probe: HashMap::new(),
+            task_publish_busy: HashSet::new(),
+            task_publish_prompt: None,
             new_task_form: None,
             task_tab_close_prompt: None,
             task_worktree_delete_prompt: None,
@@ -11286,6 +11377,7 @@ fi
                     || self.new_task_form.is_some()
                     || self.task_tab_close_prompt.is_some()
                     || self.task_worktree_delete_prompt.is_some()
+                    || self.task_publish_prompt.is_some()
                 {
                     if let iced_term::backend::Command::Write(_) = &cmd {
                         return Task::none();
@@ -12465,6 +12557,7 @@ fi
                     || self.new_task_form.is_some()
                     || self.task_tab_close_prompt.is_some()
                     || self.task_worktree_delete_prompt.is_some()
+                    || self.task_publish_prompt.is_some()
                 {
                     if let iced_term::backend::Command::Write(_) = &cmd {
                         return Task::none();
@@ -12791,6 +12884,13 @@ fi
                 if let Some(prompt) = self.task_worktree_delete_prompt.as_ref() {
                     if matches!(key.as_ref(), Key::Named(key::Named::Escape)) && !prompt.deleting {
                         self.task_worktree_delete_prompt = None;
+                    }
+                    return Task::none();
+                }
+
+                if self.task_publish_prompt.is_some() {
+                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
+                        self.task_publish_prompt = None;
                     }
                     return Task::none();
                 }
@@ -13662,6 +13762,26 @@ fi
                     self.task_ui_error = Some(error);
                 }
             },
+            Event::TaskPushBranch(task_id) => {
+                return self.request_task_publish(&task_id, TaskPublishAction::PushBranch);
+            }
+            Event::TaskOpenDraftPr(task_id) => {
+                return self.request_task_publish(&task_id, TaskPublishAction::OpenDraftPr);
+            }
+            Event::TaskPublishConfirm => {
+                let Some(prompt) = self.task_publish_prompt.take() else {
+                    return Task::none();
+                };
+                return self.start_task_publish(&prompt.task_id, prompt.action);
+            }
+            Event::TaskPublishCancel => {
+                self.task_publish_prompt = None;
+            }
+            Event::TaskPublishCompleted(task_id, result) => {
+                self.task_publish_busy.remove(&task_id);
+                // The fresh snapshot records exactly like a passive probe.
+                return self.update(Event::TaskDeliveryDiscovered(task_id, result));
+            }
             Event::TaskQueueCancel(task_id) => {
                 self.task_launch_queue
                     .retain(|entry| entry.task_id != task_id);
@@ -17083,6 +17203,13 @@ fi
             Stack::new()
                 .push(main_view)
                 .push(self.view_task_worktree_delete_modal())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.task_publish_prompt.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_task_publish_modal())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -22279,6 +22406,32 @@ fi
                     .padding([7, 12])
                     .on_press(Event::TaskReviewChanges(task.task_id.clone())),
             );
+            // Publish verbs: explicit invocation only — nothing pushes or
+            // opens a PR on its own. Draft PRs only; /pr-ready owns readiness.
+            if matches!(
+                task.workspace.location,
+                WorkspaceLocationIdentity::Local { .. }
+            ) {
+                let busy = self.task_publish_busy.contains(&task.task_id);
+                verbs = verbs.push(
+                    button(
+                        text(if busy { "Publishing…" } else { "Push branch" })
+                            .size(12)
+                            .font(mono),
+                    )
+                    .style(button::secondary)
+                    .padding([7, 12])
+                    .on_press_maybe((!busy).then(|| Event::TaskPushBranch(task.task_id.clone()))),
+                );
+                if task.delivery.pr_url.is_none() && !busy {
+                    verbs = verbs.push(
+                        button(text("Open draft PR").size(12).font(mono))
+                            .style(button::secondary)
+                            .padding([7, 12])
+                            .on_press(Event::TaskOpenDraftPr(task.task_id.clone())),
+                    );
+                }
+            }
         }
         if task.lifecycle.is_active() && first_open_session.is_some() {
             let danger = theme.danger();
@@ -22851,6 +23004,100 @@ fi
             );
         }
         body = body.push(buttons);
+
+        let card = container(body)
+            .width(Length::Fixed(560.0))
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 7.0.into(),
+                },
+                ..Default::default()
+            });
+        let backdrop = iced::Color {
+            a: 0.82,
+            ..bg_crust
+        };
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    /// Warning shown when a publish verb runs on a task with no linked issue.
+    fn view_task_publish_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let bg_surface = theme.bg_surface();
+        let bg_crust = theme.bg_crust();
+        let border = theme.border();
+        let warning = theme.danger();
+        let Some(prompt) = &self.task_publish_prompt else {
+            return container(iced::widget::Space::new()).into();
+        };
+        let task_title = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(&prompt.task_id))
+            .map(|task| task.title.as_str())
+            .unwrap_or("this task");
+        let (heading, continue_label) = match prompt.action {
+            TaskPublishAction::PushBranch => ("Push without a linked issue?", "Push anyway"),
+            TaskPublishAction::OpenDraftPr => {
+                ("Open a draft PR without a linked issue?", "Open PR anyway")
+            }
+        };
+
+        let body = Column::new()
+            .spacing(12)
+            .padding([22, 26])
+            .push(text(heading).size(16).color(text_primary))
+            .push(
+                text(format!("“{task_title}”"))
+                    .size(11)
+                    .color(text_muted)
+                    .font(mono),
+            )
+            .push(
+                text(
+                    "This task has no linked issue. Commits and pull requests \
+                     in this repo carry an issue key — link an issue to the \
+                     task first, or continue without one.",
+                )
+                .size(12)
+                .color(text_secondary),
+            )
+            .push(
+                Row::new()
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center)
+                    .push(iced::widget::Space::new().width(Length::Fill))
+                    .push(
+                        button(text("Cancel").size(12).font(mono))
+                            .style(self.ghost_button_style())
+                            .padding([5, 12])
+                            .on_press(Event::TaskPublishCancel),
+                    )
+                    .push(
+                        button(text(continue_label).size(12).color(warning).font(mono))
+                            .style(self.ghost_button_style())
+                            .padding([5, 12])
+                            .on_press(Event::TaskPublishConfirm),
+                    ),
+            );
 
         let card = container(body)
             .width(Length::Fixed(560.0))
