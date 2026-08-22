@@ -222,7 +222,17 @@ pub fn prepare(
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let endpoint = format!("http://127.0.0.1:{port}/mcp");
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    // An external test driver that launches this instance may pre-share the
+    // bearer secret through the app's own environment; whoever sets that env
+    // already controls the process. Otherwise the token is random and lives
+    // only in memory.
+    let token = match std::env::var(TASK_MCP_TOKEN_ENV) {
+        Ok(value) if !value.is_empty() => {
+            eprintln!("GitTerm V5 task MCP is using the operator-supplied token from {TASK_MCP_TOKEN_ENV}");
+            value
+        }
+        _ => format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
+    };
     let cancellation = CancellationToken::new();
     Ok((
         TaskMcpConnection {
