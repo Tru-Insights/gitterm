@@ -21333,10 +21333,19 @@ fi
                 },
             };
             let issue = task.issue.as_ref().map(|issue| issue.key.as_str());
+            let backends = self.task_backends(task);
+            // The leading dot is harness identity, colored exactly like the
+            // Chats list (newest session wins when a task mixed harnesses).
+            // Lifecycle color lives on the state text below, never here —
+            // the two palettes share hues, so one dot must not serve both.
+            let backend_dot = backends
+                .first()
+                .map(|backend| self.chat_backend_color(conversation_chat_backend(*backend)))
+                .unwrap_or(text_muted);
             let mut title_row = Row::new()
                 .spacing(7)
                 .align_y(iced::Alignment::Center)
-                .push(text("●").size(9).color(state_color))
+                .push(text("●").size(9).color(backend_dot))
                 .push(
                     text(issue.unwrap_or(task.title.as_str()))
                         .size(12)
@@ -21357,26 +21366,27 @@ fi
             let mut state_row = Row::new().spacing(4).align_y(iced::Alignment::Center).push(
                 text(state)
                     .size(10)
-                    .color(if Self::task_needs_attention(task) {
-                        state_color
-                    } else {
-                        text_muted
-                    })
+                    .color(
+                        if Self::task_needs_attention(task) || task.lifecycle.is_active() {
+                            state_color
+                        } else {
+                            text_muted
+                        },
+                    )
                     .font(mono),
             );
-            let backends = self.task_backends(task);
-            if !backends.is_empty() {
+            // Every distinct harness the task has run, for mixed-harness
+            // tasks whose dot can only carry one.
+            if backends.len() > 1 {
                 state_row = state_row.push(text("·").size(10).color(text_muted).font(mono));
-            }
-            for backend in backends {
-                // Same glyph-and-color identity the Chats list uses for
-                // each harness, so the two rails read the same way.
-                state_row = state_row.push(
-                    text(conversation_backend_glyph(backend))
-                        .size(10)
-                        .color(self.chat_backend_color(conversation_chat_backend(backend)))
-                        .font(mono),
-                );
+                for backend in backends {
+                    state_row = state_row.push(
+                        text(conversation_backend_glyph(backend))
+                            .size(10)
+                            .color(self.chat_backend_color(conversation_chat_backend(backend)))
+                            .font(mono),
+                    );
+                }
             }
             let mut row_copy = column![title_row, state_row];
             // Third line: the session's own latest update while the task is
