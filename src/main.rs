@@ -6204,6 +6204,56 @@ impl App {
         task.attention.reason.is_some() || task.attention.unread
     }
 
+    /// Close a task-linked tab: stop its terminal, fold the session outcome
+    /// into the task lifecycle, and land focus on a sibling task tab or the
+    /// task rail. Shared by the confirmed stop-and-close and the silent close
+    /// of a tab whose session is no longer live.
+    fn close_task_tab(&mut self, prompt: TaskTabClosePrompt) -> Task<Event> {
+        let valid = self
+            .workspaces
+            .get(prompt.workspace_idx)
+            .and_then(|workspace| workspace.tabs.get(prompt.tab_idx))
+            .is_some_and(|tab| tab.task_id.as_deref() == Some(&prompt.task_id));
+        if !valid {
+            return Task::none();
+        }
+        let closed_live_session = self.workspaces[prompt.workspace_idx].tabs[prompt.tab_idx]
+            .task_live_state
+            .is_some();
+        if self.workspaces[prompt.workspace_idx].tabs.len() == 1 {
+            let workspace_name = self.workspaces[prompt.workspace_idx].name.clone();
+            let workspace_dir = self.workspaces[prompt.workspace_idx].dir.clone();
+            let replacement =
+                self.create_tab_for_workspace(workspace_dir, None, Some(&workspace_name));
+            self.workspaces[prompt.workspace_idx].tabs.push(replacement);
+        }
+        self.workspaces[prompt.workspace_idx]
+            .tabs
+            .remove(prompt.tab_idx);
+        self.apply_task_session_signal(
+            &prompt.task_id,
+            closed_live_session.then_some((TaskLifecycle::Stopped, None)),
+        );
+        let sibling = task_tab_indices(&self.workspaces[prompt.workspace_idx], &prompt.task_id)
+            .into_iter()
+            .next();
+        let workspace = &mut self.workspaces[prompt.workspace_idx];
+        if let Some(sibling) = sibling {
+            workspace.active_tab = sibling;
+        } else {
+            workspace.active_tab = workspace
+                .tabs
+                .iter()
+                .position(|tab| tab.task_id.is_none())
+                .unwrap_or(0);
+            workspace.tabs[workspace.active_tab].sidebar_mode = SidebarMode::Tasks;
+            self.selected_task_id = Some(prompt.task_id);
+        }
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.scroll_to_active_tab()
+    }
+
     /// Fold a session observation into the task's durable lifecycle. Callers
     /// update the signalling tab's `task_live_state` first; the aggregate over
     /// every linked session then decides. `ended` carries the outcome of a
@@ -11711,17 +11761,24 @@ fi
                 return Task::batch([scroll_task, refresh_worktrees_task, panels_task]);
             }
             Event::TabClose(idx) => {
-                if let Some(task_id) = self
+                if let Some(tab) = self
                     .active_workspace()
                     .and_then(|workspace| workspace.tabs.get(idx))
-                    .and_then(|tab| tab.task_id.clone())
                 {
-                    self.task_tab_close_prompt = Some(TaskTabClosePrompt {
-                        workspace_idx: self.active_workspace_idx,
-                        tab_idx: idx,
-                        task_id,
-                    });
-                    return Task::none();
+                    if let Some(task_id) = tab.task_id.clone() {
+                        let prompt = TaskTabClosePrompt {
+                            workspace_idx: self.active_workspace_idx,
+                            tab_idx: idx,
+                            task_id,
+                        };
+                        // Only a live session warrants a confirm — closing a
+                        // tab whose harness already exited stops nothing.
+                        if tab.task_live_state.is_some() {
+                            self.task_tab_close_prompt = Some(prompt);
+                            return Task::none();
+                        }
+                        return self.close_task_tab(prompt);
+                    }
                 }
                 // Hide WebView when closing tabs
                 self.hide_webview_for_non_agent();
@@ -13946,51 +14003,7 @@ fi
                 let Some(prompt) = self.task_tab_close_prompt.take() else {
                     return Task::none();
                 };
-                let valid = self
-                    .workspaces
-                    .get(prompt.workspace_idx)
-                    .and_then(|workspace| workspace.tabs.get(prompt.tab_idx))
-                    .is_some_and(|tab| tab.task_id.as_deref() == Some(&prompt.task_id));
-                if !valid {
-                    return Task::none();
-                }
-                let closed_live_session = self.workspaces[prompt.workspace_idx].tabs
-                    [prompt.tab_idx]
-                    .task_live_state
-                    .is_some();
-                if self.workspaces[prompt.workspace_idx].tabs.len() == 1 {
-                    let workspace_name = self.workspaces[prompt.workspace_idx].name.clone();
-                    let workspace_dir = self.workspaces[prompt.workspace_idx].dir.clone();
-                    let replacement =
-                        self.create_tab_for_workspace(workspace_dir, None, Some(&workspace_name));
-                    self.workspaces[prompt.workspace_idx].tabs.push(replacement);
-                }
-                self.workspaces[prompt.workspace_idx]
-                    .tabs
-                    .remove(prompt.tab_idx);
-                self.apply_task_session_signal(
-                    &prompt.task_id,
-                    closed_live_session.then_some((TaskLifecycle::Stopped, None)),
-                );
-                let sibling =
-                    task_tab_indices(&self.workspaces[prompt.workspace_idx], &prompt.task_id)
-                        .into_iter()
-                        .next();
-                let workspace = &mut self.workspaces[prompt.workspace_idx];
-                if let Some(sibling) = sibling {
-                    workspace.active_tab = sibling;
-                } else {
-                    workspace.active_tab = workspace
-                        .tabs
-                        .iter()
-                        .position(|tab| tab.task_id.is_none())
-                        .unwrap_or(0);
-                    workspace.tabs[workspace.active_tab].sidebar_mode = SidebarMode::Tasks;
-                    self.selected_task_id = Some(prompt.task_id);
-                }
-                self.mark_workspaces_dirty();
-                self.mark_log_server_dirty();
-                return self.scroll_to_active_tab();
+                return self.close_task_tab(prompt);
             }
             Event::SetSidebarMode(mode) => {
                 self.task_rail_pinned = mode == SidebarMode::Tasks;
@@ -22424,25 +22437,22 @@ fi
             })
             .map(|task| task.title.as_str())
             .unwrap_or("this task");
-        let stop = button(
-            text("Stop terminal and close")
-                .size(12)
-                .color(danger)
-                .font(mono),
-        )
-        .style(self.ghost_button_style())
-        .padding([5, 12])
-        .on_press(Event::TaskTabStopAndClose);
+        let stop = button(text("Stop and close").size(12).color(danger).font(mono))
+            .style(self.ghost_button_style())
+            .padding([5, 12])
+            .on_press(Event::TaskTabStopAndClose);
         let keep = button(text("Keep open").size(12).font(mono))
             .style(self.ghost_button_style())
             .padding([5, 12])
             .on_press(Event::TaskTabCloseCancel);
         let body = column![
-            text("Task session is still attached").size(16).color(text_primary),
-            text(format!("“{task_title}” is running in this session."))
-                .size(12)
-                .color(text_secondary),
-            text("Closing stops the terminal process. The task record and worktree remain available to resume.")
+            text("Stop this task session?").size(16).color(text_primary),
+            text(format!(
+                "A session of “{task_title}” is running in this tab."
+            ))
+            .size(12)
+            .color(text_secondary),
+            text("Closing stops it. The task and its worktree stay available to resume.")
                 .size(11)
                 .color(text_muted),
             row![iced::widget::Space::new().width(Length::Fill), keep, stop]
