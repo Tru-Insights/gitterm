@@ -4145,6 +4145,8 @@ pub enum Event {
     TaskQueueCancel(String),
     TaskRailFilterSelected(TaskRailFilter),
     TaskArchive(String),
+    /// Archive every failed task in the active workspace in one click.
+    TaskArchiveAllFailed,
     TaskSwitcherOpen,
     TaskSwitcherClose,
     TaskSwitcherQueryChanged(String),
@@ -13604,6 +13606,51 @@ fi
                     }
                 }
             }
+            Event::TaskArchiveAllFailed => {
+                // Scoped to the active workspace — the button acknowledges the
+                // failures the user is looking at, not failures everywhere.
+                let failed_ids: Vec<String> =
+                    match (self.task_store.as_ref(), self.active_workspace()) {
+                        (Some(store), Some(workspace)) => store
+                            .tasks()
+                            .iter()
+                            .filter(|task| task.lifecycle == TaskLifecycle::Failed)
+                            .filter(|task| self.task_belongs_to_workspace(task, workspace))
+                            .map(|task| task.task_id.clone())
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                if !failed_ids.is_empty() {
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    let focused = self.active_task_context_id().map(str::to_string);
+                    let mut focused_archived = false;
+                    let mut archive_error = None;
+                    match self.task_store.as_mut() {
+                        Some(store) => {
+                            for task_id in failed_ids {
+                                match store.archive(&task_id, &timestamp) {
+                                    Ok(()) => {
+                                        if focused.as_deref() == Some(task_id.as_str()) {
+                                            focused_archived = true;
+                                        }
+                                        self.task_rows_seen.insert(task_id);
+                                    }
+                                    Err(error) => archive_error = Some(error.to_string()),
+                                }
+                            }
+                        }
+                        None => {
+                            archive_error = Some("GitTerm's task store is unavailable".to_string());
+                        }
+                    }
+                    if let Some(error) = archive_error {
+                        self.task_ui_error = Some(error);
+                    }
+                    if focused_archived {
+                        return self.update(Event::TaskContextBack);
+                    }
+                }
+            }
             Event::TaskWorktreeDeleteOpen(task_id) => {
                 let Some(task) = self
                     .task_store
@@ -21312,6 +21359,10 @@ fi
                 task.lifecycle != TaskLifecycle::Archived && Self::task_needs_attention(task)
             })
             .count();
+        let failed_count = repo_tasks
+            .iter()
+            .filter(|task| task.lifecycle == TaskLifecycle::Failed)
+            .count();
 
         let header = row![
             text(workspace_name).size(10).color(text_muted).font(mono),
@@ -21416,7 +21467,7 @@ fi
                 .padding([2, 6])
                 .on_press(Event::TaskRailFilterSelected(filter))
         };
-        let filters = row![
+        let mut filters = row![
             filter_button("All".to_string(), TaskRailFilter::All),
             filter_button(
                 format!("Needs you · {needs_you_count}"),
@@ -21425,6 +21476,37 @@ fi
             filter_button("Archived".to_string(), TaskRailFilter::Archived),
         ]
         .spacing(4);
+        if failed_count > 0 {
+            // One-click acknowledgement for this workspace's failed tasks —
+            // clearing them one Archive at a time doesn't scale (TRU-115).
+            let danger = theme.danger();
+            filters = filters.push(
+                button(
+                    text(format!("Archive failed · {failed_count}"))
+                        .size(9)
+                        .font(mono),
+                )
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if matches!(status, button::Status::Hovered) {
+                            theme.bg_overlay()
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: danger,
+                    border: iced::Border {
+                        color: danger,
+                        width: 1.0,
+                        radius: 10.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([2, 6])
+                .on_press(Event::TaskArchiveAllFailed),
+            );
+        }
         let mut content = Column::new()
             .spacing(8)
             .padding([10, 8])
