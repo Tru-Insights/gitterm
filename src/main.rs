@@ -6896,7 +6896,10 @@ impl App {
         }
 
         let conversation = session.conversation.clone().expect("matched conversation");
-        let command = conversation_resume_command(&conversation);
+        let mut command = conversation_resume_command(&conversation);
+        if conversation.backend == HarnessConversationBackend::Codex {
+            command = self.codex_task_notify_command(command, task_id, &session.task_session_id);
+        }
         let backend_label = conversation_backend_label(conversation.backend);
 
         if let Some((workspace_idx, tab_idx)) = self.find_chat_tab(chat_id) {
@@ -7238,6 +7241,27 @@ impl App {
         }
     }
 
+    /// Codex emits no ✳ terminal-title signals, so task sessions get their
+    /// waiting_for_input edge from a Codex `notify` hook POSTing back to the
+    /// task MCP listener. No listener means no injection — the session still
+    /// runs, it just never shows "Needs you".
+    fn codex_task_notify_command(
+        &self,
+        command: String,
+        task_id: &str,
+        task_session_id: &str,
+    ) -> String {
+        match self.task_mcp.as_ref() {
+            Some(connection) => task_mcp::configure_codex_notify(
+                &command,
+                &connection.notify_endpoint(),
+                task_id,
+                task_session_id,
+            ),
+            None => command,
+        }
+    }
+
     fn try_launch_task_child(
         &mut self,
         task_id: &str,
@@ -7344,6 +7368,13 @@ impl App {
         let original_tab_idx = self
             .active_workspace()
             .map(|workspace| workspace.active_tab);
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let command = match command {
+            Some(command) if conversation_backend == Some(HarnessConversationBackend::Codex) => {
+                Some(self.codex_task_notify_command(command, task_id, &session_id))
+            }
+            other => other,
+        };
         let workspace_idx =
             self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
         let workspace_name = self.workspaces[workspace_idx].name.clone();
@@ -7357,7 +7388,6 @@ impl App {
         }
         tab.set_local_dir(worktree_path);
         tab.task_id = Some(task_id.to_string());
-        let session_id = uuid::Uuid::new_v4().to_string();
         tab.task_session_id = Some(session_id.clone());
         if launched_agent {
             tab.task_live_state = Some(TaskSessionLiveState::Working);
@@ -8753,6 +8783,14 @@ impl App {
                         // task back to Running, hiding the Resume verb.
                         let mut startup_command = tab_config.startup_command.clone();
                         let mut chat_session_id = tab_config.chat_session_id.clone();
+                        // Fixed before the terminal starts so the Codex
+                        // notify hook can carry the session identity.
+                        let restored_task_session_id = tab_config.task_id.as_ref().map(|_| {
+                            tab_config
+                                .task_session_id
+                                .clone()
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                        });
                         if startup_command.is_some() {
                             let conversation = tab_config.task_id.as_ref().and_then(|task_id| {
                                 let task = app.task_store.as_ref()?.get(task_id)?;
@@ -8775,7 +8813,20 @@ impl App {
                                     })
                             });
                             if let Some(conversation) = conversation {
-                                startup_command = Some(conversation_resume_command(conversation));
+                                let mut command = conversation_resume_command(conversation);
+                                if conversation.backend == HarnessConversationBackend::Codex {
+                                    if let (Some(task_id), Some(task_session_id)) = (
+                                        tab_config.task_id.as_ref(),
+                                        restored_task_session_id.as_ref(),
+                                    ) {
+                                        command = app.codex_task_notify_command(
+                                            command,
+                                            task_id,
+                                            task_session_id,
+                                        );
+                                    }
+                                }
+                                startup_command = Some(command);
                                 chat_session_id = Some(conversation.session_id.clone());
                             }
                         }
@@ -8835,10 +8886,7 @@ impl App {
                         if let Some(task_id) = &tab_config.task_id {
                             if let Some(tab) = workspace.tabs.last_mut() {
                                 tab.task_id = Some(task_id.clone());
-                                tab.task_session_id = tab_config
-                                    .task_session_id
-                                    .clone()
-                                    .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
+                                tab.task_session_id = restored_task_session_id.clone();
                             }
                         }
                     }
@@ -10705,6 +10753,38 @@ fi
                         .reply
                         .send(result.and_then(|task| self.task_control_value(&task)));
                 }
+                TaskControlOperation::SessionEvent(request) => {
+                    // Only turn completion carries a lifecycle edge today;
+                    // other notify types are acknowledged and dropped.
+                    if request.event_type != "agent-turn-complete" {
+                        envelope.reply.send(Ok(serde_json::json!({
+                            "ignored": request.event_type,
+                        })));
+                        return Task::none();
+                    }
+                    let mut updated = false;
+                    for workspace in &mut self.workspaces {
+                        for tab in &mut workspace.tabs {
+                            if tab.task_id.as_deref() == Some(request.task_id.as_str())
+                                && tab.task_session_id.as_deref()
+                                    == Some(request.session_id.as_str())
+                            {
+                                tab.task_live_state = Some(TaskSessionLiveState::AwaitingInput);
+                                tab.set_attention(AttentionReason::HumanInputRequired);
+                                updated = true;
+                            }
+                        }
+                    }
+                    if updated {
+                        self.apply_task_session_signal(&request.task_id, None);
+                        self.mark_log_server_dirty();
+                    }
+                    envelope.reply.send(Ok(serde_json::json!({
+                        "task_id": request.task_id,
+                        "session_id": request.session_id,
+                        "waiting_for_input": updated,
+                    })));
+                }
             },
             Event::BrowserMcpStopped(result) => {
                 let error = match result {
@@ -11006,6 +11086,17 @@ fi
                                 tab.task_live_state = Some(TaskSessionLiveState::Working);
                                 task_signal = tab.task_id.clone().map(|task_id| (task_id, None));
                             }
+                        } else if tab.task_live_state == Some(TaskSessionLiveState::AwaitingInput)
+                            && tab.terminal_title().is_none_or(|title| {
+                                terminal_title_attention_reason(title).is_none()
+                            })
+                        {
+                            // A keystroke answers a notify-driven waiting
+                            // state (Codex). ✳-titled tabs (Claude/pi) are
+                            // excluded — their title adapter owns both
+                            // directions of this transition.
+                            tab.task_live_state = Some(TaskSessionLiveState::Working);
+                            task_signal = tab.task_id.clone().map(|task_id| (task_id, None));
                         }
                     }
                     // Hot path: PTY output proves the task session is alive.

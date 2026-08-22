@@ -117,6 +117,17 @@ pub enum TaskStoppingBoundary {
     PrepareDraftPr,
 }
 
+/// A harness-emitted session event crossing the notify bridge, e.g. a
+/// Codex `agent-turn-complete`. Task identity comes from the notify URL
+/// GitTerm injected at launch, never from the payload.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TaskSessionEventRequest {
+    pub task_id: String,
+    pub session_id: String,
+    /// The notify payload's `type` field, e.g. "agent-turn-complete".
+    pub event_type: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum TaskControlOperation {
     List(ListTasksRequest),
@@ -124,6 +135,7 @@ pub enum TaskControlOperation {
     Create(CreateTaskRequest),
     LaunchSession(LaunchTaskSessionRequest),
     UpdateHandoff(UpdateTaskHandoffRequest),
+    SessionEvent(TaskSessionEventRequest),
 }
 
 #[derive(Clone)]
@@ -180,6 +192,12 @@ impl TaskMcpConnection {
 
     pub fn codex_config_overrides(&self) -> [String; 4] {
         codex_config_overrides(&self.endpoint)
+    }
+
+    /// Plain HTTP endpoint for harness notify hooks, on the same
+    /// authenticated loopback listener as the MCP service.
+    pub fn notify_endpoint(&self) -> String {
+        format!("{}/notify", self.endpoint.trim_end_matches("/mcp"))
     }
 }
 
@@ -248,6 +266,9 @@ impl TaskMcpServer {
         let listener = tokio::net::TcpListener::from_std(self.listener).map_err(|error| {
             format!("failed to activate the GitTerm V5 task MCP listener: {error}")
         })?;
+        let notify_state = NotifyState {
+            commands: self.commands.clone(),
+        };
         let tools = TaskMcpTools::new(self.commands);
         let mcp_service: StreamableHttpService<TaskMcpTools, LocalSessionManager> =
             StreamableHttpService::new(
@@ -260,6 +281,8 @@ impl TaskMcpServer {
         let auth = Arc::new(BearerAuth { token: self.token });
         let app = Router::new()
             .nest_service("/mcp", mcp_service)
+            .route("/notify", axum::routing::post(notify_session_event))
+            .with_state(notify_state)
             .layer(middleware::from_fn_with_state(auth, authenticate));
         let shutdown = self.cancellation.cancelled_owned();
         axum::serve(listener, app)
@@ -292,6 +315,63 @@ async fn authenticate(
 }
 
 #[derive(Clone)]
+struct NotifyState {
+    commands: TaskControlSender,
+}
+
+#[derive(Deserialize)]
+struct NotifyQuery {
+    task_id: String,
+    session_id: String,
+}
+
+/// Receives a harness notify payload (Codex `notify` runs a program with
+/// one JSON argument; GitTerm's injected program POSTs it here). Task
+/// identity is trusted from the injected URL, the payload only for its
+/// `type` — everything else stays opaque.
+async fn notify_session_event(
+    State(state): State<NotifyState>,
+    axum::extract::Query(query): axum::extract::Query<NotifyQuery>,
+    body: String,
+) -> Response {
+    let event_type = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let request = TaskSessionEventRequest {
+        task_id: query.task_id,
+        session_id: query.session_id,
+        event_type,
+    };
+    match dispatch_operation(&state.commands, TaskControlOperation::SessionEvent(request)).await {
+        Ok(value) => (StatusCode::OK, axum::Json(value)).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+    }
+}
+
+async fn dispatch_operation(
+    commands: &TaskControlSender,
+    operation: TaskControlOperation,
+) -> Result<Value, String> {
+    let (reply, response) = oneshot::channel();
+    commands
+        .send(TaskControlEnvelope {
+            operation,
+            reply: TaskControlReply::new(reply),
+        })
+        .map_err(|_| "GitTerm's task command bridge is unavailable".to_string())?;
+    tokio::time::timeout(COMMAND_TIMEOUT, response)
+        .await
+        .map_err(|_| "GitTerm timed out while handling the task command".to_string())?
+        .map_err(|_| "GitTerm closed the task command without a response".to_string())?
+}
+
+#[derive(Clone)]
 struct TaskMcpTools {
     commands: TaskControlSender,
 }
@@ -302,17 +382,7 @@ impl TaskMcpTools {
     }
 
     async fn dispatch(&self, operation: TaskControlOperation) -> Result<Value, String> {
-        let (reply, response) = oneshot::channel();
-        self.commands
-            .send(TaskControlEnvelope {
-                operation,
-                reply: TaskControlReply::new(reply),
-            })
-            .map_err(|_| "GitTerm's task command bridge is unavailable".to_string())?;
-        tokio::time::timeout(COMMAND_TIMEOUT, response)
-            .await
-            .map_err(|_| "GitTerm timed out while handling the task command".to_string())?
-            .map_err(|_| "GitTerm closed the task command without a response".to_string())?
+        dispatch_operation(&self.commands, operation).await
     }
 }
 
@@ -465,6 +535,43 @@ pub fn configure_codex_command(command: &str, endpoint: &str) -> String {
     configured
 }
 
+/// Append a Codex `notify` override so this task session's
+/// agent-turn-complete events reach the live instance. The bearer token
+/// is resolved from the terminal environment at event time and never
+/// appears in the command line. Overrides any user-level `notify`
+/// (Codex config holds a single value) for GitTerm task sessions only.
+pub fn configure_codex_notify(
+    command: &str,
+    notify_endpoint: &str,
+    task_id: &str,
+    session_id: &str,
+) -> String {
+    let trimmed = command.trim();
+    let executable_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let executable = &trimmed[..executable_end];
+    let executable_name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+    if executable_name != "codex" || trimmed.contains("notify=[") {
+        return command.to_string();
+    }
+    let url = format!("{notify_endpoint}?task_id={task_id}&session_id={session_id}");
+    // Codex appends the JSON payload as the program's last argument;
+    // with `sh -c` and one placeholder arg it lands in `$1`.
+    let script = format!(
+        "curl -fsS -m 5 -X POST -H \"Authorization: Bearer ${TASK_MCP_TOKEN_ENV}\" -H \"Content-Type: application/json\" --data-binary \"$1\" \"{url}\" >/dev/null 2>&1 || true"
+    );
+    // JSON string escaping is valid TOML basic-string escaping for this
+    // character set; the single quotes keep the value one shell word.
+    let elements = ["/bin/sh", "-c", script.as_str(), "gitterm-codex-notify"]
+        .iter()
+        .map(|element| Value::String((*element).to_string()).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{executable} --config 'notify=[{elements}]'{rest}",
+        rest = &trimmed[executable_end..]
+    )
+}
+
 fn codex_config_overrides(endpoint: &str) -> [String; 4] {
     [
         format!("mcp_servers.gitterm_tasks.url={endpoint}"),
@@ -602,6 +709,95 @@ mod tests {
         assert!(integration.contains("mcp_servers.gitterm_tasks.url="));
         assert!(integration.contains("gitterm_mcp_args"));
         assert!(!integration.contains("Bearer "));
+    }
+
+    #[test]
+    fn codex_notify_injection_targets_codex_and_keeps_the_token_out_of_the_command() {
+        let configured = configure_codex_notify(
+            "codex resume abc123",
+            "http://127.0.0.1:25030/notify",
+            "task-1",
+            "session-1",
+        );
+        assert!(configured.starts_with("codex --config 'notify=[\"/bin/sh\",\"-c\","));
+        assert!(configured.ends_with("' resume abc123"));
+        assert!(configured.contains("task_id=task-1&session_id=session-1"));
+        // The token is read from the terminal environment at event time;
+        // only the variable name may appear in the command line.
+        assert!(configured.contains(&format!("${TASK_MCP_TOKEN_ENV}")));
+        // Exactly the wrapping quote pair, so the zsh eval startup path
+        // keeps the TOML override as one shell word.
+        assert_eq!(configured.matches('\'').count(), 2);
+        assert_eq!(
+            configure_codex_notify(&configured, "http://127.0.0.1:25030/notify", "t", "s"),
+            configured
+        );
+        assert_eq!(
+            configure_codex_notify("claude --resume abc", "unused", "t", "s"),
+            "claude --resume abc"
+        );
+        assert!(configure_codex_notify(
+            "/opt/homebrew/bin/codex --model gpt-5",
+            "http://127.0.0.1:25030/notify",
+            "t",
+            "s"
+        )
+        .starts_with("/opt/homebrew/bin/codex --config 'notify=["));
+    }
+
+    #[tokio::test]
+    async fn notify_route_requires_auth_and_bridges_session_events() {
+        let (commands, mut requests) = mpsc::unbounded_channel();
+        let (connection, server) = prepare("notify-test", commands).unwrap();
+        let url = format!(
+            "{}?task_id=task-9&session_id=session-9",
+            connection.notify_endpoint()
+        );
+        let token = connection.token.clone();
+        let server_task = tokio::spawn(server.run());
+        let client = hyper::Client::new();
+        let payload = r#"{"type":"agent-turn-complete","turn-id":"t1"}"#;
+
+        let unauthorized = client
+            .request(
+                hyper::Request::post(url.as_str())
+                    .body(hyper::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), hyper::StatusCode::UNAUTHORIZED);
+
+        let responder = tokio::spawn(async move {
+            let envelope = requests.recv().await.expect("missing bridged notify");
+            match envelope.operation {
+                TaskControlOperation::SessionEvent(request) => {
+                    assert_eq!(request.task_id, "task-9");
+                    assert_eq!(request.session_id, "session-9");
+                    assert_eq!(request.event_type, "agent-turn-complete");
+                }
+                other => panic!("unexpected bridged operation: {other:?}"),
+            }
+            envelope.reply.send(Ok(serde_json::json!({ "ok": true })));
+        });
+        let authorized = client
+            .request(
+                hyper::Request::post(url.as_str())
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(hyper::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), hyper::StatusCode::OK);
+        responder.await.unwrap();
+
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("task MCP server did not shut down")
+            .expect("task MCP task panicked")
+            .expect("task MCP server returned an error");
     }
 
     #[tokio::test]
