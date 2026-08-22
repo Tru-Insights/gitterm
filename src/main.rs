@@ -7437,9 +7437,19 @@ impl App {
                     });
                 }
                 let timestamp = chrono::Utc::now().to_rfc3339();
-                self.task_store
+                let store = self
+                    .task_store
                     .as_mut()
-                    .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?
+                    .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?;
+                // Persist the requested harness before the Queued signal so a
+                // restart's queue rejoin resolves the same preset — otherwise
+                // the choice lives only in this process's memory (TRU-113).
+                if let Some(selection) = harness.clone() {
+                    store
+                        .record_requested_harness(task_id, selection, &timestamp)
+                        .map_err(|error| error.to_string())?;
+                }
+                store
                     .record_lifecycle_signal(task_id, TaskLifecycle::Queued, None, &timestamp)
                     .map_err(|error| error.to_string())?;
                 self.task_launch_queue.push(QueuedTaskLaunch {

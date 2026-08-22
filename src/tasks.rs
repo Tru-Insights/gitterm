@@ -791,6 +791,28 @@ impl TaskStore {
         self.replace(task)
     }
 
+    /// Remember the harness a deferred launch asked for, so a queue entry
+    /// that survives a restart relaunches with the same preset instead of
+    /// falling back to the first configured one. No lifecycle change — the
+    /// Queued signal follows separately.
+    pub fn record_requested_harness(
+        &mut self,
+        task_id: &str,
+        harness: HarnessSelection,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "record requested harness in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        task.harness = Some(harness);
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
     pub fn update_handoff(
         &mut self,
         task_id: &str,
@@ -1653,6 +1675,50 @@ mod tests {
             Some(&HarnessKind::TerminalPreset {
                 preset_name: "Codex".to_string()
             })
+        );
+    }
+
+    #[test]
+    fn requested_harness_recorded_at_queue_time_survives_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        let mut task = sample_task("task-1");
+        // A task deferred to the queue before its first launch has no
+        // recorded harness yet — that is exactly the case being fixed.
+        task.harness = None;
+        store.insert(task).unwrap();
+        make_ready(&mut store, "task-1");
+        let requested = HarnessSelection {
+            kind: HarnessKind::TerminalPreset {
+                preset_name: "Sleeper".to_string(),
+            },
+            model: None,
+        };
+
+        store
+            .record_requested_harness("task-1", requested.clone(), "2026-08-19T08:01:00Z")
+            .unwrap();
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Queued,
+                None,
+                "2026-08-19T08:01:00Z",
+            )
+            .unwrap();
+
+        let reloaded = TaskStore::load(path).unwrap();
+        let task = reloaded.get("task-1").unwrap();
+        assert_eq!(task.lifecycle, TaskLifecycle::Queued);
+        assert_eq!(task.harness.as_ref(), Some(&requested));
+        // The queued attempt carries the request too — signal-built attempts
+        // clone the task's harness.
+        assert_eq!(
+            task.attempts
+                .last()
+                .and_then(|attempt| attempt.harness.as_ref()),
+            Some(&requested)
         );
     }
 
