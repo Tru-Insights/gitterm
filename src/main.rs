@@ -8747,6 +8747,38 @@ impl App {
                         } else {
                             repo_dir.clone()
                         };
+                        // A task tab reopens its recorded conversation on
+                        // launch — relaunching the persisted plain harness
+                        // command would fork a fresh session and flip the
+                        // task back to Running, hiding the Resume verb.
+                        let mut startup_command = tab_config.startup_command.clone();
+                        let mut chat_session_id = tab_config.chat_session_id.clone();
+                        if startup_command.is_some() {
+                            let conversation = tab_config.task_id.as_ref().and_then(|task_id| {
+                                let task = app.task_store.as_ref()?.get(task_id)?;
+                                task.sessions
+                                    .iter()
+                                    .find(|session| {
+                                        Some(&session.task_session_id)
+                                            == tab_config.task_session_id.as_ref()
+                                    })
+                                    .and_then(|session| session.conversation.as_ref())
+                                    .or_else(|| {
+                                        // pi/codex conversations are linked to
+                                        // synthetic session records by the
+                                        // Chats sync; fall back to the task's
+                                        // latest, matching the Resume verb.
+                                        task.sessions
+                                            .iter()
+                                            .rev()
+                                            .find_map(|session| session.conversation.as_ref())
+                                    })
+                            });
+                            if let Some(conversation) = conversation {
+                                startup_command = Some(conversation_resume_command(conversation));
+                                chat_session_id = Some(conversation.session_id.clone());
+                            }
+                        }
                         match (
                             tab_config.tab_kind.as_deref(),
                             tab_config.agent_config.as_ref(),
@@ -8768,7 +8800,7 @@ impl App {
                                     &mut workspace,
                                     repo_dir,
                                     Some(current_dir),
-                                    tab_config.startup_command.clone(),
+                                    startup_command.clone(),
                                 );
                             }
                             (Some(other), _) if other != "terminal" => {
@@ -8781,7 +8813,7 @@ impl App {
                                     &mut workspace,
                                     repo_dir,
                                     Some(current_dir),
-                                    tab_config.startup_command.clone(),
+                                    startup_command.clone(),
                                 );
                             }
                             _ => {
@@ -8789,15 +8821,15 @@ impl App {
                                     &mut workspace,
                                     repo_dir,
                                     Some(current_dir),
-                                    tab_config.startup_command.clone(),
+                                    startup_command.clone(),
                                 );
                             }
                         }
                         // Restore the tab↔conversation mapping so the
                         // Chats registry rule survives restarts.
-                        if let Some(session_id) = &tab_config.chat_session_id {
+                        if let Some(session_id) = chat_session_id {
                             if let Some(tab) = workspace.tabs.last_mut() {
-                                tab.chat_session_id = Some(session_id.clone());
+                                tab.chat_session_id = Some(session_id);
                             }
                         }
                         if let Some(task_id) = &tab_config.task_id {
