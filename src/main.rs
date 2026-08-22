@@ -2416,16 +2416,28 @@ fn conversation_backend_label(backend: HarnessConversationBackend) -> &'static s
     }
 }
 
+fn conversation_chat_backend(backend: HarnessConversationBackend) -> chats::ChatBackend {
+    match backend {
+        HarnessConversationBackend::Claude => chats::ChatBackend::Claude,
+        HarnessConversationBackend::Codex => chats::ChatBackend::Codex,
+        HarnessConversationBackend::Pi => chats::ChatBackend::Pi,
+    }
+}
+
+fn conversation_backend_glyph(backend: HarnessConversationBackend) -> &'static str {
+    match backend {
+        HarnessConversationBackend::Claude => "✦",
+        HarnessConversationBackend::Codex => "⌁",
+        HarnessConversationBackend::Pi => "π",
+    }
+}
+
 /// Shell command that reopens a recorded task conversation with its
 /// full history. Derived from the task store alone — the Chats index
 /// is only built when the Chats panel opens, so resume must not
 /// depend on it.
 fn conversation_resume_command(conversation: &HarnessConversationRef) -> String {
-    let backend = match conversation.backend {
-        HarnessConversationBackend::Claude => chats::ChatBackend::Claude,
-        HarnessConversationBackend::Codex => chats::ChatBackend::Codex,
-        HarnessConversationBackend::Pi => chats::ChatBackend::Pi,
-    };
+    let backend = conversation_chat_backend(conversation.backend);
     backend.resume_command(backend.label(), &conversation.session_id)
 }
 
@@ -6360,32 +6372,35 @@ impl App {
         }
     }
 
-    fn task_agent_glyphs(&self, task_id: &str) -> String {
-        let mut glyphs = Vec::new();
-        for tab in self
-            .workspaces
-            .iter()
-            .flat_map(|workspace| workspace.tabs.iter())
-            .filter(|tab| tab.task_id.as_deref() == Some(task_id))
-        {
-            // repo_name is "{harness} · {title}" — match the harness segment
-            // only, so task titles containing "pi"/"claude" don't mis-glyph.
-            let label = tab.repo_name.to_lowercase();
-            let harness = label.split(" · ").next().unwrap_or(label.as_str());
-            let glyph = if harness.contains("claude") {
-                "✦"
-            } else if harness.contains("codex") {
-                "⌁"
-            } else if harness == "pi" {
-                "π"
-            } else {
-                "▶"
-            };
-            if !glyphs.contains(&glyph) {
-                glyphs.push(glyph);
+    /// Distinct harness backends across a task's recorded sessions, newest
+    /// first. Read from the record rather than open tabs so a stopped task
+    /// keeps its harness identity in the rail.
+    fn task_backends(&self, task: &TaskRecord) -> Vec<HarnessConversationBackend> {
+        let mut backends = Vec::new();
+        for session in task.sessions.iter().rev() {
+            let backend = session
+                .conversation
+                .as_ref()
+                .map(|conversation| conversation.backend)
+                .or_else(
+                    || match session.harness.as_ref().map(|harness| &harness.kind) {
+                        Some(HarnessKind::TerminalPreset { preset_name }) => self
+                            .agent_presets
+                            .iter()
+                            .find(|preset| &preset.name == preset_name)
+                            .and_then(preset_conversation_backend),
+                        Some(HarnessKind::NativeClaude) => Some(HarnessConversationBackend::Claude),
+                        Some(HarnessKind::NativePi) => Some(HarnessConversationBackend::Pi),
+                        None => None,
+                    },
+                );
+            if let Some(backend) = backend {
+                if !backends.contains(&backend) {
+                    backends.push(backend);
+                }
             }
         }
-        glyphs.join("")
+        backends
     }
 
     /// "today 14:02" for same-day timestamps, "Aug 19 14:02" otherwise;
@@ -21338,15 +21353,8 @@ fi
             } else if !compact && issue.is_none() {
                 title_row = title_row.push(text("local").size(9).color(text_muted).font(mono));
             }
-            let glyphs = self.task_agent_glyphs(&task.task_id);
             let state = self.task_state_copy(task);
-            let state = if glyphs.is_empty() {
-                state
-            } else {
-                format!("{state} · {glyphs}")
-            };
-            let mut row_copy = column![
-                title_row,
+            let mut state_row = Row::new().spacing(4).align_y(iced::Alignment::Center).push(
                 text(state)
                     .size(10)
                     .color(if Self::task_needs_attention(task) {
@@ -21355,7 +21363,22 @@ fi
                         text_muted
                     })
                     .font(mono),
-            ];
+            );
+            let backends = self.task_backends(task);
+            if !backends.is_empty() {
+                state_row = state_row.push(text("·").size(10).color(text_muted).font(mono));
+            }
+            for backend in backends {
+                // Same glyph-and-color identity the Chats list uses for
+                // each harness, so the two rails read the same way.
+                state_row = state_row.push(
+                    text(conversation_backend_glyph(backend))
+                        .size(10)
+                        .color(self.chat_backend_color(conversation_chat_backend(backend)))
+                        .font(mono),
+                );
+            }
+            let mut row_copy = column![title_row, state_row];
             // Third line: the session's own latest update while the task is
             // active — or an honest staleness marker when it has gone quiet.
             if !compact && task.lifecycle.is_active() {
@@ -21774,10 +21797,17 @@ fi
                 button(
                     row![
                         column![
-                            text(format!("{backend} · {}", session.label))
-                                .size(12)
-                                .color(text_primary)
-                                .font(mono),
+                            row![
+                                text("●").size(8).color(self.chat_backend_color(
+                                    conversation_chat_backend(conversation.backend)
+                                )),
+                                text(format!("{backend} · {}", session.label))
+                                    .size(12)
+                                    .color(text_primary)
+                                    .font(mono),
+                            ]
+                            .spacing(6)
+                            .align_y(iced::Alignment::Center),
                             text(short_id).size(10).color(text_muted).font(mono),
                         ]
                         .spacing(2)
