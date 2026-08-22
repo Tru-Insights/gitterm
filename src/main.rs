@@ -6387,10 +6387,19 @@ impl App {
                 "Session open · no brief".to_string()
             }
             TaskLifecycle::Ready => "Session open · delivery unknown".to_string(),
-            TaskLifecycle::Queued => match self.queued_task_position(&task.task_id) {
-                Some(position) => format!("Queued · #{position}"),
-                None => "Queued".to_string(),
-            },
+            TaskLifecycle::Queued => {
+                let mut copy = match self.queued_task_position(&task.task_id) {
+                    Some(position) => format!("Queued · #{position}"),
+                    None => "Queued".to_string(),
+                };
+                // Name what the wait is — slot holders may be restored
+                // sessions in another workspace, invisible from this rail.
+                let holders = self.local_slot_holders().len();
+                if holders > 0 {
+                    copy.push_str(&format!(" · behind {holders} running"));
+                }
+                copy
+            }
             TaskLifecycle::Running => {
                 // A silent session must not read as unqualified progress —
                 // some harnesses (Codex) never signal "waiting for input",
@@ -7255,8 +7264,10 @@ impl App {
         }
     }
 
-    /// Local tasks currently occupying an execution slot.
-    fn local_running_task_count(&self) -> usize {
+    /// Local tasks currently occupying an execution slot — a queued task is
+    /// waiting on exactly these. Slots are global across workspaces, so the
+    /// holders may live in a different workspace than the queued task.
+    fn local_slot_holders(&self) -> Vec<&TaskRecord> {
         self.task_store
             .as_ref()
             .map(|store| {
@@ -7270,9 +7281,14 @@ impl App {
                             TaskLifecycle::Running | TaskLifecycle::WaitingForInput
                         )
                     })
-                    .count()
+                    .collect()
             })
-            .unwrap_or(0)
+            .unwrap_or_default()
+    }
+
+    /// Local tasks currently occupying an execution slot.
+    fn local_running_task_count(&self) -> usize {
+        self.local_slot_holders().len()
     }
 
     /// 1-based place in the launch queue, for "Queued · #N" copy.
@@ -21819,7 +21835,20 @@ fi
             .unwrap_or_else(|| "None".to_string());
         let mut details = Column::new()
             .spacing(9)
-            .push(value_row("STATE", self.task_state_copy(task)))
+            .push(value_row("STATE", self.task_state_copy(task)));
+        if task.lifecycle == TaskLifecycle::Queued {
+            // Slot holders can live in another workspace, so name them here —
+            // the rail alone can't explain what a queued task is waiting on.
+            let holders = self
+                .local_slot_holders()
+                .iter()
+                .map(|holder| holder.title.clone())
+                .collect::<Vec<_>>();
+            if !holders.is_empty() {
+                details = details.push(value_row("WAITING ON", holders.join(" · ")));
+            }
+        }
+        details = details
             .push(value_row("ISSUE", issue))
             .push(value_row(
                 "BASE",
