@@ -2578,6 +2578,21 @@ struct TaskTabClosePrompt {
     task_id: String,
 }
 
+/// A dispatch the local concurrency limit deferred: the task sits in the
+/// store as `Queued`; this remembers which preset to start when a slot frees.
+#[derive(Debug, Clone)]
+struct QueuedTaskLaunch {
+    task_id: String,
+    preset_idx: Option<usize>,
+}
+
+/// Outcome of asking for a task child session: it started, or the local
+/// concurrency limit queued it (1-based position).
+enum TaskChildLaunch {
+    Started(Task<Event>, serde_json::Value),
+    Queued { position: usize },
+}
+
 /// The guarded fifth verb: "Delete worktree…". Opens with `inspection: None`
 /// while the safety check runs; the confirm action stays unavailable until an
 /// inspection reports no work would be lost.
@@ -4101,6 +4116,8 @@ pub enum Event {
     TaskResume(String),
     /// Route into the task-scoped Git changes view (the task worktree).
     TaskReviewChanges(String),
+    /// Take a queued task back out of the launch queue, returning it to Ready.
+    TaskQueueCancel(String),
     TaskRailFilterSelected(TaskRailFilter),
     TaskArchive(String),
     TaskSwitcherOpen,
@@ -4439,6 +4456,7 @@ struct App {
     task_store_error: Option<String>,
     task_ui_error: Option<String>,
     task_worktree_root: PathBuf,
+    max_concurrent_local_tasks: usize,
     selected_task_id: Option<String>,
     task_rail_filter: TaskRailFilter,
     task_rows_seen: HashSet<String>,
@@ -4456,6 +4474,11 @@ struct App {
     // cadence. Rendering reads this before the stored snapshot — it is
     // always at least as fresh.
     task_progress_pending: HashMap<String, PendingTaskProgress>,
+    // FIFO of task launches deferred by the local concurrency limit. The
+    // durable truth is the store's Queued lifecycle; this Vec carries the
+    // order and the chosen preset within a run, and is rebuilt from the
+    // store on startup.
+    task_launch_queue: Vec<QueuedTaskLaunch>,
     new_task_form: Option<NewTaskForm>,
     task_tab_close_prompt: Option<TaskTabClosePrompt>,
     task_worktree_delete_prompt: Option<TaskWorktreeDeletePrompt>,
@@ -5388,6 +5411,7 @@ impl App {
             agent_presets: self.agent_presets.clone(),
             quick_commands: self.quick_commands.clone(),
             task_worktree_root: self.task_worktree_root.clone(),
+            max_concurrent_local_tasks: self.max_concurrent_local_tasks,
         };
         config.save();
         let elapsed = started.elapsed();
@@ -6288,7 +6312,10 @@ impl App {
                 "Session open · no brief".to_string()
             }
             TaskLifecycle::Ready => "Session open · delivery unknown".to_string(),
-            TaskLifecycle::Queued => "Briefed".to_string(),
+            TaskLifecycle::Queued => match self.queued_task_position(&task.task_id) {
+                Some(position) => format!("Queued · #{position}"),
+                None => "Queued".to_string(),
+            },
             TaskLifecycle::Running => {
                 // A silent session must not read as unqualified progress —
                 // some harnesses (Codex) never signal "waiting for input",
@@ -7087,11 +7114,97 @@ impl App {
 
     fn launch_task_child(&mut self, task_id: &str, preset_idx: Option<usize>) -> Task<Event> {
         match self.try_launch_task_child(task_id, preset_idx, true) {
-            Ok((task, _session)) => task,
+            Ok(TaskChildLaunch::Started(task, _session)) => task,
+            Ok(TaskChildLaunch::Queued { .. }) => {
+                // The rail and overview state row show "Queued · #N" — no
+                // separate notice needed.
+                self.selected_task_id = Some(task_id.to_string());
+                self.task_ui_error = None;
+                Task::none()
+            }
             Err(error) => {
                 self.record_task_ui_error(task_id, error);
                 Task::none()
             }
+        }
+    }
+
+    /// Local tasks currently occupying an execution slot.
+    fn local_running_task_count(&self) -> usize {
+        self.task_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .tasks()
+                    .iter()
+                    .filter(|task| task.executor == ExecutorTarget::Local)
+                    .filter(|task| {
+                        matches!(
+                            task.lifecycle,
+                            TaskLifecycle::Running | TaskLifecycle::WaitingForInput
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// 1-based place in the launch queue, for "Queued · #N" copy.
+    fn queued_task_position(&self, task_id: &str) -> Option<usize> {
+        self.task_launch_queue
+            .iter()
+            .position(|entry| entry.task_id == task_id)
+            .map(|index| index + 1)
+    }
+
+    /// Start queued launches while capacity allows, oldest first. Called on
+    /// the Tick cadence and after explicit stops — never from the session
+    /// signal hot path.
+    fn promote_queued_tasks(&mut self) -> Task<Event> {
+        let mut started = Vec::new();
+        while !self.task_launch_queue.is_empty() {
+            let limit = self.max_concurrent_local_tasks.max(1);
+            if self.local_running_task_count() >= limit {
+                break;
+            }
+            let entry = self.task_launch_queue.remove(0);
+            // The queue only holds launches for tasks still marked Queued —
+            // anything cancelled, archived, or started by hand just drops out.
+            let still_queued = self
+                .task_store
+                .as_ref()
+                .and_then(|store| store.get(&entry.task_id))
+                .is_some_and(|task| task.lifecycle == TaskLifecycle::Queued);
+            if !still_queued {
+                continue;
+            }
+            match self.try_launch_task_child(&entry.task_id, entry.preset_idx, false) {
+                Ok(TaskChildLaunch::Started(task, _session)) => started.push(task),
+                Ok(TaskChildLaunch::Queued { .. }) => break,
+                Err(error) => {
+                    // A queued launch that can no longer start (worktree gone,
+                    // preset removed) must not sit "Queued" forever.
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    if let Some(store) = self.task_store.as_mut() {
+                        if let Err(store_error) = store.record_lifecycle_signal(
+                            &entry.task_id,
+                            TaskLifecycle::Failed,
+                            Some(error.clone()),
+                            &timestamp,
+                        ) {
+                            eprintln!(
+                                "GitTerm V5 dropped a queued-launch failure signal: {store_error}"
+                            );
+                        }
+                    }
+                    self.record_task_ui_error(&entry.task_id, error);
+                }
+            }
+        }
+        if started.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(started)
         }
     }
 
@@ -7100,7 +7213,7 @@ impl App {
         task_id: &str,
         preset_idx: Option<usize>,
         focus: bool,
-    ) -> Result<(Task<Event>, serde_json::Value), String> {
+    ) -> Result<TaskChildLaunch, String> {
         let Some(task) = self
             .task_store
             .as_ref()
@@ -7154,6 +7267,47 @@ impl App {
         let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
             return Err("Remote task sessions require the later remote-executor slice".to_string());
         };
+        // Concurrency gate: only agent launches occupy a slot, and a task
+        // already Running/WaitingForInput adds sessions without consuming a
+        // new one.
+        if launched_agent
+            && !matches!(
+                task.lifecycle,
+                TaskLifecycle::Running | TaskLifecycle::WaitingForInput
+            )
+        {
+            let queue_position = self
+                .task_launch_queue
+                .iter()
+                .position(|entry| entry.task_id == task_id);
+            let limit = self.max_concurrent_local_tasks.max(1);
+            if self.local_running_task_count() >= limit {
+                if let Some(position) = queue_position {
+                    // Dispatching an already-queued task again keeps its
+                    // place — it never jumps the line.
+                    return Ok(TaskChildLaunch::Queued {
+                        position: position + 1,
+                    });
+                }
+                let timestamp = chrono::Utc::now().to_rfc3339();
+                self.task_store
+                    .as_mut()
+                    .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?
+                    .record_lifecycle_signal(task_id, TaskLifecycle::Queued, None, &timestamp)
+                    .map_err(|error| error.to_string())?;
+                self.task_launch_queue.push(QueuedTaskLaunch {
+                    task_id: task_id.to_string(),
+                    preset_idx,
+                });
+                return Ok(TaskChildLaunch::Queued {
+                    position: self.task_launch_queue.len(),
+                });
+            }
+            // Capacity is free: a queued task that starts leaves the line.
+            if let Some(position) = queue_position {
+                self.task_launch_queue.remove(position);
+            }
+        }
         let original_workspace_dir = self
             .active_workspace()
             .map(|workspace| workspace.dir.clone());
@@ -7249,7 +7403,7 @@ impl App {
         } else {
             Task::none()
         };
-        Ok((focus_task, session))
+        Ok(TaskChildLaunch::Started(focus_task, session))
     }
 
     /// Focus a specific tab, switching workspaces first when needed
@@ -8188,6 +8342,44 @@ impl App {
                 (None, Some(message))
             }
         };
+        // Tasks left Queued by a previous run rejoin the launch queue in
+        // dispatch order; the preset comes from the recorded harness, falling
+        // back to the first configured preset.
+        let task_launch_queue = task_store
+            .as_ref()
+            .map(|store| {
+                let mut queued: Vec<_> = store
+                    .tasks()
+                    .iter()
+                    .filter(|task| task.lifecycle == TaskLifecycle::Queued)
+                    .collect();
+                queued.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+                queued
+                    .into_iter()
+                    .map(|task| {
+                        let preset_idx = task
+                            .harness
+                            .as_ref()
+                            .and_then(|harness| match &harness.kind {
+                                HarnessKind::TerminalPreset { preset_name } => config
+                                    .agent_presets
+                                    .iter()
+                                    .position(|preset| &preset.name == preset_name),
+                                HarnessKind::NativeClaude | HarnessKind::NativePi => None,
+                            })
+                            .or(if config.agent_presets.is_empty() {
+                                None
+                            } else {
+                                Some(0)
+                            });
+                        QueuedTaskLaunch {
+                            task_id: task.task_id.clone(),
+                            preset_idx,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let (browser_mcp, browser_mcp_server, browser_error) =
             match browser_mcp::prepare(config::global_config_dir(), config::instance_id()) {
                 Ok((connection, server)) => {
@@ -8251,6 +8443,7 @@ impl App {
             task_store_error,
             task_ui_error: None,
             task_worktree_root: config.task_worktree_root.clone(),
+            max_concurrent_local_tasks: config.max_concurrent_local_tasks,
             selected_task_id: None,
             task_rail_filter: TaskRailFilter::All,
             task_rows_seen: HashSet::new(),
@@ -8260,6 +8453,7 @@ impl App {
             task_context_mru: VecDeque::from([None]),
             task_last_session_tab: HashMap::new(),
             task_progress_pending: HashMap::new(),
+            task_launch_queue,
             new_task_form: None,
             task_tab_close_prompt: None,
             task_worktree_delete_prompt: None,
@@ -10371,9 +10565,17 @@ fi
                         None => None,
                     };
                     match self.try_launch_task_child(&request.task_id, preset_idx, false) {
-                        Ok((task, session)) => {
+                        Ok(TaskChildLaunch::Started(task, session)) => {
                             envelope.reply.send(Ok(session));
                             return task;
+                        }
+                        Ok(TaskChildLaunch::Queued { position }) => {
+                            envelope.reply.send(Ok(serde_json::json!({
+                                "task_id": request.task_id,
+                                "queued": true,
+                                "queue_position": position,
+                                "detail": "The local concurrency limit deferred this launch; it starts automatically when a slot frees.",
+                            })));
                         }
                         Err(error) => envelope.reply.send(Err(error)),
                     }
@@ -10989,6 +11191,13 @@ fi
                 }
                 if workspace_dirty {
                     self.mark_workspaces_dirty();
+                }
+
+                // Start queued task launches whenever capacity has freed up
+                // (a session ending, the limit being raised, a task archived).
+                if !self.task_launch_queue.is_empty() {
+                    let promoted = self.promote_queued_tasks();
+                    tasks.push(promoted);
                 }
 
                 // Debounced task progress persistence (no-ops unless a
@@ -12922,7 +13131,9 @@ fi
                 self.selected_task_id = Some(task_id);
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
-                return self.scroll_to_active_tab();
+                // Stopping frees a slot — hand it to the queue right away.
+                let promoted = self.promote_queued_tasks();
+                return Task::batch([self.scroll_to_active_tab(), promoted]);
             }
             Event::TaskResume(task_id) => {
                 // Prefer resuming the most recent recorded conversation —
@@ -12955,7 +13166,9 @@ fi
                         self.focus_workspace_tab(workspace_idx, tab_idx)
                     }
                     None => match self.try_launch_task_child(&task_id, None, true) {
-                        Ok((focus, _session)) => focus,
+                        // A plain terminal never hits the concurrency gate.
+                        Ok(TaskChildLaunch::Started(focus, _session)) => focus,
+                        Ok(TaskChildLaunch::Queued { .. }) => Task::none(),
                         Err(error) => {
                             self.record_task_ui_error(&task_id, error);
                             return Task::none();
@@ -12967,6 +13180,27 @@ fi
                     self.update(Event::SetSidebarMode(SidebarMode::Git)),
                     self.update(Event::SetGitViewMode(GitViewMode::Changes)),
                 ]);
+            }
+            Event::TaskQueueCancel(task_id) => {
+                self.task_launch_queue
+                    .retain(|entry| entry.task_id != task_id);
+                let timestamp = chrono::Utc::now().to_rfc3339();
+                match self.task_store.as_mut() {
+                    Some(store) => {
+                        if let Err(error) = store.record_lifecycle_signal(
+                            &task_id,
+                            TaskLifecycle::Ready,
+                            None,
+                            &timestamp,
+                        ) {
+                            self.task_ui_error = Some(error.to_string());
+                        }
+                    }
+                    None => {
+                        self.task_ui_error =
+                            Some("GitTerm's task store became unavailable".to_string());
+                    }
+                }
             }
             Event::TaskRailFilterSelected(filter) => {
                 self.task_rail_filter = filter;
@@ -21285,7 +21519,7 @@ fi
                 .unwrap_or_else(|| {
                     match task.lifecycle {
                         TaskLifecycle::Preparing => "Preparing",
-                        TaskLifecycle::Queued => "Briefed",
+                        TaskLifecycle::Queued => "Queued",
                         TaskLifecycle::Running => "Working",
                         TaskLifecycle::WaitingForInput => "Waiting for input",
                         _ => "Active",
@@ -21500,6 +21734,14 @@ fi
                     .style(self.ghost_button_style())
                     .padding([7, 12])
                     .on_press(Event::TaskStop(task.task_id.clone())),
+            );
+        }
+        if task.lifecycle == TaskLifecycle::Queued {
+            verbs = verbs.push(
+                button(text("Cancel queue").size(12).font(mono))
+                    .style(self.ghost_button_style())
+                    .padding([7, 12])
+                    .on_press(Event::TaskQueueCancel(task.task_id.clone())),
             );
         }
         verbs = verbs.push(archive);

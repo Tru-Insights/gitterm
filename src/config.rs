@@ -319,6 +319,10 @@ fn default_stt_enabled() -> bool {
     true
 }
 
+fn default_max_concurrent_local_tasks() -> usize {
+    2
+}
+
 // Persistent configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -356,6 +360,12 @@ pub struct Config {
     pub quick_commands: Vec<QuickCommand>,
     #[serde(default = "default_task_worktree_root")]
     pub task_worktree_root: PathBuf,
+    /// How many local tasks may run agent sessions at once. Dispatching past
+    /// the limit queues the task; capacity release starts the next in FIFO
+    /// order. Zero is treated as 1 — a limit that can never start anything
+    /// would strand every dispatch.
+    #[serde(default = "default_max_concurrent_local_tasks")]
+    pub max_concurrent_local_tasks: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +472,7 @@ impl Default for Config {
             agent_presets: default_agent_presets(),
             quick_commands: Vec::new(),
             task_worktree_root: default_task_worktree_root(),
+            max_concurrent_local_tasks: default_max_concurrent_local_tasks(),
         }
     }
 }

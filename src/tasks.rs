@@ -333,9 +333,11 @@ impl TaskLifecycle {
                 next,
                 Self::Preparing | Self::Queued | Self::Running | Self::Archived
             ),
+            // Ready is the cancel path: a queued task that never started can
+            // step back out of the queue without pretending it ran.
             Self::Queued => matches!(
                 next,
-                Self::Running | Self::Stopped | Self::Failed | Self::Interrupted
+                Self::Ready | Self::Running | Self::Stopped | Self::Failed | Self::Interrupted
             ),
             Self::Running | Self::WaitingForInput => matches!(
                 next,
@@ -972,6 +974,14 @@ impl TaskStore {
                 }
                 (false, None) => {}
             }
+        } else if let Some(existing) = task.attempts.iter().position(|item| item.state.is_active())
+        {
+            // A between-runs target (Ready via queue cancel) closes the
+            // attempt that never got to run.
+            let attempt = &mut task.attempts[existing];
+            attempt.state = AttemptState::Stopped;
+            attempt.ended_at = Some(timestamp.to_string());
+            task.active_attempt_id = None;
         }
         let has_new_detail = last_error.is_some();
         if let Some(detail) = last_error {
@@ -1127,6 +1137,11 @@ impl TaskStore {
         let mut reconciled = 0;
         for task in &mut candidate.tasks {
             if task.executor != ExecutorTarget::Local || !task.lifecycle.is_active() {
+                continue;
+            }
+            // A queued task had nothing running to interrupt — it stays
+            // queued and rejoins the launch queue on startup.
+            if task.lifecycle == TaskLifecycle::Queued {
                 continue;
             }
             for attempt in &mut task.attempts {
@@ -2406,6 +2421,34 @@ mod tests {
             .dismiss_attention("task-1", "2026-08-19T08:08:00Z")
             .unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn queued_task_can_cancel_back_to_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        make_ready(&mut store, "task-1");
+        store
+            .record_lifecycle_signal(
+                "task-1",
+                TaskLifecycle::Queued,
+                None,
+                "2026-08-19T08:05:00Z",
+            )
+            .unwrap();
+        assert_eq!(
+            store.get("task-1").unwrap().lifecycle,
+            TaskLifecycle::Queued
+        );
+        // Cancelling the queue steps back to Ready without pretending it ran.
+        store
+            .record_lifecycle_signal("task-1", TaskLifecycle::Ready, None, "2026-08-19T08:06:00Z")
+            .unwrap();
+        let task = store.get("task-1").unwrap();
+        assert_eq!(task.lifecycle, TaskLifecycle::Ready);
+        assert_eq!(task.attention, TaskAttention::default());
     }
 
     #[test]
