@@ -20467,6 +20467,71 @@ fi
             .size(11)
             .color(theme.text_muted())
             .font(iced::Font::with_name("Menlo"));
+
+        // === Right section: fixed workspace metadata (mic, workspace
+        // name, close ×, branch) — V4 parity, restored for TRU-120.
+        let mut metadata_row = Row::new().spacing(4).align_y(iced::Alignment::Center);
+
+        // STT mic indicator
+        #[cfg(feature = "stt")]
+        if self.stt_enabled {
+            let (mic_icon, mic_color) = if self.stt_recording {
+                // Pulsing red/peach mic when recording
+                let c = if self.attention_pulse_bright {
+                    theme.danger()
+                } else {
+                    theme.peach()
+                };
+                ("\u{25CF} REC", c) // ● REC
+            } else if self.stt_transcribing {
+                ("\u{2026}", theme.warning()) // … (processing)
+            } else {
+                ("\u{25CB}", theme.overlay0()) // ○ grey idle
+            };
+            metadata_row = metadata_row.push(
+                text(mic_icon)
+                    .size(11)
+                    .color(mic_color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+
+        if let Some(ws) = self.active_workspace() {
+            let ws_color = ws.color.color(theme);
+            metadata_row = metadata_row.push(
+                text(&ws.name)
+                    .size(12)
+                    .color(ws_color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+
+            // Close workspace button (only if more than one workspace, matching
+            // the WorkspaceClose handler's guard so the button never no-ops)
+            if self.workspaces.len() > 1 {
+                let close_color = theme.overlay0();
+                let close_hover = theme.text_primary();
+                let ws_idx = self.active_workspace_idx;
+                let close_ws_btn = button(text("\u{00d7}").size(12).color(close_color))
+                    .style(move |_theme, status| {
+                        let tc = if matches!(status, button::Status::Hovered) {
+                            close_hover
+                        } else {
+                            close_color
+                        };
+                        button::Style {
+                            background: Some(iced::Color::TRANSPARENT.into()),
+                            text_color: tc,
+                            ..Default::default()
+                        }
+                    })
+                    .padding([2, 4])
+                    .on_press(Event::WorkspaceClose(ws_idx));
+                metadata_row = metadata_row.push(close_ws_btn);
+            }
+        }
+
+        metadata_row = metadata_row.push(branch_copy);
+
         let strip = row![
             container(stamp_row).padding(iced::Padding {
                 top: 4.0,
@@ -20475,7 +20540,7 @@ fi
                 left: 8.0,
             }),
             scrollable_tabs,
-            container(branch_copy)
+            container(metadata_row)
                 .padding([4, 10])
                 .align_y(iced::Alignment::Center)
         ]
