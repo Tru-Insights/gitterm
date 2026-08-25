@@ -2545,6 +2545,52 @@ summary before stopping when that tool is available.",
     )
 }
 
+/// Directory holding composed task briefs. A launch command hands the full
+/// multiline brief to the harness via `"$(cat <path>)"`, so the content never
+/// needs shell escaping — only the path does. Files are kept after launch:
+/// they are small and double as an audit record of what each session was told.
+fn task_brief_dir() -> PathBuf {
+    config::global_config_dir().join("task-briefs")
+}
+
+/// Whether this backend's CLI accepts a positional initial prompt
+/// (`claude "…"`, `codex "…"`, `pi [messages…]`). Plain terminals and unknown
+/// presets keep the clipboard flow.
+fn backend_accepts_initial_prompt(backend: Option<HarnessConversationBackend>) -> bool {
+    matches!(
+        backend,
+        Some(
+            HarnessConversationBackend::Claude
+                | HarnessConversationBackend::Codex
+                | HarnessConversationBackend::Pi
+        )
+    )
+}
+
+/// Writes the composed brief for one task session and returns its path, or a
+/// launch-safe error. Refuses paths containing a single quote — the path is
+/// embedded single-quoted in the launch command.
+fn write_task_brief(session_id: &str, task: &TaskRecord) -> Result<PathBuf, String> {
+    let dir = task_brief_dir();
+    let path = dir.join(format!("{session_id}.md"));
+    if path.display().to_string().contains('\'') {
+        return Err(format!(
+            "brief path {} contains a single quote and cannot be shell-quoted",
+            path.display()
+        ));
+    }
+    std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    std::fs::write(&path, task_handoff_prompt(task))
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+/// Appends the brief file as the harness's positional initial prompt. The
+/// brief content stays in the file; only its quote-checked path is embedded.
+fn command_with_initial_prompt(command: &str, brief_path: &Path) -> String {
+    format!("{command} \"$(cat '{}')\"", brief_path.display())
+}
+
 #[derive(Debug, Clone)]
 struct NewTaskForm {
     task_id: String,
@@ -6424,6 +6470,13 @@ impl App {
             {
                 "Session open · no brief".to_string()
             }
+            TaskLifecycle::Ready
+                if open_sessions.iter().all(|session| {
+                    session.objective_delivery == ObjectiveDeliveryState::Delivered
+                }) =>
+            {
+                "Session open · briefed".to_string()
+            }
             TaskLifecycle::Ready => "Session open · delivery unknown".to_string(),
             TaskLifecycle::Queued => {
                 let mut copy = match self.queued_task_position(&task.task_id) {
@@ -7647,6 +7700,31 @@ impl App {
             }
             other => other,
         };
+        // TRU-128: deliver the composed brief as the harness's initial prompt
+        // so every launch — UI picker and MCP task_launch_session alike —
+        // starts briefed instead of amnesiac. The pre-injection command is
+        // kept for the persisted startup command: a restart must never
+        // re-submit the objective into a fresh conversation.
+        let pre_injection_command = command.clone();
+        let (command, objective_delivery) = match command {
+            Some(launch) if backend_accepts_initial_prompt(conversation_backend) => {
+                match write_task_brief(&session_id, &task) {
+                    Ok(brief_path) => (
+                        Some(command_with_initial_prompt(&launch, &brief_path)),
+                        ObjectiveDeliveryState::Delivered,
+                    ),
+                    Err(error) => {
+                        eprintln!(
+                            "[tasks] Brief for task {task_id} session {session_id} could not be \
+                             embedded ({error}); the session starts unbriefed — paste the \
+                             clipboard copy"
+                        );
+                        (Some(launch), ObjectiveDeliveryState::NotDelivered)
+                    }
+                }
+            }
+            other => (other, ObjectiveDeliveryState::NotDelivered),
+        };
         let workspace_idx =
             self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
         let workspace_name = self.workspaces[workspace_idx].name.clone();
@@ -7670,6 +7748,11 @@ impl App {
             // the resume command so an app restart reconnects instead of trying
             // to create the same pre-assigned Claude session again.
             tab.set_startup_command(Some(format!("claude --resume {chat_session_id}")));
+        } else if objective_delivery == ObjectiveDeliveryState::Delivered {
+            // Codex/Pi have no persisted resume; a restart re-runs the launch
+            // command, which must stay brief-free so the objective is never
+            // re-submitted (create_tab stored the injected command).
+            tab.set_startup_command(pre_injection_command.clone());
         }
         tab.repo_name = format!("{child_label} · {}", task.title);
         tab.sidebar_mode = SidebarMode::Tasks;
@@ -7683,7 +7766,7 @@ impl App {
             label: child_label.clone(),
             harness: harness.clone(),
             conversation,
-            objective_delivery: ObjectiveDeliveryState::NotDelivered,
+            objective_delivery,
             created_at: timestamp.clone(),
             updated_at: timestamp.clone(),
         };
@@ -17971,9 +18054,11 @@ fi
             .spacing(3);
             if self.task_handoff_copied {
                 header = header.push(
-                    text("Handoff copied — paste it into the new session")
-                        .size(9)
-                        .color(text_secondary),
+                    text(
+                        "Agents start briefed automatically — clipboard holds a copy for terminals",
+                    )
+                    .size(9)
+                    .color(text_secondary),
                 );
             }
             header = header.push(text("AGENTS").size(9).color(text_secondary).font(mono));
@@ -28876,6 +28961,32 @@ mod tests {
         assert!(handoff.contains("Continue the existing implementation safely"));
         assert!(handoff.contains("/worktrees/task-105"));
         assert!(handoff.contains("Inspect git status and the current diff"));
+    }
+
+    #[test]
+    fn initial_prompt_supported_for_agent_backends_only() {
+        assert!(backend_accepts_initial_prompt(Some(
+            HarnessConversationBackend::Claude
+        )));
+        assert!(backend_accepts_initial_prompt(Some(
+            HarnessConversationBackend::Codex
+        )));
+        assert!(backend_accepts_initial_prompt(Some(
+            HarnessConversationBackend::Pi
+        )));
+        assert!(!backend_accepts_initial_prompt(None));
+    }
+
+    #[test]
+    fn command_with_initial_prompt_embeds_brief_file() {
+        let command = command_with_initial_prompt(
+            "claude --session-id abc",
+            Path::new("/cfg/task-briefs/abc.md"),
+        );
+        assert_eq!(
+            command,
+            "claude --session-id abc \"$(cat '/cfg/task-briefs/abc.md')\""
+        );
     }
 
     #[test]
