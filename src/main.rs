@@ -8815,6 +8815,55 @@ impl App {
                 }
             }
         }
+        // Codex subagent rollouts — the approval arbiter and similar
+        // harness-internal conversations — were historically linked as task
+        // sessions by the Chats sync and could hijack restore, which falls
+        // back to the task's latest conversation (TRU-126). New ones are no
+        // longer indexed at all; this prunes records written before that.
+        // Must run before tabs are restored so the fallback reads clean data.
+        if let Some(store) = task_store.as_mut() {
+            let codex_ids: HashSet<String> = store
+                .tasks()
+                .iter()
+                .flat_map(|task| task.sessions.iter())
+                .filter_map(|session| session.conversation.as_ref())
+                .filter(|conversation| conversation.backend == HarnessConversationBackend::Codex)
+                .map(|conversation| conversation.session_id.clone())
+                .collect();
+            let subagents = chats::codex_subagent_conversations(&codex_ids);
+            if !subagents.is_empty() {
+                let is_subagent = |session: &TaskSessionRecord| {
+                    session
+                        .conversation
+                        .as_ref()
+                        .is_some_and(|conversation| subagents.contains(&conversation.session_id))
+                };
+                let polluted: Vec<TaskRecord> = store
+                    .tasks()
+                    .iter()
+                    .filter(|task| task.sessions.iter().any(is_subagent))
+                    .cloned()
+                    .collect();
+                for mut task in polluted {
+                    // Synthetic records exist only to expose the conversation
+                    // and go entirely; a launched session's record stays but
+                    // sheds the ref so nothing can resume into the arbiter.
+                    task.sessions.retain(|session| {
+                        !(is_subagent(session) && session.task_session_id.starts_with("chat-"))
+                    });
+                    for session in &mut task.sessions {
+                        if is_subagent(session) {
+                            session.conversation = None;
+                        }
+                    }
+                    if let Err(error) = store.replace(task) {
+                        eprintln!(
+                            "GitTerm V5 could not prune a subagent conversation record: {error}"
+                        );
+                    }
+                }
+            }
+        }
         // Tasks left Queued by a previous run rejoin the launch queue in
         // dispatch order; the preset comes from the recorded harness, falling
         // back to the first configured preset.

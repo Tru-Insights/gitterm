@@ -10,7 +10,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -454,8 +454,20 @@ fn pi_message(value: &Value) -> Option<(bool, String)> {
     (!text.is_empty()).then(|| (is_user, text.to_string()))
 }
 
+/// Whether a codex `session_meta` payload marks a subagent rollout —
+/// a conversation codex spawned for itself (`source: {"subagent": …}`,
+/// e.g. the "guardian" approval arbiter) rather than a human chat.
+/// Human sessions carry `source: "cli"`; older rollouts have no source.
+fn codex_meta_is_subagent(payload: &Value) -> bool {
+    payload
+        .get("source")
+        .is_some_and(|source| source.get("subagent").is_some())
+}
+
 /// Index one codex rollout. Returns None for headless `codex exec` runs
-/// (originator carries "exec") and sessions with no real user message.
+/// (originator carries "exec"), subagent rollouts (approval arbiters and
+/// similar harness-internal sessions), and sessions with no real user
+/// message.
 fn index_codex_transcript(path: &Path) -> Option<ChatIndexEntry> {
     let meta = std::fs::metadata(path).ok()?;
     let file = std::fs::File::open(path).ok()?;
@@ -480,6 +492,9 @@ fn index_codex_transcript(path: &Path) -> Option<ChatIndexEntry> {
                 .and_then(Value::as_str)
                 .is_some_and(|originator| originator.contains("exec"))
             {
+                return None;
+            }
+            if codex_meta_is_subagent(payload) {
                 return None;
             }
             id = payload
@@ -650,6 +665,51 @@ pub fn claude_session_exists(session_id: &str) -> bool {
     entries
         .flatten()
         .any(|entry| entry.path().join(&file_name).is_file())
+}
+
+/// Which of these codex conversation ids belong to subagent rollouts
+/// (approval arbiters and similar harness-internal sessions). Matches
+/// rollout files by name and reads one head line per matched id, so the
+/// cost scales with `ids`, not the sessions tree. Ids whose transcript
+/// is missing or unreadable are not returned — absence is not evidence.
+/// Blocking; run outside update()/view() or only over small id sets.
+pub fn codex_subagent_conversations(ids: &HashSet<String>) -> HashSet<String> {
+    codex_subagent_conversations_under(&home_dir().join(".codex").join("sessions"), ids)
+}
+
+fn codex_subagent_conversations_under(dir: &Path, ids: &HashSet<String>) -> HashSet<String> {
+    let mut subagents = HashSet::new();
+    if ids.is_empty() {
+        return subagents;
+    }
+    // Rollout files are named `rollout-<timestamp>-<session-id>.jsonl`.
+    for path in jsonl_files_under(dir, 3) {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(id) = ids.iter().find(|id| stem.ends_with(id.as_str())) else {
+            continue;
+        };
+        if subagents.contains(id) {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file.take(HEAD_SCAN_BYTES));
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() {
+            continue;
+        }
+        let is_subagent = serde_json::from_str::<Value>(&line).is_ok_and(|value| {
+            value.get("type").and_then(Value::as_str) == Some("session_meta")
+                && value.get("payload").is_some_and(codex_meta_is_subagent)
+        });
+        if is_subagent {
+            subagents.insert(id.clone());
+        }
+    }
+    subagents
 }
 
 /// Build the full local index across all backends. Blocking; run on a
@@ -903,6 +963,50 @@ mod tests {
             &[meta.as_str(), user.as_str()],
         );
         assert!(index_codex_transcript(&path).is_none());
+    }
+
+    fn codex_subagent_meta_line(id: &str) -> String {
+        serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": id, "cwd": "/tmp/x", "originator": "codex-tui",
+                        "source": {"subagent": {"other": "guardian"}},
+                        "git": {"branch": "main"}}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn codex_index_skips_subagent_rollouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = codex_subagent_meta_line("019e-arb");
+        let user = codex_user_line(
+            "The following is the Codex agent history whose request action you are assessing.",
+        );
+        let path = write_transcript(
+            dir.path(),
+            "rollout-arbiter.jsonl",
+            &[meta.as_str(), user.as_str()],
+        );
+        assert!(index_codex_transcript(&path).is_none());
+    }
+
+    #[test]
+    fn codex_subagent_lookup_flags_only_subagent_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let arbiter = codex_subagent_meta_line("019e-arb");
+        let human = codex_meta_line("019e-hum", "/tmp/x", "main", "codex-tui");
+        write_transcript(dir.path(), "rollout-t1-019e-arb.jsonl", &[arbiter.as_str()]);
+        write_transcript(dir.path(), "rollout-t2-019e-hum.jsonl", &[human.as_str()]);
+
+        let ids: HashSet<String> = ["019e-arb", "019e-hum", "019e-gone"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let subagents = codex_subagent_conversations_under(dir.path(), &ids);
+        assert!(subagents.contains("019e-arb"));
+        // Human sessions and missing transcripts are never flagged.
+        assert!(!subagents.contains("019e-hum"));
+        assert!(!subagents.contains("019e-gone"));
     }
 
     #[test]
