@@ -7385,7 +7385,7 @@ impl App {
     /// Kick off an async delivery probe (worktree HEAD + open-PR lookup) for
     /// a task with a prepared local worktree; a no-op Task otherwise.
     /// Discovery only reads state — publishing stays behind explicit actions.
-    fn probe_task_delivery(&self, task_id: &str) -> Task<Event> {
+    fn probe_task_delivery(&mut self, task_id: &str) -> Task<Event> {
         let Some(task) = self
             .task_store
             .as_ref()
@@ -7403,6 +7403,19 @@ impl App {
             return Task::none();
         }
         let branch = task.branch.clone();
+        if !worktree_path.is_dir() {
+            // The worktree was removed outside GitTerm (agent cleanup after
+            // a merge, a manual `git worktree remove`). Probing it would only
+            // raise "No such file or directory" at the user — note the state
+            // on the record and leave the last known delivery in place.
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            if let Some(store) = self.task_store.as_mut() {
+                if let Err(error) = store.mark_worktree_missing(task_id, &timestamp) {
+                    self.task_ui_error = Some(error.to_string());
+                }
+            }
+            return Task::none();
+        }
         let task_id = task_id.to_string();
         Task::perform(
             discover_task_delivery(worktree_path, branch),
@@ -22331,7 +22344,10 @@ fi
             .worktree
             .path
             .as_ref()
-            .map(|path| path.display().to_string())
+            .map(|path| match task.worktree.state {
+                TaskWorktreeState::Missing => format!("{} (missing)", path.display()),
+                _ => path.display().to_string(),
+            })
             .unwrap_or_else(|| "Not prepared".to_string());
         let issue = task
             .issue
