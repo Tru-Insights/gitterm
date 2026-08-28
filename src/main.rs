@@ -47,6 +47,7 @@ use gitterm::browser_control::{
 };
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
+use gitterm::gh_identity::GH_ACCOUNT_ENV_KEY;
 use gitterm::task_mcp::{
     self, CreateTaskRequest as McpCreateTaskRequest, TaskControlEnvelope, TaskControlOperation,
     TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
@@ -7382,6 +7383,19 @@ impl App {
         self.local_slot_holders().len()
     }
 
+    /// The gh login pinned for a task's workspace via the `GITTERM_GH_ACCOUNT`
+    /// workspace env var; None lets delivery probe logged-in accounts for one
+    /// with access to the repository.
+    fn task_gh_account(&self, task_id: &str) -> Option<String> {
+        let task = self.task_store.as_ref()?.get(task_id)?;
+        self.workspaces
+            .iter()
+            .find(|workspace| self.task_belongs_to_workspace(task, workspace))
+            .and_then(|workspace| workspace.env.get(GH_ACCOUNT_ENV_KEY))
+            .map(|account| account.trim().to_string())
+            .filter(|account| !account.is_empty())
+    }
+
     /// Kick off an async delivery probe (worktree HEAD + open-PR lookup) for
     /// a task with a prepared local worktree; a no-op Task otherwise.
     /// Discovery only reads state — publishing stays behind explicit actions.
@@ -7416,9 +7430,10 @@ impl App {
             }
             return Task::none();
         }
+        let gh_account = self.task_gh_account(task_id);
         let task_id = task_id.to_string();
         Task::perform(
-            discover_task_delivery(worktree_path, branch),
+            discover_task_delivery(worktree_path, branch, gh_account),
             move |result| {
                 Event::TaskDeliveryDiscovered(task_id, result.map_err(|error| error.to_string()))
             },
@@ -7494,16 +7509,18 @@ impl App {
                 Event::TaskPublishCompleted(task_id, result.map_err(|error| error.to_string()))
             }
         };
+        let gh_account = self.task_gh_account(task_id);
         self.task_publish_busy.insert(task_id.to_string());
         match action {
-            TaskPublishAction::PushBranch => {
-                Task::perform(push_task_branch(worktree_path, branch), completed)
-            }
+            TaskPublishAction::PushBranch => Task::perform(
+                push_task_branch(worktree_path, branch, gh_account),
+                completed,
+            ),
             TaskPublishAction::OpenDraftPr => {
                 let base = pr_base_branch(&task.base.reference).to_string();
                 let (title, body) = task.draft_pr_copy();
                 Task::perform(
-                    open_task_draft_pr(worktree_path, branch, base, title, body),
+                    open_task_draft_pr(worktree_path, branch, base, title, body, gh_account),
                     completed,
                 )
             }
@@ -18499,6 +18516,13 @@ fi
             .size(12)
             .color(accent)
             .font(mono);
+        let gh_account_hint = text(format!(
+            "{GH_ACCOUNT_ENV_KEY}=<login> pins the gh account for task pushes and PRs; \
+             otherwise the logged-in account with access to the repo is used."
+        ))
+        .size(11)
+        .color(text_muted)
+        .font(mono);
 
         let mut env_col = Column::new().spacing(4);
 
@@ -18629,6 +18653,7 @@ fi
             profile_row,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             section_label,
+            gh_account_hint,
             container(iced::widget::Space::new()).height(Length::Fixed(6.0)),
             scrollable(env_col).height(Length::Fixed(200.0)),
             container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
