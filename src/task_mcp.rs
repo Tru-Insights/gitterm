@@ -523,7 +523,7 @@ impl ServerHandler for TaskMcpTools {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "These tools control GitTerm's durable tasks. A task is an isolated job with its own git worktree; a task session is one visible harness or terminal inside that task. Use task_create_batch for an approved set of independent issues, then task_launch_session for each worker. Task creation and session launch are distinct: launching currently opens the harness but does not type or submit the stored objective. Before stopping or handing work to another harness, use task_update_handoff to record a concise durable summary, decisions, next steps, and blockers. Never edit GitTerm's tasks.json or worktree registry directly.",
+                "These tools control GitTerm's durable tasks. A task is an isolated job with its own git worktree; a task session is one visible harness or terminal inside that task. Use task_create_batch for an approved set of independent issues, then task_launch_session for each worker. Task creation and session launch are distinct: launching an agent preset opens the harness with the stored objective and latest handoff delivered as its initial prompt; a plain terminal session receives nothing. Before stopping or handing work to another harness, use task_update_handoff to record a concise durable summary, decisions, next steps, and blockers. Never edit GitTerm's tasks.json or worktree registry directly.",
             )
     }
 }

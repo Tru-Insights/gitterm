@@ -751,6 +751,29 @@ impl TaskStore {
         self.replace(task)
     }
 
+    /// Records that a prepared worktree no longer exists on disk — removed
+    /// outside GitTerm (an agent ran `git worktree remove`, a manual
+    /// cleanup). The path is kept so the overview can still name it.
+    pub fn mark_worktree_missing(
+        &mut self,
+        task_id: &str,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "mark worktree missing in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        if task.worktree.state == TaskWorktreeState::Missing {
+            return Ok(());
+        }
+        task.worktree.state = TaskWorktreeState::Missing;
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
     pub fn fail_worktree_preparation(
         &mut self,
         task_id: &str,
@@ -1647,6 +1670,31 @@ mod tests {
         task.lifecycle = TaskLifecycle::Ready;
         task.updated_at = "2026-08-19T08:00:45Z".to_string();
         store.replace(task).unwrap();
+    }
+
+    #[test]
+    fn marking_a_worktree_missing_keeps_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(&temp.path().join(TASKS_FILE_NAME)).unwrap();
+        let mut task = sample_task("task-1");
+        task.worktree = TaskWorktree {
+            state: TaskWorktreeState::Ready,
+            path: Some(PathBuf::from("/tmp/worktrees/task-1")),
+        };
+        store.insert(task).unwrap();
+
+        store
+            .mark_worktree_missing("task-1", "2026-08-28T00:00:00Z")
+            .unwrap();
+
+        let task = store.get("task-1").unwrap();
+        assert_eq!(task.worktree.state, TaskWorktreeState::Missing);
+        assert_eq!(
+            task.worktree.path.as_deref(),
+            Some(std::path::Path::new("/tmp/worktrees/task-1"))
+        );
+        assert_eq!(task.updated_at, "2026-08-28T00:00:00Z");
+        assert!(store.mark_worktree_missing("task-9", "later").is_err());
     }
 
     #[test]

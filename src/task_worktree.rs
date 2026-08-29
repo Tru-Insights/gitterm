@@ -1,4 +1,5 @@
 use crate::agentd::git::git_command;
+use crate::gh_identity::{self, GhIdentity};
 use crate::tasks::{CompletedWorktreePreparation, GitBase, RepositoryIdentity};
 use std::fmt;
 use std::fs;
@@ -676,29 +677,34 @@ pub async fn inspect_task_cleanup(
 pub async fn discover_task_delivery(
     worktree_path: PathBuf,
     branch: String,
+    gh_account: Option<String>,
 ) -> Result<DeliveryDiscovery, TaskWorktreeError> {
     let error_path = worktree_path.clone();
-    tokio::task::spawn_blocking(move || discover_delivery_blocking(&worktree_path, &branch))
-        .await
-        .map_err(|error| {
-            TaskWorktreeError::new(
-                "join delivery discovery worker",
-                error_path,
-                error.to_string(),
-            )
-        })?
+    tokio::task::spawn_blocking(move || {
+        let identity = resolve_gh_identity(&worktree_path, gh_account.as_deref())?;
+        discover_delivery_blocking(&worktree_path, &branch, &identity)
+    })
+    .await
+    .map_err(|error| {
+        TaskWorktreeError::new(
+            "join delivery discovery worker",
+            error_path,
+            error.to_string(),
+        )
+    })?
 }
 
 fn discover_delivery_blocking(
     worktree_path: &Path,
     branch: &str,
+    identity: &GhIdentity,
 ) -> Result<DeliveryDiscovery, TaskWorktreeError> {
     let operation = "read task worktree head";
     let output = run_git(worktree_path, operation, &["rev-parse", "HEAD"])?;
     let local_head = stdout_text(&output, worktree_path, operation)?
         .trim()
         .to_string();
-    let pull_request = lookup_branch_pull_request(worktree_path, branch)?;
+    let pull_request = lookup_branch_pull_request(worktree_path, branch, identity)?;
     Ok(DeliveryDiscovery {
         local_head,
         pull_request,
@@ -711,15 +717,13 @@ fn discover_delivery_blocking(
 pub async fn push_task_branch(
     worktree_path: PathBuf,
     branch: String,
+    gh_account: Option<String>,
 ) -> Result<DeliveryDiscovery, TaskWorktreeError> {
     let error_path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
-        run_git(
-            &worktree_path,
-            "push task branch",
-            &["push", "--set-upstream", "origin", &branch],
-        )?;
-        discover_delivery_blocking(&worktree_path, &branch)
+        let identity = resolve_gh_identity(&worktree_path, gh_account.as_deref())?;
+        push_branch_as(&worktree_path, &branch, &identity)?;
+        discover_delivery_blocking(&worktree_path, &branch, &identity)
     })
     .await
     .map_err(|error| TaskWorktreeError::new("join push worker", error_path, error.to_string()))?
@@ -735,23 +739,22 @@ pub async fn open_task_draft_pr(
     base: String,
     title: String,
     body: String,
+    gh_account: Option<String>,
 ) -> Result<DeliveryDiscovery, TaskWorktreeError> {
     let error_path = worktree_path.clone();
     tokio::task::spawn_blocking(move || {
-        run_git(
-            &worktree_path,
-            "push task branch",
-            &["push", "--set-upstream", "origin", &branch],
-        )?;
+        let identity = resolve_gh_identity(&worktree_path, gh_account.as_deref())?;
+        push_branch_as(&worktree_path, &branch, &identity)?;
         run_gh(
             &worktree_path,
+            &identity,
             "open draft pull request",
             &[
                 "pr", "create", "--draft", "--head", &branch, "--base", &base, "--title", &title,
                 "--body", &body,
             ],
         )?;
-        discover_delivery_blocking(&worktree_path, &branch)
+        discover_delivery_blocking(&worktree_path, &branch, &identity)
     })
     .await
     .map_err(|error| {
@@ -776,10 +779,12 @@ pub fn pr_base_branch(reference: &str) -> &str {
 fn lookup_branch_pull_request(
     worktree_path: &Path,
     branch: &str,
+    identity: &GhIdentity,
 ) -> Result<Option<DiscoveredPullRequest>, TaskWorktreeError> {
     let operation = "look up task pull request";
     let output = run_gh(
         worktree_path,
+        identity,
         operation,
         &[
             "pr",
@@ -797,47 +802,73 @@ fn lookup_branch_pull_request(
         .map_err(|detail| TaskWorktreeError::new(operation, worktree_path, detail))
 }
 
-/// Runs the `gh` CLI in a worktree, surfacing nonzero exits with stderr. The
-/// app may be Finder-launched with a minimal PATH, so fall back to the
-/// standard Homebrew/Intel install locations before giving up. stdin is null
-/// so gh can never stall waiting for interactive input.
+/// Resolves which gh account acts for the worktree's repository — the
+/// workspace-pinned login when set, otherwise the logged-in account that can
+/// push there. Task delivery never depends on the globally active gh account.
+fn resolve_gh_identity(
+    worktree_path: &Path,
+    gh_account: Option<&str>,
+) -> Result<GhIdentity, TaskWorktreeError> {
+    gh_identity::resolve(worktree_path, gh_account).map_err(|error| {
+        TaskWorktreeError::new("resolve gh account for", worktree_path, error.to_string())
+    })
+}
+
+/// `git push --set-upstream origin <branch>` as `identity`: the gh credential
+/// helper honors `GH_TOKEN`, so HTTPS remotes push under the same login gh
+/// will use for the pull request. SSH remotes ignore it and use the key.
+fn push_branch_as(
+    worktree_path: &Path,
+    branch: &str,
+    identity: &GhIdentity,
+) -> Result<Output, TaskWorktreeError> {
+    let operation = "push task branch";
+    let mut command = git_command();
+    identity.apply(&mut command);
+    let output = command
+        .args(["push", "--set-upstream", "origin", branch])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|error| TaskWorktreeError::new(operation, worktree_path, error.to_string()))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        gh_identity::forget(worktree_path);
+        Err(command_failure(operation, worktree_path, &output))
+    }
+}
+
+/// Runs the `gh` CLI in a worktree as `identity`, surfacing nonzero exits
+/// with stderr and the account that was used. A failure drops the cached
+/// identity so the next attempt re-resolves (revoked token, changed login).
 fn run_gh(
     worktree_path: &Path,
+    identity: &GhIdentity,
     operation: &'static str,
     arguments: &[&str],
 ) -> Result<Output, TaskWorktreeError> {
-    for candidate in ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
-        let result = std::process::Command::new(candidate)
-            .args(arguments)
-            .current_dir(worktree_path)
-            .stdin(std::process::Stdio::null())
-            .output();
-        let output = match result {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(TaskWorktreeError::new(
-                    operation,
-                    worktree_path,
-                    error.to_string(),
-                ))
-            }
-            Ok(output) => output,
-        };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(TaskWorktreeError::new(
-                operation,
-                worktree_path,
-                format!("gh exited with status {}: {stderr}", output.status),
-            ));
-        }
-        return Ok(output);
+    let mut command = gh_identity::gh_command()
+        .map_err(|error| TaskWorktreeError::new(operation, worktree_path, error.to_string()))?;
+    identity.apply(&mut command);
+    let output = command
+        .args(arguments)
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|error| TaskWorktreeError::new(operation, worktree_path, error.to_string()))?;
+    if !output.status.success() {
+        gh_identity::forget(worktree_path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(TaskWorktreeError::new(
+            operation,
+            worktree_path,
+            format!(
+                "gh (as {}) exited with status {}: {stderr}",
+                identity.account(),
+                output.status
+            ),
+        ));
     }
-    Err(TaskWorktreeError::new(
-        operation,
-        worktree_path,
-        "gh CLI not found on PATH, /opt/homebrew/bin, or /usr/local/bin",
-    ))
+    Ok(output)
 }
 
 fn parse_pull_request_rows(json: &str) -> Result<Option<DiscoveredPullRequest>, String> {

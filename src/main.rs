@@ -47,6 +47,7 @@ use gitterm::browser_control::{
 };
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
+use gitterm::gh_identity::GH_ACCOUNT_ENV_KEY;
 use gitterm::task_mcp::{
     self, CreateTaskRequest as McpCreateTaskRequest, TaskControlEnvelope, TaskControlOperation,
     TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
@@ -2543,6 +2544,52 @@ summary before stopping when that tool is available.",
         base_commit = task.base.commit,
         stopping_boundary = stopping_boundary_label(task.stopping_boundary),
     )
+}
+
+/// Directory holding composed task briefs. A launch command hands the full
+/// multiline brief to the harness via `"$(cat <path>)"`, so the content never
+/// needs shell escaping — only the path does. Files are kept after launch:
+/// they are small and double as an audit record of what each session was told.
+fn task_brief_dir() -> PathBuf {
+    config::global_config_dir().join("task-briefs")
+}
+
+/// Whether this backend's CLI accepts a positional initial prompt
+/// (`claude "…"`, `codex "…"`, `pi [messages…]`). Plain terminals and unknown
+/// presets keep the clipboard flow.
+fn backend_accepts_initial_prompt(backend: Option<HarnessConversationBackend>) -> bool {
+    matches!(
+        backend,
+        Some(
+            HarnessConversationBackend::Claude
+                | HarnessConversationBackend::Codex
+                | HarnessConversationBackend::Pi
+        )
+    )
+}
+
+/// Writes the composed brief for one task session and returns its path, or a
+/// launch-safe error. Refuses paths containing a single quote — the path is
+/// embedded single-quoted in the launch command.
+fn write_task_brief(session_id: &str, task: &TaskRecord) -> Result<PathBuf, String> {
+    let dir = task_brief_dir();
+    let path = dir.join(format!("{session_id}.md"));
+    if path.display().to_string().contains('\'') {
+        return Err(format!(
+            "brief path {} contains a single quote and cannot be shell-quoted",
+            path.display()
+        ));
+    }
+    std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    std::fs::write(&path, task_handoff_prompt(task))
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+/// Appends the brief file as the harness's positional initial prompt. The
+/// brief content stays in the file; only its quote-checked path is embedded.
+fn command_with_initial_prompt(command: &str, brief_path: &Path) -> String {
+    format!("{command} \"$(cat '{}')\"", brief_path.display())
 }
 
 #[derive(Debug, Clone)]
@@ -6424,6 +6471,13 @@ impl App {
             {
                 "Session open · no brief".to_string()
             }
+            TaskLifecycle::Ready
+                if open_sessions.iter().all(|session| {
+                    session.objective_delivery == ObjectiveDeliveryState::Delivered
+                }) =>
+            {
+                "Session open · briefed".to_string()
+            }
             TaskLifecycle::Ready => "Session open · delivery unknown".to_string(),
             TaskLifecycle::Queued => {
                 let mut copy = match self.queued_task_position(&task.task_id) {
@@ -7329,10 +7383,23 @@ impl App {
         self.local_slot_holders().len()
     }
 
+    /// The gh login pinned for a task's workspace via the `GITTERM_GH_ACCOUNT`
+    /// workspace env var; None lets delivery probe logged-in accounts for one
+    /// with access to the repository.
+    fn task_gh_account(&self, task_id: &str) -> Option<String> {
+        let task = self.task_store.as_ref()?.get(task_id)?;
+        self.workspaces
+            .iter()
+            .find(|workspace| self.task_belongs_to_workspace(task, workspace))
+            .and_then(|workspace| workspace.env.get(GH_ACCOUNT_ENV_KEY))
+            .map(|account| account.trim().to_string())
+            .filter(|account| !account.is_empty())
+    }
+
     /// Kick off an async delivery probe (worktree HEAD + open-PR lookup) for
     /// a task with a prepared local worktree; a no-op Task otherwise.
     /// Discovery only reads state — publishing stays behind explicit actions.
-    fn probe_task_delivery(&self, task_id: &str) -> Task<Event> {
+    fn probe_task_delivery(&mut self, task_id: &str) -> Task<Event> {
         let Some(task) = self
             .task_store
             .as_ref()
@@ -7350,9 +7417,23 @@ impl App {
             return Task::none();
         }
         let branch = task.branch.clone();
+        if !worktree_path.is_dir() {
+            // The worktree was removed outside GitTerm (agent cleanup after
+            // a merge, a manual `git worktree remove`). Probing it would only
+            // raise "No such file or directory" at the user — note the state
+            // on the record and leave the last known delivery in place.
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            if let Some(store) = self.task_store.as_mut() {
+                if let Err(error) = store.mark_worktree_missing(task_id, &timestamp) {
+                    self.task_ui_error = Some(error.to_string());
+                }
+            }
+            return Task::none();
+        }
+        let gh_account = self.task_gh_account(task_id);
         let task_id = task_id.to_string();
         Task::perform(
-            discover_task_delivery(worktree_path, branch),
+            discover_task_delivery(worktree_path, branch, gh_account),
             move |result| {
                 Event::TaskDeliveryDiscovered(task_id, result.map_err(|error| error.to_string()))
             },
@@ -7428,16 +7509,18 @@ impl App {
                 Event::TaskPublishCompleted(task_id, result.map_err(|error| error.to_string()))
             }
         };
+        let gh_account = self.task_gh_account(task_id);
         self.task_publish_busy.insert(task_id.to_string());
         match action {
-            TaskPublishAction::PushBranch => {
-                Task::perform(push_task_branch(worktree_path, branch), completed)
-            }
+            TaskPublishAction::PushBranch => Task::perform(
+                push_task_branch(worktree_path, branch, gh_account),
+                completed,
+            ),
             TaskPublishAction::OpenDraftPr => {
                 let base = pr_base_branch(&task.base.reference).to_string();
                 let (title, body) = task.draft_pr_copy();
                 Task::perform(
-                    open_task_draft_pr(worktree_path, branch, base, title, body),
+                    open_task_draft_pr(worktree_path, branch, base, title, body, gh_account),
                     completed,
                 )
             }
@@ -7647,6 +7730,31 @@ impl App {
             }
             other => other,
         };
+        // TRU-128: deliver the composed brief as the harness's initial prompt
+        // so every launch — UI picker and MCP task_launch_session alike —
+        // starts briefed instead of amnesiac. The pre-injection command is
+        // kept for the persisted startup command: a restart must never
+        // re-submit the objective into a fresh conversation.
+        let pre_injection_command = command.clone();
+        let (command, objective_delivery) = match command {
+            Some(launch) if backend_accepts_initial_prompt(conversation_backend) => {
+                match write_task_brief(&session_id, &task) {
+                    Ok(brief_path) => (
+                        Some(command_with_initial_prompt(&launch, &brief_path)),
+                        ObjectiveDeliveryState::Delivered,
+                    ),
+                    Err(error) => {
+                        eprintln!(
+                            "[tasks] Brief for task {task_id} session {session_id} could not be \
+                             embedded ({error}); the session starts unbriefed — paste the \
+                             clipboard copy"
+                        );
+                        (Some(launch), ObjectiveDeliveryState::NotDelivered)
+                    }
+                }
+            }
+            other => (other, ObjectiveDeliveryState::NotDelivered),
+        };
         let workspace_idx =
             self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
         let workspace_name = self.workspaces[workspace_idx].name.clone();
@@ -7670,6 +7778,11 @@ impl App {
             // the resume command so an app restart reconnects instead of trying
             // to create the same pre-assigned Claude session again.
             tab.set_startup_command(Some(format!("claude --resume {chat_session_id}")));
+        } else if objective_delivery == ObjectiveDeliveryState::Delivered {
+            // Codex/Pi have no persisted resume; a restart re-runs the launch
+            // command, which must stay brief-free so the objective is never
+            // re-submitted (create_tab stored the injected command).
+            tab.set_startup_command(pre_injection_command.clone());
         }
         tab.repo_name = format!("{child_label} · {}", task.title);
         tab.sidebar_mode = SidebarMode::Tasks;
@@ -7683,7 +7796,7 @@ impl App {
             label: child_label.clone(),
             harness: harness.clone(),
             conversation,
-            objective_delivery: ObjectiveDeliveryState::NotDelivered,
+            objective_delivery,
             created_at: timestamp.clone(),
             updated_at: timestamp.clone(),
         };
@@ -8729,6 +8842,55 @@ impl App {
                     eprintln!(
                         "GitTerm V5 could not prune a phantom Claude conversation ref: {error}"
                     );
+                }
+            }
+        }
+        // Codex subagent rollouts — the approval arbiter and similar
+        // harness-internal conversations — were historically linked as task
+        // sessions by the Chats sync and could hijack restore, which falls
+        // back to the task's latest conversation (TRU-126). New ones are no
+        // longer indexed at all; this prunes records written before that.
+        // Must run before tabs are restored so the fallback reads clean data.
+        if let Some(store) = task_store.as_mut() {
+            let codex_ids: HashSet<String> = store
+                .tasks()
+                .iter()
+                .flat_map(|task| task.sessions.iter())
+                .filter_map(|session| session.conversation.as_ref())
+                .filter(|conversation| conversation.backend == HarnessConversationBackend::Codex)
+                .map(|conversation| conversation.session_id.clone())
+                .collect();
+            let subagents = chats::codex_subagent_conversations(&codex_ids);
+            if !subagents.is_empty() {
+                let is_subagent = |session: &TaskSessionRecord| {
+                    session
+                        .conversation
+                        .as_ref()
+                        .is_some_and(|conversation| subagents.contains(&conversation.session_id))
+                };
+                let polluted: Vec<TaskRecord> = store
+                    .tasks()
+                    .iter()
+                    .filter(|task| task.sessions.iter().any(is_subagent))
+                    .cloned()
+                    .collect();
+                for mut task in polluted {
+                    // Synthetic records exist only to expose the conversation
+                    // and go entirely; a launched session's record stays but
+                    // sheds the ref so nothing can resume into the arbiter.
+                    task.sessions.retain(|session| {
+                        !(is_subagent(session) && session.task_session_id.starts_with("chat-"))
+                    });
+                    for session in &mut task.sessions {
+                        if is_subagent(session) {
+                            session.conversation = None;
+                        }
+                    }
+                    if let Err(error) = store.replace(task) {
+                        eprintln!(
+                            "GitTerm V5 could not prune a subagent conversation record: {error}"
+                        );
+                    }
                 }
             }
         }
@@ -17971,9 +18133,11 @@ fi
             .spacing(3);
             if self.task_handoff_copied {
                 header = header.push(
-                    text("Handoff copied — paste it into the new session")
-                        .size(9)
-                        .color(text_secondary),
+                    text(
+                        "Agents start briefed automatically — clipboard holds a copy for terminals",
+                    )
+                    .size(9)
+                    .color(text_secondary),
                 );
             }
             header = header.push(text("AGENTS").size(9).color(text_secondary).font(mono));
@@ -18352,6 +18516,13 @@ fi
             .size(12)
             .color(accent)
             .font(mono);
+        let gh_account_hint = text(format!(
+            "{GH_ACCOUNT_ENV_KEY}=<login> pins the gh account for task pushes and PRs; \
+             otherwise the logged-in account with access to the repo is used."
+        ))
+        .size(11)
+        .color(text_muted)
+        .font(mono);
 
         let mut env_col = Column::new().spacing(4);
 
@@ -18482,6 +18653,7 @@ fi
             profile_row,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             section_label,
+            gh_account_hint,
             container(iced::widget::Space::new()).height(Length::Fixed(6.0)),
             scrollable(env_col).height(Length::Fixed(200.0)),
             container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
@@ -20467,6 +20639,71 @@ fi
             .size(11)
             .color(theme.text_muted())
             .font(iced::Font::with_name("Menlo"));
+
+        // === Right section: fixed workspace metadata (mic, workspace
+        // name, close ×, branch) — V4 parity, restored for TRU-120.
+        let mut metadata_row = Row::new().spacing(4).align_y(iced::Alignment::Center);
+
+        // STT mic indicator
+        #[cfg(feature = "stt")]
+        if self.stt_enabled {
+            let (mic_icon, mic_color) = if self.stt_recording {
+                // Pulsing red/peach mic when recording
+                let c = if self.attention_pulse_bright {
+                    theme.danger()
+                } else {
+                    theme.peach()
+                };
+                ("\u{25CF} REC", c) // ● REC
+            } else if self.stt_transcribing {
+                ("\u{2026}", theme.warning()) // … (processing)
+            } else {
+                ("\u{25CB}", theme.overlay0()) // ○ grey idle
+            };
+            metadata_row = metadata_row.push(
+                text(mic_icon)
+                    .size(11)
+                    .color(mic_color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+
+        if let Some(ws) = self.active_workspace() {
+            let ws_color = ws.color.color(theme);
+            metadata_row = metadata_row.push(
+                text(&ws.name)
+                    .size(12)
+                    .color(ws_color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+
+            // Close workspace button (only if more than one workspace, matching
+            // the WorkspaceClose handler's guard so the button never no-ops)
+            if self.workspaces.len() > 1 {
+                let close_color = theme.overlay0();
+                let close_hover = theme.text_primary();
+                let ws_idx = self.active_workspace_idx;
+                let close_ws_btn = button(text("\u{00d7}").size(12).color(close_color))
+                    .style(move |_theme, status| {
+                        let tc = if matches!(status, button::Status::Hovered) {
+                            close_hover
+                        } else {
+                            close_color
+                        };
+                        button::Style {
+                            background: Some(iced::Color::TRANSPARENT.into()),
+                            text_color: tc,
+                            ..Default::default()
+                        }
+                    })
+                    .padding([2, 4])
+                    .on_press(Event::WorkspaceClose(ws_idx));
+                metadata_row = metadata_row.push(close_ws_btn);
+            }
+        }
+
+        metadata_row = metadata_row.push(branch_copy);
+
         let strip = row![
             container(stamp_row).padding(iced::Padding {
                 top: 4.0,
@@ -20475,7 +20712,7 @@ fi
                 left: 8.0,
             }),
             scrollable_tabs,
-            container(branch_copy)
+            container(metadata_row)
                 .padding([4, 10])
                 .align_y(iced::Alignment::Center)
         ]
@@ -22132,7 +22369,10 @@ fi
             .worktree
             .path
             .as_ref()
-            .map(|path| path.display().to_string())
+            .map(|path| match task.worktree.state {
+                TaskWorktreeState::Missing => format!("{} (missing)", path.display()),
+                _ => path.display().to_string(),
+            })
             .unwrap_or_else(|| "Not prepared".to_string());
         let issue = task
             .issue
@@ -28811,6 +29051,32 @@ mod tests {
         assert!(handoff.contains("Continue the existing implementation safely"));
         assert!(handoff.contains("/worktrees/task-105"));
         assert!(handoff.contains("Inspect git status and the current diff"));
+    }
+
+    #[test]
+    fn initial_prompt_supported_for_agent_backends_only() {
+        assert!(backend_accepts_initial_prompt(Some(
+            HarnessConversationBackend::Claude
+        )));
+        assert!(backend_accepts_initial_prompt(Some(
+            HarnessConversationBackend::Codex
+        )));
+        assert!(backend_accepts_initial_prompt(Some(
+            HarnessConversationBackend::Pi
+        )));
+        assert!(!backend_accepts_initial_prompt(None));
+    }
+
+    #[test]
+    fn command_with_initial_prompt_embeds_brief_file() {
+        let command = command_with_initial_prompt(
+            "claude --session-id abc",
+            Path::new("/cfg/task-briefs/abc.md"),
+        );
+        assert_eq!(
+            command,
+            "claude --session-id abc \"$(cat '/cfg/task-briefs/abc.md')\""
+        );
     }
 
     #[test]
