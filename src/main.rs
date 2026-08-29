@@ -7359,6 +7359,10 @@ impl App {
     /// Local tasks currently occupying an execution slot — a queued task is
     /// waiting on exactly these. Slots are global across workspaces, so the
     /// holders may live in a different workspace than the queued task.
+    /// Only `Running` tasks hold a slot: a task parked in `WaitingForInput`
+    /// is blocked on the human, not on the machine, so it releases its slot
+    /// and reclaims one (without re-queuing) when its agent resumes — the
+    /// cap can therefore be briefly exceeded after an answer (TRU-129).
     fn local_slot_holders(&self) -> Vec<&TaskRecord> {
         self.task_store
             .as_ref()
@@ -7367,12 +7371,7 @@ impl App {
                     .tasks()
                     .iter()
                     .filter(|task| task.executor == ExecutorTarget::Local)
-                    .filter(|task| {
-                        matches!(
-                            task.lifecycle,
-                            TaskLifecycle::Running | TaskLifecycle::WaitingForInput
-                        )
-                    })
+                    .filter(|task| task.lifecycle == TaskLifecycle::Running)
                     .collect()
             })
             .unwrap_or_default()
