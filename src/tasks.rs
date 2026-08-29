@@ -402,6 +402,29 @@ pub struct TaskAttention {
     pub reason: Option<TaskAttentionReason>,
     #[serde(default)]
     pub unread: bool,
+    /// When the current `reason` was first raised (RFC 3339). Unlike
+    /// `updated_at`, this survives unrelated record writes, so the inbox can
+    /// order rows by how long they have been waiting without reshuffling
+    /// every time progress is captured (TRU-133).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+}
+
+impl TaskAttention {
+    /// Raise `reason` as unread attention. The `since` stamp is kept from
+    /// `previous` when it already carries the same reason, so re-raising an
+    /// unchanged reason does not make the task look newly waiting.
+    pub fn raised(reason: TaskAttentionReason, previous: &Self, timestamp: &str) -> Self {
+        let since = match (&previous.reason, &previous.since) {
+            (Some(prior), Some(since)) if *prior == reason => Some(since.clone()),
+            _ => Some(timestamp.to_string()),
+        };
+        Self {
+            reason: Some(reason),
+            unread: true,
+            since,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -798,10 +821,11 @@ impl TaskStore {
         };
         task.lifecycle = TaskLifecycle::Failed;
         task.last_error = Some(detail);
-        task.attention = TaskAttention {
-            reason: Some(TaskAttentionReason::ExecutionFailed),
-            unread: true,
-        };
+        task.attention = TaskAttention::raised(
+            TaskAttentionReason::ExecutionFailed,
+            &task.attention,
+            timestamp,
+        );
         task.updated_at = timestamp.to_string();
         self.replace(task)
     }
@@ -820,10 +844,11 @@ impl TaskStore {
             )
         })?;
         task.last_error = Some(detail);
-        task.attention = TaskAttention {
-            reason: Some(TaskAttentionReason::ExecutionFailed),
-            unread: true,
-        };
+        task.attention = TaskAttention::raised(
+            TaskAttentionReason::ExecutionFailed,
+            &task.attention,
+            timestamp,
+        );
         task.updated_at = timestamp.to_string();
         self.replace(task)
     }
@@ -1101,19 +1126,21 @@ impl TaskStore {
             task.last_error = Some(detail);
         }
         if target == TaskLifecycle::Failed {
-            task.attention = TaskAttention {
-                reason: Some(TaskAttentionReason::ExecutionFailed),
-                unread: true,
-            };
+            task.attention = TaskAttention::raised(
+                TaskAttentionReason::ExecutionFailed,
+                &task.attention,
+                timestamp,
+            );
         } else if target == TaskLifecycle::Completed && current != target {
             // Completion is attention until the task is visited — the visit
             // (not a glance at the rail) acknowledges it. The current==target
             // guard keeps a repeated completion signal from re-marking a task
             // the user already read.
-            task.attention = TaskAttention {
-                reason: Some(TaskAttentionReason::CompletedUnread),
-                unread: true,
-            };
+            task.attention = TaskAttention::raised(
+                TaskAttentionReason::CompletedUnread,
+                &task.attention,
+                timestamp,
+            );
         } else if target.is_active() {
             // The task is observably running again, so any failure/outcome
             // attention from a previous attempt is superseded — otherwise the
@@ -1268,10 +1295,8 @@ impl TaskStore {
             task.active_attempt_id = None;
             task.lifecycle = TaskLifecycle::Interrupted;
             task.updated_at = timestamp.to_string();
-            task.attention = TaskAttention {
-                reason: Some(TaskAttentionReason::Interrupted),
-                unread: true,
-            };
+            task.attention =
+                TaskAttention::raised(TaskAttentionReason::Interrupted, &task.attention, timestamp);
             task.last_error =
                 Some("GitTerm restarted while this local execution was active".to_string());
             reconciled += 1;
@@ -1602,6 +1627,31 @@ fn validate_task(task: &TaskRecord) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raised_attention_keeps_since_while_reason_is_unchanged() {
+        let first = TaskAttention::raised(
+            TaskAttentionReason::ExecutionFailed,
+            &TaskAttention::default(),
+            "2026-08-29T10:00:00Z",
+        );
+        assert_eq!(first.since.as_deref(), Some("2026-08-29T10:00:00Z"));
+        assert!(first.unread);
+
+        let again = TaskAttention::raised(
+            TaskAttentionReason::ExecutionFailed,
+            &first,
+            "2026-08-29T10:05:00Z",
+        );
+        assert_eq!(again.since.as_deref(), Some("2026-08-29T10:00:00Z"));
+
+        let changed = TaskAttention::raised(
+            TaskAttentionReason::CompletedUnread,
+            &again,
+            "2026-08-29T10:10:00Z",
+        );
+        assert_eq!(changed.since.as_deref(), Some("2026-08-29T10:10:00Z"));
+    }
 
     fn sample_task(task_id: &str) -> TaskRecord {
         TaskRecord::new_draft(

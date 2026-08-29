@@ -2213,7 +2213,7 @@ impl TabAttention {
 }
 
 /// Where an attention inbox row leads when selected.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AttentionTarget {
     Tab(usize),
     Task(String),
@@ -10876,7 +10876,12 @@ fi
                     continue;
                 };
                 let (priority, icon, label) = task_attention_presentation(reason);
-                let age_secs = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
+                // Age from when the reason was raised, not `updated_at` —
+                // that bumps on every progress write and would walk the row
+                // around the inbox while the agent works (TRU-133). Records
+                // written before `since` existed fall back to `updated_at`.
+                let raised_at = task.attention.since.as_deref().unwrap_or(&task.updated_at);
+                let age_secs = chrono::DateTime::parse_from_rfc3339(raised_at)
                     .ok()
                     .map(|updated| {
                         chrono::Utc::now()
@@ -10908,10 +10913,13 @@ fi
                 });
             }
         }
+        // Oldest-waiting first within a priority; the target id breaks ties
+        // so two rows with equal ages never swap between frames.
         items.sort_by(|left, right| {
             left.priority
                 .cmp(&right.priority)
                 .then(right.age_secs.cmp(&left.age_secs))
+                .then_with(|| left.target.cmp(&right.target))
         });
         items
     }
