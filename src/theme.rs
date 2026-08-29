@@ -456,17 +456,21 @@ impl AppTheme {
         }
     }
 
+    // Secondary/muted must stay on the palette's *text* tiers (subtext0,
+    // overlay2). The old values reached down into overlay0/surface1, which
+    // Catppuccin reserves for borders — as text they were unreadable on the
+    // dark base/crust backgrounds.
     pub fn text_secondary(&self) -> Color {
         match self {
-            AppTheme::Dark => color!(0x6c7086),
-            AppTheme::Light => color!(0x8c8fa1),
+            AppTheme::Dark => color!(0xa6adc8),
+            AppTheme::Light => color!(0x6c6f85),
         }
     }
 
     pub fn text_muted(&self) -> Color {
         match self {
-            AppTheme::Dark => color!(0x45475a),
-            AppTheme::Light => color!(0xbcc0cc),
+            AppTheme::Dark => color!(0x9399b2),
+            AppTheme::Light => color!(0x7c7f93),
         }
     }
 

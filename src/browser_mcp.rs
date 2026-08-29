@@ -29,6 +29,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
     future::Future,
+    io,
     net::{Ipv4Addr, SocketAddrV4},
     path::Path,
     sync::Arc,
@@ -38,8 +39,10 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub const BROWSER_MCP_TOKEN_ENV: &str = "GITTERM_V4_BROWSER_MCP_TOKEN";
-pub const BROWSER_MCP_URL_ENV: &str = "GITTERM_V4_BROWSER_MCP_URL";
+pub const BROWSER_MCP_TOKEN_ENV: &str = "GITTERM_V5_BROWSER_MCP_TOKEN";
+pub const BROWSER_MCP_URL_ENV: &str = "GITTERM_V5_BROWSER_MCP_URL";
+const BROWSER_MCP_BASE_PORT: u16 = 24_030;
+const BROWSER_MCP_PORTS_PER_INSTANCE: u16 = 10;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 60_000;
 
@@ -148,18 +151,20 @@ pub struct BrowserMcpServer {
     browser: BrowserControlService,
 }
 
-/// Reserve the random loopback endpoint synchronously so terminal environments
-/// can be constructed before Iced starts polling asynchronous startup tasks.
+/// Reserve an endpoint from the V5-only loopback range synchronously so
+/// terminal environments can be constructed before Iced starts polling
+/// asynchronous startup tasks.
 pub fn prepare(
-    v4_global_config_dir: impl AsRef<Path>,
+    v5_global_config_dir: impl AsRef<Path>,
+    instance_id: &str,
 ) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
-    let listener = std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let listener = bind_v5_loopback_listener(instance_id)?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let endpoint = format!("http://127.0.0.1:{port}/mcp");
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let cancellation = CancellationToken::new();
-    let browser = BrowserControlService::new(v4_global_config_dir);
+    let browser = BrowserControlService::new(v5_global_config_dir);
     Ok((
         BrowserMcpConnection {
             endpoint,
@@ -176,10 +181,32 @@ pub fn prepare(
     ))
 }
 
+fn browser_mcp_port_range(instance_id: &str) -> std::ops::Range<u16> {
+    let instance_slot = instance_id.parse::<u32>().unwrap_or(0).rem_euclid(100) as u16;
+    let start = BROWSER_MCP_BASE_PORT + (instance_slot * BROWSER_MCP_PORTS_PER_INSTANCE);
+    start..(start + BROWSER_MCP_PORTS_PER_INSTANCE)
+}
+
+fn bind_v5_loopback_listener(instance_id: &str) -> io::Result<std::net::TcpListener> {
+    let mut last_error = None;
+    for port in browser_mcp_port_range(instance_id) {
+        match std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)) {
+            Ok(listener) => return Ok(listener),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "GitTerm V5 browser MCP port range is empty",
+        )
+    }))
+}
+
 impl BrowserMcpServer {
     pub async fn run(self) -> Result<(), String> {
         let listener = tokio::net::TcpListener::from_std(self.listener).map_err(|error| {
-            format!("failed to activate the GitTerm V4 browser MCP listener: {error}")
+            format!("failed to activate the GitTerm V5 browser MCP listener: {error}")
         })?;
         let tools = BrowserMcpTools::new(self.browser);
         let mcp_service: StreamableHttpService<BrowserMcpTools, LocalSessionManager> =
@@ -198,7 +225,7 @@ impl BrowserMcpServer {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await
-            .map_err(|error| format!("GitTerm V4 browser MCP server stopped: {error}"))
+            .map_err(|error| format!("GitTerm V5 browser MCP server stopped: {error}"))
     }
 }
 
@@ -388,7 +415,7 @@ impl BrowserMcpTools {
     }
 
     #[tool(
-        description = "Open the visible Chrome instance using GitTerm V4's isolated browser profile.",
+        description = "Open the visible Chrome instance using GitTerm V5's isolated browser profile.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -857,11 +884,11 @@ impl ServerHandler for BrowserMcpTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                "gitterm-v4-browser",
+                "gitterm-v5-browser",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V4. Call browser_open before page operations. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Use browser_dom_outline for bounded page structure, then browser_node_inspect with its document-scoped node_ref for layout and computed styles; node references become stale after navigation. Prefer semantic role or text locators; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
+                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V5. Call browser_open before page operations. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Use browser_dom_outline for bounded page structure, then browser_node_inspect with its document-scoped node_ref for layout and computed styles; node references become stale after navigation. Prefer semantic role or text locators; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
             )
     }
 }
@@ -918,11 +945,19 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn connection_uses_ephemeral_loopback_and_memory_only_token_environment() {
+    fn connection_uses_v5_loopback_range_and_memory_only_token_environment() {
         let temp = tempdir().unwrap();
-        let (connection, _server) = prepare(temp.path()).unwrap();
+        let (connection, _server) = prepare(temp.path(), "connection-test").unwrap();
         assert!(connection.endpoint().starts_with("http://127.0.0.1:"));
         assert!(connection.endpoint().ends_with("/mcp"));
+        let port = connection
+            .endpoint()
+            .trim_start_matches("http://127.0.0.1:")
+            .trim_end_matches("/mcp")
+            .parse::<u16>()
+            .unwrap();
+        assert!((BROWSER_MCP_BASE_PORT..25_030).contains(&port));
+        assert!(!(13_030..14_030).contains(&port));
         let environment = connection.terminal_environment();
         assert_eq!(environment[0].0, BROWSER_MCP_URL_ENV);
         assert_eq!(environment[0].1, connection.endpoint());
@@ -1029,7 +1064,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_requires_bearer_token_and_serves_the_tool_contract() {
         let temp = tempdir().unwrap();
-        let (connection, server) = prepare(temp.path()).unwrap();
+        let (connection, server) = prepare(temp.path(), "endpoint-test").unwrap();
         let endpoint = connection.endpoint().to_string();
         let token = connection.token.clone();
         let server_task = tokio::spawn(server.run());

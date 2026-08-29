@@ -2261,8 +2261,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitterm-v4"
-version = "4.0.0"
+name = "gitterm-v5"
+version = "5.0.0"
 dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",

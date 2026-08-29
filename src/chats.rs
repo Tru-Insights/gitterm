@@ -117,6 +117,19 @@ impl ChatBackend {
             ChatBackend::Pi => "pi",
         }
     }
+
+    /// Shell command that resumes conversation `id` using harness
+    /// launch command `base`. Must run in the conversation's recorded
+    /// cwd.
+    pub fn resume_command(&self, base: &str, id: &str) -> String {
+        match self {
+            ChatBackend::Claude => format!("{base} --resume {id}"),
+            ChatBackend::Codex => format!("{base} resume {id}"),
+            // pi resumes a specific session via --session (`--resume`
+            // is the interactive picker).
+            ChatBackend::Pi => format!("{base} --session {id}"),
+        }
+    }
 }
 
 impl ChatIndexEntry {
@@ -155,13 +168,7 @@ impl ChatIndexEntry {
     /// remote machines resolve the binary through the remote's
     /// session_commands map (agent daemons run with a minimal PATH).
     pub fn resume_command_with(&self, base: &str) -> String {
-        match self.backend {
-            ChatBackend::Claude => format!("{base} --resume {}", self.id),
-            ChatBackend::Codex => format!("{base} resume {}", self.id),
-            // pi resumes a specific session via --session (`--resume` is
-            // the interactive picker).
-            ChatBackend::Pi => format!("{base} --session {}", self.id),
-        }
+        self.backend.resume_command(base, &self.id)
     }
 
     /// The transcript was modified moments ago yet no GitTerm tab owns
@@ -630,6 +637,19 @@ fn home_dir() -> PathBuf {
 /// agentd on a remote host).
 fn claude_home_dir() -> PathBuf {
     home_dir().join(".claude")
+}
+
+/// Whether a Claude session transcript exists on this machine. Claude
+/// Code writes `<projects>/<cwd-slug>/<session-id>.jsonl` on the first
+/// message, so a preassigned session id may never materialize on disk.
+pub fn claude_session_exists(session_id: &str) -> bool {
+    let file_name = format!("{session_id}.jsonl");
+    let Ok(entries) = std::fs::read_dir(claude_home_dir().join("projects")) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.path().join(&file_name).is_file())
 }
 
 /// Build the full local index across all backends. Blocking; run on a

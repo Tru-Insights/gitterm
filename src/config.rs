@@ -1,17 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub const APP_NAME: &str = "GitTerm V4";
-pub const CONFIG_DIR_NAME: &str = "gitterm-v4";
-pub const CONFIG_DIR_ENV: &str = "GITTERM_V4_CONFIG_DIR";
-pub const INSTANCE_ID_ENV: &str = "GITTERM_V4_INSTANCE_ID";
+pub const APP_NAME: &str = "GitTerm V5";
+pub const WINDOW_TITLE: &str = "GitTerm V5 Development";
+pub const CONFIG_DIR_NAME: &str = "gitterm-v5";
+pub const CONFIG_DIR_ENV: &str = "GITTERM_V5_CONFIG_DIR";
+pub const INSTANCE_ID_ENV: &str = "GITTERM_V5_INSTANCE_ID";
 
 // Global instance ID for this process
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
-// Config directory override, read once from GITTERM_V4_CONFIG_DIR
+// Config directory override, read once from GITTERM_V5_CONFIG_DIR
 static CONFIG_DIR_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Get or generate the unique instance ID for this GitTerm process
@@ -22,9 +23,9 @@ pub fn instance_id() -> &'static str {
     })
 }
 
-/// The config directory override from GITTERM_V4_CONFIG_DIR, if set.
+/// The config directory override from GITTERM_V5_CONFIG_DIR, if set.
 /// Dev/test instances set this so they can never read or write the
-/// real ~/.config/gitterm-v4/* state of a running V4 instance.
+/// real ~/.config/gitterm-v5/* state of a running V5 instance.
 pub fn config_dir_override() -> Option<&'static PathBuf> {
     CONFIG_DIR_OVERRIDE
         .get_or_init(|| resolve_config_dir_override(std::env::var_os(CONFIG_DIR_ENV)))
@@ -53,10 +54,11 @@ pub fn global_config_dir() -> PathBuf {
     if let Some(dir) = config_dir_override() {
         return dir.clone();
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join(CONFIG_DIR_NAME)
+    default_config_dir(&dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+}
+
+fn default_config_dir(home: &Path) -> PathBuf {
+    home.join(".config").join(CONFIG_DIR_NAME)
 }
 
 /// Get the base config directory for this instance
@@ -93,11 +95,69 @@ mod tests {
     }
 
     #[test]
-    fn default_config_dir_is_isolated_from_v3() {
+    fn default_config_dir_is_isolated_from_earlier_versions() {
         let home = PathBuf::from("/test-home");
-        let path = home.join(".config").join(CONFIG_DIR_NAME);
-        assert_eq!(path, PathBuf::from("/test-home/.config/gitterm-v4"));
+        let path = default_config_dir(&home);
+        assert_eq!(path, PathBuf::from("/test-home/.config/gitterm-v5"));
+        assert_ne!(path, PathBuf::from("/test-home/.config/gitterm-v4"));
         assert_ne!(path, PathBuf::from("/test-home/.config/gitterm"));
+    }
+
+    #[test]
+    fn runtime_identity_environment_is_v5_only() {
+        assert_eq!(APP_NAME, "GitTerm V5");
+        assert_eq!(WINDOW_TITLE, "GitTerm V5 Development");
+        assert_eq!(CONFIG_DIR_ENV, "GITTERM_V5_CONFIG_DIR");
+        assert_eq!(INSTANCE_ID_ENV, "GITTERM_V5_INSTANCE_ID");
+        assert_ne!(CONFIG_DIR_ENV, "GITTERM_V4_CONFIG_DIR");
+        assert_ne!(INSTANCE_ID_ENV, "GITTERM_V4_INSTANCE_ID");
+    }
+
+    #[test]
+    fn task_worktree_root_defaults_beneath_the_v5_config_root() {
+        let root = PathBuf::from("/test-home/.config/gitterm-v5");
+        assert_eq!(
+            task_worktree_root_for_config_root(&root),
+            PathBuf::from("/test-home/.config/gitterm-v5/worktrees")
+        );
+
+        let mut serialized = serde_json::to_value(Config::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("task_worktree_root");
+        let existing_config: Config = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            existing_config.task_worktree_root,
+            default_task_worktree_root()
+        );
+    }
+
+    #[test]
+    fn workspace_tab_task_link_is_optional_and_round_trips() {
+        let existing: WorkspaceTabConfig =
+            serde_json::from_value(serde_json::json!({ "dir": "/repo" })).unwrap();
+        assert_eq!(existing.task_id, None);
+
+        let linked: WorkspaceTabConfig = serde_json::from_value(serde_json::json!({
+            "dir": "/worktrees/task-1",
+            "task_id": "task-1"
+        }))
+        .unwrap();
+        assert_eq!(linked.task_id.as_deref(), Some("task-1"));
+        assert_eq!(linked.task_session_id, None);
+        assert_eq!(
+            serde_json::to_value(linked).unwrap()["task_id"],
+            serde_json::json!("task-1")
+        );
+
+        let session: WorkspaceTabConfig = serde_json::from_value(serde_json::json!({
+            "dir": "/worktrees/task-1",
+            "task_id": "task-1",
+            "task_session_id": "session-1"
+        }))
+        .unwrap();
+        assert_eq!(session.task_session_id.as_deref(), Some("session-1"));
     }
 
     #[test]
@@ -206,6 +266,14 @@ fn default_agent_presets() -> Vec<AgentPreset> {
     ]
 }
 
+pub fn default_task_worktree_root() -> PathBuf {
+    task_worktree_root_for_config_root(&global_config_dir())
+}
+
+pub fn task_worktree_root_for_config_root(config_root: &Path) -> PathBuf {
+    config_root.join("worktrees")
+}
+
 fn default_terminal_font() -> f32 {
     14.0
 }
@@ -251,6 +319,10 @@ fn default_stt_enabled() -> bool {
     true
 }
 
+fn default_max_concurrent_local_tasks() -> usize {
+    2
+}
+
 // Persistent configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -286,6 +358,14 @@ pub struct Config {
     pub agent_presets: Vec<AgentPreset>,
     #[serde(default)]
     pub quick_commands: Vec<QuickCommand>,
+    #[serde(default = "default_task_worktree_root")]
+    pub task_worktree_root: PathBuf,
+    /// How many local tasks may run agent sessions at once. Dispatching past
+    /// the limit queues the task; capacity release starts the next in FIFO
+    /// order. Zero is treated as 1 — a limit that can never start anything
+    /// would strand every dispatch.
+    #[serde(default = "default_max_concurrent_local_tasks")]
+    pub max_concurrent_local_tasks: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,6 +471,8 @@ impl Default for Config {
             stt_model_path: None,
             agent_presets: default_agent_presets(),
             quick_commands: Vec::new(),
+            task_worktree_root: default_task_worktree_root(),
+            max_concurrent_local_tasks: default_max_concurrent_local_tasks(),
         }
     }
 }
@@ -559,6 +641,13 @@ pub struct WorkspaceTabConfig {
     /// conversation registry rule (TRU-78) and survives restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_session_id: Option<String>,
+    /// Durable task owned by this view. Closing the tab does not remove the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Durable identity for this child view inside a task. Several tabs may
+    /// share one task id; this id distinguishes their sessions across restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

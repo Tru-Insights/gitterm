@@ -7,8 +7,8 @@ use tonic::metadata::MetadataMap;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-use super::protocol::v1::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
-use super::protocol::v1::{
+use super::protocol::v5::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
+use super::protocol::v5::{
     terminal_input, terminal_output, ChatEntry, ChatPreviewMessage, ChatPreviewRequest,
     ChatPreviewResponse, DirEntry, GitDiffRequest, GitDiffResponse, GitStatusRequest,
     GitStatusResponse, HandshakeRequest, HandshakeResponse, ListChatsRequest, ListChatsResponse,
@@ -475,10 +475,10 @@ fn proto_session(info: super::sessions::SessionInfo) -> Session {
     }
 }
 
-fn proto_diff_line(line: super::git::FileDiffLine) -> super::protocol::v1::GitDiffLine {
+fn proto_diff_line(line: super::git::FileDiffLine) -> super::protocol::v5::GitDiffLine {
     use super::git::DiffLineKind;
-    use super::protocol::v1::GitDiffLineKind;
-    super::protocol::v1::GitDiffLine {
+    use super::protocol::v5::GitDiffLineKind;
+    super::protocol::v5::GitDiffLine {
         content: line.content,
         kind: match line.kind {
             DiffLineKind::Context => GitDiffLineKind::Context,
@@ -491,8 +491,8 @@ fn proto_diff_line(line: super::git::FileDiffLine) -> super::protocol::v1::GitDi
     }
 }
 
-fn proto_file_status(status: super::git::GitFileStatus) -> super::protocol::v1::GitFileStatus {
-    super::protocol::v1::GitFileStatus {
+fn proto_file_status(status: super::git::GitFileStatus) -> super::protocol::v5::GitFileStatus {
+    super::protocol::v5::GitFileStatus {
         path: status.path,
         status: status.status,
         is_staged: status.is_staged,
@@ -676,7 +676,7 @@ pub fn is_authorized_metadata(metadata: &MetadataMap, expected_token: &str) -> b
 
 #[cfg(test)]
 mod tests {
-    use super::super::protocol::v1::git_term_agent_client::GitTermAgentClient;
+    use super::super::protocol::v5::git_term_agent_client::GitTermAgentClient;
     use super::*;
     use tokio_stream::wrappers::TcpListenerStream;
 
@@ -705,6 +705,19 @@ mod tests {
         let mut metadata = MetadataMap::new();
         metadata.insert("authorization", "Bearer secret".parse().unwrap());
         assert!(is_authorized_metadata(&metadata, "secret"));
+    }
+
+    #[test]
+    fn grpc_service_namespace_is_isolated_from_v4() {
+        type Server = GitTermAgentServer<GitTermAgentService>;
+        assert_eq!(
+            <Server as tonic::server::NamedService>::NAME,
+            "gitterm.agent.v5.GitTermAgent"
+        );
+        assert_ne!(
+            <Server as tonic::server::NamedService>::NAME,
+            "gitterm.agent.v1.GitTermAgent"
+        );
     }
 
     #[tokio::test]

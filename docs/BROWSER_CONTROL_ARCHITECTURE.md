@@ -1,4 +1,4 @@
-# GitTerm V4 Browser Control Architecture
+# GitTerm V5 Browser Control Architecture
 
 ## Goal
 
@@ -19,7 +19,7 @@ Portal-specific Rust workflow.
 
 ## Product Boundary
 
-GitTerm V4 remains the host application and Codex remains the terminal agent.
+GitTerm V5 remains the host application and Codex remains the terminal agent.
 This work does not adopt T3 Code, depend on the Codex desktop application, or
 replace GitTerm's interface.
 
@@ -35,11 +35,11 @@ Codex CLI in a GitTerm terminal
               |
               | MCP
               v
-GitTerm V4 browser-control service
+GitTerm V5 browser-control service
               |
               | Chrome DevTools Protocol
               v
-Visible Chrome window using a dedicated GitTerm V4 profile
+Visible Chrome window using a dedicated GitTerm V5 profile
 ```
 
 GitTerm owns the browser lifecycle and connection state. The first version uses

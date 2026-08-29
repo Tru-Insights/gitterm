@@ -10,9 +10,9 @@ conflict.
 
 ## Workflow Facts
 
-- Project: `gitterm-v4`
-- Default base branch: `v4`
-- Protected branches: `v4`
+- Project: `gitterm-v5`
+- Default base branch: `v5`
+- Protected branches: `v4`, `v5`
 - Issue provider: `linear`
 - Issue key pattern: `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`
 - Issue required in commits: `true`
@@ -218,7 +218,7 @@ Agent memory is private runtime state, not repository source of truth.
 
 ### Project
 
-GitTerm V4 — a Rust desktop app: terminal multiplexer + git status viewer + file
+GitTerm V5 — a Rust desktop app: terminal multiplexer + git status viewer + file
 explorer + agent (Claude Code / pi) host, built with the
 [Iced](https://github.com/iced-rs/iced) v0.14 GUI framework. macOS-first;
 Windows CI exists.
@@ -243,13 +243,13 @@ Windows CI exists.
 
 ### Persistence
 
-- Config: `~/.config/gitterm-v4/config.json` (global) +
-  `~/.config/gitterm-v4/instance-<pid>/config.json` (per-instance). Per-instance
+- Config: `~/.config/gitterm-v5/config.json` (global) +
+  `~/.config/gitterm-v5/instance-<pid>/config.json` (per-instance). Per-instance
   values override globals.
-- Workspaces: `~/.config/gitterm-v4/workspaces.json`.
+- Workspaces: `~/.config/gitterm-v5/workspaces.json`.
 - All paths resolved via `dirs::home_dir()` — on Windows that's
-  `%USERPROFILE%\.config\gitterm-v4\`.
-- V4 must remain runtime-isolated from V3: do not reuse V3 config paths,
+  `%USERPROFILE%\.config\gitterm-v5\`.
+- V5 must remain runtime-isolated from V4 and V3: do not reuse earlier config paths,
   bundle identifiers, app names, log-server port ranges, helper state, temporary
   artifact names, or future browser profiles.
 
@@ -276,7 +276,7 @@ Windows CI exists.
 - Voice is enabled by default (the `stt` default feature pulls `whisper-rs` +
   `cpal`). Use `--no-default-features` only for a build without voice.
 - macOS bundle: `cargo bundle --release` produces
-  `target/release/bundle/osx/GitTerm V4.app`. Install via `cp -R` to
+  `target/release/bundle/osx/GitTerm V5.app`. Install via `cp -R` to
   `/Applications/`.
 - Excalidraw is an optional feature: add `--features excalidraw` to enable.
 

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package gitterm.agent.v1;
+package gitterm.agent.v5;
 
 service GitTermAgent {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
