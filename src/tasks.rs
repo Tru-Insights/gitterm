@@ -106,6 +106,32 @@ impl TaskRecord {
             archived_at: None,
         }
     }
+
+    /// Title and body for this task's draft pull request. The linked issue
+    /// key prefixes the title unless the title already carries it (repo
+    /// convention: commits and PRs carry an issue key), and the body links
+    /// back to the issue so review lands with its context.
+    pub fn draft_pr_copy(&self) -> (String, String) {
+        let title = match &self.issue {
+            Some(issue) if !self.title.starts_with(&issue.key) => {
+                format!("{}: {}", issue.key, self.title)
+            }
+            _ => self.title.clone(),
+        };
+        let mut body = self.objective.trim().to_string();
+        if let Some(issue) = &self.issue {
+            let line = match &issue.url {
+                Some(url) => format!("Linked issue: [{}]({url})", issue.key),
+                None => format!("Linked issue: {}", issue.key),
+            };
+            if body.is_empty() {
+                body = line;
+            } else {
+                body = format!("{body}\n\n{line}");
+            }
+        }
+        (title, body)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,6 +734,23 @@ impl TaskStore {
         self.replace(task)
     }
 
+    /// Clear a task's worktree record after cleanup removed the working copy.
+    /// Sessions and their conversation references are deliberately untouched —
+    /// transcripts must stay auditable after the working copy is gone, and a
+    /// re-prepared worktree makes them resumable again.
+    pub fn clear_worktree(&mut self, task_id: &str, timestamp: &str) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "clear worktree in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        task.worktree = TaskWorktree::default();
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
     pub fn fail_worktree_preparation(
         &mut self,
         task_id: &str,
@@ -809,6 +852,31 @@ impl TaskStore {
             )
         })?;
         task.harness = Some(harness);
+        task.updated_at = timestamp.to_string();
+        self.replace(task)
+    }
+
+    /// Record what a task has delivered (latest commit, discovered PR).
+    /// Unchanged state is a no-op — discovery runs on every overview visit,
+    /// and rewriting an identical record would churn `updated_at` (which
+    /// drives rail ordering) and the on-disk file for nothing.
+    pub fn record_delivery(
+        &mut self,
+        task_id: &str,
+        delivery: DeliveryState,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        let mut task = self.get(task_id).cloned().ok_or_else(|| {
+            TaskStoreError::new(
+                "record delivery in",
+                &self.path,
+                format!("task {task_id} does not exist"),
+            )
+        })?;
+        if task.delivery == delivery {
+            return Ok(());
+        }
+        task.delivery = delivery;
         task.updated_at = timestamp.to_string();
         self.replace(task)
     }
@@ -1676,6 +1744,118 @@ mod tests {
                 preset_name: "Codex".to_string()
             })
         );
+    }
+
+    #[test]
+    fn recorded_delivery_survives_reload_and_unchanged_writes_are_no_ops() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        let delivery = DeliveryState {
+            commit_sha: Some("bafc5f5757b0265cb89a50a64fd539089b4265ab".to_string()),
+            pr_url: Some("https://github.com/o/r/pull/30".to_string()),
+            pr_number: Some(30),
+        };
+
+        store
+            .record_delivery("task-1", delivery.clone(), "2026-08-22T10:00:00Z")
+            .unwrap();
+        // Re-recording identical state must not churn updated_at — discovery
+        // runs on every overview visit and updated_at drives rail ordering.
+        store
+            .record_delivery("task-1", delivery.clone(), "2026-08-22T11:00:00Z")
+            .unwrap();
+
+        let reloaded = TaskStore::load(&path).unwrap();
+        let task = reloaded.get("task-1").unwrap();
+        assert_eq!(task.delivery, delivery);
+        assert_eq!(task.updated_at, "2026-08-22T10:00:00Z");
+
+        let error = store
+            .record_delivery("task-missing", delivery, "2026-08-22T12:00:00Z")
+            .unwrap_err();
+        assert!(error.to_string().contains("task-missing"));
+    }
+
+    #[test]
+    fn clearing_the_worktree_preserves_conversation_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        store
+            .begin_worktree_preparation("task-1", "2026-08-22T08:59:00Z")
+            .unwrap();
+        store
+            .complete_worktree_preparation(
+                "task-1",
+                CompletedWorktreePreparation {
+                    repository: RepositoryIdentity {
+                        common_dir: PathBuf::from("/repo with spaces/gitterm-v5/.git"),
+                        remote_url: None,
+                    },
+                    base: GitBase {
+                        reference: "v5".to_string(),
+                        commit: "0123456789abcdef".to_string(),
+                    },
+                    branch: "task/task-1-durable-tasks".to_string(),
+                    path: temp.path().join("worktrees").join("task-1"),
+                },
+                "2026-08-22T09:00:00Z",
+            )
+            .unwrap();
+        let session = TaskSessionRecord {
+            task_session_id: "task-session-1".to_string(),
+            label: "Codex implementation".to_string(),
+            harness: None,
+            conversation: Some(HarnessConversationRef {
+                backend: HarnessConversationBackend::Codex,
+                session_id: "codex-chat-1".to_string(),
+            }),
+            objective_delivery: ObjectiveDeliveryState::Delivered,
+            created_at: "2026-08-22T09:01:00Z".to_string(),
+            updated_at: "2026-08-22T09:01:00Z".to_string(),
+        };
+        store
+            .upsert_session("task-1", session.clone(), "2026-08-22T09:01:00Z")
+            .unwrap();
+
+        store
+            .clear_worktree("task-1", "2026-08-22T10:00:00Z")
+            .unwrap();
+
+        let reloaded = TaskStore::load(&path).unwrap();
+        let task = reloaded.get("task-1").unwrap();
+        assert_eq!(task.worktree, TaskWorktree::default());
+        assert_eq!(task.sessions, vec![session]);
+        assert_eq!(task.updated_at, "2026-08-22T10:00:00Z");
+    }
+
+    #[test]
+    fn draft_pr_copy_prefixes_issue_key_and_links_the_issue() {
+        let task = sample_task("task-1");
+
+        let (title, body) = task.draft_pr_copy();
+
+        assert_eq!(title, "TRU-104: Add durable tasks");
+        assert_eq!(
+            body,
+            "Persist task state without opening a workspace\n\n\
+             Linked issue: [TRU-104](https://linear.app/example/TRU-104)"
+        );
+    }
+
+    #[test]
+    fn draft_pr_copy_without_issue_uses_title_and_objective_as_is() {
+        let mut task = sample_task("task-1");
+        task.issue = None;
+        task.title = "TRU-104: Already prefixed".to_string();
+
+        let (title, body) = task.draft_pr_copy();
+
+        assert_eq!(title, "TRU-104: Already prefixed");
+        assert_eq!(body, "Persist task state without opening a workspace");
     }
 
     #[test]

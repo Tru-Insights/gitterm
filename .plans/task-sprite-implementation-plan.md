@@ -1,6 +1,6 @@
 # GitTerm V5 Task and Sprite Implementation Plan
 
-**Status:** Slices 0-4B complete; Slice 5 lifecycle and attention next
+**Status:** Slices 0-6 complete (Slice 6 delivery/publish/transcripts: TRU-117/118/119); Slice 7 Mac mini executor next
 
 **Captured:** 2026-08-19
 
