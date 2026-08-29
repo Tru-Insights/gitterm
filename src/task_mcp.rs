@@ -528,12 +528,31 @@ impl ServerHandler for TaskMcpTools {
     }
 }
 
-pub fn configure_codex_command(command: &str, endpoint: &str) -> String {
+/// Split a launch command into its executable, the executable's basename and
+/// the untouched remainder (leading whitespace included).
+fn split_executable(command: &str) -> (&str, &str, &str) {
     let trimmed = command.trim();
     let executable_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
     let executable = &trimmed[..executable_end];
     let executable_name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
-    if executable_name != "codex" || trimmed.contains("mcp_servers.gitterm_tasks.url=") {
+    (executable, executable_name, &trimmed[executable_end..])
+}
+
+/// Attach the task MCP server to whichever harness this launch command
+/// starts. Codex and Claude get per-process configuration; pi discovers the
+/// endpoint from the terminal environment through its `gitterm-mcp`
+/// extension (see `pi-extensions/`). Other commands pass through unchanged.
+pub fn configure_task_command(command: &str, endpoint: &str) -> String {
+    match split_executable(command).1 {
+        "codex" => configure_codex_command(command, endpoint),
+        "claude" => configure_claude_command(command, endpoint),
+        _ => command.to_string(),
+    }
+}
+
+pub fn configure_codex_command(command: &str, endpoint: &str) -> String {
+    let (executable, executable_name, rest) = split_executable(command);
+    if executable_name != "codex" || command.contains("mcp_servers.gitterm_tasks.url=") {
         return command.to_string();
     }
     let mut configured = executable.to_string();
@@ -541,8 +560,46 @@ pub fn configure_codex_command(command: &str, endpoint: &str) -> String {
         configured.push_str(" --config ");
         configured.push_str(&value);
     }
-    configured.push_str(&trimmed[executable_end..]);
+    configured.push_str(rest);
     configured
+}
+
+/// Claude Code takes ad-hoc servers through `--mcp-config`. The `=` form is
+/// deliberate: the option is variadic, and the space form would swallow the
+/// positional brief that task launches append. The bearer header uses
+/// Claude's own `${VAR}` expansion so the token never appears in the command
+/// line or the persisted startup command. The server's tools are
+/// pre-approved (`mcp__gitterm_tasks` covers every tool it serves): they are
+/// GitTerm-owned, and a task session must be able to record handoffs and
+/// launch workers without a human answering permission prompts.
+pub fn configure_claude_command(command: &str, endpoint: &str) -> String {
+    let (executable, executable_name, rest) = split_executable(command);
+    if executable_name != "claude" || command.contains("\"gitterm_tasks\"") {
+        return command.to_string();
+    }
+    let config = claude_mcp_config(endpoint).to_string();
+    if config.contains('\'') {
+        // The JSON is embedded single-quoted; an endpoint that would break
+        // that quoting is not one GitTerm produces, so leave the launch alone.
+        return command.to_string();
+    }
+    format!("{executable} --mcp-config='{config}' --allowedTools={CLAUDE_ALLOWED_TOOLS}{rest}")
+}
+
+const CLAUDE_ALLOWED_TOOLS: &str = "mcp__gitterm_tasks";
+
+fn claude_mcp_config(endpoint: &str) -> Value {
+    serde_json::json!({
+        "mcpServers": {
+            "gitterm_tasks": {
+                "type": "http",
+                "url": endpoint,
+                "headers": {
+                    "Authorization": format!("Bearer ${{{TASK_MCP_TOKEN_ENV}}}"),
+                },
+            },
+        },
+    })
 }
 
 /// Append a Codex `notify` override so this task session's
@@ -556,11 +613,8 @@ pub fn configure_codex_notify(
     task_id: &str,
     session_id: &str,
 ) -> String {
-    let trimmed = command.trim();
-    let executable_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-    let executable = &trimmed[..executable_end];
-    let executable_name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
-    if executable_name != "codex" || trimmed.contains("notify=[") {
+    let (executable, executable_name, rest) = split_executable(command);
+    if executable_name != "codex" || command.contains("notify=[") {
         return command.to_string();
     }
     let url = format!("{notify_endpoint}?task_id={task_id}&session_id={session_id}");
@@ -576,17 +630,17 @@ pub fn configure_codex_notify(
         .map(|element| Value::String((*element).to_string()).to_string())
         .collect::<Vec<_>>()
         .join(",");
-    format!(
-        "{executable} --config 'notify=[{elements}]'{rest}",
-        rest = &trimmed[executable_end..]
-    )
+    format!("{executable} --config 'notify=[{elements}]'{rest}")
 }
 
+/// Task tools are approved outright (Claude gets the equivalent
+/// `--allowedTools`): a task session must record handoffs and launch workers
+/// without a human answering prompts. The browser server keeps `writes`.
 fn codex_config_overrides(endpoint: &str) -> [String; 4] {
     [
         format!("mcp_servers.gitterm_tasks.url={endpoint}"),
         format!("mcp_servers.gitterm_tasks.bearer_token_env_var={TASK_MCP_TOKEN_ENV}"),
-        "mcp_servers.gitterm_tasks.default_tools_approval_mode=writes".to_string(),
+        "mcp_servers.gitterm_tasks.default_tools_approval_mode=approve".to_string(),
         "mcp_servers.gitterm_tasks.tool_timeout_sec=300".to_string(),
     ]
 }
@@ -617,7 +671,7 @@ pub fn codex_zsh_integration() -> String {
             gitterm_mcp_args+=(
                 --config "mcp_servers.gitterm_tasks.url=${{{task_url}}}"
                 --config "mcp_servers.gitterm_tasks.bearer_token_env_var={task_token}"
-                --config "mcp_servers.gitterm_tasks.default_tools_approval_mode=writes"
+                --config "mcp_servers.gitterm_tasks.default_tools_approval_mode=approve"
                 --config "mcp_servers.gitterm_tasks.tool_timeout_sec=300"
             )
         fi
@@ -719,6 +773,57 @@ mod tests {
         assert!(integration.contains("mcp_servers.gitterm_tasks.url="));
         assert!(integration.contains("gitterm_mcp_args"));
         assert!(!integration.contains("Bearer "));
+    }
+
+    #[test]
+    fn claude_injection_uses_single_value_mcp_config_and_keeps_the_token_out_of_the_command() {
+        let endpoint = "http://127.0.0.1:25031/mcp";
+        let configured =
+            configure_claude_command("claude --resume abc \"$(cat '/b.md')\"", endpoint);
+        assert!(
+            configured.starts_with("claude --mcp-config='{"),
+            "{configured}"
+        );
+        assert!(
+            configured
+                .ends_with("}' --allowedTools=mcp__gitterm_tasks --resume abc \"$(cat '/b.md')\""),
+            "{configured}"
+        );
+        assert!(!configured.contains("--mcp-config '"));
+        assert!(configured.contains("\"url\":\"http://127.0.0.1:25031/mcp\""));
+        assert!(configured.contains("\"Authorization\":\"Bearer ${GITTERM_V5_TASK_MCP_TOKEN}\""));
+        assert!(!configured.contains("secret"));
+        assert_eq!(configure_claude_command(&configured, endpoint), configured);
+        assert_eq!(configure_claude_command("codex", endpoint), "codex");
+        assert_eq!(
+            configure_claude_command("pi 'hello'", endpoint),
+            "pi 'hello'"
+        );
+        assert_eq!(
+            configure_claude_command("/opt/bin/claude", endpoint),
+            format!(
+                "/opt/bin/claude --mcp-config='{}' --allowedTools=mcp__gitterm_tasks",
+                claude_mcp_config(endpoint)
+            )
+        );
+    }
+
+    #[test]
+    fn task_command_configuration_dispatches_on_the_executable() {
+        let endpoint = "http://127.0.0.1:25031/mcp";
+        assert_eq!(
+            configure_task_command("codex resume --last", endpoint),
+            configure_codex_command("codex resume --last", endpoint)
+        );
+        assert_eq!(
+            configure_task_command("claude", endpoint),
+            configure_claude_command("claude", endpoint)
+        );
+        assert_eq!(
+            configure_task_command("pi --model x", endpoint),
+            "pi --model x"
+        );
+        assert_eq!(configure_task_command("", endpoint), "");
     }
 
     #[test]

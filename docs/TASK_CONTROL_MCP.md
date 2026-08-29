@@ -49,10 +49,24 @@ objective. Its response includes `objective_submitted: false`. GitTerm cannot
 safely type a prompt into an arbitrary configured command without knowing that
 harness's readiness, input framing, permission behavior, and failure semantics.
 
-Codex is the first automatically configured MCP client. Other local harnesses
-inherit the endpoint environment, but automatic attachment and prompt delivery
-require an explicit adapter. ACP is a promising common GitTerm-to-agent session
-transport; MCP remains the agent-to-GitTerm task-control surface.
+Every launch command passes through `task_mcp::configure_task_command`, which
+attaches the task server per process for the harnesses GitTerm knows:
+
+- Codex: `--config mcp_servers.gitterm_tasks.*` overrides with
+  `default_tools_approval_mode=approve` (plus a `notify` hook for task
+  sessions).
+- Claude Code: `--mcp-config='{…}'` with an `http` server whose bearer header
+  is `${GITTERM_V5_TASK_MCP_TOKEN}`, expanded by Claude from the terminal
+  environment, plus `--allowedTools=mcp__gitterm_tasks` so the session can
+  record handoffs and launch workers without permission prompts. The `=`
+  forms are required — both options are variadic and would otherwise swallow
+  the positional brief.
+- pi: no CLI flag; the `gitterm-mcp` extension in `pi-extensions/` reads the
+  endpoint variables and registers the tools through `pi-mcp-adapter`.
+
+Other commands inherit the endpoint environment untouched. ACP is a promising
+common GitTerm-to-agent session transport; MCP remains the agent-to-GitTerm
+task-control surface.
 
 ## Handoff boundary
 

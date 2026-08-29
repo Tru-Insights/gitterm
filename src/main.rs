@@ -9879,7 +9879,7 @@ impl App {
                 .map(|endpoint| browser_mcp::configure_codex_command(command, endpoint))
                 .unwrap_or_else(|| command.to_string());
             env.get(task_mcp::TASK_MCP_URL_ENV)
-                .map(|endpoint| task_mcp::configure_codex_command(&command, endpoint))
+                .map(|endpoint| task_mcp::configure_task_command(&command, endpoint))
                 .unwrap_or(command)
         });
         if let Some(command) = &runtime_startup_command {
