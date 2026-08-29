@@ -5247,6 +5247,13 @@ pub struct FileSyntaxSnapshot {
     file_signature: Option<FileVersionSignature>,
 }
 
+/// Whether a task occupies one of the local launch slots. Only a local task
+/// whose agent is actively `Running` holds one; `WaitingForInput` is blocked
+/// on the human, so it releases the slot for the queue (TRU-129).
+fn task_holds_local_slot(task: &TaskRecord) -> bool {
+    task.executor == ExecutorTarget::Local && task.lifecycle == TaskLifecycle::Running
+}
+
 impl App {
     /// UI font size
     fn ui_font(&self) -> f32 {
@@ -7370,8 +7377,7 @@ impl App {
                 store
                     .tasks()
                     .iter()
-                    .filter(|task| task.executor == ExecutorTarget::Local)
-                    .filter(|task| task.lifecycle == TaskLifecycle::Running)
+                    .filter(|task| task_holds_local_slot(task))
                     .collect()
             })
             .unwrap_or_default()
@@ -28864,6 +28870,63 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    fn slot_task(executor: ExecutorTarget, lifecycle: TaskLifecycle) -> TaskRecord {
+        use gitterm::tasks::{GitBase, RepositoryIdentity};
+        let mut task = TaskRecord::new_draft(
+            NewTaskRecord {
+                task_id: "task-slot".to_string(),
+                title: "Slot accounting".to_string(),
+                objective: "Only running local tasks hold a slot".to_string(),
+                workspace: TaskWorkspaceIdentity {
+                    name: "GitTerm V5".to_string(),
+                    location: WorkspaceLocationIdentity::Local {
+                        directory: PathBuf::from("/repo/gitterm-v5"),
+                    },
+                },
+                repository: RepositoryIdentity {
+                    common_dir: PathBuf::from("/repo/gitterm-v5/.git"),
+                    remote_url: None,
+                },
+                issue: None,
+                base: GitBase {
+                    reference: "v5".to_string(),
+                    commit: "0123456789abcdef".to_string(),
+                },
+                branch: "task/task-slot".to_string(),
+                executor,
+                harness: None,
+                stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+            },
+            "2026-08-29T00:00:00Z",
+        );
+        task.lifecycle = lifecycle;
+        task
+    }
+
+    #[test]
+    fn only_running_local_tasks_hold_a_launch_slot() {
+        assert!(task_holds_local_slot(&slot_task(
+            ExecutorTarget::Local,
+            TaskLifecycle::Running
+        )));
+        // Waiting on the human releases the slot so the queue can drain.
+        assert!(!task_holds_local_slot(&slot_task(
+            ExecutorTarget::Local,
+            TaskLifecycle::WaitingForInput
+        )));
+        assert!(!task_holds_local_slot(&slot_task(
+            ExecutorTarget::Local,
+            TaskLifecycle::Queued
+        )));
+        // Remote executors are outside the local gate entirely.
+        assert!(!task_holds_local_slot(&slot_task(
+            ExecutorTarget::RemoteAgent {
+                remote_id: "mac-mini".to_string()
+            },
+            TaskLifecycle::Running
+        )));
+    }
 
     fn test_browser_evidence(
         id: u64,
