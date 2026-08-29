@@ -21,6 +21,11 @@ mkdir -p "$APP_DIR/Contents/Resources"
 # Copy binary with a different name so the launcher script can call it directly
 cp "$BUILD_DIR/gitterm-v5" "$APP_DIR/Contents/MacOS/gitterm-v5-bin"
 
+# The app attaches to remote agent sessions by running gitterm-v5-agent from
+# the directory of its own executable; without it beside the binary the tab
+# falls back to a bare `gitterm-v5-agent` that is not on a GUI app's PATH.
+cp "$BUILD_DIR/gitterm-v5-agent" "$APP_DIR/Contents/MacOS/gitterm-v5-agent"
+
 # Create launcher script as the app executable — bypasses Launch Services
 # deduplication so each double-click spawns a fresh process
 cat > "$APP_DIR/Contents/MacOS/$APP_NAME" << 'LAUNCHER'
@@ -73,6 +78,11 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 </dict>
 </plist>
 EOF
+
+# Ad-hoc sign so macOS honours the Info.plist usage descriptions (microphone)
+# and the bundle verifies after copying to /Applications or another Mac.
+codesign --force --deep -s - "$APP_DIR"
+codesign --verify --deep "$APP_DIR"
 
 echo "App bundle created at: $APP_DIR"
 echo "You can now run: open \"$APP_DIR\""
