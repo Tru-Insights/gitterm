@@ -903,7 +903,7 @@ fn structured_browser_result<T: Serialize>(
 }
 
 fn snapshot_result(snapshot: BrowserSnapshot) -> CallToolResult {
-    let structured = match serde_json::to_value(&snapshot) {
+    let structured = match serialize_structured_content(&snapshot) {
         Ok(value) => value,
         Err(error) => {
             return tool_error(format!(
@@ -922,10 +922,18 @@ fn snapshot_result(snapshot: BrowserSnapshot) -> CallToolResult {
 }
 
 fn structured_value<T: Serialize>(value: T) -> CallToolResult {
-    match serde_json::to_value(value) {
+    match serialize_structured_content(value) {
         Ok(value) => CallToolResult::structured(value),
         Err(error) => tool_error(format!("failed to serialize browser tool result: {error}")),
     }
+}
+
+fn serialize_structured_content<T: Serialize>(value: T) -> serde_json::Result<serde_json::Value> {
+    let value = serde_json::to_value(value)?;
+    Ok(match value {
+        serde_json::Value::Object(_) => value,
+        value => serde_json::json!({ "result": value }),
+    })
 }
 
 fn tool_error(error: impl std::fmt::Display) -> CallToolResult {
@@ -943,6 +951,45 @@ mod tests {
         ServiceExt,
     };
     use tempfile::tempdir;
+
+    fn successful_structured_content<T: Serialize>(value: T) -> serde_json::Value {
+        let result = structured_value(value);
+        assert_eq!(result.is_error, Some(false));
+        result
+            .structured_content
+            .expect("successful result must include structured content")
+    }
+
+    #[test]
+    fn structured_content_preserves_objects() {
+        let value = serde_json::json!({ "status": "ready" });
+        assert_eq!(successful_structured_content(&value), value);
+    }
+
+    #[test]
+    fn structured_content_wraps_arrays() {
+        let value = serde_json::json!(["source", "target"]);
+        assert_eq!(
+            successful_structured_content(&value),
+            serde_json::json!({ "result": value })
+        );
+    }
+
+    #[test]
+    fn structured_content_wraps_scalars() {
+        assert_eq!(
+            successful_structured_content(true),
+            serde_json::json!({ "result": true })
+        );
+    }
+
+    #[test]
+    fn structured_content_wraps_unit_as_null() {
+        assert_eq!(
+            successful_structured_content(()),
+            serde_json::json!({ "result": null })
+        );
+    }
 
     #[test]
     fn connection_uses_v5_loopback_range_and_memory_only_token_environment() {
