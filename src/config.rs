@@ -319,8 +319,12 @@ fn default_stt_enabled() -> bool {
     true
 }
 
+// Local task slots gate agent launches, not tabs or sessions. The number is
+// a guard against a runaway dispatch fan-out rather than a throughput
+// budget — the task system's value is worktree organization, so the cap
+// should rarely be the thing a user bumps into (TRU-129).
 fn default_max_concurrent_local_tasks() -> usize {
-    2
+    4
 }
 
 // Persistent configuration
