@@ -9876,7 +9876,7 @@ impl App {
         let runtime_startup_command = startup_command.map(|command| {
             let command = env
                 .get(browser_mcp::BROWSER_MCP_URL_ENV)
-                .map(|endpoint| browser_mcp::configure_codex_command(command, endpoint))
+                .map(|endpoint| browser_mcp::configure_browser_command(command, endpoint))
                 .unwrap_or_else(|| command.to_string());
             env.get(task_mcp::TASK_MCP_URL_ENV)
                 .map(|endpoint| task_mcp::configure_task_command(&command, endpoint))
