@@ -150,6 +150,13 @@ startup and protects every MCP request with a random per-process bearer token.
 The token remains in memory and is inherited only by local GitTerm terminals;
 it is not logged or written to a config file.
 
+Claude Code presets receive the same server through
+`browser_mcp::configure_claude_command` — a per-run `--mcp-config='{…}'`
+(bearer header expanded by Claude from `GITTERM_V5_BROWSER_MCP_TOKEN`) with the
+read-only inspection tools pre-approved via `--allowedTools`; mutating tools
+still prompt. pi attaches through the `gitterm-mcp` extension in
+`pi-extensions/`.
+
 When GitTerm launches a local Codex preset, it adds per-run `--config`
 overrides for the MCP URL, bearer-token environment variable, write-tool
 approval policy, and tool timeout. The persisted preset command remains

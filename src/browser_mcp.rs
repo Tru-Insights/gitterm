@@ -102,6 +102,75 @@ pub fn configure_codex_command(command: &str, endpoint: &str) -> String {
     configured
 }
 
+/// Attach the browser MCP server to whichever harness this launch command
+/// starts. pi attaches through its `gitterm-mcp` extension (see
+/// `pi-extensions/`); other commands pass through unchanged.
+pub fn configure_browser_command(command: &str, endpoint: &str) -> String {
+    let trimmed = command.trim();
+    let executable = &trimmed[..trimmed.find(char::is_whitespace).unwrap_or(trimmed.len())];
+    match executable.rsplit(['/', '\\']).next().unwrap_or(executable) {
+        "codex" => configure_codex_command(command, endpoint),
+        "claude" => configure_claude_command(command, endpoint),
+        _ => command.to_string(),
+    }
+}
+
+/// The browser tools Claude may call without a permission prompt: exactly the
+/// inspection tools the server annotates `read_only_hint = true`. Mutating
+/// tools (navigate, click, type, …) still prompt, mirroring Codex's
+/// `default_tools_approval_mode=writes`. Kept in sync with the tool router by
+/// `claude_allowed_tools_match_the_read_only_annotations`.
+const CLAUDE_ALLOWED_READ_TOOLS: [&str; 10] = [
+    "browser_status",
+    "browser_targets",
+    "browser_snapshot",
+    "browser_capture",
+    "browser_wait_for",
+    "browser_console",
+    "browser_network",
+    "browser_target_diagnostics",
+    "browser_dom_outline",
+    "browser_node_inspect",
+];
+
+/// Claude Code: a second `--mcp-config='{…}'` alongside the task server's
+/// (Claude merges repeated flags). Same rules as
+/// `task_mcp::configure_claude_command`: the `=` form because both options
+/// are variadic, and the bearer header expanded by Claude from the terminal
+/// environment so the token never appears on the command line.
+pub fn configure_claude_command(command: &str, endpoint: &str) -> String {
+    let trimmed = command.trim();
+    let executable_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let executable = &trimmed[..executable_end];
+    let executable_name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+    if executable_name != "claude" || command.contains("\"gitterm_browser\"") {
+        return command.to_string();
+    }
+    let config = serde_json::json!({
+        "mcpServers": {
+            "gitterm_browser": {
+                "type": "http",
+                "url": endpoint,
+                "headers": {
+                    "Authorization": format!("Bearer ${{{BROWSER_MCP_TOKEN_ENV}}}"),
+                },
+            },
+        },
+    })
+    .to_string();
+    if config.contains('\'') {
+        // Embedded single-quoted; GitTerm never produces such an endpoint.
+        return command.to_string();
+    }
+    let allowed = CLAUDE_ALLOWED_READ_TOOLS
+        .map(|tool| format!("mcp__gitterm_browser__{tool}"))
+        .join(",");
+    format!(
+        "{executable} --mcp-config='{config}' --allowedTools={allowed}{rest}",
+        rest = &trimmed[executable_end..]
+    )
+}
+
 /// Define a session-local zsh wrapper so Codex launched manually from a
 /// GitTerm terminal receives the same ephemeral MCP configuration as a preset.
 /// The bearer token itself remains only in the inherited environment.
@@ -1080,6 +1149,71 @@ mod tests {
         assert!(configured.contains(BROWSER_MCP_TOKEN_ENV));
         assert_eq!(configure_codex_command("claude", endpoint), "claude");
         assert_eq!(configure_codex_command("pi", endpoint), "pi");
+    }
+
+    #[test]
+    fn claude_commands_receive_browser_config_with_read_only_tools_pre_approved() {
+        let endpoint = "http://127.0.0.1:45678/mcp";
+        let configured =
+            configure_claude_command("claude --resume abc \"$(cat '/b.md')\"", endpoint);
+        assert!(
+            configured.starts_with("claude --mcp-config='{"),
+            "{configured}"
+        );
+        assert!(
+            configured.ends_with(" --resume abc \"$(cat '/b.md')\""),
+            "{configured}"
+        );
+        assert!(configured.contains("\"url\":\"http://127.0.0.1:45678/mcp\""));
+        assert!(configured.contains("\"Authorization\":\"Bearer ${GITTERM_V5_BROWSER_MCP_TOKEN}\""));
+        assert!(configured.contains("--allowedTools=mcp__gitterm_browser__browser_status,"));
+        assert!(configured.contains("mcp__gitterm_browser__browser_node_inspect"));
+        assert!(!configured.contains("mcp__gitterm_browser__browser_click"));
+        assert!(!configured.contains("--allowedTools=mcp__gitterm_browser \""));
+        assert_eq!(configure_claude_command(&configured, endpoint), configured);
+        assert_eq!(configure_claude_command("codex", endpoint), "codex");
+        assert_eq!(configure_claude_command("pi", endpoint), "pi");
+    }
+
+    #[test]
+    fn claude_allowed_tools_match_the_read_only_annotations() {
+        let routes = BrowserMcpTools::tool_router();
+        let mut annotated: Vec<String> = routes
+            .list_all()
+            .into_iter()
+            .filter(|tool| {
+                tool.annotations
+                    .as_ref()
+                    .and_then(|value| value.read_only_hint)
+                    == Some(true)
+            })
+            .map(|tool| tool.name.to_string())
+            .collect();
+        annotated.sort();
+        let mut allowed: Vec<String> = CLAUDE_ALLOWED_READ_TOOLS
+            .iter()
+            .map(|tool| tool.to_string())
+            .collect();
+        allowed.sort();
+        assert_eq!(allowed, annotated);
+    }
+
+    #[test]
+    fn browser_command_configuration_dispatches_on_the_executable() {
+        let endpoint = "http://127.0.0.1:45678/mcp";
+        assert_eq!(
+            configure_browser_command("codex resume --last", endpoint),
+            configure_codex_command("codex resume --last", endpoint)
+        );
+        assert_eq!(
+            configure_browser_command("claude", endpoint),
+            configure_claude_command("claude", endpoint)
+        );
+        assert_eq!(
+            configure_browser_command("pi --model x", endpoint),
+            "pi --model x"
+        );
+        assert_eq!(configure_browser_command("", endpoint), "");
     }
 
     #[test]
