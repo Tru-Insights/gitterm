@@ -418,9 +418,13 @@
     background: var(--bg);
     font-size: 13px;
   }
-  details.dlg.completed { border-left-color: var(--result); }
-  details.dlg.failed, details.dlg.interrupted { border-left-color: var(--err); }
+  details.dlg.completed, details.dlg.done { border-left-color: var(--result); }
+  details.dlg.failed, details.dlg.interrupted, details.dlg.exited { border-left-color: var(--err); }
   details.dlg.cancelled, details.dlg.dismissed { border-left-color: var(--fg-muted); }
+  details.dlg.blocked, details.dlg.waiting { border-left-color: var(--warn); }
+  details.dlg.blocked .dlg-kind, details.dlg.waiting .dlg-kind { color: var(--warn); }
+  details.dlg.waiting .dlg-state, details.dlg.blocked .dlg-state { color: var(--warn); }
+  .dlg-path { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); word-break: break-all; margin: 2px 0 6px; }
   details.dlg.flash { outline: 1px solid var(--accent); }
   details.dlg > summary {
     cursor: pointer; user-select: none; list-style: none;
@@ -430,7 +434,7 @@
   details.dlg > summary::before { content: '\25B8'; color: var(--fg-muted); font-size: 10px; }
   details.dlg[open] > summary::before { content: '\25BE'; }
   .dlg-kind { font-weight: 600; color: var(--accent); font-size: 12.5px; white-space: nowrap; }
-  details.dlg.completed .dlg-kind { color: var(--result); }
+  details.dlg.completed .dlg-kind, details.dlg.done .dlg-kind { color: var(--result); }
   details.dlg.failed .dlg-kind, details.dlg.interrupted .dlg-kind { color: var(--err); }
   .dlg-what { flex: 1; min-width: 0; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .dlg-state { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; }
@@ -466,6 +470,7 @@
   .ro-row.done .ro-dot { animation: none; background: var(--result); }
   .ro-row.failed .ro-dot { animation: none; background: var(--err); }
   .ro-row.queued .ro-dot { animation: none; background: var(--fg-muted); }
+  .ro-row.waiting .ro-dot { animation: none; background: var(--warn); }
   .ro-name { color: var(--fg); white-space: nowrap; }
   .ro-what { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ro-meta { white-space: nowrap; }
@@ -1550,11 +1555,62 @@
     card.data = d;
     card.activity = ev.activity || null;
     card.held = !!ev.held;
+    card.worker = ev.worker || null;
     renderCard(card);
     renderRoster();
   }
-  function kindLabel(d) { return d.kind === 'consult' ? 'Codex consult' : d.kind === 'review' ? 'Codex review' : 'Delegation'; }
+  function kindLabel(d) { return d.kind === 'consult' ? 'Codex consult' : d.kind === 'review' ? 'Codex review' : d.kind === 'implement' ? 'Worker' : 'Delegation'; }
   function childModel(d) { return (d.child && d.child.model) || 'default model'; }
+  // ---- worker cards (delegate_task, TRU-142 S6) ----
+  // The worker part of the payload ({preset, model, role, title, issue_key,
+  // worktree_path, branch, session_state, progress, tab_open}) mirrors the
+  // task session; the record's status carries done / blocked.
+  function isWorker(d) { return d.kind === 'implement'; }
+  function workerState(card) { return (card.worker && card.worker.session_state) || state(card.data); }
+  function workerHead(card) {
+    const w = card.worker || {};
+    const parts = ['Worker', w.preset || (card.data.child && card.data.child.preset_name) || 'agent'];
+    parts.push(w.model || childModel(card.data));
+    if (w.role) parts.push(w.role);
+    return parts.join(' · ');
+  }
+  function workerWhat(card) {
+    const w = card.worker || {};
+    const title = w.title || (card.data.brief || '').split('\n')[0];
+    return (w.issue_key ? w.issue_key + ' · ' : '') + title;
+  }
+  const WORKER_STATE_TEXT = {
+    queued: 'queued', starting: 'starting', waiting: 'needs you', exited: 'worker exited',
+    interrupted: 'interrupted', done: 'done', blocked: 'blocked', failed: 'failed', cancelled: 'cancelled',
+  };
+  function workerStateText(card) {
+    const ws = workerState(card);
+    if (ws === 'running') {
+      const start = parseTime(card.data.created_at);
+      return 'running ' + (start != null ? fmtClock(Date.now() - start) : '');
+    }
+    return WORKER_STATE_TEXT[ws] || ws;
+  }
+  function renderWorkerBody(card, body) {
+    const d = card.data;
+    const w = card.worker || {};
+    const ws = workerState(card);
+    if (w.worktree_path || w.branch) {
+      body.appendChild(el('div', 'dlg-path', (w.branch || '') + (w.worktree_path ? ' · ' + w.worktree_path : '')));
+    }
+    if (ws === 'waiting') body.appendChild(el('div', 'dlg-banner', 'The worker is waiting for you. Open its tab to answer.'));
+    else if (ws === 'exited') body.appendChild(el('div', 'dlg-banner', 'The worker stopped without reporting. Open its tab, or the task, to resume it.'));
+    else if (ws === 'interrupted') body.appendChild(el('div', 'dlg-line', 'GitTerm restarted; the worker tab is back. Resume it there.'));
+    else if (ws === 'queued') body.appendChild(el('div', 'dlg-line', 'Waiting for a free task slot.'));
+    else if (ws === 'blocked') body.appendChild(el('div', 'dlg-banner', 'The worker is blocked and needs you.'));
+    else if (ws === 'failed') body.appendChild(el('div', 'dlg-error', (d.status && d.status.message) || 'The worker failed'));
+    else if (ws === 'cancelled') body.appendChild(el('div', 'dlg-line', 'No longer tracked. The worker tab and task are untouched.'));
+    if (state(d) === 'completed' || state(d) === 'blocked') {
+      renderResult(card, body);
+    } else if (w.progress) {
+      body.appendChild(el('div', 'dlg-activity', 'Latest: ' + w.progress));
+    }
+  }
   function targetText(d) {
     const t = d.target;
     if (!t || !t.mode) return d.kind === 'consult' ? d.brief : '';
@@ -1573,6 +1629,7 @@
   }
   function stateText(card) {
     const d = card.data;
+    if (isWorker(d)) return workerStateText(card);
     const st = state(d);
     if (st === 'running') {
       const start = parseTime(d.updated_at);
@@ -1596,15 +1653,18 @@
     if (!d) return;
     const st = state(d);
     const dismissed = !!d.dismissed_at;
-    card.root.className = 'dlg ' + st + (dismissed ? ' dismissed' : '');
+    const worker = isWorker(d);
+    card.root.className = 'dlg ' + (worker ? workerState(card) : st) + (dismissed ? ' dismissed' : '');
     if (dismissed && !card.wasDismissed) card.root.open = false;
     card.wasDismissed = dismissed;
-    card.kindEl.textContent = kindLabel(d) + ' · ' + childModel(d);
-    card.whatEl.textContent = targetText(d);
+    card.kindEl.textContent = worker ? workerHead(card) : kindLabel(d) + ' · ' + childModel(d);
+    card.whatEl.textContent = worker ? workerWhat(card) : targetText(d);
     card.stateEl.textContent = (dismissed ? 'dismissed · ' : '') + stateText(card);
     const body = card.body;
     body.innerHTML = '';
-    if (st === 'running' || st === 'requested') {
+    if (worker) {
+      renderWorkerBody(card, body);
+    } else if (st === 'running' || st === 'requested') {
       body.appendChild(el('div', 'dlg-activity', card.activity || (st === 'requested' ? 'Waiting for a free Codex slot' : 'Starting Codex…')));
     } else if (st === 'failed') {
       body.appendChild(el('div', 'dlg-error', (d.status && d.status.message) || 'Codex failed'));
@@ -1616,7 +1676,13 @@
       renderResult(card, body);
     }
     const actions = body.appendChild(el('div', 'dlg-actions'));
-    if (st === 'completed' && !dismissed) {
+    if (worker && st !== 'cancelled') {
+      const open = actions.appendChild(el('button', workerState(card) === 'waiting' ? 'primary' : null, 'Open worker tab'));
+      open.title = (card.worker && card.worker.tab_open) ? 'Switch to the worker\'s terminal tab' : 'The worker tab is not open';
+      open.addEventListener('click', () => postIpc({ type: 'delegation_open_worker', delegationId: d.delegation_id }));
+    }
+    const sendable = st === 'completed' || (worker && st === 'blocked');
+    if (sendable && !dismissed) {
       const send = actions.appendChild(el('button', 'primary', 'Send to Claude'));
       card.sendBtn = send;
       if (d.delivered_at) {
@@ -1626,18 +1692,20 @@
         send.textContent = 'Queued, sends when Claude finishes';
         send.disabled = true;
       } else {
-        send.title = busy ? 'Claude is working; it is sent when this turn ends' : 'Send the selected findings as a message';
+        send.title = busy ? 'Claude is working; it is sent when this turn ends' : (worker ? 'Send the worker\'s report as a message' : 'Send the selected findings as a message');
         send.addEventListener('click', () => sendCard(card));
       }
     } else {
       card.sendBtn = null;
     }
-    if (st !== 'running' && st !== 'requested') {
+    if (!worker && st !== 'running' && st !== 'requested') {
       const rerun = actions.appendChild(el('button', null, 'Re-run'));
       rerun.addEventListener('click', () => postIpc({ type: 'delegation_rerun', delegationId: d.delegation_id }));
     }
     if (!dismissed) {
-      const dismiss = actions.appendChild(el('button', null, st === 'running' || st === 'requested' ? 'Cancel' : 'Dismiss'));
+      const live = st === 'running' || st === 'requested' || st === 'interrupted';
+      const dismiss = actions.appendChild(el('button', null, worker ? (live ? 'Stop tracking' : 'Dismiss') : (st === 'running' || st === 'requested' ? 'Cancel' : 'Dismiss')));
+      if (worker && live) dismiss.title = 'Stop waiting for this worker\'s report; its tab and task stay as they are';
       dismiss.addEventListener('click', () => postIpc({ type: 'delegation_dismiss', delegationId: d.delegation_id }));
     }
     actions.appendChild(el('span', 'dlg-note', d.delegation_id.slice(0, 8)));
@@ -1745,8 +1813,33 @@
       live: sub.state === 'running',
     };
   }
+  function workerRow(card) {
+    const d = card.data;
+    const w = card.worker || {};
+    const ws = workerState(card);
+    const live = ['queued', 'starting', 'running', 'waiting'].includes(ws);
+    let what;
+    if (ws === 'done' || ws === 'blocked') {
+      const h = d.result && d.result.handoff;
+      what = (card.held ? 'sends when Claude finishes · ' : '') + ws + (h && h.summary ? ' · ' + lastLine(h.summary.split('\n')[0]) : '');
+    } else {
+      what = workerStateText(card) + (w.progress ? ' · ' + w.progress : '');
+    }
+    const created = parseTime(d.created_at);
+    const updated = parseTime(d.updated_at);
+    let meta = '';
+    if (live && created != null) meta = fmtDur(Date.now() - created);
+    else if (created != null && updated != null) meta = fmtDur(updated - created);
+    return {
+      key: 'dlg:' + d.delegation_id,
+      cls: ws === 'waiting' || ws === 'blocked' ? 'waiting' : ws === 'queued' || ws === 'starting' ? 'queued' : live ? 'running' : ws === 'done' ? 'done' : 'failed',
+      name: 'Worker · ' + (w.preset || 'agent') + ' · ' + (w.model || childModel(d)),
+      what, meta, target: card.root, live,
+    };
+  }
   function delegationRow(card) {
     const d = card.data;
+    if (isWorker(d)) return workerRow(card);
     const st = state(d);
     const live = st === 'running' || st === 'requested';
     let what;
@@ -1805,7 +1898,7 @@
       });
     }
     // Timers tick while something runs.
-    const anyRunningCard = Array.from(cards.values()).some((c) => c.data && state(c.data) === 'running');
+    const anyRunningCard = Array.from(cards.values()).some((c) => c.data && state(c.data) === 'running' && !c.data.dismissed_at);
     if ((live || anyRunningCard) && !rosterTimer) {
       rosterTimer = setInterval(() => {
         for (const card of cards.values()) if (card.data && state(card.data) === 'running') card.stateEl.textContent = stateText(card);

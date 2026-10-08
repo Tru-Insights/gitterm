@@ -1,6 +1,6 @@
 # Agent handoff UX: ask for a review, get findings back where you work
 
-Status: R1 and S0-S5 implemented on `tracey/tru-142-agent-handoff-ux` (see §9); S6 not started. Branch context: TRU-140 (`tracey/tru-140-claude-control-protocol-spike`, PR #43).
+Status: R1 and S0-S6 implemented on `tracey/tru-142-agent-handoff-ux` (see §9). Branch context: TRU-140 (`tracey/tru-140-claude-control-protocol-spike`, PR #43).
 Goal: from the chat tab she is working in, Tracey asks another agent for a code review (or hands off an
 implementation slice), keeps working, is told when the result lands, reads it, and acts on it from the same chat.
 Constraint already decided: handoffs are summaries, not transcript copies
@@ -519,4 +519,82 @@ S3b, S4 and S5, which wire the runner into delegations and the chat.
 - A Claude consult sends `review::consult_prompt`: one subagent, the brief verbatim, read-only, then "My take".
 - "Branch vs base" maps to Codex `--base`, and the popover says that this includes uncommitted changes.
 - The command-palette entry for terminal tabs was not built.
+
+## 10. Implemented: S6 implementation workers (2026-10-08)
+
+**Tool.** `delegate_task {title, objective, preset_name?, role?: scoped|judgment|specialist, model?, issue_key?,
+base_reference?, stopping_boundary?, workspace_name?}` is pre-approved with the other task tools and needs a caller
+(refused before the bridge without `?caller=`). It returns `{delegation_id, task_id, task_session_id, worktree_path,
+branch, preset_name, model, role, queued, queue_position, detail}` once the worktree exists; `task_session_id` is null
+when the concurrency queue deferred the launch.
+- The repository is the calling tab's `repo_path` (a managed worktree maps back to its source repo, as `task_create`
+  does). A remote workspace is refused.
+- Creation reuses `pending_task_from_control` → `TaskMetadataResolved` → `TaskWorktreePrepared` (a `PendingWorker`
+  rides on `PendingTaskLaunch`). When the worktree is ready, `start_delegated_worker` inserts an `Implement`
+  delegation with a `TaskSession` child (now also carrying `preset_name`, `model`, `role`, all additive), anchors the
+  card in the parent chat, and calls `try_launch_task_child(.., focus: false)`, which already restores the user's
+  workspace and tab: the worker opens in a background tab.
+- `try_launch_task_child` finds an open worker delegation on the task whose session is not live (first launch, a
+  queued launch, or a relaunch after its tab closed) and that names the launched preset. It adds the model flag,
+  ends the brief with Report back, records `HarnessSelection.model`, and attaches the session
+  (`TaskStore::attach_worker_session`, status `running`). Queued launches and restart queue rejoins therefore
+  get the model and the Report back without extra state.
+
+**Model policy.** `policy` in `config.json` (`gitterm::workers::ModelPolicy`, serde-defaulted; seed in
+`src/workers.rs`, `claude_seed` / `codex_seed`):
+
+| Role | Claude (`--model`) | Codex (`-m`) |
+|---|---|---|
+| coordinator (reference only) | `opus` | `gpt-6.1-sol` |
+| scoped (default role) | `sonnet` | `gpt-6-luna` |
+| judgment | `opus` | `gpt-6.1-sol` |
+| specialist | `fable` | `gpt-6-astra` |
+
+The Codex slugs were verified with `codex debug models` (codex-cli 0.161.0); the Claude aliases are the ones
+`claude --help` names. `resolve_worker` picks the preset (named, else the first Codex preset, else the first Claude
+Code one), the role (default scoped) and the model (explicit `model`, else the policy). A preset whose command
+already names a model keeps it (an explicit `model` is then an error); pi, gemini and other CLIs get no model (an
+explicit one is an error). `with_model_flag` inserts the option right after the executable and never rewrites the
+preset's own arguments. A provider object present in `policy` replaces that provider's seed; a role left out runs
+on the CLI default.
+
+**Report back.** `task_handoff_prompt(task, report_back)` keeps the existing brief and, for a worker, appends
+`delegations::report_back_section` (delegation id, task id, `progress` / `done` / `blocked`, the four fields, "Do
+not merge or push unless the objective says so."). `task_update_handoff` gains `status?: progress|done|blocked`
+(default progress). `delegations::record_handoff` stores the task handoff as before; for done or blocked it first
+finds the open worker delegation whose session the calling tab hosts (S1 attribution, never a typed `session_id`).
+An open delegation the caller does not host is an error and nothing is stored; a task with no open worker
+delegation just records the handoff and says nobody was notified. Done snapshots the handoff into the delegation
+result and completes it; blocked uses the new additive `DelegationStatus::Blocked`, which carries the handoff as
+its result, can be sent and dismissed, and still accepts a later done (which clears `delivered_at` and
+`dismissed_at` so the finished report is news again). Progress changes no status; the card's latest line is the
+task handoff's first summary line.
+
+**Wake.** Done sets the task lifecycle `Completed` and clears the worker tab's live state; blocked sets
+`WaitingForInput` and marks the worker tab as needing input. The parent tab gets "Worker done" or the new "Worker
+blocked" attention (rank 0, like an input request) unless it is in front; the inbox row follows from tab attention
+as for reviews. A Codex `agent-turn-complete` from a worker that already reported done is ignored. Card pushes
+also follow every task-session signal (`apply_task_session_signal`), so the card mirrors queued, running, waiting
+(Codex notify, Claude/pi ✳ titles), exited and interrupted.
+
+**Card and roster.** Worker cards (same card family): "Worker · <preset> · <model> · <role>", issue and title,
+branch and worktree, state, latest progress line, the handoff once done or blocked, and Open worker tab (focuses
+the tab hosting the session; a closed or queued worker gets a note), Send to Claude (done or blocked;
+`compose_send_message` builds a bounded message headed "Worker <id> (<preset> · <model>) reports done|is blocked:
+<title>. Task <id>; task_get <id> has its worktree and branch.", then the summary and sections, then
+`Full record: delegation_get <id>`), Dismiss, and "Stop tracking" while it runs (cancels the delegation, leaves the
+worker tab and task alone). No Re-run for workers. The roster row reads "Worker · <preset> · <model>", the state
+and latest progress line, and the elapsed time. `delegation_get` adds the same `worker` object.
+
+**Restart.** Reconcile no longer interrupts an `Implement` delegation whose task still exists: the worker's tab is
+restored (or the queue starts it) and may still report, so the delegation stays `running` (or `requested`) and a
+later done completes it. Codex reviews and consults are still interrupted.
+
+**Proof.** Unit tests cover the policy and preset resolution, the model flag, the brief, the store transitions,
+`record_handoff` attribution, the card state mapping and the send message; a task_mcp test drives `delegate_task`
+and a worker's `status: done` through a fake bridge. `cargo run --example worker_delegation_smoke -- --workdir
+<scratch>`: a real Claude (haiku) calls `delegate_task`, a real task worktree is created in a scratch repo, the
+launch is simulated (no PTY headless), a second MCP client as the worker tab reports progress then done, and
+`delegation_get` from the parent shows the completed handoff. Page states were checked in headless Chromium. The
+real terminal launch is a manual check.
 
