@@ -573,6 +573,7 @@ async fn review_scenario(workdir: &Path) {
     let prompt = review_prompt(&ReviewRequest {
         target: ReviewTarget::Uncommitted,
         focus: None,
+        reviewer: gitterm::review::PopoverReviewer::ClaudeSubagent,
         model: reviewer_model.clone(),
     })
     .expect("review prompt builds");

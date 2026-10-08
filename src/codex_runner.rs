@@ -586,7 +586,7 @@ fn focused_review_prompt(mode: &ReviewTargetMode, focus: &str) -> String {
     format!("Review {scope}.\n\nFocus: {}", focus.trim())
 }
 
-fn describe_target(target: &ReviewTarget) -> String {
+pub fn describe_target(target: &ReviewTarget) -> String {
     let scope = match &target.mode {
         ReviewTargetMode::Uncommitted => "uncommitted changes".to_string(),
         ReviewTargetMode::Base { reference } => {

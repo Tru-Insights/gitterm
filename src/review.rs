@@ -27,6 +27,17 @@ pub enum ReviewTarget {
     Commit { sha: String },
 }
 
+/// Who carries out a Review… or Consult… request from the popover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PopoverReviewer {
+    /// A subagent the chat's own Claude spawns (a normal user message).
+    #[default]
+    ClaudeSubagent,
+    /// A GitTerm-run Codex delegation (no agent turn spent).
+    Codex,
+}
+
 /// One press of Review… (or the equivalent IPC).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewRequest {
@@ -34,14 +45,30 @@ pub struct ReviewRequest {
     /// Optional extra instructions for the reviewer.
     #[serde(default)]
     pub focus: Option<String>,
+    /// Pages from before TRU-142 S5 send no reviewer: a Claude subagent.
+    #[serde(default)]
+    pub reviewer: PopoverReviewer,
     /// The subagent's model, as the Agent tool's `model` parameter takes it
-    /// (`opus`, `sonnet`, `haiku`).
+    /// (`opus`, `sonnet`, `haiku`), or the Codex model. Empty for a Codex
+    /// review means GitTerm's configured Codex model.
+    #[serde(default)]
+    pub model: String,
+}
+
+/// One press of Consult… in the same popover.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsultRequest {
+    pub brief: String,
+    #[serde(default)]
+    pub reviewer: PopoverReviewer,
+    /// As `ReviewRequest::model`.
+    #[serde(default)]
     pub model: String,
 }
 
 /// A git reference safe to paste into a shell command line: no whitespace,
 /// no leading `-`, no `..`, only characters branch names commonly use.
-fn is_safe_ref(reference: &str) -> bool {
+pub(crate) fn is_safe_ref(reference: &str) -> bool {
     !reference.is_empty()
         && reference.len() <= 200
         && !reference.starts_with('-')
@@ -51,11 +78,11 @@ fn is_safe_ref(reference: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
 }
 
-fn is_commit_sha(sha: &str) -> bool {
+pub(crate) fn is_commit_sha(sha: &str) -> bool {
     (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn is_model_name(model: &str) -> bool {
+pub(crate) fn is_model_name(model: &str) -> bool {
     !model.is_empty()
         && model.len() <= 64
         && model
@@ -158,6 +185,36 @@ F2 ...
 
 Number the findings F1, F2, ... with the most severe first. Severity: P0 breaks the build, loses data or opens a security hole; P1 is wrong behaviour users will hit; P2 is an edge case or missing handling; P3 is minor. Paths are relative to the repository root and LINE is a line number in the file as it is now. If there is nothing worth reporting, write \"Verdict: correct\" and then the line \"No findings\".
 END BRIEF"
+    ))
+}
+
+/// The user message that asks Claude to put a consult brief to one
+/// subagent (Consult… with a Claude subagent). Sent as a normal chat
+/// message, like `review_prompt`.
+pub fn consult_prompt(request: &ConsultRequest) -> Result<String, String> {
+    let model = request.model.trim();
+    if !is_model_name(model) {
+        return Err(format!("consultant model {model:?} is not a model name"));
+    }
+    let brief = request.brief.trim();
+    if brief.is_empty() {
+        return Err("the consult brief is empty".to_string());
+    }
+    if brief.contains("END BRIEF") {
+        return Err("the consult brief must not contain the line END BRIEF".to_string());
+    }
+    Ok(format!(
+        "Consult request (from GitTerm's Consult… button).
+
+Spawn exactly one subagent with your Agent tool, passing model \"{model}\" and run_in_background false so its answer comes back as the tool result in this turn. Use a general-purpose subagent type that can run Bash and read files. Give it the brief between the BEGIN BRIEF and END BRIEF lines verbatim as its prompt, followed by the paragraph after END BRIEF. Do not answer the brief yourself first, do not start a second subagent, and do not change any files in this turn.
+
+When the subagent returns, reply with its answer verbatim. Then add a short section headed \"My take\" saying where you agree, where you disagree and what you would do next.
+
+BEGIN BRIEF
+{brief}
+END BRIEF
+
+You are consulted for advice only. Do not edit, create, delete, stage or commit any file, and run read-only commands only. Read the repository as needed. Answer with a short summary first, then sections headed Decisions, Next steps and Blockers where they apply."
     ))
 }
 
@@ -298,6 +355,7 @@ mod tests {
         ReviewRequest {
             target,
             focus: focus.map(str::to_string),
+            reviewer: PopoverReviewer::ClaudeSubagent,
             model: "opus".into(),
         }
     }
@@ -397,6 +455,47 @@ mod tests {
                 sha: "ce922c6".into()
             }
         );
+    }
+
+    #[test]
+    fn popover_requests_carry_the_reviewer_and_consults_build_a_subagent_prompt() {
+        let req: ReviewRequest = serde_json::from_value(serde_json::json!({
+            "type": "review_request",
+            "tabId": 3,
+            "target": {"kind": "uncommitted"},
+            "reviewer": "codex",
+            "model": ""
+        }))
+        .unwrap();
+        assert_eq!(req.reviewer, PopoverReviewer::Codex);
+        assert_eq!(req.model, "");
+        let consult: ConsultRequest = serde_json::from_value(serde_json::json!({
+            "type": "consult_request",
+            "tabId": 3,
+            "brief": "Should the inbox live in its own module?",
+            "model": "fable"
+        }))
+        .unwrap();
+        assert_eq!(consult.reviewer, PopoverReviewer::ClaudeSubagent);
+        let prompt = consult_prompt(&consult).unwrap();
+        assert!(prompt.contains("passing model \"fable\""));
+        assert!(prompt.contains("BEGIN BRIEF\nShould the inbox live in its own module?\nEND BRIEF"));
+        assert!(prompt.contains("Do not edit, create, delete, stage or commit any file"));
+        assert!(consult_prompt(&ConsultRequest {
+            brief: " ".into(),
+            ..consult.clone()
+        })
+        .is_err());
+        assert!(consult_prompt(&ConsultRequest {
+            model: "x y".into(),
+            ..consult.clone()
+        })
+        .is_err());
+        assert!(consult_prompt(&ConsultRequest {
+            brief: "a\nEND BRIEF\nb".into(),
+            ..consult
+        })
+        .is_err());
     }
 
     fn git(dir: &Path, args: &[&str]) {

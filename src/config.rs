@@ -211,7 +211,11 @@ mod tests {
         let mut serialized = serde_json::to_value(Config::default()).unwrap();
         assert_eq!(
             serialized["review"],
-            serde_json::json!({"default_reviewer": "claude-subagent", "subagent_model": "opus"})
+            serde_json::json!({
+                "default_reviewer": "claude-subagent",
+                "subagent_model": "opus",
+                "max_concurrent_reviews": 2
+            })
         );
         serialized.as_object_mut().unwrap().remove("review");
         let existing: Config = serde_json::from_value(serialized.clone()).unwrap();
@@ -221,6 +225,8 @@ mod tests {
         let codex: Config = serde_json::from_value(serialized).unwrap();
         assert_eq!(codex.review.default_reviewer, ReviewerKind::Codex);
         assert_eq!(codex.review.subagent_model, "opus");
+        assert_eq!(codex.review.codex_model, None);
+        assert_eq!(codex.review.max_concurrent_reviews, 2);
     }
 
     #[test]
@@ -557,7 +563,7 @@ pub enum ReviewerKind {
     /// A subagent spawned by the chat's own Claude through its Agent tool.
     #[default]
     ClaudeSubagent,
-    /// An independent Codex run. Not available yet (TRU-142 S3/S4).
+    /// An independent `codex exec review` run owned by GitTerm (TRU-142).
     Codex,
 }
 
@@ -574,6 +580,14 @@ fn default_review_subagent_model() -> String {
     "opus".to_string()
 }
 
+/// Concurrent Codex runs (reviews and consults) before new requests queue
+/// (TRU-142 decision D7).
+pub const DEFAULT_MAX_CONCURRENT_REVIEWS: usize = 2;
+
+fn default_max_concurrent_reviews() -> usize {
+    DEFAULT_MAX_CONCURRENT_REVIEWS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewConfig {
     #[serde(default)]
@@ -581,6 +595,15 @@ pub struct ReviewConfig {
     /// The Agent tool `model` a Claude-subagent review runs on.
     #[serde(default = "default_review_subagent_model")]
     pub subagent_model: String,
+    /// `codex -m <model>` for Codex reviews and consults; `None` keeps
+    /// Codex's configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
+    /// Codex runs (reviews and consults) that may run at once; further
+    /// requests wait as `requested` and start when a slot frees. Zero is
+    /// treated as 1.
+    #[serde(default = "default_max_concurrent_reviews")]
+    pub max_concurrent_reviews: usize,
 }
 
 impl Default for ReviewConfig {
@@ -588,6 +611,8 @@ impl Default for ReviewConfig {
         Self {
             default_reviewer: ReviewerKind::default(),
             subagent_model: default_review_subagent_model(),
+            codex_model: None,
+            max_concurrent_reviews: default_max_concurrent_reviews(),
         }
     }
 }

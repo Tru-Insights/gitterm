@@ -155,6 +155,40 @@ pub enum AgentIpcMessage {
         tab_id: usize,
         request: Result<gitterm::review::ReviewRequest, String>,
     },
+    /// The popover's Consult… kind was submitted (TRU-142 S5).
+    ConsultRequest {
+        tab_id: usize,
+        request: Result<gitterm::review::ConsultRequest, String>,
+    },
+    /// A delegation card's Send to Claude, with the ticked finding ids.
+    DelegationSend {
+        tab_id: usize,
+        delegation_id: String,
+        finding_ids: Vec<String>,
+    },
+    DelegationRerun {
+        tab_id: usize,
+        delegation_id: String,
+    },
+    DelegationDismiss {
+        tab_id: usize,
+        delegation_id: String,
+    },
+    /// A finding's `file:line` was clicked; relative to the tab's checkout.
+    OpenFile {
+        tab_id: usize,
+        path: PathBuf,
+    },
+}
+
+/// Where a delegation request came from, so its acceptance or refusal
+/// reaches whoever asked (TRU-142).
+#[derive(Debug, Clone)]
+pub enum DelegationOrigin {
+    /// A `review_request` / `consult_request` tool call.
+    Mcp(TaskControlReply),
+    /// The chat page of this tab (Review… popover, Re-run).
+    Page(usize),
 }
 
 static AGENT_IPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<AgentIpcMessage>> =
@@ -314,11 +348,18 @@ fn push_agent_event_to_webview(tab_id: usize, ev: &tab::AgentEvent) {
 
 /// Replay a tab's whole conversation buffer into its page in one script call.
 /// The page renders it without live timing (elapsed counters, auto-follow
-/// jitter).
-fn replay_agent_conversation_in_webview(tab_id: usize, conversation: &[tab::AgentEvent]) {
+/// jitter). `cards` are the tab's delegation cards (TRU-142): they are not in
+/// the conversation, so they follow it; a card whose anchor is in the
+/// conversation lands at the anchor, any other at the end.
+fn replay_agent_conversation_in_webview(
+    tab_id: usize,
+    conversation: &[tab::AgentEvent],
+    cards: Vec<serde_json::Value>,
+) {
     let payloads: Vec<serde_json::Value> = conversation
         .iter()
         .filter_map(tab::AgentEvent::webview_payload)
+        .chain(cards)
         .collect();
     let json = serde_json::Value::Array(payloads);
     webview::evaluate_script(
@@ -484,6 +525,58 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                 request: serde_json::from_value(value.clone())
                     .map_err(|e| format!("could not read the review request: {e}")),
             },
+            "consult_request" => AgentIpcMessage::ConsultRequest {
+                tab_id,
+                request: serde_json::from_value(value.clone())
+                    .map_err(|e| format!("could not read the consult request: {e}")),
+            },
+            "delegation_send" | "delegation_rerun" | "delegation_dismiss" => {
+                let Some(delegation_id) = value
+                    .get("delegationId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                else {
+                    eprintln!("[agent-ipc] {kind} without delegationId: {body}");
+                    return;
+                };
+                match kind {
+                    "delegation_send" => {
+                        let finding_ids = match value.get("findingIds") {
+                            None | Some(serde_json::Value::Null) => Vec::new(),
+                            Some(ids) => match serde_json::from_value::<Vec<String>>(ids.clone()) {
+                                Ok(ids) => ids,
+                                Err(e) => {
+                                    eprintln!("[agent-ipc] bad findingIds in {body}: {e}");
+                                    return;
+                                }
+                            },
+                        };
+                        AgentIpcMessage::DelegationSend {
+                            tab_id,
+                            delegation_id,
+                            finding_ids,
+                        }
+                    }
+                    "delegation_rerun" => AgentIpcMessage::DelegationRerun {
+                        tab_id,
+                        delegation_id,
+                    },
+                    _ => AgentIpcMessage::DelegationDismiss {
+                        tab_id,
+                        delegation_id,
+                    },
+                }
+            }
+            "open_file" => {
+                let Some(path) = value.get("path").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] open_file without path: {body}");
+                    return;
+                };
+                AgentIpcMessage::OpenFile {
+                    tab_id,
+                    path: PathBuf::from(path),
+                }
+            }
             "open_url" => {
                 let url = value.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 // Links in agent output open in the browser, never inside
@@ -2388,6 +2481,10 @@ enum AttentionReason {
     HumanInputRequired,
     AgentFailed,
     CompletedUnread,
+    /// A Codex review or consult this tab requested has its result (TRU-142).
+    DelegationReady(gitterm::tasks::DelegationKind),
+    /// A Codex review or consult this tab requested failed.
+    DelegationFailed(gitterm::tasks::DelegationKind),
 }
 
 impl AttentionReason {
@@ -2397,8 +2494,8 @@ impl AttentionReason {
     fn priority(self) -> u8 {
         match self {
             Self::HumanInputRequired => 0,
-            Self::AgentFailed => 1,
-            Self::CompletedUnread => 3,
+            Self::AgentFailed | Self::DelegationFailed(_) => 1,
+            Self::CompletedUnread | Self::DelegationReady(_) => 3,
         }
     }
 
@@ -2407,14 +2504,20 @@ impl AttentionReason {
             Self::HumanInputRequired => "Input or approval needed",
             Self::AgentFailed => "Agent failed",
             Self::CompletedUnread => "Ready to review",
+            Self::DelegationReady(gitterm::tasks::DelegationKind::Review) => "Review ready",
+            Self::DelegationReady(gitterm::tasks::DelegationKind::Consult) => "Consult ready",
+            Self::DelegationReady(gitterm::tasks::DelegationKind::Implement) => "Worker done",
+            Self::DelegationFailed(gitterm::tasks::DelegationKind::Review) => "Review failed",
+            Self::DelegationFailed(gitterm::tasks::DelegationKind::Consult) => "Consult failed",
+            Self::DelegationFailed(gitterm::tasks::DelegationKind::Implement) => "Worker failed",
         }
     }
 
     fn icon(self) -> &'static str {
         match self {
             Self::HumanInputRequired => "●",
-            Self::AgentFailed => "!",
-            Self::CompletedUnread => "✓",
+            Self::AgentFailed | Self::DelegationFailed(_) => "!",
+            Self::CompletedUnread | Self::DelegationReady(_) => "✓",
         }
     }
 }
@@ -3173,6 +3276,15 @@ impl TabState {
 
     fn mark_visited(&mut self) {
         self.clear_attention(AttentionReason::CompletedUnread);
+        // A delegation result is read on the card in this tab.
+        if let Some(attention) = self.attention {
+            if matches!(
+                attention.reason,
+                AttentionReason::DelegationReady(_) | AttentionReason::DelegationFailed(_)
+            ) {
+                self.attention = None;
+            }
+        }
     }
 
     /// The startup command requested when this tab was created (e.g. "claude").
@@ -4622,6 +4734,30 @@ pub enum Event {
     AgentReviewContextLoaded(usize, gitterm::review::ReviewContext),
     /// The chat tab's Review… popover was submitted (TRU-142).
     AgentReviewRequested(usize, Result<gitterm::review::ReviewRequest, String>),
+    /// The popover's Consult… kind was submitted (TRU-142 S5).
+    AgentConsultRequested(usize, Result<gitterm::review::ConsultRequest, String>),
+    /// A delegation request passed (or failed) its checkout checks off the
+    /// UI thread and can be stored and started (TRU-142).
+    DelegationChecked(
+        Box<gitterm::tasks::NewDelegation>,
+        DelegationOrigin,
+        Result<(), String>,
+    ),
+    /// Progress from a running Codex delegation.
+    DelegationProgress(String, gitterm::codex_runner::CodexRunEvent),
+    /// A Codex delegation run ended.
+    DelegationFinished(
+        String,
+        Result<Box<gitterm::codex_runner::CodexRunOutcome>, String>,
+    ),
+    /// The parent tab's checkout HEAD, for the cards' "branch has moved".
+    DelegationHeadLoaded(usize, Result<String, String>),
+    /// A card's Send to Claude: tab, delegation, ticked finding ids.
+    DelegationSendRequested(usize, String, Vec<String>),
+    DelegationRerunRequested(usize, String),
+    DelegationDismissRequested(usize, String),
+    /// A finding's file was clicked on the chat page of this tab.
+    DelegationOpenFile(usize, PathBuf),
     /// User picked a model on the Claude chat tab with this id (TRU-143).
     AgentSetModel(usize, String),
     /// User picked an effort level (`None`: the model's default).
@@ -4852,6 +4988,13 @@ struct App {
     task_store: Option<TaskStore>,
     /// Review… button defaults (config `review`, TRU-142).
     review_config: config::ReviewConfig,
+    /// Codex delegation runs in flight, by delegation id. Aborting a handle
+    /// drops the run, which kills its Codex process (TRU-142).
+    delegation_runs: HashMap<String, iced::task::Handle>,
+    /// Latest Codex activity line per running delegation (not persisted).
+    delegation_activity: HashMap<String, String>,
+    /// Send-to-Claude messages held per chat tab until its turn ends.
+    delegation_held: HashMap<usize, Vec<gitterm::delegations::HeldSend>>,
     /// New-chat model/effort defaults and the last selection (config
     /// `chat`, TRU-143).
     chat_config: config::ChatDefaults,
@@ -9251,6 +9394,530 @@ impl App {
     }
 }
 
+/// One Codex delegation run as an Iced stream: its progress events, then
+/// `DelegationFinished`. Dropping the stream (an aborted task, app exit)
+/// drops the run, which kills Codex (TRU-142).
+fn delegation_run_stream(
+    delegation_id: String,
+    run: gitterm::codex_runner::CodexRun,
+) -> iced::futures::stream::BoxStream<'static, Event> {
+    use iced::futures::{SinkExt, StreamExt};
+    iced::stream::channel(32, async move |mut output| {
+        let (progress, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let runner = gitterm::codex_runner::run(run, progress);
+        tokio::pin!(runner);
+        let outcome = loop {
+            tokio::select! {
+                Some(event) = events.recv() => {
+                    if output
+                        .send(Event::DelegationProgress(delegation_id.clone(), event))
+                        .await
+                        .is_err()
+                    {
+                        // The app is gone; dropping the runner kills Codex.
+                        return;
+                    }
+                }
+                outcome = &mut runner => break outcome,
+            }
+        };
+        while let Ok(event) = events.try_recv() {
+            let _ = output
+                .send(Event::DelegationProgress(delegation_id.clone(), event))
+                .await;
+        }
+        let outcome = outcome.map(Box::new).map_err(|error| error.to_string());
+        if let Err(error) = output
+            .send(Event::DelegationFinished(delegation_id.clone(), outcome))
+            .await
+        {
+            eprintln!("[delegation] {delegation_id}: the app stopped listening before the result: {error}");
+        }
+    })
+    .boxed()
+}
+
+/// Delegations a chat tab requested (TRU-142 S3b/S4/S5): request, run,
+/// card, attention, send.
+impl App {
+    fn delegation_parent_tab_id(&self, session_uid: &str) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.session_uid == session_uid)
+            .map(|tab| tab.id)
+    }
+
+    /// The open tab a delegation request came from, by its caller identity.
+    fn delegation_caller(
+        &self,
+        session_uid: &str,
+    ) -> Result<gitterm::delegations::CallerTab, String> {
+        for workspace in &self.workspaces {
+            if let Some(tab) = workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.session_uid == session_uid)
+            {
+                return Ok(gitterm::delegations::CallerTab {
+                    session_uid: session_uid.to_string(),
+                    chat_session_id: tab.chat_session_id.clone(),
+                    workspace: workspace.name.clone(),
+                    cwd: tab.repo_path.clone(),
+                    remote: self.workspace_has_remote_identity(workspace),
+                });
+            }
+        }
+        Err(format!(
+            "no open GitTerm tab has session id {session_uid}; a delegation reports back to the open tab that asked"
+        ))
+    }
+
+    fn delegation_caller_for_tab(
+        &self,
+        tab_id: usize,
+    ) -> Result<gitterm::delegations::CallerTab, String> {
+        let session_uid = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.session_uid.clone())
+            .ok_or_else(|| format!("tab {tab_id} is not open"))?;
+        self.delegation_caller(&session_uid)
+    }
+
+    fn delegation_caller_for_tool(
+        &self,
+        caller: Option<&str>,
+        tool: &str,
+    ) -> Result<gitterm::delegations::CallerTab, String> {
+        let caller = caller.ok_or_else(|| task_mcp::missing_caller_error(tool))?;
+        self.delegation_caller(caller)
+    }
+
+    fn report_delegation_error(origin: &DelegationOrigin, error: String) {
+        match origin {
+            DelegationOrigin::Mcp(reply) => reply.send(Err(error)),
+            DelegationOrigin::Page(tab_id) => {
+                eprintln!("[delegation] tab {tab_id}: {error}");
+                agent_webview_note(*tab_id, &format!("Not started: {error}"));
+            }
+        }
+    }
+
+    /// Checks the checkout off the UI thread, then stores and starts the
+    /// delegation (`DelegationChecked`).
+    fn request_delegation(
+        &mut self,
+        new: Result<gitterm::tasks::NewDelegation, String>,
+        origin: DelegationOrigin,
+    ) -> Task<Event> {
+        let new = match new {
+            Ok(new) => new,
+            Err(error) => {
+                Self::report_delegation_error(&origin, error);
+                return Task::none();
+            }
+        };
+        if self.task_store.is_none() {
+            Self::report_delegation_error(&origin, "GitTerm's task store is unavailable".into());
+            return Task::none();
+        }
+        let cwd = new.parent.cwd.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || gitterm::delegations::check_checkout(&cwd))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("the checkout check failed: {error}")))
+            },
+            move |result| Event::DelegationChecked(Box::new(new), origin, result),
+        )
+    }
+
+    fn delegation_checked(
+        &mut self,
+        new: gitterm::tasks::NewDelegation,
+        origin: DelegationOrigin,
+        result: Result<(), String>,
+    ) -> Task<Event> {
+        if let Err(error) = result {
+            Self::report_delegation_error(&origin, error);
+            return Task::none();
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let delegation = gitterm::tasks::Delegation::new_requested(new, now);
+        let delegation_id = delegation.delegation_id.clone();
+        let session_uid = delegation.parent.session_uid.clone();
+        let Some(store) = self.task_store.as_mut() else {
+            Self::report_delegation_error(&origin, "GitTerm's task store is unavailable".into());
+            return Task::none();
+        };
+        if let Err(error) = store.insert_delegation(delegation) {
+            Self::report_delegation_error(&origin, error.to_string());
+            return Task::none();
+        }
+        self.anchor_delegation_card(&session_uid, &delegation_id);
+        let start = self.start_queued_delegations();
+        let queued = !self.delegation_runs.contains_key(&delegation_id);
+        if let DelegationOrigin::Mcp(reply) = &origin {
+            reply.send(Ok(serde_json::json!({
+                "delegation_id": delegation_id,
+                "status": "requested",
+                "queued": queued,
+                "detail": if queued {
+                    "Queued behind other Codex runs; it starts when a slot frees. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
+                } else {
+                    "Codex is working in the background. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
+                },
+            })));
+        }
+        self.push_delegation_card(&delegation_id);
+        start
+    }
+
+    /// Records where in the parent chat the request was made, so the card
+    /// stays there when the page is rebuilt from the conversation buffer.
+    fn anchor_delegation_card(&mut self, session_uid: &str, delegation_id: &str) {
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|tab| tab.session_uid == session_uid)
+        else {
+            return;
+        };
+        let tab_id = tab.id;
+        let Some(session) = tab.agent_session_mut() else {
+            return;
+        };
+        let anchor = tab::AgentEvent::Other(gitterm::delegations::anchor_payload(delegation_id));
+        session.record(anchor.clone());
+        push_agent_event_to_webview(tab_id, &anchor);
+    }
+
+    /// Starts queued Codex runs while slots are free
+    /// (`review.max_concurrent_reviews`).
+    fn start_queued_delegations(&mut self) -> Task<Event> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Task::none();
+        };
+        let running: HashSet<String> = self.delegation_runs.keys().cloned().collect();
+        let config_root = config::global_config_dir();
+        let mut runs = Vec::new();
+        let mut unrunnable = Vec::new();
+        for delegation_id in gitterm::delegations::runs_to_start(
+            store.delegations(),
+            &running,
+            self.review_config.max_concurrent_reviews,
+        ) {
+            let Some(delegation) = store.delegation(&delegation_id) else {
+                continue;
+            };
+            match gitterm::delegations::codex_run(delegation, &config_root) {
+                Ok(run) => runs.push((delegation_id, run)),
+                Err(error) => unrunnable.push((delegation_id, error)),
+            }
+        }
+        let mut tasks = Vec::new();
+        for (delegation_id, run) in runs {
+            eprintln!(
+                "[delegation] starting {delegation_id} in {} (log {})",
+                run.cwd.display(),
+                run.log_path.display()
+            );
+            let (task, handle) =
+                Task::run(delegation_run_stream(delegation_id.clone(), run), |event| {
+                    event
+                })
+                .abortable();
+            self.delegation_runs.insert(delegation_id, handle);
+            tasks.push(task);
+        }
+        for (delegation_id, error) in unrunnable {
+            tasks.push(self.finish_delegation(&delegation_id, Err(error)));
+        }
+        Task::batch(tasks)
+    }
+
+    fn delegation_progress(
+        &mut self,
+        delegation_id: &str,
+        event: gitterm::codex_runner::CodexRunEvent,
+    ) {
+        use gitterm::codex_runner::CodexRunEvent;
+        match event {
+            CodexRunEvent::Started { thread_id } => {
+                let now = chrono::Utc::now().to_rfc3339();
+                if let Some(store) = self.task_store.as_mut() {
+                    if let Err(error) =
+                        store.mark_delegation_started(delegation_id, &thread_id, &now)
+                    {
+                        eprintln!("[delegation] {delegation_id}: {error}");
+                    }
+                }
+            }
+            CodexRunEvent::Activity { description } => {
+                self.delegation_activity
+                    .insert(delegation_id.to_string(), description);
+            }
+            // `DelegationFinished` carries the outcome.
+            CodexRunEvent::Completed | CodexRunEvent::Failed { .. } => return,
+        }
+        self.push_delegation_card(delegation_id);
+    }
+
+    /// Stores a run's outcome, tells the parent tab, and starts the next
+    /// queued run.
+    fn finish_delegation(
+        &mut self,
+        delegation_id: &str,
+        outcome: Result<Box<gitterm::codex_runner::CodexRunOutcome>, String>,
+    ) -> Task<Event> {
+        self.delegation_runs.remove(delegation_id);
+        self.delegation_activity.remove(delegation_id);
+        let now = chrono::Utc::now().to_rfc3339();
+        let Some(store) = self.task_store.as_mut() else {
+            eprintln!("[delegation] {delegation_id} finished but the task store is unavailable");
+            return Task::none();
+        };
+        let Some(delegation) = store.delegation(delegation_id) else {
+            eprintln!("[delegation] {delegation_id} finished but is not in the store");
+            return Task::none();
+        };
+        if !delegation.status.is_active() {
+            eprintln!(
+                "[delegation] {delegation_id} finished after it was {}; the result is dropped",
+                delegation.status.label()
+            );
+            return self.start_queued_delegations();
+        }
+        let kind = delegation.kind;
+        let session_uid = delegation.parent.session_uid.clone();
+        let completed = match outcome {
+            Ok(outcome) => match store.complete_delegation(delegation_id, outcome.result, &now) {
+                Ok(()) => true,
+                Err(error) => {
+                    let message = format!("could not store the Codex result: {error}");
+                    eprintln!("[delegation] {delegation_id}: {message}");
+                    if let Err(error) = store.set_delegation_status(
+                        delegation_id,
+                        gitterm::tasks::DelegationStatus::Failed { message },
+                        &now,
+                    ) {
+                        eprintln!("[delegation] {delegation_id}: {error}");
+                    }
+                    false
+                }
+            },
+            Err(message) => {
+                eprintln!("[delegation] {delegation_id} failed: {message}");
+                if let Err(error) = store.set_delegation_status(
+                    delegation_id,
+                    gitterm::tasks::DelegationStatus::Failed { message },
+                    &now,
+                ) {
+                    eprintln!("[delegation] {delegation_id}: {error}");
+                }
+                false
+            }
+        };
+        let parent_tab = self.delegation_parent_tab_id(&session_uid);
+        if let Some(tab_id) = parent_tab {
+            let reason = if completed {
+                AttentionReason::DelegationReady(kind)
+            } else {
+                AttentionReason::DelegationFailed(kind)
+            };
+            // The tab in front shows the card itself.
+            let in_front = self.active_tab().map(|tab| tab.id) == Some(tab_id);
+            if !in_front {
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id)
+                {
+                    tab.set_attention(reason);
+                }
+                self.mark_log_server_dirty();
+            }
+        }
+        self.push_delegation_card(delegation_id);
+        let head =
+            parent_tab.map_or_else(Task::none, |tab_id| self.refresh_delegation_head(tab_id));
+        Task::batch([self.start_queued_delegations(), head])
+    }
+
+    /// Updates (or creates) the delegation's card on its parent's chat page.
+    fn push_delegation_card(&self, delegation_id: &str) {
+        let Some(delegation) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.delegation(delegation_id))
+        else {
+            return;
+        };
+        let Some(tab_id) = self.delegation_parent_tab_id(&delegation.parent.session_uid) else {
+            return;
+        };
+        if !webview::is_active(WebviewSurface::Agent(tab_id)) {
+            return;
+        }
+        match self.delegation_card(tab_id, delegation) {
+            Ok(payload) => webview::evaluate_script(
+                WebviewSurface::Agent(tab_id),
+                &format!("window.__appendEvent({payload})"),
+            ),
+            Err(error) => eprintln!("[delegation] {delegation_id}: {error}"),
+        }
+    }
+
+    fn delegation_card(
+        &self,
+        tab_id: usize,
+        delegation: &gitterm::tasks::Delegation,
+    ) -> Result<serde_json::Value, String> {
+        let id = delegation.delegation_id.as_str();
+        let held = self
+            .delegation_held
+            .get(&tab_id)
+            .is_some_and(|held| held.iter().any(|send| send.delegation_id == id));
+        gitterm::delegations::card_payload(
+            delegation,
+            self.delegation_activity.get(id).map(String::as_str),
+            held,
+            &config::global_config_dir(),
+        )
+    }
+
+    /// Every delegation card of a chat tab, oldest first, for a replay.
+    fn delegation_cards_for_tab(&self, tab_id: usize) -> Vec<serde_json::Value> {
+        let Some(session_uid) = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.session_uid.as_str())
+        else {
+            return Vec::new();
+        };
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let mut delegations = store.delegations_for_parent(session_uid);
+        delegations.reverse();
+        delegations
+            .into_iter()
+            .filter_map(
+                |delegation| match self.delegation_card(tab_id, delegation) {
+                    Ok(card) => Some(card),
+                    Err(error) => {
+                        eprintln!("[delegation] {}: {error}", delegation.delegation_id);
+                        None
+                    }
+                },
+            )
+            .collect()
+    }
+
+    /// Reads the chat tab's HEAD for its cards' "branch has moved" banner.
+    fn refresh_delegation_head(&self, tab_id: usize) -> Task<Event> {
+        let Some(tab) = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+        else {
+            return Task::none();
+        };
+        let has_cards = self
+            .task_store
+            .as_ref()
+            .is_some_and(|store| !store.delegations_for_parent(&tab.session_uid).is_empty());
+        if !has_cards {
+            return Task::none();
+        }
+        let cwd = tab.repo_path.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || gitterm::delegations::current_head(&cwd))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("the HEAD check failed: {error}")))
+            },
+            move |head| Event::DelegationHeadLoaded(tab_id, head),
+        )
+    }
+
+    /// Submits a delegation's message as a user message and stamps it
+    /// delivered, so a replay or restart never sends it again.
+    fn deliver_delegation(
+        &mut self,
+        tab_id: usize,
+        delegation_id: &str,
+        message: String,
+    ) -> Task<Event> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let marked = match self.task_store.as_mut() {
+            Some(store) => store
+                .mark_delegation_delivered(delegation_id, &now)
+                .map_err(|error| error.to_string()),
+            None => Err("GitTerm's task store is unavailable".to_string()),
+        };
+        if let Err(error) = marked {
+            eprintln!("[delegation] {delegation_id}: not sent: {error}");
+            agent_webview_note(tab_id, &format!("Not sent: {error}"));
+            return Task::none();
+        }
+        self.push_delegation_card(delegation_id);
+        Task::done(Event::AgentSubmitPrompt(tab_id, message))
+    }
+
+    /// After the parent's turn ends: send the oldest held message.
+    fn flush_held_delegation(&mut self, tab_id: usize) -> Task<Event> {
+        let streaming = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.agent_session())
+            .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming));
+        let Some(held) = self.delegation_held.get_mut(&tab_id) else {
+            return Task::none();
+        };
+        let Some(next) = gitterm::delegations::next_held_send(held, streaming) else {
+            return Task::none();
+        };
+        self.deliver_delegation(tab_id, &next.delegation_id, next.message)
+    }
+
+    /// The delegation behind a card on `tab_id`'s page, checked to belong
+    /// to that tab.
+    fn tab_delegation(
+        &self,
+        tab_id: usize,
+        delegation_id: &str,
+    ) -> Result<&gitterm::tasks::Delegation, String> {
+        let session_uid = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.session_uid.as_str())
+            .ok_or_else(|| format!("tab {tab_id} is not open"))?;
+        let delegation = self
+            .task_store
+            .as_ref()
+            .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?
+            .delegation(delegation_id)
+            .ok_or_else(|| format!("delegation {delegation_id} does not exist"))?;
+        if delegation.parent.session_uid != session_uid {
+            return Err(format!("delegation {delegation_id} belongs to another tab"));
+        }
+        Ok(delegation)
+    }
+}
+
 fn load_task_store_for_startup(
     path: PathBuf,
     timestamp: &str,
@@ -9467,6 +10134,9 @@ impl App {
             next_tab_id: 0,
             task_store,
             review_config: config.review.clone(),
+            delegation_runs: HashMap::new(),
+            delegation_activity: HashMap::new(),
+            delegation_held: HashMap::new(),
             chat_config: config.chat.clone(),
             task_store_error,
             task_ui_error: None,
@@ -11847,6 +12517,77 @@ fi
                         "waiting_for_input": updated,
                     })));
                 }
+                TaskControlOperation::RequestReview(request) => {
+                    let new = self
+                        .delegation_caller_for_tool(envelope.caller.as_deref(), "review_request")
+                        .and_then(|caller| {
+                            gitterm::delegations::review_delegation(
+                                &request,
+                                &caller,
+                                self.review_config.codex_model.as_deref(),
+                                None,
+                            )
+                        });
+                    return self.request_delegation(new, DelegationOrigin::Mcp(envelope.reply));
+                }
+                TaskControlOperation::RequestConsult(request) => {
+                    let new = self
+                        .delegation_caller_for_tool(envelope.caller.as_deref(), "consult_request")
+                        .and_then(|caller| {
+                            gitterm::delegations::consult_delegation(
+                                &request,
+                                &caller,
+                                self.review_config.codex_model.as_deref(),
+                                None,
+                            )
+                        });
+                    return self.request_delegation(new, DelegationOrigin::Mcp(envelope.reply));
+                }
+                TaskControlOperation::GetDelegation(request) => {
+                    let result = envelope
+                        .caller
+                        .as_deref()
+                        .ok_or_else(|| task_mcp::missing_caller_error("delegation_get"))
+                        .and_then(|_| {
+                            self.task_store
+                                .as_ref()
+                                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
+                        })
+                        .and_then(|store| {
+                            store
+                                .delegation(request.delegation_id.trim())
+                                .ok_or_else(|| {
+                                    format!(
+                                        "delegation {} does not exist",
+                                        request.delegation_id.trim()
+                                    )
+                                })
+                        })
+                        .and_then(|delegation| {
+                            gitterm::delegations::delegation_record(
+                                delegation,
+                                &config::global_config_dir(),
+                            )
+                        });
+                    envelope.reply.send(result);
+                }
+                TaskControlOperation::ListDelegations(request) => {
+                    let result = envelope
+                        .caller
+                        .as_deref()
+                        .ok_or_else(|| task_mcp::missing_caller_error("delegation_list"))
+                        .and_then(|caller| {
+                            let store = self
+                                .task_store
+                                .as_ref()
+                                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
+                            gitterm::delegations::delegation_list(
+                                &store.delegations_for_parent(caller),
+                                request.status.as_deref(),
+                            )
+                        });
+                    envelope.reply.send(result);
+                }
             },
             Event::BrowserMcpStopped(result) => {
                 let error = match result {
@@ -12790,6 +13531,29 @@ fi
                     AgentIpcMessage::ReviewRequest { tab_id, request } => {
                         Task::done(Event::AgentReviewRequested(tab_id, request))
                     }
+                    AgentIpcMessage::ConsultRequest { tab_id, request } => {
+                        Task::done(Event::AgentConsultRequested(tab_id, request))
+                    }
+                    AgentIpcMessage::DelegationSend {
+                        tab_id,
+                        delegation_id,
+                        finding_ids,
+                    } => Task::done(Event::DelegationSendRequested(
+                        tab_id,
+                        delegation_id,
+                        finding_ids,
+                    )),
+                    AgentIpcMessage::DelegationRerun {
+                        tab_id,
+                        delegation_id,
+                    } => Task::done(Event::DelegationRerunRequested(tab_id, delegation_id)),
+                    AgentIpcMessage::DelegationDismiss {
+                        tab_id,
+                        delegation_id,
+                    } => Task::done(Event::DelegationDismissRequested(tab_id, delegation_id)),
+                    AgentIpcMessage::OpenFile { tab_id, path } => {
+                        Task::done(Event::DelegationOpenFile(tab_id, path))
+                    }
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
@@ -13240,6 +14004,7 @@ fi
                     "context": context,
                     "reviewer": self.review_config.default_reviewer.as_str(),
                     "model": self.review_config.subagent_model,
+                    "codex_model": self.review_config.codex_model,
                 });
                 webview::evaluate_script(
                     WebviewSurface::Agent(tab_id),
@@ -13260,12 +14025,19 @@ fi
                     agent_webview_note(tab_id, "Review… needs a Claude chat tab.");
                     return Task::none();
                 }
-                if self.review_config.default_reviewer == config::ReviewerKind::Codex {
-                    agent_webview_note(
-                        tab_id,
-                        "Codex reviews are not available yet. Set review.default_reviewer to \"claude-subagent\" in the GitTerm config to review with a Claude subagent.",
-                    );
-                    return Task::none();
+                if let Ok(request) = &request {
+                    if request.reviewer == gitterm::review::PopoverReviewer::Codex {
+                        // A GitTerm-run delegation: no agent turn is spent.
+                        let new = self.delegation_caller_for_tab(tab_id).and_then(|caller| {
+                            gitterm::delegations::review_delegation(
+                                &gitterm::delegations::review_request_from_popover(request),
+                                &caller,
+                                self.review_config.codex_model.as_deref(),
+                                None,
+                            )
+                        });
+                        return self.request_delegation(new, DelegationOrigin::Page(tab_id));
+                    }
                 }
                 let prompt = request.and_then(|r| gitterm::review::review_prompt(&r));
                 return match prompt {
@@ -13276,6 +14048,180 @@ fi
                         Task::none()
                     }
                 };
+            }
+            Event::AgentConsultRequested(tab_id, request) => {
+                let is_claude = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                    .is_some_and(|s| s.backend() == tab::AgentBackend::Claude);
+                if !is_claude {
+                    eprintln!("AgentConsultRequested: tab {tab_id} is not a Claude chat tab");
+                    agent_webview_note(tab_id, "Consult… needs a Claude chat tab.");
+                    return Task::none();
+                }
+                let request = match request {
+                    Ok(request) => request,
+                    Err(e) => {
+                        eprintln!("AgentConsultRequested: tab {tab_id}: {e}");
+                        agent_webview_note(tab_id, &format!("Consult not sent: {e}"));
+                        return Task::none();
+                    }
+                };
+                if request.reviewer == gitterm::review::PopoverReviewer::Codex {
+                    let new = self.delegation_caller_for_tab(tab_id).and_then(|caller| {
+                        gitterm::delegations::consult_delegation(
+                            &task_mcp::ConsultDelegationRequest {
+                                brief: request.brief.clone(),
+                                model: Some(request.model.clone()),
+                            },
+                            &caller,
+                            self.review_config.codex_model.as_deref(),
+                            None,
+                        )
+                    });
+                    return self.request_delegation(new, DelegationOrigin::Page(tab_id));
+                }
+                return match gitterm::review::consult_prompt(&request) {
+                    Ok(prompt) => Task::done(Event::AgentSubmitPrompt(tab_id, prompt)),
+                    Err(e) => {
+                        eprintln!("AgentConsultRequested: tab {tab_id}: {e}");
+                        agent_webview_note(tab_id, &format!("Consult not sent: {e}"));
+                        Task::none()
+                    }
+                };
+            }
+            Event::DelegationChecked(new, origin, result) => {
+                return self.delegation_checked(*new, origin, result);
+            }
+            Event::DelegationProgress(delegation_id, event) => {
+                self.delegation_progress(&delegation_id, event);
+                return Task::none();
+            }
+            Event::DelegationFinished(delegation_id, outcome) => {
+                return self.finish_delegation(&delegation_id, outcome);
+            }
+            Event::DelegationHeadLoaded(tab_id, head) => {
+                match head {
+                    Ok(head) => {
+                        let head = serde_json::Value::String(head);
+                        webview::evaluate_script(
+                            WebviewSurface::Agent(tab_id),
+                            &format!("window.__setDelegationHead({head})"),
+                        );
+                    }
+                    Err(error) => eprintln!("[delegation] tab {tab_id}: {error}"),
+                }
+                return Task::none();
+            }
+            Event::DelegationSendRequested(tab_id, delegation_id, finding_ids) => {
+                let streaming = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                    .is_some_and(|s| matches!(s.state, tab::AgentSessionState::Streaming));
+                let prepared = self.tab_delegation(tab_id, &delegation_id).and_then(|d| {
+                    gitterm::delegations::compose_send_message(d, &finding_ids)
+                        .map(|message| (message, d.delivered_at.is_some()))
+                });
+                let (message, delivered) = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        eprintln!("[delegation] send {delegation_id} on tab {tab_id}: {error}");
+                        agent_webview_note(tab_id, &format!("Not sent: {error}"));
+                        return Task::none();
+                    }
+                };
+                let held = self.delegation_held.entry(tab_id).or_default();
+                match gitterm::delegations::decide_send(streaming, delivered, held, &delegation_id)
+                {
+                    gitterm::delegations::SendDecision::SendNow => {
+                        return self.deliver_delegation(tab_id, &delegation_id, message);
+                    }
+                    gitterm::delegations::SendDecision::Hold => {
+                        held.push(gitterm::delegations::HeldSend {
+                            delegation_id: delegation_id.clone(),
+                            message,
+                        });
+                        self.push_delegation_card(&delegation_id);
+                    }
+                    gitterm::delegations::SendDecision::AlreadyDelivered => {
+                        agent_webview_note(tab_id, "That result was already sent to Claude.");
+                    }
+                    gitterm::delegations::SendDecision::AlreadyHeld => {}
+                }
+                return Task::none();
+            }
+            Event::DelegationRerunRequested(tab_id, delegation_id) => {
+                let new = self
+                    .tab_delegation(tab_id, &delegation_id)
+                    .and_then(gitterm::delegations::rerun_delegation);
+                return self.request_delegation(new, DelegationOrigin::Page(tab_id));
+            }
+            Event::DelegationDismissRequested(tab_id, delegation_id) => {
+                let active = match self.tab_delegation(tab_id, &delegation_id) {
+                    Ok(delegation) => delegation.status.is_active(),
+                    Err(error) => {
+                        eprintln!("[delegation] dismiss {delegation_id}: {error}");
+                        agent_webview_note(tab_id, &format!("Not dismissed: {error}"));
+                        return Task::none();
+                    }
+                };
+                // Dismissing a running card stops its Codex run.
+                if let Some(handle) = self.delegation_runs.remove(&delegation_id) {
+                    handle.abort();
+                }
+                self.delegation_activity.remove(&delegation_id);
+                if let Some(held) = self.delegation_held.get_mut(&tab_id) {
+                    held.retain(|send| send.delegation_id != delegation_id);
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                let result = match self.task_store.as_mut() {
+                    Some(store) => {
+                        let cancelled = if active {
+                            store.cancel_delegation(&delegation_id, &now)
+                        } else {
+                            Ok(())
+                        };
+                        cancelled
+                            .and_then(|()| store.dismiss_delegation(&delegation_id, &now))
+                            .map_err(|error| error.to_string())
+                    }
+                    None => Err("GitTerm's task store is unavailable".to_string()),
+                };
+                if let Err(error) = result {
+                    eprintln!("[delegation] dismiss {delegation_id}: {error}");
+                    agent_webview_note(tab_id, &format!("Not dismissed: {error}"));
+                }
+                self.push_delegation_card(&delegation_id);
+                return self.start_queued_delegations();
+            }
+            Event::DelegationOpenFile(tab_id, path) => {
+                let Some(repo_path) = self
+                    .active_tab()
+                    .filter(|tab| tab.id == tab_id)
+                    .map(|tab| tab.repo_path.clone())
+                else {
+                    eprintln!("[delegation] open_file from tab {tab_id}, which is not in front");
+                    return Task::none();
+                };
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    repo_path.join(path)
+                };
+                if !path.is_file() {
+                    agent_webview_note(
+                        tab_id,
+                        &format!("{} is not a file in this checkout.", path.display()),
+                    );
+                    return Task::none();
+                }
+                return Task::done(Event::ViewFile(SourcePath::Local(path)));
             }
             Event::NewClaudeChatTab => {
                 self.tab_picker_visible = false;
@@ -13375,9 +14321,10 @@ fi
                     session.configured_permission_mode().as_deref(),
                     composer.as_ref(),
                 );
-                replay_agent_conversation_in_webview(tab_id, &session.conversation);
+                let cards = self.delegation_cards_for_tab(tab_id);
+                replay_agent_conversation_in_webview(tab_id, &session.conversation, cards);
                 webview::focus_agent_composer(tab_id);
-                return Task::none();
+                return self.refresh_delegation_head(tab_id);
             }
             Event::AgentHistoryLoaded(tab_id, history) => {
                 let Some(session) = self
@@ -13404,8 +14351,11 @@ fi
                 // A page still being built replays the merged buffer when
                 // it is done (`AgentWebviewCreated`).
                 if webview::is_active(WebviewSurface::Agent(tab_id)) {
+                    let conversation = session.conversation.clone();
+                    let cards = self.delegation_cards_for_tab(tab_id);
                     reset_agent_webview(tab_id);
-                    replay_agent_conversation_in_webview(tab_id, &session.conversation);
+                    replay_agent_conversation_in_webview(tab_id, &conversation, cards);
+                    return self.refresh_delegation_head(tab_id);
                 }
                 return Task::none();
             }
@@ -13416,6 +14366,11 @@ fi
                 // shown last counts as being read (completion is not unread).
                 let is_front_page = self.agent_pages.first() == Some(&tab_id);
                 let attention_reason = agent_event_attention_reason(&ev);
+                // A held Send-to-Claude goes out when the turn ends (TRU-142).
+                let turn_ended = matches!(
+                    &ev,
+                    tab::AgentEvent::Harness(HarnessEvent::TurnCompleted { .. })
+                );
                 // Progress capture: what the session last said it was doing.
                 // Only meaningful events feed this — streaming deltas don't.
                 let progress_note: Option<(Option<String>, Option<String>)> = match &ev {
@@ -13648,6 +14603,12 @@ fi
                 }
                 if chat_config_changed {
                     self.save_config();
+                }
+                if turn_ended {
+                    return Task::batch([
+                        self.flush_held_delegation(tab_id),
+                        self.refresh_delegation_head(tab_id),
+                    ]);
                 }
                 return Task::none();
             }
@@ -20875,9 +21836,16 @@ fi
             let has_error = ws.console.status == ConsoleStatus::Error;
 
             // Colored dot before name — override for attention/error
-            let dot_color = if has_error || attention_reason == Some(AttentionReason::AgentFailed) {
+            let dot_color = if has_error
+                || matches!(
+                    attention_reason,
+                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))
+                ) {
                 theme.danger()
-            } else if attention_reason == Some(AttentionReason::CompletedUnread) {
+            } else if matches!(
+                attention_reason,
+                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_))
+            ) {
                 theme.success()
             } else if has_attention && pulse_bright {
                 theme.peach()
@@ -20955,8 +21923,12 @@ fi
                 );
             } else if has_attention {
                 let badge_bg = match attention_reason {
-                    Some(AttentionReason::AgentFailed) => theme.danger(),
-                    Some(AttentionReason::CompletedUnread) => theme.success(),
+                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)) => {
+                        theme.danger()
+                    }
+                    Some(
+                        AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_),
+                    ) => theme.success(),
                     _ => theme.peach(),
                 };
                 let badge_text_color = theme.bg_crust();
@@ -21559,11 +22531,19 @@ fi
             };
 
             // Color: error (red) > attention (pulsing amber) > active (ws color) > inactive
-            let dot_color = if (has_error || attention_reason == Some(AttentionReason::AgentFailed))
+            let dot_color = if (has_error
+                || matches!(
+                    attention_reason,
+                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))
+                ))
                 && !is_active
             {
                 theme.danger()
-            } else if attention_reason == Some(AttentionReason::CompletedUnread) && !is_active {
+            } else if matches!(
+                attention_reason,
+                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_))
+            ) && !is_active
+            {
                 theme.success()
             } else if has_attention && !is_active && pulse_bright {
                 theme.peach()
@@ -21824,8 +22804,12 @@ fi
                         theme.warning()
                     },
                 ),
-                Some(AttentionReason::AgentFailed) => ("! ", theme.danger()),
-                Some(AttentionReason::CompletedUnread) => ("✓ ", theme.success()),
+                Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)) => {
+                    ("! ", theme.danger())
+                }
+                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_)) => {
+                    ("✓ ", theme.success())
+                }
                 None if is_claude => ("✦ ", theme.peach()),
                 None => ("▶ ", theme.success()),
             };
@@ -21862,8 +22846,12 @@ fi
 
             // Attention background colors
             let attention_base_color = match attention_reason {
-                Some(AttentionReason::AgentFailed) => theme.danger(),
-                Some(AttentionReason::CompletedUnread) => theme.success(),
+                Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)) => {
+                    theme.danger()
+                }
+                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_)) => {
+                    theme.success()
+                }
                 _ => theme.peach(),
             };
             let attn_bg_color = iced::Color {
@@ -30766,6 +31754,31 @@ mod tests {
         assert!(
             AttentionReason::AgentFailed.priority() < AttentionReason::CompletedUnread.priority()
         );
+    }
+
+    #[test]
+    fn delegation_results_rank_and_read_like_their_kind_and_clear_on_visit() {
+        use gitterm::tasks::DelegationKind;
+        let ready = AttentionReason::DelegationReady(DelegationKind::Review);
+        let failed = AttentionReason::DelegationFailed(DelegationKind::Consult);
+        assert_eq!(
+            ready.priority(),
+            AttentionReason::CompletedUnread.priority()
+        );
+        assert_eq!(failed.priority(), AttentionReason::AgentFailed.priority());
+        assert_eq!(ready.label(), "Review ready");
+        assert_eq!(
+            AttentionReason::DelegationReady(DelegationKind::Consult).label(),
+            "Consult ready"
+        );
+        assert_eq!(failed.label(), "Consult failed");
+        let mut tab = TabState::new(1, PathBuf::from("/tmp"));
+        tab.set_attention(ready);
+        tab.mark_visited();
+        assert!(!tab.needs_attention());
+        tab.set_attention(failed);
+        tab.mark_visited();
+        assert!(!tab.needs_attention());
     }
 
     #[test]

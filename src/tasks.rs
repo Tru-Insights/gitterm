@@ -567,6 +567,19 @@ pub struct DeliveryState {
 pub enum DelegationKind {
     Review,
     Implement,
+    /// Free-form advice (brainstorming, architecture, investigation). The
+    /// result is a handoff, not findings (TRU-144).
+    Consult,
+}
+
+impl DelegationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::Implement => "implement",
+            Self::Consult => "consult",
+        }
+    }
 }
 
 /// The session that asked for the delegation and is told when it lands.
@@ -590,6 +603,16 @@ pub enum DelegationChild {
     CodexReview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread_id: Option<String>,
+        /// `-m <model>`; `None` keeps Codex's configured default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    /// A background `codex exec` consult owned by GitTerm.
+    CodexConsult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// A worker session inside a GitTerm task.
     TaskSession {
@@ -669,7 +692,7 @@ impl DelegationStatus {
         matches!(self, Self::Requested | Self::Running | Self::Interrupted)
     }
 
-    fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Self::Requested => "requested",
             Self::Running => "running",
@@ -791,6 +814,10 @@ pub struct Delegation {
     /// sends it twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
+    /// When the human dismissed the result card; it then stays collapsed
+    /// and leaves the roster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -821,6 +848,19 @@ impl Delegation {
             created_at: timestamp.clone(),
             updated_at: timestamp,
             delivered_at: None,
+            dismissed_at: None,
+        }
+    }
+
+    /// The Codex run's thread id and model, for a delegation GitTerm runs
+    /// through `codex_runner`. `None` for any other child.
+    pub fn codex_child(&self) -> Option<(Option<&str>, Option<&str>)> {
+        match &self.child {
+            DelegationChild::CodexReview { thread_id, model }
+            | DelegationChild::CodexConsult { thread_id, model } => {
+                Some((thread_id.as_deref(), model.as_deref()))
+            }
+            _ => None,
         }
     }
 }
@@ -1628,6 +1668,7 @@ impl TaskStore {
         if !delegation.status.is_active()
             || delegation.result.is_some()
             || delegation.delivered_at.is_some()
+            || delegation.dismissed_at.is_some()
         {
             return Err(TaskStoreError::new(
                 "insert delegation into",
@@ -1750,6 +1791,76 @@ impl TaskStore {
         timestamp: &str,
     ) -> Result<(), TaskStoreError> {
         self.set_delegation_status(delegation_id, DelegationStatus::Cancelled, timestamp)
+    }
+
+    /// A Codex run started: the delegation becomes `Running` and records the
+    /// run's thread id. Only `Requested` delegations with a Codex child start.
+    pub fn mark_delegation_started(
+        &mut self,
+        delegation_id: &str,
+        thread_id: &str,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "mark delegation started in";
+        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
+        if delegation.status != DelegationStatus::Requested {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!(
+                    "delegation {delegation_id} is {}, not requested",
+                    delegation.status.label()
+                ),
+            ));
+        }
+        match &mut delegation.child {
+            DelegationChild::CodexReview {
+                thread_id: slot, ..
+            }
+            | DelegationChild::CodexConsult {
+                thread_id: slot, ..
+            } => {
+                *slot = Some(thread_id.to_string());
+            }
+            other => {
+                return Err(TaskStoreError::new(
+                    OPERATION,
+                    &self.path,
+                    format!("delegation {delegation_id} has no Codex run ({other:?})"),
+                ));
+            }
+        }
+        delegation.status = DelegationStatus::Running;
+        delegation.updated_at = timestamp.to_string();
+        self.commit_delegation(index, delegation)
+    }
+
+    /// The human dismissed a finished delegation's card. Dismissing twice is
+    /// a no-op that keeps the first time; an active delegation must be
+    /// cancelled first.
+    pub fn dismiss_delegation(
+        &mut self,
+        delegation_id: &str,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "dismiss delegation in";
+        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
+        if delegation.status.is_active() {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!(
+                    "delegation {delegation_id} is still {}; cancel it first",
+                    delegation.status.label()
+                ),
+            ));
+        }
+        if delegation.dismissed_at.is_some() {
+            return Ok(());
+        }
+        delegation.dismissed_at = Some(timestamp.to_string());
+        delegation.updated_at = timestamp.to_string();
+        self.commit_delegation(index, delegation)
     }
 
     fn delegation_for_update(
@@ -1936,6 +2047,10 @@ fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
             DelegationKind::Review,
             DelegationChild::CodexReview { .. } | DelegationChild::ClaudeSubagent { .. },
         ) => true,
+        (
+            DelegationKind::Consult,
+            DelegationChild::CodexConsult { .. } | DelegationChild::ClaudeSubagent { .. },
+        ) => true,
         (DelegationKind::Implement, DelegationChild::TaskSession { task_id, .. }) => {
             !task_id.trim().is_empty()
         }
@@ -1975,6 +2090,12 @@ fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
         }
         (_, None) => {}
     }
+    if delegation.dismissed_at.is_some() && delegation.status.is_active() {
+        return Err(format!(
+            "delegation {id} is dismissed but still {}",
+            delegation.status.label()
+        ));
+    }
     if delegation.delivered_at.is_some() && delegation.status != DelegationStatus::Completed {
         return Err(format!(
             "delegation {id} is marked delivered but is {}",
@@ -1996,6 +2117,11 @@ fn validate_delegation_result(
         DelegationKind::Implement if result.handoff.is_none() => {
             return Err(format!(
                 "implement delegation {id} completed without a handoff"
+            ));
+        }
+        DelegationKind::Consult if result.handoff.is_none() => {
+            return Err(format!(
+                "consult delegation {id} completed without a handoff"
             ));
         }
         _ => {}
@@ -2305,7 +2431,10 @@ mod tests {
                     workspace: "GitTerm V5".to_string(),
                     cwd: PathBuf::from("/repo with spaces/gitterm-v5"),
                 },
-                child: DelegationChild::CodexReview { thread_id: None },
+                child: DelegationChild::CodexReview {
+                    thread_id: None,
+                    model: None,
+                },
                 brief: "Review the uncommitted changes".to_string(),
                 target: Some(ReviewTarget {
                     mode: ReviewTargetMode::Base {
@@ -3919,5 +4048,90 @@ mod tests {
         let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
         store.insert(sample_task("task-1")).unwrap();
         assert_eq!(fs::read(workspace_path).unwrap(), workspace_bytes);
+    }
+
+    #[test]
+    fn a_started_codex_run_records_its_thread_and_a_finished_card_can_be_dismissed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store
+            .insert_delegation(sample_delegation("review-1", "tab-a", "t1"))
+            .unwrap();
+        // Active delegations cannot be dismissed.
+        assert!(store.dismiss_delegation("review-1", "t2").is_err());
+        store
+            .mark_delegation_started("review-1", "thread-9", "t2")
+            .unwrap();
+        let delegation = store.delegation("review-1").unwrap();
+        assert_eq!(delegation.status, DelegationStatus::Running);
+        assert_eq!(delegation.codex_child(), Some((Some("thread-9"), None)));
+        // Starting twice is an error.
+        assert!(store
+            .mark_delegation_started("review-1", "thread-10", "t3")
+            .is_err());
+        store
+            .complete_delegation("review-1", sample_review_result(), "t4")
+            .unwrap();
+        store.dismiss_delegation("review-1", "t5").unwrap();
+        store.dismiss_delegation("review-1", "t6").unwrap();
+        assert_eq!(
+            store
+                .delegation("review-1")
+                .unwrap()
+                .dismissed_at
+                .as_deref(),
+            Some("t5")
+        );
+        let reloaded = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        assert_eq!(
+            reloaded
+                .delegation("review-1")
+                .unwrap()
+                .dismissed_at
+                .as_deref(),
+            Some("t5")
+        );
+    }
+
+    #[test]
+    fn consult_delegations_need_a_codex_consult_child_and_complete_with_a_handoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        let mut consult = sample_delegation("consult-1", "tab-a", "t1");
+        consult.kind = DelegationKind::Consult;
+        consult.target = None;
+        // A review child does not fit a consult.
+        assert!(store.insert_delegation(consult.clone()).is_err());
+        consult.child = DelegationChild::CodexConsult {
+            thread_id: None,
+            model: Some("gpt-6-astra".to_string()),
+        };
+        store.insert_delegation(consult).unwrap();
+        // Findings alone are not a consult result.
+        assert!(store
+            .complete_delegation("consult-1", sample_review_result(), "t2")
+            .is_err());
+        store
+            .complete_delegation(
+                "consult-1",
+                DelegationResult {
+                    handoff: Some(TaskHandoff {
+                        summary: "Split the module".to_string(),
+                        decisions: Vec::new(),
+                        next_steps: Vec::new(),
+                        blockers: Vec::new(),
+                        updated_by_session_id: None,
+                        updated_at: "t2".to_string(),
+                    }),
+                    findings: None,
+                    reviewed: None,
+                },
+                "t2",
+            )
+            .unwrap();
+        assert_eq!(
+            store.delegation("consult-1").unwrap().status,
+            DelegationStatus::Completed
+        );
     }
 }
