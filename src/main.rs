@@ -2791,6 +2791,42 @@ fn conversation_backend_glyph(backend: HarnessConversationBackend) -> &'static s
 /// full history. Derived from the task store alone — the Chats index
 /// is only built when the Chats panel opens, so resume must not
 /// depend on it.
+/// A persisted `claude … --session-id <id>` launch whose session has since
+/// been written cannot be re-run: the CLI refuses with "Session ID <id> is
+/// already in use". Returns the resume command (other flags kept) and the
+/// id in that case. None leaves the command alone: not a Claude launch, no
+/// `--session-id`, a quoted command (an embedded brief) or a session that
+/// never got a message, where the fresh launch is still right.
+fn resume_for_preassigned_claude_launch(
+    command: &str,
+    session_exists: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    if command.contains(['"', '\'']) {
+        return None;
+    }
+    let mut words = command.split_whitespace();
+    if words.next() != Some("claude") {
+        return None;
+    }
+    let words: Vec<&str> = words.collect();
+    let idx = words.iter().position(|w| *w == "--session-id")?;
+    let id = *words.get(idx + 1)?;
+    if !session_exists(id) {
+        return None;
+    }
+    let mut out = vec!["claude"];
+    out.extend(
+        words
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx && *i != idx + 1)
+            .map(|(_, w)| *w),
+    );
+    out.push("--resume");
+    out.push(id);
+    Some((out.join(" "), id.to_string()))
+}
+
 fn conversation_resume_command(conversation: &HarnessConversationRef) -> String {
     let backend = conversation_chat_backend(conversation.backend);
     backend.resume_command(backend.label(), &conversation.session_id)
@@ -11206,6 +11242,20 @@ impl App {
                                     startup_command = Some("claude".to_string());
                                     chat_session_id = None;
                                 }
+                            } else if let Some((resume, session_id)) =
+                                startup_command.as_deref().and_then(|command| {
+                                    resume_for_preassigned_claude_launch(
+                                        command,
+                                        chats::claude_session_exists,
+                                    )
+                                })
+                            {
+                                // A plain `claude --session-id X` launch whose
+                                // session has since been written cannot be
+                                // re-run (the CLI refuses: "Session ID X is
+                                // already in use"); resume it instead.
+                                startup_command = Some(resume);
+                                chat_session_id = Some(session_id);
                             }
                         }
                         match (
@@ -32350,6 +32400,43 @@ mod tests {
             HarnessConversationBackend::Pi
         )));
         assert!(!backend_accepts_initial_prompt(None));
+    }
+
+    #[test]
+    fn preassigned_claude_launch_resumes_once_the_session_exists() {
+        let exists = |id: &str| id == "abc";
+        assert_eq!(
+            resume_for_preassigned_claude_launch("claude --session-id abc", exists),
+            Some(("claude --resume abc".to_string(), "abc".to_string()))
+        );
+        assert_eq!(
+            resume_for_preassigned_claude_launch("claude --model opus --session-id abc", exists),
+            Some((
+                "claude --model opus --resume abc".to_string(),
+                "abc".to_string()
+            ))
+        );
+        // The session never got a message: the fresh launch still works.
+        assert_eq!(
+            resume_for_preassigned_claude_launch("claude --session-id new", exists),
+            None
+        );
+        assert_eq!(
+            resume_for_preassigned_claude_launch("claude --resume abc", exists),
+            None
+        );
+        assert_eq!(
+            resume_for_preassigned_claude_launch("codex --session-id abc", exists),
+            None
+        );
+        // An embedded brief is quoted; leave it to the task restore path.
+        assert_eq!(
+            resume_for_preassigned_claude_launch(
+                "claude --session-id abc \"$(cat 'b.md')\"",
+                exists
+            ),
+            None
+        );
     }
 
     #[test]
