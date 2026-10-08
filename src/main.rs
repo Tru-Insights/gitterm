@@ -25473,11 +25473,16 @@ fi
             list = list.push(text(msg).size(font_small).color(theme.text_secondary()));
         }
 
-        let live_ids: std::collections::HashSet<&str> = self
+        // Conversations open in a tab, with the workspace that holds them:
+        // the "open" marker doubles as a jump to that tab.
+        let live_in: HashMap<&str, &str> = self
             .workspaces
             .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .filter_map(|t| t.chat_session_id.as_deref())
+            .flat_map(|ws| {
+                ws.tabs
+                    .iter()
+                    .filter_map(move |t| Some((t.chat_session_id.as_deref()?, ws.name.as_str())))
+            })
             .collect();
         let selected_bg = theme.surface0();
         let selected_border = theme.surface1();
@@ -25604,9 +25609,17 @@ fi
                                 .color(theme.text_secondary()),
                         );
                     }
-                    if live_ids.contains(entry.id.as_str()) {
-                        meta =
-                            meta.push(text("● open").size(font_small - 1.0).color(theme.green()));
+                    if let Some(ws_name) = live_in.get(entry.id.as_str()) {
+                        meta = meta.push(
+                            button(
+                                text(format!("● open in {ws_name}"))
+                                    .size(font_small - 1.0)
+                                    .color(theme.green()),
+                            )
+                            .style(button::text)
+                            .padding(0)
+                            .on_press(Event::FocusChatTab(entry.id.clone())),
+                        );
                     } else if entry.possibly_running() {
                         meta = meta.push(
                             text("◐ possibly running")
