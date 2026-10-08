@@ -279,9 +279,11 @@
   .rq-sending { color: var(--fg-muted); font-size: 12px; }
 
   /* Composer */
-  #composer { display: flex; gap: 6px; align-items: flex-end; }
+  /* Composer (T3 Code layout): the message box full width on top, a
+     toolbar of compact chips below it with Send/Stop on the right. */
+  #composer { display: flex; flex-direction: column; gap: 6px; }
   #prompt {
-    flex: 1;
+    width: 100%;
     min-height: 36px;
     max-height: 200px;
     padding: 8px 10px;
@@ -294,6 +296,11 @@
     resize: none;
   }
   #prompt:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  #toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  #toolbar .tb-chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
+  #toolbar .tb-send { display: flex; gap: 6px; margin-left: auto; }
+  #toolbar .tb-send button { padding: 5px 14px; }
+  .chip svg, #mode svg, #review svg { width: 12px; height: 12px; flex: none; }
   button {
     padding: 7px 14px;
     background: var(--bg-block);
@@ -314,7 +321,7 @@
   /* Permission mode chip (left of Send) and its menu */
   .mode-wrap { position: relative; display: none; }
   .mode-wrap.visible { display: block; }
-  #mode { padding: 7px 10px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
+  #mode { padding: 4px 8px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; }
   #mode[data-mode=acceptEdits] { color: var(--accent); border-color: var(--accent); }
   #mode[data-mode=plan] { color: var(--result); border-color: var(--result); }
   #mode[data-mode=auto] { color: var(--warn); border-color: var(--warn); }
@@ -323,7 +330,7 @@
   #mode-menu {
     display: none;
     position: absolute;
-    right: 0;
+    left: 0;
     bottom: calc(100% + 6px);
     min-width: 190px;
     padding: 4px;
@@ -341,14 +348,15 @@
   /* Model, effort and checkout chips (TRU-143); menus like the mode chip's */
   .chip-wrap { position: relative; display: none; }
   .chip-wrap.visible { display: block; }
-  .chip { padding: 7px 10px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+  .chip { padding: 4px 8px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; display: inline-flex; align-items: center; gap: 5px; }
+  .chip .lbl { overflow: hidden; text-overflow: ellipsis; }
   .chip.pending { opacity: 0.65; }
   .chip.locked { cursor: default; }
   .chip.locked:hover { background: var(--bg-block); }
   .chip-menu {
     display: none;
     position: absolute;
-    right: 0;
+    left: 0;
     bottom: calc(100% + 6px);
     min-width: 210px;
     max-height: 320px;
@@ -365,15 +373,18 @@
   .chip-menu .mark { width: 12px; flex: none; color: var(--accent); }
   .chip-menu .sub { color: var(--fg-muted); font-size: 11px; margin-left: auto; padding-left: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
   .chip-menu .hint { padding: 4px 8px 2px; color: var(--fg-muted); font-size: 11px; white-space: nowrap; }
+  .chip-menu .section { padding: 6px 8px 2px; color: var(--fg-muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; border-top: 1px solid var(--border); margin-top: 4px; }
+  .chip-menu .section:first-child { border-top: none; margin-top: 0; }
+  .chip-menu button:disabled { opacity: 0.45; }
 
   /* Review… button and popover (left of the mode chip) */
   .review-wrap { position: relative; display: none; }
   .review-wrap.visible { display: block; }
-  #review { padding: 7px 10px; font-size: 12px; white-space: nowrap; }
+  #review { padding: 4px 8px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; }
   #review-pop {
     display: none;
     position: absolute;
-    right: 0;
+    left: 0;
     bottom: calc(100% + 6px);
     width: 340px;
     padding: 10px 12px;
@@ -490,28 +501,34 @@
   <div id="roster"></div>
   <div id="composer">
     <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
-    <div class="review-wrap">
-      <div id="review-pop"></div>
-      <button id="review" title="Ask a Claude subagent or Codex to review this checkout, or consult them">Review…</button>
+    <div id="toolbar">
+      <div class="tb-chips">
+        <div class="review-wrap">
+          <div id="review-pop"></div>
+          <button id="review" title="Ask a Claude subagent or Codex to review this checkout, or consult them">Review / Consult…</button>
+        </div>
+        <div class="chip-wrap" id="model-wrap">
+          <div class="chip-menu" id="model-menu"></div>
+          <button class="chip" id="model" title="Model"></button>
+        </div>
+        <div class="chip-wrap" id="effort-wrap">
+          <div class="chip-menu" id="effort-menu"></div>
+          <button class="chip" id="effort" title="Effort and context window"></button>
+        </div>
+        <div class="mode-wrap">
+          <div id="mode-menu"></div>
+          <button id="mode" title="Permission mode (Shift+Tab in the message box cycles)"></button>
+        </div>
+        <div class="chip-wrap" id="checkout-wrap">
+          <div class="chip-menu" id="checkout-menu"></div>
+          <button class="chip" id="checkout"></button>
+        </div>
+      </div>
+      <div class="tb-send">
+        <button id="submit" class="primary">Send</button>
+        <button id="stop" class="danger" disabled>Stop</button>
+      </div>
     </div>
-    <div class="chip-wrap" id="model-wrap">
-      <div class="chip-menu" id="model-menu"></div>
-      <button class="chip" id="model" title="Model"></button>
-    </div>
-    <div class="chip-wrap" id="effort-wrap">
-      <div class="chip-menu" id="effort-menu"></div>
-      <button class="chip" id="effort" title="Effort"></button>
-    </div>
-    <div class="mode-wrap">
-      <div id="mode-menu"></div>
-      <button id="mode" title="Permission mode (Shift+Tab in the message box cycles)"></button>
-    </div>
-    <div class="chip-wrap" id="checkout-wrap">
-      <div class="chip-menu" id="checkout-menu"></div>
-      <button class="chip" id="checkout"></button>
-    </div>
-    <button id="submit" class="primary">Send</button>
-    <button id="stop" class="danger" disabled>Stop</button>
   </div>
 <script>
 (function () {
@@ -561,6 +578,17 @@
   }
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  // Chip glyphs (inline SVG, currentColor).
+  const ICONS = {
+    model: '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0.8l1.7 4.6 4.7 1.6-4.7 1.7L8 13.4 6.3 8.7 1.6 7l4.7-1.6z"/></svg>',
+    lock: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7.5" rx="1.5"/><path d="M5.2 7V5a2.8 2.8 0 0 1 5.6 0v2"/></svg>',
+    folder: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M1.5 4.2c0-.7.5-1.2 1.2-1.2h3.4l1.6 1.7h5.6c.7 0 1.2.5 1.2 1.2v6.4c0 .7-.5 1.2-1.2 1.2H2.7c-.7 0-1.2-.5-1.2-1.2z"/></svg>',
+    gauge: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M2.5 11.5a5.5 5.5 0 1 1 11 0"/><path d="M8 11.5l2.6-3.4"/></svg>',
+    review: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.4 10.4l3.6 3.6"/></svg>',
+  };
+  function setChip(btn, icon, text) {
+    btn.innerHTML = (ICONS[icon] || '') + '<span class="lbl">' + escapeHtml(text) + '</span>';
   }
   function postIpc(payload) {
     if (!window.ipc || typeof window.ipc.postMessage !== 'function') return;
@@ -998,7 +1026,7 @@
     if (mode.current == null) { modeMenuEl.classList.remove('visible'); return; }
     modeBtn.dataset.mode = mode.current;
     modeBtn.classList.toggle('pending', mode.pending != null);
-    modeBtn.textContent = modeLabel(mode.current) + (mode.pending != null ? ' → ' + modeLabel(mode.pending) + '…' : '');
+    setChip(modeBtn, 'lock', modeLabel(mode.current) + (mode.pending != null ? ' → ' + modeLabel(mode.pending) + '…' : ''));
     modeMenuEl.innerHTML = '';
     modeMenuEl.appendChild(el('div', 'hint', 'Permission mode · Shift+Tab cycles'));
     for (const m of modeList()) {
@@ -1095,9 +1123,29 @@
     return list;
   }
   function modelInfo(value) { return modelList().find((m) => m.value === value) || null; }
+  // Context window: Claude lists the 1M-context variant of a model as its
+  // own value, `<model>[1m]`. The effort chip switches between the two.
+  const ONE_M = '[1m]';
+  function is1m(v) { return typeof v === 'string' && v.endsWith(ONE_M); }
+  function baseModel(v) { return is1m(v) ? v.slice(0, -ONE_M.length) : v; }
+  function oneMVariant(v) {
+    if (!chips.models || !v) return null;
+    const want = baseModel(v) + ONE_M;
+    return chips.models.some((m) => m && m.value === want) ? want : null;
+  }
+  // What the model chip reads: the CLI's display name once `ready` listed
+  // the models (for `default`, the entry's description, which names the
+  // model it resolves to); before that, the configured value itself.
   function modelLabel(value) {
-    const m = modelInfo(value);
-    return (m && m.displayName) || value;
+    const base = baseModel(value);
+    if (!chips.models) return base === 'default' ? 'Claude settings' : base;
+    const m = chips.models.find((x) => x && x.value === base) || modelInfo(value);
+    if (!m) return base;
+    if (base === 'default') {
+      const desc = String(m.description || '').split(/\s[·—-]\s/)[0].trim();
+      return desc || 'Claude settings';
+    }
+    return m.displayName || base;
   }
   function effortLevels() {
     const m = modelInfo(chips.model.current);
@@ -1111,8 +1159,11 @@
     return !m || m.supportsEffort === true;
   }
   function effortLabel(v) { return v == null ? 'auto' : v; }
-  function menuItem(menu, marked, label, sub, onPick) {
+  const EFFORT_NAMES = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'X-High', max: 'Max' };
+  function effortName(v) { return v == null ? 'Auto' : (EFFORT_NAMES[v] || v); }
+  function menuItem(menu, marked, label, sub, onPick, disabled) {
     const b = el('button');
+    if (disabled) b.disabled = true;
     b.appendChild(el('span', 'mark', marked));
     b.appendChild(el('span', null, label));
     if (sub) b.appendChild(el('span', 'sub', sub));
@@ -1124,13 +1175,20 @@
     if (!chips.enabled || chips.model.current == null) { modelMenuEl.classList.remove('visible'); return; }
     const m = chips.model;
     modelBtn.classList.toggle('pending', m.pending != null);
-    modelBtn.textContent = modelLabel(m.current) + (m.pending != null ? ' → ' + modelLabel(m.pending) + '…' : '');
+    setChip(modelBtn, 'model', modelLabel(m.current) + (m.pending != null ? ' → ' + modelLabel(m.pending) + '…' : ''));
     modelBtn.title = 'Model: ' + m.current;
     modelMenuEl.innerHTML = '';
     modelMenuEl.appendChild(el('div', 'hint', chips.models ? 'Model' : 'Model · full list after the session starts'));
+    // 1M variants are picked on the effort chip's Context window section.
+    const values = new Set(modelList().map((x) => x.value));
+    const wide = is1m(m.current);
     for (const info of modelList()) {
-      menuItem(modelMenuEl, info.value === m.current ? '✓' : (info.value === m.pending ? '…' : ''),
-        info.displayName || info.value, info.description || '', () => requestModel(info.value));
+      if (is1m(info.value) && values.has(baseModel(info.value))) continue;
+      const cur = baseModel(m.current) === info.value || m.current === info.value;
+      // Keep the 1M context when the new model has it too.
+      const target = wide && oneMVariant(info.value) ? oneMVariant(info.value) : info.value;
+      menuItem(modelMenuEl, cur ? '✓' : (m.pending != null && baseModel(m.pending) === info.value ? '…' : ''),
+        info.displayName || info.value, info.description || '', () => requestModel(target));
     }
   }
   function renderEffort() {
@@ -1141,18 +1199,33 @@
     const supported = effortSupported();
     effortBtn.classList.toggle('pending', e.pending != null);
     effortBtn.classList.toggle('locked', !supported);
-    let label = 'Effort: ' + effortLabel(e.current);
-    if (e.current == null && e.applied) label += ' (' + e.applied + ')';
-    if (e.pending != null) label += ' → ' + effortLabel(e.pending.value) + '…';
-    effortBtn.textContent = label;
-    effortBtn.title = supported ? 'Effort level' : 'This model has no effort setting';
+    const cur = chips.model.current;
+    const context = is1m(cur) ? '1M' : '200k';
+    let label = supported ? effortName(e.current) : '';
+    if (supported && e.pending != null) label += ' → ' + effortName(e.pending.value) + '…';
+    label = label ? label + ' · ' + context : context;
+    setChip(effortBtn, 'gauge', label);
+    effortBtn.classList.remove('locked');
+    effortBtn.title = (supported ? 'Effort' + (e.current == null && e.applied ? ' (auto runs at ' + e.applied + ')' : '') : 'This model has no effort setting') + ' · context window ' + context;
     effortMenuEl.innerHTML = '';
-    effortMenuEl.appendChild(el('div', 'hint', 'Effort'));
-    const isPending = (v) => e.pending != null && e.pending.value === v;
-    menuItem(effortMenuEl, e.current == null ? '✓' : (isPending(null) ? '…' : ''), 'Auto', "the model's default", () => requestEffort(null));
-    for (const level of effortLevels()) {
-      menuItem(effortMenuEl, level === e.current ? '✓' : (isPending(level) ? '…' : ''), level, '', () => requestEffort(level));
+    effortMenuEl.appendChild(el('div', 'section', 'Effort'));
+    if (supported) {
+      const isPending = (v) => e.pending != null && e.pending.value === v;
+      menuItem(effortMenuEl, e.current == null ? '✓' : (isPending(null) ? '…' : ''), 'Auto', "the model's default", () => requestEffort(null));
+      for (const level of effortLevels()) {
+        menuItem(effortMenuEl, level === e.current ? '✓' : (isPending(level) ? '…' : ''), effortName(level), '', () => requestEffort(level));
+      }
+    } else {
+      effortMenuEl.appendChild(el('div', 'hint', 'This model has no effort setting'));
     }
+    effortMenuEl.appendChild(el('div', 'section', 'Context window'));
+    const variant = oneMVariant(cur);
+    const pendingModel = chips.model.pending;
+    menuItem(effortMenuEl, !is1m(cur) ? '✓' : (pendingModel != null && !is1m(pendingModel) ? '…' : ''), '200k', '',
+      () => requestModel(baseModel(cur)));
+    menuItem(effortMenuEl, is1m(cur) ? '✓' : (pendingModel != null && is1m(pendingModel) ? '…' : ''), '1M',
+      is1m(cur) || variant ? '' : (chips.models ? 'not offered for this model' : 'after the session starts'),
+      () => requestModel(variant || cur), !is1m(cur) && !variant);
   }
   function renderCheckout() {
     const c = chips.checkout;
@@ -1160,7 +1233,7 @@
     if (!chips.enabled || c == null) { checkoutMenuEl.classList.remove('visible'); return; }
     checkoutBtn.classList.toggle('pending', chips.checkoutPending != null);
     checkoutBtn.classList.toggle('locked', !!c.locked);
-    checkoutBtn.textContent = c.label + (chips.checkoutPending != null ? '…' : '');
+    setChip(checkoutBtn, 'folder', c.label + (chips.checkoutPending != null ? '…' : ''));
     checkoutBtn.title = (c.path || '') + (c.locked ? '\n' + (c.reason || 'Set when the chat started; start a new chat to change it') : '\nWhere this chat runs');
     if (c.locked) { checkoutMenuEl.classList.remove('visible'); return; }
     checkoutMenuEl.innerHTML = '';
@@ -1203,7 +1276,7 @@
     const m = chips.model;
     if (m.current == null || v === (m.pending != null ? m.pending : m.current)) return;
     m.pending = v;
-    renderModel();
+    renderModel(); renderEffort();
     postIpc({ type: 'set_model', model: v });
   }
   function requestEffort(v) {
@@ -1236,10 +1309,7 @@
     return open;
   }
   modelBtn.addEventListener('click', (e) => toggleChipMenu(modelMenuEl, e));
-  effortBtn.addEventListener('click', (e) => {
-    if (!effortSupported()) { e.stopPropagation(); return; }
-    toggleChipMenu(effortMenuEl, e);
-  });
+  effortBtn.addEventListener('click', (e) => toggleChipMenu(effortMenuEl, e));
   checkoutBtn.addEventListener('click', (e) => {
     if (chips.checkout && chips.checkout.locked) { e.stopPropagation(); return; }
     // Task worktrees come and go; ask for fresh choices while it is open.
