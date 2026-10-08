@@ -73,6 +73,7 @@ use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, Works
 use tab::{
     AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
 };
+use webview::WebviewSurface;
 
 // Start with just config for now to avoid conflicts
 use config::{
@@ -262,13 +263,16 @@ fn agent_chat_html() -> String {
 }
 
 /// Push one `AgentEvent` into the live webview via `window.__appendEvent(...)`.
-/// Caller is responsible for ensuring the agent webview is the active one;
-/// this is a no-op if no webview exists.
+/// Caller is responsible for ensuring the Agent surface mirrors this event's
+/// tab; this is a no-op if the Agent surface doesn't exist.
 fn push_agent_event_to_webview(ev: &tab::AgentEvent) {
     let Some(payload) = ev.webview_payload() else {
         return;
     };
-    webview::evaluate_script(&format!("window.__appendEvent({payload})"));
+    webview::evaluate_script(
+        WebviewSurface::Agent,
+        &format!("window.__appendEvent({payload})"),
+    );
 }
 
 /// Replay a tab's whole conversation buffer in one script call. The page
@@ -279,20 +283,23 @@ fn replay_agent_conversation_in_webview(conversation: &[tab::AgentEvent]) {
         .filter_map(tab::AgentEvent::webview_payload)
         .collect();
     let json = serde_json::Value::Array(payloads);
-    webview::evaluate_script(&format!("window.__replay({json})"));
+    webview::evaluate_script(WebviewSurface::Agent, &format!("window.__replay({json})"));
 }
 
 /// Set the active tab id on the JS side. The webview tags every IPC message
 /// with this id so the Rust dispatcher can route the prompt/stop to the
-/// correct tab (multiple agent tabs may share the singleton webview, swapping
-/// in and out via tab activation).
+/// correct tab (multiple agent tabs share the Agent surface, swapping in and
+/// out via tab activation).
 fn set_agent_webview_tab_id(tab_id: usize) {
-    webview::evaluate_script(&format!("window.__setTabId({})", tab_id));
+    webview::evaluate_script(
+        WebviewSurface::Agent,
+        &format!("window.__setTabId({})", tab_id),
+    );
 }
 
 /// Reset the chat surface: clears all rendered messages and sets status to Idle.
 fn reset_agent_webview() {
-    webview::evaluate_script("window.__resetConversation()");
+    webview::evaluate_script(WebviewSurface::Agent, "window.__resetConversation()");
 }
 
 /// Build the IPC handler closure to install at agent-webview creation. Parses
@@ -2823,6 +2830,13 @@ struct TabState {
     repo_path: PathBuf,
     repo_name: String,
     kind: TabKind,
+    /// Modal file viewer overlay sitting on top of the tab's primary content
+    /// (the terminal, or the chat surface of an agent tab). Closing it (Back /
+    /// Close) drops this back to None and reveals that content again.
+    file_viewer: Option<FileViewerOverlay>,
+    /// Debounce: most-recent `ViewFile` request this tab received, to suppress double-clicks.
+    last_view_request_path: Option<PathBuf>,
+    last_view_request_at: Option<Instant>,
     staged: Vec<FileEntry>,
     unstaged: Vec<FileEntry>,
     untracked: Vec<FileEntry>,
@@ -2903,6 +2917,9 @@ impl TabState {
             repo_path,
             repo_name,
             kind: TabKind::Terminal(TerminalTab::new()),
+            file_viewer: None,
+            last_view_request_path: None,
+            last_view_request_at: None,
             staged: Vec::new(),
             unstaged: Vec::new(),
             untracked: Vec::new(),
@@ -2958,8 +2975,9 @@ impl TabState {
 
     // ---- Tab-kind accessors -------------------------------------------------
     //
-    // Agent tabs don't have a terminal, terminal title, startup command, or file
-    // viewer overlay — these accessors all return None / no-op for that variant.
+    // Agent tabs don't have a terminal, terminal title, or startup command —
+    // these accessors all return None / no-op for that variant. The file viewer
+    // overlay lives on `TabState` itself, so both kinds host it.
     // The Agent variant has its own state in `AgentSession`; see `agent_session()`.
 
     /// The terminal widget if this is a terminal tab and a terminal has been spawned.
@@ -3040,19 +3058,13 @@ impl TabState {
         }
     }
 
-    /// File viewer overlay (modal-style on top of a terminal tab) if one is open.
+    /// File viewer overlay (modal-style on top of the tab's content) if one is open.
     fn file_viewer(&self) -> Option<&FileViewerOverlay> {
-        match &self.kind {
-            TabKind::Terminal(tt) => tt.file_viewer.as_ref(),
-            TabKind::Agent(_) => None,
-        }
+        self.file_viewer.as_ref()
     }
 
     fn file_viewer_mut(&mut self) -> Option<&mut FileViewerOverlay> {
-        match &mut self.kind {
-            TabKind::Terminal(tt) => tt.file_viewer.as_mut(),
-            TabKind::Agent(_) => None,
-        }
+        self.file_viewer.as_mut()
     }
 
     /// Path of the file currently shown in the file viewer overlay, if any.
@@ -3060,44 +3072,26 @@ impl TabState {
         self.file_viewer().map(|fv| fv.path.as_path())
     }
 
-    /// Open (or replace) a file viewer overlay on this tab. Returns `None` for
-    /// agent tabs (which don't host file viewers in v1). The caller is responsible
-    /// for kicking off the actual file load — this just clears prior overlay state.
-    fn open_file_viewer(&mut self, path: PathBuf) -> Option<&mut FileViewerOverlay> {
-        match &mut self.kind {
-            TabKind::Terminal(tt) => {
-                tt.file_viewer = Some(FileViewerOverlay::for_path(path));
-                Some(tt.file_viewer.as_mut().expect("just inserted"))
-            }
-            TabKind::Agent(_) => None,
-        }
+    /// Open (or replace) the file viewer overlay on this tab (terminal or agent).
+    /// The caller is responsible for kicking off the actual file load — this
+    /// just clears prior overlay state.
+    fn open_file_viewer(&mut self, path: PathBuf) -> &mut FileViewerOverlay {
+        self.file_viewer.insert(FileViewerOverlay::for_path(path))
     }
 
     fn close_file_viewer(&mut self) {
-        match &mut self.kind {
-            TabKind::Terminal(tt) => tt.file_viewer = None,
-            TabKind::Agent(_) => {}
-        }
+        self.file_viewer = None;
     }
 
     fn last_view_request(&self) -> Option<(&Path, Instant)> {
-        match &self.kind {
-            TabKind::Terminal(tt) => tt
-                .last_view_request_path
-                .as_deref()
-                .zip(tt.last_view_request_at),
-            TabKind::Agent(_) => None,
-        }
+        self.last_view_request_path
+            .as_deref()
+            .zip(self.last_view_request_at)
     }
 
     fn set_last_view_request(&mut self, path: Option<PathBuf>, at: Option<Instant>) {
-        match &mut self.kind {
-            TabKind::Terminal(tt) => {
-                tt.last_view_request_path = path;
-                tt.last_view_request_at = at;
-            }
-            TabKind::Agent(_) => {}
-        }
+        self.last_view_request_path = path;
+        self.last_view_request_at = at;
     }
 
     /// The agent session for an agent tab, if this is one.
@@ -3208,10 +3202,7 @@ impl TabState {
     #[allow(dead_code)]
     fn load_file(&mut self, path: &PathBuf, is_dark_theme: bool) {
         // Reset / open the overlay so subsequent writes target a fresh state.
-        // No-op for agent tabs (which don't host file viewers in v1).
-        let Some(fv) = self.open_file_viewer(path.clone()) else {
-            return;
-        };
+        let fv = self.open_file_viewer(path.clone());
 
         let file_size = freeze_time!("file metadata check", {
             std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0)
@@ -4833,28 +4824,90 @@ struct App {
     stt_sample_rate: u32,
     #[cfg(feature = "stt")]
     stt_transcribing: bool,
-    /// What kind of content the singleton webview is currently hosting. Used
-    /// to decide whether a tab activation can keep / update the webview in
-    /// place or has to destroy + recreate it (the IPC handler is set at
-    /// construction and can't be swapped, so Static<->Agent transitions need
-    /// a recreate).
-    webview_kind: WebviewKind,
-    /// The agent tab id whose state the webview is currently mirroring (if
-    /// `webview_kind == Agent`). Used to detect tab-switch-to-different-agent
-    /// transitions which need a buffer replay.
+    /// What the Viewer webview surface is presenting (`None` = hidden).
+    viewer_webview: ViewerWebview,
+    /// The agent tab whose conversation the Agent webview surface's DOM holds.
+    /// The surface keeps mirroring this tab while hidden (events keep being
+    /// pushed), so revealing it again needs no reset or replay. Set at staging
+    /// time; `webview::is_active(WebviewSurface::Agent)` says whether the
+    /// surface has actually been created.
     webview_agent_tab_id: Option<usize>,
 }
 
-/// What kind of content the singleton wry webview is currently hosting.
+/// What the Viewer webview surface is presenting. The Agent surface (chat)
+/// is tracked separately via `App::webview_agent_tab_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WebviewKind {
+enum ViewerWebview {
+    /// Hidden.
     None,
-    /// Markdown / Excalidraw / HTML file viewer — no IPC handler.
-    Static,
-    /// Agent chat — installed once with an IPC handler at construction.
-    Agent,
+    /// Markdown / Excalidraw / HTML file viewer for the active tab's overlay.
+    File,
     /// Plans viewer — URL-loaded surface served by warp on localhost.
     PlansViewer,
+}
+
+/// What the active tab needs from the webview surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveTabSurface {
+    /// A terminal tab (or no tab): the Agent surface has nothing to show.
+    Other,
+    /// An agent tab showing its chat.
+    AgentChat(usize),
+    /// An agent tab whose chat is covered by its file viewer overlay.
+    AgentFileOverlay,
+}
+
+/// The one webview surface that should be on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisibleSurface {
+    None,
+    Viewer,
+    /// The Agent surface, showing this agent tab's chat.
+    AgentChat(usize),
+}
+
+/// Pick the visible webview surface: at most one, Viewer over Agent, nothing
+/// while the attention view covers the content area.
+fn visible_webview_surface(
+    viewer: ViewerWebview,
+    active: ActiveTabSurface,
+    attention_open: bool,
+) -> VisibleSurface {
+    if attention_open {
+        return VisibleSurface::None;
+    }
+    if viewer != ViewerWebview::None {
+        return VisibleSurface::Viewer;
+    }
+    match active {
+        ActiveTabSurface::AgentChat(tab_id) => VisibleSurface::AgentChat(tab_id),
+        ActiveTabSurface::Other | ActiveTabSurface::AgentFileOverlay => VisibleSurface::None,
+    }
+}
+
+/// How `App::show_agent_webview` brings an agent tab's chat on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentSurfaceAction {
+    /// The live Agent surface already mirrors this tab: show it, DOM intact.
+    Reveal,
+    /// The live Agent surface mirrors another tab: reset it and replay this one.
+    SwitchTab,
+    /// No live Agent surface: create it and replay this tab's conversation.
+    Create,
+}
+
+fn agent_surface_action(
+    alive: bool,
+    mirrored_tab: Option<usize>,
+    tab_id: usize,
+) -> AgentSurfaceAction {
+    if !alive {
+        AgentSurfaceAction::Create
+    } else if mirrored_tab == Some(tab_id) {
+        AgentSurfaceAction::Reveal
+    } else {
+        AgentSurfaceAction::SwitchTab
+    }
 }
 
 const SPINE_WIDTH: f32 = 36.0;
@@ -7416,18 +7469,9 @@ impl App {
         self.remember_task_context(Some(task_id.to_string()));
         self.acknowledge_task_attention(task_id);
         self.task_ui_error = None;
-        // An agent session's webview is its primary surface — show it when we
+        // An agent session's chat is its primary surface — show it when we
         // land on one; otherwise drop any webview left over from before.
-        let active_agent_tab_id = self
-            .active_tab()
-            .filter(|tab| matches!(tab.kind, TabKind::Agent(_)))
-            .map(|tab| tab.id);
-        let webview_task = if let Some(tab_id) = active_agent_tab_id {
-            self.show_agent_webview(tab_id)
-        } else {
-            self.hide_webview_for_non_agent();
-            Task::none()
-        };
+        let webview_task = self.present_active_tab_surfaces();
         self.mark_workspaces_dirty();
         self.sync_plans_dir();
         self.snap_slide_to_active_workspace();
@@ -9212,7 +9256,7 @@ impl App {
             stt_sample_rate: 48000,
             #[cfg(feature = "stt")]
             stt_transcribing: false,
-            webview_kind: WebviewKind::None,
+            viewer_webview: ViewerWebview::None,
             webview_agent_tab_id: None,
             chat_index: Vec::new(),
             chat_index_loading: false,
@@ -10630,7 +10674,7 @@ fi
     }
 
     fn open_remote_workspace(&mut self, session_name: &str) -> Task<Event> {
-        self.hide_webview_for_non_agent();
+        self.dismiss_viewer_surface();
 
         if let Some(idx) = self.workspaces.iter().position(|workspace| {
             self.remote_session_for_workspace(workspace)
@@ -11038,21 +11082,7 @@ fi
     }
 
     fn restore_webview_after_attention(&mut self) -> Task<Event> {
-        if self.webview_kind == WebviewKind::Agent {
-            if let Some(tab_id) = self
-                .active_tab()
-                .filter(|tab| matches!(tab.kind, TabKind::Agent(_)))
-                .map(|tab| tab.id)
-            {
-                return self.show_agent_webview(tab_id);
-            }
-        } else if matches!(
-            self.webview_kind,
-            WebviewKind::Static | WebviewKind::PlansViewer
-        ) {
-            webview::set_visible(true);
-        }
-        Task::none()
+        self.apply_webview_surfaces()
     }
 
     fn title(&self) -> String {
@@ -12202,34 +12232,15 @@ fi
                 };
                 let refresh_worktrees_task = self.refresh_worktrees_for_active_tab();
                 let scroll_task = self.scroll_to_active_tab();
-                // Agent tab takes priority over the static-webview path because
-                // its webview is the tab's primary surface, not a modal overlay.
-                let active_agent_tab_id = self
-                    .active_tab()
-                    .filter(|t| matches!(t.kind, TabKind::Agent(_)))
-                    .map(|t| t.id);
-                if let Some(tab_id) = active_agent_tab_id {
-                    return Task::batch([
-                        scroll_task,
-                        refresh_worktrees_task,
-                        panels_task,
-                        self.show_agent_webview(tab_id),
-                    ]);
-                }
-                if let Some(html) = self.active_inline_webview_html() {
-                    let bounds = self.calculate_webview_bounds();
-                    return Task::batch([
-                        scroll_task,
-                        refresh_worktrees_task,
-                        panels_task,
-                        self.show_webview(html, bounds),
-                    ]);
-                }
-                // No webview kind is active for this tab. Hide whatever is
-                // there but don't change webview_kind — the static webview
-                // can be reused for the next markdown/file viewer.
-                self.hide_webview_for_non_agent();
-                return Task::batch([scroll_task, refresh_worktrees_task, panels_task]);
+                // The tab's file viewer HTML (Viewer surface) wins over an agent
+                // tab's chat (Agent surface); returning to the agent tab the
+                // Agent surface already mirrors reveals it without a replay.
+                return Task::batch([
+                    scroll_task,
+                    refresh_worktrees_task,
+                    panels_task,
+                    self.present_active_tab_surfaces(),
+                ]);
             }
             Event::TabClose(idx) => {
                 if let Some(tab) = self
@@ -12251,8 +12262,6 @@ fi
                         return self.close_task_tab(prompt);
                     }
                 }
-                // Hide WebView when closing tabs
-                self.hide_webview_for_non_agent();
                 if let Some(ws) = self.active_workspace_mut() {
                     if idx < ws.tabs.len() && ws.tabs.len() > 1 {
                         ws.tabs.remove(idx);
@@ -12263,9 +12272,11 @@ fi
                 }
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
+                // Surfaces follow whichever tab is active now.
                 return Task::batch([
                     self.scroll_to_active_tab(),
                     self.refresh_task_conversation_history(),
+                    self.present_active_tab_surfaces(),
                 ]);
             }
             Event::AgentActivityLoaded(tab_id, result) => {
@@ -12489,9 +12500,7 @@ fi
                 }
                 // Also push the echo into the webview if this tab is the one
                 // currently rendered there.
-                if self.webview_kind == WebviewKind::Agent
-                    && self.webview_agent_tab_id == Some(tab_id)
-                {
+                if self.webview_agent_tab_id == Some(tab_id) {
                     push_agent_event_to_webview(&echo);
                 }
                 if let Some(rx) = bridge {
@@ -12563,7 +12572,7 @@ fi
                 eprintln!("[agent] opened Claude chat tab id={id}");
                 self.mark_workspaces_dirty();
                 let scroll_task = self.scroll_to_active_tab();
-                return Task::batch([scroll_task, self.show_agent_webview(id)]);
+                return Task::batch([scroll_task, self.present_active_tab_surfaces()]);
             }
             Event::AgentStopRequested(tab_id) => {
                 let mut task_signal: Option<String> = None;
@@ -12599,8 +12608,9 @@ fi
             Event::AgentEventReceived(tab_id, ev) => {
                 // Append to the conversation buffer; if this tab's webview is
                 // currently visible, also push the event live for rendering.
-                let is_active_in_webview = self.webview_kind == WebviewKind::Agent
-                    && self.webview_agent_tab_id == Some(tab_id);
+                // The Agent surface keeps mirroring its tab while hidden behind
+                // a viewer, so push regardless of visibility.
+                let is_active_in_webview = self.webview_agent_tab_id == Some(tab_id);
                 let attention_reason = agent_event_attention_reason(&ev);
                 // Progress capture: what the session last said it was doing.
                 // Only meaningful events feed this — streaming deltas don't.
@@ -12832,7 +12842,7 @@ fi
                 // Surface the agent webview for the brand-new tab. The user
                 // can type prompts directly into it; no hardcoded prompt now.
                 let scroll_task = self.scroll_to_active_tab();
-                return Task::batch([scroll_task, self.show_agent_webview(id)]);
+                return Task::batch([scroll_task, self.present_active_tab_surfaces()]);
             }
             Event::ShowQuickCommands => {
                 if !self.quick_commands.is_empty() {
@@ -13187,8 +13197,12 @@ fi
                     }
                     return Task::none();
                 }
-                // Hide WebView when switching to git diff view
-                self.hide_webview_for_non_agent();
+                // The diff replaces any open file viewer: close it before
+                // settling the surfaces so an agent tab's chat can come back.
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.close_file_viewer();
+                }
+                self.dismiss_viewer_surface();
                 let is_dark_theme = self.theme == AppTheme::Dark;
 
                 if let Some(tab) = self.active_tab_mut() {
@@ -13235,8 +13249,12 @@ fi
                 if !git_diff_supported {
                     return Task::none();
                 }
-                // Hide WebView when switching to git diff view
-                self.hide_webview_for_non_agent();
+                // The diff replaces any open file viewer: close it before
+                // settling the surfaces so an agent tab's chat can come back.
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.close_file_viewer();
+                }
+                self.dismiss_viewer_surface();
                 let is_dark_theme = self.theme == AppTheme::Dark;
 
                 if let Some(tab) = self.active_tab_mut() {
@@ -13381,7 +13399,7 @@ fi
                 }
 
                 // Plans viewer: Escape dismisses
-                if self.webview_kind == WebviewKind::PlansViewer
+                if self.viewer_webview == ViewerWebview::PlansViewer
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     return self.update(Event::ClosePlansViewer);
@@ -13688,10 +13706,7 @@ fi
             Event::ToggleSidebar => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
                 // Update WebView bounds if active
-                if webview::is_active() {
-                    let bounds = self.calculate_webview_bounds();
-                    webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
-                }
+                self.sync_webview_bounds();
             }
             Event::TaskCreateOpen => {
                 self.task_ui_error = None;
@@ -14115,7 +14130,7 @@ fi
                 self.workspaces[workspace_idx].active_tab = tab_idx;
                 self.selected_task_id = Some(task_id.clone());
                 self.remember_task_context(Some(task_id));
-                self.hide_webview_for_non_agent();
+                self.dismiss_viewer_surface();
                 self.mark_workspaces_dirty();
                 return Task::batch([
                     self.scroll_to_active_tab(),
@@ -14830,7 +14845,7 @@ fi
                 }
                 // Hide WebView when switching modes (but keep agent webview alive
                 // — it's the agent tab's primary content, not a modal overlay).
-                self.hide_webview_for_non_agent();
+                self.dismiss_viewer_surface();
 
                 let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
                 if let Some(tab) = self.active_tab_mut() {
@@ -15036,7 +15051,7 @@ fi
                 }
             }
             Event::OpenWorktree(path) => {
-                self.hide_webview_for_non_agent();
+                self.dismiss_viewer_surface();
                 if self.active_workspace_idx >= self.workspaces.len() {
                     return Task::none();
                 }
@@ -15089,16 +15104,7 @@ fi
                     tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
                 }
 
-                let active_agent_tab_id = self
-                    .active_tab()
-                    .filter(|t| matches!(t.kind, TabKind::Agent(_)))
-                    .map(|t| t.id);
-                if let Some(tab_id) = active_agent_tab_id {
-                    tasks.push(self.show_agent_webview(tab_id));
-                } else if let Some(html) = self.active_inline_webview_html() {
-                    let bounds = self.calculate_webview_bounds();
-                    tasks.push(self.show_webview(html, bounds));
-                }
+                tasks.push(self.present_active_tab_surfaces());
 
                 return Task::batch(tasks);
             }
@@ -15279,10 +15285,7 @@ fi
                     self.sidebar_width = (x - SPINE_WIDTH).clamp(150.0, 600.0);
 
                     // Update WebView bounds if active
-                    if webview::is_active() {
-                        let bounds = self.calculate_webview_bounds();
-                        webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
-                    }
+                    self.sync_webview_bounds();
                 }
                 if self.dragging_console_divider {
                     // Console height = distance from bottom of window to mouse position
@@ -15291,10 +15294,7 @@ fi
                     self.console_height = new_height;
 
                     // Update WebView bounds if active
-                    if webview::is_active() {
-                        let bounds = self.calculate_webview_bounds();
-                        webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
-                    }
+                    self.sync_webview_bounds();
                 }
 
                 // Edge peek detection — check if cursor is near left/right edge of content area
@@ -15341,9 +15341,9 @@ fi
                 let has_webview_content = is_markdown || is_html;
                 let mut request: Option<(usize, PathBuf)> = None;
 
-                // Hide WebView if switching to non-webview file
-                if !has_webview_content && webview::is_active() {
-                    self.hide_webview_for_non_agent();
+                // Hide the Viewer surface if switching to a non-webview file.
+                if !has_webview_content {
+                    self.dismiss_viewer_surface();
                 }
 
                 if let Some(tab) = self.active_tab_mut() {
@@ -15387,16 +15387,17 @@ fi
                     tab.diff_syntax_notice = None;
                     {
                         // Open / replace the file viewer overlay; resets all overlay state.
-                        // No-op on agent tabs (which don't host file viewers in v1).
-                        if let Some(fv) = tab.open_file_viewer(path.clone()) {
-                            fv.load_in_progress = true;
-                            fv.load_started_at = Some(Instant::now());
-                        }
+                        let fv = tab.open_file_viewer(path.clone());
+                        fv.load_in_progress = true;
+                        fv.load_started_at = Some(Instant::now());
                     }
                     tab.set_last_view_request(Some(path.clone()), Some(Instant::now()));
                     request = Some((tab.id, path));
                 }
                 if let Some((tab_id, file_path)) = request {
+                    // The overlay now covers an agent tab's chat: hide the
+                    // Agent surface (kept alive) while the file loads.
+                    self.settle_agent_surface();
                     self.mark_log_server_dirty();
                     return match remote_source {
                         None => Self::request_file_load(tab_id, file_path, is_dark_theme),
@@ -15412,13 +15413,13 @@ fi
                 // Inline WebView files (markdown/html/excalidraw) are shown once load completes.
             }
             Event::CloseFileView => {
-                // Hide WebView
-                self.hide_webview_for_non_agent();
-
                 if let Some(tab) = self.active_tab_mut() {
                     tab.close_file_viewer();
                 }
                 self.mark_log_server_dirty();
+                // Hide the Viewer surface; an agent tab's chat comes back with
+                // its DOM intact (no reset, no replay).
+                return self.present_active_tab_surfaces();
             }
             Event::CopyFileContent => {
                 if let Some(tab) = self.active_tab() {
@@ -15675,11 +15676,10 @@ fi
                 }
             }
             Event::OpenPlansViewer => {
-                // If already open, treat the shortcut/menu as a toggle and dismiss.
-                if self.webview_kind == WebviewKind::PlansViewer {
-                    webview::set_visible(false);
-                    self.webview_kind = WebviewKind::None;
-                    return Task::none();
+                // If already open, treat the shortcut/menu as a toggle and dismiss,
+                // restoring whatever the active tab shows underneath.
+                if self.viewer_webview == ViewerWebview::PlansViewer {
+                    return self.present_active_tab_surfaces();
                 }
                 return self.open_plans_viewer(plans_viewer::DocumentSource::Plans, None);
             }
@@ -15687,9 +15687,8 @@ fi
                 return self.open_plans_viewer(source, Some(name));
             }
             Event::ClosePlansViewer => {
-                if self.webview_kind == WebviewKind::PlansViewer {
-                    webview::set_visible(false);
-                    self.webview_kind = WebviewKind::None;
+                if self.viewer_webview == ViewerWebview::PlansViewer {
+                    return self.present_active_tab_surfaces();
                 }
             }
             Event::WindowCloseRequested => {
@@ -15774,10 +15773,7 @@ fi
                 );
 
                 // Update WebView bounds if active
-                if webview::is_active() {
-                    let bounds = self.calculate_webview_bounds();
-                    webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
-                }
+                self.sync_webview_bounds();
 
                 return scroll_task;
             }
@@ -16149,6 +16145,9 @@ fi
                 }
             }
             Event::FileLoaded(snapshot) => {
+                // Only the active tab's overlay drives the webview surfaces; a
+                // background tab's HTML is shown when that tab is selected.
+                let is_active_tab = self.active_tab().is_some_and(|t| t.id == snapshot.tab_id);
                 // Extract WebView HTML before mutable borrow is released
                 let mut inline_webview_html: Option<String> = None;
                 let mut hide_webview = false;
@@ -16200,7 +16199,9 @@ fi
                             if is_excalidraw || is_markdown_webview || is_html_webview {
                                 inline_webview_html = Some(html.clone());
                             } else {
-                                webview::update_content(html);
+                                if is_active_tab {
+                                    webview::update_content(WebviewSurface::Viewer, html);
+                                }
                                 hide_webview = true;
                             }
                         } else {
@@ -16250,12 +16251,12 @@ fi
                     }
                 }
 
-                if hide_webview {
-                    self.hide_webview_for_non_agent();
+                if hide_webview && is_active_tab {
+                    self.dismiss_viewer_surface();
                 }
 
                 // Show inline WebView after mutable borrow is released
-                if let Some(html) = inline_webview_html {
+                if let Some(html) = inline_webview_html.filter(|_| is_active_tab) {
                     let bounds = self.calculate_webview_bounds();
                     self.mark_log_server_dirty();
                     return self.show_webview(html, bounds);
@@ -16568,24 +16569,13 @@ fi
                         ),
                     );
                     let bar_task = self.scroll_to_active_workspace_bar();
-                    if let Some(html) = self.active_inline_webview_html() {
-                        let bounds = self.calculate_webview_bounds();
-                        return Task::batch([
-                            slide_task,
-                            bar_task,
-                            refresh_worktrees_task,
-                            refresh_files_task,
-                            remote_agent_task,
-                            self.show_webview(html, bounds),
-                        ]);
-                    }
-                    self.hide_webview_for_non_agent();
                     return Task::batch([
                         slide_task,
                         bar_task,
                         refresh_worktrees_task,
                         refresh_files_task,
                         remote_agent_task,
+                        self.present_active_tab_surfaces(),
                     ]);
                 }
             }
@@ -16661,7 +16651,7 @@ fi
                             self.active_workspace_idx = nearest;
                             self.sync_visible_terminals();
                             self.mark_workspaces_dirty();
-                            self.hide_webview_for_non_agent();
+                            self.dismiss_viewer_surface();
                             self.editing_console_command = None;
                             self.sync_plans_dir();
                             let refresh_worktrees_task = self.refresh_worktrees_for_active_tab();
@@ -16678,7 +16668,7 @@ fi
                 }
             }
             Event::WorkspaceClose(idx) => {
-                self.hide_webview_for_non_agent();
+                self.dismiss_viewer_surface();
                 if idx < self.workspaces.len() && self.workspaces.len() > 1 {
                     // Stash the workspace config (env, color, etc.) before removing,
                     // so it's preserved in workspaces.json for reopening later.
@@ -17000,10 +16990,7 @@ fi
                 self.console_expanded = !self.console_expanded;
                 self.save_config();
                 // Update WebView bounds if active
-                if webview::is_active() {
-                    let bounds = self.calculate_webview_bounds();
-                    webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
-                }
+                self.sync_webview_bounds();
                 // When collapsing console while bottom terminal is focused, refocus main terminal
                 if !self.console_expanded && self.bottom_panel_focused {
                     return self.focus_main_terminal();
@@ -17129,7 +17116,8 @@ fi
             Event::AttentionViewToggle => {
                 self.attention_view_open = !self.attention_view_open;
                 if self.attention_view_open {
-                    webview::set_visible(false);
+                    webview::set_visible(WebviewSurface::Viewer, false);
+                    webview::set_visible(WebviewSurface::Agent, false);
                     return Task::none();
                 }
                 return self.restore_webview_after_attention();
@@ -17267,22 +17255,96 @@ fi
         Task::none()
     }
 
-    /// Hide the singleton webview unless it's the agent webview for the
-    /// currently active tab — in which case it's the tab's primary content
-    /// and should stay visible. Replaces unconditional `webview::set_visible(false)`
-    /// calls scattered across handlers that predate the agent tab kind.
-    fn hide_webview_for_non_agent(&mut self) {
-        let active_is_agent_tab_with_active_webview = self
-            .active_tab()
-            .map(|t| matches!(t.kind, TabKind::Agent(_)))
-            .unwrap_or(false)
-            && self.webview_kind == WebviewKind::Agent;
-        if !active_is_agent_tab_with_active_webview {
-            webview::set_visible(false);
-            // Clear kind for any non-agent surface so the plans-viewer header
-            // (and any future kind-driven chrome) goes away with the webview.
-            if self.webview_kind != WebviewKind::Agent {
-                self.webview_kind = WebviewKind::None;
+    /// What the active tab needs from the webview surfaces.
+    fn active_tab_surface(&self) -> ActiveTabSurface {
+        match self.active_tab() {
+            Some(tab) if matches!(tab.kind, TabKind::Agent(_)) => {
+                if tab.file_viewer().is_some() {
+                    ActiveTabSurface::AgentFileOverlay
+                } else {
+                    ActiveTabSurface::AgentChat(tab.id)
+                }
+            }
+            _ => ActiveTabSurface::Other,
+        }
+    }
+
+    fn visible_webview_surface(&self) -> VisibleSurface {
+        visible_webview_surface(
+            self.viewer_webview,
+            self.active_tab_surface(),
+            self.attention_view_open,
+        )
+    }
+
+    /// Re-apply the layout's webview bounds to both surfaces (no-op for a
+    /// surface that hasn't been created).
+    fn sync_webview_bounds(&self) {
+        let (x, y, width, height) = self.calculate_webview_bounds();
+        webview::update_bounds(WebviewSurface::Agent, x, y, width, height);
+        webview::update_bounds(WebviewSurface::Viewer, x, y, width, height);
+    }
+
+    /// Hide the Viewer surface and let the Agent surface follow the active tab
+    /// without creating anything (see `settle_agent_surface`). Use
+    /// `present_active_tab_surfaces` instead when the active tab may need its
+    /// file HTML loaded or its chat created / replayed.
+    fn dismiss_viewer_surface(&mut self) {
+        webview::set_visible(WebviewSurface::Viewer, false);
+        self.viewer_webview = ViewerWebview::None;
+        self.settle_agent_surface();
+    }
+
+    /// Synchronously show or hide the Agent surface per
+    /// `visible_webview_surface`. Never creates or replays: the surface is
+    /// revealed only when it is alive and already mirrors the active agent
+    /// tab, otherwise it is hidden.
+    fn settle_agent_surface(&mut self) {
+        if let VisibleSurface::AgentChat(tab_id) = self.visible_webview_surface() {
+            let alive = webview::is_active(WebviewSurface::Agent);
+            if agent_surface_action(alive, self.webview_agent_tab_id, tab_id)
+                == AgentSurfaceAction::Reveal
+            {
+                let (x, y, width, height) = self.calculate_webview_bounds();
+                webview::update_bounds(WebviewSurface::Agent, x, y, width, height);
+                webview::set_visible(WebviewSurface::Agent, true);
+                return;
+            }
+        }
+        webview::set_visible(WebviewSurface::Agent, false);
+    }
+
+    /// Bring both surfaces in line with the active tab: its inline file viewer
+    /// HTML on the Viewer surface, else its chat on the Agent surface (created
+    /// or replayed only if it isn't already mirroring this tab), else nothing.
+    fn present_active_tab_surfaces(&mut self) -> Task<Event> {
+        if let Some(html) = self.active_inline_webview_html() {
+            let bounds = self.calculate_webview_bounds();
+            return self.show_webview(html, bounds);
+        }
+        webview::set_visible(WebviewSurface::Viewer, false);
+        self.viewer_webview = ViewerWebview::None;
+        self.apply_webview_surfaces()
+    }
+
+    /// Show the surface `visible_webview_surface` selects and hide the other,
+    /// keeping whatever the Viewer surface currently presents.
+    fn apply_webview_surfaces(&mut self) -> Task<Event> {
+        match self.visible_webview_surface() {
+            VisibleSurface::Viewer => {
+                webview::set_visible(WebviewSurface::Agent, false);
+                self.sync_webview_bounds();
+                webview::set_visible(WebviewSurface::Viewer, true);
+                Task::none()
+            }
+            VisibleSurface::AgentChat(tab_id) => {
+                webview::set_visible(WebviewSurface::Viewer, false);
+                self.show_agent_webview(tab_id)
+            }
+            VisibleSurface::None => {
+                webview::set_visible(WebviewSurface::Viewer, false);
+                webview::set_visible(WebviewSurface::Agent, false);
+                Task::none()
             }
         }
     }
@@ -17314,14 +17376,13 @@ fi
         (x, y, width, height)
     }
 
-    /// Create or update the embedded WebView with static HTML content
-    /// (markdown, excalidraw, html file viewer). If the webview is currently
-    /// hosting agent chat, we destroy + recreate it (the chat IPC handler
-    /// can't be swapped post-construction).
+    /// Create or update the Viewer surface with static HTML content
+    /// (markdown, excalidraw, html file viewer). The Agent surface is only
+    /// hidden, never destroyed, so its chat DOM survives the visit.
     fn show_webview(&mut self, html: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
         perf_log!(
             "webview mode={} html_bytes={} bounds=({}, {}, {}, {})",
-            if webview::is_active() {
+            if webview::is_active(WebviewSurface::Viewer) {
                 "reuse"
             } else {
                 "create"
@@ -17332,28 +17393,34 @@ fi
             bounds.2,
             bounds.3
         );
-        // If the active webview is the agent chat, tear it down so we don't
-        // try to render markdown into the chat scaffold (or vice-versa).
-        if self.webview_kind == WebviewKind::Agent {
-            webview::destroy();
-            self.webview_kind = WebviewKind::None;
-            self.webview_agent_tab_id = None;
-        }
+        webview::set_visible(WebviewSurface::Agent, false);
+        self.viewer_webview = ViewerWebview::File;
         // Reuse the existing WebView when possible to avoid expensive recreation churn.
-        if webview::is_active() {
-            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
-            webview::update_content(&html);
-            webview::set_visible(true);
-            self.webview_kind = WebviewKind::Static;
+        if webview::is_active(WebviewSurface::Viewer) {
+            webview::update_bounds(
+                WebviewSurface::Viewer,
+                bounds.0,
+                bounds.1,
+                bounds.2,
+                bounds.3,
+            );
+            webview::update_content(WebviewSurface::Viewer, &html);
+            webview::set_visible(WebviewSurface::Viewer, true);
             return Task::none();
         }
 
-        webview::set_pending_content(html, bounds);
-        self.webview_kind = WebviewKind::Static;
+        webview::set_pending_content(WebviewSurface::Viewer, html, bounds);
+        Self::create_staged_viewer_surface()
+    }
+
+    /// Task that builds the Viewer surface from its staged content once the
+    /// window is reachable.
+    fn create_staged_viewer_surface() -> Task<Event> {
         iced::window::oldest().then(|opt_id| {
             if let Some(id) = opt_id {
                 iced::window::run(id, |window| {
-                    if let Err(e) = webview::try_create_with_window(window) {
+                    if let Err(e) = webview::try_create_with_window(WebviewSurface::Viewer, window)
+                    {
                         perf_log!("webview_create_failed: {e}");
                     }
                 })
@@ -17398,13 +17465,13 @@ fi
         self.show_webview_url(url, bounds)
     }
 
-    /// Create or update the embedded WebView to display a URL (used by the
+    /// Create or update the Viewer surface to display a URL (used by the
     /// plans viewer, which loads `/plans/viewer` from the local warp server).
     /// Mirrors `show_webview` but stages a URL instead of HTML.
     fn show_webview_url(&mut self, url: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
         perf_log!(
             "webview_url mode={} url={} bounds=({}, {}, {}, {})",
-            if webview::is_active() {
+            if webview::is_active(WebviewSurface::Viewer) {
                 "reuse"
             } else {
                 "create"
@@ -17415,71 +17482,54 @@ fi
             bounds.2,
             bounds.3
         );
-        if self.webview_kind == WebviewKind::Agent {
-            webview::destroy();
-            self.webview_kind = WebviewKind::None;
-            self.webview_agent_tab_id = None;
-        }
-        if webview::is_active() {
-            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
-            webview::navigate_to_url(&url);
-            webview::set_visible(true);
-            self.webview_kind = WebviewKind::PlansViewer;
+        webview::set_visible(WebviewSurface::Agent, false);
+        self.viewer_webview = ViewerWebview::PlansViewer;
+        if webview::is_active(WebviewSurface::Viewer) {
+            webview::update_bounds(
+                WebviewSurface::Viewer,
+                bounds.0,
+                bounds.1,
+                bounds.2,
+                bounds.3,
+            );
+            webview::navigate_to_url(WebviewSurface::Viewer, &url);
+            webview::set_visible(WebviewSurface::Viewer, true);
             return Task::none();
         }
 
-        webview::set_pending_url(url, bounds);
-        self.webview_kind = WebviewKind::PlansViewer;
-        iced::window::oldest().then(|opt_id| {
-            if let Some(id) = opt_id {
-                iced::window::run(id, |window| {
-                    if let Err(e) = webview::try_create_with_window(window) {
-                        perf_log!("webview_create_failed: {e}");
-                    }
-                })
-                .discard()
-            } else {
-                Task::none()
-            }
-        })
+        webview::set_pending_url(WebviewSurface::Viewer, url, bounds);
+        Self::create_staged_viewer_surface()
     }
 
-    /// Show the agent chat webview for `tab_id`. If the webview is currently
-    /// hosting static content (markdown / excalidraw), destroy + recreate it
-    /// with the chat HTML and IPC handler. If it's already an agent webview
-    /// for a different tab, just clear and replay this tab's buffer.
+    /// Show the agent chat for `tab_id` on the Agent surface. If the surface
+    /// already mirrors this tab it is just revealed (no reset, no replay); if
+    /// it mirrors another agent tab it is reset and this tab's buffer is
+    /// replayed; if it doesn't exist yet it is created with the chat page and
+    /// IPC handler. Callers hide the Viewer surface first.
     fn show_agent_webview(&mut self, tab_id: usize) -> Task<Event> {
         let bounds = self.calculate_webview_bounds();
+        let alive = webview::is_active(WebviewSurface::Agent);
+        let action = agent_surface_action(alive, self.webview_agent_tab_id, tab_id);
 
-        // Find the conversation buffer to replay.
-        let conversation: Vec<tab::AgentEvent> = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|t| t.id == tab_id)
-            .and_then(|t| t.agent_session())
-            .map(|s| s.conversation.clone())
-            .unwrap_or_default();
-
-        // Reconcile bookkeeping with the actual webview state. If we think we
-        // have an Agent webview but `is_active()` says no, the previous
-        // construction must have failed silently (or been destroyed by a
-        // sibling code path). Fall through to the recreate branch below.
-        let webview_alive = webview::is_active();
-        let same_tab_fast_path = self.webview_kind == WebviewKind::Agent
-            && self.webview_agent_tab_id == Some(tab_id)
-            && webview_alive;
-        let other_agent_tab_path = self.webview_kind == WebviewKind::Agent
-            && self.webview_agent_tab_id != Some(tab_id)
-            && webview_alive;
+        // Find the conversation buffer to replay (not needed to reveal).
+        let conversation: Vec<tab::AgentEvent> = if action == AgentSurfaceAction::Reveal {
+            Vec::new()
+        } else {
+            self.workspaces
+                .iter()
+                .flat_map(|ws| ws.tabs.iter())
+                .find(|t| t.id == tab_id)
+                .and_then(|t| t.agent_session())
+                .map(|s| s.conversation.clone())
+                .unwrap_or_default()
+        };
 
         eprintln!(
-            "[agent-webview] show tab={} kind={:?} alive={} same={} other={} bounds=({},{},{},{}) buf_len={}",
+            "[agent-webview] show tab={} mirrored={:?} alive={} action={:?} bounds=({},{},{},{}) replay_len={}",
             tab_id,
-            self.webview_kind,
-            webview_alive,
-            same_tab_fast_path,
-            other_agent_tab_path,
+            self.webview_agent_tab_id,
+            alive,
+            action,
             bounds.0,
             bounds.1,
             bounds.2,
@@ -17487,65 +17537,91 @@ fi
             conversation.len()
         );
 
-        if same_tab_fast_path {
-            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
-            webview::set_visible(true);
-            return Task::none();
-        }
-
-        if other_agent_tab_path {
-            // Different agent tab on the live agent webview — reset surface
-            // and replay this tab's events. No recreate needed (the IPC
-            // handler routes by tabId, set per activation).
-            webview::update_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
-            webview::set_visible(true);
-            reset_agent_webview();
-            set_agent_webview_tab_id(tab_id);
-            replay_agent_conversation_in_webview(&conversation);
-            self.webview_agent_tab_id = Some(tab_id);
-            return Task::none();
-        }
-
-        // No agent webview alive — destroy whatever's there and recreate.
-        if webview_alive {
-            eprintln!(
-                "[agent-webview] destroying existing kind={:?}",
-                self.webview_kind
-            );
-            webview::destroy();
-        }
-        webview::set_pending_content_with_ipc(agent_chat_html(), bounds, Some(agent_ipc_handler()));
-        self.webview_kind = WebviewKind::Agent;
-        self.webview_agent_tab_id = Some(tab_id);
-
-        // After construction, set the tab id on the JS side and replay buffered
-        // events. Both happen via evaluate_script after `try_create_with_window`
-        // runs. Using Arc because Task::then's closure is FnMut, so the Vec
-        // can't be moved out of the captured environment on each call.
-        let conversation = std::sync::Arc::new(conversation);
-        iced::window::oldest().then(move |opt_id| {
-            let conversation = std::sync::Arc::clone(&conversation);
-            if let Some(id) = opt_id {
-                iced::window::run(id, move |window| {
-                    eprintln!("[agent-webview] try_create_with_window for tab={}", tab_id);
-                    if let Err(e) = webview::try_create_with_window(window) {
-                        eprintln!("[agent-webview] create FAILED for tab={}: {}", tab_id, e);
-                        return;
-                    }
-                    eprintln!(
-                        "[agent-webview] create OK for tab={}, replaying {} events",
-                        tab_id,
-                        conversation.len()
-                    );
-                    set_agent_webview_tab_id(tab_id);
-                    replay_agent_conversation_in_webview(&conversation);
-                })
-                .discard()
-            } else {
-                eprintln!("[agent-webview] no window available; skipping create");
+        match action {
+            AgentSurfaceAction::Reveal => {
+                webview::update_bounds(
+                    WebviewSurface::Agent,
+                    bounds.0,
+                    bounds.1,
+                    bounds.2,
+                    bounds.3,
+                );
+                webview::set_visible(WebviewSurface::Agent, true);
                 Task::none()
             }
-        })
+            AgentSurfaceAction::SwitchTab => {
+                // Different agent tab on the live Agent surface — reset it and
+                // replay this tab's events. No recreate needed (the IPC
+                // handler routes by tabId, set per activation).
+                webview::update_bounds(
+                    WebviewSurface::Agent,
+                    bounds.0,
+                    bounds.1,
+                    bounds.2,
+                    bounds.3,
+                );
+                webview::set_visible(WebviewSurface::Agent, true);
+                reset_agent_webview();
+                set_agent_webview_tab_id(tab_id);
+                replay_agent_conversation_in_webview(&conversation);
+                self.webview_agent_tab_id = Some(tab_id);
+                Task::none()
+            }
+            AgentSurfaceAction::Create => {
+                webview::set_pending_content_with_ipc(
+                    WebviewSurface::Agent,
+                    agent_chat_html(),
+                    bounds,
+                    Some(agent_ipc_handler()),
+                );
+                self.webview_agent_tab_id = Some(tab_id);
+
+                // After construction, set the tab id on the JS side and replay
+                // buffered events. Both happen via evaluate_script after
+                // `try_create_with_window` runs. Using Arc because Task::then's
+                // closure is FnMut, so the Vec can't be moved out of the
+                // captured environment on each call.
+                let conversation = std::sync::Arc::new(conversation);
+                iced::window::oldest().then(move |opt_id| {
+                    let conversation = std::sync::Arc::clone(&conversation);
+                    if let Some(id) = opt_id {
+                        iced::window::run(id, move |window| {
+                            eprintln!("[agent-webview] try_create_with_window for tab={}", tab_id);
+                            match webview::try_create_with_window(WebviewSurface::Agent, window) {
+                                Err(e) => {
+                                    eprintln!(
+                                        "[agent-webview] create FAILED for tab={}: {}",
+                                        tab_id, e
+                                    );
+                                }
+                                Ok(false) => {
+                                    // A later staging's task already built the
+                                    // page and replayed; replaying again here
+                                    // would duplicate the conversation.
+                                    eprintln!(
+                                        "[agent-webview] nothing staged for tab={}; skipping replay",
+                                        tab_id
+                                    );
+                                }
+                                Ok(true) => {
+                                    eprintln!(
+                                        "[agent-webview] create OK for tab={}, replaying {} events",
+                                        tab_id,
+                                        conversation.len()
+                                    );
+                                    set_agent_webview_tab_id(tab_id);
+                                    replay_agent_conversation_in_webview(&conversation);
+                                }
+                            }
+                        })
+                        .discard()
+                    } else {
+                        eprintln!("[agent-webview] no window available; skipping create");
+                        Task::none()
+                    }
+                })
+            }
+        }
     }
 
     fn recreate_terminals(&mut self) {
@@ -17632,7 +17708,7 @@ fi
             .width(Length::Fill)
             .height(Length::Fill);
         main_col = main_col.push(tab_bar);
-        if self.webview_kind == WebviewKind::PlansViewer {
+        if self.viewer_webview == ViewerWebview::PlansViewer {
             main_col = main_col.push(self.view_plans_viewer_header());
         }
         main_col = main_col.push(content);
@@ -21099,11 +21175,17 @@ fi
         let theme = &self.theme;
         if let Some(tab) = ws.active_tab() {
             let main_panel = if matches!(tab.kind, TabKind::Agent(_)) {
-                // Agent tabs render the chat UI in the wry webview which is
-                // positioned by `calculate_webview_bounds` and managed via
-                // `show_agent_webview`. The Iced view here is just an empty
-                // background that lets the webview occupy the same area.
-                freeze_time!("view_agent_tab", { self.view_agent_tab(tab) })
+                if tab.viewing_file_path().is_some() {
+                    // Same overlay as terminal tabs; the Agent surface is
+                    // hidden underneath (markdown/HTML use the Viewer surface).
+                    freeze_time!("view_file_content", { self.view_file_content(tab) })
+                } else {
+                    // Agent tabs render the chat UI in the Agent webview surface,
+                    // positioned by `calculate_webview_bounds` and managed via
+                    // `show_agent_webview`. The Iced view here is just an empty
+                    // background that lets the webview occupy the same area.
+                    freeze_time!("view_agent_tab", { self.view_agent_tab(tab) })
+                }
             } else if tab.agent_sidebar.selected_capture_idx.is_some()
                 && tab.sidebar_mode == SidebarMode::Agent
             {
@@ -30498,5 +30580,100 @@ mod tests {
         let expected_rms = (0.5f32 / 3.0).sqrt();
         assert!((rms - expected_rms).abs() < 0.000001);
         assert_eq!(peak, 0.5);
+    }
+
+    #[test]
+    fn viewer_surface_wins_over_agent_chat() {
+        for viewer in [ViewerWebview::File, ViewerWebview::PlansViewer] {
+            for active in [
+                ActiveTabSurface::Other,
+                ActiveTabSurface::AgentChat(7),
+                ActiveTabSurface::AgentFileOverlay,
+            ] {
+                assert_eq!(
+                    visible_webview_surface(viewer, active, false),
+                    VisibleSurface::Viewer,
+                    "viewer={viewer:?} active={active:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agent_chat_shows_only_without_viewer_or_overlay() {
+        assert_eq!(
+            visible_webview_surface(ViewerWebview::None, ActiveTabSurface::AgentChat(3), false),
+            VisibleSurface::AgentChat(3)
+        );
+        // A code file in the Iced viewer covers the chat: nothing on top.
+        assert_eq!(
+            visible_webview_surface(
+                ViewerWebview::None,
+                ActiveTabSurface::AgentFileOverlay,
+                false
+            ),
+            VisibleSurface::None
+        );
+        assert_eq!(
+            visible_webview_surface(ViewerWebview::None, ActiveTabSurface::Other, false),
+            VisibleSurface::None
+        );
+    }
+
+    #[test]
+    fn attention_view_hides_every_surface() {
+        for viewer in [
+            ViewerWebview::None,
+            ViewerWebview::File,
+            ViewerWebview::PlansViewer,
+        ] {
+            assert_eq!(
+                visible_webview_surface(viewer, ActiveTabSurface::AgentChat(1), true),
+                VisibleSurface::None
+            );
+        }
+    }
+
+    #[test]
+    fn agent_surface_reveals_same_tab_without_replay() {
+        assert_eq!(
+            agent_surface_action(true, Some(4), 4),
+            AgentSurfaceAction::Reveal
+        );
+        assert_eq!(
+            agent_surface_action(true, Some(4), 5),
+            AgentSurfaceAction::SwitchTab
+        );
+        assert_eq!(
+            agent_surface_action(true, None, 4),
+            AgentSurfaceAction::SwitchTab
+        );
+        // Not created yet (or creation failed): build it, whatever the bookkeeping says.
+        assert_eq!(
+            agent_surface_action(false, Some(4), 4),
+            AgentSurfaceAction::Create
+        );
+        assert_eq!(
+            agent_surface_action(false, None, 4),
+            AgentSurfaceAction::Create
+        );
+    }
+
+    #[test]
+    fn file_viewer_overlay_opens_on_agent_tabs() {
+        let dir = PathBuf::from("/tmp/gitterm-test-agent-overlay");
+        let mut tab = TabState::new(9, dir.clone());
+        tab.kind = TabKind::Agent(AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".to_string(),
+            permission_mode: None,
+            effort: None,
+        }));
+        tab.open_file_viewer(dir.join("README.md")).load_in_progress = true;
+        assert_eq!(
+            tab.viewing_file_path(),
+            Some(dir.join("README.md").as_path())
+        );
+        tab.close_file_viewer();
+        assert!(tab.file_viewer().is_none());
     }
 }

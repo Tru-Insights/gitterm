@@ -229,11 +229,14 @@ Windows CI exists.
   lines). Don't split into submodules unless the change is large and contained.
 - **Supporting modules**: `src/log_server.rs` (warp localhost server),
   `src/plans_viewer.rs` (plans viewer routes), `src/markdown.rs`,
-  `src/webview.rs` (singleton wry WebView), `src/services.rs`, `src/agent.rs`,
+  `src/webview.rs` (two wry WebView surfaces), `src/services.rs`, `src/agent.rs`,
   `src/tab/` (TabKind enum + AgentSession), `src/events.rs`, `src/config.rs`,
   `src/theme.rs`.
-- **Embedded WebView**: one wry `WebView` instance per app, repurposed for
-  markdown viewer / Excalidraw / agent chat / plans viewer. See
+- **Embedded WebView**: two wry child `WebView` surfaces keyed by
+  `webview::WebviewSurface`. `Agent` hosts the Claude chat page (IPC handler
+  installed at construction) and stays alive, hidden, while `Viewer` shows
+  markdown / HTML / Excalidraw or the plans viewer; at most one is visible,
+  Viewer over Agent (`visible_webview_surface` in `main.rs`). See
   `webview::set_pending_content`, `set_pending_url`, `navigate_to_url`.
 - **Terminal**: uses `iced_term` fork at `../iced_term_fork`. The Windows CI
   workflow clones from `https://github.com/Tru-Insights/iced_term.git` master
