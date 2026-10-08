@@ -1,10 +1,13 @@
 // TRU-140 Phase B: drive `gitterm::harness::claude::ClaudeSession` (the
 // library adapter the chat tab uses) through the acceptance flow without
-// the UI: a text turn, a Bash permission prompt (allowed), an
-// AskUserQuestion (answered), and an interrupted long turn.
+// the UI: a permission mode cycle (acceptEdits, plan, auto, default), a text
+// turn, a Bash permission prompt (allowed), an AskUserQuestion (answered),
+// and an interrupted long turn.
 //
 //   cargo run --example claude_harness_smoke -- --workdir <empty dir> [--model haiku]
+//       [--scenario all|permission-mode]
 //
+// `--scenario permission-mode` runs only the mode switch (no model turns).
 // Prints every HarnessEvent as JSON and exits 1 if a step fails.
 
 use std::path::PathBuf;
@@ -91,6 +94,43 @@ async fn turn(
     }
 }
 
+/// Waits for the next event matching `pick`, printing everything on the way.
+async fn wait_for<T>(
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    mut pick: impl FnMut(&HarnessEvent) -> Option<T>,
+) -> Result<T, String> {
+    loop {
+        let ev = tokio::time::timeout(STEP_TIMEOUT, events.recv())
+            .await
+            .map_err(|_| "timed out".to_string())?
+            .ok_or("event channel closed")?;
+        show(&ev);
+        if let Some(found) = pick(&ev) {
+            return Ok(found);
+        }
+        match ev {
+            HarnessEvent::Error(e) => return Err(e),
+            HarnessEvent::ProcessExited { code } => return Err(format!("claude exited {code:?}")),
+            _ => {}
+        }
+    }
+}
+
+/// Switches the session's permission mode and waits for the confirmation.
+async fn set_mode(
+    session: &ClaudeSession,
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    mode: &str,
+) -> Result<String, String> {
+    println!("\n>> set permission mode {mode}");
+    session.send(HarnessCommand::SetPermissionMode(mode.to_string()))?;
+    wait_for(events, |ev| match ev {
+        HarnessEvent::PermissionModeChanged(m) => Some(m.clone()),
+        _ => None,
+    })
+    .await
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let workdir = PathBuf::from(arg("--workdir").expect("--workdir <dir> is required"));
@@ -114,6 +154,44 @@ async fn main() {
     let deny_all = |_: &RuntimeRequestKind| RuntimeDecision::Deny {
         message: "smoke test did not expect a prompt".into(),
     };
+
+    let scenario = arg("--scenario").unwrap_or_else(|| "all".into());
+    if scenario != "all" && scenario != "permission-mode" {
+        eprintln!("unknown --scenario {scenario:?} (expected all or permission-mode)");
+        std::process::exit(2);
+    }
+
+    // The handshake reply arrives without a prompt; switch modes after it.
+    match wait_for(&mut events, |ev| match ev {
+        HarnessEvent::Ready {
+            permission_mode, ..
+        } => Some(permission_mode.clone()),
+        _ => None,
+    })
+    .await
+    {
+        Ok(mode) => check(
+            "ready",
+            mode.as_deref() == Some("default"),
+            format!("mode={mode:?}"),
+        ),
+        Err(e) => check("ready", false, e),
+    }
+    // The chat page's Shift+Tab cycle, ending back where it started.
+    for mode in ["acceptEdits", "plan", "auto", "default"] {
+        match set_mode(&session, &mut events, mode).await {
+            Ok(confirmed) => check(
+                &format!("permission mode {mode}"),
+                confirmed == mode,
+                format!("confirmed={confirmed:?}"),
+            ),
+            Err(e) => check(&format!("permission mode {mode}"), false, e),
+        }
+    }
+    if scenario == "permission-mode" {
+        finish(session, events, failures).await;
+        return;
+    }
 
     match turn(
         &session,
@@ -225,6 +303,15 @@ async fn main() {
         Err(e) => check("turn after interrupt", false, e),
     }
 
+    finish(session, events, failures).await;
+}
+
+/// Shuts the session down, drains its last events, and sets the exit code.
+async fn finish(
+    session: ClaudeSession,
+    mut events: UnboundedReceiver<HarnessEvent>,
+    failures: Vec<String>,
+) {
     drop(session);
     while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(10), events.recv()).await {
         show(&ev);

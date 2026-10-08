@@ -264,7 +264,15 @@ impl ClaudeFrameParser {
             (HostRequest::SetPermissionMode(mode), Err(e)) => out.push(ParsedFrame::Event(
                 HarnessEvent::Error(format!("Claude rejected permission mode {mode:?}: {e}")),
             )),
-            (HostRequest::Interrupt | HostRequest::SetPermissionMode(_), Ok(_)) => {}
+            (HostRequest::SetPermissionMode(requested), Ok(body)) => {
+                // The CLI echoes the mode it switched to; a success without
+                // the echo still confirms the mode that was asked for.
+                let mode = body["mode"].as_str().unwrap_or(requested).to_string();
+                out.push(ParsedFrame::Event(HarnessEvent::PermissionModeChanged(
+                    mode,
+                )));
+            }
+            (HostRequest::Interrupt, Ok(_)) => {}
         }
         out.push(ParsedFrame::HostRequestDone {
             request_id: request_id.to_string(),
@@ -1016,6 +1024,7 @@ async fn run_session(
                     }
                     HarnessCommand::SetPermissionMode(mode) => {
                         let id = new_request_id();
+                        harness_log(&format!("set_permission_mode {mode:?} ({id})"));
                         parser.register_host_request(id.clone(), HostRequest::SetPermissionMode(mode.clone()));
                         io.write(control_request_frame(
                             &id,
@@ -1130,6 +1139,8 @@ mod tests {
     const TURN_BASH_DENY: &str = include_str!("../../tests/fixtures/claude/turn_bash_deny.jsonl");
     const TURN_QUESTION: &str = include_str!("../../tests/fixtures/claude/turn_question.jsonl");
     const TURN_INTERRUPT: &str = include_str!("../../tests/fixtures/claude/turn_interrupt.jsonl");
+    const SET_PERMISSION_MODE_REPLY: &str =
+        include_str!("../../tests/fixtures/claude/set_permission_mode_reply.jsonl");
 
     #[test]
     fn initialize_reply_becomes_ready() {
@@ -1392,6 +1403,29 @@ mod tests {
             deny,
             json!({"behavior": "deny", "message": "no", "toolUseID": "toolu_1"})
         );
+    }
+
+    #[test]
+    fn set_permission_mode_reply_confirms_the_mode() {
+        let mut p = ClaudeFrameParser::new();
+        p.register_host_request(
+            "gitterm_5121_2".into(),
+            HostRequest::SetPermissionMode("plan".into()),
+        );
+        let frames = parse_fixture(&mut p, SET_PERMISSION_MODE_REPLY);
+        // The follow-up system/status frame does not confirm a second time.
+        assert_eq!(
+            events(&frames),
+            vec![HarnessEvent::PermissionModeChanged("plan".into())]
+        );
+        assert!(matches!(
+            frames.last(),
+            Some(ParsedFrame::HostRequestDone {
+                request: HostRequest::SetPermissionMode(_),
+                result: Ok(_),
+                ..
+            })
+        ));
     }
 
     #[test]

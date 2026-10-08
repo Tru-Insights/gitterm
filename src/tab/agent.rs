@@ -28,6 +28,17 @@ use tokio::sync::{mpsc, oneshot};
 /// Permission mode for a Claude tab whose config does not name one. Always
 /// passed explicitly so a user-level `defaultMode` cannot pre-empt prompts.
 pub(crate) const DEFAULT_CLAUDE_PERMISSION_MODE: &str = "default";
+/// Every mode the CLI accepts for `set_permission_mode` (its `invalid_mode`
+/// error lists these; `claude --help` also accepts `manual`, an alias it
+/// reports back as `default`).
+pub(crate) const CLAUDE_PERMISSION_MODES: [&str; 6] = [
+    "default",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+];
 /// Set to a directory to log every Claude stdin/stdout frame there.
 const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_CLAUDE_WIRE_LOG_DIR";
 
@@ -280,6 +291,20 @@ impl AgentSession {
 
     pub(crate) fn backend(&self) -> AgentBackend {
         self.config.backend()
+    }
+
+    /// The permission mode the next Claude spawn passes; `None` for pi.
+    pub(crate) fn configured_permission_mode(&self) -> Option<String> {
+        match &self.config {
+            AgentBackendConfig::Claude {
+                permission_mode, ..
+            } => Some(
+                permission_mode
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
+            ),
+            AgentBackendConfig::Pi { .. } => None,
+        }
     }
 }
 

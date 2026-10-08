@@ -121,6 +121,11 @@ pub enum AgentIpcMessage {
         request_id: String,
         decision: RuntimeDecision,
     },
+    /// The human picked a Claude permission mode (chip or Shift+Tab).
+    SetPermissionMode {
+        tab_id: usize,
+        mode: String,
+    },
 }
 
 static AGENT_IPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<AgentIpcMessage>> =
@@ -289,11 +294,18 @@ fn replay_agent_conversation_in_webview(conversation: &[tab::AgentEvent]) {
 /// Set the active tab id on the JS side. The webview tags every IPC message
 /// with this id so the Rust dispatcher can route the prompt/stop to the
 /// correct tab (multiple agent tabs share the Agent surface, swapping in and
-/// out via tab activation).
-fn set_agent_webview_tab_id(tab_id: usize) {
+/// out via tab activation). `permission_mode` is the Claude tab's configured
+/// mode (what the next spawn passes); the replayed buffer's `ready` and
+/// `permission_mode_changed` events override it. `None` (pi tabs) hides the
+/// mode chip.
+fn set_agent_webview_tab_id(tab_id: usize, permission_mode: Option<&str>) {
+    let mode = serde_json::to_string(&permission_mode).unwrap_or_else(|e| {
+        eprintln!("[agent-webview] tab {tab_id}: cannot encode mode {permission_mode:?}: {e}");
+        "null".to_string()
+    });
     webview::evaluate_script(
         WebviewSurface::Agent,
-        &format!("window.__setTabId({})", tab_id),
+        &format!("window.__setTabId({tab_id}, {mode})"),
     );
 }
 
@@ -358,6 +370,16 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     tab_id,
                     request_id: request_id.to_string(),
                     decision,
+                }
+            }
+            "set_permission_mode" => {
+                let Some(mode) = value.get("mode").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] set_permission_mode without mode: {}", body);
+                    return;
+                };
+                AgentIpcMessage::SetPermissionMode {
+                    tab_id,
+                    mode: mode.to_string(),
                 }
             }
             "open_url" => {
@@ -4443,6 +4465,8 @@ pub enum Event {
     /// User answered a pending runtime request (Claude permission prompt
     /// or question) on the agent tab with this id.
     AgentAnswerRequest(usize, String, RuntimeDecision),
+    /// User picked a permission mode for the Claude chat tab with this id.
+    AgentSetPermissionMode(usize, String),
     /// Open a native Claude chat tab in the active workspace (TRU-140).
     NewClaudeChatTab,
     /// One streaming event from the agent subprocess (Step 4 will refine the
@@ -12401,6 +12425,9 @@ fi
                         request_id,
                         decision,
                     } => Task::done(Event::AgentAnswerRequest(tab_id, request_id, decision)),
+                    AgentIpcMessage::SetPermissionMode { tab_id, mode } => {
+                        Task::done(Event::AgentSetPermissionMode(tab_id, mode))
+                    }
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
@@ -12558,6 +12585,61 @@ fi
                 }
                 return Task::none();
             }
+            Event::AgentSetPermissionMode(tab_id, mode) => {
+                if !tab::CLAUDE_PERMISSION_MODES.contains(&mode.as_str()) {
+                    eprintln!("AgentSetPermissionMode: tab {tab_id}: unknown mode {mode:?}");
+                    return Task::none();
+                }
+                let is_active_in_webview = self.webview_agent_tab_id == Some(tab_id);
+                let Some(session) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session_mut())
+                else {
+                    eprintln!("AgentSetPermissionMode: tab {tab_id} is not an agent tab");
+                    return Task::none();
+                };
+                let tab::AgentBackendConfig::Claude {
+                    permission_mode, ..
+                } = &mut session.config
+                else {
+                    eprintln!("AgentSetPermissionMode: tab {tab_id} is not a Claude tab");
+                    return Task::none();
+                };
+                let (ev, config_changed) = if let Some(claude) = session.claude.as_ref() {
+                    // Live process: the CLI decides. The tab config (and the
+                    // page) follow its confirmation, PermissionModeChanged in
+                    // AgentEventReceived, so a rejected mode is never saved.
+                    match claude.send(HarnessCommand::SetPermissionMode(mode.clone())) {
+                        Ok(()) => return Task::none(),
+                        Err(e) => {
+                            eprintln!(
+                                "AgentSetPermissionMode {mode:?} on tab {tab_id} failed: {e}"
+                            );
+                            let message =
+                                format!("Could not change the permission mode to {mode}: {e}");
+                            (HarnessEvent::Error(message), false)
+                        }
+                    }
+                } else {
+                    // No process yet (or it exited): the next spawn passes
+                    // `--permission-mode` from this config, so the mode is in
+                    // effect now and the page may show it as current at once.
+                    *permission_mode = Some(mode.clone());
+                    (HarnessEvent::PermissionModeChanged(mode), true)
+                };
+                let ev = tab::AgentEvent::Harness(ev);
+                if is_active_in_webview {
+                    push_agent_event_to_webview(&ev);
+                }
+                session.record(ev);
+                if config_changed {
+                    self.mark_workspaces_dirty();
+                }
+                return Task::none();
+            }
             Event::NewClaudeChatTab => {
                 self.tab_picker_visible = false;
                 let config = tab::AgentBackendConfig::Claude {
@@ -12679,6 +12761,7 @@ fi
                 };
                 let mut progress_task: Option<String> = None;
                 let mut session_id_changed = false;
+                let mut config_changed = false;
                 let mut task_signal: Option<(String, Option<TaskSessionOutcome>)> = None;
                 'outer_event: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
@@ -12736,6 +12819,18 @@ fi
                                                         Some(message.clone()),
                                                     ));
                                                 }
+                                            }
+                                        }
+                                        HarnessEvent::PermissionModeChanged(mode) => {
+                                            // Confirmed by the CLI: a respawn
+                                            // or restart starts in this mode.
+                                            if let tab::AgentBackendConfig::Claude {
+                                                permission_mode,
+                                                ..
+                                            } = &mut session.config
+                                            {
+                                                *permission_mode = Some(mode.clone());
+                                                config_changed = true;
                                             }
                                         }
                                         HarnessEvent::ProcessExited { code } => {
@@ -12845,7 +12940,7 @@ fi
                 if let Some((task_id, ended)) = task_signal {
                     self.apply_task_session_signal(&task_id, ended);
                 }
-                if session_id_changed {
+                if session_id_changed || config_changed {
                     self.mark_workspaces_dirty();
                 }
                 return Task::none();
@@ -17566,17 +17661,18 @@ fi
         let history_task = self.start_agent_history_load(tab_id);
 
         // Find the conversation buffer to replay (not needed to reveal).
+        let session = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.agent_session());
         let conversation: Vec<tab::AgentEvent> = if action == AgentSurfaceAction::Reveal {
             Vec::new()
         } else {
-            self.workspaces
-                .iter()
-                .flat_map(|ws| ws.tabs.iter())
-                .find(|t| t.id == tab_id)
-                .and_then(|t| t.agent_session())
-                .map(|s| s.conversation.clone())
-                .unwrap_or_default()
+            session.map(|s| s.conversation.clone()).unwrap_or_default()
         };
+        let permission_mode = session.and_then(tab::AgentSession::configured_permission_mode);
 
         eprintln!(
             "[agent-webview] show tab={} mirrored={:?} alive={} action={:?} bounds=({},{},{},{}) replay_len={}",
@@ -17616,7 +17712,7 @@ fi
                 );
                 webview::set_visible(WebviewSurface::Agent, true);
                 reset_agent_webview();
-                set_agent_webview_tab_id(tab_id);
+                set_agent_webview_tab_id(tab_id, permission_mode.as_deref());
                 replay_agent_conversation_in_webview(&conversation);
                 self.webview_agent_tab_id = Some(tab_id);
                 Task::none()
@@ -17638,6 +17734,7 @@ fi
                 let conversation = std::sync::Arc::new(conversation);
                 iced::window::oldest().then(move |opt_id| {
                     let conversation = std::sync::Arc::clone(&conversation);
+                    let permission_mode = permission_mode.clone();
                     if let Some(id) = opt_id {
                         iced::window::run(id, move |window| {
                             eprintln!("[agent-webview] try_create_with_window for tab={}", tab_id);
@@ -17663,7 +17760,7 @@ fi
                                         tab_id,
                                         conversation.len()
                                     );
-                                    set_agent_webview_tab_id(tab_id);
+                                    set_agent_webview_tab_id(tab_id, permission_mode.as_deref());
                                     replay_agent_conversation_in_webview(&conversation);
                                 }
                             }

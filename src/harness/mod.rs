@@ -123,6 +123,9 @@ pub enum HarnessEvent {
         /// Claude reports this cumulatively per process.
         cost_usd: Option<f64>,
     },
+    /// The harness confirmed a permission mode change GitTerm requested.
+    /// Carries the mode now in effect.
+    PermissionModeChanged(String),
     Error(String),
     ProcessExited {
         code: Option<i32>,

@@ -279,6 +279,33 @@
   button.danger:hover { filter: brightness(1.1); }
   button:disabled { opacity: 0.4; cursor: not-allowed; }
 
+  /* Permission mode chip (left of Send) and its menu */
+  .mode-wrap { position: relative; display: none; }
+  .mode-wrap.visible { display: block; }
+  #mode { padding: 7px 10px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
+  #mode[data-mode=acceptEdits] { color: var(--accent); border-color: var(--accent); }
+  #mode[data-mode=plan] { color: var(--result); border-color: var(--result); }
+  #mode[data-mode=auto] { color: var(--warn); border-color: var(--warn); }
+  #mode[data-mode=dontAsk], #mode[data-mode=bypassPermissions] { color: var(--err); border-color: var(--err); }
+  #mode.pending { opacity: 0.65; }
+  #mode-menu {
+    display: none;
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 6px);
+    min-width: 190px;
+    padding: 4px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    z-index: 10;
+  }
+  #mode-menu.visible { display: block; }
+  #mode-menu button { display: flex; width: 100%; gap: 8px; border: none; background: transparent; text-align: left; font-size: 12.5px; padding: 5px 8px; }
+  #mode-menu button:hover { background: var(--bg-block); }
+  #mode-menu .mark { width: 12px; color: var(--accent); }
+  #mode-menu .hint { padding: 4px 8px 2px; color: var(--fg-muted); font-size: 11px; white-space: nowrap; }
+
   /* highlight.js tokens (Catppuccin Mocha) */
   .hljs-keyword, .hljs-selector-tag, .hljs-built_in { color: #cba6f7; }
   .hljs-string, .hljs-attr-value, .hljs-template-string { color: #a6e3a1; }
@@ -307,6 +334,10 @@
   <div id="request-panel"></div>
   <div id="composer">
     <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+    <div class="mode-wrap">
+      <div id="mode-menu"></div>
+      <button id="mode" title="Permission mode (Shift+Tab in the message box cycles)"></button>
+    </div>
     <button id="submit" class="primary">Send</button>
     <button id="stop" class="danger" disabled>Stop</button>
   </div>
@@ -315,8 +346,14 @@
   'use strict';
   // The Rust side calls window.__setTabId(N) when an agent tab is activated.
   // Every IPC message carries it so Rust routes to the right tab.
+  // `permissionMode` is the Claude tab's configured mode (null for other
+  // backends); the replayed buffer's ready/permission_mode_changed events
+  // override it.
   window.__currentTabId = null;
-  window.__setTabId = function (id) { window.__currentTabId = id; };
+  window.__setTabId = function (id, permissionMode) {
+    window.__currentTabId = id;
+    resetMode(permissionMode == null ? null : permissionMode);
+  };
 
   const messagesEl = document.getElementById('messages');
   const jumpBtn = document.getElementById('jump');
@@ -627,11 +664,87 @@
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       submitPrompt();
+    } else if (e.key === 'Tab' && e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      cycleMode();
     }
   });
   promptEl.addEventListener('input', () => {
     promptEl.style.height = 'auto';
     promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + 'px';
+  });
+
+  // ---- permission mode ---------------------------------------------------
+  // `current` is only ever a mode the harness confirmed (ready, or the reply
+  // to set_permission_mode) or the configured mode of a tab whose process
+  // has not started yet (the Rust side confirms those itself). `pending` is
+  // the last mode asked for and not yet confirmed.
+  const MODE_LABELS = {
+    default: 'Default', acceptEdits: 'Accept edits', plan: 'Plan mode',
+    auto: 'Auto mode', dontAsk: "Don't ask", bypassPermissions: 'Bypass permissions',
+  };
+  // The CLI's Shift+Tab order. A tab launched in a mode outside it (e.g.
+  // bypassPermissions) keeps that mode at the end so it can cycle back.
+  const MODE_CYCLE = ['default', 'acceptEdits', 'plan', 'auto'];
+  const modeWrapEl = document.querySelector('.mode-wrap');
+  const modeBtn = document.getElementById('mode');
+  const modeMenuEl = document.getElementById('mode-menu');
+  const mode = { current: null, pending: null, extra: [] };
+  function modeLabel(m) { return MODE_LABELS[m] || m; }
+  function modeList() { return MODE_CYCLE.concat(mode.extra); }
+  function renderMode() {
+    modeWrapEl.classList.toggle('visible', mode.current != null);
+    if (mode.current == null) { modeMenuEl.classList.remove('visible'); return; }
+    modeBtn.dataset.mode = mode.current;
+    modeBtn.classList.toggle('pending', mode.pending != null);
+    modeBtn.textContent = modeLabel(mode.current) + (mode.pending != null ? ' → ' + modeLabel(mode.pending) + '…' : '');
+    modeMenuEl.innerHTML = '';
+    modeMenuEl.appendChild(el('div', 'hint', 'Permission mode · Shift+Tab cycles'));
+    for (const m of modeList()) {
+      const b = el('button');
+      b.appendChild(el('span', 'mark', m === mode.current ? '✓' : (m === mode.pending ? '…' : '')));
+      b.appendChild(el('span', null, modeLabel(m)));
+      b.addEventListener('click', () => { modeMenuEl.classList.remove('visible'); requestMode(m); promptEl.focus(); });
+      modeMenuEl.appendChild(b);
+    }
+  }
+  function confirmMode(m) {
+    if (!m) return;
+    if (!MODE_CYCLE.includes(m) && !mode.extra.includes(m)) mode.extra.push(m);
+    mode.current = m;
+    if (mode.pending === m) mode.pending = null;
+    renderMode();
+  }
+  function resetMode(m) {
+    mode.current = null; mode.pending = null; mode.extra = [];
+    if (m) confirmMode(m); else renderMode();
+  }
+  function clearPendingMode() {
+    if (mode.pending == null) return;
+    mode.pending = null;
+    renderMode();
+  }
+  function requestMode(m) {
+    if (mode.current == null || m === (mode.pending != null ? mode.pending : mode.current)) return;
+    mode.pending = m;
+    renderMode();
+    postIpc({ type: 'set_permission_mode', mode: m });
+  }
+  function cycleMode() {
+    if (mode.current == null) return;
+    const list = modeList();
+    const from = list.indexOf(mode.pending != null ? mode.pending : mode.current);
+    requestMode(list[(from + 1) % list.length]);
+  }
+  modeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    modeMenuEl.classList.toggle('visible');
+  });
+  document.addEventListener('click', (e) => {
+    if (!modeMenuEl.contains(e.target)) modeMenuEl.classList.remove('visible');
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') modeMenuEl.classList.remove('visible');
   });
 
   // ---- runtime requests (panel above the composer) -----------------------
@@ -814,6 +927,7 @@
     const d = ev.data;
     switch (ev.type) {
       case 'ready':
+        confirmMode(d.permission_mode);
         note(d.session_id ? 'Resumed Claude session ' + d.session_id.slice(0, 8) + ' · permission mode ' + (d.permission_mode || '?')
                           : 'Claude session ready · permission mode ' + (d.permission_mode || '?'));
         break;
@@ -854,12 +968,19 @@
         setBusy(false);
         break;
       }
+      case 'permission_mode_changed':
+        confirmMode(d);
+        note('Permission mode · ' + modeLabel(d));
+        break;
       case 'error':
+        // A rejected or undeliverable mode change surfaces as an error.
+        clearPendingMode();
         errorBlock(d);
         break;
       case 'process_exited':
         endSegment(); endThinking();
         clearPending();
+        clearPendingMode();
         if (busy) finishActivity('Claude exited', 'failed');
         note('Claude process exited' + (d.code != null ? ' (code ' + d.code + ')' : '') + '. The next message resumes the session.');
         setBusy(false);
