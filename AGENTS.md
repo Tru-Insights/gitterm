@@ -252,6 +252,25 @@ Windows CI exists.
 - V5 must remain runtime-isolated from V4 and V3: do not reuse earlier config paths,
   bundle identifiers, app names, log-server port ranges, helper state, temporary
   artifact names, or future browser profiles.
+- **A second instance must never share the real config dir.** Tracey runs the
+  installed V5 all day. `workspaces.json`, `tasks.json`, `profiles.json`,
+  `remote-agents.json`, `browser-profile/`, `worktrees/` and `task-briefs/`
+  are shared across instances and each instance writes back its whole view
+  (last writer wins), so a dev or test launch against `~/.config/gitterm-v5`
+  can erase or resurrect tabs, tasks and chat sessions in the running app and
+  contend for the Chrome profile lock. Every dev/test launch, by an agent or
+  in a try-it checklist, sets `GITTERM_V5_CONFIG_DIR` to an absolute isolated
+  directory, seeded with copies of the files above when the test needs real
+  workspaces:
+
+  ```
+  D=$HOME/.config/gitterm-v5-<purpose>
+  mkdir -p "$D" && cp ~/.config/gitterm-v5/{workspaces.json,tasks.json,profiles.json} "$D"/ 2>/dev/null
+  GITTERM_V5_CONFIG_DIR="$D" cargo run
+  ```
+
+  Never kill, signal, or replace the bundle of the running instance; prefer a
+  headless example over driving the GUI to verify a change.
 
 ### Workspaces
 
