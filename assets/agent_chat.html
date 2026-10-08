@@ -398,6 +398,69 @@
   #review-pop .rv-label { color: var(--fg-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin: 8px 0 3px; }
   #review-pop .rv-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; }
 
+  /* Delegation cards (Codex review / consult, TRU-142) */
+  details.dlg {
+    margin: 8px 0;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    background: var(--bg);
+    font-size: 13px;
+  }
+  details.dlg.completed { border-left-color: var(--result); }
+  details.dlg.failed, details.dlg.interrupted { border-left-color: var(--err); }
+  details.dlg.cancelled, details.dlg.dismissed { border-left-color: var(--fg-muted); }
+  details.dlg.flash { outline: 1px solid var(--accent); }
+  details.dlg > summary {
+    cursor: pointer; user-select: none; list-style: none;
+    padding: 6px 10px; display: flex; gap: 8px; align-items: baseline;
+  }
+  details.dlg > summary::-webkit-details-marker { display: none; }
+  details.dlg > summary::before { content: '\25B8'; color: var(--fg-muted); font-size: 10px; }
+  details.dlg[open] > summary::before { content: '\25BE'; }
+  .dlg-kind { font-weight: 600; color: var(--accent); font-size: 12.5px; white-space: nowrap; }
+  details.dlg.completed .dlg-kind { color: var(--result); }
+  details.dlg.failed .dlg-kind, details.dlg.interrupted .dlg-kind { color: var(--err); }
+  .dlg-what { flex: 1; min-width: 0; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dlg-state { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; }
+  details.dlg.running .dlg-state, details.dlg.requested .dlg-state { color: var(--accent); }
+  .dlg-body { padding: 0 10px 8px 22px; }
+  .dlg-line { color: var(--fg-muted); font-size: 12px; margin: 2px 0 6px; }
+  .dlg-activity { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dlg-banner { margin: 4px 0 6px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--warn); color: var(--warn); font-size: 12px; }
+  .dlg-error { margin: 4px 0 6px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--err); color: var(--err); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow: auto; }
+  .dlg-summary { margin: 4px 0 6px; white-space: pre-wrap; word-break: break-word; }
+  .dlg-findings { list-style: none; margin: 4px 0; padding: 0; }
+  .dlg-finding { display: flex; gap: 6px; align-items: flex-start; padding: 4px 0; border-top: 1px solid var(--border); }
+  .dlg-finding:first-child { border-top: none; }
+  .dlg-finding input { margin-top: 3px; }
+  .dlg-fmain { flex: 1; min-width: 0; }
+  .dlg-ftitle { font-weight: 600; }
+  .dlg-fid { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); }
+  .sev { font-family: var(--mono); font-size: 10.5px; padding: 0 5px; border-radius: 4px; color: var(--bg); background: var(--fg-muted); }
+  .sev.P0 { background: var(--err); } .sev.P1 { background: var(--tool); } .sev.P2 { background: var(--warn); } .sev.P3 { background: var(--border-strong); color: var(--fg); }
+  .dlg-loc { font-family: var(--mono); font-size: 11.5px; color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+  .dlg-fbody { color: var(--fg-muted); font-size: 12px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
+  .dlg-section { margin: 6px 0 2px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-muted); }
+  .dlg-actions { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .dlg-actions button { padding: 4px 10px; font-size: 12px; }
+  .dlg-actions .dlg-note { color: var(--fg-muted); font-size: 11.5px; }
+
+  /* Agent roster: live subagents and delegations (above the composer) */
+  #roster { display: none; flex-direction: column; gap: 2px; padding: 4px 6px; background: var(--bg-block); border: 1px solid var(--border); border-radius: 8px; max-height: 132px; overflow-y: auto; }
+  #roster.visible { display: flex; }
+  .ro-row { display: flex; gap: 8px; align-items: baseline; font-size: 12px; font-family: var(--mono); color: var(--fg-muted); cursor: pointer; padding: 1px 4px; border-radius: 4px; }
+  .ro-row:hover { background: var(--border); }
+  .ro-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+  .ro-row.done .ro-dot { animation: none; background: var(--result); }
+  .ro-row.failed .ro-dot { animation: none; background: var(--err); }
+  .ro-row.queued .ro-dot { animation: none; background: var(--fg-muted); }
+  .ro-name { color: var(--fg); white-space: nowrap; }
+  .ro-what { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ro-meta { white-space: nowrap; }
+  .ro-x { border: none; background: transparent; padding: 0 4px; font-size: 12px; color: var(--fg-muted); }
+  .ro-x:hover { color: var(--fg); background: transparent; }
+
   /* highlight.js tokens (Catppuccin Mocha) */
   .hljs-keyword, .hljs-selector-tag, .hljs-built_in { color: #cba6f7; }
   .hljs-string, .hljs-attr-value, .hljs-template-string { color: #a6e3a1; }
@@ -424,11 +487,12 @@
     <span class="activity-meta"></span>
   </div>
   <div id="request-panel"></div>
+  <div id="roster"></div>
   <div id="composer">
     <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
     <div class="review-wrap">
       <div id="review-pop"></div>
-      <button id="review" title="Ask a reviewer subagent to review this checkout">Review…</button>
+      <button id="review" title="Ask a Claude subagent or Codex to review this checkout, or consult them">Review…</button>
     </div>
     <div class="chip-wrap" id="model-wrap">
       <div class="chip-menu" id="model-menu"></div>
@@ -673,6 +737,7 @@
     endSegment(); endThinking();
     const name = kind && kind.name ? kind.name : 'tool';
     const d = append(el('details', 'tool running'));
+    d.dataset.toolId = id;
     d.open = true;
     const summary = d.appendChild(el('summary'));
     summary.appendChild(el('span', 'tool-name', name));
@@ -742,7 +807,10 @@
       toolsEl: null, textEl: null,
       state: 'running', tracked: false, waiting: false,
       tools: [], text: '', model: null,
+      // Roster: elapsed is only known for subagents seen live.
+      startMs: replaying ? null : Date.now(), endMs: null, tokens: null, fromReplay: replaying,
     };
+    subagents.push(sub);
     const body = d.appendChild(el('div', 'sa-body'));
     sub.toolsEl = body.appendChild(el('div', 'sa-tools'));
     sub.textEl = body.appendChild(el('div', 'sa-text'));
@@ -769,6 +837,8 @@
     sub.details.className = 'subagent ' + sub.state;
     sub.latestEl.textContent = lastLine(sub.text);
     sub.latestEl.style.display = sub.text ? '' : 'none';
+    if (sub.state !== 'running' && sub.startMs != null && sub.endMs == null) sub.endMs = Date.now();
+    if (!replaying) renderRoster();
   }
   function subagentEvent(parentId, ev) {
     const rootId = items.has(parentId) ? parentId : subTools.get(parentId);
@@ -785,6 +855,9 @@
       case 'turn_completed': {
         const st = (d && d.status && d.status.state) || 'completed';
         sub.state = st === 'completed' ? 'done' : st === 'interrupted' ? 'stopped' : 'failed';
+        const usage = (d && d.usage) || {};
+        const tokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : (typeof usage.total_tokens === 'number' ? usage.total_tokens : null);
+        if (tokens != null) sub.tokens = tokens;
         if (st === 'failed' && d.status.message) sub.text += (sub.text ? '\n' : '') + d.status.message;
         break;
       }
@@ -800,8 +873,12 @@
         const name = d.kind && d.kind.name ? d.kind.name : 'tool';
         subTools.set(d.id, rootId);
         const chip = sub.toolsEl.appendChild(el('span', 'sa-tool', name));
-        chip.title = salient(name, d.kind && d.kind.input) || name;
-        sub.tools.push({ id: d.id, name, chip });
+        const toolInput = (d.kind && d.kind.input) || {};
+        chip.title = salient(name, toolInput) || name;
+        // The roster shows what the subagent is doing as the CLI does: the
+        // tool call's own description, else its salient argument.
+        const desc = toolInput.description || salient(name, toolInput);
+        sub.tools.push({ id: d.id, name, chip, desc: desc ? name + ': ' + desc : name });
         // Separate the text before and after each tool call.
         if (sub.text && !sub.text.endsWith('\n')) sub.text += '\n';
         setActivity('Subagent: ' + name);
@@ -870,6 +947,7 @@
     submitBtn.disabled = busy || pending.size > 0;
     stopBtn.disabled = !busy;
     if (typeof refreshReviewSubmit === 'function') refreshReviewSubmit();
+    for (const card of cards.values()) refreshCardSend(card);
   }
   function setBusy(b) { busy = b; refreshComposer(); }
   function submitPrompt() {
@@ -1171,16 +1249,17 @@
   document.addEventListener('click', () => closeChipMenus(null));
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeChipMenus(null); });
 
-  // ---- Review… (TRU-142) ---------------------------------------------------
-  // The popover only collects the request; Rust builds the review prompt
-  // and sends it as a normal user message, so the transcript shows exactly
-  // what Claude was asked.
+  // ---- Review… and Consult… (TRU-142) --------------------------------------
+  // The popover only collects the request. With a Claude subagent, Rust
+  // builds the prompt and sends it as a normal user message, so the
+  // transcript shows exactly what Claude was asked. With Codex, Rust starts
+  // a GitTerm-run delegation directly (no agent turn) and a card appears.
   const reviewWrapEl = document.querySelector('.review-wrap');
   const reviewBtn = document.getElementById('review');
   const reviewPopEl = document.getElementById('review-pop');
-  const REVIEW_MODELS = ['opus', 'sonnet', 'haiku'];
+  const CLAUDE_MODELS = ['opus', 'sonnet', 'haiku', 'fable'];
   const BASE_SOURCES = { task: "this task's base", 'agent-workflow': 'agent-workflow.config.json', inferred: 'inferred from the repository' };
-  const review = { available: false, ctx: null, form: null };
+  const review = { available: false, ctx: null, form: null, kind: 'review', reviewer: null };
   let reviewSubmitBtn = null;
   function setReviewAvailable(on) {
     review.available = !!on;
@@ -1191,93 +1270,148 @@
   function refreshReviewSubmit() {
     if (!reviewSubmitBtn || !review.form) return;
     const f = review.form;
-    const target = f.target();
-    const missing = (target === 'branch' && !f.base.value.trim()) || (target === 'commit' && !f.sha.value.trim());
-    reviewSubmitBtn.disabled = busy || pending.size > 0 || missing;
-    reviewSubmitBtn.title = busy ? 'Waits until Claude finishes this turn' : (missing ? 'Fill in the target first' : '');
+    const codex = f.reviewer.value === 'codex';
+    let missing = false;
+    if (review.kind === 'review') {
+      const target = f.target();
+      missing = (target === 'branch' && !f.base.value.trim()) || (target === 'commit' && !f.sha.value.trim());
+    } else {
+      missing = !f.brief.value.trim();
+    }
+    // A Claude subagent is spawned by this chat's Claude, so it waits for
+    // the turn; Codex runs on its own.
+    const blocked = !codex && (busy || pending.size > 0);
+    reviewSubmitBtn.disabled = blocked || missing;
+    reviewSubmitBtn.title = blocked ? 'Waits until Claude finishes this turn'
+      : (missing ? (review.kind === 'review' ? 'Fill in the target first' : 'Write the brief first') : '');
   }
   function renderReview() {
     reviewPopEl.innerHTML = '';
-    reviewPopEl.appendChild(el('div', 'rv-title', 'Review'));
     const r = review.ctx;
+    const head = reviewPopEl.appendChild(el('div', 'rv-row'));
+    for (const [kind, label] of [['review', 'Review'], ['consult', 'Consult']]) {
+      const l = head.appendChild(el('label'));
+      const input = l.appendChild(el('input'));
+      input.type = 'radio'; input.name = 'rv-kind'; input.value = kind; input.checked = review.kind === kind;
+      input.addEventListener('change', () => { review.kind = kind; renderReview(); });
+      l.appendChild(el('span', 'rv-title', label));
+    }
     if (!r) { reviewPopEl.appendChild(el('div', 'rv-hint', 'Reading the repository…')); review.form = null; reviewSubmitBtn = null; return; }
     const c = r.context || {};
-    if (c.error) reviewPopEl.appendChild(el('div', 'rv-hint warn', c.error));
-    reviewPopEl.appendChild(el('div', 'rv-label', 'Target'));
-    const radios = {};
-    function radio(value, text) {
-      const row = reviewPopEl.appendChild(el('div', 'rv-row'));
-      const label = row.appendChild(el('label'));
-      const input = label.appendChild(el('input'));
-      input.type = 'radio'; input.name = 'rv-target'; input.value = value;
-      label.appendChild(document.createTextNode(text));
-      input.addEventListener('change', refreshReviewSubmit);
-      radios[value] = input;
-      return row;
-    }
-    const branchRow = radio('branch', 'Branch vs');
-    const base = branchRow.appendChild(el('input'));
-    base.type = 'text'; base.placeholder = 'base branch'; base.value = c.base || '';
-    base.addEventListener('input', () => { radios.branch.checked = true; refreshReviewSubmit(); });
-    let baseHint;
-    if (c.base) {
-      baseHint = 'Base from ' + (BASE_SOURCES[c.base_source] || c.base_source || '?') +
-        (typeof c.ahead === 'number' ? ' · ' + c.ahead + (c.ahead === 1 ? ' commit' : ' commits') + ' ahead' : '');
-    } else {
-      baseHint = 'No base branch found; enter one.';
-    }
-    reviewPopEl.appendChild(el('div', 'rv-hint' + (c.base ? '' : ' warn'), baseHint));
-    radio('uncommitted', 'Uncommitted changes');
-    reviewPopEl.appendChild(el('div', 'rv-hint', c.dirty ? 'Staged, unstaged and untracked changes against HEAD' : 'The working tree is clean'));
-    const commitRow = radio('commit', 'Commit');
-    const sha = commitRow.appendChild(el('input'));
-    sha.type = 'text'; sha.placeholder = 'SHA'; sha.value = c.head || '';
-    sha.addEventListener('input', () => { radios.commit.checked = true; refreshReviewSubmit(); });
-    // Branch vs base when the branch has commits of its own, else the
-    // uncommitted changes.
-    const initial = c.base && c.ahead > 0 ? 'branch' : (c.dirty || !c.base ? 'uncommitted' : 'branch');
-    radios[initial].checked = true;
+    const form = { target: () => 'uncommitted' };
 
-    reviewPopEl.appendChild(el('div', 'rv-label', 'Focus (optional)'));
-    const focus = reviewPopEl.appendChild(el('textarea'));
-    focus.placeholder = 'e.g. error handling in the webview lifecycle';
-
-    reviewPopEl.appendChild(el('div', 'rv-label', 'Reviewer'));
+    reviewPopEl.appendChild(el('div', 'rv-label', review.kind === 'review' ? 'Reviewer' : 'Consultant'));
     const revRow = reviewPopEl.appendChild(el('div', 'rv-row'));
-    const codex = r.reviewer === 'codex';
-    revRow.appendChild(el('span', null, codex ? 'Codex (not available yet)' : 'Claude subagent on'));
-    const model = revRow.appendChild(el('select'));
-    const models = REVIEW_MODELS.includes(r.model) || !r.model ? REVIEW_MODELS : [r.model].concat(REVIEW_MODELS);
-    for (const m of models) { const o = model.appendChild(el('option', null, m)); o.value = m; }
-    model.value = r.model || 'opus';
-    if (codex) model.style.display = 'none';
+    const reviewer = revRow.appendChild(el('select'));
+    for (const [value, label] of [['claude-subagent', 'Claude subagent'], ['codex', 'Codex']]) {
+      const o = reviewer.appendChild(el('option', null, label)); o.value = value;
+    }
+    reviewer.value = review.reviewer || (r.reviewer === 'codex' ? 'codex' : 'claude-subagent');
+    const claudeModel = revRow.appendChild(el('select'));
+    const models = CLAUDE_MODELS.includes(r.model) || !r.model ? CLAUDE_MODELS : [r.model].concat(CLAUDE_MODELS);
+    for (const m of models) { const o = claudeModel.appendChild(el('option', null, m)); o.value = m; }
+    claudeModel.value = r.model || 'opus';
+    const codexModel = revRow.appendChild(el('input'));
+    codexModel.type = 'text'; codexModel.placeholder = 'Codex default model'; codexModel.value = r.codex_model || '';
+    codexModel.title = 'codex -m; empty uses GitTerm\'s review.codex_model or Codex\'s own default';
+    const revHint = reviewPopEl.appendChild(el('div', 'rv-hint'));
+    function syncReviewer() {
+      review.reviewer = reviewer.value;
+      const codex = reviewer.value === 'codex';
+      claudeModel.style.display = codex ? 'none' : '';
+      codexModel.style.display = codex ? '' : 'none';
+      revHint.textContent = codex
+        ? 'Runs in the background in this checkout; a card shows its progress and result. No Claude turn is spent.'
+        : 'Claude spawns one subagent in this chat; its report comes back as a reply.';
+      if (form.syncTarget) form.syncTarget();
+      refreshReviewSubmit();
+    }
+    reviewer.addEventListener('change', syncReviewer);
+    form.reviewer = reviewer; form.claudeModel = claudeModel; form.codexModel = codexModel;
+
+    if (review.kind === 'review') {
+      if (c.error) reviewPopEl.appendChild(el('div', 'rv-hint warn', c.error));
+      reviewPopEl.appendChild(el('div', 'rv-label', 'Target'));
+      const radios = {};
+      function radio(value, text) {
+        const row = reviewPopEl.appendChild(el('div', 'rv-row'));
+        const label = row.appendChild(el('label'));
+        const input = label.appendChild(el('input'));
+        input.type = 'radio'; input.name = 'rv-target'; input.value = value;
+        label.appendChild(document.createTextNode(text));
+        input.addEventListener('change', () => { form.syncTarget(); refreshReviewSubmit(); });
+        radios[value] = input;
+        return row;
+      }
+      const branchRow = radio('branch', 'Branch vs');
+      const base = branchRow.appendChild(el('input'));
+      base.type = 'text'; base.placeholder = 'base branch'; base.value = c.base || '';
+      base.addEventListener('input', () => { radios.branch.checked = true; form.syncTarget(); refreshReviewSubmit(); });
+      let baseHint;
+      if (c.base) {
+        baseHint = 'Base from ' + (BASE_SOURCES[c.base_source] || c.base_source || '?') +
+          (typeof c.ahead === 'number' ? ' · ' + c.ahead + (c.ahead === 1 ? ' commit' : ' commits') + ' ahead' : '');
+      } else {
+        baseHint = 'No base branch found; enter one.';
+      }
+      reviewPopEl.appendChild(el('div', 'rv-hint' + (c.base ? '' : ' warn'), baseHint));
+      const codexBaseHint = reviewPopEl.appendChild(el('div', 'rv-hint', 'Codex compares the working tree with the merge base, so uncommitted changes are included.'));
+      radio('uncommitted', 'Uncommitted changes');
+      reviewPopEl.appendChild(el('div', 'rv-hint', c.dirty ? 'Staged, unstaged and untracked changes against HEAD' : 'The working tree is clean'));
+      const commitRow = radio('commit', 'Commit');
+      const sha = commitRow.appendChild(el('input'));
+      sha.type = 'text'; sha.placeholder = 'SHA'; sha.value = c.head || '';
+      sha.addEventListener('input', () => { radios.commit.checked = true; refreshReviewSubmit(); });
+      // Branch vs base when the branch has commits of its own, else the
+      // uncommitted changes.
+      const initial = c.base && c.ahead > 0 ? 'branch' : (c.dirty || !c.base ? 'uncommitted' : 'branch');
+      radios[initial].checked = true;
+      reviewPopEl.appendChild(el('div', 'rv-label', 'Focus (optional)'));
+      const focus = reviewPopEl.appendChild(el('textarea'));
+      focus.placeholder = 'e.g. error handling in the webview lifecycle';
+      form.base = base; form.sha = sha; form.focus = focus;
+      form.target = () => (Object.keys(radios).find((k) => radios[k].checked) || 'uncommitted');
+      form.syncTarget = () => { codexBaseHint.style.display = reviewer.value === 'codex' && form.target() === 'branch' ? '' : 'none'; };
+    } else {
+      reviewPopEl.appendChild(el('div', 'rv-label', 'Brief'));
+      const brief = reviewPopEl.appendChild(el('textarea'));
+      brief.placeholder = 'The question, the context it needs, and the answer you want. The consultant cannot see this chat.';
+      brief.style.minHeight = '90px';
+      brief.addEventListener('input', refreshReviewSubmit);
+      form.brief = brief;
+    }
 
     const actions = reviewPopEl.appendChild(el('div', 'rv-actions'));
     const cancel = actions.appendChild(el('button', null, 'Cancel'));
     cancel.addEventListener('click', () => { closeReview(); promptEl.focus(); });
-    reviewSubmitBtn = actions.appendChild(el('button', 'primary', 'Start review'));
-    review.form = {
-      base, sha, focus, model,
-      target: () => (Object.keys(radios).find((k) => radios[k].checked) || 'uncommitted'),
-    };
+    reviewSubmitBtn = actions.appendChild(el('button', 'primary', review.kind === 'review' ? 'Start review' : 'Ask'));
+    review.form = form;
     reviewSubmitBtn.addEventListener('click', submitReview);
-    refreshReviewSubmit();
+    syncReviewer();
   }
   function submitReview() {
     const f = review.form;
-    if (!f || reviewSubmitBtn.disabled) return;
-    const kind = f.target();
-    const target = kind === 'branch' ? { kind, base: f.base.value.trim() }
-      : kind === 'commit' ? { kind, sha: f.sha.value.trim() } : { kind };
-    const focus = f.focus.value.trim();
-    postIpc({ type: 'review_request', target, focus: focus || null, model: f.model.value });
+    if (!f || !reviewSubmitBtn || reviewSubmitBtn.disabled) return;
+    const reviewer = f.reviewer.value;
+    const model = reviewer === 'codex' ? f.codexModel.value.trim() : f.claudeModel.value;
+    if (review.kind === 'review') {
+      const kind = f.target();
+      const target = kind === 'branch' ? { kind, base: f.base.value.trim() }
+        : kind === 'commit' ? { kind, sha: f.sha.value.trim() } : { kind };
+      const focus = f.focus.value.trim();
+      postIpc({ type: 'review_request', target, focus: focus || null, reviewer, model });
+    } else {
+      postIpc({ type: 'consult_request', brief: f.brief.value.trim(), reviewer, model });
+    }
     closeReview();
     follow = true;
   }
   reviewBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     if (reviewPopEl.classList.contains('visible')) { closeReview(); return; }
+    // Each opening starts from the configured reviewer.
     review.ctx = null;
+    review.reviewer = null;
     renderReview();
     reviewPopEl.classList.add('visible');
     postIpc({ type: 'review_context' });
@@ -1288,16 +1422,337 @@
     if (e.key === 'Escape') { closeReview(); promptEl.focus(); }
     else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submitReview(); }
   });
-  // Rust answers review_context with {context, reviewer, model}.
+  // Rust answers review_context with {context, reviewer, model, codex_model}.
   window.__setReviewContext = function (payload) {
     if (!reviewPopEl.classList.contains('visible')) return;
     review.ctx = payload || {};
     renderReview();
     const f = review.form;
-    if (f) (f.target() === 'branch' && !f.base.value ? f.base : f.focus).focus();
+    if (!f) return;
+    if (review.kind === 'consult') f.brief.focus();
+    else (f.target() === 'branch' && !f.base.value ? f.base : f.focus).focus();
   };
-  // Why a review was not sent (Codex not available, bad target, ...).
+  // Why a review, consult or delegation action was not done (bad target,
+  // not a git checkout, ...).
   window.__reviewNote = function (text) { note(text, 'warn'); };
+
+  // ---- delegation cards (Codex review / consult, TRU-142) ------------------
+  // Rust sends {"kind":"delegation_anchor", delegation_id} into the
+  // conversation where the request was made, and {"kind":"delegation",
+  // delegation, activity, held} whenever the record changes (and after a
+  // replay, since cards are not in Claude's transcript). A card is created
+  // at its anchor, or at the end of the timeline when it has none.
+  const cards = new Map();       // delegation_id -> card
+  let checkoutHead = null;       // the tab's current HEAD (__setDelegationHead)
+  const SEVERITIES = ['P0', 'P1', 'P2', 'P3'];
+  function shortHead(h) { return h ? String(h).slice(0, 7) : '?'; }
+  function parseTime(t) { const ms = Date.parse(t || ''); return isNaN(ms) ? null : ms; }
+  function fmtClock(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+  function newCard(id) {
+    endSegment(); endThinking();
+    const root = el('details', 'dlg requested');
+    root.open = true;
+    root.dataset.delegationId = id;
+    const summary = root.appendChild(el('summary'));
+    const card = {
+      id, root, data: null, activity: null, held: false, selected: null,
+      kindEl: summary.appendChild(el('span', 'dlg-kind', 'Codex')),
+      whatEl: summary.appendChild(el('span', 'dlg-what')),
+      stateEl: summary.appendChild(el('span', 'dlg-state', 'requested')),
+      body: root.appendChild(el('div', 'dlg-body')),
+      wasDismissed: false,
+    };
+    cards.set(id, card);
+    append(root);
+    return card;
+  }
+  function delegationAnchor(id) {
+    if (!id || cards.has(id)) return;
+    newCard(id);
+  }
+  function delegationEvent(ev) {
+    const d = ev.delegation;
+    if (!d || !d.delegation_id) { console.warn('delegation event without a record', ev); return; }
+    const card = cards.get(d.delegation_id) || newCard(d.delegation_id);
+    card.data = d;
+    card.activity = ev.activity || null;
+    card.held = !!ev.held;
+    renderCard(card);
+    renderRoster();
+  }
+  function kindLabel(d) { return d.kind === 'consult' ? 'Codex consult' : d.kind === 'review' ? 'Codex review' : 'Delegation'; }
+  function childModel(d) { return (d.child && d.child.model) || 'default model'; }
+  function targetText(d) {
+    const t = d.target;
+    if (!t || !t.mode) return d.kind === 'consult' ? d.brief : '';
+    const m = t.mode;
+    const scope = m.type === 'uncommitted' ? 'uncommitted changes'
+      : m.type === 'base' ? 'vs ' + m.reference + ' (+ uncommitted)'
+      : m.type === 'commit' ? 'commit ' + shortHead(m.sha) : m.type;
+    return scope + (t.focus ? ' · focus: ' + t.focus : '');
+  }
+  function state(d) { return (d.status && d.status.state) || 'requested'; }
+  function findingsOf(d) { return (d.result && d.result.findings) || null; }
+  function severityCounts(list) {
+    const counts = {};
+    for (const f of list) counts[f.severity] = (counts[f.severity] || 0) + 1;
+    return SEVERITIES.filter((s) => counts[s]).map((s) => counts[s] + ' ' + s).join(', ');
+  }
+  function stateText(card) {
+    const d = card.data;
+    const st = state(d);
+    if (st === 'running') {
+      const start = parseTime(d.updated_at);
+      return 'running ' + (start != null ? fmtClock(Date.now() - start) : '');
+    }
+    if (st === 'requested') return 'queued';
+    if (st === 'completed') {
+      const f = findingsOf(d);
+      if (f) return f.findings.length ? f.findings.length + (f.findings.length === 1 ? ' finding' : ' findings') + ' (' + severityCounts(f.findings) + ')' : 'no findings';
+      return 'answered';
+    }
+    return st;
+  }
+  function openFinding(f) {
+    // Opens the file viewer over the chat (line numbers are shown, the view
+    // does not scroll to the line).
+    postIpc({ type: 'open_file', path: f.file });
+  }
+  function renderCard(card) {
+    const d = card.data;
+    if (!d) return;
+    const st = state(d);
+    const dismissed = !!d.dismissed_at;
+    card.root.className = 'dlg ' + st + (dismissed ? ' dismissed' : '');
+    if (dismissed && !card.wasDismissed) card.root.open = false;
+    card.wasDismissed = dismissed;
+    card.kindEl.textContent = kindLabel(d) + ' · ' + childModel(d);
+    card.whatEl.textContent = targetText(d);
+    card.stateEl.textContent = (dismissed ? 'dismissed · ' : '') + stateText(card);
+    const body = card.body;
+    body.innerHTML = '';
+    if (st === 'running' || st === 'requested') {
+      body.appendChild(el('div', 'dlg-activity', card.activity || (st === 'requested' ? 'Waiting for a free Codex slot' : 'Starting Codex…')));
+    } else if (st === 'failed') {
+      body.appendChild(el('div', 'dlg-error', (d.status && d.status.message) || 'Codex failed'));
+    } else if (st === 'interrupted') {
+      body.appendChild(el('div', 'dlg-line', 'GitTerm restarted while this was running. Re-run it to try again.'));
+    } else if (st === 'cancelled') {
+      body.appendChild(el('div', 'dlg-line', 'Cancelled.'));
+    } else if (st === 'completed') {
+      renderResult(card, body);
+    }
+    const actions = body.appendChild(el('div', 'dlg-actions'));
+    if (st === 'completed' && !dismissed) {
+      const send = actions.appendChild(el('button', 'primary', 'Send to Claude'));
+      card.sendBtn = send;
+      if (d.delivered_at) {
+        send.textContent = 'Sent to Claude';
+        send.disabled = true;
+      } else if (card.held) {
+        send.textContent = 'Queued, sends when Claude finishes';
+        send.disabled = true;
+      } else {
+        send.title = busy ? 'Claude is working; it is sent when this turn ends' : 'Send the selected findings as a message';
+        send.addEventListener('click', () => sendCard(card));
+      }
+    } else {
+      card.sendBtn = null;
+    }
+    if (st !== 'running' && st !== 'requested') {
+      const rerun = actions.appendChild(el('button', null, 'Re-run'));
+      rerun.addEventListener('click', () => postIpc({ type: 'delegation_rerun', delegationId: d.delegation_id }));
+    }
+    if (!dismissed) {
+      const dismiss = actions.appendChild(el('button', null, st === 'running' || st === 'requested' ? 'Cancel' : 'Dismiss'));
+      dismiss.addEventListener('click', () => postIpc({ type: 'delegation_dismiss', delegationId: d.delegation_id }));
+    }
+    actions.appendChild(el('span', 'dlg-note', d.delegation_id.slice(0, 8)));
+    refreshCardSend(card);
+  }
+  function renderResult(card, body) {
+    const d = card.data;
+    const result = d.result || {};
+    const reviewed = result.reviewed;
+    if (reviewed) {
+      body.appendChild(el('div', 'dlg-line', 'Reviewed at ' + shortHead(reviewed.head) + (reviewed.dirty ? ', dirty' : '') +
+        (reviewed.target_description && reviewed.target_description !== 'consult' ? ' · ' + reviewed.target_description : '')));
+      if (checkoutHead && reviewed.head && checkoutHead !== reviewed.head) {
+        body.appendChild(el('div', 'dlg-banner', 'The branch has moved since (now at ' + shortHead(checkoutHead) + '); line numbers may have drifted.'));
+      }
+    }
+    const f = findingsOf(d);
+    if (f) {
+      body.appendChild(el('div', 'dlg-line', 'Verdict: ' + (f.verdict || 'unknown').replace('_', ' ') + (f.structured ? '' : ' · unstructured reply')));
+      if (f.summary) body.appendChild(el('div', 'dlg-summary', f.summary));
+      if (card.selected == null) card.selected = new Set(f.findings.map((x) => x.id));
+      const list = body.appendChild(el('ul', 'dlg-findings'));
+      for (const finding of f.findings) {
+        const li = list.appendChild(el('li', 'dlg-finding'));
+        const box = li.appendChild(el('input'));
+        box.type = 'checkbox';
+        box.checked = card.selected.has(finding.id);
+        box.disabled = !!d.delivered_at;
+        box.addEventListener('change', () => {
+          if (box.checked) card.selected.add(finding.id); else card.selected.delete(finding.id);
+          refreshCardSend(card);
+        });
+        const main = li.appendChild(el('div', 'dlg-fmain'));
+        const top = main.appendChild(el('div'));
+        top.appendChild(el('span', 'sev ' + finding.severity, finding.severity));
+        top.appendChild(document.createTextNode(' '));
+        top.appendChild(el('span', 'dlg-fid', finding.id + ' '));
+        top.appendChild(el('span', 'dlg-ftitle', finding.title));
+        if (finding.file) {
+          const lines = finding.line_start ? ':' + finding.line_start + (finding.line_end && finding.line_end !== finding.line_start ? '-' + finding.line_end : '') : '';
+          const loc = main.appendChild(el('div'));
+          const link = loc.appendChild(el('span', 'dlg-loc', finding.file + lines));
+          link.title = 'Open ' + finding.file + ' in the file viewer';
+          link.addEventListener('click', (e) => { e.preventDefault(); openFinding(finding); });
+        }
+        if (finding.body) main.appendChild(el('div', 'dlg-fbody', finding.body));
+      }
+      return;
+    }
+    const handoff = result.handoff;
+    if (handoff) {
+      const summary = body.appendChild(el('div', 'assistant'));
+      summary.innerHTML = renderMarkdown(handoff.summary || '');
+      for (const [title, items] of [['Decisions', handoff.decisions], ['Next steps', handoff.next_steps], ['Blockers', handoff.blockers]]) {
+        if (!Array.isArray(items) || !items.length) continue;
+        body.appendChild(el('div', 'dlg-section', title));
+        const ul = body.appendChild(el('ul'));
+        for (const item of items) ul.appendChild(el('li', null, item));
+      }
+    }
+  }
+  function refreshCardSend(card) {
+    const btn = card.sendBtn;
+    const d = card.data;
+    if (!btn || !d || d.delivered_at || card.held) return;
+    const f = findingsOf(d);
+    const none = f && f.findings.length > 0 && card.selected && card.selected.size === 0;
+    btn.disabled = !!none;
+    if (none) btn.title = 'Select at least one finding';
+    else btn.title = busy ? 'Claude is working; it is sent when this turn ends' : 'Send the selected findings as a message';
+  }
+  function sendCard(card) {
+    const d = card.data;
+    const f = findingsOf(d);
+    const ids = f ? f.findings.map((x) => x.id).filter((id) => card.selected && card.selected.has(id)) : [];
+    postIpc({ type: 'delegation_send', delegationId: d.delegation_id, findingIds: ids });
+    if (card.sendBtn) { card.sendBtn.disabled = true; card.sendBtn.textContent = busy ? 'Queued, sends when Claude finishes' : 'Sending…'; }
+  }
+  window.__setDelegationHead = function (head) {
+    checkoutHead = head || null;
+    for (const card of cards.values()) if (card.data && state(card.data) === 'completed') renderCard(card);
+  };
+
+  // ---- agent roster (live subagents and delegations) -----------------------
+  const rosterEl = document.getElementById('roster');
+  const subagents = [];          // sub objects in start order
+  const rosterHidden = new Set(); // row keys the human closed
+  let rosterTimer = null;
+  function subagentRow(sub) {
+    const input = sub.item.input || {};
+    const last = sub.tools.length ? sub.tools[sub.tools.length - 1] : null;
+    const doing = sub.state === 'running'
+      ? (sub.waiting ? 'waiting for approval' : (last ? (last.desc || last.name) : (lastLine(sub.text) || 'starting')))
+      : (sub.state === 'done' ? 'done' : sub.state);
+    const parts = [];
+    if (sub.startMs != null) parts.push(fmtDur((sub.endMs != null ? sub.endMs : Date.now()) - sub.startMs));
+    if (sub.tokens != null) parts.push('↓ ' + sub.tokens + ' tokens');
+    return {
+      key: 'sub:' + sub.item.card.dataset.toolId,
+      cls: sub.state === 'running' ? 'running' : sub.state === 'done' ? 'done' : 'failed',
+      name: (input.subagent_type || 'Subagent') + ((input.model || sub.model) ? ' · ' + (input.model || sub.model) : ''),
+      what: (input.description ? input.description + ' — ' : '') + doing,
+      meta: parts.join(' · '),
+      target: sub.item.card,
+      live: sub.state === 'running',
+    };
+  }
+  function delegationRow(card) {
+    const d = card.data;
+    const st = state(d);
+    const live = st === 'running' || st === 'requested';
+    let what;
+    if (live) what = card.activity || (st === 'requested' ? 'queued' : 'starting');
+    else if (st === 'completed') what = (card.held ? 'sends when Claude finishes · ' : 'ready · ') + stateText(card);
+    else what = st;
+    const created = parseTime(d.created_at);
+    const updated = parseTime(d.updated_at);
+    let meta = '';
+    if (st === 'running' && updated != null) meta = fmtDur(Date.now() - updated);
+    else if (!live && created != null && updated != null) meta = fmtDur(updated - created);
+    return {
+      key: 'dlg:' + d.delegation_id,
+      cls: live ? (st === 'requested' ? 'queued' : 'running') : st === 'completed' ? 'done' : 'failed',
+      name: kindLabel(d) + ' · ' + childModel(d),
+      what, meta, target: card.root, live,
+    };
+  }
+  function rosterRows() {
+    const rows = [];
+    for (const sub of subagents) {
+      // Finished subagents read back from history are not news.
+      if (sub.fromReplay && sub.state !== 'running') continue;
+      rows.push(subagentRow(sub));
+    }
+    for (const card of cards.values()) {
+      const d = card.data;
+      if (!d || d.dismissed_at || d.delivered_at) continue;
+      rows.push(delegationRow(card));
+    }
+    return rows.filter((row) => !rosterHidden.has(row.key));
+  }
+  function renderRoster() {
+    const rows = rosterRows();
+    rosterEl.innerHTML = '';
+    rosterEl.classList.toggle('visible', rows.length > 0);
+    let live = false;
+    for (const row of rows) {
+      live = live || row.live;
+      const r = rosterEl.appendChild(el('div', 'ro-row ' + row.cls));
+      r.dataset.key = row.key;
+      r.appendChild(el('span', 'ro-dot'));
+      r.appendChild(el('span', 'ro-name', row.name));
+      r.appendChild(el('span', 'ro-what', row.what));
+      if (row.meta) r.appendChild(el('span', 'ro-meta', row.meta));
+      if (!row.live) {
+        const x = r.appendChild(el('button', 'ro-x', '×'));
+        x.title = 'Hide from this list';
+        x.addEventListener('click', (e) => { e.stopPropagation(); rosterHidden.add(row.key); renderRoster(); });
+      }
+      r.addEventListener('click', () => {
+        if (row.target.tagName === 'DETAILS') row.target.open = true;
+        row.target.scrollIntoView({ block: 'nearest' });
+        row.target.classList.add('flash');
+        setTimeout(() => row.target.classList.remove('flash'), 900);
+      });
+    }
+    // Timers tick while something runs.
+    const anyRunningCard = Array.from(cards.values()).some((c) => c.data && state(c.data) === 'running');
+    if ((live || anyRunningCard) && !rosterTimer) {
+      rosterTimer = setInterval(() => {
+        for (const card of cards.values()) if (card.data && state(card.data) === 'running') card.stateEl.textContent = stateText(card);
+        renderRoster();
+      }, 1000);
+    } else if (!live && !anyRunningCard && rosterTimer) {
+      clearInterval(rosterTimer); rosterTimer = null;
+    }
+  }
+  function resetDelegations() {
+    cards.clear();
+    subagents.length = 0;
+    rosterHidden.clear();
+    if (rosterTimer) { clearInterval(rosterTimer); rosterTimer = null; }
+    renderRoster();
+  }
+
 
   // ---- runtime requests (panel above the composer) -----------------------
   function answer(requestId, decision) {
@@ -1603,6 +2058,8 @@
     if (!event || typeof event !== 'object') return;
     try {
       if (event.kind === 'harness') { harnessEvent(event.event); return; }
+      if (event.kind === 'delegation_anchor') { delegationAnchor(event.delegation_id); return; }
+      if (event.kind === 'delegation') { delegationEvent(event); return; }
       if (event.type === 'user_prompt') {
         endSegment(); endThinking();
         append(el('div', 'user-msg', event.text || ''));
@@ -1633,6 +2090,7 @@
       if (!activity.timer) activity.timer = setInterval(paintActivity, 500);
     }
     paintActivity();
+    renderRoster();
     follow = true;
     messagesEl.scrollTop = messagesEl.scrollHeight;
   };
@@ -1641,6 +2099,7 @@
     messagesEl.innerHTML = '';
     segment = null; thinking = null;
     items.clear(); pending.clear(); subTools.clear();
+    resetDelegations();
     if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
     activityEl.className = 'activity';
     follow = true;

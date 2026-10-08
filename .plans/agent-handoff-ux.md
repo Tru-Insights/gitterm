@@ -1,6 +1,6 @@
 # Agent handoff UX: ask for a review, get findings back where you work
 
-Status: design, not started. Branch context: TRU-140 (`tracey/tru-140-claude-control-protocol-spike`, PR #43).
+Status: R1 and S0-S5 implemented on `tracey/tru-142-agent-handoff-ux` (see §9); S6 not started. Branch context: TRU-140 (`tracey/tru-140-claude-control-protocol-spike`, PR #43).
 Goal: from the chat tab she is working in, Tracey asks another agent for a code review (or hands off an
 implementation slice), keeps working, is told when the result lands, reads it, and acts on it from the same chat.
 Constraint already decided: handoffs are summaries, not transcript copies
@@ -433,3 +433,90 @@ worker). Each row shows type or kind, model, what it is doing now (the current t
 as the CLI shows it), elapsed time and output tokens (from the subagent's assistant-frame usage). A finished
 row shows the outcome until dismissed or sent. Clicking a row scrolls to its nested block or card in the
 timeline. The nested Subagent block from R1 stays as the detail view.
+
+## 9. Implemented (2026-10-08)
+
+R1, S0, S1 (c4ece51), S2 (70d2b85) and S3a, the Codex runner (914bc6e), landed earlier. This section covers
+S3b, S4 and S5, which wire the runner into delegations and the chat.
+
+**S3b: tools and runner driving.**
+- Four new task MCP tools are pre-approved with the others (`mcp__gitterm_tasks`). Each needs a caller. A call
+  without `?caller=` is refused in `task_mcp.rs` before it reaches the bridge (`missing_caller_error`).
+  - `review_request {target: uncommitted|base|commit, base_ref?, commit?, focus?, reviewer?: "codex", model?}`
+    returns `{delegation_id, status: "requested", queued, detail}`. The smoke measured 33 ms.
+  - `consult_request {brief, model?}` returns the same shape.
+  - `delegation_get {delegation_id}` returns the stored record plus `log_path`.
+  - `delegation_list {status?}` returns the caller's rows newest first: kind, status, brief, verdict,
+    finding count, summary. It does not include full results.
+  - A mismatched field (for example `commit` with target `uncommitted`) is an error, not ignored. A reviewer
+    other than `codex` is an error that points to the Agent tool.
+- The cwd is the calling tab's `repo_path`. A remote workspace, a non-git directory, or a repository with no
+  commit is refused. The git check runs off the UI thread (`delegations::check_checkout`).
+- The rules are pure functions in a new lib module, `gitterm::delegations`, so the headless example uses the
+  same code as the app. They cover request mapping, queue selection, records, the send composer, and
+  hold-and-flush.
+- Driving lives in `main.rs` (`impl App`, "Delegations a chat tab requested"):
+  1. Insert the delegation.
+  2. `start_queued_delegations` starts a run while fewer than `review.max_concurrent_reviews` (default 2)
+     Codex runs are going. The cap counts reviews and consults together, since both are Codex processes.
+  3. Each run is an abortable `Task::run` over `delegation_run_stream`.
+  4. `Started` becomes `mark_delegation_started`: status `running`, plus `child.thread_id`.
+  5. `Activity` updates an in-memory activity line.
+  6. `DelegationFinished` calls `complete_delegation`, or `Failed { message }` with the runner's error.
+- Logs go to `<config dir>/delegations/<id>.jsonl` (`config::global_config_dir()`, so `GITTERM_V5_CONFIG_DIR`
+  is honoured). A finished run raises `DelegationReady(kind)` attention ("Review ready" / "Consult ready", or
+  "… failed") on the parent tab unless that tab is in front. The existing inbox row for tab attention focuses
+  the tab.
+- Store changes in `tasks.rs`, all additive:
+  - `DelegationKind::Consult` and `DelegationChild::CodexConsult {thread_id, model}`.
+  - `model` on `CodexReview`, so a queued run knows its model.
+  - `Delegation.dismissed_at`.
+  - `TaskStore::{mark_delegation_started, dismiss_delegation}`.
+  - A consult completes with a handoff.
+- Config: `review.codex_model` (default none, which means Codex's default) and `review.max_concurrent_reviews`
+  (2).
+- `agentd::git::git_command` now also clears `GIT_ALTERNATE_OBJECT_DIRECTORIES` and `GIT_PREFIX`.
+- Proof: `cargo run --example delegation_smoke -- --workdir <scratch>`. A real Claude (haiku) calls
+  `review_request` through the per-tab URL. A real Codex reviews a planted bug. `delegation_get` reads a
+  finding in `stats.py`.
+
+**S4: card, roster, send.**
+- The anchor and the card:
+  - The request records `{"kind":"delegation_anchor"}` in the parent's conversation buffer.
+  - Every record change pushes `{"kind":"delegation", delegation, activity, held}` through `__appendEvent`.
+  - On a replay, the tab's cards follow the conversation. A card with an anchor in the buffer lands there;
+    any other card is appended at the end.
+  - Anchors are not in Claude's transcript. After a GitTerm restart the anchors are gone, so cards append at
+    the end. During a session they keep their place across page rebuilds.
+- `file:line` opens the existing file viewer over the chat (IPC `open_file`, which becomes `ViewFile`). The
+  viewer does not scroll to the line.
+- The roster sits above the composer. It lists live Claude subagents, and delegations that are neither
+  dismissed nor sent.
+  - Subagent rows show the tool call's own `description`, else its salient argument.
+  - Output tokens come from the subagent's completion `usage` (`output_tokens`, else `total_tokens`) when
+    present. Per-frame subagent usage is not parsed.
+  - Finished subagents read back from a replay are left out.
+  - × hides a row for the life of the page.
+- Send to Claude:
+  - `compose_send_message` builds a message of at most 8 KB: a header with the verdict and counts, then per
+    finding `Fn [Pn] file:line title` and up to 400 characters of body, with omissions named, then
+    `Full record: delegation_get <id>`.
+  - The message is submitted through `AgentSubmitPrompt`, the `submit` path.
+  - While the tab streams, the message is held per tab (`App::delegation_held`). On `TurnCompleted`, one held
+    message is flushed per turn end, oldest first.
+  - `delivered_at` is stamped when the message is actually sent.
+  - Dismiss sets `dismissed_at`, and the card collapses. On a running card, Dismiss reads "Cancel": it aborts
+    the run (killing Codex) and then dismisses.
+  - Re-run creates a new delegation with `previous` set. The re-run brief does not list the earlier findings.
+
+**S5: popover.**
+- Review… gets a Review | Consult switch and a reviewer select (Claude subagent | Codex).
+- Claude models: opus, sonnet, haiku, fable. The default comes from `review.subagent_model`.
+- The Codex model is free text, defaulting to `review.codex_model`. The reviewer resets to
+  `review.default_reviewer` each time the popover opens.
+- Codex requests (`review_request` with `reviewer: "codex"`, `consult_request`) create the delegation
+  directly, with no agent turn, and are allowed while Claude streams.
+- A Claude consult sends `review::consult_prompt`: one subagent, the brief verbatim, read-only, then "My take".
+- "Branch vs base" maps to Codex `--base`, and the popover says that this includes uncommitted changes.
+- The command-palette entry for terminal tabs was not built.
+
