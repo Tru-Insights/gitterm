@@ -8,10 +8,15 @@ use std::path::{Path, PathBuf};
 pub const TASK_STORE_SCHEMA_VERSION: u32 = 1;
 pub const TASKS_FILE_NAME: &str = "tasks.json";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Not `Eq`: review findings carry an `f32` confidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskStoreDocument {
     pub schema_version: u32,
     pub tasks: Vec<TaskRecord>,
+    /// Additive (TRU-142): documents written before delegations existed
+    /// load with an empty list, and an empty list is not written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<Delegation>,
 }
 
 impl Default for TaskStoreDocument {
@@ -19,6 +24,7 @@ impl Default for TaskStoreDocument {
         Self {
             schema_version: TASK_STORE_SCHEMA_VERSION,
             tasks: Vec::new(),
+            delegations: Vec::new(),
         }
     }
 }
@@ -553,6 +559,270 @@ pub struct DeliveryState {
     pub pr_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
+}
+
+/// What a delegation asks the child to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationKind {
+    Review,
+    Implement,
+}
+
+/// The session that asked for the delegation and is told when it lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationParent {
+    /// Persisted GitTerm tab identity (S1 caller identity).
+    pub session_uid: String,
+    /// Harness conversation of the parent chat, so a result can reappear
+    /// when that conversation is reopened after its tab was closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_session_id: Option<String>,
+    pub workspace: String,
+    pub cwd: PathBuf,
+}
+
+/// Who carries the delegation out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "runner", rename_all = "snake_case")]
+pub enum DelegationChild {
+    /// A background `codex exec review` run owned by GitTerm.
+    CodexReview {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+    },
+    /// A worker session inside a GitTerm task.
+    TaskSession {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<HarnessConversationRef>,
+    },
+    /// Claude's own Agent tool inside the parent chat.
+    ClaudeSubagent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReviewTargetMode {
+    /// Staged, unstaged and untracked changes against HEAD.
+    Uncommitted,
+    /// The merge base with `reference` against the working tree (Codex
+    /// `--base`, which includes uncommitted changes).
+    Base { reference: String },
+    /// One commit.
+    Commit { sha: String },
+}
+
+/// What a review delegation looks at. Distinct from `review::ReviewTarget`,
+/// which is the R1 chat-page payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewTarget {
+    pub mode: ReviewTargetMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DelegationStatus {
+    Requested,
+    Running,
+    Completed,
+    Failed {
+        message: String,
+    },
+    /// GitTerm restarted while the delegation was requested or running.
+    Interrupted,
+    Cancelled,
+}
+
+impl DelegationStatus {
+    /// Requested or running: a result may still arrive from the child.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Requested | Self::Running)
+    }
+
+    /// Transitions allowed through `TaskStore::set_delegation_status`.
+    /// `Completed` is reached only through `complete_delegation`, which
+    /// carries the result. `Interrupted` may resume to `Running` because a
+    /// task-session worker can be resumed after a restart.
+    fn can_transition_to(&self, next: &Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Requested | Self::Interrupted, Self::Running)
+                | (
+                    Self::Requested | Self::Running,
+                    Self::Failed { .. } | Self::Interrupted | Self::Cancelled,
+                )
+                | (Self::Interrupted, Self::Failed { .. } | Self::Cancelled)
+        )
+    }
+
+    /// States `complete_delegation` accepts. A late result for an
+    /// interrupted delegation (a resumed worker) is still accepted.
+    fn accepts_completion(&self) -> bool {
+        matches!(self, Self::Requested | Self::Running | Self::Interrupted)
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed { .. } => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdict {
+    Correct,
+    NeedsChanges,
+    Unknown,
+}
+
+/// Codex priority 0-3, rendered as `[P0]`..`[P3]`. P0 is the most severe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ReviewSeverity {
+    P0,
+    P1,
+    P2,
+    P3,
+}
+
+impl ReviewSeverity {
+    pub fn from_priority(priority: u8) -> Option<Self> {
+        match priority {
+            0 => Some(Self::P0),
+            1 => Some(Self::P1),
+            2 => Some(Self::P2),
+            3 => Some(Self::P3),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewFinding {
+    /// Stable within one result: `F1`, `F2`, ... in reviewer order.
+    pub id: String,
+    pub severity: ReviewSeverity,
+    pub title: String,
+    pub body: String,
+    /// Repo-relative when the reviewer's path is under the repo root,
+    /// otherwise the reviewer's absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reviewer {
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewFindings {
+    pub verdict: ReviewVerdict,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<ReviewFinding>,
+    pub reviewer: Reviewer,
+    /// False when the findings could not be read structurally and
+    /// `summary` holds the reviewer's whole text instead.
+    pub structured: bool,
+}
+
+/// The checkout a review actually looked at, for the stale banner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewedState {
+    pub head: String,
+    pub dirty: bool,
+    pub target_description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DelegationResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<TaskHandoff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<ReviewFindings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed: Option<ReviewedState>,
+}
+
+/// A parent-addressed request with a typed result, stored next to tasks
+/// (TRU-142, plan option B).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Delegation {
+    pub delegation_id: String,
+    pub kind: DelegationKind,
+    pub parent: DelegationParent,
+    pub child: DelegationChild,
+    pub brief: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ReviewTarget>,
+    /// The delegation this one re-runs or follows up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    pub status: DelegationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<DelegationResult>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// When the result was sent to the parent, so a replay or restart never
+    /// sends it twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDelegation {
+    pub kind: DelegationKind,
+    pub parent: DelegationParent,
+    pub child: DelegationChild,
+    pub brief: String,
+    pub target: Option<ReviewTarget>,
+    pub previous: Option<String>,
+}
+
+impl Delegation {
+    /// A new `requested` delegation with a fresh UUID id, the same id
+    /// convention as `TaskRecord.task_id`.
+    pub fn new_requested(input: NewDelegation, timestamp: impl Into<String>) -> Self {
+        let timestamp = timestamp.into();
+        Self {
+            delegation_id: uuid::Uuid::new_v4().to_string(),
+            kind: input.kind,
+            parent: input.parent,
+            child: input.child,
+            brief: input.brief,
+            target: input.target,
+            previous: input.previous,
+            status: DelegationStatus::Requested,
+            result: None,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+            delivered_at: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1272,8 +1542,14 @@ impl TaskStore {
         Ok(true)
     }
 
+    /// Marks local executions that were active when GitTerm stopped as
+    /// interrupted, and in the same write turns requested or running
+    /// delegations into `Interrupted` (no runner survives a restart). The
+    /// returned count is tasks only; see `interrupted_delegations` for the
+    /// delegations this touched.
     pub fn reconcile_after_restart(&mut self, timestamp: &str) -> Result<usize, TaskStoreError> {
         let mut candidate = self.document.clone();
+        let interrupted_delegations = reconcile_delegations_in(&mut candidate, timestamp);
         let mut reconciled = 0;
         for task in &mut candidate.tasks {
             if task.executor != ExecutorTarget::Local || !task.lifecycle.is_active() {
@@ -1301,10 +1577,208 @@ impl TaskStore {
                 Some("GitTerm restarted while this local execution was active".to_string());
             reconciled += 1;
         }
-        if reconciled > 0 {
+        if reconciled > 0 || interrupted_delegations > 0 {
             self.commit_candidate(candidate)?;
         }
         Ok(reconciled)
+    }
+
+    /// Delegations interrupted by a restart, newest first, for the parent
+    /// tab or inbox to offer Re-run.
+    pub fn interrupted_delegations(&self) -> Vec<&Delegation> {
+        self.document
+            .delegations
+            .iter()
+            .rev()
+            .filter(|delegation| delegation.status == DelegationStatus::Interrupted)
+            .collect()
+    }
+
+    pub fn delegations(&self) -> &[Delegation] {
+        &self.document.delegations
+    }
+
+    pub fn delegation(&self, delegation_id: &str) -> Option<&Delegation> {
+        self.document
+            .delegations
+            .iter()
+            .find(|delegation| delegation.delegation_id == delegation_id)
+    }
+
+    /// Delegations requested by one parent session, newest first. The store
+    /// appends on insert, so newest means most recently inserted.
+    pub fn delegations_for_parent(&self, session_uid: &str) -> Vec<&Delegation> {
+        self.document
+            .delegations
+            .iter()
+            .rev()
+            .filter(|delegation| delegation.parent.session_uid == session_uid)
+            .collect()
+    }
+
+    pub fn insert_delegation(&mut self, delegation: Delegation) -> Result<(), TaskStoreError> {
+        let id = delegation.delegation_id.as_str();
+        if self.delegation(id).is_some() {
+            return Err(TaskStoreError::new(
+                "insert delegation into",
+                &self.path,
+                format!("delegation {id} already exists"),
+            ));
+        }
+        if !delegation.status.is_active()
+            || delegation.result.is_some()
+            || delegation.delivered_at.is_some()
+        {
+            return Err(TaskStoreError::new(
+                "insert delegation into",
+                &self.path,
+                format!(
+                    "delegation {id} must be inserted requested or running, without a result or delivery; it is {}",
+                    delegation.status.label()
+                ),
+            ));
+        }
+        if let Some(previous) = delegation.previous.as_deref() {
+            if self.delegation(previous).is_none() {
+                return Err(TaskStoreError::new(
+                    "insert delegation into",
+                    &self.path,
+                    format!("delegation {id} follows unknown delegation {previous}"),
+                ));
+            }
+        }
+        if let DelegationChild::TaskSession { task_id, .. } = &delegation.child {
+            if self.get(task_id).is_none() {
+                return Err(TaskStoreError::new(
+                    "insert delegation into",
+                    &self.path,
+                    format!("delegation {id} names unknown task {task_id}"),
+                ));
+            }
+        }
+        let mut candidate = self.document.clone();
+        candidate.delegations.push(delegation);
+        self.commit_candidate(candidate)
+    }
+
+    /// Moves a delegation through its non-terminal lifecycle. `Completed`
+    /// is rejected here: use `complete_delegation`, which carries the result.
+    pub fn set_delegation_status(
+        &mut self,
+        delegation_id: &str,
+        status: DelegationStatus,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "set delegation status in";
+        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
+        if !delegation.status.can_transition_to(&status) {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!(
+                    "delegation {delegation_id} cannot move from {} to {}",
+                    delegation.status.label(),
+                    status.label()
+                ),
+            ));
+        }
+        delegation.status = status;
+        delegation.updated_at = timestamp.to_string();
+        self.commit_delegation(index, delegation)
+    }
+
+    /// Records the child's result. A delegation that already completed,
+    /// failed or was cancelled is an error, never a silent overwrite.
+    pub fn complete_delegation(
+        &mut self,
+        delegation_id: &str,
+        result: DelegationResult,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "complete delegation in";
+        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
+        if !delegation.status.accepts_completion() {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!(
+                    "delegation {delegation_id} is already {}",
+                    delegation.status.label()
+                ),
+            ));
+        }
+        delegation.status = DelegationStatus::Completed;
+        delegation.result = Some(result);
+        delegation.updated_at = timestamp.to_string();
+        self.commit_delegation(index, delegation)
+    }
+
+    /// Stamps that a completed result was sent to the parent. Stamping twice
+    /// is an error so a caller cannot deliver the same result again.
+    pub fn mark_delegation_delivered(
+        &mut self,
+        delegation_id: &str,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "mark delegation delivered in";
+        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
+        if delegation.status != DelegationStatus::Completed {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!(
+                    "delegation {delegation_id} is {}, not completed",
+                    delegation.status.label()
+                ),
+            ));
+        }
+        if let Some(delivered_at) = &delegation.delivered_at {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!("delegation {delegation_id} was already delivered at {delivered_at}"),
+            ));
+        }
+        delegation.delivered_at = Some(timestamp.to_string());
+        delegation.updated_at = timestamp.to_string();
+        self.commit_delegation(index, delegation)
+    }
+
+    pub fn cancel_delegation(
+        &mut self,
+        delegation_id: &str,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        self.set_delegation_status(delegation_id, DelegationStatus::Cancelled, timestamp)
+    }
+
+    fn delegation_for_update(
+        &self,
+        operation: &'static str,
+        delegation_id: &str,
+    ) -> Result<(usize, Delegation), TaskStoreError> {
+        self.document
+            .delegations
+            .iter()
+            .position(|delegation| delegation.delegation_id == delegation_id)
+            .map(|index| (index, self.document.delegations[index].clone()))
+            .ok_or_else(|| {
+                TaskStoreError::new(
+                    operation,
+                    &self.path,
+                    format!("delegation {delegation_id} does not exist"),
+                )
+            })
+    }
+
+    fn commit_delegation(
+        &mut self,
+        index: usize,
+        delegation: Delegation,
+    ) -> Result<(), TaskStoreError> {
+        let mut candidate = self.document.clone();
+        candidate.delegations[index] = delegation;
+        self.commit_candidate(candidate)
     }
 
     fn commit_candidate(&mut self, candidate: TaskStoreDocument) -> Result<(), TaskStoreError> {
@@ -1426,6 +1900,125 @@ fn cleanup_temporary_file(path: &Path, primary_error: String) -> String {
     }
 }
 
+fn reconcile_delegations_in(document: &mut TaskStoreDocument, timestamp: &str) -> usize {
+    let mut interrupted = 0;
+    for delegation in &mut document.delegations {
+        if delegation.status.is_active() {
+            delegation.status = DelegationStatus::Interrupted;
+            delegation.updated_at = timestamp.to_string();
+            interrupted += 1;
+        }
+    }
+    interrupted
+}
+
+fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
+    let id = delegation.delegation_id.as_str();
+    if id.trim().is_empty() {
+        return Err("delegation id is empty".to_string());
+    }
+    for (label, value) in [
+        ("parent session uid", delegation.parent.session_uid.as_str()),
+        ("parent workspace", delegation.parent.workspace.as_str()),
+        ("brief", delegation.brief.as_str()),
+        ("created_at timestamp", delegation.created_at.as_str()),
+        ("updated_at timestamp", delegation.updated_at.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("delegation {id} has an empty {label}"));
+        }
+    }
+    if delegation.parent.cwd.as_os_str().is_empty() {
+        return Err(format!("delegation {id} has an empty parent cwd"));
+    }
+    let child_matches_kind = match (&delegation.kind, &delegation.child) {
+        (
+            DelegationKind::Review,
+            DelegationChild::CodexReview { .. } | DelegationChild::ClaudeSubagent { .. },
+        ) => true,
+        (DelegationKind::Implement, DelegationChild::TaskSession { task_id, .. }) => {
+            !task_id.trim().is_empty()
+        }
+        _ => false,
+    };
+    if !child_matches_kind {
+        return Err(format!(
+            "delegation {id} has a {:?} child that does not fit a {:?} delegation",
+            delegation.child, delegation.kind
+        ));
+    }
+    if delegation.target.is_some() && delegation.kind != DelegationKind::Review {
+        return Err(format!(
+            "delegation {id} has a review target but is not a review"
+        ));
+    }
+    if delegation.previous.as_deref() == Some(id) {
+        return Err(format!("delegation {id} names itself as previous"));
+    }
+    if let DelegationStatus::Failed { message } = &delegation.status {
+        if message.trim().is_empty() {
+            return Err(format!("delegation {id} failed without a message"));
+        }
+    }
+    match (&delegation.status, &delegation.result) {
+        (DelegationStatus::Completed, None) => {
+            return Err(format!("delegation {id} is completed without a result"));
+        }
+        (DelegationStatus::Completed, Some(result)) => {
+            validate_delegation_result(delegation, result)?
+        }
+        (_, Some(_)) => {
+            return Err(format!(
+                "delegation {id} has a result but is {}",
+                delegation.status.label()
+            ));
+        }
+        (_, None) => {}
+    }
+    if delegation.delivered_at.is_some() && delegation.status != DelegationStatus::Completed {
+        return Err(format!(
+            "delegation {id} is marked delivered but is {}",
+            delegation.status.label()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_delegation_result(
+    delegation: &Delegation,
+    result: &DelegationResult,
+) -> Result<(), String> {
+    let id = delegation.delegation_id.as_str();
+    match delegation.kind {
+        DelegationKind::Review if result.findings.is_none() => {
+            return Err(format!("review delegation {id} completed without findings"));
+        }
+        DelegationKind::Implement if result.handoff.is_none() => {
+            return Err(format!(
+                "implement delegation {id} completed without a handoff"
+            ));
+        }
+        _ => {}
+    }
+    if let Some(handoff) = &result.handoff {
+        if handoff.summary.trim().is_empty() {
+            return Err(format!("delegation {id} handoff summary is empty"));
+        }
+    }
+    if let Some(findings) = &result.findings {
+        let mut finding_ids = HashSet::new();
+        for finding in &findings.findings {
+            if !finding_ids.insert(finding.id.as_str()) {
+                return Err(format!(
+                    "delegation {id} has duplicate finding id {}",
+                    finding.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_document(document: &TaskStoreDocument) -> Result<(), String> {
     if document.schema_version != TASK_STORE_SCHEMA_VERSION {
         return Err(format!(
@@ -1438,6 +2031,16 @@ fn validate_document(document: &TaskStoreDocument) -> Result<(), String> {
         validate_task(task)?;
         if !task_ids.insert(task.task_id.as_str()) {
             return Err(format!("duplicate task id {}", task.task_id));
+        }
+    }
+    let mut delegation_ids = HashSet::new();
+    for delegation in &document.delegations {
+        validate_delegation(delegation)?;
+        if !delegation_ids.insert(delegation.delegation_id.as_str()) {
+            return Err(format!(
+                "duplicate delegation id {}",
+                delegation.delegation_id
+            ));
         }
     }
     Ok(())
@@ -1690,6 +2293,434 @@ mod tests {
             },
             "2026-08-19T08:00:00Z",
         )
+    }
+
+    fn sample_delegation(id: &str, session_uid: &str, timestamp: &str) -> Delegation {
+        let mut delegation = Delegation::new_requested(
+            NewDelegation {
+                kind: DelegationKind::Review,
+                parent: DelegationParent {
+                    session_uid: session_uid.to_string(),
+                    chat_session_id: Some("claude-session-1".to_string()),
+                    workspace: "GitTerm V5".to_string(),
+                    cwd: PathBuf::from("/repo with spaces/gitterm-v5"),
+                },
+                child: DelegationChild::CodexReview { thread_id: None },
+                brief: "Review the uncommitted changes".to_string(),
+                target: Some(ReviewTarget {
+                    mode: ReviewTargetMode::Base {
+                        reference: "v5".to_string(),
+                    },
+                    focus: Some("error handling".to_string()),
+                }),
+                previous: None,
+            },
+            timestamp,
+        );
+        delegation.delegation_id = id.to_string();
+        delegation
+    }
+
+    fn sample_review_result() -> DelegationResult {
+        DelegationResult {
+            handoff: None,
+            findings: Some(ReviewFindings {
+                verdict: ReviewVerdict::NeedsChanges,
+                summary: "One regression".to_string(),
+                findings: vec![ReviewFinding {
+                    id: "F1".to_string(),
+                    severity: ReviewSeverity::P1,
+                    title: "Return None when no user matches".to_string(),
+                    body: "matches[0] raises IndexError".to_string(),
+                    file: Some(PathBuf::from("stats.py")),
+                    line_start: Some(18),
+                    line_end: Some(18),
+                    confidence: Some(0.75),
+                }],
+                reviewer: Reviewer {
+                    harness: "codex".to_string(),
+                    model: None,
+                    conversation_id: Some("thread-1".to_string()),
+                },
+                structured: true,
+            }),
+            reviewed: Some(ReviewedState {
+                head: "0123456789abcdef".to_string(),
+                dirty: true,
+                target_description: "changes against 'v5'".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn document_without_delegations_loads_and_is_written_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let old = serde_json::json!({
+            "schema_version": TASK_STORE_SCHEMA_VERSION,
+            "tasks": [sample_task("task-1")],
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+
+        let mut store = TaskStore::load(&path).unwrap();
+        assert_eq!(store.tasks().len(), 1);
+        assert!(store.delegations().is_empty());
+
+        store.archive("task-1", "2026-10-08T10:00:00Z").unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(written.get("delegations").is_none());
+    }
+
+    #[test]
+    fn delegations_round_trip_through_the_store_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        let review = sample_delegation("review-1", "tab-a", "2026-10-08T10:00:00Z");
+        store.insert_delegation(review).unwrap();
+        store
+            .set_delegation_status(
+                "review-1",
+                DelegationStatus::Running,
+                "2026-10-08T10:00:01Z",
+            )
+            .unwrap();
+        store
+            .complete_delegation("review-1", sample_review_result(), "2026-10-08T10:01:00Z")
+            .unwrap();
+        store
+            .mark_delegation_delivered("review-1", "2026-10-08T10:02:00Z")
+            .unwrap();
+
+        let mut worker = sample_delegation("implement-1", "tab-a", "2026-10-08T10:03:00Z");
+        worker.kind = DelegationKind::Implement;
+        worker.target = None;
+        worker.previous = Some("review-1".to_string());
+        worker.child = DelegationChild::TaskSession {
+            task_id: "task-1".to_string(),
+            task_session_id: Some("session-1".to_string()),
+            conversation: Some(HarnessConversationRef {
+                backend: HarnessConversationBackend::Claude,
+                session_id: "conversation-1".to_string(),
+            }),
+        };
+        store.insert_delegation(worker).unwrap();
+        store
+            .set_delegation_status(
+                "implement-1",
+                DelegationStatus::Failed {
+                    message: "worker exited".to_string(),
+                },
+                "2026-10-08T10:04:00Z",
+            )
+            .unwrap();
+
+        let reloaded = TaskStore::load(&path).unwrap();
+        assert_eq!(reloaded.delegations(), store.delegations());
+        let review = reloaded.delegation("review-1").unwrap();
+        assert_eq!(review.status, DelegationStatus::Completed);
+        assert_eq!(review.result, Some(sample_review_result()));
+        assert_eq!(review.delivered_at.as_deref(), Some("2026-10-08T10:02:00Z"));
+        assert_eq!(review.updated_at, "2026-10-08T10:02:00Z");
+        assert_eq!(review.created_at, "2026-10-08T10:00:00Z");
+
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let raw_review = &raw["delegations"][0];
+        assert_eq!(raw_review["kind"], "review");
+        assert_eq!(raw_review["child"]["runner"], "codex_review");
+        assert_eq!(raw_review["status"]["state"], "completed");
+        assert_eq!(raw_review["target"]["mode"]["type"], "base");
+        assert_eq!(raw_review["target"]["mode"]["reference"], "v5");
+        assert_eq!(raw_review["result"]["findings"]["verdict"], "needs_changes");
+        assert_eq!(
+            raw_review["result"]["findings"]["findings"][0]["severity"],
+            "P1"
+        );
+        let raw_worker = &raw["delegations"][1];
+        assert_eq!(raw_worker["child"]["runner"], "task_session");
+        assert_eq!(raw_worker["status"]["state"], "failed");
+        assert_eq!(raw_worker["status"]["message"], "worker exited");
+    }
+
+    #[test]
+    fn new_delegations_get_uuid_ids_and_start_requested() {
+        let mut first = sample_delegation("unused", "tab-a", "2026-10-08T10:00:00Z");
+        first.delegation_id = Delegation::new_requested(
+            NewDelegation {
+                kind: first.kind,
+                parent: first.parent.clone(),
+                child: first.child.clone(),
+                brief: first.brief.clone(),
+                target: first.target.clone(),
+                previous: None,
+            },
+            "2026-10-08T10:00:00Z",
+        )
+        .delegation_id;
+        assert!(uuid::Uuid::parse_str(&first.delegation_id).is_ok());
+        assert_eq!(first.status, DelegationStatus::Requested);
+        assert_eq!(first.created_at, first.updated_at);
+    }
+
+    #[test]
+    fn insert_delegation_rejects_duplicates_and_invalid_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store
+            .insert_delegation(sample_delegation("review-1", "tab-a", "t1"))
+            .unwrap();
+        assert!(store
+            .insert_delegation(sample_delegation("review-1", "tab-a", "t2"))
+            .is_err());
+
+        let mut completed = sample_delegation("review-2", "tab-a", "t2");
+        completed.status = DelegationStatus::Completed;
+        completed.result = Some(sample_review_result());
+        assert!(store.insert_delegation(completed).is_err());
+
+        let mut unknown_previous = sample_delegation("review-3", "tab-a", "t3");
+        unknown_previous.previous = Some("missing".to_string());
+        assert!(store.insert_delegation(unknown_previous).is_err());
+
+        let mut unknown_task = sample_delegation("implement-1", "tab-a", "t4");
+        unknown_task.kind = DelegationKind::Implement;
+        unknown_task.target = None;
+        unknown_task.child = DelegationChild::TaskSession {
+            task_id: "task-9".to_string(),
+            task_session_id: None,
+            conversation: None,
+        };
+        assert!(store.insert_delegation(unknown_task).is_err());
+
+        let mut mismatched = sample_delegation("review-4", "tab-a", "t5");
+        mismatched.kind = DelegationKind::Implement;
+        let error = store.insert_delegation(mismatched).unwrap_err();
+        assert_eq!(error.operation(), "validate");
+
+        let mut empty_parent = sample_delegation("review-5", "tab-a", "t6");
+        empty_parent.parent.session_uid = " ".to_string();
+        assert!(store.insert_delegation(empty_parent).is_err());
+
+        assert_eq!(store.delegations().len(), 1);
+    }
+
+    #[test]
+    fn completing_a_delegation_twice_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store
+            .insert_delegation(sample_delegation("review-1", "tab-a", "t1"))
+            .unwrap();
+        store
+            .complete_delegation("review-1", sample_review_result(), "t2")
+            .unwrap();
+
+        let mut other = sample_review_result();
+        other.findings.as_mut().unwrap().summary = "Different".to_string();
+        let error = store
+            .complete_delegation("review-1", other, "t3")
+            .unwrap_err();
+        assert!(error.to_string().contains("already completed"));
+        let reloaded = TaskStore::load(&path).unwrap();
+        let review = reloaded.delegation("review-1").unwrap();
+        assert_eq!(review.result, Some(sample_review_result()));
+        assert_eq!(review.updated_at, "t2");
+
+        store
+            .insert_delegation(sample_delegation("review-2", "tab-a", "t4"))
+            .unwrap();
+        store.cancel_delegation("review-2", "t5").unwrap();
+        assert!(store
+            .complete_delegation("review-2", sample_review_result(), "t6")
+            .is_err());
+
+        store
+            .insert_delegation(sample_delegation("review-3", "tab-a", "t7"))
+            .unwrap();
+        store
+            .set_delegation_status(
+                "review-3",
+                DelegationStatus::Failed {
+                    message: "codex is not logged in".to_string(),
+                },
+                "t8",
+            )
+            .unwrap();
+        assert!(store
+            .complete_delegation("review-3", sample_review_result(), "t9")
+            .is_err());
+        assert!(store
+            .complete_delegation("missing", sample_review_result(), "t9")
+            .is_err());
+    }
+
+    #[test]
+    fn completion_requires_the_result_the_kind_promises() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store
+            .insert_delegation(sample_delegation("review-1", "tab-a", "t1"))
+            .unwrap();
+        let error = store
+            .complete_delegation("review-1", DelegationResult::default(), "t2")
+            .unwrap_err();
+        assert!(error.to_string().contains("without findings"));
+        assert_eq!(
+            store.delegation("review-1").unwrap().status,
+            DelegationStatus::Requested
+        );
+    }
+
+    #[test]
+    fn delegation_status_transitions_are_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store
+            .insert_delegation(sample_delegation("review-1", "tab-a", "t1"))
+            .unwrap();
+        assert!(store
+            .set_delegation_status("review-1", DelegationStatus::Completed, "t2")
+            .is_err());
+        assert!(store
+            .set_delegation_status("review-1", DelegationStatus::Requested, "t2")
+            .is_err());
+        assert!(store
+            .set_delegation_status(
+                "review-1",
+                DelegationStatus::Failed {
+                    message: " ".to_string()
+                },
+                "t2"
+            )
+            .is_err());
+        store
+            .set_delegation_status("review-1", DelegationStatus::Running, "t2")
+            .unwrap();
+        store.cancel_delegation("review-1", "t3").unwrap();
+        assert!(store.cancel_delegation("review-1", "t4").is_err());
+        assert!(store
+            .set_delegation_status("review-1", DelegationStatus::Running, "t4")
+            .is_err());
+        assert!(store.mark_delegation_delivered("review-1", "t4").is_err());
+    }
+
+    #[test]
+    fn delivering_twice_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store
+            .insert_delegation(sample_delegation("review-1", "tab-a", "t1"))
+            .unwrap();
+        assert!(store.mark_delegation_delivered("review-1", "t2").is_err());
+        store
+            .complete_delegation("review-1", sample_review_result(), "t2")
+            .unwrap();
+        store.mark_delegation_delivered("review-1", "t3").unwrap();
+        let error = store
+            .mark_delegation_delivered("review-1", "t4")
+            .unwrap_err();
+        assert!(error.to_string().contains("already delivered at t3"));
+        assert_eq!(
+            store
+                .delegation("review-1")
+                .unwrap()
+                .delivered_at
+                .as_deref(),
+            Some("t3")
+        );
+    }
+
+    #[test]
+    fn delegations_for_parent_lists_newest_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        for (id, parent, timestamp) in [
+            ("d1", "tab-a", "2026-10-08T10:00:00Z"),
+            ("d2", "tab-b", "2026-10-08T10:01:00Z"),
+            ("d3", "tab-a", "2026-10-08T10:02:00Z"),
+            ("d4", "tab-a", "2026-10-08T10:03:00Z"),
+        ] {
+            store
+                .insert_delegation(sample_delegation(id, parent, timestamp))
+                .unwrap();
+        }
+        // Updating an older delegation does not reorder the list.
+        store
+            .set_delegation_status("d1", DelegationStatus::Running, "2026-10-08T10:04:00Z")
+            .unwrap();
+        let ids = |uid: &str| {
+            store
+                .delegations_for_parent(uid)
+                .into_iter()
+                .map(|delegation| delegation.delegation_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("tab-a"), ["d4", "d3", "d1"]);
+        assert_eq!(ids("tab-b"), ["d2"]);
+        assert!(ids("tab-c").is_empty());
+    }
+
+    #[test]
+    fn startup_reconciles_requested_and_running_delegations_to_interrupted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        for id in ["requested", "running", "completed", "cancelled"] {
+            store
+                .insert_delegation(sample_delegation(id, "tab-a", "t1"))
+                .unwrap();
+        }
+        store
+            .set_delegation_status("running", DelegationStatus::Running, "t2")
+            .unwrap();
+        store
+            .complete_delegation("completed", sample_review_result(), "t2")
+            .unwrap();
+        store.cancel_delegation("cancelled", "t2").unwrap();
+
+        // No task was active, so the task count is zero, but the
+        // delegations are still reconciled and written.
+        assert_eq!(store.reconcile_after_restart("t9").unwrap(), 0);
+
+        let mut reloaded = TaskStore::load(&path).unwrap();
+        let state = |store: &TaskStore, id: &str| {
+            let delegation = store.delegation(id).unwrap();
+            (delegation.status.clone(), delegation.updated_at.clone())
+        };
+        assert_eq!(
+            state(&reloaded, "requested"),
+            (DelegationStatus::Interrupted, "t9".to_string())
+        );
+        assert_eq!(
+            state(&reloaded, "running"),
+            (DelegationStatus::Interrupted, "t9".to_string())
+        );
+        assert_eq!(
+            state(&reloaded, "completed"),
+            (DelegationStatus::Completed, "t2".to_string())
+        );
+        assert_eq!(
+            state(&reloaded, "cancelled"),
+            (DelegationStatus::Cancelled, "t2".to_string())
+        );
+        let interrupted = reloaded
+            .interrupted_delegations()
+            .into_iter()
+            .map(|delegation| delegation.delegation_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(interrupted, ["running", "requested"]);
+
+        // A resumed worker may still report back after an interruption.
+        reloaded
+            .complete_delegation("running", sample_review_result(), "t10")
+            .unwrap();
+        assert_eq!(reloaded.reconcile_after_restart("t11").unwrap(), 0);
+        assert_eq!(
+            state(&reloaded, "requested"),
+            (DelegationStatus::Interrupted, "t9".to_string())
+        );
     }
 
     fn active_attempt(attempt_id: &str, executor: ExecutorTarget) -> TaskExecutionAttempt {
