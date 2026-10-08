@@ -201,6 +201,54 @@ mod tests {
     }
 
     #[test]
+    fn new_chats_use_the_defaults_until_something_is_picked() {
+        // An older config without `chat` gets the defaults.
+        let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(config.chat, ChatDefaults::default());
+        let mut chat = ChatDefaults {
+            default_effort: Some("high".into()),
+            ..ChatDefaults::default()
+        };
+        assert_eq!(
+            chat.new_chat_selection(),
+            ChatSelection {
+                model: "opus".into(),
+                effort: Some("high".into())
+            }
+        );
+        // Picking a model keeps the effort a new chat would have had.
+        chat.remember_model("sonnet");
+        assert_eq!(
+            chat.new_chat_selection(),
+            ChatSelection {
+                model: "sonnet".into(),
+                effort: Some("high".into())
+            }
+        );
+        chat.remember_effort(None);
+        assert_eq!(
+            chat.new_chat_selection(),
+            ChatSelection {
+                model: "sonnet".into(),
+                effort: None
+            }
+        );
+        // With remembering off, the configured defaults win again.
+        chat.remember_last = false;
+        assert_eq!(
+            chat.new_chat_selection(),
+            ChatSelection {
+                model: "opus".into(),
+                effort: Some("high".into())
+            }
+        );
+        let json = serde_json::to_value(&chat).unwrap();
+        assert_eq!(json["last"]["model"], "sonnet");
+        let back: ChatDefaults = serde_json::from_value(json).unwrap();
+        assert_eq!(back, chat);
+    }
+
+    #[test]
     fn terminal_log_mirroring_is_opt_in() {
         let mut serialized = serde_json::to_value(Config::default()).unwrap();
         let object = serialized.as_object_mut().unwrap();
@@ -390,6 +438,93 @@ pub struct Config {
     /// Defaults for the chat tab's Review… button (TRU-142).
     #[serde(default)]
     pub review: ReviewConfig,
+    /// Model and effort for new chats, and the last selection (TRU-143).
+    #[serde(default)]
+    pub chat: ChatDefaults,
+}
+
+fn default_chat_model() -> String {
+    "opus".to_string()
+}
+
+/// What a new chat tab starts with (TRU-143). The app has no settings
+/// panel; edit the `chat` object in `config.json`:
+///
+/// ```json
+/// "chat": { "default_model": "opus", "default_effort": "high", "remember_last": true }
+/// ```
+///
+/// `default_model` is a Claude model alias (`default` leaves the choice to
+/// the user's Claude settings); `default_effort` is one of the CLI's effort
+/// levels (`low`, `medium`, `high`, `xhigh`, `max`), or absent for the
+/// model's own default. With `remember_last`, a new chat starts with the
+/// model and effort last picked on any chat (`last`, written by the app)
+/// instead of the defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatDefaults {
+    #[serde(default = "default_chat_model")]
+    pub default_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    #[serde(default = "default_true")]
+    pub remember_last: bool,
+    /// The model and effort last picked on any chat. One global selection,
+    /// not per workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<ChatSelection>,
+}
+
+/// A chat's model and effort (`effort: None` is the model's default).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSelection {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl Default for ChatDefaults {
+    fn default() -> Self {
+        Self {
+            default_model: default_chat_model(),
+            default_effort: None,
+            remember_last: true,
+            last: None,
+        }
+    }
+}
+
+impl ChatDefaults {
+    /// The configured defaults, ignoring any remembered selection.
+    fn defaults(&self) -> ChatSelection {
+        ChatSelection {
+            model: self.default_model.clone(),
+            effort: self.default_effort.clone(),
+        }
+    }
+
+    /// What a new chat starts with: the last selection when remembering is
+    /// on and one exists, else the configured defaults.
+    pub fn new_chat_selection(&self) -> ChatSelection {
+        match &self.last {
+            Some(last) if self.remember_last => last.clone(),
+            _ => self.defaults(),
+        }
+    }
+
+    /// Record a model picked on a chat; the effort stays as the next new
+    /// chat would have it.
+    pub fn remember_model(&mut self, model: &str) {
+        let mut selection = self.new_chat_selection();
+        selection.model = model.to_string();
+        self.last = Some(selection);
+    }
+
+    /// Record an effort picked on a chat.
+    pub fn remember_effort(&mut self, effort: Option<&str>) {
+        let mut selection = self.new_chat_selection();
+        selection.effort = effort.map(str::to_string);
+        self.last = Some(selection);
+    }
 }
 
 /// Who reviews code when the chat tab's Review… button is pressed.
@@ -540,6 +675,7 @@ impl Default for Config {
             task_worktree_root: default_task_worktree_root(),
             max_concurrent_local_tasks: default_max_concurrent_local_tasks(),
             review: ReviewConfig::default(),
+            chat: ChatDefaults::default(),
         }
     }
 }

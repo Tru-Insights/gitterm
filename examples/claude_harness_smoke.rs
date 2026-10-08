@@ -5,9 +5,13 @@
 // and an interrupted long turn.
 //
 //   cargo run --example claude_harness_smoke -- --workdir <empty dir> [--model haiku]
-//       [--scenario all|permission-mode|review] [--reviewer-model haiku]
+//       [--scenario all|permission-mode|review|model] [--reviewer-model haiku]
 //
 // `--scenario permission-mode` runs only the mode switch (no model turns).
+// `--scenario model` (TRU-143) switches the model to sonnet after Ready
+// (`set_model`), pins the effort to low and back to auto
+// (`apply_flag_settings` then `get_settings`), and checks that the next turn
+// runs on sonnet.
 // `--scenario review` (TRU-142 R1) builds a scratch git repo under the
 // workdir with a planted bug in an uncommitted change, sends the Review…
 // prompt (`gitterm::review::review_prompt`), and checks that the subagent's
@@ -152,8 +156,10 @@ async fn main() {
     let workdir = PathBuf::from(arg("--workdir").expect("--workdir <dir> is required"));
     std::fs::create_dir_all(&workdir).expect("create workdir");
     let scenario = arg("--scenario").unwrap_or_else(|| "all".into());
-    if !["all", "permission-mode", "review"].contains(&scenario.as_str()) {
-        eprintln!("unknown --scenario {scenario:?} (expected all, permission-mode or review)");
+    if !["all", "permission-mode", "review", "model"].contains(&scenario.as_str()) {
+        eprintln!(
+            "unknown --scenario {scenario:?} (expected all, permission-mode, review or model)"
+        );
         std::process::exit(2);
     }
     if scenario == "review" {
@@ -195,6 +201,11 @@ async fn main() {
             format!("mode={mode:?}"),
         ),
         Err(e) => check("ready", false, e),
+    }
+    if scenario == "model" {
+        model_scenario(&session, &mut events, &mut check).await;
+        finish(session, events, failures).await;
+        return;
     }
     // The chat page's Shift+Tab cycle, ending back where it started.
     for mode in ["acceptEdits", "plan", "auto", "default"] {
@@ -323,6 +334,81 @@ async fn main() {
     }
 
     finish(session, events, failures).await;
+}
+
+/// The composer's model and effort chips against the live CLI (TRU-143).
+async fn model_scenario(
+    session: &ClaudeSession,
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    check: &mut impl FnMut(&str, bool, String),
+) {
+    println!("\n>> set model sonnet");
+    let changed = async {
+        session.send(HarnessCommand::SetModel("sonnet".into()))?;
+        wait_for(events, |ev| match ev {
+            HarnessEvent::ModelChanged(m) => Some(m.clone()),
+            _ => None,
+        })
+        .await
+    }
+    .await;
+    match changed {
+        Ok(model) => check(
+            "model sonnet",
+            model == "sonnet",
+            format!("confirmed={model:?}"),
+        ),
+        Err(e) => check("model sonnet", false, e),
+    }
+    for effort in [Some("low"), None] {
+        println!("\n>> set effort {effort:?}");
+        let changed = async {
+            session.send(HarnessCommand::SetEffort(effort.map(str::to_string)))?;
+            wait_for(events, |ev| match ev {
+                HarnessEvent::EffortChanged { effort, applied } => {
+                    Some((effort.clone(), applied.clone()))
+                }
+                _ => None,
+            })
+            .await
+        }
+        .await;
+        let name = format!("effort {}", effort.unwrap_or("auto"));
+        match changed {
+            Ok((pinned, applied)) => check(
+                &name,
+                pinned.as_deref() == effort && (effort.is_none() || applied.as_deref() == effort),
+                format!("effort={pinned:?} applied={applied:?}"),
+            ),
+            Err(e) => check(&name, false, e),
+        }
+    }
+    println!("\n>> Reply with exactly: ok");
+    let model = async {
+        session.send(HarnessCommand::SendUserMessage(
+            "Reply with exactly: ok".into(),
+        ))?;
+        let model = wait_for(events, |ev| match ev {
+            HarnessEvent::TurnStarted { model, .. } => Some(model.clone()),
+            _ => None,
+        })
+        .await?;
+        wait_for(events, |ev| match ev {
+            HarnessEvent::TurnCompleted { .. } => Some(()),
+            _ => None,
+        })
+        .await?;
+        Ok::<_, String>(model)
+    }
+    .await;
+    match model {
+        Ok(model) => check(
+            "turn on sonnet",
+            model.as_deref().is_some_and(|m| m.contains("sonnet")),
+            format!("model={model:?}"),
+        ),
+        Err(e) => check("turn on sonnet", false, e),
+    }
 }
 
 /// Shuts the session down, drains its last events, and sets the exit code.

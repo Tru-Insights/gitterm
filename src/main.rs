@@ -126,6 +126,25 @@ pub enum AgentIpcMessage {
         tab_id: usize,
         mode: String,
     },
+    /// The human picked a model on the composer's model chip (TRU-143).
+    SetModel {
+        tab_id: usize,
+        model: String,
+    },
+    /// The human picked an effort level; `None` is the model's default.
+    SetEffort {
+        tab_id: usize,
+        effort: Option<String>,
+    },
+    /// The checkout chip's menu opened and wants fresh choices.
+    CheckoutContext {
+        tab_id: usize,
+    },
+    /// The human picked a directory on the checkout chip.
+    SetCheckout {
+        tab_id: usize,
+        path: PathBuf,
+    },
     /// The Review… popover opened and wants its git defaults (TRU-142).
     ReviewContext {
         tab_id: usize,
@@ -313,15 +332,30 @@ fn replay_agent_conversation_in_webview(tab_id: usize, conversation: &[tab::Agen
 /// the right tab; each tab has its own page, so this runs once per page.
 /// `permission_mode` is the Claude tab's configured mode (what the next spawn
 /// passes); the replayed buffer's `ready` and `permission_mode_changed` events
-/// override it. `None` (pi tabs) hides the mode chip.
-fn set_agent_webview_tab_id(tab_id: usize, permission_mode: Option<&str>) {
+/// override it. `None` (pi tabs) hides the mode chip. `composer` carries the
+/// Claude tab's configured model and effort and its checkout chip state
+/// (`None` for pi tabs hides those chips).
+fn set_agent_webview_tab_id(
+    tab_id: usize,
+    permission_mode: Option<&str>,
+    composer: Option<&serde_json::Value>,
+) {
     let mode = serde_json::to_string(&permission_mode).unwrap_or_else(|e| {
         eprintln!("[agent-webview] tab {tab_id}: cannot encode mode {permission_mode:?}: {e}");
         "null".to_string()
     });
+    let composer = composer.map_or_else(|| "null".to_string(), |c| c.to_string());
     webview::evaluate_script(
         WebviewSurface::Agent(tab_id),
-        &format!("window.__setTabId({tab_id}, {mode})"),
+        &format!("window.__setTabId({tab_id}, {mode}, {composer})"),
+    );
+}
+
+/// Update a chat page's checkout chip (choices, label, lock).
+fn push_checkout_state_to_webview(tab_id: usize, checkout: &serde_json::Value) {
+    webview::evaluate_script(
+        WebviewSurface::Agent(tab_id),
+        &format!("window.__setCheckout({checkout})"),
     );
 }
 
@@ -410,6 +444,38 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                 AgentIpcMessage::SetPermissionMode {
                     tab_id,
                     mode: mode.to_string(),
+                }
+            }
+            "set_model" => {
+                let Some(model) = value.get("model").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] set_model without model: {}", body);
+                    return;
+                };
+                AgentIpcMessage::SetModel {
+                    tab_id,
+                    model: model.to_string(),
+                }
+            }
+            "set_effort" => {
+                let effort = match value.get("effort") {
+                    Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(level)) => Some(level.clone()),
+                    _ => {
+                        eprintln!("[agent-ipc] set_effort without effort: {}", body);
+                        return;
+                    }
+                };
+                AgentIpcMessage::SetEffort { tab_id, effort }
+            }
+            "checkout_context" => AgentIpcMessage::CheckoutContext { tab_id },
+            "set_checkout" => {
+                let Some(path) = value.get("path").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] set_checkout without path: {}", body);
+                    return;
+                };
+                AgentIpcMessage::SetCheckout {
+                    tab_id,
+                    path: PathBuf::from(path),
                 }
             }
             "review_context" => AgentIpcMessage::ReviewContext { tab_id },
@@ -4514,8 +4580,19 @@ pub enum Event {
     AgentReviewContextLoaded(usize, gitterm::review::ReviewContext),
     /// The chat tab's Review… popover was submitted (TRU-142).
     AgentReviewRequested(usize, Result<gitterm::review::ReviewRequest, String>),
-    /// Open a native Claude chat tab in the active workspace (TRU-140).
+    /// User picked a model on the Claude chat tab with this id (TRU-143).
+    AgentSetModel(usize, String),
+    /// User picked an effort level (`None`: the model's default).
+    AgentSetEffort(usize, Option<String>),
+    /// The chat's checkout chip menu opened and wants fresh choices.
+    AgentCheckoutContextRequested(usize),
+    /// User picked the directory a not-yet-started chat runs in.
+    AgentSetCheckout(usize, PathBuf),
+    /// Open a native Claude chat tab in the active workspace (TRU-140),
+    /// the + menu's "New chat".
     NewClaudeChatTab,
+    /// The + menu's "CLI" entry: show the agent presets (TRU-143).
+    ShowTabPickerCli,
     /// One streaming event from the agent subprocess (Step 4 will refine the
     /// payload once the parser lands; today every line arrives as `Other`).
     AgentEventReceived(usize, tab::AgentEvent),
@@ -4733,6 +4810,9 @@ struct App {
     task_store: Option<TaskStore>,
     /// Review… button defaults (config `review`, TRU-142).
     review_config: config::ReviewConfig,
+    /// New-chat model/effort defaults and the last selection (config
+    /// `chat`, TRU-143).
+    chat_config: config::ChatDefaults,
     task_store_error: Option<String>,
     task_ui_error: Option<String>,
     task_worktree_root: PathBuf,
@@ -4829,6 +4909,8 @@ struct App {
     workspace_settings_new_value: String,
     // Tab picker popup (Option+click on "+")
     tab_picker_visible: bool,
+    /// The + menu shows the CLI presets instead of its top level.
+    tab_picker_cli_open: bool,
     // True only when the picker was opened by "+ Continue" and the task's
     // handoff brief was actually written to the clipboard.
     task_handoff_copied: bool,
@@ -5794,6 +5876,7 @@ impl App {
             task_worktree_root: self.task_worktree_root.clone(),
             max_concurrent_local_tasks: self.max_concurrent_local_tasks,
             review: self.review_config.clone(),
+            chat: self.chat_config.clone(),
         };
         config.save();
         let elapsed = started.elapsed();
@@ -6381,6 +6464,91 @@ impl App {
                 .position(|tab| tab.chat_session_id.as_deref() == Some(session_id))
                 .map(|tab_idx| (ws_idx, tab_idx))
         })
+    }
+
+    /// The checkout chip's state for a Claude chat tab (TRU-143): its label
+    /// and directory, the choices offered before the first message, and
+    /// whether it is locked and why. `None` when the tab is not a Claude chat.
+    fn chat_checkout_state(&self, tab_id: usize) -> Option<serde_json::Value> {
+        let (ws, tab) = self
+            .workspaces
+            .iter()
+            .find_map(|ws| ws.tabs.iter().find(|t| t.id == tab_id).map(|tab| (ws, tab)))?;
+        let session = tab.agent_session()?;
+        if session.backend() != tab::AgentBackend::Claude {
+            return None;
+        }
+        let task_worktree = tab
+            .task_id
+            .as_deref()
+            .and_then(|id| self.task_store.as_ref()?.get(id))
+            .and_then(|task| task.worktree.path.clone());
+        let label = tab::checkout_label(
+            &tab.repo_path,
+            task_worktree.as_deref(),
+            &ws.dir,
+            paths_equal,
+        );
+        // A session that has spawned (or has a conversation to resume) is
+        // bound to the directory it started in.
+        let reason = if tab.task_id.is_some() {
+            Some("This chat belongs to a task and runs in the task's worktree")
+        } else if session.claude.is_some() || session.session_id.is_some() {
+            Some("Set when the chat started; start a new chat to change it")
+        } else {
+            None
+        };
+        let choices = if reason.is_some() {
+            Vec::new()
+        } else {
+            self.checkout_choices_for(&ws.dir)
+        };
+        Some(serde_json::json!({
+            "label": label,
+            "path": tab.repo_path,
+            "locked": reason.is_some(),
+            "reason": reason,
+            "choices": choices,
+        }))
+    }
+
+    /// Where a new chat in this workspace may run: the checkout, then the
+    /// workspace's prepared task worktrees.
+    fn checkout_choices_for(&self, workspace_dir: &Path) -> Vec<tab::CheckoutChoice> {
+        let tasks = self.task_store.as_ref().map_or(&[][..], TaskStore::tasks);
+        tab::checkout_choices(
+            workspace_dir,
+            tasks.iter().map(|task| tab::TaskWorktreeInfo {
+                title: &task.title,
+                workspace_dir: match &task.workspace.location {
+                    WorkspaceLocationIdentity::Local { directory } => Some(directory.as_path()),
+                    WorkspaceLocationIdentity::RemoteAgent { .. } => None,
+                },
+                worktree: task.worktree.path.as_deref(),
+                ready: task.worktree.state == TaskWorktreeState::Ready,
+                archived: task.lifecycle == TaskLifecycle::Archived,
+            }),
+            paths_equal,
+        )
+    }
+
+    /// The composer chips' starting state for a Claude chat page: the tab's
+    /// configured model and effort, and its checkout. `None` for pi tabs.
+    fn chat_composer_state(&self, tab_id: usize) -> Option<serde_json::Value> {
+        let session = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|t| t.id == tab_id)?
+            .agent_session()?;
+        let tab::AgentBackendConfig::Claude { model, effort, .. } = &session.config else {
+            return None;
+        };
+        Some(serde_json::json!({
+            "model": model,
+            "effort": effort,
+            "checkout": self.chat_checkout_state(tab_id)?,
+        }))
     }
 
     fn active_task_context_id(&self) -> Option<&str> {
@@ -9254,6 +9422,7 @@ impl App {
             next_tab_id: 0,
             task_store,
             review_config: config.review.clone(),
+            chat_config: config.chat.clone(),
             task_store_error,
             task_ui_error: None,
             task_worktree_root: config.task_worktree_root.clone(),
@@ -9322,6 +9491,7 @@ impl App {
             workspace_settings_new_key: String::new(),
             workspace_settings_new_value: String::new(),
             tab_picker_visible: false,
+            tab_picker_cli_open: false,
             task_handoff_copied: false,
             workspace_source_picker_visible: false,
             remote_workspace_picker: None,
@@ -12461,6 +12631,7 @@ fi
                 // Option+click on "+" shows tab picker (but not if picker is already open)
                 if self.current_modifiers.alt() && !self.tab_picker_visible {
                     self.tab_picker_visible = true;
+                    self.tab_picker_cli_open = false;
                     self.task_handoff_copied = false;
                 } else {
                     self.tab_picker_visible = false;
@@ -12507,6 +12678,18 @@ fi
                     AgentIpcMessage::SetPermissionMode { tab_id, mode } => {
                         Task::done(Event::AgentSetPermissionMode(tab_id, mode))
                     }
+                    AgentIpcMessage::SetModel { tab_id, model } => {
+                        Task::done(Event::AgentSetModel(tab_id, model))
+                    }
+                    AgentIpcMessage::SetEffort { tab_id, effort } => {
+                        Task::done(Event::AgentSetEffort(tab_id, effort))
+                    }
+                    AgentIpcMessage::CheckoutContext { tab_id } => {
+                        Task::done(Event::AgentCheckoutContextRequested(tab_id))
+                    }
+                    AgentIpcMessage::SetCheckout { tab_id, path } => {
+                        Task::done(Event::AgentSetCheckout(tab_id, path))
+                    }
                     AgentIpcMessage::ReviewContext { tab_id } => {
                         Task::done(Event::AgentReviewContextRequested(tab_id))
                     }
@@ -12529,6 +12712,7 @@ fi
                 let mut task_started: Option<String> = None;
                 let mut harness_bridge: Option<tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>> =
                     None;
+                let mut claude_spawned = false;
                 // A native Claude spawn gets the same GitTerm MCP servers a
                 // terminal-launched `claude` does.
                 let mut claude_mcp_servers: Vec<gitterm::harness::claude::ClaudeMcpServer> = self
@@ -12577,6 +12761,7 @@ fi
                                     gitterm::harness::claude::ClaudeSession::spawn(config);
                                 session.claude = Some(claude);
                                 harness_bridge = Some(rx);
+                                claude_spawned = true;
                             }
                             let mut submitted = false;
                             if let Some(claude) = session.claude.as_ref() {
@@ -12628,6 +12813,12 @@ fi
                 }
                 // Also push the echo into the tab's chat page, if it has one.
                 push_agent_event_to_webview(tab_id, &echo);
+                if claude_spawned {
+                    // The session is now bound to its directory.
+                    if let Some(state) = self.chat_checkout_state(tab_id) {
+                        push_checkout_state_to_webview(tab_id, &state);
+                    }
+                }
                 if let Some(rx) = bridge {
                     use tokio_stream::wrappers::UnboundedReceiverStream;
                     let stream = UnboundedReceiverStream::new(rx);
@@ -12719,6 +12910,195 @@ fi
                 }
                 return Task::none();
             }
+            Event::AgentSetModel(tab_id, model) => {
+                let model = model.trim().to_string();
+                if model.is_empty() || model.len() > 256 || model.contains(char::is_whitespace) {
+                    eprintln!("AgentSetModel: tab {tab_id}: refusing model {model:?}");
+                    return Task::none();
+                }
+                let Some(session) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session_mut())
+                else {
+                    eprintln!("AgentSetModel: tab {tab_id} is not an agent tab");
+                    return Task::none();
+                };
+                let tab::AgentBackendConfig::Claude {
+                    model: configured, ..
+                } = &mut session.config
+                else {
+                    eprintln!("AgentSetModel: tab {tab_id} is not a Claude tab");
+                    return Task::none();
+                };
+                let (ev, config_changed) = if let Some(claude) = session.claude.as_ref() {
+                    // Live process: the tab config, the last selection and
+                    // the page follow ModelChanged in AgentEventReceived.
+                    match claude.send(HarnessCommand::SetModel(model.clone())) {
+                        Ok(()) => return Task::none(),
+                        Err(e) => {
+                            eprintln!("AgentSetModel {model:?} on tab {tab_id} failed: {e}");
+                            let message = format!("Could not change the model to {model}: {e}");
+                            (HarnessEvent::Error(message), false)
+                        }
+                    }
+                } else {
+                    // No process yet (or it exited): the next spawn passes
+                    // `--model` from this config.
+                    configured.clone_from(&model);
+                    self.chat_config.remember_model(&model);
+                    (HarnessEvent::ModelChanged(model), true)
+                };
+                let ev = tab::AgentEvent::Harness(ev);
+                push_agent_event_to_webview(tab_id, &ev);
+                session.record(ev);
+                if config_changed {
+                    self.mark_workspaces_dirty();
+                    self.save_config();
+                }
+                return Task::none();
+            }
+            Event::AgentSetEffort(tab_id, effort) => {
+                if effort
+                    .as_deref()
+                    .is_some_and(|level| !tab::CLAUDE_EFFORT_LEVELS.contains(&level))
+                {
+                    eprintln!("AgentSetEffort: tab {tab_id}: unknown effort {effort:?}");
+                    return Task::none();
+                }
+                let Some(session) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session_mut())
+                else {
+                    eprintln!("AgentSetEffort: tab {tab_id} is not an agent tab");
+                    return Task::none();
+                };
+                let tab::AgentBackendConfig::Claude {
+                    effort: configured, ..
+                } = &mut session.config
+                else {
+                    eprintln!("AgentSetEffort: tab {tab_id} is not a Claude tab");
+                    return Task::none();
+                };
+                let (ev, config_changed) = if let Some(claude) = session.claude.as_ref() {
+                    // Live process: confirmed by EffortChanged (the
+                    // session reads its settings back after the change).
+                    match claude.send(HarnessCommand::SetEffort(effort.clone())) {
+                        Ok(()) => return Task::none(),
+                        Err(e) => {
+                            eprintln!("AgentSetEffort {effort:?} on tab {tab_id} failed: {e}");
+                            let message = format!(
+                                "Could not change the effort to {}: {e}",
+                                effort.as_deref().unwrap_or("auto")
+                            );
+                            (HarnessEvent::Error(message), false)
+                        }
+                    }
+                } else {
+                    // The next spawn passes `--effort` from this config.
+                    configured.clone_from(&effort);
+                    self.chat_config.remember_effort(effort.as_deref());
+                    (
+                        HarnessEvent::EffortChanged {
+                            effort,
+                            applied: None,
+                        },
+                        true,
+                    )
+                };
+                let ev = tab::AgentEvent::Harness(ev);
+                push_agent_event_to_webview(tab_id, &ev);
+                session.record(ev);
+                if config_changed {
+                    self.mark_workspaces_dirty();
+                    self.save_config();
+                }
+                return Task::none();
+            }
+            Event::AgentCheckoutContextRequested(tab_id) => {
+                match self.chat_checkout_state(tab_id) {
+                    Some(state) => push_checkout_state_to_webview(tab_id, &state),
+                    None => eprintln!(
+                        "AgentCheckoutContextRequested: tab {tab_id} is not a Claude chat"
+                    ),
+                }
+                return Task::none();
+            }
+            Event::AgentSetCheckout(tab_id, path) => {
+                let Some(state) = self.chat_checkout_state(tab_id) else {
+                    eprintln!("AgentSetCheckout: tab {tab_id} is not a Claude chat");
+                    return Task::none();
+                };
+                if state["locked"] == true {
+                    eprintln!("AgentSetCheckout: tab {tab_id}: checkout is locked");
+                    agent_webview_note(
+                        tab_id,
+                        state["reason"]
+                            .as_str()
+                            .unwrap_or("The checkout cannot change now."),
+                    );
+                    push_checkout_state_to_webview(tab_id, &state);
+                    return Task::none();
+                }
+                let Some(workspace_dir) = self
+                    .workspaces
+                    .iter()
+                    .find(|ws| ws.tabs.iter().any(|t| t.id == tab_id))
+                    .map(|ws| ws.dir.clone())
+                else {
+                    return Task::none();
+                };
+                // Only a directory the chip offered: the workspace checkout
+                // or one of its prepared task worktrees.
+                let Some(choice) = self
+                    .checkout_choices_for(&workspace_dir)
+                    .into_iter()
+                    .find(|c| paths_equal(&c.path, &path))
+                else {
+                    eprintln!(
+                        "AgentSetCheckout: tab {tab_id}: {} is not a checkout of this workspace",
+                        path.display()
+                    );
+                    agent_webview_note(
+                        tab_id,
+                        &format!("{} is no longer available.", path.display()),
+                    );
+                    if let Some(state) = self.chat_checkout_state(tab_id) {
+                        push_checkout_state_to_webview(tab_id, &state);
+                    }
+                    return Task::none();
+                };
+                let is_active = self.active_tab().is_some_and(|t| t.id == tab_id);
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                {
+                    tab.repo_path = choice.path.clone();
+                    tab.set_local_dir(choice.path.clone());
+                }
+                eprintln!(
+                    "[agent] tab {tab_id}: chat checkout set to {}",
+                    choice.path.display()
+                );
+                self.mark_workspaces_dirty();
+                if let Some(state) = self.chat_checkout_state(tab_id) {
+                    push_checkout_state_to_webview(tab_id, &state);
+                }
+                if is_active {
+                    return Task::batch([
+                        self.refresh_panels_for_task_context(),
+                        self.refresh_files_for_active_tab(),
+                    ]);
+                }
+                return Task::none();
+            }
             Event::AgentReviewContextRequested(tab_id) => {
                 let Some(tab) = self
                     .workspaces
@@ -12799,11 +13179,13 @@ fi
             }
             Event::NewClaudeChatTab => {
                 self.tab_picker_visible = false;
+                // The remembered or configured model and effort ("default"
+                // leaves the model to the user's Claude settings).
+                let selection = self.chat_config.new_chat_selection();
                 let config = tab::AgentBackendConfig::Claude {
-                    // "default" leaves the model to the user's Claude settings.
-                    model: "default".to_string(),
+                    model: selection.model,
                     permission_mode: Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
-                    effort: None,
+                    effort: selection.effort,
                 };
                 let (repo_path, current_dir) = match self.active_workspace() {
                     Some(ws) => {
@@ -12887,7 +13269,12 @@ fi
                 // Reset first: an event that arrived between the build and
                 // this message was already pushed live and is in the buffer.
                 reset_agent_webview(tab_id);
-                set_agent_webview_tab_id(tab_id, session.configured_permission_mode().as_deref());
+                let composer = self.chat_composer_state(tab_id);
+                set_agent_webview_tab_id(
+                    tab_id,
+                    session.configured_permission_mode().as_deref(),
+                    composer.as_ref(),
+                );
                 replay_agent_conversation_in_webview(tab_id, &session.conversation);
                 webview::focus_agent_composer(tab_id);
                 return Task::none();
@@ -12952,6 +13339,7 @@ fi
                 let mut progress_task: Option<String> = None;
                 let mut session_id_changed = false;
                 let mut config_changed = false;
+                let mut chat_config_changed = false;
                 let mut task_signal: Option<(String, Option<TaskSessionOutcome>)> = None;
                 'outer_event: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
@@ -13022,6 +13410,33 @@ fi
                                                 *permission_mode = Some(mode.clone());
                                                 config_changed = true;
                                             }
+                                        }
+                                        HarnessEvent::ModelChanged(confirmed) => {
+                                            // Confirmed by the CLI: a respawn
+                                            // starts on this model, and new
+                                            // chats may start on it too.
+                                            if let tab::AgentBackendConfig::Claude {
+                                                model, ..
+                                            } = &mut session.config
+                                            {
+                                                model.clone_from(confirmed);
+                                                config_changed = true;
+                                            }
+                                            self.chat_config.remember_model(confirmed);
+                                            chat_config_changed = true;
+                                        }
+                                        HarnessEvent::EffortChanged {
+                                            effort: confirmed, ..
+                                        } => {
+                                            if let tab::AgentBackendConfig::Claude {
+                                                effort, ..
+                                            } = &mut session.config
+                                            {
+                                                effort.clone_from(confirmed);
+                                                config_changed = true;
+                                            }
+                                            self.chat_config.remember_effort(confirmed.as_deref());
+                                            chat_config_changed = true;
                                         }
                                         HarnessEvent::ProcessExited { code } => {
                                             // Next prompt respawns with --resume.
@@ -13130,6 +13545,9 @@ fi
                 }
                 if session_id_changed || config_changed {
                     self.mark_workspaces_dirty();
+                }
+                if chat_config_changed {
+                    self.save_config();
                 }
                 return Task::none();
             }
@@ -13293,10 +13711,14 @@ fi
             },
             Event::ShowTabPicker => {
                 self.tab_picker_visible = true;
+                self.tab_picker_cli_open = false;
                 self.task_handoff_copied = false;
             }
             Event::HideTabPicker => {
                 self.tab_picker_visible = false;
+            }
+            Event::ShowTabPickerCli => {
+                self.tab_picker_cli_open = true;
             }
             Event::EditFile(path) => {
                 let Some(path) = path.as_local().map(|p| p.to_path_buf()) else {
@@ -14475,6 +14897,7 @@ fi
                     .map(task_handoff_prompt);
                 self.selected_task_id = Some(task_id);
                 self.tab_picker_visible = true;
+                self.tab_picker_cli_open = false;
                 self.task_handoff_copied = handoff.is_some();
                 if let Some(handoff) = handoff {
                     return iced::clipboard::write(handoff);
@@ -18986,72 +19409,104 @@ fi
             header = header.push(text("AGENTS").size(9).color(text_secondary).font(mono));
             items = items.push(header.padding([7, 10]));
         }
-        for (idx, preset) in self.agent_presets.iter().enumerate() {
-            let icon = if preset.icon.is_empty() {
-                preset.name.chars().next().unwrap_or('?').to_string()
-            } else {
-                preset.icon.clone()
+        // Outside a task the top level is New chat, CLI (the agent presets,
+        // one level down) and Terminal (TRU-143). Inside a task the presets
+        // launch task sessions, so they stay at the top with Terminal.
+        let cli_list = task_context_id.is_some() || self.tab_picker_cli_open;
+        if !cli_list {
+            let selection = self.chat_config.new_chat_selection();
+            let chat_desc = match &selection.effort {
+                Some(effort) => format!("Claude · {} · {effort} effort", selection.model),
+                None => format!("Claude · {}", selection.model),
             };
-            let accent = preset.color.color(theme);
-            let launch_event = task_context_id
-                .as_ref()
-                .map_or(Event::LaunchAgentPreset(idx), |task_id| {
-                    Event::TaskChildLaunchPreset(task_id.clone(), idx)
-                });
             items = items.push(picker_row(
-                preset.name.clone(),
-                preset.command.clone(),
-                icon.clone(),
-                accent,
-                launch_event,
-            ));
-            // Add resume row if the preset has a resume command
-            if task_context_id.is_none() {
-                if let Some(resume_cmd) = &preset.resume_command {
-                    items = items.push(picker_row(
-                        format!("{} (resume)", preset.name),
-                        resume_cmd.clone(),
-                        "\u{21ba}".to_string(), // ↺ symbol
-                        accent,
-                        Event::ResumeAgentPreset(idx),
-                    ));
-                }
-            }
-        }
-        if task_context_id.is_some() {
-            items = items.push(
-                container(text("TOOLS").size(9).color(text_secondary).font(mono)).padding(
-                    iced::Padding {
-                        top: 8.0,
-                        right: 10.0,
-                        bottom: 3.0,
-                        left: 10.0,
-                    },
-                ),
-            );
-        }
-        if task_context_id.is_none() {
-            items = items.push(picker_row(
-                "Claude chat".to_string(),
-                "Native chat with approvals (preview)".to_string(),
+                "New chat".to_string(),
+                chat_desc,
                 "\u{2733}".to_string(), // ✳
                 theme.accent(),
                 Event::NewClaudeChatTab,
             ));
+            let cli_names: Vec<&str> = self.agent_presets.iter().map(|p| p.name.as_str()).collect();
+            items = items.push(picker_row(
+                "CLI \u{203a}".to_string(), // ›
+                if cli_names.is_empty() {
+                    "No agent presets configured".to_string()
+                } else {
+                    cli_names.join(", ")
+                },
+                "\u{276f}".to_string(), // ❯
+                text_secondary,
+                Event::ShowTabPickerCli,
+            ));
+            items = items.push(picker_row(
+                "Terminal".to_string(),
+                "Plain shell".to_string(),
+                "\u{25b8}".to_string(),
+                text_secondary,
+                Event::NewPlainTab,
+            ));
+        } else {
+            if task_context_id.is_none() {
+                items = items.push(picker_row(
+                    "\u{2039} CLI".to_string(), // ‹
+                    "Back".to_string(),
+                    String::new(),
+                    text_secondary,
+                    Event::ShowTabPicker,
+                ));
+            }
+            for (idx, preset) in self.agent_presets.iter().enumerate() {
+                let icon = if preset.icon.is_empty() {
+                    preset.name.chars().next().unwrap_or('?').to_string()
+                } else {
+                    preset.icon.clone()
+                };
+                let accent = preset.color.color(theme);
+                let launch_event = task_context_id
+                    .as_ref()
+                    .map_or(Event::LaunchAgentPreset(idx), |task_id| {
+                        Event::TaskChildLaunchPreset(task_id.clone(), idx)
+                    });
+                items = items.push(picker_row(
+                    preset.name.clone(),
+                    preset.command.clone(),
+                    icon.clone(),
+                    accent,
+                    launch_event,
+                ));
+                // Add resume row if the preset has a resume command
+                if task_context_id.is_none() {
+                    if let Some(resume_cmd) = &preset.resume_command {
+                        items = items.push(picker_row(
+                            format!("{} (resume)", preset.name),
+                            resume_cmd.clone(),
+                            "\u{21ba}".to_string(), // ↺ symbol
+                            accent,
+                            Event::ResumeAgentPreset(idx),
+                        ));
+                    }
+                }
+            }
+            if let Some(task_id) = task_context_id.as_ref() {
+                items = items.push(
+                    container(text("TOOLS").size(9).color(text_secondary).font(mono)).padding(
+                        iced::Padding {
+                            top: 8.0,
+                            right: 10.0,
+                            bottom: 3.0,
+                            left: 10.0,
+                        },
+                    ),
+                );
+                items = items.push(picker_row(
+                    "Terminal".to_string(),
+                    "Plain shell".to_string(),
+                    "\u{25b8}".to_string(),
+                    text_secondary,
+                    Event::TaskChildLaunchTerminal(task_id.clone()),
+                ));
+            }
         }
-        // Always add plain terminal at the bottom
-        let terminal_event = task_context_id
-            .as_ref()
-            .map_or(Event::NewPlainTab, |task_id| {
-                Event::TaskChildLaunchTerminal(task_id.clone())
-            });
-        items = items.push(picker_row(
-            "Terminal".to_string(),
-            "Plain shell".to_string(),
-            "\u{25b8}".to_string(),
-            text_secondary,
-            terminal_event,
-        ));
 
         let picker_menu = container(items)
             .style(move |_| container::Style {

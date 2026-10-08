@@ -15,8 +15,9 @@ mod agent;
 // AgentEvent variants in earnest.
 #[allow(unused_imports)]
 pub(crate) use agent::{
-    spawn_agent_task, AgentBackend, AgentBackendConfig, AgentEvent, AgentInput, AgentSession,
-    AgentSessionState, AgentTaskHandle, HistoryLoad, CLAUDE_PERMISSION_MODES,
+    checkout_choices, checkout_label, spawn_agent_task, AgentBackend, AgentBackendConfig,
+    AgentEvent, AgentInput, AgentSession, AgentSessionState, AgentTaskHandle, CheckoutChoice,
+    HistoryLoad, TaskWorktreeInfo, CLAUDE_EFFORT_LEVELS, CLAUDE_PERMISSION_MODES,
     DEFAULT_CLAUDE_PERMISSION_MODE,
 };
 

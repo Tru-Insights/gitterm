@@ -56,6 +56,15 @@ pub enum HostRequest {
     },
     Interrupt,
     SetPermissionMode(String),
+    /// `set_model`; its success reply carries no payload.
+    SetModel(String),
+    /// `apply_flag_settings {effortLevel}`. Its success reply carries no
+    /// payload and the CLI accepts unknown levels without applying them, so
+    /// the session confirms with a `ConfirmEffort` read afterwards.
+    SetEffort(Option<String>),
+    /// `get_settings`, sent after a successful `SetEffort` to read back what
+    /// the session's flag settings now hold.
+    ConfirmEffort(Option<String>),
 }
 
 /// One thing the parser found in a CLI stdout line.
@@ -328,6 +337,26 @@ impl ClaudeFrameParser {
                     mode,
                 )));
             }
+            (HostRequest::SetModel(model), Err(e)) => out.push(ParsedFrame::Event(
+                HarnessEvent::Error(format!("Claude rejected model {model:?}: {e}")),
+            )),
+            (HostRequest::SetModel(model), Ok(_)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::ModelChanged(
+                    model.clone(),
+                )));
+            }
+            (HostRequest::SetEffort(effort), Err(e))
+            | (HostRequest::ConfirmEffort(effort), Err(e)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::Error(format!(
+                    "Claude did not change the effort to {}: {e}",
+                    effort.as_deref().unwrap_or("auto")
+                ))))
+            }
+            // The session follows up with `ConfirmEffort`.
+            (HostRequest::SetEffort(_), Ok(_)) => {}
+            (HostRequest::ConfirmEffort(requested), Ok(body)) => {
+                out.push(ParsedFrame::Event(confirm_effort(requested, body)));
+            }
             (HostRequest::Interrupt, Ok(_)) => {}
         }
         out.push(ParsedFrame::HostRequestDone {
@@ -336,6 +365,30 @@ impl ClaudeFrameParser {
             result,
         });
         out
+    }
+}
+
+/// Reads a `get_settings` reply after `apply_flag_settings {effortLevel}`.
+/// The flag-settings source holds the session's pinned level (absent once it
+/// is reset); `applied.effort` is what the model actually runs at.
+fn confirm_effort(requested: &Option<String>, body: &Value) -> HarnessEvent {
+    let pinned = body["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|source| source["source"] == "flagSettings")
+        .and_then(|source| source["settings"]["effortLevel"].as_str())
+        .map(str::to_string);
+    if &pinned != requested {
+        return HarnessEvent::Error(format!(
+            "Claude did not apply effort {}: its session settings hold {}",
+            requested.as_deref().unwrap_or("auto"),
+            pinned.as_deref().unwrap_or("no effort level")
+        ));
+    }
+    HarnessEvent::EffortChanged {
+        effort: pinned,
+        applied: body["applied"]["effort"].as_str().map(str::to_string),
     }
 }
 
@@ -1087,10 +1140,28 @@ async fn run_session(
                             harness_log(&format!(
                                 "{request:?} ({request_id}) -> {}",
                                 match &result {
+                                    // get_settings carries the user's whole
+                                    // settings (env, tokens); never log it.
+                                    Ok(_) if matches!(request, HostRequest::ConfirmEffort(_)) => {
+                                        "ok (settings not logged)".to_string()
+                                    }
                                     Ok(v) => format!("ok {}", trim_for_log(&v.to_string(), 160)),
                                     Err(e) => format!("error {e}"),
                                 }
                             ));
+                            // An accepted effort change is confirmed by
+                            // reading the session's settings back.
+                            if let (HostRequest::SetEffort(effort), Ok(_)) = (&request, &result) {
+                                let id = new_request_id();
+                                parser.register_host_request(id.clone(), HostRequest::ConfirmEffort(effort.clone()));
+                                if let Err(e) = io
+                                    .write(control_request_frame(&id, json!({"subtype": "get_settings"})))
+                                    .await
+                                {
+                                    harness_log(&e);
+                                    io.emit(HarnessEvent::Error(e));
+                                }
+                            }
                         }
                         ParsedFrame::Unparsed(line) => {
                             harness_log(&format!("non-JSON stdout: {}", trim_for_log(&line, 200)));
@@ -1155,6 +1226,26 @@ async fn run_session(
                         io.write(control_request_frame(
                             &id,
                             json!({"subtype": "set_permission_mode", "mode": mode}),
+                        ))
+                        .await
+                    }
+                    HarnessCommand::SetModel(model) => {
+                        let id = new_request_id();
+                        harness_log(&format!("set_model {model:?} ({id})"));
+                        parser.register_host_request(id.clone(), HostRequest::SetModel(model.clone()));
+                        io.write(control_request_frame(
+                            &id,
+                            json!({"subtype": "set_model", "model": model}),
+                        ))
+                        .await
+                    }
+                    HarnessCommand::SetEffort(effort) => {
+                        let id = new_request_id();
+                        harness_log(&format!("apply_flag_settings effortLevel={effort:?} ({id})"));
+                        parser.register_host_request(id.clone(), HostRequest::SetEffort(effort.clone()));
+                        io.write(control_request_frame(
+                            &id,
+                            json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}),
                         ))
                         .await
                     }
@@ -1267,6 +1358,12 @@ mod tests {
     const TURN_INTERRUPT: &str = include_str!("../../tests/fixtures/claude/turn_interrupt.jsonl");
     const SET_PERMISSION_MODE_REPLY: &str =
         include_str!("../../tests/fixtures/claude/set_permission_mode_reply.jsonl");
+    // Captured from `claude_harness_smoke --scenario model` (TRU-143):
+    // set_model, apply_flag_settings low, get_settings, apply_flag_settings
+    // null, get_settings. The get_settings replies keep only effortLevel
+    // (the rest is the user's own settings).
+    const MODEL_EFFORT_REPLIES: &str =
+        include_str!("../../tests/fixtures/claude/model_effort_replies.jsonl");
     // Captured from `claude_harness_smoke --scenario review` (TRU-142):
     // consecutive deltas on one block merged, signatures and paths redacted.
     const TURN_SUBAGENT_REVIEW: &str =
@@ -1735,6 +1832,80 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn set_model_reply_confirms_the_model() {
+        let mut p = ClaudeFrameParser::new();
+        p.register_host_request(
+            "gitterm_30932_2".into(),
+            HostRequest::SetModel("sonnet".into()),
+        );
+        let line = MODEL_EFFORT_REPLIES.lines().next().unwrap();
+        let frames = p.parse_line(line);
+        assert_eq!(
+            events(&frames),
+            vec![HarnessEvent::ModelChanged("sonnet".into())]
+        );
+        assert!(matches!(
+            frames.last(),
+            Some(ParsedFrame::HostRequestDone {
+                request: HostRequest::SetModel(_),
+                result: Ok(_),
+                ..
+            })
+        ));
+        // An unknown model is the CLI's error, not a confirmation.
+        p.register_host_request("m2".into(), HostRequest::SetModel("nonsense".into()));
+        let frames = p.parse_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"m2","error":"Model 'nonsense' not found","error_code":"catalog_unknown"}}"#,
+        );
+        assert!(
+            matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("not found"))
+        );
+    }
+
+    #[test]
+    fn effort_is_confirmed_by_the_settings_read_back() {
+        let mut p = ClaudeFrameParser::new();
+        let low = Some("low".to_string());
+        p.register_host_request(
+            "gitterm_30932_3".into(),
+            HostRequest::SetEffort(low.clone()),
+        );
+        p.register_host_request(
+            "gitterm_30932_4".into(),
+            HostRequest::ConfirmEffort(low.clone()),
+        );
+        p.register_host_request("gitterm_30932_5".into(), HostRequest::SetEffort(None));
+        p.register_host_request("gitterm_30932_6".into(), HostRequest::ConfirmEffort(None));
+        let frames = parse_fixture(&mut p, MODEL_EFFORT_REPLIES);
+        // The apply_flag_settings replies themselves confirm nothing; the
+        // user's own effortLevel (userSettings) is not mistaken for the pin.
+        assert_eq!(
+            events(&frames),
+            vec![
+                HarnessEvent::EffortChanged {
+                    effort: low.clone(),
+                    applied: low.clone()
+                },
+                HarnessEvent::EffortChanged {
+                    effort: None,
+                    applied: Some("medium".into())
+                },
+            ]
+        );
+        // A level the CLI accepted but did not pin is reported, not shown.
+        p.register_host_request(
+            "c1".into(),
+            HostRequest::ConfirmEffort(Some("bogus".into())),
+        );
+        let frames = p.parse_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"c1","response":{"effective":{},"sources":[{"source":"flagSettings","settings":{}}],"applied":{"effort":"low"}}}}"#,
+        );
+        assert!(
+            matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("bogus"))
+        );
     }
 
     #[test]

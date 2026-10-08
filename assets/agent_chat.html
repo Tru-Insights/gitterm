@@ -338,6 +338,34 @@
   #mode-menu .mark { width: 12px; color: var(--accent); }
   #mode-menu .hint { padding: 4px 8px 2px; color: var(--fg-muted); font-size: 11px; white-space: nowrap; }
 
+  /* Model, effort and checkout chips (TRU-143); menus like the mode chip's */
+  .chip-wrap { position: relative; display: none; }
+  .chip-wrap.visible { display: block; }
+  .chip { padding: 7px 10px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+  .chip.pending { opacity: 0.65; }
+  .chip.locked { cursor: default; }
+  .chip.locked:hover { background: var(--bg-block); }
+  .chip-menu {
+    display: none;
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 6px);
+    min-width: 210px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding: 4px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    z-index: 10;
+  }
+  .chip-menu.visible { display: block; }
+  .chip-menu button { display: flex; width: 100%; gap: 8px; border: none; background: transparent; text-align: left; font-size: 12.5px; padding: 5px 8px; align-items: baseline; }
+  .chip-menu button:hover { background: var(--bg-block); }
+  .chip-menu .mark { width: 12px; flex: none; color: var(--accent); }
+  .chip-menu .sub { color: var(--fg-muted); font-size: 11px; margin-left: auto; padding-left: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+  .chip-menu .hint { padding: 4px 8px 2px; color: var(--fg-muted); font-size: 11px; white-space: nowrap; }
+
   /* Review… button and popover (left of the mode chip) */
   .review-wrap { position: relative; display: none; }
   .review-wrap.visible { display: block; }
@@ -402,9 +430,21 @@
       <div id="review-pop"></div>
       <button id="review" title="Ask a reviewer subagent to review this checkout">Review…</button>
     </div>
+    <div class="chip-wrap" id="model-wrap">
+      <div class="chip-menu" id="model-menu"></div>
+      <button class="chip" id="model" title="Model"></button>
+    </div>
+    <div class="chip-wrap" id="effort-wrap">
+      <div class="chip-menu" id="effort-menu"></div>
+      <button class="chip" id="effort" title="Effort"></button>
+    </div>
     <div class="mode-wrap">
       <div id="mode-menu"></div>
       <button id="mode" title="Permission mode (Shift+Tab in the message box cycles)"></button>
+    </div>
+    <div class="chip-wrap" id="checkout-wrap">
+      <div class="chip-menu" id="checkout-menu"></div>
+      <button class="chip" id="checkout"></button>
     </div>
     <button id="submit" class="primary">Send</button>
     <button id="stop" class="danger" disabled>Stop</button>
@@ -416,13 +456,16 @@
   // Every IPC message carries it so Rust routes to the right tab.
   // `permissionMode` is the Claude tab's configured mode (null for other
   // backends); the replayed buffer's ready/permission_mode_changed events
-  // override it.
+  // override it. `composer` (null for other backends) is the Claude tab's
+  // configured {model, effort, checkout}; replayed model_changed /
+  // effort_changed events override the first two.
   window.__currentTabId = null;
-  window.__setTabId = function (id, permissionMode) {
+  window.__setTabId = function (id, permissionMode, composer) {
     window.__currentTabId = id;
     resetMode(permissionMode == null ? null : permissionMode);
     // Only Claude tabs have a permission mode, and only they can review.
     setReviewAvailable(permissionMode != null);
+    resetComposerChips(composer || null);
   };
 
   const messagesEl = document.getElementById('messages');
@@ -918,6 +961,7 @@
   }
   modeBtn.addEventListener('click', (e) => {
     e.stopPropagation();
+    closeChipMenus(null);
     modeMenuEl.classList.toggle('visible');
   });
   document.addEventListener('click', (e) => {
@@ -926,6 +970,206 @@
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') modeMenuEl.classList.remove('visible');
   });
+
+
+  // ---- model, effort and checkout chips (TRU-143) -----------------------
+  // Like the mode chip, `current` is only ever a value the harness confirmed
+  // (model_changed / effort_changed) or the tab's configured value before
+  // its process starts (Rust confirms those itself). `pending` is the last
+  // value asked for and not yet confirmed.
+  // Until the CLI's initialize reply lists its models, offer the common ones.
+  const FALLBACK_MODELS = [
+    { value: 'default', displayName: 'Default', description: 'Your Claude settings decide' },
+    { value: 'opus', displayName: 'Opus' },
+    { value: 'sonnet', displayName: 'Sonnet' },
+    { value: 'haiku', displayName: 'Haiku' },
+    { value: 'fable', displayName: 'Fable' },
+  ];
+  const FALLBACK_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+  const modelWrapEl = document.getElementById('model-wrap');
+  const modelBtn = document.getElementById('model');
+  const modelMenuEl = document.getElementById('model-menu');
+  const effortWrapEl = document.getElementById('effort-wrap');
+  const effortBtn = document.getElementById('effort');
+  const effortMenuEl = document.getElementById('effort-menu');
+  const checkoutWrapEl = document.getElementById('checkout-wrap');
+  const checkoutBtn = document.getElementById('checkout');
+  const checkoutMenuEl = document.getElementById('checkout-menu');
+  const chips = {
+    enabled: false,
+    models: null,                                  // from `ready`
+    model: { current: null, pending: null },
+    // effort.current: a level or null (the model's default); pending is
+    // {value} while a change is in flight so null can be pending too.
+    effort: { current: null, pending: null, applied: null },
+    checkout: null,                                // {label, path, locked, reason, choices}
+    checkoutPending: null,
+  };
+  const CHIP_MENUS = [modelMenuEl, effortMenuEl, checkoutMenuEl];
+  function closeChipMenus(except) {
+    for (const m of CHIP_MENUS) if (m !== except) m.classList.remove('visible');
+  }
+  function modelList() {
+    const list = (chips.models && chips.models.length ? chips.models : FALLBACK_MODELS)
+      .filter((m) => m && typeof m.value === 'string');
+    const cur = chips.model.current;
+    if (cur && !list.some((m) => m.value === cur)) return [{ value: cur, displayName: cur }].concat(list);
+    return list;
+  }
+  function modelInfo(value) { return modelList().find((m) => m.value === value) || null; }
+  function modelLabel(value) {
+    const m = modelInfo(value);
+    return (m && m.displayName) || value;
+  }
+  function effortLevels() {
+    const m = modelInfo(chips.model.current);
+    if (m && Array.isArray(m.supportedEffortLevels) && m.supportedEffortLevels.length) return m.supportedEffortLevels;
+    return FALLBACK_EFFORTS;
+  }
+  // A model the CLI lists without effort support (supportsEffort absent).
+  function effortSupported() {
+    if (!chips.models) return true;
+    const m = modelInfo(chips.model.current);
+    return !m || m.supportsEffort === true;
+  }
+  function effortLabel(v) { return v == null ? 'auto' : v; }
+  function menuItem(menu, marked, label, sub, onPick) {
+    const b = el('button');
+    b.appendChild(el('span', 'mark', marked));
+    b.appendChild(el('span', null, label));
+    if (sub) b.appendChild(el('span', 'sub', sub));
+    b.addEventListener('click', (e) => { e.stopPropagation(); menu.classList.remove('visible'); onPick(); promptEl.focus(); });
+    menu.appendChild(b);
+  }
+  function renderModel() {
+    modelWrapEl.classList.toggle('visible', chips.enabled && chips.model.current != null);
+    if (!chips.enabled || chips.model.current == null) { modelMenuEl.classList.remove('visible'); return; }
+    const m = chips.model;
+    modelBtn.classList.toggle('pending', m.pending != null);
+    modelBtn.textContent = modelLabel(m.current) + (m.pending != null ? ' → ' + modelLabel(m.pending) + '…' : '');
+    modelBtn.title = 'Model: ' + m.current;
+    modelMenuEl.innerHTML = '';
+    modelMenuEl.appendChild(el('div', 'hint', chips.models ? 'Model' : 'Model · full list after the session starts'));
+    for (const info of modelList()) {
+      menuItem(modelMenuEl, info.value === m.current ? '✓' : (info.value === m.pending ? '…' : ''),
+        info.displayName || info.value, info.description || '', () => requestModel(info.value));
+    }
+  }
+  function renderEffort() {
+    const on = chips.enabled && chips.model.current != null;
+    effortWrapEl.classList.toggle('visible', on);
+    if (!on) { effortMenuEl.classList.remove('visible'); return; }
+    const e = chips.effort;
+    const supported = effortSupported();
+    effortBtn.classList.toggle('pending', e.pending != null);
+    effortBtn.classList.toggle('locked', !supported);
+    let label = 'Effort: ' + effortLabel(e.current);
+    if (e.current == null && e.applied) label += ' (' + e.applied + ')';
+    if (e.pending != null) label += ' → ' + effortLabel(e.pending.value) + '…';
+    effortBtn.textContent = label;
+    effortBtn.title = supported ? 'Effort level' : 'This model has no effort setting';
+    effortMenuEl.innerHTML = '';
+    effortMenuEl.appendChild(el('div', 'hint', 'Effort'));
+    const isPending = (v) => e.pending != null && e.pending.value === v;
+    menuItem(effortMenuEl, e.current == null ? '✓' : (isPending(null) ? '…' : ''), 'Auto', "the model's default", () => requestEffort(null));
+    for (const level of effortLevels()) {
+      menuItem(effortMenuEl, level === e.current ? '✓' : (isPending(level) ? '…' : ''), level, '', () => requestEffort(level));
+    }
+  }
+  function renderCheckout() {
+    const c = chips.checkout;
+    checkoutWrapEl.classList.toggle('visible', chips.enabled && c != null);
+    if (!chips.enabled || c == null) { checkoutMenuEl.classList.remove('visible'); return; }
+    checkoutBtn.classList.toggle('pending', chips.checkoutPending != null);
+    checkoutBtn.classList.toggle('locked', !!c.locked);
+    checkoutBtn.textContent = c.label + (chips.checkoutPending != null ? '…' : '');
+    checkoutBtn.title = (c.path || '') + (c.locked ? '\n' + (c.reason || 'Set when the chat started; start a new chat to change it') : '\nWhere this chat runs');
+    if (c.locked) { checkoutMenuEl.classList.remove('visible'); return; }
+    checkoutMenuEl.innerHTML = '';
+    checkoutMenuEl.appendChild(el('div', 'hint', 'Run this chat in'));
+    for (const choice of (c.choices || [])) {
+      const current = choice.path === c.path;
+      menuItem(checkoutMenuEl, current ? '✓' : (choice.path === chips.checkoutPending ? '…' : ''),
+        choice.label, choice.detail || '', () => requestCheckout(choice.path));
+    }
+  }
+  function renderChips() { renderModel(); renderEffort(); renderCheckout(); }
+  function resetComposerChips(composer) {
+    chips.enabled = composer != null;
+    chips.models = null;
+    chips.model = { current: composer ? composer.model || 'default' : null, pending: null };
+    chips.effort = { current: composer ? (composer.effort == null ? null : composer.effort) : null, pending: null, applied: null };
+    chips.checkout = composer ? composer.checkout || null : null;
+    chips.checkoutPending = null;
+    renderChips();
+  }
+  function confirmModel(v) {
+    chips.model.current = v;
+    // The level the old model ran at says nothing about the new one.
+    chips.effort.applied = null;
+    if (chips.model.pending === v) chips.model.pending = null;
+    renderModel(); renderEffort();
+  }
+  function confirmEffort(v, applied) {
+    chips.effort.current = v == null ? null : v;
+    chips.effort.applied = applied || null;
+    if (chips.effort.pending != null && chips.effort.pending.value === chips.effort.current) chips.effort.pending = null;
+    renderEffort();
+  }
+  function clearPendingChips() {
+    if (chips.model.pending == null && chips.effort.pending == null) return;
+    chips.model.pending = null; chips.effort.pending = null;
+    renderModel(); renderEffort();
+  }
+  function requestModel(v) {
+    const m = chips.model;
+    if (m.current == null || v === (m.pending != null ? m.pending : m.current)) return;
+    m.pending = v;
+    renderModel();
+    postIpc({ type: 'set_model', model: v });
+  }
+  function requestEffort(v) {
+    const e = chips.effort;
+    if (!effortSupported() || v === (e.pending != null ? e.pending.value : e.current)) return;
+    e.pending = { value: v };
+    renderEffort();
+    postIpc({ type: 'set_effort', effort: v });
+  }
+  function requestCheckout(path) {
+    const c = chips.checkout;
+    if (!c || c.locked || path === c.path) return;
+    chips.checkoutPending = path;
+    renderCheckout();
+    postIpc({ type: 'set_checkout', path });
+  }
+  // Rust pushes the checkout chip's state: on a checkout_context request,
+  // after a pick, and when the session starts (it locks).
+  window.__setCheckout = function (state) {
+    chips.checkout = state || null;
+    chips.checkoutPending = null;
+    renderCheckout();
+  };
+  function toggleChipMenu(menu, e) {
+    e.stopPropagation();
+    const open = !menu.classList.contains('visible');
+    closeChipMenus(menu);
+    modeMenuEl.classList.remove('visible');
+    menu.classList.toggle('visible', open);
+    return open;
+  }
+  modelBtn.addEventListener('click', (e) => toggleChipMenu(modelMenuEl, e));
+  effortBtn.addEventListener('click', (e) => {
+    if (!effortSupported()) { e.stopPropagation(); return; }
+    toggleChipMenu(effortMenuEl, e);
+  });
+  checkoutBtn.addEventListener('click', (e) => {
+    if (chips.checkout && chips.checkout.locked) { e.stopPropagation(); return; }
+    // Task worktrees come and go; ask for fresh choices while it is open.
+    if (toggleChipMenu(checkoutMenuEl, e)) postIpc({ type: 'checkout_context' });
+  });
+  for (const m of CHIP_MENUS) m.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => closeChipMenus(null));
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeChipMenus(null); });
 
   // ---- Review… (TRU-142) ---------------------------------------------------
   // The popover only collects the request; Rust builds the review prompt
@@ -1242,6 +1486,7 @@
     switch (ev.type) {
       case 'ready':
         confirmMode(d.permission_mode);
+        if (Array.isArray(d.models) && d.models.length) { chips.models = d.models; renderModel(); renderEffort(); }
         note(d.session_id ? 'Resumed Claude session ' + d.session_id.slice(0, 8) + ' · permission mode ' + (d.permission_mode || '?')
                           : 'Claude session ready · permission mode ' + (d.permission_mode || '?'));
         break;
@@ -1292,15 +1537,26 @@
         confirmMode(d);
         note('Permission mode · ' + modeLabel(d));
         break;
+      case 'model_changed':
+        confirmModel(d);
+        note('Model · ' + modelLabel(d));
+        break;
+      case 'effort_changed':
+        confirmEffort(d.effort, d.applied);
+        note('Effort · ' + effortLabel(d.effort) + (d.effort == null && d.applied ? ' (' + d.applied + ')' : ''));
+        break;
       case 'error':
-        // A rejected or undeliverable mode change surfaces as an error.
+        // A rejected or undeliverable mode, model or effort change
+        // surfaces as an error.
         clearPendingMode();
+        clearPendingChips();
         errorBlock(d);
         break;
       case 'process_exited':
         endSegment(); endThinking();
         clearPending();
         clearPendingMode();
+        clearPendingChips();
         if (busy) finishActivity('Claude exited', 'failed');
         note('Claude process exited' + (d.code != null ? ' (code ' + d.code + ')' : '') + '. The next message resumes the session.');
         setBusy(false);

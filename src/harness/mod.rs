@@ -135,6 +135,18 @@ pub enum HarnessEvent {
     /// The harness confirmed a permission mode change GitTerm requested.
     /// Carries the mode now in effect.
     PermissionModeChanged(String),
+    /// The harness confirmed a model change GitTerm requested. Carries the
+    /// model value as requested (an alias such as `sonnet`, or `default`
+    /// for the user's own default).
+    ModelChanged(String),
+    /// The harness confirmed an effort change GitTerm requested. `effort`
+    /// is the level the session is now pinned to (`None`: the model's own
+    /// default); `applied` is the level the harness reports in effect,
+    /// when it said.
+    EffortChanged {
+        effort: Option<String>,
+        applied: Option<String>,
+    },
     Error(String),
     ProcessExited {
         code: Option<i32>,
@@ -174,6 +186,12 @@ pub enum HarnessCommand {
     },
     Interrupt,
     SetPermissionMode(String),
+    /// Switch the running session's model (`default` resets it to the
+    /// user's own default).
+    SetModel(String),
+    /// Pin the running session's effort level, or `None` to return to the
+    /// model's default.
+    SetEffort(Option<String>),
     Shutdown,
 }
 
@@ -199,6 +217,22 @@ mod tests {
             json!({"type": "turn_completed", "data": {
                 "status": {"state": "failed", "message": "boom"},
                 "usage": {}, "cost_usd": 0.5}})
+        );
+    }
+
+    #[test]
+    fn model_and_effort_changes_serialize_for_the_page() {
+        assert_eq!(
+            serde_json::to_value(HarnessEvent::ModelChanged("sonnet".into())).unwrap(),
+            json!({"type": "model_changed", "data": "sonnet"})
+        );
+        assert_eq!(
+            serde_json::to_value(HarnessEvent::EffortChanged {
+                effort: None,
+                applied: Some("medium".into())
+            })
+            .unwrap(),
+            json!({"type": "effort_changed", "data": {"effort": null, "applied": "medium"}})
         );
     }
 

@@ -220,6 +220,16 @@ All of these are observed.
 | `{"subtype":"set_permission_mode","mode":"not-a-mode"}` | `{"subtype":"error",…,"error":"Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan","error_code":"invalid_mode"}` |
 | `{"subtype":"set_model","model":"haiku"}` (null or `"default"` resets) | `{"subtype":"success",…}` (no payload) |
 | unknown subtype | `{"subtype":"error",…,"error":"Unsupported control request subtype: no_such_subtype"}` |
+| `{"subtype":"set_model","model":"nonsense"}` (TRU-143) | `{"subtype":"error",…,"error":"Model 'nonsense' not found","error_code":"catalog_unknown"}` |
+| `{"subtype":"apply_flag_settings","settings":{"effortLevel":"low"}}` (TRU-143; `null` resets) | `{"subtype":"success",…}` (no payload; an unknown level also succeeds and is not applied) |
+| `{"subtype":"get_settings"}` (TRU-143) | `{"subtype":"success",…,"response":{"effective":{…},"sources":[{"source":"userSettings",…},{"source":"flagSettings","settings":{"effortLevel":"low"}}],"applied":{"model":"claude-sonnet-5-5","effort":"low",…}}}` |
+
+There is no `set_effort` subtype (`Unsupported control request subtype: set_effort`). The SDK changes
+effort mid-session with `apply_flag_settings {effortLevel}`; GitTerm confirms it by reading
+`get_settings` back and comparing the `flagSettings` source's `effortLevel` (not `effective`, which
+also carries the user's own `effortLevel`). `applied.effort` is the level in force, which for
+`null` is the model's default. The `get_settings` reply includes the user's whole settings, so it
+is never logged or kept as a fixture untrimmed.
 
 After an interrupt the CLI sends these frames, in this order:
 
@@ -384,8 +394,8 @@ the per-turn path, and the old `claude --print` command builder is gone.
   (`chats::claude_session_exists`), the session starts fresh instead of
   failing `--resume`.
 - A model of `"default"` (or empty) omits `--model`, so the user's Claude
-  settings choose. The "Claude chat" entry in the picker uses this, with
-  permission mode `default`.
+  settings choose. (TRU-143: "New chat" now starts on the configured or
+  remembered model, `opus` by default, with permission mode `default`.)
 - Frames carrying a non-null `parent_tool_use_id` (subagent internals) are
   ignored. The parent Task tool card still shows.
 - Any runtime request still open when its turn ends, or when the process

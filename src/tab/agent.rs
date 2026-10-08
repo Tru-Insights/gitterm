@@ -13,7 +13,7 @@
 // Step 4 ships.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +39,9 @@ pub(crate) const CLAUDE_PERMISSION_MODES: [&str; 6] = [
     "dontAsk",
     "bypassPermissions",
 ];
+/// Effort levels the CLI accepts (`claude --help`: `--effort <level>`, and
+/// every model's `supportedEffortLevels` in the initialize reply).
+pub(crate) const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// Set to a directory to log every Claude stdin/stdout frame there.
 const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_CLAUDE_WIRE_LOG_DIR";
 
@@ -288,6 +291,86 @@ impl AgentSession {
             AgentBackendConfig::Pi { .. } => None,
         }
     }
+}
+
+/// One task's worktree as the chat's checkout chip sees it (TRU-143).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TaskWorktreeInfo<'a> {
+    pub(crate) title: &'a str,
+    /// The task's local workspace directory (`None` for remote workspaces).
+    pub(crate) workspace_dir: Option<&'a Path>,
+    pub(crate) worktree: Option<&'a Path>,
+    /// The worktree is prepared (`TaskWorktreeState::Ready`).
+    pub(crate) ready: bool,
+    pub(crate) archived: bool,
+}
+
+/// A directory a chat can start in.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct CheckoutChoice {
+    pub(crate) label: String,
+    pub(crate) detail: String,
+    pub(crate) path: PathBuf,
+}
+
+/// The label of the workspace's own checkout in the chip.
+pub(crate) const CURRENT_CHECKOUT_LABEL: &str = "Current checkout";
+
+fn dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// What the checkout chip offers before a chat's first message: the
+/// workspace's current checkout, then every prepared, unarchived task
+/// worktree of that workspace, each once. `same_path` compares directories
+/// (the app canonicalises; tests compare literally).
+pub(crate) fn checkout_choices<'a>(
+    workspace_dir: &Path,
+    tasks: impl IntoIterator<Item = TaskWorktreeInfo<'a>>,
+    same_path: impl Fn(&Path, &Path) -> bool,
+) -> Vec<CheckoutChoice> {
+    let mut choices = vec![CheckoutChoice {
+        label: CURRENT_CHECKOUT_LABEL.to_string(),
+        detail: workspace_dir.display().to_string(),
+        path: workspace_dir.to_path_buf(),
+    }];
+    for task in tasks {
+        let (Some(task_workspace), Some(worktree)) = (task.workspace_dir, task.worktree) else {
+            continue;
+        };
+        if !task.ready || task.archived || !same_path(task_workspace, workspace_dir) {
+            continue;
+        }
+        if choices.iter().any(|c| same_path(&c.path, worktree)) {
+            continue;
+        }
+        choices.push(CheckoutChoice {
+            label: dir_name(worktree),
+            detail: task.title.to_string(),
+            path: worktree.to_path_buf(),
+        });
+    }
+    choices
+}
+
+/// The chip's label for a chat running in `tab_dir`: the task worktree's
+/// name for a task-linked tab, "Current checkout" for the workspace's own
+/// directory, else the directory's name (a task worktree picked in the chip).
+pub(crate) fn checkout_label(
+    tab_dir: &Path,
+    task_worktree: Option<&Path>,
+    workspace_dir: &Path,
+    same_path: impl Fn(&Path, &Path) -> bool,
+) -> String {
+    if let Some(worktree) = task_worktree {
+        return dir_name(worktree);
+    }
+    if same_path(tab_dir, workspace_dir) {
+        return CURRENT_CHECKOUT_LABEL.to_string();
+    }
+    dir_name(tab_dir)
 }
 
 /// Fold `next` into `last` when both are fragments of the same stream:
@@ -588,6 +671,77 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn task<'a>(
+        title: &'a str,
+        workspace: &'a str,
+        worktree: &'a str,
+        ready: bool,
+        archived: bool,
+    ) -> TaskWorktreeInfo<'a> {
+        TaskWorktreeInfo {
+            title,
+            workspace_dir: Some(Path::new(workspace)),
+            worktree: Some(Path::new(worktree)),
+            ready,
+            archived,
+        }
+    }
+
+    #[test]
+    fn checkout_choices_are_the_checkout_then_this_workspaces_ready_worktrees() {
+        let same = |a: &Path, b: &Path| a == b;
+        let ws = Path::new("/repo");
+        let tasks = [
+            task("Add chips", "/repo", "/wt/tru-143-chips", true, false),
+            task("Other repo", "/other", "/wt/other", true, false),
+            task("Not prepared", "/repo", "/wt/preparing", false, false),
+            task("Done", "/repo", "/wt/archived", true, true),
+            task("Same tree again", "/repo", "/wt/tru-143-chips", true, false),
+            TaskWorktreeInfo {
+                title: "Remote",
+                workspace_dir: None,
+                worktree: Some(Path::new("/wt/remote")),
+                ready: true,
+                archived: false,
+            },
+            task("Fix review", "/repo", "/wt/tru-142-review", true, false),
+        ];
+        let choices = checkout_choices(ws, tasks, same);
+        let summary: Vec<(&str, &str, &Path)> = choices
+            .iter()
+            .map(|c| (c.label.as_str(), c.detail.as_str(), c.path.as_path()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Current checkout", "/repo", Path::new("/repo")),
+                ("tru-143-chips", "Add chips", Path::new("/wt/tru-143-chips")),
+                (
+                    "tru-142-review",
+                    "Fix review",
+                    Path::new("/wt/tru-142-review")
+                ),
+            ]
+        );
+        // No tasks: the checkout alone.
+        assert_eq!(checkout_choices(ws, [], same).len(), 1);
+    }
+
+    #[test]
+    fn checkout_label_names_the_task_worktree_or_the_checkout() {
+        let same = |a: &Path, b: &Path| a == b;
+        let ws = Path::new("/repo");
+        assert_eq!(checkout_label(ws, None, ws, same), "Current checkout");
+        assert_eq!(
+            checkout_label(Path::new("/wt/tru-143"), None, ws, same),
+            "tru-143"
+        );
+        assert_eq!(
+            checkout_label(ws, Some(Path::new("/wt/task-tree")), ws, same),
+            "task-tree"
+        );
     }
 
     #[test]
