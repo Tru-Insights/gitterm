@@ -1073,6 +1073,8 @@
     setBusy(false);
   };
 
+  window.__focusComposer = function () { promptEl.focus(); };
+
   refreshComposer();
   promptEl.focus();
 })();

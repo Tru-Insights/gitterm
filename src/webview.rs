@@ -314,6 +314,20 @@ pub fn show_only_agent_page(tab_id: Option<usize>) {
     });
 }
 
+/// Give agent tab `tab_id`'s page keyboard focus and put the caret in its
+/// composer, so typing goes straight into the chat after a tab switch. A
+/// hidden page may otherwise keep first-responder status.
+pub fn focus_agent_composer(tab_id: usize) {
+    with_existing_slot(WebviewSurface::Agent(tab_id), |slot| {
+        if let Some(webview) = slot.webview.as_ref() {
+            if let Err(e) = webview.focus() {
+                eprintln!("[agent-webview] focus failed for tab={tab_id}: {e}");
+            }
+            let _ = webview.evaluate_script("window.__focusComposer && window.__focusComposer()");
+        }
+    });
+}
+
 /// Hide every agent page.
 pub fn hide_agent_pages() {
     show_only_agent_page(None);

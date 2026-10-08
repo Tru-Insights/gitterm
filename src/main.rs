@@ -3100,6 +3100,11 @@ impl TabState {
     }
 
     /// Path of the file currently shown in the file viewer overlay, if any.
+    /// A conversation picked in the Chats panel is being previewed.
+    fn chat_preview_open(&self) -> bool {
+        self.sidebar_mode == SidebarMode::Chats && self.selected_chat_id.is_some()
+    }
+
     fn viewing_file_path(&self) -> Option<&Path> {
         self.file_viewer().map(|fv| fv.path.as_path())
     }
@@ -12764,6 +12769,7 @@ fi
                 reset_agent_webview(tab_id);
                 set_agent_webview_tab_id(tab_id, session.configured_permission_mode().as_deref());
                 replay_agent_conversation_in_webview(tab_id, &session.conversation);
+                webview::focus_agent_composer(tab_id);
                 return Task::none();
             }
             Event::AgentHistoryLoaded(tab_id, history) => {
@@ -15885,49 +15891,15 @@ fi
                 }
             }
             Event::SelectChat(id) => {
-                let already_selected = self
-                    .active_tab()
-                    .is_some_and(|tab| tab.selected_chat_id.as_deref() == Some(id.as_str()));
-                if already_selected {
-                    if let Some(tab) = self.active_tab_mut() {
-                        tab.selected_chat_id = None;
-                    }
-                    return Task::none();
-                }
-                let source = self.find_chat_entry(&id).map(|(remote_id, entry)| {
-                    (
-                        remote_id.map(str::to_string),
-                        entry.path.clone(),
-                        entry.backend,
-                    )
-                });
-                if let Some(tab) = self.active_tab_mut() {
-                    tab.selected_chat_id = Some(id.clone());
-                }
-                if let Some((remote_id, path, backend)) = source {
-                    return match remote_id {
-                        None => Self::request_chat_preview(id, path, backend),
-                        Some(remote_id) => {
-                            let Some(agent) = self.fresh_remote_agent_config(&remote_id) else {
-                                eprintln!(
-                                    "[chats] no config for remote {remote_id}; cannot preview {id}"
-                                );
-                                return Task::none();
-                            };
-                            Self::request_remote_chat_preview(
-                                id,
-                                path,
-                                backend,
-                                remote_agent_client_config(agent),
-                            )
-                        }
-                    };
-                }
+                let task = self.select_chat(id);
+                self.settle_agent_surface();
+                return task;
             }
             Event::CloseChatPreview => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.selected_chat_id = None;
                 }
+                self.settle_agent_surface();
             }
             Event::ChatPreviewLoaded(id, preview) => {
                 self.chat_preview = Some((id, preview));
@@ -17289,7 +17261,10 @@ fi
     fn active_tab_surface(&self) -> ActiveTabSurface {
         match self.active_tab() {
             Some(tab) if matches!(tab.kind, TabKind::Agent(_)) => {
-                if tab.file_viewer().is_some() || tab.selected_file.is_some() {
+                if tab.file_viewer().is_some()
+                    || tab.selected_file.is_some()
+                    || tab.chat_preview_open()
+                {
                     ActiveTabSurface::AgentFileOverlay
                 } else {
                     ActiveTabSurface::AgentChat(tab.id)
@@ -17530,6 +17505,7 @@ fi
         let (x, y, width, height) = self.calculate_webview_bounds();
         webview::update_bounds(WebviewSurface::Agent(tab_id), x, y, width, height);
         webview::show_only_agent_page(Some(tab_id));
+        webview::focus_agent_composer(tab_id);
         // The tab already has a page, so nothing is pushed past the cap.
         for evicted in promote_agent_page(&mut self.agent_pages, tab_id, MAX_AGENT_PAGES) {
             self.destroy_agent_page(evicted, "evicted");
@@ -17864,6 +17840,49 @@ fi
             }
         };
         Task::batch([surface_task, history_task])
+    }
+
+    /// Toggle the Chats-panel selection and fetch the preview for a newly
+    /// selected conversation. Callers settle the agent surface afterwards:
+    /// on a chat tab the preview covers the page.
+    fn select_chat(&mut self, id: String) -> Task<Event> {
+        let already_selected = self
+            .active_tab()
+            .is_some_and(|tab| tab.selected_chat_id.as_deref() == Some(id.as_str()));
+        if already_selected {
+            if let Some(tab) = self.active_tab_mut() {
+                tab.selected_chat_id = None;
+            }
+            return Task::none();
+        }
+        let source = self.find_chat_entry(&id).map(|(remote_id, entry)| {
+            (
+                remote_id.map(str::to_string),
+                entry.path.clone(),
+                entry.backend,
+            )
+        });
+        if let Some(tab) = self.active_tab_mut() {
+            tab.selected_chat_id = Some(id.clone());
+        }
+        if let Some((remote_id, path, backend)) = source {
+            return match remote_id {
+                None => Self::request_chat_preview(id, path, backend),
+                Some(remote_id) => {
+                    let Some(agent) = self.fresh_remote_agent_config(&remote_id) else {
+                        eprintln!("[chats] no config for remote {remote_id}; cannot preview {id}");
+                        return Task::none();
+                    };
+                    Self::request_remote_chat_preview(
+                        id,
+                        path,
+                        backend,
+                        remote_agent_client_config(agent),
+                    )
+                }
+            };
+        }
+        Task::none()
     }
 
     /// Kick off the transcript read-back for a resumed chat tab the first
@@ -21468,6 +21487,11 @@ fi
                     // Git diff for a selected file covers the chat the same
                     // way it covers a terminal; the Agent surface is hidden.
                     freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
+                } else if tab.chat_preview_open() {
+                    // A chat picked in the Chats panel previews over the chat
+                    // page. Unlike terminal tabs the page stays while the
+                    // panel is merely open: nothing typed there can leak.
+                    freeze_time!("view_chat_preview", { self.view_chat_preview(tab) })
                 } else {
                     // Agent tabs render the chat UI in the Agent webview surface,
                     // positioned by `calculate_webview_bounds` and managed via
