@@ -285,3 +285,15 @@ say that in the chat, and maybe have a default for code reviews."
   delegation record needed) or `codex` (Option B runner, independent model). The Review… button and
   `review_request` use the default unless the request names a reviewer. Recommended order: ship the
   Claude-subagent reviewer first (a prompt template plus the Review… button), then Codex via S3/S4.
+
+## 7. Decisions taken (2026-10-08, ticket TRU-142)
+
+Tracey took the recommended defaults for D1-D9: card with one-click Send (auto-send later as a toggle);
+default target branch-vs-base when the branch has commits, else uncommitted; reviews run in the live checkout
+with a stale banner; requests show in the parent tab and the Needs-you inbox; delegations stored in tasks.json;
+`delegate_task` pre-approved like the other task tools; cap of 2 concurrent reviews and Codex's default model;
+transcript slices (S7) dropped until summaries prove insufficient; default reviewer is a Claude subagent on Opus,
+Codex second.
+
+Build order: **R1** Claude-subagent reviewer (review prompt template, Review… button, nested subagent cards),
+then S0, S1, S2, S3, S4, S5, S6 as written above. Branch `tracey/tru-142-agent-handoff-ux` off the TRU-140 spike.
