@@ -229,11 +229,23 @@ Windows CI exists.
   lines). Don't split into submodules unless the change is large and contained.
 - **Supporting modules**: `src/log_server.rs` (warp localhost server),
   `src/plans_viewer.rs` (plans viewer routes), `src/markdown.rs`,
-  `src/webview.rs` (singleton wry WebView), `src/services.rs`, `src/agent.rs`,
+  `src/webview.rs` (wry WebView surfaces), `src/services.rs`, `src/agent.rs`,
   `src/tab/` (TabKind enum + AgentSession), `src/events.rs`, `src/config.rs`,
   `src/theme.rs`.
-- **Embedded WebView**: one wry `WebView` instance per app, repurposed for
-  markdown viewer / Excalidraw / agent chat / plans viewer. See
+- **Embedded WebView**: wry child `WebView` surfaces keyed by
+  `webview::WebviewSurface`. `Agent(tab_id)` is one agent tab's chat page (its
+  own IPC handler installed at construction; the page holds its tab id via
+  `window.__setTabId`). Each chat tab keeps its own page alive, hidden, while
+  another tab, a file or the plans viewer is shown, and keeps receiving the
+  tab's events, so switching back is show/hide with scroll, tool cards and
+  composer draft intact. At most `MAX_AGENT_PAGES` (4) pages live per process
+  (`App::agent_pages`, most recently shown first, `promote_agent_page`); the
+  least recently shown is destroyed and rebuilt and replayed from
+  `AgentSession.conversation` (the source of truth) on its next show, via
+  `AgentWebviewCreated`. A closed tab's page is destroyed
+  (`prune_agent_pages`). `Viewer` shows markdown / HTML / Excalidraw or the
+  plans viewer. At most one surface is visible, Viewer over the agent page
+  (`visible_webview_surface` in `main.rs`). See
   `webview::set_pending_content`, `set_pending_url`, `navigate_to_url`.
 - **Terminal**: uses `iced_term` fork at `../iced_term_fork`. The Windows CI
   workflow clones from `https://github.com/Tru-Insights/iced_term.git` master
@@ -252,6 +264,25 @@ Windows CI exists.
 - V5 must remain runtime-isolated from V4 and V3: do not reuse earlier config paths,
   bundle identifiers, app names, log-server port ranges, helper state, temporary
   artifact names, or future browser profiles.
+- **A second instance must never share the real config dir.** Tracey runs the
+  installed V5 all day. `workspaces.json`, `tasks.json`, `profiles.json`,
+  `remote-agents.json`, `browser-profile/`, `worktrees/` and `task-briefs/`
+  are shared across instances and each instance writes back its whole view
+  (last writer wins), so a dev or test launch against `~/.config/gitterm-v5`
+  can erase or resurrect tabs, tasks and chat sessions in the running app and
+  contend for the Chrome profile lock. Every dev/test launch, by an agent or
+  in a try-it checklist, sets `GITTERM_V5_CONFIG_DIR` to an absolute isolated
+  directory, seeded with copies of the files above when the test needs real
+  workspaces:
+
+  ```
+  D=$HOME/.config/gitterm-v5-<purpose>
+  mkdir -p "$D" && cp ~/.config/gitterm-v5/{workspaces.json,tasks.json,profiles.json} "$D"/ 2>/dev/null
+  GITTERM_V5_CONFIG_DIR="$D" cargo run
+  ```
+
+  Never kill, signal, or replace the bundle of the running instance; prefer a
+  headless example over driving the GUI to verify a change.
 
 ### Workspaces
 
