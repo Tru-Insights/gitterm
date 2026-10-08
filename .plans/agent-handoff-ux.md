@@ -297,3 +297,114 @@ Codex second.
 
 Build order: **R1** Claude-subagent reviewer (review prompt template, Review… button, nested subagent cards),
 then S0, S1, S2, S3, S4, S5, S6 as written above. Branch `tracey/tru-142-agent-handoff-ux` off the TRU-140 spike.
+
+## 8. Codex review output contract (S0, verified 2026-10-08)
+
+**Versions and setup.** `codex-cli 0.161.0`, default model from `~/.codex/config.toml` (the model name is not in
+the events). Scratch Python repo: `main` with one commit, branch `feature` with one commit planting two
+off-by-ones (`moving_average`, `last_n`), plus an uncommitted change that indexes `matches[0]` unchecked.
+Each run in its own copy of that repo, five in parallel, stdout/stderr/exit code captured separately:
+```
+codex exec review --uncommitted --json -o last-uncommitted.md                 rc 0, 40 s, 1 finding
+codex exec review --base main --json -o last-base.md                          rc 0, 55 s, 3 findings
+codex exec review --commit <feature sha> --json -o last-commit.md             rc 0, 43 s, 2 findings
+codex exec review --uncommitted --output-schema schema.json --json -o ...     rc 0, 33 s, 1 finding
+codex exec review --uncommitted --ephemeral --json -o ...                     rc 0, 55 s, 2 findings
+codex exec review --uncommitted --json -o ...   (docstring-only change)       rc 0, 17 s, 0 findings
+```
+Fixtures in `tests/fixtures/codex/`: `review-{uncommitted,base,commit,schema,ephemeral,clean}.jsonl` (stdout, 10
+lines each, 12-17 KB), `review-{uncommitted,base,commit,clean}.last.md` (the `-o` file) and
+`review-{uncommitted,base,commit,clean}.rollout.jsonl` (5-line excerpt of the session file, see below). Scratch paths
+are `/scratch/repo`; `ls` owner and git author are anonymised; nothing else was edited.
+
+**Headline: `--json` stdout has no structured review event.** Every run emits the same ten lines:
+```
+{"type":"thread.started","thread_id":"01a11c9d-b01b-77f1-8ae8-36be47f37050"}
+{"type":"turn.started"}
+item.started / item.completed  {"item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc '...'",
+                                "aggregated_output":"...","exit_code":0,"status":"completed"}}   (x3, the model's own shell)
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"<rendered review>"}}
+{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,
+                                  "output_tokens":0,"reasoning_output_tokens":0}}
+```
+The findings exist only as text in the final `agent_message`, rendered as follows (`—` is U+2014, from `review-base.last.md`):
+```
+<overall_explanation>\n\nFull review comments:\n\n
+- [P2] Include the final complete moving-average window — /scratch/repo/stats.py:9-9\n  <body>\n\n
+- [P2] Return None when no user matches — /scratch/repo/stats.py:18-18\n  <body>\n\n ...
+```
+With one finding, the heading reads `Review comment:` instead of `Full review comments:`. With no findings the text is
+only the explanation (`review-clean.last.md`: "The only change expands the module docstring in stats.py. It does not
+alter behavior or introduce any actionable issues."). The `-o` file was byte-identical to the last
+`agent_message.text` in all 8 runs (6 above plus 2 sandbox probes; no trailing newline).
+
+**The structured review is in the session rollout, not on stdout.** `~/.codex/sessions/YYYY/MM/DD/rollout-<local
+start time>-<thread_id>.jsonl` holds `event_msg` → `payload.type:"item_completed"` → `payload.item`:
+```
+{"type":"EnteredReviewMode","id":"…","target":{"type":"baseBranch","branch":"main"},"user_facing_hint":"changes against 'main'"}
+   target variants seen: {"type":"uncommittedChanges"}, {"type":"commit","sha":"09889ca6…","title":null}
+{"type":"ExitedReviewMode","id":"…","review_output":{
+   "findings":[{"title":"[P2] Return None when no user matches","body":"If `users` is empty …",
+                "confidence_score":1.0,"priority":2,
+                "code_location":{"absolute_file_path":"/scratch/repo/stats.py","line_range":{"start":18,"end":18}}}],
+   "overall_correctness":"patch is incorrect",          ("patch is correct" in the clean run)
+   "overall_explanation":"Direct execution confirms …","overall_confidence_score":1.0}}
+```
+With `--ephemeral`, no rollout file is written, so this source is gone. The rollout's `session_meta` line carries
+`creator_user_id` / `creator_account_id`; the fixtures keep only the review items, `AgentMessage`,
+`task_started` and `task_complete`. This is Codex's internal persistence format: the item names moved to PascalCase
+`item_completed` in this version, so it is not a public contract.
+
+**Flags and options.**
+- `--output-schema` composes syntactically with `review` (rc 0) but has **no observable effect**: the final
+  message is the same rendered text, not JSON matching the schema. Do not use it.
+- `[PROMPT]` and a target flag are mutually exclusive (`--uncommitted x` → clap error, rc 2).
+- `--base main` diffs the merge-base **against the working tree** (`git diff 08254e1…` with no second side). It
+  reported the uncommitted bug alongside the branch bugs, so base mode means branch plus dirty changes.
+- File references: `absolute_file_path` / the text path is the canonical absolute path (`/private/tmp/...`, not
+  `/tmp`). Lines are 1-based inclusive ranges, usually single lines. For `--uncommitted` and `--base`, line numbers
+  refer to the working tree. For `--commit`, they refer to **the commit's version** of the file: `last_n` was
+  reported at line 25 while the working tree has it at line 23.
+- Severity: `priority` is an integer 0-3 in the rollout. In the text it appears only as the `[Pn] ` title prefix, which
+  the model writes; all 11 findings seen used it. Confidence and overall correctness appear only in the rollout.
+- Token usage: `turn.completed.usage` was **all zeros** in every run, and the rollout has no token-count event. Do not
+  report review cost from it.
+- stderr: four of the six main runs logged one or two benign `ERROR codex_models_manager::manager: failed to refresh
+  available models: request timed out` lines with rc 0. Do not treat non-empty stderr as failure.
+
+**Sandbox and repo writes.** `exec review` has no `-s/--sandbox` flag, and neither the stdout events nor
+`session_meta` report a sandbox. Two custom-prompt probes (`codex exec review "<run touch probe.txt; touch
+../outside.txt>"`, one with `-c 'projects."<repo>".trust_level="trusted"'`) got `Operation not permitted` for both
+writes. The model's git calls also failed to create `/tmp` cache files. The effective sandbox is read-only, whether
+or not the project is trusted (the override's effect is not confirmed separately).
+`git status --porcelain --ignored` was identical before and after all runs, so review mode wrote nothing to the
+repo. Codex itself writes the `-o` file (outside the sandbox, any path) and the rollout file (unless `--ephemeral`).
+
+**Incidental, do not parse:** the `command_execution` items. They are the model's own exploration and depend on
+the user's setup; here `~/.codex/AGENTS.md` made every review start by reading `~/.agents/model-workflow.md`, and
+that text appears in `item_0` of the fixtures. Also ignore `item_N` ids, the usage numbers, the stderr
+log lines, the wording of the explanation, and whether the title carries a `[Pn]` prefix.
+
+**Parser recommendation for S3.**
+1. Spawn `codex exec review <target> --json -o <config>/delegations/<id>.last.md` without `--ephemeral` or
+   `--output-schema`. Record `thread.started.thread_id` as `reviewer.conversation_id`. Success means
+   `turn.completed` was seen and the exit code was 0. Neither `turn.failed` nor `error` events appeared in these runs:
+   treat any other terminal state as `failed`, with the stderr tail.
+2. Final text = the last `item.completed` with `item.type == "agent_message"` → `item.text`. Fall back to the `-o`
+   file if the stream was cut.
+3. Structured findings, preferred source: locate `rollout-*-<thread_id>.jsonl` under `$CODEX_HOME/sessions` (or
+   `~/.codex`), take the last `payload.item.type == "ExitedReviewMode"` and map:
+   `priority` → `P{n}`, `title` (strip a leading `[Pn] `), `body`, `code_location.absolute_file_path` (made
+   repo-relative after canonicalising both sides), `line_range.start/end`, `confidence_score`. Map
+   `overall_correctness` `"patch is correct"`/`"patch is incorrect"` → `correct`/`needs_changes`, and anything else →
+   `unknown`. `overall_explanation` → `summary`. Set `structured: true`.
+4. Fallback when the rollout is missing or unreadable: parse the final text. Split on
+   `\n\n(Review comment|Full review comments):\n\n`; the summary is the part before the split. Each finding header matches
+   `^- \[P([0-3])\] (.+) — (/.+):(\d+)-(\d+)$`, and the body is the following lines minus their 2-space indent.
+   Verdict: `needs_changes` if at least one finding, else `unknown`. Set `structured: true` only if every
+   bullet parsed.
+5. Last resort: the whole text as `summary`, with `findings: []` and `structured: false`.
+
+Unit tests should cover (3) with `review-*.rollout.jsonl`, (4) with `review-*.last.md` (1 finding, several,
+none), and the stream reading with `review-*.jsonl`. The S3 parser must not depend on any other field of the stdout
+items.
