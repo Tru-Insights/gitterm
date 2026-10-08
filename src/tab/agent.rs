@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use gitterm::harness::claude::{ClaudeSession, ClaudeSessionConfig};
+use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSession, ClaudeSessionConfig};
 use gitterm::harness::transcript::TranscriptEntry;
 use gitterm::harness::HarnessEvent;
 use serde::{Deserialize, Serialize};
@@ -249,8 +249,13 @@ impl AgentSession {
     }
 
     /// The Claude process settings for this tab. `model` "default" (or
-    /// empty) leaves the model to the user's Claude settings.
-    pub(crate) fn claude_session_config(&self, cwd: PathBuf) -> Option<ClaudeSessionConfig> {
+    /// empty) leaves the model to the user's Claude settings. `mcp_servers`
+    /// are the GitTerm MCP servers the app attaches (task and browser).
+    pub(crate) fn claude_session_config(
+        &self,
+        cwd: PathBuf,
+        mcp_servers: Vec<ClaudeMcpServer>,
+    ) -> Option<ClaudeSessionConfig> {
         let AgentBackendConfig::Claude {
             model,
             permission_mode,
@@ -269,6 +274,7 @@ impl AgentSession {
             effort: effort.clone(),
             resume: self.session_id.clone(),
             wire_log_dir: std::env::var_os(CLAUDE_WIRE_LOG_ENV).map(PathBuf::from),
+            mcp_servers,
         })
     }
 

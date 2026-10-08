@@ -12417,6 +12417,18 @@ fi
                 let mut task_started: Option<String> = None;
                 let mut harness_bridge: Option<tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>> =
                     None;
+                // A native Claude spawn gets the same GitTerm MCP servers a
+                // terminal-launched `claude` does.
+                let mut claude_mcp_servers: Vec<gitterm::harness::claude::ClaudeMcpServer> = self
+                    .task_mcp
+                    .iter()
+                    .map(TaskMcpConnection::claude_mcp_server)
+                    .chain(
+                        self.browser_mcp
+                            .iter()
+                            .map(BrowserMcpConnection::claude_mcp_server),
+                    )
+                    .collect();
                 'outer_submit: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id != tab_id {
@@ -12443,7 +12455,10 @@ fi
                                         session.session_id = None;
                                     }
                                 }
-                                let Some(config) = session.claude_session_config(repo_path) else {
+                                let Some(config) = session.claude_session_config(
+                                    repo_path,
+                                    std::mem::take(&mut claude_mcp_servers),
+                                ) else {
                                     return Task::none();
                                 };
                                 let (claude, rx) =
@@ -29783,7 +29798,7 @@ mod tests {
             ]
         );
         let config = session
-            .claude_session_config(PathBuf::from("/tmp"))
+            .claude_session_config(PathBuf::from("/tmp"), Vec::new())
             .expect("claude config");
         assert_eq!(config.model, None, "\"default\" defers to Claude settings");
         assert_eq!(config.permission_mode, "default");

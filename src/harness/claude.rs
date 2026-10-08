@@ -504,6 +504,34 @@ pub fn permission_result(
 // Session
 // ---------------------------------------------------------------------------
 
+/// One MCP server attached to a session through `--mcp-config`, mirroring
+/// what GitTerm injects into terminal-launched `claude` commands.
+#[derive(Clone)]
+pub struct ClaudeMcpServer {
+    /// The `{"mcpServers": {…}}` document passed as `--mcp-config=<json>`.
+    /// Secrets must appear only as `${VAR}` references, which Claude expands
+    /// from the child environment, never as literal values.
+    pub config: Value,
+    /// Tools pre-approved through `--allowedTools=`; empty adds no flag.
+    pub allowed_tools: Vec<String>,
+    /// Child environment the config's `${VAR}` references resolve from.
+    /// Values may be secrets: they never reach argv, logs or `Debug`.
+    pub env: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for ClaudeMcpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeMcpServer")
+            .field("config", &self.config)
+            .field("allowed_tools", &self.allowed_tools)
+            .field(
+                "env",
+                &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaudeSessionConfig {
     pub cwd: PathBuf,
@@ -516,6 +544,8 @@ pub struct ClaudeSessionConfig {
     /// When set, every stdin/stdout line is appended to
     /// `<dir>/claude-<pid>-{stdin,stdout}.jsonl`.
     pub wire_log_dir: Option<PathBuf>,
+    /// GitTerm MCP servers to attach (task and browser controls).
+    pub mcp_servers: Vec<ClaudeMcpServer>,
 }
 
 impl ClaudeSessionConfig {
@@ -544,6 +574,14 @@ impl ClaudeSessionConfig {
         if let Some(effort) = &self.effort {
             args.push("--effort".into());
             args.push(effort.clone());
+        }
+        // The `=` form keeps each JSON document a single value of these
+        // variadic options; repeated flags accumulate, one pair per server.
+        for server in &self.mcp_servers {
+            args.push(format!("--mcp-config={}", server.config));
+            if !server.allowed_tools.is_empty() {
+                args.push(format!("--allowedTools={}", server.allowed_tools.join(",")));
+            }
         }
         if let Some(id) = &self.resume {
             args.push(format!("--resume={id}"));
@@ -749,6 +787,11 @@ async fn run_session(
     cmd.env_remove("NODE_OPTIONS")
         .env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts")
         .env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
+    // MCP bearer tokens travel only through the environment, exactly as
+    // terminal launches carry them.
+    for server in &config.mcp_servers {
+        cmd.envs(server.env.iter().map(|(key, value)| (key, value)));
+    }
 
     harness_log(&format!(
         "spawn: {} {} (cwd {})",
@@ -1389,6 +1432,7 @@ mod tests {
             effort: None,
             resume: Some("sid".into()),
             wire_log_dir: None,
+            mcp_servers: Vec::new(),
         };
         let args = cfg.args().join(" ");
         assert!(args.contains("--permission-prompt-tool stdio"));
@@ -1399,5 +1443,109 @@ mod tests {
         assert!(args.ends_with("--resume=sid"));
         assert!(!args.contains("--print"));
         assert!(!args.contains("--setting-sources"));
+    }
+
+    const SECRET: &str = "s3cret-bearer-value";
+
+    fn mcp_server(name: &str, token_env: &str, allowed: &[&str]) -> ClaudeMcpServer {
+        ClaudeMcpServer {
+            config: json!({
+                "mcpServers": {
+                    name: {
+                        "type": "http",
+                        "url": "http://127.0.0.1:1/mcp",
+                        "headers": { "Authorization": format!("Bearer ${{{token_env}}}") },
+                    },
+                },
+            }),
+            allowed_tools: allowed.iter().map(|tool| tool.to_string()).collect(),
+            env: vec![(token_env.to_string(), SECRET.to_string())],
+        }
+    }
+
+    fn config_with(mcp_servers: Vec<ClaudeMcpServer>) -> ClaudeSessionConfig {
+        ClaudeSessionConfig {
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            permission_mode: "default".into(),
+            effort: None,
+            resume: Some("sid".into()),
+            wire_log_dir: None,
+            mcp_servers,
+        }
+    }
+
+    fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+        let prefix = format!("{flag}=");
+        args.iter()
+            .filter_map(|arg| arg.strip_prefix(prefix.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn args_without_mcp_servers_have_no_mcp_flags() {
+        let args = config_with(Vec::new()).args();
+        assert!(args
+            .iter()
+            .all(|arg| !arg.starts_with("--mcp-config") && !arg.starts_with("--allowedTools")));
+    }
+
+    #[test]
+    fn args_attach_one_mcp_server_with_the_token_left_in_the_environment() {
+        let args = config_with(vec![mcp_server(
+            "gitterm_tasks",
+            "TASK_TOKEN",
+            &["mcp__gitterm_tasks"],
+        )])
+        .args();
+        let configs = flag_values(&args, "--mcp-config");
+        assert_eq!(configs.len(), 1);
+        let config: Value = serde_json::from_str(configs[0]).expect("config is one JSON value");
+        assert_eq!(
+            config["mcpServers"]["gitterm_tasks"]["headers"]["Authorization"],
+            "Bearer ${TASK_TOKEN}"
+        );
+        assert_eq!(flag_values(&args, "--allowedTools"), ["mcp__gitterm_tasks"]);
+        assert_eq!(args.last().map(String::as_str), Some("--resume=sid"));
+        assert!(args.iter().all(|arg| !arg.contains(SECRET)));
+    }
+
+    #[test]
+    fn args_attach_two_mcp_servers_as_repeated_flags() {
+        let servers = vec![
+            mcp_server("gitterm_tasks", "TASK_TOKEN", &["mcp__gitterm_tasks"]),
+            mcp_server(
+                "gitterm_browser",
+                "BROWSER_TOKEN",
+                &[
+                    "mcp__gitterm_browser__browser_status",
+                    "mcp__gitterm_browser__browser_snapshot",
+                ],
+            ),
+        ];
+        let cfg = config_with(servers);
+        let args = cfg.args();
+        let names: Vec<String> = flag_values(&args, "--mcp-config")
+            .into_iter()
+            .map(|raw| {
+                let config: Value = serde_json::from_str(raw).expect("config is one JSON value");
+                let servers = config["mcpServers"].as_object().expect("mcpServers object");
+                assert_eq!(servers.len(), 1);
+                servers.keys().next().cloned().unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(names, ["gitterm_tasks", "gitterm_browser"]);
+        assert_eq!(
+            flag_values(&args, "--allowedTools"),
+            [
+                "mcp__gitterm_tasks",
+                "mcp__gitterm_browser__browser_status,mcp__gitterm_browser__browser_snapshot",
+            ]
+        );
+        assert!(args.iter().all(|arg| !arg.contains(SECRET)));
+        assert!(
+            !format!("{cfg:?}").contains(SECRET),
+            "Debug must redact env values"
+        );
     }
 }

@@ -102,6 +102,7 @@ async fn main() {
         effort: None,
         resume: None,
         wire_log_dir: Some(workdir.with_extension("wire")),
+        mcp_servers: Vec::new(),
     });
     let mut failures = Vec::new();
     let mut check = |name: &str, ok: bool, detail: String| {
