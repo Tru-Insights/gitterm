@@ -4853,7 +4853,8 @@ enum ActiveTabSurface {
     Other,
     /// An agent tab showing its chat.
     AgentChat(usize),
-    /// An agent tab whose chat is covered by its file viewer overlay.
+    /// An agent tab whose chat is covered by its file viewer overlay or by
+    /// the git diff panel for a selected file.
     AgentFileOverlay,
 }
 
@@ -13310,6 +13311,8 @@ fi
                     tab.diff_syntax_lines = None;
                     tab.diff_syntax_notice = None;
                 }
+                // A chat tab's diff panel was covering the Agent surface.
+                self.settle_agent_surface();
             }
             Event::KeyPressed(key, modifiers) => {
                 self.current_modifiers = modifiers;
@@ -14824,183 +14827,9 @@ fi
                 return self.close_task_tab(prompt);
             }
             Event::SetSidebarMode(mode) => {
-                self.task_rail_pinned = mode == SidebarMode::Tasks;
-                let active_source = self.source_for_active_tab().ok();
-                let active_caps = active_source
-                    .as_ref()
-                    .map(|source| source.capabilities())
-                    .unwrap_or_else(SourceCapabilities::none);
-                let active_workspace_is_remote = self.active_workspace_is_remote();
-                let active_workspace_is_remote_agent =
-                    self.active_workspace().is_some_and(|workspace| {
-                        self.remote_agent_id_for_workspace(workspace).is_some()
-                    });
-                if mode == SidebarMode::Remote && !active_workspace_is_remote {
-                    return Task::none();
-                }
-
-                // Expand sidebar if collapsed when switching modes
-                if self.sidebar_collapsed {
-                    self.sidebar_collapsed = false;
-                }
-                // Hide WebView when switching modes (but keep agent webview alive
-                // — it's the agent tab's primary content, not a modal overlay).
-                self.dismiss_viewer_surface();
-
-                let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
-                if let Some(tab) = self.active_tab_mut() {
-                    if tab.sidebar_mode != mode {
-                        if active_workspace_is_remote
-                            && !active_workspace_is_remote_agent
-                            && mode != SidebarMode::Remote
-                        {
-                            tab.agent_sidebar.selected_capture_idx = None;
-                            tab.agent_sidebar.conversation = None;
-                            tab.close_file_viewer();
-                            tab.selected_file = None;
-                            tab.diff_lines.clear();
-                            tab.diff_load_in_progress = false;
-                            tab.diff_load_started_at = None;
-                            tab.diff_syntax_lines = None;
-                            tab.diff_syntax_notice = None;
-                            tab.sidebar_mode = mode;
-                            return Task::none();
-                        }
-                        match mode {
-                            SidebarMode::Git => {
-                                // Switching to Git mode - clear file viewer and refresh status
-                                tab.agent_sidebar.selected_capture_idx = None;
-                                tab.agent_sidebar.conversation = None;
-                                tab.close_file_viewer();
-                                tab.diff_load_in_progress = false;
-                                tab.diff_load_started_at = None;
-                                tab.last_poll = Instant::now();
-                                tab.git_status_loading = true;
-                                let tab_id = tab.id;
-                                let repo_path = tab.repo_path.clone();
-                                let load_worktrees = tab.git_view_mode == GitViewMode::Worktrees
-                                    && active_caps.git_worktrees;
-                                if load_worktrees {
-                                    tab.worktrees_loading = true;
-                                    tab.last_worktrees_poll = Instant::now();
-                                }
-                                let Some(source) = active_source else {
-                                    tab.git_status_loading = false;
-                                    tab.sidebar_mode = mode;
-                                    return Task::none();
-                                };
-                                tab.sidebar_mode = mode;
-                                self.mark_log_server_dirty();
-                                let status_task = Self::request_source_git_status(
-                                    source,
-                                    tab_id,
-                                    repo_path.clone(),
-                                );
-                                if load_worktrees {
-                                    let worktrees_repo_path =
-                                        active_workspace_dir.unwrap_or_else(|| repo_path.clone());
-                                    return Task::batch([
-                                        status_task,
-                                        Self::request_git_worktrees(tab_id, worktrees_repo_path),
-                                    ]);
-                                }
-                                return status_task;
-                            }
-                            SidebarMode::Files => {
-                                // Switching to Files mode - clear git selection
-                                tab.agent_sidebar.selected_capture_idx = None;
-                                tab.agent_sidebar.conversation = None;
-                                tab.selected_file = None;
-                                tab.diff_lines.clear();
-                                tab.diff_load_in_progress = false;
-                                tab.diff_load_started_at = None;
-                                tab.diff_syntax_lines = None;
-                                tab.diff_syntax_notice = None;
-                                tab.sidebar_mode = mode;
-                                let dir = tab.files.dir.clone();
-                                return self.browse_active_tab_to(dir);
-                            }
-                            SidebarMode::Claude => {
-                                // Switching to Claude mode - clear file viewer and git selection
-                                tab.agent_sidebar.selected_capture_idx = None;
-                                tab.agent_sidebar.conversation = None;
-                                tab.close_file_viewer();
-                                tab.selected_file = None;
-                                tab.diff_lines.clear();
-                                tab.diff_load_in_progress = false;
-                                tab.diff_load_started_at = None;
-                                tab.diff_syntax_lines = None;
-                                tab.diff_syntax_notice = None;
-                                tab.fetch_claude_config();
-                            }
-                            SidebarMode::Agent => {
-                                // Switching to Agent mode - clear file viewer and git selection
-                                tab.close_file_viewer();
-                                tab.selected_file = None;
-                                tab.diff_lines.clear();
-                                tab.diff_load_in_progress = false;
-                                tab.diff_load_started_at = None;
-                                tab.diff_syntax_lines = None;
-                                tab.diff_syntax_notice = None;
-                                let task = tab.fetch_agent_activity();
-                                tab.sidebar_mode = mode;
-                                return task;
-                            }
-                            SidebarMode::Plans => {
-                                // Switching to Plans mode - clear file viewer and git selection.
-                                // Plan list is read fresh in view_plans_sidebar on each render.
-                                tab.close_file_viewer();
-                                tab.selected_file = None;
-                                tab.diff_lines.clear();
-                                tab.diff_load_in_progress = false;
-                                tab.diff_load_started_at = None;
-                                tab.diff_syntax_lines = None;
-                                tab.diff_syntax_notice = None;
-                            }
-                            SidebarMode::Chats => {
-                                // Switching to Chats mode - clear other detail panes;
-                                // the index refreshes in the background if stale.
-                                tab.agent_sidebar.selected_capture_idx = None;
-                                tab.agent_sidebar.conversation = None;
-                                tab.close_file_viewer();
-                                tab.selected_file = None;
-                                tab.diff_lines.clear();
-                                tab.diff_load_in_progress = false;
-                                tab.diff_load_started_at = None;
-                                tab.diff_syntax_lines = None;
-                                tab.diff_syntax_notice = None;
-                                tab.sidebar_mode = mode;
-                                return self.refresh_chat_index_if_stale();
-                            }
-                            SidebarMode::Tasks => {
-                                tab.agent_sidebar.selected_capture_idx = None;
-                                tab.agent_sidebar.conversation = None;
-                                tab.close_file_viewer();
-                                tab.selected_file = None;
-                                tab.diff_lines.clear();
-                                tab.diff_load_in_progress = false;
-                                tab.diff_load_started_at = None;
-                                tab.diff_syntax_lines = None;
-                                tab.diff_syntax_notice = None;
-                            }
-                            SidebarMode::Remote => {
-                                // Switching to Remote mode - clear local file/git detail panes.
-                                tab.agent_sidebar.selected_capture_idx = None;
-                                tab.agent_sidebar.conversation = None;
-                                tab.close_file_viewer();
-                                tab.selected_file = None;
-                                tab.diff_lines.clear();
-                                tab.diff_load_in_progress = false;
-                                tab.diff_load_started_at = None;
-                                tab.diff_syntax_lines = None;
-                                tab.diff_syntax_notice = None;
-                                tab.sidebar_mode = mode;
-                                return self.refresh_remote_sessions();
-                            }
-                        }
-                        tab.sidebar_mode = mode;
-                    }
-                }
+                let task = self.set_sidebar_mode(mode);
+                self.settle_agent_surface();
+                return task;
             }
             Event::SetGitViewMode(mode) => {
                 let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
@@ -17259,7 +17088,7 @@ fi
     fn active_tab_surface(&self) -> ActiveTabSurface {
         match self.active_tab() {
             Some(tab) if matches!(tab.kind, TabKind::Agent(_)) => {
-                if tab.file_viewer().is_some() {
+                if tab.file_viewer().is_some() || tab.selected_file.is_some() {
                     ActiveTabSurface::AgentFileOverlay
                 } else {
                     ActiveTabSurface::AgentChat(tab.id)
@@ -17293,6 +17122,186 @@ fi
         webview::set_visible(WebviewSurface::Viewer, false);
         self.viewer_webview = ViewerWebview::None;
         self.settle_agent_surface();
+    }
+
+    /// Body of `Event::SetSidebarMode`; the caller settles the Agent
+    /// surface afterwards because several branches clear a diff that was
+    /// covering a chat tab.
+    fn set_sidebar_mode(&mut self, mode: SidebarMode) -> Task<Event> {
+        self.task_rail_pinned = mode == SidebarMode::Tasks;
+        let active_source = self.source_for_active_tab().ok();
+        let active_caps = active_source
+            .as_ref()
+            .map(|source| source.capabilities())
+            .unwrap_or_else(SourceCapabilities::none);
+        let active_workspace_is_remote = self.active_workspace_is_remote();
+        let active_workspace_is_remote_agent = self
+            .active_workspace()
+            .is_some_and(|workspace| self.remote_agent_id_for_workspace(workspace).is_some());
+        if mode == SidebarMode::Remote && !active_workspace_is_remote {
+            return Task::none();
+        }
+
+        // Expand sidebar if collapsed when switching modes
+        if self.sidebar_collapsed {
+            self.sidebar_collapsed = false;
+        }
+        // Hide WebView when switching modes (but keep agent webview alive
+        // — it's the agent tab's primary content, not a modal overlay).
+        self.dismiss_viewer_surface();
+
+        let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
+        if let Some(tab) = self.active_tab_mut() {
+            if tab.sidebar_mode != mode {
+                if active_workspace_is_remote
+                    && !active_workspace_is_remote_agent
+                    && mode != SidebarMode::Remote
+                {
+                    tab.agent_sidebar.selected_capture_idx = None;
+                    tab.agent_sidebar.conversation = None;
+                    tab.close_file_viewer();
+                    tab.selected_file = None;
+                    tab.diff_lines.clear();
+                    tab.diff_load_in_progress = false;
+                    tab.diff_load_started_at = None;
+                    tab.diff_syntax_lines = None;
+                    tab.diff_syntax_notice = None;
+                    tab.sidebar_mode = mode;
+                    return Task::none();
+                }
+                match mode {
+                    SidebarMode::Git => {
+                        // Switching to Git mode - clear file viewer and refresh status
+                        tab.agent_sidebar.selected_capture_idx = None;
+                        tab.agent_sidebar.conversation = None;
+                        tab.close_file_viewer();
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
+                        tab.last_poll = Instant::now();
+                        tab.git_status_loading = true;
+                        let tab_id = tab.id;
+                        let repo_path = tab.repo_path.clone();
+                        let load_worktrees = tab.git_view_mode == GitViewMode::Worktrees
+                            && active_caps.git_worktrees;
+                        if load_worktrees {
+                            tab.worktrees_loading = true;
+                            tab.last_worktrees_poll = Instant::now();
+                        }
+                        let Some(source) = active_source else {
+                            tab.git_status_loading = false;
+                            tab.sidebar_mode = mode;
+                            return Task::none();
+                        };
+                        tab.sidebar_mode = mode;
+                        self.mark_log_server_dirty();
+                        let status_task =
+                            Self::request_source_git_status(source, tab_id, repo_path.clone());
+                        if load_worktrees {
+                            let worktrees_repo_path =
+                                active_workspace_dir.unwrap_or_else(|| repo_path.clone());
+                            return Task::batch([
+                                status_task,
+                                Self::request_git_worktrees(tab_id, worktrees_repo_path),
+                            ]);
+                        }
+                        return status_task;
+                    }
+                    SidebarMode::Files => {
+                        // Switching to Files mode - clear git selection
+                        tab.agent_sidebar.selected_capture_idx = None;
+                        tab.agent_sidebar.conversation = None;
+                        tab.selected_file = None;
+                        tab.diff_lines.clear();
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
+                        tab.sidebar_mode = mode;
+                        let dir = tab.files.dir.clone();
+                        return self.browse_active_tab_to(dir);
+                    }
+                    SidebarMode::Claude => {
+                        // Switching to Claude mode - clear file viewer and git selection
+                        tab.agent_sidebar.selected_capture_idx = None;
+                        tab.agent_sidebar.conversation = None;
+                        tab.close_file_viewer();
+                        tab.selected_file = None;
+                        tab.diff_lines.clear();
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
+                        tab.fetch_claude_config();
+                    }
+                    SidebarMode::Agent => {
+                        // Switching to Agent mode - clear file viewer and git selection
+                        tab.close_file_viewer();
+                        tab.selected_file = None;
+                        tab.diff_lines.clear();
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
+                        let task = tab.fetch_agent_activity();
+                        tab.sidebar_mode = mode;
+                        return task;
+                    }
+                    SidebarMode::Plans => {
+                        // Switching to Plans mode - clear file viewer and git selection.
+                        // Plan list is read fresh in view_plans_sidebar on each render.
+                        tab.close_file_viewer();
+                        tab.selected_file = None;
+                        tab.diff_lines.clear();
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
+                    }
+                    SidebarMode::Chats => {
+                        // Switching to Chats mode - clear other detail panes;
+                        // the index refreshes in the background if stale.
+                        tab.agent_sidebar.selected_capture_idx = None;
+                        tab.agent_sidebar.conversation = None;
+                        tab.close_file_viewer();
+                        tab.selected_file = None;
+                        tab.diff_lines.clear();
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
+                        tab.sidebar_mode = mode;
+                        return self.refresh_chat_index_if_stale();
+                    }
+                    SidebarMode::Tasks => {
+                        tab.agent_sidebar.selected_capture_idx = None;
+                        tab.agent_sidebar.conversation = None;
+                        tab.close_file_viewer();
+                        tab.selected_file = None;
+                        tab.diff_lines.clear();
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
+                    }
+                    SidebarMode::Remote => {
+                        // Switching to Remote mode - clear local file/git detail panes.
+                        tab.agent_sidebar.selected_capture_idx = None;
+                        tab.agent_sidebar.conversation = None;
+                        tab.close_file_viewer();
+                        tab.selected_file = None;
+                        tab.diff_lines.clear();
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
+                        tab.sidebar_mode = mode;
+                        return self.refresh_remote_sessions();
+                    }
+                }
+                tab.sidebar_mode = mode;
+            }
+        }
+        Task::none()
     }
 
     /// Synchronously show or hide the Agent surface per
@@ -21179,6 +21188,10 @@ fi
                     // Same overlay as terminal tabs; the Agent surface is
                     // hidden underneath (markdown/HTML use the Viewer surface).
                     freeze_time!("view_file_content", { self.view_file_content(tab) })
+                } else if tab.selected_file.is_some() {
+                    // Git diff for a selected file covers the chat the same
+                    // way it covers a terminal; the Agent surface is hidden.
+                    freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
                 } else {
                     // Agent tabs render the chat UI in the Agent webview surface,
                     // positioned by `calculate_webview_bounds` and managed via
