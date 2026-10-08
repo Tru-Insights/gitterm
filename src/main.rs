@@ -35,6 +35,7 @@ mod webview;
 
 // New modules
 mod agent;
+mod chat_rank;
 mod config;
 mod events;
 mod tab;
@@ -4880,6 +4881,10 @@ pub enum Event {
     ChatsQueryChanged(String),
     ChatsScopeChanged(chats::ChatScope),
     ChatsBackendFilterChanged(Option<chats::ChatBackend>),
+    /// The Chats panel's "Relevant" ordering toggle (TRU-141).
+    ChatsRelevanceToggled,
+    /// A Jev relevance ranking of the local chats landed (TRU-141).
+    ChatsRanked(Result<gitterm::jev::Ranking, gitterm::jev::JevError>),
     RemoteChatIndexLoaded(String, Result<Vec<chats::ChatIndexEntry>, String>),
     /// Expand/collapse one machine section in the Everywhere scope
     /// ("local" or a remote id).
@@ -5191,6 +5196,10 @@ struct App {
     /// Preview tail for the most recently selected chat, keyed by session
     /// id so a stale load never renders under the wrong chat.
     chat_preview: Option<(String, chats::ChatPreview)>,
+    /// Jev client for relevance ordering (TRU-141); None without
+    /// TYPESAFE_API_KEY, and then the panel offers no toggle.
+    jev_client: Option<gitterm::jev::JevClient>,
+    chat_rank: chat_rank::ChatRankState,
     // Track whether the window has focus (skip terminal processing when unfocused)
     window_focused: bool,
     terminal_redraws: TerminalRedrawQueue,
@@ -6636,6 +6645,89 @@ impl App {
             })
             .filter(|entry| entry.matches_query(query))
             .collect()
+    }
+
+    /// The local chats the panel shows now (scope, backend filter and
+    /// query applied; newest first) and the workspace root they are
+    /// ranked against. None when the panel shows a remote machine's list
+    /// instead, which relevance ordering does not cover (TRU-141).
+    fn visible_local_chats(&self) -> Option<(PathBuf, Vec<&chats::ChatIndexEntry>)> {
+        let ws = self.active_workspace()?;
+        let remote = self.active_machine_remote_id().is_some();
+        let root = match &ws.location {
+            WorkspaceLocation::RemoteAgent { root, .. } => PathBuf::from(root),
+            _ => ws.dir.clone(),
+        };
+        let query = self.chat_query.to_lowercase();
+        let entries = match self.chat_scope {
+            chats::ChatScope::Workspace if !remote => {
+                self.filter_chat_entries(&self.chat_index, Some(&root), &query)
+            }
+            chats::ChatScope::Machine if !remote => {
+                self.filter_chat_entries(&self.chat_index, None, &query)
+            }
+            chats::ChatScope::Everywhere => {
+                self.filter_chat_entries(&self.chat_index, None, &query)
+            }
+            _ => return None,
+        };
+        Some((root, entries))
+    }
+
+    fn chat_rank_key(&self, root: &Path, entries: &[&chats::ChatIndexEntry]) -> chat_rank::RankKey {
+        chat_rank::RankKey::new(
+            &self.chat_query,
+            self.chat_scope,
+            self.chat_backend_filter,
+            root,
+            entries,
+        )
+    }
+
+    /// Rank the visible local chats with Jev when the "Relevant" toggle is
+    /// on and the cache does not already hold this state. One call at a
+    /// time: a change while one is in flight is ranked when it lands.
+    fn request_chat_rank(&mut self) -> Task<Event> {
+        let Some(client) = self.jev_client.clone() else {
+            return Task::none();
+        };
+        // Only while the toggle is on and the Chats panel is showing; the
+        // panel ranks again when it is opened.
+        let panel_open = self
+            .active_tab()
+            .is_some_and(|t| t.sidebar_mode == SidebarMode::Chats);
+        if !self.chat_rank.active() || !panel_open {
+            return Task::none();
+        }
+        let Some((root, entries)) = self.visible_local_chats() else {
+            return Task::none();
+        };
+        let key = self.chat_rank_key(&root, &entries);
+        let candidates = chat_rank::candidates(&entries, self.chat_preview.as_ref());
+        let tab = self.active_tab();
+        let branch = tab
+            .filter(|t| t.is_git_repo && !t.branch_name.is_empty())
+            .map(|t| t.branch_name.clone());
+        let recent_prompt = tab.and_then(|t| match &t.kind {
+            TabKind::Agent(session) => {
+                chat_rank::last_prompt(&session.conversation).map(str::to_string)
+            }
+            TabKind::Terminal(_) => None,
+        });
+        let query = (!self.chat_query.trim().is_empty()).then(|| self.chat_query.clone());
+        let Some(candidates) = self.chat_rank.begin(key, candidates) else {
+            return Task::none();
+        };
+        let ctx = gitterm::jev::RankContext {
+            workspace_dir: root,
+            branch,
+            query,
+            recent_prompt,
+        };
+        Task::perform(
+            async move { gitterm::jev::rank_chats(&client, &ctx, &candidates).await },
+            Event::ChatsRanked,
+        )
     }
 
     /// The machine the active workspace lives on (None = local).
@@ -10809,6 +10901,8 @@ impl App {
             machine_menu: None,
             remote_chat_indexes: HashMap::new(),
             chat_preview: None,
+            jev_client: gitterm::jev::JevClient::from_env(),
+            chat_rank: chat_rank::ChatRankState::default(),
         };
 
         if let Some(remote_file) = RemoteSessionsFile::load() {
@@ -17990,15 +18084,29 @@ fi
                 self.chat_index_loading = false;
                 self.chat_index_loaded_at = Some(Instant::now());
                 self.sync_task_sessions_from_chat_index();
+                return self.request_chat_rank();
             }
             Event::ChatsQueryChanged(query) => {
                 self.chat_query = query;
+                return self.request_chat_rank();
             }
             Event::ChatsScopeChanged(scope) => {
                 self.chat_scope = scope;
+                return self.request_chat_rank();
             }
             Event::ChatsBackendFilterChanged(filter) => {
                 self.chat_backend_filter = filter;
+                return self.request_chat_rank();
+            }
+            Event::ChatsRelevanceToggled => {
+                if self.jev_client.is_some() && self.chat_rank.toggle() {
+                    return self.request_chat_rank();
+                }
+            }
+            Event::ChatsRanked(result) => {
+                if self.chat_rank.finish(result) {
+                    return self.request_chat_rank();
+                }
             }
             Event::ToggleMachineGroup(key) => {
                 self.machine_menu = None;
@@ -19617,7 +19725,9 @@ fi
                         tab.diff_syntax_lines = None;
                         tab.diff_syntax_notice = None;
                         tab.sidebar_mode = mode;
-                        return self.refresh_chat_index_if_stale();
+                        self.chat_rank.panel_opened();
+                        let refresh = self.refresh_chat_index_if_stale();
+                        return Task::batch([refresh, self.request_chat_rank()]);
                     }
                     SidebarMode::Tasks => {
                         tab.agent_sidebar.selected_capture_idx = None;
@@ -27010,6 +27120,26 @@ fi
         let visible_count: usize = sections.iter().map(|(_, entries)| entries.len()).sum();
         let everywhere = self.chat_scope == chats::ChatScope::Everywhere;
 
+        // TRU-141: Jev relevance order for this Mac's list, when the
+        // "Relevant" toggle is on and a confident ranking matches it.
+        let mut relevance_ordered = false;
+        let mut rank_note: Option<String> = None;
+        if self.jev_client.is_some() && self.chat_rank.enabled() {
+            let key = self
+                .visible_local_chats()
+                .map(|(root, entries)| self.chat_rank_key(&root, &entries));
+            if let Some(key) = &key {
+                for (remote_id, entries) in sections.iter_mut() {
+                    if remote_id.is_none() {
+                        let (ordered, ranked) = self.chat_rank.order(key, std::mem::take(entries));
+                        *entries = ordered;
+                        relevance_ordered = ranked;
+                    }
+                }
+            }
+            rank_note = self.chat_rank.note(key.as_ref());
+        }
+
         let mut list = Column::new().spacing(2).padding([4, 6]);
         if self.chat_index_loading && self.chat_index.is_empty() {
             list = list.push(
@@ -27119,13 +27249,22 @@ fi
                 continue;
             }
 
-            // Group by repo root, preserving most-recent-first order.
+            // Group by repo root, preserving most-recent-first order. In
+            // relevance order a group is a run of adjacent chats, so the
+            // ranking is never reshuffled by repo.
+            let ranked_section = relevance_ordered && section_remote_id.is_none();
             let mut groups: Vec<(&std::path::Path, Vec<&chats::ChatIndexEntry>)> = Vec::new();
             for entry in section_entries {
-                match groups
-                    .iter_mut()
-                    .find(|(root, _)| *root == entry.group_root())
-                {
+                let existing = if ranked_section {
+                    groups
+                        .last_mut()
+                        .filter(|(root, _)| *root == entry.group_root())
+                } else {
+                    groups
+                        .iter_mut()
+                        .find(|(root, _)| *root == entry.group_root())
+                };
+                match existing {
                     Some((_, list)) => list.push(entry),
                     None => groups.push((entry.group_root(), vec![entry])),
                 }
@@ -27294,16 +27433,65 @@ fi
             }
         }
 
-        column![
-            container(search).padding([6, 8]),
+        // "Relevant" toggle (TRU-141), only with a TypeSafe key. Disabled
+        // while TypeSafe is down, until the panel is opened again.
+        let header: Element<'a, Event, Theme, iced::Renderer> = if self.jev_client.is_some() {
+            let on = self.chat_rank.enabled() && !self.chat_rank.down();
+            let bg = if on {
+                Some(theme.surface0().into())
+            } else {
+                None
+            };
+            let color = if self.chat_rank.down() {
+                theme.text_muted()
+            } else if on {
+                theme.text_primary()
+            } else {
+                theme.text_secondary()
+            };
+            let border = theme.surface1();
+            let mut toggle = button(text("Relevant").size(font_small - 1.0).color(color))
+                .style(move |_theme, _status| button::Style {
+                    background: bg,
+                    border: iced::Border {
+                        width: 1.0,
+                        color: border,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([4, 8]);
+            if !self.chat_rank.down() {
+                toggle = toggle.on_press(Event::ChatsRelevanceToggled);
+            }
+            row![search, toggle]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into()
+        } else {
+            search.into()
+        };
+
+        let mut panel = column![
+            container(header).padding([6, 8]),
             container(scope_row).padding([0, 8]),
             container(chips_row).padding([2, 8]),
-            scrollable(list).height(Length::Fill),
-        ]
-        .spacing(4)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        ];
+        if let Some(note) = rank_note {
+            let color = if self.chat_rank.has_error() {
+                theme.red()
+            } else {
+                theme.text_muted()
+            };
+            panel = panel
+                .push(container(text(note).size(font_small - 1.0).color(color)).padding([0, 10]));
+        }
+        panel
+            .push(scrollable(list).height(Length::Fill))
+            .spacing(4)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// Main-pane preview for the chat selected in the Chats sidebar:

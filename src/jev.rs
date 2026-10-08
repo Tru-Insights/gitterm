@@ -1,6 +1,12 @@
 //! TypeSafe System One ("Jev") client, and ranking of the Chats index by
 //! relevance to what the user is doing (TRU-141).
 //!
+//! The Chats panel (the app's `chat_rank` module) offers a "Relevant" toggle only when
+//! [`JevClient::from_env`] finds a key, ranks the visible local chats newest first with
+//! one call in flight, and caches the last ranking per query, scope, filter and chat set.
+//! Below [`DEFAULT_CONFIDENCE_GATE`] or on "none" it keeps recency with a note; an error
+//! shows in the note, and an [`JevError::is_down`] one disables the toggle until reopen.
+//!
 //! Jev is a decision model, not a chat model: it answers typed questions
 //! about a state with probabilities. One plain HTTPS POST per call:
 //!
