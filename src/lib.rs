@@ -3,6 +3,7 @@ pub mod browser_control;
 pub mod browser_mcp;
 pub mod chats;
 pub mod codex_review;
+pub mod codex_runner;
 pub mod gh_identity;
 pub mod harness;
 pub mod review;
