@@ -174,6 +174,11 @@ pub enum AgentIpcMessage {
         tab_id: usize,
         delegation_id: String,
     },
+    /// A worker card's Open worker tab (TRU-142 S6).
+    DelegationOpenWorker {
+        tab_id: usize,
+        delegation_id: String,
+    },
     /// A finding's `file:line` was clicked; relative to the tab's checkout.
     OpenFile {
         tab_id: usize,
@@ -530,7 +535,10 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                 request: serde_json::from_value(value.clone())
                     .map_err(|e| format!("could not read the consult request: {e}")),
             },
-            "delegation_send" | "delegation_rerun" | "delegation_dismiss" => {
+            "delegation_send"
+            | "delegation_rerun"
+            | "delegation_dismiss"
+            | "delegation_open_worker" => {
                 let Some(delegation_id) = value
                     .get("delegationId")
                     .and_then(|v| v.as_str())
@@ -558,6 +566,10 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                         }
                     }
                     "delegation_rerun" => AgentIpcMessage::DelegationRerun {
+                        tab_id,
+                        delegation_id,
+                    },
+                    "delegation_open_worker" => AgentIpcMessage::DelegationOpenWorker {
                         tab_id,
                         delegation_id,
                     },
@@ -2485,6 +2497,9 @@ enum AttentionReason {
     DelegationReady(gitterm::tasks::DelegationKind),
     /// A Codex review or consult this tab requested failed.
     DelegationFailed(gitterm::tasks::DelegationKind),
+    /// A worker this tab delegated reported itself blocked (TRU-142 S6):
+    /// it needs the human.
+    DelegationBlocked(gitterm::tasks::DelegationKind),
 }
 
 impl AttentionReason {
@@ -2493,7 +2508,7 @@ impl AttentionReason {
     /// completions by construction.
     fn priority(self) -> u8 {
         match self {
-            Self::HumanInputRequired => 0,
+            Self::HumanInputRequired | Self::DelegationBlocked(_) => 0,
             Self::AgentFailed | Self::DelegationFailed(_) => 1,
             Self::CompletedUnread | Self::DelegationReady(_) => 3,
         }
@@ -2510,12 +2525,14 @@ impl AttentionReason {
             Self::DelegationFailed(gitterm::tasks::DelegationKind::Review) => "Review failed",
             Self::DelegationFailed(gitterm::tasks::DelegationKind::Consult) => "Consult failed",
             Self::DelegationFailed(gitterm::tasks::DelegationKind::Implement) => "Worker failed",
+            Self::DelegationBlocked(gitterm::tasks::DelegationKind::Implement) => "Worker blocked",
+            Self::DelegationBlocked(_) => "Delegation blocked",
         }
     }
 
     fn icon(self) -> &'static str {
         match self {
-            Self::HumanInputRequired => "●",
+            Self::HumanInputRequired | Self::DelegationBlocked(_) => "●",
             Self::AgentFailed | Self::DelegationFailed(_) => "!",
             Self::CompletedUnread | Self::DelegationReady(_) => "✓",
         }
@@ -2798,7 +2815,10 @@ fn preset_conversation_backend(preset: &AgentPreset) -> Option<HarnessConversati
     }
 }
 
-fn task_handoff_prompt(task: &TaskRecord) -> String {
+/// The brief a task session starts with. `report_back` is the worker
+/// delegation this session carries out (TRU-142 S6): the brief then ends with
+/// the Report back section naming it.
+fn task_handoff_prompt(task: &TaskRecord, report_back: Option<&str>) -> String {
     let bullet_list = |items: &[String]| {
         if items.is_empty() {
             "- none recorded".to_string()
@@ -2853,7 +2873,7 @@ fn task_handoff_prompt(task: &TaskRecord) -> String {
             )
         },
     );
-    format!(
+    let brief = format!(
         "Continue GitTerm task {task_id}: {title}\n\n\
 Objective:\n{objective}\n\n\
 Task context:\n\
@@ -2878,7 +2898,14 @@ summary before stopping when that tool is available.",
         base_ref = task.base.reference,
         base_commit = task.base.commit,
         stopping_boundary = stopping_boundary_label(task.stopping_boundary),
-    )
+    );
+    match report_back {
+        Some(delegation_id) => format!(
+            "{brief}\n\n{}",
+            gitterm::delegations::report_back_section(delegation_id, &task.task_id)
+        ),
+        None => brief,
+    }
 }
 
 /// Directory holding composed task briefs. A launch command hands the full
@@ -2905,8 +2932,13 @@ fn backend_accepts_initial_prompt(backend: Option<HarnessConversationBackend>) -
 
 /// Writes the composed brief for one task session and returns its path, or a
 /// launch-safe error. Refuses paths containing a single quote — the path is
-/// embedded single-quoted in the launch command.
-fn write_task_brief(session_id: &str, task: &TaskRecord) -> Result<PathBuf, String> {
+/// embedded single-quoted in the launch command. `report_back` as in
+/// `task_handoff_prompt`.
+fn write_task_brief(
+    session_id: &str,
+    task: &TaskRecord,
+    report_back: Option<&str>,
+) -> Result<PathBuf, String> {
     let dir = task_brief_dir();
     let path = dir.join(format!("{session_id}.md"));
     if path.display().to_string().contains('\'') {
@@ -2916,7 +2948,7 @@ fn write_task_brief(session_id: &str, task: &TaskRecord) -> Result<PathBuf, Stri
         ));
     }
     std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-    std::fs::write(&path, task_handoff_prompt(task))
+    std::fs::write(&path, task_handoff_prompt(task, report_back))
         .map_err(|error| format!("write {}: {error}", path.display()))?;
     Ok(path)
 }
@@ -2980,6 +3012,18 @@ pub struct PendingTaskLaunch {
     /// `session_uid` of the tab whose MCP call created this task, recorded
     /// as `TaskCreator.session_id`. `None` for manual creation.
     creator_session_id: Option<String>,
+    /// Set by `delegate_task` (TRU-142 S6): once the worktree is ready, a
+    /// worker delegation is recorded and the worker launched, instead of
+    /// replying with the bare task.
+    worker: Option<PendingWorker>,
+}
+
+/// The worker a `delegate_task` call asked for, carried through task
+/// creation.
+#[derive(Debug, Clone)]
+pub struct PendingWorker {
+    caller: gitterm::delegations::CallerTab,
+    choice: gitterm::workers::WorkerChoice,
 }
 
 #[derive(Debug, Clone)]
@@ -3280,7 +3324,9 @@ impl TabState {
         if let Some(attention) = self.attention {
             if matches!(
                 attention.reason,
-                AttentionReason::DelegationReady(_) | AttentionReason::DelegationFailed(_)
+                AttentionReason::DelegationReady(_)
+                    | AttentionReason::DelegationFailed(_)
+                    | AttentionReason::DelegationBlocked(_)
             ) {
                 self.attention = None;
             }
@@ -4756,6 +4802,8 @@ pub enum Event {
     DelegationSendRequested(usize, String, Vec<String>),
     DelegationRerunRequested(usize, String),
     DelegationDismissRequested(usize, String),
+    /// A worker card's Open worker tab: tab, delegation.
+    DelegationOpenWorkerRequested(usize, String),
     /// A finding's file was clicked on the chat page of this tab.
     DelegationOpenFile(usize, PathBuf),
     /// User picked a model on the Claude chat tab with this id (TRU-143).
@@ -4988,6 +5036,8 @@ struct App {
     task_store: Option<TaskStore>,
     /// Review… button defaults (config `review`, TRU-142).
     review_config: config::ReviewConfig,
+    /// Worker role → model per provider, for `delegate_task` (TRU-142 S6).
+    model_policy: gitterm::workers::ModelPolicy,
     /// Codex delegation runs in flight, by delegation id. Aborting a handle
     /// drops the run, which kills its Codex process (TRU-142).
     delegation_runs: HashMap<String, iced::task::Handle>,
@@ -6062,6 +6112,7 @@ impl App {
             max_concurrent_local_tasks: self.max_concurrent_local_tasks,
             review: self.review_config.clone(),
             chat: self.chat_config.clone(),
+            policy: self.model_policy.clone(),
         };
         config.save();
         let elapsed = started.elapsed();
@@ -6992,6 +7043,8 @@ impl App {
         {
             eprintln!("GitTerm V5 dropped a task lifecycle signal: {error}");
         }
+        // A worker card mirrors its task session's live state (S6).
+        self.push_worker_cards(task_id);
     }
 
     /// Visiting a task acknowledges its attention (the unread badge, and a
@@ -7868,6 +7921,7 @@ impl App {
             request,
             control_reply: Some(reply),
             creator_session_id: caller,
+            worker: None,
         })
     }
 
@@ -8270,6 +8324,31 @@ impl App {
         } else {
             (None, "Terminal".to_string(), None, None)
         };
+        // TRU-142 S6: a worker delegation open on this task whose session is
+        // not live yet (first launch, a queued launch, or a relaunch after its
+        // tab closed) is carried out by this launch when it runs the
+        // delegation's preset: the model goes on the command, the brief ends
+        // with Report back, and the session is attached after launch.
+        let worker = if command.is_some() {
+            self.worker_awaiting_launch(task_id, &child_label)
+        } else {
+            None
+        };
+        let worker_model = worker.as_ref().and_then(|(_, model)| model.clone());
+        let (command, harness) = match (command, worker_model.as_deref()) {
+            (Some(command), Some(model)) => (
+                Some(
+                    gitterm::workers::with_model_flag(&command, model).map_err(|error| {
+                        format!("The worker model {model} cannot be passed to preset {child_label}: {error}")
+                    })?,
+                ),
+                harness.map(|harness| HarnessSelection {
+                    model: Some(model.to_string()),
+                    ..harness
+                }),
+            ),
+            (command, _) => (command, harness),
+        };
         let (command, chat_session_id) = match command {
             Some(command) => {
                 let (command, session_id) = Self::with_preassigned_session_id(&command);
@@ -8355,7 +8434,13 @@ impl App {
         let pre_injection_command = command.clone();
         let (command, objective_delivery) = match command {
             Some(launch) if backend_accepts_initial_prompt(conversation_backend) => {
-                match write_task_brief(&session_id, &task) {
+                match write_task_brief(
+                    &session_id,
+                    &task,
+                    worker
+                        .as_ref()
+                        .map(|(delegation_id, _)| delegation_id.as_str()),
+                ) {
                     Ok(brief_path) => (
                         Some(command_with_initial_prompt(&launch, &brief_path)),
                         ObjectiveDeliveryState::Delivered,
@@ -8394,7 +8479,12 @@ impl App {
             // The terminal is already running the new-session command. Persist
             // the resume command so an app restart reconnects instead of trying
             // to create the same pre-assigned Claude session again.
-            tab.set_startup_command(Some(format!("claude --resume {chat_session_id}")));
+            // A worker keeps its model across the restart.
+            let model = worker_model
+                .as_deref()
+                .map(|model| format!("--model {model} "))
+                .unwrap_or_default();
+            tab.set_startup_command(Some(format!("claude {model}--resume {chat_session_id}")));
         } else if objective_delivery == ObjectiveDeliveryState::Delivered {
             // Codex/Pi have no persisted resume; a restart re-runs the launch
             // command, which must stay brief-free so the objective is never
@@ -8412,16 +8502,29 @@ impl App {
             task_session_id: session_id.clone(),
             label: child_label.clone(),
             harness: harness.clone(),
-            conversation,
+            conversation: conversation.clone(),
             objective_delivery,
             created_at: timestamp.clone(),
             updated_at: timestamp.clone(),
         };
-        self.task_store
+        let store = self
+            .task_store
             .as_mut()
-            .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?
+            .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?;
+        store
             .upsert_session(task_id, task_session, &timestamp)
             .map_err(|error| error.to_string())?;
+        if let Some((delegation_id, _)) = &worker {
+            // The worker is running; its report reaches the delegation.
+            if let Err(error) =
+                store.attach_worker_session(delegation_id, &session_id, conversation, &timestamp)
+            {
+                eprintln!(
+                    "[delegation] {delegation_id}: worker session {session_id} launched but \
+                     could not be attached: {error}"
+                );
+            }
+        }
         self.workspaces[workspace_idx].tabs.push(tab);
         let tab_idx = self.workspaces[workspace_idx].tabs.len() - 1;
         if focus {
@@ -9749,6 +9852,449 @@ impl App {
         Task::batch([self.start_queued_delegations(), head])
     }
 
+    /// The open worker delegation on `task_id` that a launch of preset
+    /// `preset_name` carries out (TRU-142 S6): its id and model. Only a
+    /// delegation whose session is not live qualifies — none attached yet
+    /// (first or queued launch), or one whose tab is gone (a relaunch).
+    fn worker_awaiting_launch(
+        &self,
+        task_id: &str,
+        preset_name: &str,
+    ) -> Option<(String, Option<String>)> {
+        let store = self.task_store.as_ref()?;
+        store
+            .open_worker_delegations(task_id)
+            .into_iter()
+            .find_map(|delegation| match &delegation.child {
+                gitterm::tasks::DelegationChild::TaskSession {
+                    preset_name: Some(preset),
+                    task_session_id,
+                    model,
+                    ..
+                } if preset == preset_name
+                    && task_session_id.as_deref().is_none_or(|session| {
+                        find_task_session_tab(&self.workspaces, session).is_none()
+                    }) =>
+                {
+                    Some((delegation.delegation_id.clone(), model.clone()))
+                }
+                _ => None,
+            })
+    }
+
+    /// `delegate_task` (TRU-142 S6): resolve the worker, then create the
+    /// task through the same path as `task_create`. The worker is launched
+    /// in `start_delegated_worker` once the worktree is ready.
+    fn delegate_task_requested(
+        &mut self,
+        request: task_mcp::DelegateTaskRequest,
+        caller: Option<String>,
+        reply: TaskControlReply,
+    ) -> Task<Event> {
+        let prepared = (|| {
+            let tab = self.delegation_caller_for_tool(caller.as_deref(), "delegate_task")?;
+            if tab.remote {
+                return Err(format!(
+                    "delegate_task creates a local task worktree from the calling tab's \
+                     repository, and the tab's workspace {:?} is remote; remote workers are not \
+                     supported yet",
+                    tab.workspace
+                ));
+            }
+            let presets: Vec<gitterm::workers::PresetRef<'_>> = self
+                .agent_presets
+                .iter()
+                .map(|preset| gitterm::workers::PresetRef {
+                    name: &preset.name,
+                    command: &preset.command,
+                })
+                .collect();
+            let choice = gitterm::workers::resolve_worker(
+                &presets,
+                request.preset_name.as_deref(),
+                request.role,
+                request.model.as_deref(),
+                &self.model_policy,
+            )?;
+            let create = McpCreateTaskRequest {
+                title: request.title.clone(),
+                objective: request.objective.clone(),
+                repository_path: tab.cwd.clone(),
+                workspace_name: request.workspace_name.clone(),
+                issue_key: request.issue_key.clone(),
+                base_reference: request.base_reference.clone(),
+                stopping_boundary: request.stopping_boundary,
+            };
+            let mut pending =
+                self.pending_task_from_control(create, reply.clone(), caller.clone())?;
+            // Check the delegation's own rules before any worktree exists.
+            gitterm::delegations::worker_delegation(
+                &tab,
+                &pending.task_id,
+                &pending.title,
+                &pending.objective,
+                &choice,
+            )?;
+            pending.worker = Some(PendingWorker {
+                caller: tab,
+                choice,
+            });
+            Ok(pending)
+        })();
+        let pending = match prepared {
+            Ok(pending) => pending,
+            Err(error) => {
+                reply.send(Err(error));
+                return Task::none();
+            }
+        };
+        let worktree_request = pending.request.clone();
+        Task::perform(resolve_task_preparation(worktree_request), move |result| {
+            Event::TaskMetadataResolved(pending, result.map_err(|error| error.to_string()))
+        })
+    }
+
+    /// The delegated task's worktree is ready: record the worker delegation,
+    /// anchor its card in the parent chat, launch the worker in a background
+    /// tab (focus stays where it is), and answer `delegate_task`.
+    fn start_delegated_worker(
+        &mut self,
+        task_id: &str,
+        worker: PendingWorker,
+        reply: TaskControlReply,
+    ) -> Task<Event> {
+        let Some(task) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id))
+            .cloned()
+        else {
+            reply.send(Err(format!(
+                "Task {task_id} disappeared after worktree preparation"
+            )));
+            return Task::none();
+        };
+        let new = match gitterm::delegations::worker_delegation(
+            &worker.caller,
+            task_id,
+            &task.title,
+            &task.objective,
+            &worker.choice,
+        ) {
+            Ok(new) => new,
+            Err(error) => {
+                reply.send(Err(error));
+                return Task::none();
+            }
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let delegation = gitterm::tasks::Delegation::new_requested(new, now);
+        let delegation_id = delegation.delegation_id.clone();
+        let inserted = match self.task_store.as_mut() {
+            Some(store) => store
+                .insert_delegation(delegation)
+                .map_err(|error| error.to_string()),
+            None => Err("GitTerm's task store is unavailable".to_string()),
+        };
+        if let Err(error) = inserted {
+            reply.send(Err(format!(
+                "Created task {task_id}, but could not record the worker delegation: {error}"
+            )));
+            return Task::none();
+        }
+        self.anchor_delegation_card(&worker.caller.session_uid, &delegation_id);
+        let launch = self.try_launch_task_child(task_id, Some(worker.choice.preset_index), false);
+        let (focus, task_session_id, queue_position) = match launch {
+            Ok(TaskChildLaunch::Started(focus, session)) => (
+                focus,
+                session["session_id"].as_str().map(str::to_string),
+                None,
+            ),
+            Ok(TaskChildLaunch::Queued { position }) => (Task::none(), None, Some(position)),
+            Err(error) => {
+                let message = format!("the worker could not start: {error}");
+                eprintln!("[delegation] {delegation_id}: {message}");
+                if let Some(store) = self.task_store.as_mut() {
+                    if let Err(store_error) = store.set_delegation_status(
+                        &delegation_id,
+                        gitterm::tasks::DelegationStatus::Failed {
+                            message: message.clone(),
+                        },
+                        &chrono::Utc::now().to_rfc3339(),
+                    ) {
+                        eprintln!("[delegation] {delegation_id}: {store_error}");
+                    }
+                }
+                self.push_delegation_card(&delegation_id);
+                reply.send(Err(format!(
+                    "Created task {task_id} at {}, but {message}",
+                    task.worktree
+                        .path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                )));
+                return Task::none();
+            }
+        };
+        self.push_delegation_card(&delegation_id);
+        let queued = queue_position.is_some();
+        reply.send(Ok(serde_json::json!({
+            "delegation_id": delegation_id,
+            "task_id": task_id,
+            "task_session_id": task_session_id,
+            "worktree_path": task.worktree.path,
+            "branch": task.branch,
+            "preset_name": worker.choice.preset_name,
+            "model": worker.choice.model,
+            "role": worker.choice.role.label(),
+            "queued": queued,
+            "queue_position": queue_position,
+            "detail": if queued {
+                "The local concurrency limit queued the worker; it starts when a slot frees. Do not wait or poll: its report appears as a card in the requesting chat tab, and delegation_get reads it."
+            } else {
+                "The worker is running in a background tab. Do not wait or poll: its report appears as a card in the requesting chat tab, and delegation_get reads it."
+            },
+        })));
+        focus
+    }
+
+    /// `task_update_handoff` (with TRU-142 S6's `status`). The handoff is
+    /// stored on the task as before; `done` / `blocked` from the worker's own
+    /// tab also snapshot it into the worker delegation and wake its parent.
+    fn update_handoff_requested(
+        &mut self,
+        request: task_mcp::UpdateTaskHandoffRequest,
+        caller: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        use task_mcp::HandoffStatus;
+        let status = request.status.unwrap_or_default();
+        let summary = request.summary.trim().to_string();
+        if summary.is_empty() {
+            return Err("handoff summary is required".to_string());
+        }
+        let clean = |items: Vec<String>| {
+            items
+                .into_iter()
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        };
+        // The task session the calling tab hosts in this task (S1). Only
+        // this, never a typed session id, may report done or blocked.
+        let hosted_session = caller.and_then(|caller| {
+            self.workspaces
+                .iter()
+                .flat_map(|workspace| workspace.tabs.iter())
+                .find(|tab| {
+                    tab.session_uid == caller
+                        && tab.task_id.as_deref() == Some(request.task_id.as_str())
+                })
+                .and_then(|tab| tab.task_session_id.clone())
+        });
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let store = self
+            .task_store
+            .as_mut()
+            .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
+        let task_sessions = store
+            .get(&request.task_id)
+            .map(|task| {
+                task.sessions
+                    .iter()
+                    .map(|session| session.task_session_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let updated_by_session_id = handoff_writer(
+            &self.workspaces,
+            &request.task_id,
+            &task_sessions,
+            request.session_id.as_deref(),
+            caller,
+        )?;
+        let handoff = TaskHandoff {
+            summary,
+            decisions: clean(request.decisions),
+            next_steps: clean(request.next_steps),
+            blockers: clean(request.blockers),
+            updated_by_session_id,
+            updated_at: timestamp.clone(),
+        };
+        let report_to = gitterm::delegations::record_handoff(
+            store,
+            &request.task_id,
+            handoff,
+            status,
+            hosted_session.as_deref(),
+            &timestamp,
+        )?;
+        let delegation_status = report_to.as_deref().and_then(|delegation_id| {
+            store
+                .delegation(delegation_id)
+                .map(|delegation| delegation.status.label())
+        });
+        if let Some(delegation_id) = &report_to {
+            self.worker_reported(
+                delegation_id,
+                &request.task_id,
+                hosted_session.as_deref(),
+                status,
+            );
+        }
+        // A progress line (or any new handoff) shows on the worker cards.
+        self.push_worker_cards(&request.task_id);
+        let task = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(&request.task_id))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "Task {} disappeared after updating its handoff",
+                    request.task_id
+                )
+            })?;
+        let mut value = self.task_control_value(&task)?;
+        value["handoff_status"] = serde_json::Value::String(status.label().to_string());
+        value["delegation_id"] = report_to
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null);
+        value["delegation_status"] = delegation_status
+            .map(|label| serde_json::Value::String(label.to_string()))
+            .unwrap_or(serde_json::Value::Null);
+        if status != HandoffStatus::Progress && value["delegation_id"].is_null() {
+            value["detail"] = serde_json::Value::String(
+                "No worker delegation is open on this task, so nobody was notified; the handoff \
+                 is saved on the task."
+                    .to_string(),
+            );
+        }
+        Ok(value)
+    }
+
+    /// A worker reported done or blocked: mirror it on the task and the
+    /// worker's tab, and tell the parent chat (attention unless it is in
+    /// front, the inbox row that follows from it, and the card).
+    fn worker_reported(
+        &mut self,
+        delegation_id: &str,
+        task_id: &str,
+        worker_session: Option<&str>,
+        status: task_mcp::HandoffStatus,
+    ) {
+        let done = status == task_mcp::HandoffStatus::Done;
+        if let Some(session) = worker_session {
+            if let Some((ws_idx, tab_idx)) = find_task_session_tab(&self.workspaces, session) {
+                let tab = &mut self.workspaces[ws_idx].tabs[tab_idx];
+                if done {
+                    tab.task_live_state = None;
+                } else {
+                    tab.task_live_state = Some(TaskSessionLiveState::AwaitingInput);
+                    tab.set_attention(AttentionReason::HumanInputRequired);
+                }
+            }
+        }
+        let lifecycle = if done {
+            TaskLifecycle::Completed
+        } else {
+            TaskLifecycle::WaitingForInput
+        };
+        if let Some(store) = self.task_store.as_mut() {
+            if let Err(error) = store.record_lifecycle_signal(
+                task_id,
+                lifecycle,
+                None,
+                &chrono::Utc::now().to_rfc3339(),
+            ) {
+                eprintln!("[delegation] {delegation_id}: task lifecycle not updated: {error}");
+            }
+        }
+        let parent = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.delegation(delegation_id))
+            .map(|delegation| delegation.parent.session_uid.clone());
+        if let Some(tab_id) = parent.and_then(|uid| self.delegation_parent_tab_id(&uid)) {
+            let in_front = self.active_tab().map(|tab| tab.id) == Some(tab_id);
+            if !in_front {
+                let reason = if done {
+                    AttentionReason::DelegationReady(gitterm::tasks::DelegationKind::Implement)
+                } else {
+                    AttentionReason::DelegationBlocked(gitterm::tasks::DelegationKind::Implement)
+                };
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id)
+                {
+                    tab.set_attention(reason);
+                }
+            }
+        }
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.push_delegation_card(delegation_id);
+    }
+
+    /// Pushes the cards of every worker delegation on `task_id`, after its
+    /// sessions' live state or handoff changed.
+    fn push_worker_cards(&self, task_id: &str) {
+        let Some(store) = self.task_store.as_ref() else {
+            return;
+        };
+        let ids: Vec<String> = store
+            .delegations()
+            .iter()
+            .filter(|delegation| delegation.dismissed_at.is_none())
+            .filter(|delegation| {
+                matches!(
+                    &delegation.child,
+                    gitterm::tasks::DelegationChild::TaskSession { task_id: child, .. }
+                        if child == task_id
+                )
+            })
+            .map(|delegation| delegation.delegation_id.clone())
+            .collect();
+        for id in ids {
+            self.push_delegation_card(&id);
+        }
+    }
+
+    /// The worker part of a card and of `delegation_get`: the task, its live
+    /// tab state and latest progress line. `None` for Codex delegations.
+    fn worker_info(&self, delegation: &gitterm::tasks::Delegation) -> Option<serde_json::Value> {
+        let gitterm::tasks::DelegationChild::TaskSession {
+            task_id,
+            task_session_id,
+            ..
+        } = &delegation.child
+        else {
+            return None;
+        };
+        let task = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id));
+        let tab = task_session_id
+            .as_deref()
+            .and_then(|session| find_task_session_tab(&self.workspaces, session))
+            .map(
+                |(ws_idx, tab_idx)| match self.workspaces[ws_idx].tabs[tab_idx].task_live_state {
+                    Some(TaskSessionLiveState::AwaitingInput) => {
+                        gitterm::delegations::WorkerTab::AwaitingInput
+                    }
+                    Some(TaskSessionLiveState::Working) => gitterm::delegations::WorkerTab::Working,
+                    None => gitterm::delegations::WorkerTab::Idle,
+                },
+            )
+            .unwrap_or(gitterm::delegations::WorkerTab::Closed);
+        Some(gitterm::delegations::worker_card_info(
+            delegation, task, tab,
+        ))
+    }
+
     /// Updates (or creates) the delegation's card on its parent's chat page.
     fn push_delegation_card(&self, delegation_id: &str) {
         let Some(delegation) = self
@@ -9787,6 +10333,7 @@ impl App {
             delegation,
             self.delegation_activity.get(id).map(String::as_str),
             held,
+            self.worker_info(delegation),
             &config::global_config_dir(),
         )
     }
@@ -10134,6 +10681,7 @@ impl App {
             next_tab_id: 0,
             task_store,
             review_config: config.review.clone(),
+            model_policy: config.policy.clone(),
             delegation_runs: HashMap::new(),
             delegation_activity: HashMap::new(),
             delegation_held: HashMap::new(),
@@ -12421,69 +12969,15 @@ fi
                     }
                 }
                 TaskControlOperation::UpdateHandoff(request) => {
-                    let summary = request.summary.trim().to_string();
-                    if summary.is_empty() {
-                        envelope
-                            .reply
-                            .send(Err("handoff summary is required".to_string()));
-                        return Task::none();
-                    }
-                    let clean = |items: Vec<String>| {
-                        items
-                            .into_iter()
-                            .map(|item| item.trim().to_string())
-                            .filter(|item| !item.is_empty())
-                            .collect::<Vec<_>>()
-                    };
-                    let timestamp = chrono::Utc::now().to_rfc3339();
-                    let result = if let Some(store) = self.task_store.as_mut() {
-                        let task_sessions = store
-                            .get(&request.task_id)
-                            .map(|task| {
-                                task.sessions
-                                    .iter()
-                                    .map(|session| session.task_session_id.clone())
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
-                        let writer = handoff_writer(
-                            &self.workspaces,
-                            &request.task_id,
-                            &task_sessions,
-                            request.session_id.as_deref(),
-                            envelope.caller.as_deref(),
-                        );
-                        match writer {
-                            Err(error) => Err(error),
-                            Ok(updated_by_session_id) => store
-                                .update_handoff(
-                                    &request.task_id,
-                                    TaskHandoff {
-                                        summary,
-                                        decisions: clean(request.decisions),
-                                        next_steps: clean(request.next_steps),
-                                        blockers: clean(request.blockers),
-                                        updated_by_session_id,
-                                        updated_at: timestamp.clone(),
-                                    },
-                                    &timestamp,
-                                )
-                                .map_err(|error| error.to_string())
-                                .and_then(|()| {
-                                    store.get(&request.task_id).cloned().ok_or_else(|| {
-                                        format!(
-                                            "Task {} disappeared after updating its handoff",
-                                            request.task_id
-                                        )
-                                    })
-                                }),
-                        }
-                    } else {
-                        Err("GitTerm's task store is unavailable".to_string())
-                    };
-                    envelope
-                        .reply
-                        .send(result.and_then(|task| self.task_control_value(&task)));
+                    let result = self.update_handoff_requested(request, envelope.caller.as_deref());
+                    envelope.reply.send(result);
+                }
+                TaskControlOperation::DelegateTask(request) => {
+                    return self.delegate_task_requested(
+                        request,
+                        envelope.caller.clone(),
+                        envelope.reply,
+                    );
                 }
                 TaskControlOperation::SessionEvent(request) => {
                     // Only turn completion carries a lifecycle edge today;
@@ -12491,6 +12985,29 @@ fi
                     if request.event_type != "agent-turn-complete" {
                         envelope.reply.send(Ok(serde_json::json!({
                             "ignored": request.event_type,
+                        })));
+                        return Task::none();
+                    }
+                    // A worker that reported done goes idle at its prompt;
+                    // that turn end is not a request for input (S6).
+                    let reported_done = self.task_store.as_ref().is_some_and(|store| {
+                        store.delegations().iter().any(|delegation| {
+                            delegation.status == gitterm::tasks::DelegationStatus::Completed
+                                && matches!(
+                                    &delegation.child,
+                                    gitterm::tasks::DelegationChild::TaskSession {
+                                        task_session_id: Some(session),
+                                        ..
+                                    } if *session == request.session_id
+                                )
+                        })
+                    });
+                    if reported_done {
+                        envelope.reply.send(Ok(serde_json::json!({
+                            "task_id": request.task_id,
+                            "session_id": request.session_id,
+                            "waiting_for_input": false,
+                            "ignored": "the worker reported done",
                         })));
                         return Task::none();
                     }
@@ -12564,10 +13081,14 @@ fi
                                 })
                         })
                         .and_then(|delegation| {
-                            gitterm::delegations::delegation_record(
+                            let mut record = gitterm::delegations::delegation_record(
                                 delegation,
                                 &config::global_config_dir(),
-                            )
+                            )?;
+                            if let Some(worker) = self.worker_info(delegation) {
+                                record["worker"] = worker;
+                            }
+                            Ok(record)
                         });
                     envelope.reply.send(result);
                 }
@@ -13551,6 +14072,10 @@ fi
                         tab_id,
                         delegation_id,
                     } => Task::done(Event::DelegationDismissRequested(tab_id, delegation_id)),
+                    AgentIpcMessage::DelegationOpenWorker {
+                        tab_id,
+                        delegation_id,
+                    } => Task::done(Event::DelegationOpenWorkerRequested(tab_id, delegation_id)),
                     AgentIpcMessage::OpenFile { tab_id, path } => {
                         Task::done(Event::DelegationOpenFile(tab_id, path))
                     }
@@ -14199,6 +14724,34 @@ fi
                 }
                 self.push_delegation_card(&delegation_id);
                 return self.start_queued_delegations();
+            }
+            Event::DelegationOpenWorkerRequested(tab_id, delegation_id) => {
+                let target = self
+                    .tab_delegation(tab_id, &delegation_id)
+                    .and_then(|delegation| match &delegation.child {
+                        gitterm::tasks::DelegationChild::TaskSession {
+                            task_session_id: Some(session),
+                            ..
+                        } => find_task_session_tab(&self.workspaces, session).ok_or_else(|| {
+                            "The worker's tab is closed. Open its task from the Tasks rail to \
+                             resume it."
+                                .to_string()
+                        }),
+                        gitterm::tasks::DelegationChild::TaskSession { .. } => Err(
+                            "The worker has not started yet (it is queued behind other tasks)."
+                                .to_string(),
+                        ),
+                        _ => Err(format!("delegation {delegation_id} has no worker tab")),
+                    });
+                return match target {
+                    Ok((ws_idx, worker_tab_idx)) => {
+                        self.focus_workspace_tab(ws_idx, worker_tab_idx)
+                    }
+                    Err(error) => {
+                        agent_webview_note(tab_id, &error);
+                        Task::none()
+                    }
+                };
             }
             Event::DelegationOpenFile(tab_id, path) => {
                 let Some(repo_path) = self
@@ -15698,6 +16251,7 @@ fi
                     request: request.clone(),
                     control_reply: None,
                     creator_session_id: None,
+                    worker: None,
                 };
                 form.submitting = true;
                 form.error = None;
@@ -15811,6 +16365,15 @@ fi
                     });
                     match persisted {
                         Some(Ok(())) => {
+                            if let (Some(reply), Some(worker)) =
+                                (&pending.control_reply, pending.worker.clone())
+                            {
+                                return self.start_delegated_worker(
+                                    &pending.task_id,
+                                    worker,
+                                    reply.clone(),
+                                );
+                            }
                             if let Some(reply) = &pending.control_reply {
                                 let result = self
                                     .task_store
@@ -15956,7 +16519,7 @@ fi
                     .task_store
                     .as_ref()
                     .and_then(|store| store.get(&task_id))
-                    .map(task_handoff_prompt);
+                    .map(|task| task_handoff_prompt(task, None));
                 self.selected_task_id = Some(task_id);
                 self.tab_picker_visible = true;
                 self.tab_picker_cli_open = false;
@@ -22796,7 +23359,9 @@ fi
 
             // Icon prefix — attention overrides normal icon
             let (icon_str, icon_color) = match attention_reason {
-                Some(AttentionReason::HumanInputRequired) => (
+                Some(
+                    AttentionReason::HumanInputRequired | AttentionReason::DelegationBlocked(_),
+                ) => (
                     "● ",
                     if pulse_bright {
                         theme.peach()
@@ -31527,12 +32092,23 @@ mod tests {
         };
         task.lifecycle = TaskLifecycle::Ready;
 
-        let handoff = task_handoff_prompt(&task);
+        let handoff = task_handoff_prompt(&task, None);
 
         assert!(handoff.contains("task-105: Resume task work"));
         assert!(handoff.contains("Continue the existing implementation safely"));
         assert!(handoff.contains("/worktrees/task-105"));
         assert!(handoff.contains("Inspect git status and the current diff"));
+        assert!(!handoff.contains("Report back:"));
+
+        // A delegated worker's brief keeps all of that and ends with the
+        // Report back section naming its delegation (TRU-142 S6).
+        let worker = task_handoff_prompt(&task, Some("d-42"));
+        assert!(worker.starts_with(&handoff), "{worker}");
+        let section = &worker[handoff.len()..];
+        assert!(section.starts_with("\n\nReport back:\n"), "{section}");
+        assert!(section.contains("GitTerm delegation d-42"));
+        assert!(section.contains("task_update_handoff tool for task task-105"));
+        assert!(section.ends_with("Do not merge or push unless the objective says so."));
     }
 
     #[test]
@@ -31772,6 +32348,21 @@ mod tests {
             "Consult ready"
         );
         assert_eq!(failed.label(), "Consult failed");
+        // A blocked worker needs the human, like an input request.
+        let blocked = AttentionReason::DelegationBlocked(DelegationKind::Implement);
+        assert_eq!(blocked.label(), "Worker blocked");
+        assert_eq!(
+            blocked.priority(),
+            AttentionReason::HumanInputRequired.priority()
+        );
+        assert_eq!(
+            AttentionReason::DelegationReady(DelegationKind::Implement).label(),
+            "Worker done"
+        );
+        let mut worker_parent = TabState::new(2, PathBuf::from("/tmp"));
+        worker_parent.set_attention(blocked);
+        worker_parent.mark_visited();
+        assert!(!worker_parent.needs_attention());
         let mut tab = TabState::new(1, PathBuf::from("/tmp"));
         tab.set_attention(ready);
         tab.mark_visited();

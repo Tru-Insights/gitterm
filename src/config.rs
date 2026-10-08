@@ -230,6 +230,21 @@ mod tests {
     }
 
     #[test]
+    fn the_worker_model_policy_is_seeded_and_old_configs_load() {
+        let mut serialized = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(
+            serialized["policy"],
+            serde_json::json!({
+                "claude": {"coordinator": "opus", "scoped": "sonnet", "judgment": "opus", "specialist": "fable"},
+                "codex": {"coordinator": "gpt-6.1-sol", "scoped": "gpt-6-luna", "judgment": "gpt-6.1-sol", "specialist": "gpt-6-astra"}
+            })
+        );
+        serialized.as_object_mut().unwrap().remove("policy");
+        let existing: Config = serde_json::from_value(serialized).unwrap();
+        assert_eq!(existing.policy, gitterm::workers::ModelPolicy::default());
+    }
+
+    #[test]
     fn new_chats_use_the_defaults_until_something_is_picked() {
         // An older config without `chat` gets the defaults.
         let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
@@ -470,6 +485,11 @@ pub struct Config {
     /// Model and effort for new chats, and the last selection (TRU-143).
     #[serde(default)]
     pub chat: ChatDefaults,
+    /// Which model each worker role runs on, per provider, for
+    /// `delegate_task` (TRU-142 S6, TRU-144). Seeded with the routing table;
+    /// see `gitterm::workers::ModelPolicy`.
+    #[serde(default)]
+    pub policy: gitterm::workers::ModelPolicy,
 }
 
 fn default_chat_model() -> String {
@@ -724,6 +744,7 @@ impl Default for Config {
             max_concurrent_local_tasks: default_max_concurrent_local_tasks(),
             review: ReviewConfig::default(),
             chat: ChatDefaults::default(),
+            policy: gitterm::workers::ModelPolicy::default(),
         }
     }
 }

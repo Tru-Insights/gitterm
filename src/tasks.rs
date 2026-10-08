@@ -617,10 +617,21 @@ pub enum DelegationChild {
     /// A worker session inside a GitTerm task.
     TaskSession {
         task_id: String,
+        /// The task session carrying the work out; `None` until the launch
+        /// (which the concurrency queue may defer) starts it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<HarnessConversationRef>,
+        /// The agent preset the worker runs on (S6, additive).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preset_name: Option<String>,
+        /// The model GitTerm passed to the preset's CLI; `None` keeps the
+        /// preset's or the CLI's own choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<crate::workers::WorkerRole>,
     },
     /// Claude's own Agent tool inside the parent chat.
     ClaudeSubagent {
@@ -662,6 +673,10 @@ pub enum DelegationStatus {
     /// GitTerm restarted while the delegation was requested or running.
     Interrupted,
     Cancelled,
+    /// A worker reported that it cannot go on without a human (S6). It
+    /// carries the worker's handoff as its result, like `Completed`, and a
+    /// later `done` from the same worker still completes it.
+    Blocked,
 }
 
 impl DelegationStatus {
@@ -687,9 +702,19 @@ impl DelegationStatus {
     }
 
     /// States `complete_delegation` accepts. A late result for an
-    /// interrupted delegation (a resumed worker) is still accepted.
+    /// interrupted delegation (a resumed worker) is still accepted, and so
+    /// is a worker's `done` after it reported itself blocked.
     fn accepts_completion(&self) -> bool {
-        matches!(self, Self::Requested | Self::Running | Self::Interrupted)
+        matches!(
+            self,
+            Self::Requested | Self::Running | Self::Interrupted | Self::Blocked
+        )
+    }
+
+    /// Whether the delegation carries a result the parent can read and be
+    /// sent: a completed one, or a worker's blocked report.
+    pub fn has_result(&self) -> bool {
+        matches!(self, Self::Completed | Self::Blocked)
     }
 
     pub fn label(&self) -> &'static str {
@@ -700,6 +725,7 @@ impl DelegationStatus {
             Self::Failed { .. } => "failed",
             Self::Interrupted => "interrupted",
             Self::Cancelled => "cancelled",
+            Self::Blocked => "blocked",
         }
     }
 }
@@ -1583,8 +1609,10 @@ impl TaskStore {
     }
 
     /// Marks local executions that were active when GitTerm stopped as
-    /// interrupted, and in the same write turns requested or running
-    /// delegations into `Interrupted` (no runner survives a restart). The
+    /// interrupted, and in the same write turns requested or running Codex
+    /// delegations into `Interrupted` (no runner survives a restart). A
+    /// worker delegation whose task still exists is left as it was: the
+    /// worker's tab comes back and may still report (TRU-142 S6). The
     /// returned count is tasks only; see `interrupted_delegations` for the
     /// delegations this touched.
     pub fn reconcile_after_restart(&mut self, timestamp: &str) -> Result<usize, TaskStoreError> {
@@ -1748,14 +1776,130 @@ impl TaskStore {
                 ),
             ));
         }
+        if delegation.status == DelegationStatus::Blocked {
+            // The blocked report was a different result: the finished one
+            // is news again, whether or not the blocked one was sent or
+            // dismissed.
+            delegation.delivered_at = None;
+            delegation.dismissed_at = None;
+        }
         delegation.status = DelegationStatus::Completed;
         delegation.result = Some(result);
         delegation.updated_at = timestamp.to_string();
         self.commit_delegation(index, delegation)
     }
 
-    /// Stamps that a completed result was sent to the parent. Stamping twice
-    /// is an error so a caller cannot deliver the same result again.
+    /// A worker reported itself blocked (S6): the delegation becomes
+    /// `Blocked` with the worker's handoff as its result. Reporting blocked
+    /// again replaces the result; either way the new report is unsent and
+    /// undismissed. Only implementation delegations block.
+    pub fn block_delegation(
+        &mut self,
+        delegation_id: &str,
+        result: DelegationResult,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "block delegation in";
+        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
+        if delegation.kind != DelegationKind::Implement {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!(
+                    "delegation {delegation_id} is a {}, and only workers report blocked",
+                    delegation.kind.label()
+                ),
+            ));
+        }
+        if !delegation.status.accepts_completion() {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!(
+                    "delegation {delegation_id} is already {}",
+                    delegation.status.label()
+                ),
+            ));
+        }
+        delegation.status = DelegationStatus::Blocked;
+        delegation.result = Some(result);
+        delegation.delivered_at = None;
+        delegation.dismissed_at = None;
+        delegation.updated_at = timestamp.to_string();
+        self.commit_delegation(index, delegation)
+    }
+
+    /// The task session that carries out an implementation delegation
+    /// started (S6): it is recorded on the child, and a requested or
+    /// interrupted delegation becomes `Running`. A worker relaunched after
+    /// its tab was closed attaches its new session the same way.
+    pub fn attach_worker_session(
+        &mut self,
+        delegation_id: &str,
+        task_session_id: &str,
+        conversation: Option<HarnessConversationRef>,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "attach a worker session in";
+        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
+        let DelegationChild::TaskSession {
+            task_id,
+            task_session_id: session_slot,
+            conversation: conversation_slot,
+            ..
+        } = &mut delegation.child
+        else {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!("delegation {delegation_id} has no task-session worker"),
+            ));
+        };
+        let known = self.get(task_id).is_some_and(|task| {
+            task.sessions
+                .iter()
+                .any(|session| session.task_session_id == task_session_id)
+        });
+        if !known {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!("task {task_id} has no session {task_session_id}"),
+            ));
+        }
+        *session_slot = Some(task_session_id.to_string());
+        *conversation_slot = conversation;
+        if matches!(
+            delegation.status,
+            DelegationStatus::Requested | DelegationStatus::Interrupted
+        ) {
+            delegation.status = DelegationStatus::Running;
+        }
+        delegation.updated_at = timestamp.to_string();
+        self.commit_delegation(index, delegation)
+    }
+
+    /// Implementation delegations still open on `task_id` (a worker may
+    /// still report: requested, running, interrupted or blocked), newest
+    /// first.
+    pub fn open_worker_delegations(&self, task_id: &str) -> Vec<&Delegation> {
+        self.document
+            .delegations
+            .iter()
+            .rev()
+            .filter(|delegation| delegation.status.accepts_completion())
+            .filter(|delegation| {
+                matches!(
+                    &delegation.child,
+                    DelegationChild::TaskSession { task_id: child, .. } if child == task_id
+                )
+            })
+            .collect()
+    }
+
+    /// Stamps that a completed result (or a worker's blocked report) was
+    /// sent to the parent. Stamping twice is an error so a caller cannot
+    /// deliver the same result again.
     pub fn mark_delegation_delivered(
         &mut self,
         delegation_id: &str,
@@ -1763,12 +1907,12 @@ impl TaskStore {
     ) -> Result<(), TaskStoreError> {
         const OPERATION: &str = "mark delegation delivered in";
         let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
-        if delegation.status != DelegationStatus::Completed {
+        if !delegation.status.has_result() {
             return Err(TaskStoreError::new(
                 OPERATION,
                 &self.path,
                 format!(
-                    "delegation {delegation_id} is {}, not completed",
+                    "delegation {delegation_id} is {}, not completed or blocked",
                     delegation.status.label()
                 ),
             ));
@@ -2012,9 +2156,22 @@ fn cleanup_temporary_file(path: &Path, primary_error: String) -> String {
 }
 
 fn reconcile_delegations_in(document: &mut TaskStoreDocument, timestamp: &str) -> usize {
+    let tasks: HashSet<&str> = document
+        .tasks
+        .iter()
+        .map(|task| task.task_id.as_str())
+        .collect();
     let mut interrupted = 0;
     for delegation in &mut document.delegations {
-        if delegation.status.is_active() {
+        // A worker lives in a task tab, which a restart restores (or the
+        // launch queue starts later): it may still be going and report
+        // `done`, so its delegation stays as it was. Only GitTerm-owned
+        // runs (Codex reviews and consults) die with the app.
+        let worker_survives = matches!(
+            &delegation.child,
+            DelegationChild::TaskSession { task_id, .. } if tasks.contains(task_id.as_str())
+        );
+        if delegation.status.is_active() && !worker_survives {
             delegation.status = DelegationStatus::Interrupted;
             delegation.updated_at = timestamp.to_string();
             interrupted += 1;
@@ -2076,10 +2233,16 @@ fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
         }
     }
     match (&delegation.status, &delegation.result) {
-        (DelegationStatus::Completed, None) => {
-            return Err(format!("delegation {id} is completed without a result"));
+        (DelegationStatus::Completed | DelegationStatus::Blocked, None) => {
+            return Err(format!(
+                "delegation {id} is {} without a result",
+                delegation.status.label()
+            ));
         }
-        (DelegationStatus::Completed, Some(result)) => {
+        (DelegationStatus::Blocked, Some(_)) if delegation.kind != DelegationKind::Implement => {
+            return Err(format!("delegation {id} is blocked but only workers block"));
+        }
+        (DelegationStatus::Completed | DelegationStatus::Blocked, Some(result)) => {
             validate_delegation_result(delegation, result)?
         }
         (_, Some(_)) => {
@@ -2096,7 +2259,7 @@ fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
             delegation.status.label()
         ));
     }
-    if delegation.delivered_at.is_some() && delegation.status != DelegationStatus::Completed {
+    if delegation.delivered_at.is_some() && !delegation.status.has_result() {
         return Err(format!(
             "delegation {id} is marked delivered but is {}",
             delegation.status.label()
@@ -2533,6 +2696,9 @@ mod tests {
                 backend: HarnessConversationBackend::Claude,
                 session_id: "conversation-1".to_string(),
             }),
+            preset_name: None,
+            model: None,
+            role: None,
         };
         store.insert_delegation(worker).unwrap();
         store
@@ -2619,6 +2785,9 @@ mod tests {
             task_id: "task-9".to_string(),
             task_session_id: None,
             conversation: None,
+            preset_name: None,
+            model: None,
+            role: None,
         };
         assert!(store.insert_delegation(unknown_task).is_err());
 
@@ -2850,6 +3019,177 @@ mod tests {
             state(&reloaded, "requested"),
             (DelegationStatus::Interrupted, "t9".to_string())
         );
+    }
+
+    fn worker_delegation(id: &str, task_id: &str) -> Delegation {
+        let mut worker = sample_delegation(id, "tab-a", "t1");
+        worker.kind = DelegationKind::Implement;
+        worker.target = None;
+        worker.child = DelegationChild::TaskSession {
+            task_id: task_id.to_string(),
+            task_session_id: None,
+            conversation: None,
+            preset_name: Some("Codex".to_string()),
+            model: Some("gpt-6-luna".to_string()),
+            role: Some(crate::workers::WorkerRole::Scoped),
+        };
+        worker
+    }
+
+    fn worker_result(summary: &str, blockers: &[&str]) -> DelegationResult {
+        DelegationResult {
+            handoff: Some(TaskHandoff {
+                summary: summary.to_string(),
+                decisions: Vec::new(),
+                next_steps: Vec::new(),
+                blockers: blockers.iter().map(|item| item.to_string()).collect(),
+                updated_by_session_id: Some("session-1".to_string()),
+                updated_at: "t5".to_string(),
+            }),
+            findings: None,
+            reviewed: None,
+        }
+    }
+
+    fn add_session(store: &mut TaskStore, task_id: &str, session_id: &str) {
+        store
+            .upsert_session(
+                task_id,
+                TaskSessionRecord {
+                    task_session_id: session_id.to_string(),
+                    label: "Codex".to_string(),
+                    harness: None,
+                    conversation: None,
+                    objective_delivery: ObjectiveDeliveryState::Delivered,
+                    created_at: "t2".to_string(),
+                    updated_at: "t2".to_string(),
+                },
+                "t2",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_worker_attaches_its_session_blocks_and_then_completes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        store
+            .insert_delegation(worker_delegation("w1", "task-1"))
+            .unwrap();
+        assert_eq!(store.open_worker_delegations("task-1").len(), 1);
+        assert!(store.open_worker_delegations("task-2").is_empty());
+
+        // Only a session the task knows can be attached.
+        assert!(store
+            .attach_worker_session("w1", "session-1", None, "t2")
+            .is_err());
+        add_session(&mut store, "task-1", "session-1");
+        store
+            .attach_worker_session("w1", "session-1", None, "t3")
+            .unwrap();
+        let worker = store.delegation("w1").unwrap();
+        assert_eq!(worker.status, DelegationStatus::Running);
+        assert!(matches!(
+            &worker.child,
+            DelegationChild::TaskSession { task_session_id: Some(id), model: Some(model), .. }
+                if id == "session-1" && model == "gpt-6-luna"
+        ));
+
+        store
+            .block_delegation("w1", worker_result("Stuck", &["No staging access"]), "t4")
+            .unwrap();
+        store.mark_delegation_delivered("w1", "t5").unwrap();
+        store.dismiss_delegation("w1", "t6").unwrap();
+        // Blocked is still open: the worker may report again.
+        assert_eq!(store.open_worker_delegations("task-1").len(), 1);
+        store
+            .complete_delegation("w1", worker_result("Done, tests pass", &[]), "t7")
+            .unwrap();
+        let reloaded = TaskStore::load(&path).unwrap();
+        let worker = reloaded.delegation("w1").unwrap();
+        assert_eq!(worker.status, DelegationStatus::Completed);
+        assert_eq!(
+            worker
+                .result
+                .as_ref()
+                .unwrap()
+                .handoff
+                .as_ref()
+                .unwrap()
+                .summary,
+            "Done, tests pass"
+        );
+        // The finished report is news again.
+        assert_eq!(worker.delivered_at, None);
+        assert_eq!(worker.dismissed_at, None);
+        assert!(reloaded.open_worker_delegations("task-1").is_empty());
+
+        // A finished worker cannot report again, and reviews never block.
+        let mut store = reloaded;
+        assert!(store
+            .complete_delegation("w1", worker_result("again", &[]), "t8")
+            .is_err());
+        store
+            .insert_delegation(sample_delegation("r1", "tab-a", "t8"))
+            .unwrap();
+        let error = store
+            .block_delegation("r1", worker_result("x", &[]), "t9")
+            .unwrap_err();
+        assert!(error.to_string().contains("only workers"), "{error}");
+        // A blocked or completed worker needs a handoff.
+        let error = store
+            .block_delegation("w1", DelegationResult::default(), "t9")
+            .unwrap_err();
+        assert!(error.to_string().contains("already completed"), "{error}");
+    }
+
+    #[test]
+    fn a_blocked_worker_without_a_handoff_is_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        store
+            .insert_delegation(worker_delegation("w1", "task-1"))
+            .unwrap();
+        let error = store
+            .block_delegation("w1", DelegationResult::default(), "t2")
+            .unwrap_err();
+        assert_eq!(error.operation(), "validate");
+        assert_eq!(
+            store.delegation("w1").unwrap().status,
+            DelegationStatus::Requested
+        );
+    }
+
+    #[test]
+    fn restart_keeps_workers_whose_task_exists_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        add_session(&mut store, "task-1", "session-1");
+        store
+            .insert_delegation(worker_delegation("running", "task-1"))
+            .unwrap();
+        store
+            .attach_worker_session("running", "session-1", None, "t3")
+            .unwrap();
+        // Still queued behind the concurrency limit: no session yet.
+        store
+            .insert_delegation(worker_delegation("queued", "task-1"))
+            .unwrap();
+        store
+            .insert_delegation(sample_delegation("review", "tab-a", "t3"))
+            .unwrap();
+        store.reconcile_after_restart("t9").unwrap();
+
+        let reloaded = TaskStore::load(&path).unwrap();
+        let status = |id: &str| reloaded.delegation(id).unwrap().status.clone();
+        assert_eq!(status("running"), DelegationStatus::Running);
+        assert_eq!(status("queued"), DelegationStatus::Requested);
+        assert_eq!(status("review"), DelegationStatus::Interrupted);
     }
 
     fn active_attempt(attempt_id: &str, executor: ExecutorTarget) -> TaskExecutionAttempt {

@@ -11,3 +11,4 @@ pub mod review;
 pub mod task_mcp;
 pub mod task_worktree;
 pub mod tasks;
+pub mod workers;
