@@ -42,6 +42,12 @@ libc = "0.2"
 base64 = "0.22"
 futures-util = "0.3"
 hyper = { version = "0.14", features = ["client", "http1", "tcp"] }
+# TLS for the TypeSafe Jev client (src/jev.rs). Both crates are already in
+# the tree through tonic's tls-roots (rustls 0.23 on ring, native roots), so
+# naming them adds no new crates and no C toolchain (reqwest 0.13's rustls
+# feature would pull aws-lc-sys, which needs cmake/NASM on Windows CI).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-native-certs = "0.8"
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 tokio-tungstenite = "0.21"
 url = "2.5"

@@ -1,0 +1,15 @@
+{
+  "state": "A developer in a terminal workspace wants to pick up an earlier AI coding conversation.\nWorkspace: ~/GitRepo/gitterm-v5\nGit branch: tracey/tru-141-jev\nSearching the conversations for: chats search",
+  "model": "jev-latest",
+  "questions": {
+    "relevant": {
+      "type": "choice",
+      "instructions": "Which earlier conversation is most relevant to what the developer is doing now (the workspace, branch, search text and current request in the state)? Prefer a conversation about the same task or topic; the same directory or branch alone is weaker evidence than the same subject. Choose \"none\" if no conversation is about this work.",
+      "criteria": {
+        "c0": "Wire the Chats panel search | ~/GitRepo/gitterm-v5 @ tracey/tru-78-chats | 2d ago | asked: make search match branch names / reply: Done, matches_query now checks…",
+        "c1": "Fix Windows CI | /srv/ci | active now",
+        "none": "None of these conversations is about the current work"
+      }
+    }
+  }
+}

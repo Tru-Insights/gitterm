@@ -7,6 +7,7 @@ pub mod codex_runner;
 pub mod delegations;
 pub mod gh_identity;
 pub mod harness;
+pub mod jev;
 pub mod review;
 pub mod task_mcp;
 pub mod task_worktree;
