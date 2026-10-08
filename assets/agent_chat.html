@@ -393,7 +393,9 @@
   if (hasMarked) {
     marked.use({
       gfm: true,
-      breaks: false,
+      // Single newlines are hard breaks: slash-command replies (`/model`,
+      // `/help`) are plain multi-line text, and streamed prose never wraps.
+      breaks: true,
       renderer: {
         // Agent output is untrusted: raw HTML is shown as text.
         html(html) { return escapeHtml(html); },
