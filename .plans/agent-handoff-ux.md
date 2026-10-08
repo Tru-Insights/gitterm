@@ -408,3 +408,9 @@ log lines, the wording of the explanation, and whether the title carries a `[Pn]
 Unit tests should cover (3) with `review-*.rollout.jsonl`, (4) with `review-*.last.md` (1 finding, several,
 none), and the stream reading with `review-*.jsonl`. The S3 parser must not depend on any other field of the stdout
 items.
+
+**Addendum 2026-10-08, later:** Claude is the fixed coordinator of every chat tab; other models and harnesses are
+only ever called from it (subagents, `codex exec review`, task workers in terminal tabs). The Codex app-server
+chat adapter is dropped: nothing in this plan needs Codex in the coordinator seat. Composer chips (model, effort,
+permission mode, checkout) and the single "New chat" entry are TRU-143. S6 (`delegate_task`) must accept any
+configured preset and, for Claude workers, a model.
