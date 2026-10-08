@@ -422,3 +422,14 @@ Astra needs the Codex runner to accept a free-form brief, not only `codex exec r
 `consult` delegation kind: `codex exec --json` with the brief, result = the final agent message as the handoff
 summary (no findings contract). The Review… popover gains a sibling "Consult…" (or one popover with a kind
 switch) defaulting to the specialist model of the chosen provider.
+
+**Policy seed confirmed 2026-10-08:** coordinator Opus 5.5 / GPT-6.1 Sol; scoped worker (routine coding)
+Sonnet / GPT-6 Luna; judgment worker (harder coding) Opus 5.5 / GPT-6.1 Sol; specialist (review, investigation,
+brainstorming) Fable / GPT-6 Astra. Claude picks Sonnet or Opus by difficulty per the routing rule.
+
+**S4 addition (2026-10-08): agent roster.** A strip above the composer, modelled on the Claude Code CLI's
+subagent list: one row per live Claude subagent (from `SubagentEvent`) and per delegation (review, consult,
+worker). Each row shows type or kind, model, what it is doing now (the current tool call's description text,
+as the CLI shows it), elapsed time and output tokens (from the subagent's assistant-frame usage). A finished
+row shows the outcome until dismissed or sent. Clicking a row scrolls to its nested block or card in the
+timeline. The nested Subagent block from R1 stays as the detail view.
