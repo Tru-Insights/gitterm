@@ -17,10 +17,18 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
+use gitterm::harness::claude::{ClaudeSession, ClaudeSessionConfig};
+use gitterm::harness::HarnessEvent;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
+
+/// Permission mode for a Claude tab whose config does not name one. Always
+/// passed explicitly so a user-level `defaultMode` cannot pre-empt prompts.
+pub(crate) const DEFAULT_CLAUDE_PERMISSION_MODE: &str = "default";
+/// Set to a directory to log every Claude stdin/stdout frame there.
+const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_CLAUDE_WIRE_LOG_DIR";
 
 /// Which agent backend this tab is driving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +121,27 @@ pub enum AgentEvent {
     /// Backend-specific event that doesn't fit the normalized variants above.
     /// Kept as raw JSON so the UI layer can decide whether to render it.
     Other(serde_json::Value),
+    /// Normalized event from a native harness session (Claude, TRU-140).
+    Harness(HarnessEvent),
+}
+
+impl AgentEvent {
+    /// The JSON the chat webview's `__appendEvent` receives. Harness events
+    /// are wrapped so the page can tell them from pi's raw stream shapes.
+    pub(crate) fn webview_payload(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Other(value) => Some(value.clone()),
+            Self::Harness(ev) => match serde_json::to_value(ev) {
+                Ok(event) => Some(serde_json::json!({"kind": "harness", "event": event})),
+                Err(e) => {
+                    eprintln!("[agent] could not serialize harness event {ev:?}: {e}");
+                    None
+                }
+            },
+            // The typed pi variants are not produced yet.
+            _ => None,
+        }
+    }
 }
 
 /// Live agent-tab session state. The conversation buffer here is the source of
@@ -126,8 +155,14 @@ pub(crate) struct AgentSession {
     pub(crate) state: AgentSessionState,
     /// Background task that owns the subprocess, if one has been spawned.
     /// Lazy: `None` until the first prompt submit, then created and reused
-    /// across turns until the tab is closed.
+    /// across turns until the tab is closed. Pi only.
     pub(crate) task_handle: Option<AgentTaskHandle>,
+    /// Long-lived native Claude process (Claude backend only). Lazy like
+    /// `task_handle`; dropped (and respawned with `--resume`) when the
+    /// process exits. Dropping it shuts the process down.
+    pub(crate) claude: Option<ClaudeSession>,
+    /// Runtime requests (permission prompts, questions) awaiting the human.
+    pub(crate) pending_requests: Vec<String>,
 }
 
 impl AgentSession {
@@ -140,7 +175,64 @@ impl AgentSession {
             session_id: None,
             state: AgentSessionState::Idle,
             task_handle: None,
+            claude: None,
+            pending_requests: Vec::new(),
         }
+    }
+
+    /// Append an event to the conversation buffer, merging consecutive
+    /// streaming fragments so tab switches replay a compact buffer.
+    pub(crate) fn record(&mut self, ev: AgentEvent) {
+        use HarnessEvent as H;
+        if let (Some(AgentEvent::Harness(last)), AgentEvent::Harness(next)) =
+            (self.conversation.last_mut(), &ev)
+        {
+            match (last, next) {
+                (H::TextDelta(a), H::TextDelta(b)) | (H::ThinkingDelta(a), H::ThinkingDelta(b)) => {
+                    a.push_str(b);
+                    return;
+                }
+                (
+                    H::ItemInputDelta {
+                        id: a_id,
+                        partial_json: a,
+                    },
+                    H::ItemInputDelta {
+                        id: b_id,
+                        partial_json: b,
+                    },
+                ) if a_id == b_id => {
+                    a.push_str(b);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.conversation.push(ev);
+    }
+
+    /// The Claude process settings for this tab. `model` "default" (or
+    /// empty) leaves the model to the user's Claude settings.
+    pub(crate) fn claude_session_config(&self, cwd: PathBuf) -> Option<ClaudeSessionConfig> {
+        let AgentBackendConfig::Claude {
+            model,
+            permission_mode,
+            effort,
+        } = &self.config
+        else {
+            return None;
+        };
+        let model = model.trim();
+        Some(ClaudeSessionConfig {
+            cwd,
+            model: (!model.is_empty() && model != "default").then(|| model.to_string()),
+            permission_mode: permission_mode
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
+            effort: effort.clone(),
+            resume: self.session_id.clone(),
+            wire_log_dir: std::env::var_os(CLAUDE_WIRE_LOG_ENV).map(PathBuf::from),
+        })
     }
 
     pub(crate) fn backend(&self) -> AgentBackend {
@@ -284,7 +376,7 @@ async fn run_turn(
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
-    let mut cmd = build_command(config, prompt);
+    let mut cmd = build_command(config, prompt)?;
     cmd.current_dir(repo_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -358,7 +450,7 @@ async fn run_turn(
     Ok(())
 }
 
-fn build_command(config: &AgentBackendConfig, prompt: &str) -> Command {
+fn build_command(config: &AgentBackendConfig, prompt: &str) -> Result<Command, String> {
     match config {
         AgentBackendConfig::Pi {
             model,
@@ -380,27 +472,12 @@ fn build_command(config: &AgentBackendConfig, prompt: &str) -> Command {
                 }
             }
             cmd.arg(prompt);
-            cmd
+            Ok(cmd)
         }
-        AgentBackendConfig::Claude {
-            model,
-            permission_mode,
-            effort,
-        } => {
-            let mut cmd = Command::new("claude");
-            cmd.arg("--print")
-                .arg("--output-format")
-                .arg("stream-json")
-                .arg("--model")
-                .arg(model);
-            if let Some(mode) = permission_mode {
-                cmd.arg("--permission-mode").arg(mode);
-            }
-            if let Some(e) = effort {
-                cmd.arg("--effort").arg(e);
-            }
-            cmd.arg(prompt);
-            cmd
+        // Claude tabs run one long-lived process through
+        // `gitterm::harness::claude::ClaudeSession` (TRU-140).
+        AgentBackendConfig::Claude { .. } => {
+            Err("Claude tabs use the native harness session, not per-turn processes".to_string())
         }
     }
 }

@@ -48,6 +48,7 @@ use gitterm::browser_control::{
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
 use gitterm::gh_identity::GH_ACCOUNT_ENV_KEY;
+use gitterm::harness::{HarnessCommand, HarnessEvent, RuntimeDecision, TurnStatus};
 use gitterm::task_mcp::{
     self, CreateTaskRequest as McpCreateTaskRequest, TaskControlEnvelope, TaskControlOperation,
     TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
@@ -106,8 +107,19 @@ static MAIN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 // or stop signal to the right tab.
 #[derive(Debug, Clone)]
 pub enum AgentIpcMessage {
-    Submit { tab_id: usize, text: String },
-    Stop { tab_id: usize },
+    Submit {
+        tab_id: usize,
+        text: String,
+    },
+    Stop {
+        tab_id: usize,
+    },
+    /// The human answered a runtime request (permission or question).
+    Answer {
+        tab_id: usize,
+        request_id: String,
+        decision: RuntimeDecision,
+    },
 }
 
 static AGENT_IPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<AgentIpcMessage>> =
@@ -231,20 +243,43 @@ fn browser_telemetry_stream(
 
 /// Embedded HTML scaffold for the agent chat surface (Step 4 of TRU-29).
 const AGENT_CHAT_HTML: &str = include_str!("../assets/agent_chat.html");
+/// Vendored renderers inlined into the chat page (no network at runtime).
+/// Licenses sit next to them in `assets/vendor/`.
+const AGENT_CHAT_VENDOR_JS: [&str; 2] = [
+    include_str!("../assets/vendor/marked.min.js"),
+    include_str!("../assets/vendor/highlight.min.js"),
+];
+const AGENT_CHAT_VENDOR_SLOT: &str = "/*__VENDOR_JS__*/";
+
+/// The chat page with the vendored scripts inlined into its slot.
+fn agent_chat_html() -> String {
+    debug_assert!(AGENT_CHAT_HTML.contains(AGENT_CHAT_VENDOR_SLOT));
+    AGENT_CHAT_HTML.replacen(
+        AGENT_CHAT_VENDOR_SLOT,
+        &AGENT_CHAT_VENDOR_JS.join("\n;\n"),
+        1,
+    )
+}
 
 /// Push one `AgentEvent` into the live webview via `window.__appendEvent(...)`.
 /// Caller is responsible for ensuring the agent webview is the active one;
 /// this is a no-op if no webview exists.
 fn push_agent_event_to_webview(ev: &tab::AgentEvent) {
-    let payload = match ev {
-        tab::AgentEvent::Other(value) => value.clone(),
-        // Other typed variants don't currently fire (Step 3 emits only
-        // `Other`). When the typed parser lands these will be serialized
-        // into a richer JS-side shape.
-        _ => return,
+    let Some(payload) = ev.webview_payload() else {
+        return;
     };
-    let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string());
-    webview::evaluate_script(&format!("window.__appendEvent({})", payload_json));
+    webview::evaluate_script(&format!("window.__appendEvent({payload})"));
+}
+
+/// Replay a tab's whole conversation buffer in one script call. The page
+/// renders it without live timing (elapsed counters, auto-follow jitter).
+fn replay_agent_conversation_in_webview(conversation: &[tab::AgentEvent]) {
+    let payloads: Vec<serde_json::Value> = conversation
+        .iter()
+        .filter_map(tab::AgentEvent::webview_payload)
+        .collect();
+    let json = serde_json::Value::Array(payloads);
+    webview::evaluate_script(&format!("window.__replay({json})"));
 }
 
 /// Set the active tab id on the JS side. The webview tags every IPC message
@@ -292,6 +327,45 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                 AgentIpcMessage::Submit { tab_id, text }
             }
             "stop" => AgentIpcMessage::Stop { tab_id },
+            "answer" => {
+                let Some(request_id) = value.get("requestId").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] answer without requestId: {}", body);
+                    return;
+                };
+                let decision = match value
+                    .get("decision")
+                    .cloned()
+                    .map(serde_json::from_value::<RuntimeDecision>)
+                {
+                    Some(Ok(decision)) => decision,
+                    Some(Err(e)) => {
+                        eprintln!("[agent-ipc] bad decision in {}: {}", body, e);
+                        return;
+                    }
+                    None => {
+                        eprintln!("[agent-ipc] answer without decision: {}", body);
+                        return;
+                    }
+                };
+                AgentIpcMessage::Answer {
+                    tab_id,
+                    request_id: request_id.to_string(),
+                    decision,
+                }
+            }
+            "open_url" => {
+                let url = value.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                // Links in agent output open in the browser, never inside
+                // the chat webview (which would navigate the chat away).
+                if url.starts_with("https://") || url.starts_with("http://") {
+                    if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
+                        eprintln!("[agent-ipc] open {} failed: {}", url, e);
+                    }
+                } else {
+                    eprintln!("[agent-ipc] refusing to open non-http url {:?}", url);
+                }
+                return;
+            }
             _ => {
                 eprintln!("[agent-ipc] unknown type {:?}", kind);
                 return;
@@ -674,6 +748,23 @@ fn setup_menu_bar() {
         ])
         .unwrap();
 
+    // Edit menu: the predefined items route Cmd+C/V/X/Z/A to the first
+    // responder, which is how WKWebView (agent chat composer) receives
+    // edit actions. Items no responder handles stay disabled, so the iced
+    // view keeps receiving those keys as before.
+    let edit_menu = Submenu::new("Edit", true);
+    edit_menu
+        .append_items(&[
+            &PredefinedMenuItem::undo(None),
+            &PredefinedMenuItem::redo(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::cut(None),
+            &PredefinedMenuItem::copy(None),
+            &PredefinedMenuItem::paste(None),
+            &PredefinedMenuItem::select_all(None),
+        ])
+        .unwrap();
+
     // Window menu
     let window_menu = Submenu::new("Window", true);
     window_menu
@@ -685,7 +776,7 @@ fn setup_menu_bar() {
         ])
         .unwrap();
 
-    menu.append_items(&[&app_menu, &view_menu, &window_menu])
+    menu.append_items(&[&app_menu, &edit_menu, &view_menu, &window_menu])
         .unwrap();
 
     // Store menu IDs for event handling
@@ -2302,6 +2393,16 @@ fn task_attention_presentation(reason: TaskAttentionReason) -> (u8, &'static str
 
 fn agent_event_attention_reason(event: &tab::AgentEvent) -> Option<AttentionReason> {
     match event {
+        tab::AgentEvent::Harness(harness_event) => match harness_event {
+            HarnessEvent::RuntimeRequest { .. } => Some(AttentionReason::HumanInputRequired),
+            HarnessEvent::TurnCompleted { status, .. } => match status {
+                TurnStatus::Completed => Some(AttentionReason::CompletedUnread),
+                TurnStatus::Failed(_) => Some(AttentionReason::AgentFailed),
+                TurnStatus::Interrupted => None,
+            },
+            HarnessEvent::Error(_) => Some(AttentionReason::AgentFailed),
+            _ => None,
+        },
         tab::AgentEvent::Result(_) => Some(AttentionReason::CompletedUnread),
         tab::AgentEvent::Other(value) => match value.get("type").and_then(|value| value.as_str()) {
             Some("done") => Some(AttentionReason::CompletedUnread),
@@ -4348,6 +4449,11 @@ pub enum Event {
     AgentSubmitPrompt(usize, String),
     /// User clicked the stop button on the agent tab with this id.
     AgentStopRequested(usize),
+    /// User answered a pending runtime request (Claude permission prompt
+    /// or question) on the agent tab with this id.
+    AgentAnswerRequest(usize, String, RuntimeDecision),
+    /// Open a native Claude chat tab in the active workspace (TRU-140).
+    NewClaudeChatTab,
     /// One streaming event from the agent subprocess (Step 4 will refine the
     /// payload once the parser lands; today every line arrives as `Other`).
     AgentEventReceived(usize, tab::AgentEvent),
@@ -9420,6 +9526,13 @@ impl App {
                         // Chats registry rule survives restarts.
                         if let Some(session_id) = chat_session_id {
                             if let Some(tab) = workspace.tabs.last_mut() {
+                                // A native Claude chat tab resumes its
+                                // conversation on the next prompt.
+                                if let Some(session) = tab.agent_session_mut() {
+                                    if session.backend() == tab::AgentBackend::Claude {
+                                        session.session_id = Some(session_id.clone());
+                                    }
+                                }
                                 tab.chat_session_id = Some(session_id);
                             }
                         }
@@ -12268,6 +12381,11 @@ fi
                     AgentIpcMessage::Stop { tab_id } => {
                         Task::done(Event::AgentStopRequested(tab_id))
                     }
+                    AgentIpcMessage::Answer {
+                        tab_id,
+                        request_id,
+                        decision,
+                    } => Task::done(Event::AgentAnswerRequest(tab_id, request_id, decision)),
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
@@ -12285,6 +12403,8 @@ fi
                     "text": prompt,
                 }));
                 let mut task_started: Option<String> = None;
+                let mut harness_bridge: Option<tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>> =
+                    None;
                 'outer_submit: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id != tab_id {
@@ -12297,6 +12417,47 @@ fi
                             eprintln!("AgentSubmitPrompt: tab {} is not an agent tab", tab_id);
                             return Task::none();
                         };
+                        if session.backend() == tab::AgentBackend::Claude {
+                            // Native Claude: one long-lived process per tab,
+                            // spawned on first prompt (or after it exited).
+                            if session.claude.is_none() {
+                                if let Some(id) = session.session_id.clone() {
+                                    // Resuming a session whose transcript
+                                    // is gone fails at launch; start fresh.
+                                    if !chats::claude_session_exists(&id) {
+                                        eprintln!(
+                                            "[agent] Claude session {id} has no transcript; starting a new session"
+                                        );
+                                        session.session_id = None;
+                                    }
+                                }
+                                let Some(config) = session.claude_session_config(repo_path) else {
+                                    return Task::none();
+                                };
+                                let (claude, rx) =
+                                    gitterm::harness::claude::ClaudeSession::spawn(config);
+                                session.claude = Some(claude);
+                                harness_bridge = Some(rx);
+                            }
+                            let mut submitted = false;
+                            if let Some(claude) = session.claude.as_ref() {
+                                match claude.send(HarnessCommand::SendUserMessage(prompt.clone())) {
+                                    Ok(()) => {
+                                        session.state = tab::AgentSessionState::Streaming;
+                                        submitted = true;
+                                    }
+                                    Err(e) => eprintln!("AgentSubmitPrompt failed: {}", e),
+                                }
+                            }
+                            session.record(echo.clone());
+                            if submitted {
+                                if let Some(task_id) = tab_task_id {
+                                    t.task_live_state = Some(TaskSessionLiveState::Working);
+                                    task_started = Some(task_id);
+                                }
+                            }
+                            break 'outer_submit;
+                        }
                         if session.task_handle.is_none() {
                             let handle = tab::spawn_agent_task(session.config.clone(), repo_path);
                             // Take the receiver up-front so this turn can wire
@@ -12338,7 +12499,71 @@ fi
                     let stream = UnboundedReceiverStream::new(rx);
                     return Task::run(stream, move |ev| Event::AgentEventReceived(tab_id, ev));
                 }
+                if let Some(rx) = harness_bridge {
+                    use tokio_stream::wrappers::UnboundedReceiverStream;
+                    let stream = UnboundedReceiverStream::new(rx);
+                    return Task::run(stream, move |ev| {
+                        Event::AgentEventReceived(tab_id, tab::AgentEvent::Harness(ev))
+                    });
+                }
                 return Task::none();
+            }
+            Event::AgentAnswerRequest(tab_id, request_id, decision) => {
+                let Some(session) = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                else {
+                    eprintln!("AgentAnswerRequest: tab {tab_id} is not an agent tab");
+                    return Task::none();
+                };
+                let Some(claude) = session.claude.as_ref() else {
+                    eprintln!(
+                        "AgentAnswerRequest: tab {tab_id} has no live Claude session for request {request_id}"
+                    );
+                    return Task::none();
+                };
+                if let Err(e) = claude.send(HarnessCommand::Answer {
+                    request_id: request_id.clone(),
+                    decision,
+                }) {
+                    eprintln!("AgentAnswerRequest {request_id} on tab {tab_id} failed: {e}");
+                }
+                return Task::none();
+            }
+            Event::NewClaudeChatTab => {
+                self.tab_picker_visible = false;
+                let config = tab::AgentBackendConfig::Claude {
+                    // "default" leaves the model to the user's Claude settings.
+                    model: "default".to_string(),
+                    permission_mode: Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
+                    effort: None,
+                };
+                let (repo_path, current_dir) = match self.active_workspace() {
+                    Some(ws) => {
+                        let cd = ws
+                            .active_tab()
+                            .map(|t| t.current_dir.clone())
+                            .unwrap_or_else(|| ws.dir.clone());
+                        (ws.dir.clone(), Some(cd))
+                    }
+                    None => return Task::none(),
+                };
+                let id = self.next_tab_id;
+                self.next_tab_id += 1;
+                if let Some(ws) = self.active_workspace_mut() {
+                    let mut tab = TabState::new(id, repo_path.clone());
+                    tab.kind = TabKind::Agent(AgentSession::new(config));
+                    tab.set_local_dir(current_dir.unwrap_or(repo_path));
+                    ws.tabs.push(tab);
+                    ws.active_tab = ws.tabs.len() - 1;
+                }
+                eprintln!("[agent] opened Claude chat tab id={id}");
+                self.mark_workspaces_dirty();
+                let scroll_task = self.scroll_to_active_tab();
+                return Task::batch([scroll_task, self.show_agent_webview(id)]);
             }
             Event::AgentStopRequested(tab_id) => {
                 let mut task_signal: Option<String> = None;
@@ -12346,6 +12571,14 @@ fi
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
                             if let Some(session) = t.agent_session_mut() {
+                                if let Some(claude) = session.claude.as_ref() {
+                                    // The process stays alive; the turn ends
+                                    // with TurnCompleted { Interrupted }.
+                                    if let Err(e) = claude.send(HarnessCommand::Interrupt) {
+                                        eprintln!("AgentStopRequested: interrupt failed: {e}");
+                                    }
+                                    break 'outer_stop;
+                                }
                                 if let Some(handle) = session.task_handle.as_ref() {
                                     handle.request_stop();
                                 }
@@ -12380,9 +12613,17 @@ fi
                     }
                     tab::AgentEvent::AssistantText(text) => Self::task_progress_line(text)
                         .map(|line| (Some("Responding".to_string()), Some(line))),
+                    tab::AgentEvent::Harness(HarnessEvent::ItemStarted { kind, .. }) => {
+                        let gitterm::harness::ItemKind::ToolCall { name, .. } = kind;
+                        Some((Some(format!("Running {name}")), None))
+                    }
+                    tab::AgentEvent::Harness(HarnessEvent::RuntimeRequest { .. }) => {
+                        Some((Some("Waiting for approval".to_string()), None))
+                    }
                     _ => None,
                 };
                 let mut progress_task: Option<String> = None;
+                let mut session_id_changed = false;
                 let mut task_signal: Option<(String, Option<TaskSessionOutcome>)> = None;
                 'outer_event: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
@@ -12394,7 +12635,75 @@ fi
                             // The agent session's own end states translate
                             // directly into task session outcomes.
                             let mut session_ended: Option<TaskSessionOutcome> = None;
+                            // Live-state edge for a task-linked Claude tab
+                            // (runtime request opened / all resolved).
+                            let mut live_edge: Option<TaskSessionLiveState> = None;
+                            let mut new_session_id: Option<String> = None;
                             if let Some(session) = t.agent_session_mut() {
+                                if let tab::AgentEvent::Harness(harness_event) = &ev {
+                                    match harness_event {
+                                        HarnessEvent::TurnStarted {
+                                            session_id: Some(id),
+                                            ..
+                                        } if session.session_id.as_deref() != Some(id) => {
+                                            session.session_id = Some(id.clone());
+                                            new_session_id = Some(id.clone());
+                                        }
+                                        HarnessEvent::RuntimeRequest { request_id, .. } => {
+                                            session.pending_requests.push(request_id.clone());
+                                            live_edge = Some(TaskSessionLiveState::AwaitingInput);
+                                        }
+                                        HarnessEvent::RuntimeRequestResolved { request_id } => {
+                                            session.pending_requests.retain(|id| id != request_id);
+                                            if session.pending_requests.is_empty() {
+                                                live_edge = Some(TaskSessionLiveState::Working);
+                                            }
+                                        }
+                                        HarnessEvent::TurnCompleted { status, .. } => {
+                                            session.pending_requests.clear();
+                                            match status {
+                                                TurnStatus::Completed => {
+                                                    session.state = tab::AgentSessionState::Idle;
+                                                    session_ended =
+                                                        Some((TaskLifecycle::Completed, None));
+                                                }
+                                                TurnStatus::Interrupted => {
+                                                    session.state = tab::AgentSessionState::Idle;
+                                                    session_ended =
+                                                        Some((TaskLifecycle::Stopped, None));
+                                                }
+                                                TurnStatus::Failed(message) => {
+                                                    session.state = tab::AgentSessionState::Errored(
+                                                        message.clone(),
+                                                    );
+                                                    session_ended = Some((
+                                                        TaskLifecycle::Failed,
+                                                        Some(message.clone()),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        HarnessEvent::ProcessExited { code } => {
+                                            // Next prompt respawns with --resume.
+                                            session.claude = None;
+                                            session.pending_requests.clear();
+                                            if matches!(
+                                                session.state,
+                                                tab::AgentSessionState::Streaming
+                                            ) {
+                                                let message = format!(
+                                                    "Claude exited mid-turn (code {code:?})"
+                                                );
+                                                session.state = tab::AgentSessionState::Errored(
+                                                    message.clone(),
+                                                );
+                                                session_ended =
+                                                    Some((TaskLifecycle::Failed, Some(message)));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 if matches!(&ev, tab::AgentEvent::Result(_)) {
                                     session.state = tab::AgentSessionState::Idle;
                                     session_ended = Some((TaskLifecycle::Completed, None));
@@ -12424,7 +12733,33 @@ fi
                                 if is_active_in_webview {
                                     push_agent_event_to_webview(&ev);
                                 }
-                                session.conversation.push(ev);
+                                session.record(ev);
+                            }
+                            if let Some(id) = new_session_id {
+                                // The tab owns this conversation (Chats
+                                // registry) and resumes it after restart.
+                                t.chat_session_id = Some(id);
+                                session_id_changed = true;
+                            }
+                            match live_edge {
+                                Some(TaskSessionLiveState::Working) => {
+                                    t.clear_attention(AttentionReason::HumanInputRequired);
+                                    if t.task_live_state
+                                        == Some(TaskSessionLiveState::AwaitingInput)
+                                    {
+                                        t.task_live_state = Some(TaskSessionLiveState::Working);
+                                        task_signal = t.task_id.clone().map(|id| (id, None));
+                                    }
+                                }
+                                Some(TaskSessionLiveState::AwaitingInput)
+                                    if t.task_id.is_some()
+                                        && t.task_live_state
+                                            != Some(TaskSessionLiveState::AwaitingInput) =>
+                                {
+                                    t.task_live_state = Some(TaskSessionLiveState::AwaitingInput);
+                                    task_signal = t.task_id.clone().map(|id| (id, None));
+                                }
+                                _ => {}
                             }
                             if let Some(ended) = session_ended {
                                 t.task_live_state = None;
@@ -12454,6 +12789,9 @@ fi
                 }
                 if let Some((task_id, ended)) = task_signal {
                     self.apply_task_session_signal(&task_id, ended);
+                }
+                if session_id_changed {
+                    self.mark_workspaces_dirty();
                 }
                 return Task::none();
             }
@@ -17163,9 +17501,7 @@ fi
             webview::set_visible(true);
             reset_agent_webview();
             set_agent_webview_tab_id(tab_id);
-            for ev in &conversation {
-                push_agent_event_to_webview(ev);
-            }
+            replay_agent_conversation_in_webview(&conversation);
             self.webview_agent_tab_id = Some(tab_id);
             return Task::none();
         }
@@ -17178,11 +17514,7 @@ fi
             );
             webview::destroy();
         }
-        webview::set_pending_content_with_ipc(
-            AGENT_CHAT_HTML.to_string(),
-            bounds,
-            Some(agent_ipc_handler()),
-        );
+        webview::set_pending_content_with_ipc(agent_chat_html(), bounds, Some(agent_ipc_handler()));
         self.webview_kind = WebviewKind::Agent;
         self.webview_agent_tab_id = Some(tab_id);
 
@@ -17206,9 +17538,7 @@ fi
                         conversation.len()
                     );
                     set_agent_webview_tab_id(tab_id);
-                    for ev in conversation.iter() {
-                        push_agent_event_to_webview(ev);
-                    }
+                    replay_agent_conversation_in_webview(&conversation);
                 })
                 .discard()
             } else {
@@ -18199,6 +18529,15 @@ fi
                     },
                 ),
             );
+        }
+        if task_context_id.is_none() {
+            items = items.push(picker_row(
+                "Claude chat".to_string(),
+                "Native chat with approvals (preview)".to_string(),
+                "\u{2733}".to_string(), // ✳
+                theme.accent(),
+                Event::NewClaudeChatTab,
+            ));
         }
         // Always add plain terminal at the bottom
         let terminal_event = task_context_id
@@ -29189,6 +29528,96 @@ mod tests {
             agent_event_attention_reason(&tab::AgentEvent::AssistantText("working".to_string())),
             None
         );
+    }
+
+    #[test]
+    fn claude_harness_events_map_to_semantic_attention() {
+        let harness = |ev| agent_event_attention_reason(&tab::AgentEvent::Harness(ev));
+        assert_eq!(
+            harness(HarnessEvent::RuntimeRequest {
+                request_id: "r1".into(),
+                tool_use_id: "t1".into(),
+                kind: gitterm::harness::RuntimeRequestKind::Question {
+                    questions: serde_json::json!([]),
+                },
+            }),
+            Some(AttentionReason::HumanInputRequired)
+        );
+        let completed = |status| HarnessEvent::TurnCompleted {
+            status,
+            usage: serde_json::Value::Null,
+            cost_usd: None,
+        };
+        assert_eq!(
+            harness(completed(TurnStatus::Completed)),
+            Some(AttentionReason::CompletedUnread)
+        );
+        assert_eq!(
+            harness(completed(TurnStatus::Failed("x".into()))),
+            Some(AttentionReason::AgentFailed)
+        );
+        assert_eq!(harness(completed(TurnStatus::Interrupted)), None);
+        assert_eq!(harness(HarnessEvent::TextDelta("hi".into())), None);
+    }
+
+    #[test]
+    fn agent_chat_page_inlines_vendored_renderers() {
+        let html = agent_chat_html();
+        assert!(!html.contains(AGENT_CHAT_VENDOR_SLOT));
+        assert!(html.contains("marked v12"));
+        assert!(html.contains("Highlight.js v11"));
+        // An inlined script must not close its own <script> element early.
+        for js in AGENT_CHAT_VENDOR_JS {
+            assert!(!js.contains("</script"));
+        }
+    }
+
+    #[test]
+    fn agent_session_record_merges_streaming_fragments() {
+        let mut session = AgentSession::new(tab::AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        for ev in [
+            HarnessEvent::TextDelta("a".into()),
+            HarnessEvent::TextDelta("b".into()),
+            HarnessEvent::ItemInputDelta {
+                id: "t1".into(),
+                partial_json: "{".into(),
+            },
+            HarnessEvent::ItemInputDelta {
+                id: "t1".into(),
+                partial_json: "}".into(),
+            },
+            HarnessEvent::TextDelta("c".into()),
+        ] {
+            session.record(tab::AgentEvent::Harness(ev));
+        }
+        let merged: Vec<_> = session
+            .conversation
+            .iter()
+            .map(|e| match e {
+                tab::AgentEvent::Harness(h) => h.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            merged,
+            vec![
+                HarnessEvent::TextDelta("ab".into()),
+                HarnessEvent::ItemInputDelta {
+                    id: "t1".into(),
+                    partial_json: "{}".into()
+                },
+                HarnessEvent::TextDelta("c".into()),
+            ]
+        );
+        let config = session
+            .claude_session_config(PathBuf::from("/tmp"))
+            .expect("claude config");
+        assert_eq!(config.model, None, "\"default\" defers to Claude settings");
+        assert_eq!(config.permission_mode, "default");
     }
 
     #[test]

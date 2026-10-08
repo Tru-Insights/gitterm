@@ -352,3 +352,62 @@ came to well under $0.05.
   crate's own `tokio` features do not list `time`; it is enabled through
   feature unification (warp, hyper, tonic). The app code should add `time`
   explicitly if it relies on it.
+
+## Phase B notes (chat tab on a native session)
+
+**Shape.** `src/harness/mod.rs` holds the normalized model (`HarnessEvent`,
+`HarnessCommand`, `RuntimeDecision`). `src/harness/claude.rs` holds
+`ClaudeFrameParser`, which is pure and stateful only where the wire forces
+it (block index to tool id, host `request_id` to request kind), and
+`ClaudeSession`, which runs one process on its own thread with a
+current-thread tokio runtime. Only `AgentBackend::Claude` uses it. Pi keeps
+the per-turn path, and the old `claude --print` command builder is gone.
+
+**Decisions taken in Phase B:**
+
+- `CLAUDE_CODE_ENTRYPOINT=sdk-ts` and `CLAUDE_CODE_SDK_READS_SESSION_STATE=1`
+  stay as tested, with `CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_PID` and
+  `NODE_OPTIONS` stripped. **Revisit:** whether GitTerm should claim its own
+  entrypoint value.
+- `TurnStarted` comes from `system/init`, which fires every turn. It carries
+  `session_id` and `model`, because `initialize` does not return the session
+  id for a fresh session. `Ready.session_id` is only the id being resumed.
+- The session id persists in the tab's existing `chat_session_id`, so the
+  Chats registry sees the tab as owning that conversation. On restore it
+  seeds `AgentSession.session_id`. If the transcript is missing
+  (`chats::claude_session_exists`), the session starts fresh instead of
+  failing `--resume`.
+- A model of `"default"` (or empty) omits `--model`, so the user's Claude
+  settings choose. The "Claude chat" entry in the picker uses this, with
+  permission mode `default`.
+- Frames carrying a non-null `parent_tool_use_id` (subagent internals) are
+  ignored. The parent Task tool card still shows.
+- Any runtime request still open when its turn ends, or when the process
+  exits, is emitted as `RuntimeRequestResolved`. If an interrupt was
+  requested, an `error_during_execution` result maps to `Interrupted`.
+- `cost_usd` is the CLI's cumulative `total_cost_usd`. The activity bar
+  labels it "session".
+- `claude` is resolved on PATH plus `~/.local/bin`, `~/.cargo/bin`,
+  `/opt/homebrew/bin` and `/usr/local/bin`, and the child gets that PATH. A
+  Finder launch otherwise has no `claude` on PATH.
+- `GITTERM_CLAUDE_WIRE_LOG_DIR=<dir>` appends every stdin and stdout frame to
+  `claude-<pid>-{stdin,stdout}.jsonl`.
+- The tokio `time` feature is now explicit in `Cargo.toml`.
+
+**Verification:**
+
+- Parser tests run against trimmed recorded frames in `tests/fixtures/claude/`.
+- `cargo run --example claude_harness_smoke -- --workdir <empty dir>` drives
+  the library session through five steps against the real CLI (haiku, user
+  settings loaded): a text turn, a Bash prompt that is allowed, an
+  AskUserQuestion that is answered, an interrupt, and a turn after the
+  interrupt. All five passed on claude 2.1.294.
+
+**Open:**
+
+- The `--resume` path from the UI after an app restart has not been exercised
+  live.
+- The Edit menu (needed for Cmd+V in WKWebView) has not been checked against
+  the terminal's own Cmd+C/V handling in the running app.
+- Task and browser MCP servers are not attached to chat-tab sessions
+  (TRU-134/135 cover terminal sessions only).

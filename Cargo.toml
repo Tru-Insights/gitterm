@@ -34,7 +34,7 @@ warp = "0.3"
 tonic = { version = "0.12", features = ["transport", "tls-roots"] }
 portable-pty = "0.8"
 prost = "0.13"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "process", "io-util", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "process", "io-util", "macros", "net", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
 chrono = "0.4"
