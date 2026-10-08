@@ -184,6 +184,23 @@ mod tests {
     }
 
     #[test]
+    fn review_defaults_to_an_opus_claude_subagent_and_old_configs_load() {
+        let mut serialized = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(
+            serialized["review"],
+            serde_json::json!({"default_reviewer": "claude-subagent", "subagent_model": "opus"})
+        );
+        serialized.as_object_mut().unwrap().remove("review");
+        let existing: Config = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(existing.review, ReviewConfig::default());
+
+        serialized["review"] = serde_json::json!({"default_reviewer": "codex"});
+        let codex: Config = serde_json::from_value(serialized).unwrap();
+        assert_eq!(codex.review.default_reviewer, ReviewerKind::Codex);
+        assert_eq!(codex.review.subagent_model, "opus");
+    }
+
+    #[test]
     fn terminal_log_mirroring_is_opt_in() {
         let mut serialized = serde_json::to_value(Config::default()).unwrap();
         let object = serialized.as_object_mut().unwrap();
@@ -370,6 +387,51 @@ pub struct Config {
     /// would strand every dispatch.
     #[serde(default = "default_max_concurrent_local_tasks")]
     pub max_concurrent_local_tasks: usize,
+    /// Defaults for the chat tab's Review… button (TRU-142).
+    #[serde(default)]
+    pub review: ReviewConfig,
+}
+
+/// Who reviews code when the chat tab's Review… button is pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewerKind {
+    /// A subagent spawned by the chat's own Claude through its Agent tool.
+    #[default]
+    ClaudeSubagent,
+    /// An independent Codex run. Not available yet (TRU-142 S3/S4).
+    Codex,
+}
+
+impl ReviewerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeSubagent => "claude-subagent",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+fn default_review_subagent_model() -> String {
+    "opus".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    #[serde(default)]
+    pub default_reviewer: ReviewerKind,
+    /// The Agent tool `model` a Claude-subagent review runs on.
+    #[serde(default = "default_review_subagent_model")]
+    pub subagent_model: String,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            default_reviewer: ReviewerKind::default(),
+            subagent_model: default_review_subagent_model(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +539,7 @@ impl Default for Config {
             quick_commands: Vec::new(),
             task_worktree_root: default_task_worktree_root(),
             max_concurrent_local_tasks: default_max_concurrent_local_tasks(),
+            review: ReviewConfig::default(),
         }
     }
 }

@@ -123,6 +123,15 @@ pub enum HarnessEvent {
         /// Claude reports this cumulatively per process.
         cost_usd: Option<f64>,
     },
+    /// Activity inside a subagent the turn spawned (Claude's Agent tool).
+    /// `parent_tool_use_id` is the parent's Agent tool call; `event` is one
+    /// of the subagent's own text, thinking or item events. Kept apart from
+    /// the turn's events so the subagent's text never streams into the
+    /// parent's reply.
+    SubagentEvent {
+        parent_tool_use_id: String,
+        event: Box<HarnessEvent>,
+    },
     /// The harness confirmed a permission mode change GitTerm requested.
     /// Carries the mode now in effect.
     PermissionModeChanged(String),

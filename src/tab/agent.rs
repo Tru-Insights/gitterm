@@ -231,29 +231,11 @@ impl AgentSession {
     /// Append an event to the conversation buffer, merging consecutive
     /// streaming fragments so tab switches replay a compact buffer.
     pub(crate) fn record(&mut self, ev: AgentEvent) {
-        use HarnessEvent as H;
         if let (Some(AgentEvent::Harness(last)), AgentEvent::Harness(next)) =
             (self.conversation.last_mut(), &ev)
         {
-            match (last, next) {
-                (H::TextDelta(a), H::TextDelta(b)) | (H::ThinkingDelta(a), H::ThinkingDelta(b)) => {
-                    a.push_str(b);
-                    return;
-                }
-                (
-                    H::ItemInputDelta {
-                        id: a_id,
-                        partial_json: a,
-                    },
-                    H::ItemInputDelta {
-                        id: b_id,
-                        partial_json: b,
-                    },
-                ) if a_id == b_id => {
-                    a.push_str(b);
-                    return;
-                }
-                _ => {}
+            if merge_fragment(last, next) {
+                return;
             }
         }
         self.conversation.push(ev);
@@ -305,6 +287,43 @@ impl AgentSession {
             ),
             AgentBackendConfig::Pi { .. } => None,
         }
+    }
+}
+
+/// Fold `next` into `last` when both are fragments of the same stream:
+/// text, thinking, one tool call's input, or any of those from the same
+/// subagent. Returns whether `next` was absorbed.
+fn merge_fragment(last: &mut HarnessEvent, next: &HarnessEvent) -> bool {
+    use HarnessEvent as H;
+    match (last, next) {
+        (H::TextDelta(a), H::TextDelta(b)) | (H::ThinkingDelta(a), H::ThinkingDelta(b)) => {
+            a.push_str(b);
+            true
+        }
+        (
+            H::ItemInputDelta {
+                id: a_id,
+                partial_json: a,
+            },
+            H::ItemInputDelta {
+                id: b_id,
+                partial_json: b,
+            },
+        ) if a_id == b_id => {
+            a.push_str(b);
+            true
+        }
+        (
+            H::SubagentEvent {
+                parent_tool_use_id: a_parent,
+                event: a,
+            },
+            H::SubagentEvent {
+                parent_tool_use_id: b_parent,
+                event: b,
+            },
+        ) if a_parent == b_parent => merge_fragment(a, b),
+        _ => false,
     }
 }
 
@@ -547,5 +566,78 @@ fn build_command(config: &AgentBackendConfig, prompt: &str) -> Result<Command, S
         AgentBackendConfig::Claude { .. } => {
             Err("Claude tabs use the native harness session, not per-turn processes".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(parent: &str, event: HarnessEvent) -> AgentEvent {
+        AgentEvent::Harness(HarnessEvent::SubagentEvent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(event),
+        })
+    }
+
+    fn harness(events: &[AgentEvent]) -> Vec<&HarnessEvent> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Harness(h) => Some(h),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn record_coalesces_subagent_deltas_per_parent() {
+        let mut session = AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        session.record(AgentEvent::Harness(HarnessEvent::TextDelta(
+            "parent ".into(),
+        )));
+        session.record(sub("a", HarnessEvent::TextDelta("one ".into())));
+        session.record(sub("a", HarnessEvent::TextDelta("two".into())));
+        // A different subagent, or a non-delta, starts a new entry.
+        session.record(sub("b", HarnessEvent::TextDelta("other".into())));
+        session.record(sub("b", HarnessEvent::ThinkingDelta("hm".into())));
+        session.record(sub("b", HarnessEvent::ThinkingDelta("m".into())));
+        session.record(sub(
+            "b",
+            HarnessEvent::ItemCompleted {
+                id: "t".into(),
+                output: String::new(),
+                is_error: false,
+            },
+        ));
+        session.record(sub(
+            "b",
+            HarnessEvent::ItemCompleted {
+                id: "t2".into(),
+                output: String::new(),
+                is_error: false,
+            },
+        ));
+        // Subagent text does not merge into the parent's text either way.
+        session.record(AgentEvent::Harness(HarnessEvent::TextDelta("more".into())));
+
+        let got = harness(&session.conversation);
+        assert_eq!(got.len(), 7, "{got:?}");
+        assert_eq!(got[0], &HarnessEvent::TextDelta("parent ".into()));
+        let AgentEvent::Harness(expected) = sub("a", HarnessEvent::TextDelta("one two".into()))
+        else {
+            unreachable!()
+        };
+        assert_eq!(got[1], &expected);
+        let AgentEvent::Harness(expected) = sub("b", HarnessEvent::ThinkingDelta("hmm".into()))
+        else {
+            unreachable!()
+        };
+        assert_eq!(got[3], &expected);
+        assert_eq!(got[6], &HarnessEvent::TextDelta("more".into()));
     }
 }

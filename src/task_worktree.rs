@@ -492,14 +492,10 @@ pub async fn resolve_worktree_adoption(
         })?
 }
 
-/// Prefer the remote default branch, then the product defaults, then the main
-/// checkout's branch; a branch can never be its own base. The recorded base
-/// commit is the fork point when one exists — for a pre-existing branch that
-/// is the honest anchor for "what changed" comparisons.
-fn infer_adoption_base(
-    repository: &ResolvedRepository,
-    branch: &str,
-) -> Result<GitBase, TaskWorktreeError> {
+/// The base branch GitTerm infers for an existing branch: the remote default
+/// branch, then the product defaults, then the main checkout's branch; a
+/// branch can never be its own base. `None` when no candidate resolves.
+pub fn infer_branch_base(repository: &ResolvedRepository, branch: &str) -> Option<GitBase> {
     let origin_head = git_command()
         .args([
             "symbolic-ref",
@@ -521,16 +517,22 @@ fn infer_adoption_base(
     if let Some(current) = &repository.current_branch {
         candidates.push(current.clone());
     }
-    let mut base = None;
-    for reference in candidates {
-        if reference == branch || reference.strip_prefix("origin/") == Some(branch) {
-            continue;
-        }
-        if let Ok(resolved) = resolve_base(repository, &reference) {
-            base = Some(resolved);
-            break;
-        }
-    }
+    candidates
+        .into_iter()
+        .filter(|reference| {
+            reference != branch && reference.strip_prefix("origin/") != Some(branch)
+        })
+        .find_map(|reference| resolve_base(repository, &reference).ok())
+}
+
+/// [`infer_branch_base`], anchored at the fork point. The recorded base
+/// commit is the fork point when one exists — for a pre-existing branch that
+/// is the honest anchor for "what changed" comparisons.
+fn infer_adoption_base(
+    repository: &ResolvedRepository,
+    branch: &str,
+) -> Result<GitBase, TaskWorktreeError> {
+    let base = infer_branch_base(repository, branch);
     let mut base = base.ok_or_else(|| {
         TaskWorktreeError::new(
             "infer adoption base",

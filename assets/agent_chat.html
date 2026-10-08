@@ -152,6 +152,38 @@
   }
   .tool-body pre.err { color: var(--err); }
 
+  /* Subagent block nested in an Agent tool card */
+  details.subagent {
+    margin: 6px 0 2px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 5px;
+    background: var(--bg-alt);
+    font-size: 12.5px;
+  }
+  details.subagent.done { border-left-color: var(--result); }
+  details.subagent.failed { border-left-color: var(--err); }
+  details.subagent.stopped { border-left-color: var(--fg-muted); }
+  details.subagent summary {
+    cursor: pointer; user-select: none; list-style: none;
+    padding: 4px 8px; display: flex; gap: 8px; align-items: baseline;
+  }
+  details.subagent summary::-webkit-details-marker { display: none; }
+  details.subagent summary::before { content: '\25B8'; color: var(--fg-muted); font-size: 10px; }
+  details.subagent[open] summary::before { content: '\25BE'; }
+  .sa-label { font-weight: 600; color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  details.subagent.done .sa-label { color: var(--result); }
+  details.subagent.failed .sa-label { color: var(--err); }
+  .sa-desc { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sa-state { font-size: 11px; color: var(--fg-muted); white-space: nowrap; font-family: var(--mono); }
+  details.subagent.running .sa-state { color: var(--accent); }
+  .sa-latest { padding: 0 8px 4px 22px; color: var(--fg-muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sa-body { padding: 2px 8px 6px 22px; }
+  .sa-tools { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; }
+  .sa-tool { font-family: var(--mono); font-size: 11px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--tool); }
+  .sa-tool.done { color: var(--result); } .sa-tool.error { color: var(--err); }
+  .sa-text { white-space: pre-wrap; word-break: break-word; font-size: 12px; max-height: 240px; overflow: auto; margin-top: 4px; }
+
   .note { color: var(--fg-muted); font-size: 12px; margin: 6px 0; }
   .note.warn { color: var(--warn); }
   .error-block {
@@ -306,6 +338,38 @@
   #mode-menu .mark { width: 12px; color: var(--accent); }
   #mode-menu .hint { padding: 4px 8px 2px; color: var(--fg-muted); font-size: 11px; white-space: nowrap; }
 
+  /* Review… button and popover (left of the mode chip) */
+  .review-wrap { position: relative; display: none; }
+  .review-wrap.visible { display: block; }
+  #review { padding: 7px 10px; font-size: 12px; white-space: nowrap; }
+  #review-pop {
+    display: none;
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 6px);
+    width: 340px;
+    padding: 10px 12px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    z-index: 10;
+    font-size: 12.5px;
+  }
+  #review-pop.visible { display: block; }
+  #review-pop .rv-title { font-weight: 600; margin-bottom: 6px; }
+  #review-pop .rv-row { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+  #review-pop .rv-row input[type=text], #review-pop textarea, #review-pop select {
+    flex: 1; min-width: 0; padding: 4px 6px; font-size: 12px;
+    background: var(--bg-input); color: var(--fg);
+    border: 1px solid var(--border-strong); border-radius: 5px; font-family: inherit;
+  }
+  #review-pop textarea { width: 100%; resize: vertical; min-height: 44px; }
+  #review-pop label { display: flex; gap: 6px; align-items: center; cursor: pointer; white-space: nowrap; }
+  #review-pop .rv-hint { color: var(--fg-muted); font-size: 11px; margin: 0 0 4px 22px; }
+  #review-pop .rv-hint.warn { color: var(--warn); }
+  #review-pop .rv-label { color: var(--fg-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin: 8px 0 3px; }
+  #review-pop .rv-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; }
+
   /* highlight.js tokens (Catppuccin Mocha) */
   .hljs-keyword, .hljs-selector-tag, .hljs-built_in { color: #cba6f7; }
   .hljs-string, .hljs-attr-value, .hljs-template-string { color: #a6e3a1; }
@@ -334,6 +398,10 @@
   <div id="request-panel"></div>
   <div id="composer">
     <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+    <div class="review-wrap">
+      <div id="review-pop"></div>
+      <button id="review" title="Ask a reviewer subagent to review this checkout">Review…</button>
+    </div>
     <div class="mode-wrap">
       <div id="mode-menu"></div>
       <button id="mode" title="Permission mode (Shift+Tab in the message box cycles)"></button>
@@ -353,6 +421,8 @@
   window.__setTabId = function (id, permissionMode) {
     window.__currentTabId = id;
     resetMode(permissionMode == null ? null : permissionMode);
+    // Only Claude tabs have a permission mode, and only they can review.
+    setReviewAvailable(permissionMode != null);
   };
 
   const messagesEl = document.getElementById('messages');
@@ -568,15 +638,17 @@
     const body = d.appendChild(el('div', 'tool-body'));
     body.appendChild(el('div', 'tool-label', 'Input'));
     const inputEl = body.appendChild(el('pre'));
-    const item = { card: d, name, brief, badge, body, inputEl, outputEl: null, raw: '', input: kind && kind.input };
+    const item = { card: d, name, brief, badge, body, inputEl, outputEl: null, raw: '', input: kind && kind.input, sub: null };
     items.set(id, item);
     if (item.input && Object.keys(item.input).length) showInput(item, item.input);
+    if (name === 'Agent' || name === 'Task') ensureSubagent(item);
     setActivity('Calling ' + name);
   }
   function showInput(item, input) {
     item.input = input;
     item.brief.textContent = salient(item.name, input);
     item.inputEl.textContent = JSON.stringify(input, null, 2);
+    if (item.sub) renderSubagent(item.sub);
   }
   function itemInputDelta(id, partial) {
     const item = items.get(id);
@@ -597,7 +669,114 @@
     item.outputEl = item.body.appendChild(el('pre', isError ? 'err' : null, text));
     item.badge.textContent = '';
     item.card.open = false;
+    // A foreground subagent is done when its Agent call returns, even if
+    // the harness sent no completion of its own. A background one only
+    // finishes on its own completion event.
+    if (item.sub && item.sub.state === 'running' && !item.sub.tracked) {
+      item.sub.state = isError ? 'failed' : 'done';
+      renderSubagent(item.sub);
+    }
     setActivity('Thinking');
+    scrollIfFollowing();
+  }
+
+  // ---- subagents (nested under the parent's Agent tool card) -------------
+  // tool_use id of a tool a subagent called -> the root Agent call's id, so
+  // permission prompts and nested subagents land in the right block.
+  const subTools = new Map();
+  function ensureSubagent(item) {
+    if (item.sub) return item.sub;
+    const d = el('details', 'subagent running');
+    item.card.insertBefore(d, item.body);
+    const summary = d.appendChild(el('summary'));
+    const sub = {
+      details: d,
+      item,
+      label: summary.appendChild(el('span', 'sa-label', 'Subagent')),
+      desc: summary.appendChild(el('span', 'sa-desc')),
+      stateEl: summary.appendChild(el('span', 'sa-state')),
+      latestEl: item.card.insertBefore(el('div', 'sa-latest'), item.body),
+      toolsEl: null, textEl: null,
+      state: 'running', tracked: false, waiting: false,
+      tools: [], text: '', model: null,
+    };
+    const body = d.appendChild(el('div', 'sa-body'));
+    sub.toolsEl = body.appendChild(el('div', 'sa-tools'));
+    sub.textEl = body.appendChild(el('div', 'sa-text'));
+    item.sub = sub;
+    renderSubagent(sub);
+    return sub;
+  }
+  function lastLine(text) {
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+    const line = lines.length ? lines[lines.length - 1] : '';
+    return line.length > 200 ? line.slice(0, 200) + '…' : line;
+  }
+  function renderSubagent(sub) {
+    const input = sub.item.input || {};
+    const parts = [];
+    if (input.description) parts.push(input.description);
+    if (input.subagent_type) parts.push(input.subagent_type);
+    const model = input.model || sub.model;
+    if (model) parts.push(model);
+    sub.desc.textContent = parts.join(' · ');
+    const states = { running: sub.waiting ? 'waiting for approval' : 'running', done: 'done', failed: 'failed', stopped: 'stopped' };
+    const n = sub.tools.length;
+    sub.stateEl.textContent = states[sub.state] + (n ? ' · ' + n + (n === 1 ? ' tool' : ' tools') : '');
+    sub.details.className = 'subagent ' + sub.state;
+    sub.latestEl.textContent = lastLine(sub.text);
+    sub.latestEl.style.display = sub.text ? '' : 'none';
+  }
+  function subagentEvent(parentId, ev) {
+    const rootId = items.has(parentId) ? parentId : subTools.get(parentId);
+    const item = rootId && items.get(rootId);
+    if (!item) { console.warn('subagent event for unknown tool call', parentId, ev); return; }
+    const sub = ensureSubagent(item);
+    const d = ev.data;
+    switch (ev.type) {
+      case 'turn_started':
+        sub.tracked = true;
+        sub.state = 'running';
+        if (d && d.model) sub.model = d.model;
+        break;
+      case 'turn_completed': {
+        const st = (d && d.status && d.status.state) || 'completed';
+        sub.state = st === 'completed' ? 'done' : st === 'interrupted' ? 'stopped' : 'failed';
+        if (st === 'failed' && d.status.message) sub.text += (sub.text ? '\n' : '') + d.status.message;
+        break;
+      }
+      case 'text_delta':
+        sub.text += d;
+        sub.textEl.textContent = sub.text;
+        setActivity('Subagent responding');
+        break;
+      case 'thinking_delta':
+        setActivity('Subagent thinking');
+        break;
+      case 'item_started': {
+        const name = d.kind && d.kind.name ? d.kind.name : 'tool';
+        subTools.set(d.id, rootId);
+        const chip = sub.toolsEl.appendChild(el('span', 'sa-tool', name));
+        chip.title = salient(name, d.kind && d.kind.input) || name;
+        sub.tools.push({ id: d.id, name, chip });
+        // Separate the text before and after each tool call.
+        if (sub.text && !sub.text.endsWith('\n')) sub.text += '\n';
+        setActivity('Subagent: ' + name);
+        break;
+      }
+      case 'item_completed': {
+        const tool = sub.tools.find((t) => t.id === d.id);
+        if (tool) tool.chip.classList.add(d.is_error ? 'error' : 'done');
+        break;
+      }
+      case 'subagent_event':
+        // A subagent's own subagent rolls up into the same block.
+        subagentEvent(d.parent_tool_use_id, d.event);
+        return;
+      default:
+        break;
+    }
+    renderSubagent(sub);
     scrollIfFollowing();
   }
 
@@ -647,6 +826,7 @@
     // Typing stays possible while a request is pending; sending waits.
     submitBtn.disabled = busy || pending.size > 0;
     stopBtn.disabled = !busy;
+    if (typeof refreshReviewSubmit === 'function') refreshReviewSubmit();
   }
   function setBusy(b) { busy = b; refreshComposer(); }
   function submitPrompt() {
@@ -746,6 +926,134 @@
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') modeMenuEl.classList.remove('visible');
   });
+
+  // ---- Review… (TRU-142) ---------------------------------------------------
+  // The popover only collects the request; Rust builds the review prompt
+  // and sends it as a normal user message, so the transcript shows exactly
+  // what Claude was asked.
+  const reviewWrapEl = document.querySelector('.review-wrap');
+  const reviewBtn = document.getElementById('review');
+  const reviewPopEl = document.getElementById('review-pop');
+  const REVIEW_MODELS = ['opus', 'sonnet', 'haiku'];
+  const BASE_SOURCES = { task: "this task's base", 'agent-workflow': 'agent-workflow.config.json', inferred: 'inferred from the repository' };
+  const review = { available: false, ctx: null, form: null };
+  let reviewSubmitBtn = null;
+  function setReviewAvailable(on) {
+    review.available = !!on;
+    reviewWrapEl.classList.toggle('visible', review.available);
+    if (!review.available) closeReview();
+  }
+  function closeReview() { reviewPopEl.classList.remove('visible'); }
+  function refreshReviewSubmit() {
+    if (!reviewSubmitBtn || !review.form) return;
+    const f = review.form;
+    const target = f.target();
+    const missing = (target === 'branch' && !f.base.value.trim()) || (target === 'commit' && !f.sha.value.trim());
+    reviewSubmitBtn.disabled = busy || pending.size > 0 || missing;
+    reviewSubmitBtn.title = busy ? 'Waits until Claude finishes this turn' : (missing ? 'Fill in the target first' : '');
+  }
+  function renderReview() {
+    reviewPopEl.innerHTML = '';
+    reviewPopEl.appendChild(el('div', 'rv-title', 'Review'));
+    const r = review.ctx;
+    if (!r) { reviewPopEl.appendChild(el('div', 'rv-hint', 'Reading the repository…')); review.form = null; reviewSubmitBtn = null; return; }
+    const c = r.context || {};
+    if (c.error) reviewPopEl.appendChild(el('div', 'rv-hint warn', c.error));
+    reviewPopEl.appendChild(el('div', 'rv-label', 'Target'));
+    const radios = {};
+    function radio(value, text) {
+      const row = reviewPopEl.appendChild(el('div', 'rv-row'));
+      const label = row.appendChild(el('label'));
+      const input = label.appendChild(el('input'));
+      input.type = 'radio'; input.name = 'rv-target'; input.value = value;
+      label.appendChild(document.createTextNode(text));
+      input.addEventListener('change', refreshReviewSubmit);
+      radios[value] = input;
+      return row;
+    }
+    const branchRow = radio('branch', 'Branch vs');
+    const base = branchRow.appendChild(el('input'));
+    base.type = 'text'; base.placeholder = 'base branch'; base.value = c.base || '';
+    base.addEventListener('input', () => { radios.branch.checked = true; refreshReviewSubmit(); });
+    let baseHint;
+    if (c.base) {
+      baseHint = 'Base from ' + (BASE_SOURCES[c.base_source] || c.base_source || '?') +
+        (typeof c.ahead === 'number' ? ' · ' + c.ahead + (c.ahead === 1 ? ' commit' : ' commits') + ' ahead' : '');
+    } else {
+      baseHint = 'No base branch found; enter one.';
+    }
+    reviewPopEl.appendChild(el('div', 'rv-hint' + (c.base ? '' : ' warn'), baseHint));
+    radio('uncommitted', 'Uncommitted changes');
+    reviewPopEl.appendChild(el('div', 'rv-hint', c.dirty ? 'Staged, unstaged and untracked changes against HEAD' : 'The working tree is clean'));
+    const commitRow = radio('commit', 'Commit');
+    const sha = commitRow.appendChild(el('input'));
+    sha.type = 'text'; sha.placeholder = 'SHA'; sha.value = c.head || '';
+    sha.addEventListener('input', () => { radios.commit.checked = true; refreshReviewSubmit(); });
+    // Branch vs base when the branch has commits of its own, else the
+    // uncommitted changes.
+    const initial = c.base && c.ahead > 0 ? 'branch' : (c.dirty || !c.base ? 'uncommitted' : 'branch');
+    radios[initial].checked = true;
+
+    reviewPopEl.appendChild(el('div', 'rv-label', 'Focus (optional)'));
+    const focus = reviewPopEl.appendChild(el('textarea'));
+    focus.placeholder = 'e.g. error handling in the webview lifecycle';
+
+    reviewPopEl.appendChild(el('div', 'rv-label', 'Reviewer'));
+    const revRow = reviewPopEl.appendChild(el('div', 'rv-row'));
+    const codex = r.reviewer === 'codex';
+    revRow.appendChild(el('span', null, codex ? 'Codex (not available yet)' : 'Claude subagent on'));
+    const model = revRow.appendChild(el('select'));
+    const models = REVIEW_MODELS.includes(r.model) || !r.model ? REVIEW_MODELS : [r.model].concat(REVIEW_MODELS);
+    for (const m of models) { const o = model.appendChild(el('option', null, m)); o.value = m; }
+    model.value = r.model || 'opus';
+    if (codex) model.style.display = 'none';
+
+    const actions = reviewPopEl.appendChild(el('div', 'rv-actions'));
+    const cancel = actions.appendChild(el('button', null, 'Cancel'));
+    cancel.addEventListener('click', () => { closeReview(); promptEl.focus(); });
+    reviewSubmitBtn = actions.appendChild(el('button', 'primary', 'Start review'));
+    review.form = {
+      base, sha, focus, model,
+      target: () => (Object.keys(radios).find((k) => radios[k].checked) || 'uncommitted'),
+    };
+    reviewSubmitBtn.addEventListener('click', submitReview);
+    refreshReviewSubmit();
+  }
+  function submitReview() {
+    const f = review.form;
+    if (!f || reviewSubmitBtn.disabled) return;
+    const kind = f.target();
+    const target = kind === 'branch' ? { kind, base: f.base.value.trim() }
+      : kind === 'commit' ? { kind, sha: f.sha.value.trim() } : { kind };
+    const focus = f.focus.value.trim();
+    postIpc({ type: 'review_request', target, focus: focus || null, model: f.model.value });
+    closeReview();
+    follow = true;
+  }
+  reviewBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (reviewPopEl.classList.contains('visible')) { closeReview(); return; }
+    review.ctx = null;
+    renderReview();
+    reviewPopEl.classList.add('visible');
+    postIpc({ type: 'review_context' });
+  });
+  reviewPopEl.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => closeReview());
+  reviewPopEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { closeReview(); promptEl.focus(); }
+    else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submitReview(); }
+  });
+  // Rust answers review_context with {context, reviewer, model}.
+  window.__setReviewContext = function (payload) {
+    if (!reviewPopEl.classList.contains('visible')) return;
+    review.ctx = payload || {};
+    renderReview();
+    const f = review.form;
+    if (f) (f.target() === 'branch' && !f.base.value ? f.base : f.focus).focus();
+  };
+  // Why a review was not sent (Codex not available, bad target, ...).
+  window.__reviewNote = function (text) { note(text, 'warn'); };
 
   // ---- runtime requests (panel above the composer) -----------------------
   function answer(requestId, decision) {
@@ -899,6 +1207,8 @@
     pending.set(d.request_id, { tool_use_id: d.tool_use_id, kind: d.kind, sending: false });
     const item = items.get(d.tool_use_id);
     if (item) item.badge.textContent = d.kind.type === 'question' ? 'waiting for your answer' : 'waiting for approval';
+    const subRoot = subTools.has(d.tool_use_id) && items.get(subTools.get(d.tool_use_id));
+    if (subRoot && subRoot.sub) { subRoot.sub.waiting = true; renderSubagent(subRoot.sub); }
     setActivity(d.kind.type === 'question' ? 'Waiting for your answer' : 'Waiting for approval: ' + (d.kind.tool_name || ''), 'waiting');
     renderPanel();
   }
@@ -908,12 +1218,16 @@
     pending.delete(requestId);
     const item = items.get(req.tool_use_id);
     if (item) { item.badge.textContent = ''; setActivity('Running ' + item.name); }
+    const subRoot = subTools.has(req.tool_use_id) && items.get(subTools.get(req.tool_use_id));
+    if (subRoot && subRoot.sub) { subRoot.sub.waiting = false; renderSubagent(subRoot.sub); }
     renderPanel();
   }
   function clearPending() {
     for (const req of pending.values()) {
       const item = items.get(req.tool_use_id);
       if (item) item.badge.textContent = '';
+      const subRoot = subTools.has(req.tool_use_id) && items.get(subTools.get(req.tool_use_id));
+      if (subRoot && subRoot.sub) { subRoot.sub.waiting = false; renderSubagent(subRoot.sub); }
     }
     pending.clear();
     renderPanel();
@@ -932,6 +1246,12 @@
                           : 'Claude session ready · permission mode ' + (d.permission_mode || '?'));
         break;
       case 'turn_started':
+        // Claude starts a turn on its own when a background subagent
+        // finishes; show it as running like any other turn.
+        if (!busy) { endSegment(); endThinking(); setBusy(true); startActivity('Starting'); }
+        break;
+      case 'subagent_event':
+        subagentEvent(d.parent_tool_use_id, d.event);
         break;
       case 'text_delta':
         endThinking();
@@ -1064,7 +1384,7 @@
   window.__resetConversation = function () {
     messagesEl.innerHTML = '';
     segment = null; thinking = null;
-    items.clear(); pending.clear();
+    items.clear(); pending.clear(); subTools.clear();
     if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
     activityEl.className = 'activity';
     follow = true;

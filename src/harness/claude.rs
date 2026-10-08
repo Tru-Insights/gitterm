@@ -111,6 +111,11 @@ pub struct ClaudeFrameParser {
     /// Content block index -> tool_use id, for the current message.
     tool_blocks: HashMap<u64, String>,
     host_requests: HashMap<String, HostRequest>,
+    /// Agent calls whose subagent reported `task_started` and has not
+    /// finished -> whether the subagent has sent text since its last tool
+    /// call. Background Bash commands are tasks too; only subagents'
+    /// completions become `SubagentEvent`s.
+    agent_tasks: HashMap<String, bool>,
 }
 
 impl ClaudeFrameParser {
@@ -132,10 +137,24 @@ impl ClaudeFrameParser {
             return vec![ParsedFrame::Unparsed(line.to_string())];
         };
         let str_at = |p: &str| v.pointer(p).and_then(Value::as_str);
-        // Subagent traffic (Task tool) carries a parent tool_use id. The
-        // chat shows the parent tool call only; its internals are not items
-        // of this turn and their block indexes would collide with ours.
-        let from_subagent = v.get("parent_tool_use_id").is_some_and(|p| !p.is_null());
+        // Subagent traffic (Agent tool) carries the parent's tool_use id.
+        // It is wrapped in `SubagentEvent`s so the chat nests it under the
+        // parent's tool card instead of mixing it into this turn.
+        if let Some(parent) = v.get("parent_tool_use_id").and_then(Value::as_str) {
+            let frames = parse_subagent_frame(parent, &v);
+            if let Some(text_seen) = self.agent_tasks.get_mut(parent) {
+                for frame in &frames {
+                    if let ParsedFrame::Event(HarnessEvent::SubagentEvent { event, .. }) = frame {
+                        match **event {
+                            HarnessEvent::TextDelta(_) => *text_seen = true,
+                            HarnessEvent::ItemStarted { .. } => *text_seen = false,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return frames;
+        }
         match str_at("/type").unwrap_or("") {
             "system" if str_at("/subtype") == Some("init") => {
                 vec![ParsedFrame::Event(HarnessEvent::TurnStarted {
@@ -143,14 +162,51 @@ impl ClaudeFrameParser {
                     model: str_at("/model").map(str::to_string),
                 })]
             }
-            "stream_event" if !from_subagent => self.parse_stream_event(&v["event"]),
+            // Subagent lifecycle; `tool_use_id` is the parent's Agent call.
+            "system" if str_at("/subtype") == Some("task_started") => {
+                match str_at("/tool_use_id") {
+                    Some(parent) if str_at("/task_type") == Some("local_agent") => {
+                        self.agent_tasks.insert(parent.to_string(), false);
+                        vec![subagent_event(
+                            parent,
+                            HarnessEvent::TurnStarted {
+                                session_id: None,
+                                model: None,
+                            },
+                        )]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            "system" if str_at("/subtype") == Some("task_notification") => {
+                let Some(parent) = str_at("/tool_use_id") else {
+                    return Vec::new();
+                };
+                let Some(text_seen) = self.agent_tasks.remove(parent) else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                // A foreground subagent's final message reaches the parent
+                // only as the Agent tool result; the notification's summary
+                // is that message, so it stands in as the subagent's text.
+                match str_at("/summary") {
+                    Some(summary) if !text_seen && !summary.is_empty() => out.push(subagent_event(
+                        parent,
+                        HarnessEvent::TextDelta(summary.to_string()),
+                    )),
+                    _ => {}
+                }
+                out.push(subagent_event(parent, task_completion(&v)));
+                out
+            }
+            "stream_event" => self.parse_stream_event(&v["event"]),
             // Slash-command replies (`/model sonnet`, `/effort high`, ...) are
             // synthetic assistant messages with no stream deltas; surface
             // their text or the turn looks like it produced nothing.
-            "assistant" if !from_subagent && str_at("/message/model") == Some("<synthetic>") => {
+            "assistant" if str_at("/message/model") == Some("<synthetic>") => {
                 parse_synthetic_assistant(&v)
             }
-            "user" if !from_subagent => parse_tool_results(&v),
+            "user" => parse_tool_results(&v),
             "result" => vec![ParsedFrame::Event(parse_result(&v))],
             "control_request" => parse_control_request(&v),
             "control_response" => self.parse_control_response(&v),
@@ -280,6 +336,76 @@ impl ClaudeFrameParser {
             result,
         });
         out
+    }
+}
+
+/// Wraps one normalized event as activity of the subagent whose Agent call
+/// is `parent`.
+fn subagent_event(parent: &str, event: HarnessEvent) -> ParsedFrame {
+    ParsedFrame::Event(HarnessEvent::SubagentEvent {
+        parent_tool_use_id: parent.to_string(),
+        event: Box::new(event),
+    })
+}
+
+/// A frame the subagent produced. The CLI sends subagents' turns as whole
+/// `assistant` messages (one content block each) and `user` tool results;
+/// any subagent `stream_event`s would duplicate those, so they are dropped,
+/// which also keeps their block indexes away from the parent's.
+fn parse_subagent_frame(parent: &str, v: &Value) -> Vec<ParsedFrame> {
+    match v["type"].as_str().unwrap_or("") {
+        "assistant" => v
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|block| {
+                let event = match block["type"].as_str()? {
+                    "text" => HarnessEvent::TextDelta(block["text"].as_str()?.to_string()),
+                    "thinking" => {
+                        HarnessEvent::ThinkingDelta(block["thinking"].as_str()?.to_string())
+                    }
+                    "tool_use" => HarnessEvent::ItemStarted {
+                        id: block["id"].as_str()?.to_string(),
+                        kind: ItemKind::ToolCall {
+                            name: block["name"].as_str().unwrap_or("").to_string(),
+                            input: block.get("input").cloned().unwrap_or(Value::Null),
+                        },
+                    },
+                    _ => return None,
+                };
+                Some(subagent_event(parent, event))
+            })
+            .collect(),
+        "user" => parse_tool_results(v)
+            .into_iter()
+            .map(|frame| match frame {
+                ParsedFrame::Event(event) => subagent_event(parent, event),
+                other => other,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A subagent's `system/task_notification` as the end of its work. For a
+/// background agent this, not the Agent tool result, is when it is done.
+fn task_completion(v: &Value) -> HarnessEvent {
+    let status = match v["status"].as_str().unwrap_or("") {
+        "completed" => TurnStatus::Completed,
+        "failed" | "error" => TurnStatus::Failed(
+            v["summary"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("the subagent failed")
+                .to_string(),
+        ),
+        _ => TurnStatus::Interrupted,
+    };
+    HarnessEvent::TurnCompleted {
+        status,
+        usage: v.get("usage").cloned().unwrap_or(Value::Null),
+        cost_usd: None,
     }
 }
 
@@ -1141,6 +1267,42 @@ mod tests {
     const TURN_INTERRUPT: &str = include_str!("../../tests/fixtures/claude/turn_interrupt.jsonl");
     const SET_PERMISSION_MODE_REPLY: &str =
         include_str!("../../tests/fixtures/claude/set_permission_mode_reply.jsonl");
+    // Captured from `claude_harness_smoke --scenario review` (TRU-142):
+    // consecutive deltas on one block merged, signatures and paths redacted.
+    const TURN_SUBAGENT_REVIEW: &str =
+        include_str!("../../tests/fixtures/claude/turn_subagent_review.jsonl");
+    const TURN_SUBAGENT_BACKGROUND: &str =
+        include_str!("../../tests/fixtures/claude/turn_subagent_background.jsonl");
+
+    /// The subagent events for `parent`, unwrapped, plus the number of
+    /// subagent events addressed to any other parent.
+    fn nested(evs: &[HarnessEvent], parent: &str) -> (Vec<HarnessEvent>, usize) {
+        let mut mine = Vec::new();
+        let mut others = 0;
+        for ev in evs {
+            if let HarnessEvent::SubagentEvent {
+                parent_tool_use_id,
+                event,
+            } = ev
+            {
+                if parent_tool_use_id == parent {
+                    mine.push((**event).clone());
+                } else {
+                    others += 1;
+                }
+            }
+        }
+        (mine, others)
+    }
+
+    fn top_level_text(evs: &[HarnessEvent]) -> String {
+        evs.iter()
+            .filter_map(|e| match e {
+                HarnessEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn initialize_reply_becomes_ready() {
@@ -1370,6 +1532,153 @@ mod tests {
         assert!(!evs
             .iter()
             .any(|e| matches!(e, HarnessEvent::ItemCompleted { .. })));
+    }
+
+    #[test]
+    fn foreground_subagent_nests_under_its_agent_call() {
+        let mut p = ClaudeFrameParser::new();
+        let evs = events(&parse_fixture(&mut p, TURN_SUBAGENT_REVIEW));
+        let agent = "toolu_01Y8qfELQtVXDWYpWrA2LVpU";
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemStarted { id, kind: ItemKind::ToolCall { name, .. } }
+                if id == agent && name == "Agent"
+        )));
+        let (sub, others) = nested(&evs, agent);
+        assert_eq!(others, 0, "{evs:?}");
+        let kinds: Vec<&str> = sub
+            .iter()
+            .map(|e| match e {
+                HarnessEvent::TurnStarted { .. } => "started",
+                HarnessEvent::ItemStarted { .. } => "item",
+                HarnessEvent::ItemCompleted { .. } => "result",
+                HarnessEvent::TextDelta(_) => "text",
+                HarnessEvent::TurnCompleted { .. } => "completed",
+                _ => "other",
+            })
+            .collect();
+        // The brief the parent sent (a subagent `user` text frame) is not
+        // an event; task_progress and task_updated add nothing.
+        assert_eq!(kinds, ["started", "item", "result", "text", "completed"]);
+        assert!(matches!(
+            &sub[1],
+            HarnessEvent::ItemStarted { id, kind: ItemKind::ToolCall { name, input } }
+                if id == "toolu_01V55VdwsBegzZmpoUhcm6DG"
+                    && name == "Bash"
+                    && input["command"].as_str().unwrap().contains("git diff HEAD")
+        ));
+        assert!(matches!(
+            &sub[2],
+            HarnessEvent::ItemCompleted { id, output, is_error: false }
+                if id == "toolu_01V55VdwsBegzZmpoUhcm6DG" && output.contains("values[1:]")
+        ));
+        // A foreground subagent's last message only exists as the
+        // notification summary; it becomes the subagent's text.
+        assert!(
+            matches!(&sub[3], HarnessEvent::TextDelta(t) if t.starts_with("Verdict: needs_changes") && t.contains("F1 [P1] calc.py:4"))
+        );
+        assert!(matches!(
+            &sub[4],
+            HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                cost_usd: None,
+                ..
+            }
+        ));
+        // The subagent's text never reaches the parent's reply stream; the
+        // parent relays the report itself.
+        assert!(!top_level_text(&evs).contains("Model: haiku"));
+        assert!(top_level_text(&evs).contains("F1"));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { id, output, is_error: false }
+                if id == agent && output.contains("F1 [P1] calc.py:4")
+        )));
+        assert!(matches!(
+            evs.last(),
+            Some(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn background_subagent_text_is_not_repeated_by_its_summary() {
+        let mut p = ClaudeFrameParser::new();
+        let evs = events(&parse_fixture(&mut p, TURN_SUBAGENT_BACKGROUND));
+        let agent = "toolu_01Dd3gSqnmMHifQuUBFNNzgL";
+        // The Agent call returns at once; the subagent outlives the turn.
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { id, output, .. }
+                if id == agent && output.starts_with("Async agent launched")
+        )));
+        let (sub, others) = nested(&evs, agent);
+        assert_eq!(others, 0);
+        let tools: Vec<&str> = sub
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::ItemStarted {
+                    kind: ItemKind::ToolCall { name, .. },
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools, ["Bash", "Read"]);
+        let texts: Vec<&String> = sub
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::TextDelta(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].starts_with("Verdict: needs_changes"));
+        assert!(sub.contains(&HarnessEvent::ThinkingDelta(String::new())));
+        assert!(matches!(
+            sub.first(),
+            Some(HarnessEvent::TurnStarted { .. })
+        ));
+        assert!(matches!(
+            sub.last(),
+            Some(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+        // Claude starts a follow-up turn on its own when the agent is done.
+        let turns = evs
+            .iter()
+            .filter(|e| matches!(e, HarnessEvent::TurnStarted { .. }))
+            .count();
+        assert_eq!(turns, 2);
+    }
+
+    #[test]
+    fn background_bash_tasks_are_not_subagents() {
+        let mut p = ClaudeFrameParser::new();
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#;
+        let done = r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_bash","status":"completed","summary":"exit 0"}"#;
+        assert!(p.parse_line(started).is_empty());
+        assert!(p.parse_line(done).is_empty());
+        // A subagent that failed reports the summary as the failure.
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_agent","task_type":"local_agent"}"#;
+        let failed = r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_agent","status":"failed","summary":"API error"}"#;
+        p.parse_line(started);
+        let evs = events(&p.parse_line(failed));
+        assert_eq!(
+            evs.last(),
+            Some(&HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "toolu_agent".into(),
+                event: Box::new(HarnessEvent::TurnCompleted {
+                    status: TurnStatus::Failed("API error".into()),
+                    usage: Value::Null,
+                    cost_usd: None,
+                }),
+            })
+        );
     }
 
     #[test]

@@ -126,6 +126,16 @@ pub enum AgentIpcMessage {
         tab_id: usize,
         mode: String,
     },
+    /// The Review… popover opened and wants its git defaults (TRU-142).
+    ReviewContext {
+        tab_id: usize,
+    },
+    /// The Review… popover was submitted. `Err` carries why the page's
+    /// request could not be read.
+    ReviewRequest {
+        tab_id: usize,
+        request: Result<gitterm::review::ReviewRequest, String>,
+    },
 }
 
 static AGENT_IPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<AgentIpcMessage>> =
@@ -315,6 +325,16 @@ fn set_agent_webview_tab_id(tab_id: usize, permission_mode: Option<&str>) {
     );
 }
 
+/// Show a transient note in a tab's chat page (not recorded in the
+/// conversation buffer), e.g. why a Review… request was not sent.
+fn agent_webview_note(tab_id: usize, text: &str) {
+    let text = serde_json::Value::String(text.to_string());
+    webview::evaluate_script(
+        WebviewSurface::Agent(tab_id),
+        &format!("window.__reviewNote({text})"),
+    );
+}
+
 /// Reset a tab's chat page: clears all rendered messages and sets status to
 /// Idle.
 fn reset_agent_webview(tab_id: usize) {
@@ -392,6 +412,12 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     mode: mode.to_string(),
                 }
             }
+            "review_context" => AgentIpcMessage::ReviewContext { tab_id },
+            "review_request" => AgentIpcMessage::ReviewRequest {
+                tab_id,
+                request: serde_json::from_value(value.clone())
+                    .map_err(|e| format!("could not read the review request: {e}")),
+            },
             "open_url" => {
                 let url = value.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 // Links in agent output open in the browser, never inside
@@ -4482,6 +4508,12 @@ pub enum Event {
     AgentAnswerRequest(usize, String, RuntimeDecision),
     /// User picked a permission mode for the Claude chat tab with this id.
     AgentSetPermissionMode(usize, String),
+    /// The chat tab's Review… popover asked for its git defaults.
+    AgentReviewContextRequested(usize),
+    /// Git defaults for the Review… popover, computed off the UI thread.
+    AgentReviewContextLoaded(usize, gitterm::review::ReviewContext),
+    /// The chat tab's Review… popover was submitted (TRU-142).
+    AgentReviewRequested(usize, Result<gitterm::review::ReviewRequest, String>),
     /// Open a native Claude chat tab in the active workspace (TRU-140).
     NewClaudeChatTab,
     /// One streaming event from the agent subprocess (Step 4 will refine the
@@ -4699,6 +4731,8 @@ struct App {
     next_tab_id: usize,
     // Durable task registry and cross-workspace Tasks UI state.
     task_store: Option<TaskStore>,
+    /// Review… button defaults (config `review`, TRU-142).
+    review_config: config::ReviewConfig,
     task_store_error: Option<String>,
     task_ui_error: Option<String>,
     task_worktree_root: PathBuf,
@@ -5759,6 +5793,7 @@ impl App {
             quick_commands: self.quick_commands.clone(),
             task_worktree_root: self.task_worktree_root.clone(),
             max_concurrent_local_tasks: self.max_concurrent_local_tasks,
+            review: self.review_config.clone(),
         };
         config.save();
         let elapsed = started.elapsed();
@@ -9218,6 +9253,7 @@ impl App {
             active_workspace_idx: 0,
             next_tab_id: 0,
             task_store,
+            review_config: config.review.clone(),
             task_store_error,
             task_ui_error: None,
             task_worktree_root: config.task_worktree_root.clone(),
@@ -12471,6 +12507,12 @@ fi
                     AgentIpcMessage::SetPermissionMode { tab_id, mode } => {
                         Task::done(Event::AgentSetPermissionMode(tab_id, mode))
                     }
+                    AgentIpcMessage::ReviewContext { tab_id } => {
+                        Task::done(Event::AgentReviewContextRequested(tab_id))
+                    }
+                    AgentIpcMessage::ReviewRequest { tab_id, request } => {
+                        Task::done(Event::AgentReviewRequested(tab_id, request))
+                    }
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
@@ -12676,6 +12718,84 @@ fi
                     self.mark_workspaces_dirty();
                 }
                 return Task::none();
+            }
+            Event::AgentReviewContextRequested(tab_id) => {
+                let Some(tab) = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                else {
+                    eprintln!("AgentReviewContextRequested: no tab {tab_id}");
+                    return Task::none();
+                };
+                let repo_path = tab.repo_path.clone();
+                // A task tab reviews against the base its task was cut from.
+                let task_base = tab
+                    .task_id
+                    .as_deref()
+                    .and_then(|id| self.task_store.as_ref()?.get(id))
+                    .map(|task| task.base.reference.clone());
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            gitterm::review::review_context(&repo_path, task_base.as_deref())
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            gitterm::review::ReviewContext {
+                                error: Some(format!("review context worker failed: {e}")),
+                                ..Default::default()
+                            }
+                        })
+                    },
+                    move |context| Event::AgentReviewContextLoaded(tab_id, context),
+                );
+            }
+            Event::AgentReviewContextLoaded(tab_id, context) => {
+                if let Some(e) = &context.error {
+                    eprintln!("[review] tab {tab_id}: {e}");
+                }
+                let payload = serde_json::json!({
+                    "context": context,
+                    "reviewer": self.review_config.default_reviewer.as_str(),
+                    "model": self.review_config.subagent_model,
+                });
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!("window.__setReviewContext({payload})"),
+                );
+                return Task::none();
+            }
+            Event::AgentReviewRequested(tab_id, request) => {
+                let is_claude = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                    .is_some_and(|s| s.backend() == tab::AgentBackend::Claude);
+                if !is_claude {
+                    eprintln!("AgentReviewRequested: tab {tab_id} is not a Claude chat tab");
+                    agent_webview_note(tab_id, "Review… needs a Claude chat tab.");
+                    return Task::none();
+                }
+                if self.review_config.default_reviewer == config::ReviewerKind::Codex {
+                    agent_webview_note(
+                        tab_id,
+                        "Codex reviews are not available yet. Set review.default_reviewer to \"claude-subagent\" in the GitTerm config to review with a Claude subagent.",
+                    );
+                    return Task::none();
+                }
+                let prompt = request.and_then(|r| gitterm::review::review_prompt(&r));
+                return match prompt {
+                    Ok(prompt) => Task::done(Event::AgentSubmitPrompt(tab_id, prompt)),
+                    Err(e) => {
+                        eprintln!("AgentReviewRequested: tab {tab_id}: {e}");
+                        agent_webview_note(tab_id, &format!("Review not sent: {e}"));
+                        Task::none()
+                    }
+                };
             }
             Event::NewClaudeChatTab => {
                 self.tab_picker_visible = false;
