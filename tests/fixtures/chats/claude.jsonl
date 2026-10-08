@@ -1,0 +1,9 @@
+{"type":"user","cwd":"/Users/dev/GitRepo/sample","gitBranch":"main","sessionId":"s-claude","message":{"role":"user","content":"rename the config loader"}}
+{"type":"assistant","cwd":"/Users/dev/GitRepo/sample","gitBranch":"main","message":{"role":"assistant","content":[{"type":"text","text":"Renamed it to load_settings."}]}}
+{"type":"user","cwd":"/Users/dev/GitRepo/sample","gitBranch":"main","message":{"role":"user","content":"now add a test for the\nmissing-file case"}}
+{"type":"assistant","cwd":"/Users/dev/GitRepo/sample","gitBranch":"main","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"src/config.rs"}}]}}
+{"type":"user","cwd":"/Users/dev/GitRepo/sample","gitBranch":"main","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}
+{"type":"user","cwd":"/Users/dev/GitRepo/sample","gitBranch":"main","isMeta":true,"message":{"role":"user","content":"<system-reminder>meta line</system-reminder>"}}
+{"type":"assistant","cwd":"/Users/dev/GitRepo/sample","gitBranch":"main","message":{"role":"assistant","content":[{"type":"text","text":"Added missing_file_is_an_error; cargo test passes."}]}}
+{"type":"user","cwd":"/Users/dev/GitRepo/sample","gitBranch":"main","message":{"role":"user","content":"<command-name>/clear</command-name>"}}
+{"type":"system","subtype":"turn_duration","messageCount":9}

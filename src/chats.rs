@@ -356,19 +356,22 @@ fn scan_head(path: &Path) -> std::io::Result<HeadScan> {
 
 /// Complete JSONL lines from the last `TAIL_READ_BYTES` of the file.
 fn read_tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
+    read_tail_lines_bounded(path, TAIL_READ_BYTES)
+}
+
+/// Complete JSONL lines from the last `max_bytes` of the file: at most
+/// `max_bytes` are read, and the first line is dropped when the read
+/// starts mid-file (it is a partial line).
+fn read_tail_lines_bounded(path: &Path, max_bytes: u64) -> std::io::Result<Vec<String>> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let start = len.saturating_sub(TAIL_READ_BYTES);
+    let start = len.saturating_sub(max_bytes);
     file.seek(SeekFrom::Start(start))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).or_else(|_| {
-        // A seek can land mid-UTF-8; retry lossily.
-        file.seek(SeekFrom::Start(start))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        buf = String::from_utf8_lossy(&bytes).into_owned();
-        Ok::<usize, std::io::Error>(buf.len())
-    })?;
+    // `take` keeps the read bounded even if the file grows meanwhile.
+    let mut bytes = Vec::new();
+    file.take(max_bytes).read_to_end(&mut bytes)?;
+    // A seek can land mid-UTF-8; that partial first line is dropped below.
+    let buf = String::from_utf8_lossy(&bytes);
     let mut lines: Vec<String> = buf.lines().map(str::to_string).collect();
     // The first line is truncated unless we started at 0.
     if start > 0 && !lines.is_empty() {
@@ -772,6 +775,26 @@ pub fn load_preview(path: &Path, backend: ChatBackend) -> ChatPreview {
     let Ok(lines) = read_tail_lines(path) else {
         return ChatPreview::default();
     };
+    preview_from_lines(&lines, backend)
+}
+
+/// Bytes read from the end of a transcript for a ranking snippet
+/// ([`load_snippet_preview`]): smaller than the preview's tail, since a
+/// snippet needs only the last ask and the last reply.
+pub const SNIPPET_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The preview messages in the last [`SNIPPET_TAIL_BYTES`] of a
+/// transcript, parsed as [`load_preview`] parses its tail. Blocking; run
+/// on a background Task. An unreadable file is an error for the caller
+/// to report; a tail with no conversation text is an empty preview.
+pub fn load_snippet_preview(path: &Path, backend: ChatBackend) -> std::io::Result<ChatPreview> {
+    let lines = read_tail_lines_bounded(path, SNIPPET_TAIL_BYTES)?;
+    Ok(preview_from_lines(&lines, backend))
+}
+
+/// The last [`PREVIEW_MESSAGES`] conversation messages of `lines` (oldest
+/// first), and claude's message count when the tail carries one.
+fn preview_from_lines(lines: &[String], backend: ChatBackend) -> ChatPreview {
     let mut messages = Vec::new();
     let mut message_count = None;
     for line in lines.iter().rev() {
@@ -1093,6 +1116,25 @@ mod tests {
         let preview = load_preview(&path, ChatBackend::Codex);
         assert_eq!(preview.messages.len(), PREVIEW_MESSAGES);
         assert_eq!(preview.messages.last().unwrap().text, "turn 11");
+    }
+
+    #[test]
+    fn bounded_tail_drops_the_partial_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_transcript(dir.path(), "t.jsonl", &["aaaaaaaa", "bbbb", "cccc"]);
+        // The file is 18 bytes ("aaaaaaaa\nbbbb\ncccc"): 15 starts inside "a…".
+        assert_eq!(
+            read_tail_lines_bounded(&path, 15).unwrap(),
+            ["bbbb", "cccc"]
+        );
+        // The whole file: nothing dropped.
+        assert_eq!(
+            read_tail_lines_bounded(&path, 1024).unwrap(),
+            ["aaaaaaaa", "bbbb", "cccc"]
+        );
+        // Starting exactly on a line boundary still drops one line: the
+        // reader cannot tell, and a lost line only shortens the tail.
+        assert_eq!(read_tail_lines_bounded(&path, 9).unwrap(), ["cccc"]);
     }
 
     #[test]

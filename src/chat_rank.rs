@@ -7,10 +7,19 @@
 //! Jev's order only when the cached key matches what is on screen and the
 //! ranking clears [`jev::DEFAULT_CONFIDENCE_GATE`]; otherwise it keeps
 //! recency and says why in a one-line note.
+//!
+//! Every candidate carries a snippet of its conversation's tail, read
+//! from at most [`chats::SNIPPET_TAIL_BYTES`] of the transcript inside the
+//! ranking task ([`fill_snippets`]) and cached per (path, mtime, size) in
+//! a [`SnippetCache`], so a re-rank or an index reload re-reads only the
+//! transcripts that changed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
-use gitterm::chats::{self, ChatBackend, ChatIndexEntry, ChatPreview, ChatScope};
+use gitterm::chats::{self, ChatBackend, ChatIndexEntry, ChatScope};
 use gitterm::jev::{self, ChatCandidate, JevError, Ranking};
 
 use crate::tab::AgentEvent;
@@ -52,12 +61,10 @@ impl RankKey {
     }
 }
 
-/// Candidates in the entries' own (recency) order. The snippet comes from
-/// the one preview already loaded, if it is this chat's; otherwise empty.
-pub(crate) fn candidates(
-    entries: &[&ChatIndexEntry],
-    preview: Option<&(String, ChatPreview)>,
-) -> Vec<ChatCandidate> {
+/// Candidates in the entries' own (recency) order, snippets still empty:
+/// [`fill_snippets`] reads them off the UI thread, from the
+/// [`snippet_sources`] of the same entries.
+pub(crate) fn candidates(entries: &[&ChatIndexEntry]) -> Vec<ChatCandidate> {
     entries
         .iter()
         .map(|e| ChatCandidate {
@@ -66,12 +73,146 @@ pub(crate) fn candidates(
             cwd: e.cwd.clone(),
             branch: e.branch.clone(),
             age: chats::format_age(e.mtime),
-            snippet: preview
-                .filter(|(id, _)| *id == e.id)
-                .map(|(_, p)| jev::snippet_from_preview(&p.messages))
-                .unwrap_or_default(),
+            snippet: String::new(),
         })
         .collect()
+}
+
+/// A transcript as the index saw it: a snippet read for one key is
+/// reused only while the file's mtime and size are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SnippetKey {
+    path: PathBuf,
+    mtime: SystemTime,
+    size: u64,
+}
+
+impl SnippetKey {
+    pub(crate) fn of(entry: &ChatIndexEntry) -> Self {
+        SnippetKey {
+            path: entry.path.clone(),
+            mtime: entry.mtime,
+            size: entry.size,
+        }
+    }
+}
+
+/// Where each candidate's snippet comes from, aligned with
+/// [`candidates`] of the same entries.
+pub(crate) fn snippet_sources(entries: &[&ChatIndexEntry]) -> Vec<(SnippetKey, ChatBackend)> {
+    entries
+        .iter()
+        .map(|e| (SnippetKey::of(e), e.backend))
+        .collect()
+}
+
+/// Snippets by transcript. One slot per path: a file that changed
+/// replaces its old snippet, so the cache never outgrows the index.
+#[derive(Debug, Default)]
+pub(crate) struct SnippetCache {
+    by_path: HashMap<PathBuf, (SnippetKey, String)>,
+}
+
+impl SnippetCache {
+    /// The snippet read for exactly this (path, mtime, size), if any.
+    pub(crate) fn get(&self, key: &SnippetKey) -> Option<&str> {
+        self.by_path
+            .get(&key.path)
+            .filter(|(cached, _)| cached == key)
+            .map(|(_, snippet)| snippet.as_str())
+    }
+
+    pub(crate) fn insert(&mut self, key: SnippetKey, snippet: String) {
+        self.by_path.insert(key.path.clone(), (key, snippet));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_path.len()
+    }
+}
+
+/// One transcript's snippet: the last ask and reply in its bounded tail,
+/// shaped by [`jev::snippet_from_preview`]. Empty when the tail holds no
+/// conversation text. Blocking.
+pub(crate) fn local_snippet(path: &Path, backend: ChatBackend) -> std::io::Result<String> {
+    let preview = chats::load_snippet_preview(path, backend)?;
+    Ok(jev::snippet_from_preview(&preview.messages))
+}
+
+/// What [`fill_snippets`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnippetStats {
+    /// Snippets taken from the cache.
+    pub(crate) cached: usize,
+    /// Transcripts read.
+    pub(crate) read: usize,
+    /// Transcripts that could not be read (logged, snippet left empty).
+    pub(crate) failed: usize,
+}
+
+/// Fill each candidate's snippet from `cache`, reading the transcripts it
+/// does not hold (each at most [`chats::SNIPPET_TAIL_BYTES`]) and caching
+/// what was read. `sources` is aligned with `candidates`. Blocking: run it
+/// on a blocking thread, never in `update()` or `view()`. The lock is not
+/// held while files are read.
+pub(crate) fn fill_snippets(
+    cache: &Mutex<SnippetCache>,
+    candidates: &mut [ChatCandidate],
+    sources: &[(SnippetKey, ChatBackend)],
+) -> SnippetStats {
+    debug_assert_eq!(candidates.len(), sources.len());
+    let mut stats = SnippetStats::default();
+    let mut misses: Vec<usize> = Vec::new();
+    {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (i, (key, _)) in sources.iter().enumerate() {
+            match cache.get(key) {
+                Some(snippet) => {
+                    candidates[i].snippet = snippet.to_string();
+                    stats.cached += 1;
+                }
+                None => misses.push(i),
+            }
+        }
+    }
+    if misses.is_empty() {
+        return stats;
+    }
+    let read: Vec<(usize, String)> = misses
+        .into_iter()
+        .map(|i| {
+            let (key, backend) = &sources[i];
+            let snippet = match local_snippet(&key.path, *backend) {
+                Ok(snippet) => {
+                    stats.read += 1;
+                    snippet
+                }
+                Err(e) => {
+                    // Cached empty under this key, so it is reported once
+                    // per change of the file, not on every re-rank.
+                    eprintln!(
+                        "[chats] snippet for {} ({}) unreadable: {e}",
+                        key.path.display(),
+                        backend.label()
+                    );
+                    stats.failed += 1;
+                    String::new()
+                }
+            };
+            (i, snippet)
+        })
+        .collect();
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (i, snippet) in read {
+        candidates[i].snippet = snippet.clone();
+        cache.insert(sources[i].0.clone(), snippet);
+    }
+    stats
 }
 
 /// The text of the last prompt the human sent in an agent tab.
@@ -248,7 +389,6 @@ impl ChatRankState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gitterm::chats::ChatPreviewMessage;
     use gitterm::jev::{RankedChat, Usage};
     use std::time::{Duration, SystemTime};
 
@@ -301,38 +441,197 @@ mod tests {
     }
 
     #[test]
-    fn candidates_keep_recency_and_take_only_a_loaded_preview() {
+    fn candidates_keep_recency_with_snippets_left_to_fill() {
         let (a, b) = (entry("a", 5), entry("b", 120));
         let entries = vec![&a, &b];
-        let preview = (
-            "b".to_string(),
-            ChatPreview {
-                messages: vec![
-                    ChatPreviewMessage {
-                        is_user: true,
-                        text: "fix the build".into(),
-                    },
-                    ChatPreviewMessage {
-                        is_user: false,
-                        text: "done".into(),
-                    },
-                ],
-                message_count: None,
-            },
-        );
-        let c = candidates(&entries, Some(&preview));
+        let c = candidates(&entries);
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].id, "a");
         assert_eq!(c[0].title, "Title a");
         assert_eq!(c[0].cwd, PathBuf::from("/repo/app"));
         assert_eq!(c[0].branch.as_deref(), Some("branch-a"));
         assert_eq!(c[0].age, "5m");
-        assert_eq!(c[0].snippet, "", "no preview loaded for a");
         assert_eq!(c[1].age, "2h");
-        assert_eq!(c[1].snippet, "asked: fix the build / reply: done");
-        assert!(candidates(&entries, None)
-            .iter()
-            .all(|c| c.snippet.is_empty()));
+        assert!(c.iter().all(|c| c.snippet.is_empty()));
+        let sources = snippet_sources(&entries);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[1].0, SnippetKey::of(&b));
+        assert_eq!(sources[1].1, ChatBackend::Claude);
+    }
+
+    const CHAT_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/chats");
+
+    #[test]
+    fn local_snippet_takes_the_last_ask_and_reply_for_every_backend() {
+        let cases = [
+            (
+                "claude.jsonl",
+                ChatBackend::Claude,
+                "asked: now add a test for the missing-file case / \
+                 reply: Added missing_file_is_an_error; cargo test passes.",
+            ),
+            (
+                "codex.jsonl",
+                ChatBackend::Codex,
+                "asked: add exponential backoff to the uploader / \
+                 reply: Backoff now doubles from 500 ms, capped at 8 s.",
+            ),
+            (
+                "pi.jsonl",
+                ChatBackend::Pi,
+                "asked: what about stale sockets? / \
+                 reply: Unlink them when connect fails with ECONNREFUSED.",
+            ),
+        ];
+        for (file, backend, want) in cases {
+            let path = Path::new(CHAT_FIXTURES).join(file);
+            let got = local_snippet(&path, backend).unwrap();
+            assert_eq!(got, want, "{file}");
+        }
+    }
+
+    #[test]
+    fn local_snippet_reads_only_the_bounded_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.jsonl");
+        let line = |kind: &str, text: &str| {
+            serde_json::json!({"type": kind, "message": {"role": kind, "content": text}})
+                .to_string()
+        };
+        // An ask far back, then more than the tail of filler replies that
+        // the snippet must not reach past.
+        let mut lines = vec![line("user", "the early ask")];
+        let filler = line("assistant", &"x".repeat(1000));
+        let n = (chats::SNIPPET_TAIL_BYTES as usize / filler.len()) + 2;
+        lines.extend(vec![filler; n]);
+        lines.push(line("assistant", "the last reply"));
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let got = local_snippet(&path, ChatBackend::Claude).unwrap();
+        assert_eq!(got, "reply: the last reply");
+
+        // A tail that is one partial line holds no conversation.
+        let huge = dir.path().join("huge.jsonl");
+        let big = line("user", &"y".repeat(2 * chats::SNIPPET_TAIL_BYTES as usize));
+        std::fs::write(&huge, big + "\n").unwrap();
+        assert_eq!(local_snippet(&huge, ChatBackend::Claude).unwrap(), "");
+
+        assert!(local_snippet(&dir.path().join("gone.jsonl"), ChatBackend::Pi).is_err());
+    }
+
+    #[test]
+    fn snippet_cache_is_keyed_by_path_mtime_and_size() {
+        let a = entry("a", 5);
+        let key = SnippetKey::of(&a);
+        let mut cache = SnippetCache::default();
+        assert_eq!(cache.get(&key), None);
+        cache.insert(key.clone(), "asked: x".into());
+        assert_eq!(cache.get(&key), Some("asked: x"));
+
+        let mut touched = a.clone();
+        touched.mtime += Duration::from_secs(1);
+        assert_eq!(cache.get(&SnippetKey::of(&touched)), None, "mtime");
+        let mut grown = a.clone();
+        grown.size += 1;
+        assert_eq!(cache.get(&SnippetKey::of(&grown)), None, "size");
+        let mut moved = a.clone();
+        moved.path = PathBuf::from("/t/other.jsonl");
+        assert_eq!(cache.get(&SnippetKey::of(&moved)), None, "path");
+
+        // A changed file replaces its slot rather than adding one.
+        cache.insert(SnippetKey::of(&grown), "asked: y".into());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&key), None);
+        assert_eq!(cache.get(&SnippetKey::of(&grown)), Some("asked: y"));
+    }
+
+    #[test]
+    fn fill_snippets_reads_each_unchanged_transcript_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = Vec::new();
+        for (file, backend) in [
+            ("claude.jsonl", ChatBackend::Claude),
+            ("codex.jsonl", ChatBackend::Codex),
+            ("pi.jsonl", ChatBackend::Pi),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::copy(Path::new(CHAT_FIXTURES).join(file), &path).unwrap();
+            let mut e = entry(file, 1);
+            e.backend = backend;
+            e.size = std::fs::metadata(&path).unwrap().len();
+            e.path = path;
+            entries.push(e);
+        }
+        let mut gone = entry("gone", 1);
+        gone.path = dir.path().join("gone.jsonl");
+        entries.push(gone);
+        let refs: Vec<&ChatIndexEntry> = entries.iter().collect();
+        let cache = Mutex::new(SnippetCache::default());
+
+        let mut first = candidates(&refs);
+        let stats = fill_snippets(&cache, &mut first, &snippet_sources(&refs));
+        assert_eq!(
+            stats,
+            SnippetStats {
+                cached: 0,
+                read: 3,
+                failed: 1
+            }
+        );
+        assert!(first[..3].iter().all(|c| c.snippet.starts_with("asked: ")));
+        assert_eq!(first[3].snippet, "");
+
+        // Same files: nothing is read again, even the unreadable one, and
+        // the snippets are the same.
+        for e in &entries[..3] {
+            std::fs::write(&e.path, "").unwrap();
+        }
+        let mut again = candidates(&refs);
+        let stats = fill_snippets(&cache, &mut again, &snippet_sources(&refs));
+        assert_eq!(stats.cached, 4);
+        assert_eq!(stats.read, 0);
+        assert_eq!(again, first);
+
+        // A changed file (new size) is read again.
+        entries[0].size += 1;
+        let refs: Vec<&ChatIndexEntry> = entries.iter().collect();
+        let mut changed = candidates(&refs);
+        let stats = fill_snippets(&cache, &mut changed, &snippet_sources(&refs));
+        assert_eq!((stats.cached, stats.read), (3, 1));
+        assert_eq!(changed[0].snippet, "", "the emptied file was re-read");
+    }
+
+    #[test]
+    #[ignore = "reads every transcript tail on this machine; run manually with --ignored --nocapture"]
+    fn real_index_cold_snippet_pass() {
+        let started = std::time::Instant::now();
+        let entries = chats::build_local_index();
+        let indexed = started.elapsed();
+        let refs: Vec<&ChatIndexEntry> = entries.iter().collect();
+        let cache = Mutex::new(SnippetCache::default());
+        let mut cands = candidates(&refs);
+        let started = std::time::Instant::now();
+        let stats = fill_snippets(&cache, &mut cands, &snippet_sources(&refs));
+        let cold = started.elapsed();
+        let mut warm_cands = candidates(&refs);
+        let started = std::time::Instant::now();
+        let warm = fill_snippets(&cache, &mut warm_cands, &snippet_sources(&refs));
+        let warm_time = started.elapsed();
+        let empty = cands.iter().filter(|c| c.snippet.is_empty()).count();
+        let per_backend = |b: ChatBackend| entries.iter().filter(|e| e.backend == b).count();
+        // Counts and timings only: never transcript contents.
+        eprintln!(
+            "index: {} chats (claude {}, codex {}, pi {}) in {indexed:?}; \
+             cold snippets: {} read, {} unreadable, {empty} empty in {cold:?}; \
+             warm: {} cached in {warm_time:?}",
+            entries.len(),
+            per_backend(ChatBackend::Claude),
+            per_backend(ChatBackend::Codex),
+            per_backend(ChatBackend::Pi),
+            stats.read,
+            stats.failed,
+            warm.cached,
+        );
+        assert_eq!(warm.read, 0);
     }
 
     #[test]
@@ -380,7 +679,7 @@ mod tests {
         assert!(s.toggle());
 
         let sent = s
-            .begin(key.clone(), candidates(&recency, None))
+            .begin(key.clone(), candidates(&recency))
             .expect("first call");
         assert_eq!(sent.len(), 3);
         assert_eq!(s.note(Some(&key)).as_deref(), Some(NOTE_RANKING));
@@ -401,7 +700,7 @@ mod tests {
         assert_eq!(ids(&s.order(&key, recency.clone()).0), ["a", "b", "c"]);
         assert_eq!(s.note(Some(&key)), None);
         assert!(s.toggle());
-        assert!(s.begin(key.clone(), candidates(&recency, None)).is_none());
+        assert!(s.begin(key.clone(), candidates(&recency)).is_none());
         assert_eq!(ids(&s.order(&key, recency.clone()).0), ["c", "a", "b"]);
     }
 
@@ -416,7 +715,7 @@ mod tests {
         ] {
             let mut s = ChatRankState::default();
             s.toggle();
-            s.begin(key.clone(), candidates(&recency, None)).unwrap();
+            s.begin(key.clone(), candidates(&recency)).unwrap();
             s.finish(Ok(r));
             let (shown, ranked) = s.order(&key, recency.clone());
             assert!(!ranked);
@@ -431,8 +730,7 @@ mod tests {
         let key = key_for("", &[&a, &b, &c]);
         let mut s = ChatRankState::default();
         s.toggle();
-        s.begin(key.clone(), candidates(&[&a, &b, &c], None))
-            .unwrap();
+        s.begin(key.clone(), candidates(&[&a, &b, &c])).unwrap();
         s.finish(Ok(ranking(&["c"], 0.9, false)));
         assert_eq!(ids(&s.order(&key, vec![&a, &b, &c]).0), ["c", "a", "b"]);
     }
@@ -444,11 +742,11 @@ mod tests {
         let k2 = key_for("fo", &[&a]);
         let mut s = ChatRankState::default();
         s.toggle();
-        assert!(s.begin(k1.clone(), candidates(&[&a, &b], None)).is_some());
-        assert!(s.begin(k1.clone(), candidates(&[&a, &b], None)).is_none());
-        assert!(s.begin(k2.clone(), candidates(&[&a], None)).is_none());
+        assert!(s.begin(k1.clone(), candidates(&[&a, &b])).is_some());
+        assert!(s.begin(k1.clone(), candidates(&[&a, &b])).is_none());
+        assert!(s.begin(k2.clone(), candidates(&[&a])).is_none());
         assert!(s.finish(Ok(ranking(&["b", "a"], 0.9, false))), "re-rank");
-        assert!(s.begin(k2.clone(), candidates(&[&a], None)).is_some());
+        assert!(s.begin(k2.clone(), candidates(&[&a])).is_some());
         assert!(!s.finish(Ok(ranking(&["a"], 0.9, false))));
         // Nothing to rank: no call.
         assert!(s.begin(key_for("zzz", &[]), Vec::new()).is_none());
@@ -463,7 +761,7 @@ mod tests {
         s.toggle();
 
         // One call's problem: note, recency, toggle still usable.
-        s.begin(key.clone(), candidates(&[&a], None)).unwrap();
+        s.begin(key.clone(), candidates(&[&a])).unwrap();
         assert!(!s.finish(Err(JevError::Http(500, "boom".into()))));
         assert!(s.active());
         assert!(s.has_error());
@@ -472,19 +770,19 @@ mod tests {
         assert!(!s.order(&key, vec![&a]).1);
 
         // TypeSafe down (a dummy key is refused): toggle disabled.
-        s.begin(key.clone(), candidates(&[&a], None)).unwrap();
+        s.begin(key.clone(), candidates(&[&a])).unwrap();
         s.finish(Err(JevError::KeyRefused(401, "bad key".into())));
         assert!(s.down());
         assert!(!s.active());
         assert!(!s.toggle(), "disabled while down");
         assert!(s.enabled());
-        assert!(s.begin(key.clone(), candidates(&[&a], None)).is_none());
+        assert!(s.begin(key.clone(), candidates(&[&a])).is_none());
         assert!(s.note(Some(&key)).unwrap().contains("refused the key"));
 
         s.panel_opened();
         assert!(s.active());
         assert!(!s.has_error());
-        assert!(s.begin(key.clone(), candidates(&[&a], None)).is_some());
+        assert!(s.begin(key.clone(), candidates(&[&a])).is_some());
     }
 
     #[test]

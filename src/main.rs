@@ -5200,6 +5200,9 @@ struct App {
     /// TYPESAFE_API_KEY, and then the panel offers no toggle.
     jev_client: Option<gitterm::jev::JevClient>,
     chat_rank: chat_rank::ChatRankState,
+    /// Ranking snippets per transcript (path, mtime, size), shared with
+    /// the ranking task that reads them off the UI thread.
+    chat_snippets: Arc<Mutex<chat_rank::SnippetCache>>,
     // Track whether the window has focus (skip terminal processing when unfocused)
     window_focused: bool,
     terminal_redraws: TerminalRedrawQueue,
@@ -6703,7 +6706,8 @@ impl App {
             return Task::none();
         };
         let key = self.chat_rank_key(&root, &entries);
-        let candidates = chat_rank::candidates(&entries, self.chat_preview.as_ref());
+        let candidates = chat_rank::candidates(&entries);
+        let sources = chat_rank::snippet_sources(&entries);
         let tab = self.active_tab();
         let branch = tab
             .filter(|t| t.is_git_repo && !t.branch_name.is_empty())
@@ -6724,8 +6728,42 @@ impl App {
             query,
             recent_prompt,
         };
+        let snippets = self.chat_snippets.clone();
         Task::perform(
-            async move { gitterm::jev::rank_chats(&client, &ctx, &candidates).await },
+            async move {
+                // Snippets first: bounded tail reads, cached per
+                // (path, mtime, size), on a blocking thread.
+                let started = Instant::now();
+                let bare = candidates.clone();
+                let candidates = match tokio::task::spawn_blocking(move || {
+                    let mut candidates = candidates;
+                    let stats = chat_rank::fill_snippets(&snippets, &mut candidates, &sources);
+                    (candidates, stats)
+                })
+                .await
+                {
+                    Ok((candidates, stats)) => {
+                        if stats.read > 0 || stats.failed > 0 {
+                            eprintln!(
+                                "[chats] ranking snippets: {} read, {} cached, {} unreadable in {:?}",
+                                stats.read,
+                                stats.cached,
+                                stats.failed,
+                                started.elapsed()
+                            );
+                        }
+                        candidates
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[chats] ranking snippet task failed: {err}; ranking {} chats without snippets",
+                            bare.len()
+                        );
+                        bare
+                    }
+                };
+                gitterm::jev::rank_chats(&client, &ctx, &candidates).await
+            },
             Event::ChatsRanked,
         )
     }
@@ -10903,6 +10941,7 @@ impl App {
             chat_preview: None,
             jev_client: gitterm::jev::JevClient::from_env(),
             chat_rank: chat_rank::ChatRankState::default(),
+            chat_snippets: Arc::new(Mutex::new(chat_rank::SnippetCache::default())),
         };
 
         if let Some(remote_file) = RemoteSessionsFile::load() {
