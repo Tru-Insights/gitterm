@@ -161,6 +161,29 @@ mod tests {
     }
 
     #[test]
+    fn workspace_tab_session_uid_is_optional_and_round_trips() {
+        let existing: WorkspaceTabConfig =
+            serde_json::from_value(serde_json::json!({ "dir": "/repo" })).unwrap();
+        assert_eq!(existing.session_uid, None);
+        assert!(serde_json::to_value(&existing)
+            .unwrap()
+            .get("session_uid")
+            .is_none());
+
+        let tab: WorkspaceTabConfig = serde_json::from_value(serde_json::json!({
+            "dir": "/repo",
+            "session_uid": "7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90"
+        }))
+        .unwrap();
+        let encoded = serde_json::to_string(&tab).unwrap();
+        let decoded: WorkspaceTabConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.session_uid.as_deref(),
+            Some("7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90")
+        );
+    }
+
+    #[test]
     fn test_resolve_config_dir_override_unset() {
         assert_eq!(resolve_config_dir_override(None), None);
     }
@@ -851,6 +874,12 @@ pub struct WorkspaceTabConfig {
     /// share one task id; this id distinguishes their sessions across restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_session_id: Option<String>,
+    /// Durable caller identity of this tab (uuid v4). Every tab carries one
+    /// on its task MCP URL (`?caller=<uid>`) so the task server can tell
+    /// which tab made a call. Older files predate it; a missing value is
+    /// generated when the tab is restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_uid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -8,13 +8,13 @@ use crate::harness::claude::ClaudeMcpServer;
 use axum::{
     body::Body,
     extract::State,
-    http::{header, Request, StatusCode},
+    http::{header, request::Parts, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     Router,
 };
 use rmcp::{
-    handler::server::wrapper::Parameters,
+    handler::server::{tool::Extension, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
     transport::{
@@ -41,6 +41,9 @@ use uuid::Uuid;
 
 pub const TASK_MCP_TOKEN_ENV: &str = "GITTERM_V5_TASK_MCP_TOKEN";
 pub const TASK_MCP_URL_ENV: &str = "GITTERM_V5_TASK_MCP_URL";
+/// Query parameter on a tab's task MCP URL naming the calling tab's durable
+/// `session_uid`. The bearer token authenticates; this only attributes.
+pub const TASK_MCP_CALLER_QUERY: &str = "caller";
 const TASK_MCP_BASE_PORT: u16 = 25_030;
 const TASK_MCP_PORTS_PER_INSTANCE: u16 = 10;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
@@ -106,7 +109,8 @@ pub struct UpdateTaskHandoffRequest {
     pub next_steps: Vec<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
-    /// GitTerm task-session id writing this handoff, when known.
+    /// GitTerm task-session id writing this handoff, when known. Omit it to
+    /// attribute the handoff to the calling GitTerm tab.
     pub session_id: Option<String>,
 }
 
@@ -170,7 +174,31 @@ impl TaskControlReply {
 #[derive(Debug, Clone)]
 pub struct TaskControlEnvelope {
     pub operation: TaskControlOperation,
+    /// The calling tab's `session_uid`, read from the `caller` query of the
+    /// MCP URL GitTerm handed that tab. `None` for calls from a URL without
+    /// it (bottom-panel terminals, external clients, the notify route).
+    pub caller: Option<String>,
     pub reply: TaskControlReply,
+}
+
+/// The task MCP URL handed to one tab: the shared endpoint plus
+/// `?caller=<session_uid>`. Without a caller the bare endpoint is returned.
+pub fn caller_endpoint(endpoint: &str, caller: Option<&str>) -> String {
+    match caller.filter(|caller| !caller.is_empty()) {
+        Some(caller) => {
+            let encoded: String = url::form_urlencoded::byte_serialize(caller.as_bytes()).collect();
+            format!("{endpoint}?{TASK_MCP_CALLER_QUERY}={encoded}")
+        }
+        None => endpoint.to_string(),
+    }
+}
+
+/// The caller named by a request URI's `caller` query, if any.
+fn caller_from_query(query: Option<&str>) -> Option<String> {
+    url::form_urlencoded::parse(query?.as_bytes())
+        .find(|(key, _)| key == TASK_MCP_CALLER_QUERY)
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty())
 }
 
 pub struct TaskMcpConnection {
@@ -184,9 +212,15 @@ impl TaskMcpConnection {
         &self.endpoint
     }
 
-    pub fn terminal_environment(&self) -> [(String, String); 2] {
+    /// The task MCP variables for one tab's terminal. The URL carries the
+    /// tab's caller identity; the token is the same for every tab and lives
+    /// only in the environment.
+    pub fn terminal_environment(&self, caller: Option<&str>) -> [(String, String); 2] {
         [
-            (TASK_MCP_URL_ENV.to_string(), self.endpoint.clone()),
+            (
+                TASK_MCP_URL_ENV.to_string(),
+                caller_endpoint(&self.endpoint, caller),
+            ),
             (TASK_MCP_TOKEN_ENV.to_string(), self.token.clone()),
         ]
     }
@@ -198,12 +232,12 @@ impl TaskMcpConnection {
     /// The task server for a natively spawned Claude session (chat tabs):
     /// the same config and pre-approval `configure_claude_command` injects
     /// into terminal launches, with the token carried in the child
-    /// environment.
-    pub fn claude_mcp_server(&self) -> ClaudeMcpServer {
+    /// environment. `caller` is the chat tab's `session_uid`.
+    pub fn claude_mcp_server(&self, caller: Option<&str>) -> ClaudeMcpServer {
         ClaudeMcpServer {
-            config: claude_mcp_config(&self.endpoint),
+            config: claude_mcp_config(&caller_endpoint(&self.endpoint, caller)),
             allowed_tools: vec![CLAUDE_ALLOWED_TOOLS.to_string()],
-            env: self.terminal_environment().into(),
+            env: self.terminal_environment(caller).into(),
         }
     }
 
@@ -371,7 +405,13 @@ async fn notify_session_event(
         session_id: query.session_id,
         event_type,
     };
-    match dispatch_operation(&state.commands, TaskControlOperation::SessionEvent(request)).await {
+    match dispatch_operation(
+        &state.commands,
+        TaskControlOperation::SessionEvent(request),
+        None,
+    )
+    .await
+    {
         Ok(value) => (StatusCode::OK, axum::Json(value)).into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
     }
@@ -380,11 +420,13 @@ async fn notify_session_event(
 async fn dispatch_operation(
     commands: &TaskControlSender,
     operation: TaskControlOperation,
+    caller: Option<String>,
 ) -> Result<Value, String> {
     let (reply, response) = oneshot::channel();
     commands
         .send(TaskControlEnvelope {
             operation,
+            caller,
             reply: TaskControlReply::new(reply),
         })
         .map_err(|_| "GitTerm's task command bridge is unavailable".to_string())?;
@@ -404,8 +446,19 @@ impl TaskMcpTools {
         Self { commands }
     }
 
-    async fn dispatch(&self, operation: TaskControlOperation) -> Result<Value, String> {
-        dispatch_operation(&self.commands, operation).await
+    /// Bridge one operation, attributed to the caller named on the HTTP
+    /// request's URL (rmcp injects the request `Parts` into every call).
+    async fn dispatch(
+        &self,
+        operation: TaskControlOperation,
+        parts: &Parts,
+    ) -> Result<Value, String> {
+        dispatch_operation(
+            &self.commands,
+            operation,
+            caller_from_query(parts.uri.query()),
+        )
+        .await
     }
 }
 
@@ -420,8 +473,15 @@ impl TaskMcpTools {
             open_world_hint = false
         )
     )]
-    async fn task_list(&self, Parameters(request): Parameters<ListTasksRequest>) -> CallToolResult {
-        task_result(self.dispatch(TaskControlOperation::List(request)).await)
+    async fn task_list(
+        &self,
+        Parameters(request): Parameters<ListTasksRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        task_result(
+            self.dispatch(TaskControlOperation::List(request), &parts)
+                .await,
+        )
     }
 
     #[tool(
@@ -433,8 +493,15 @@ impl TaskMcpTools {
             open_world_hint = false
         )
     )]
-    async fn task_get(&self, Parameters(request): Parameters<GetTaskRequest>) -> CallToolResult {
-        task_result(self.dispatch(TaskControlOperation::Get(request)).await)
+    async fn task_get(
+        &self,
+        Parameters(request): Parameters<GetTaskRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        task_result(
+            self.dispatch(TaskControlOperation::Get(request), &parts)
+                .await,
+        )
     }
 
     #[tool(
@@ -449,8 +516,12 @@ impl TaskMcpTools {
     async fn task_create(
         &self,
         Parameters(request): Parameters<CreateTaskRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
-        task_result(self.dispatch(TaskControlOperation::Create(request)).await)
+        task_result(
+            self.dispatch(TaskControlOperation::Create(request), &parts)
+                .await,
+        )
     }
 
     #[tool(
@@ -465,6 +536,7 @@ impl TaskMcpTools {
     async fn task_create_batch(
         &self,
         Parameters(request): Parameters<CreateTaskBatchRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         if request.tasks.is_empty() {
             return tool_error("task_create_batch requires at least one task");
@@ -472,7 +544,10 @@ impl TaskMcpTools {
         let mut results = Vec::with_capacity(request.tasks.len());
         for task in request.tasks {
             let title = task.title.clone();
-            match self.dispatch(TaskControlOperation::Create(task)).await {
+            match self
+                .dispatch(TaskControlOperation::Create(task), &parts)
+                .await
+            {
                 Ok(value) => results.push(serde_json::json!({
                     "title": title,
                     "ok": true,
@@ -500,9 +575,10 @@ impl TaskMcpTools {
     async fn task_launch_session(
         &self,
         Parameters(request): Parameters<LaunchTaskSessionRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         task_result(
-            self.dispatch(TaskControlOperation::LaunchSession(request))
+            self.dispatch(TaskControlOperation::LaunchSession(request), &parts)
                 .await,
         )
     }
@@ -519,9 +595,10 @@ impl TaskMcpTools {
     async fn task_update_handoff(
         &self,
         Parameters(request): Parameters<UpdateTaskHandoffRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         task_result(
-            self.dispatch(TaskControlOperation::UpdateHandoff(request))
+            self.dispatch(TaskControlOperation::UpdateHandoff(request), &parts)
                 .await,
         )
     }
@@ -571,7 +648,15 @@ pub fn configure_codex_command(command: &str, endpoint: &str) -> String {
     let mut configured = executable.to_string();
     for value in codex_config_overrides(endpoint) {
         configured.push_str(" --config ");
-        configured.push_str(&value);
+        if value.contains(['?', '&', '*', '[']) {
+            // A per-tab URL carries `?caller=…`; unquoted, zsh treats `?`
+            // as a glob and aborts the launch with "no matches found".
+            configured.push('\'');
+            configured.push_str(&value);
+            configured.push('\'');
+        } else {
+            configured.push_str(&value);
+        }
     }
     configured.push_str(rest);
     configured
@@ -732,8 +817,9 @@ mod tests {
             .unwrap();
         assert!((TASK_MCP_BASE_PORT..26_030).contains(&port));
         assert!(!(14_030..15_030).contains(&port));
-        let environment = connection.terminal_environment();
+        let environment = connection.terminal_environment(None);
         assert_eq!(environment[0].0, TASK_MCP_URL_ENV);
+        assert_eq!(environment[0].1, connection.endpoint());
         assert_eq!(environment[1].0, TASK_MCP_TOKEN_ENV);
         assert_eq!(environment[1].1.len(), 64);
         assert!(!connection
@@ -743,7 +829,7 @@ mod tests {
 
         // Chat tabs get the terminal launch's config and pre-approvals, with
         // the token only in the child environment.
-        let server = connection.claude_mcp_server();
+        let server = connection.claude_mcp_server(None);
         let config = server.config.to_string();
         assert!(config.contains("\"gitterm_tasks\""));
         assert!(!config.contains(&environment[1].1));
@@ -833,6 +919,75 @@ mod tests {
                 claude_mcp_config(endpoint)
             )
         );
+    }
+
+    #[test]
+    fn every_injection_path_carries_the_caller_and_keeps_the_token_in_the_environment() {
+        let (commands, _requests) = mpsc::unbounded_channel();
+        let (connection, _server) = prepare("caller-injection-test", commands).unwrap();
+        let caller = "7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90";
+        let expected_url = format!("{}?caller={caller}", connection.endpoint());
+        let token = connection.token.clone();
+
+        // Terminal tabs: the per-tab environment.
+        let environment = connection.terminal_environment(Some(caller));
+        assert_eq!(
+            environment[0],
+            (TASK_MCP_URL_ENV.to_string(), expected_url.clone())
+        );
+        assert_eq!(
+            environment[1],
+            (TASK_MCP_TOKEN_ENV.to_string(), token.clone())
+        );
+
+        // Claude and Codex terminal launches read the URL from that
+        // environment (`build_terminal_settings`).
+        let claude = configure_task_command("claude", &environment[0].1);
+        assert!(
+            claude.contains(&format!("\"url\":\"{expected_url}\"")),
+            "{claude}"
+        );
+        assert!(!claude.contains(&token));
+        let codex = configure_task_command("codex resume --last", &environment[0].1);
+        // Quoted: zsh would glob the bare `?` and abort the launch.
+        assert!(
+            codex.contains(&format!(
+                " --config 'mcp_servers.gitterm_tasks.url={expected_url}' "
+            )),
+            "{codex}"
+        );
+        assert!(codex.ends_with(" resume --last"), "{codex}");
+        assert!(!codex.contains(&token));
+
+        // Native chat tabs: the spawned Claude's MCP config.
+        let server = connection.claude_mcp_server(Some(caller));
+        assert_eq!(
+            server.config["mcpServers"]["gitterm_tasks"]["url"],
+            Value::String(expected_url.clone())
+        );
+        assert!(!server.config.to_string().contains(&token));
+        assert_eq!(server.env, environment.to_vec());
+
+        // No caller: the bare endpoint, unchanged launch shapes.
+        assert_eq!(
+            caller_endpoint(connection.endpoint(), None),
+            connection.endpoint()
+        );
+        assert_eq!(
+            caller_endpoint(connection.endpoint(), Some("")),
+            connection.endpoint()
+        );
+        assert!(!configure_codex_command("codex", connection.endpoint()).contains('\''));
+        assert_eq!(
+            caller_from_query(Some("caller=abc")),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            caller_from_query(Some("other=1&caller=a%20b")),
+            Some("a b".to_string())
+        );
+        assert_eq!(caller_from_query(Some("caller=")), None);
+        assert_eq!(caller_from_query(None), None);
     }
 
     #[test]
@@ -962,6 +1117,7 @@ mod tests {
             let envelope = requests.recv().await.expect("missing bridged request");
             assert!(matches!(envelope.operation, TaskControlOperation::List(_)));
             envelope.reply.send(Ok(serde_json::json!({ "tasks": [] })));
+            envelope.caller
         });
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(endpoint).auth_header(token),
@@ -984,7 +1140,70 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
-        responder.await.unwrap();
+        assert_eq!(responder.await.unwrap(), None);
+        client.cancel().await.unwrap();
+
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("task MCP server did not shut down")
+            .expect("task MCP task panicked")
+            .expect("task MCP server returned an error");
+    }
+
+    #[tokio::test]
+    async fn caller_query_reaches_the_bridged_envelope() {
+        let (commands, mut requests) = mpsc::unbounded_channel();
+        let (connection, server) = prepare("caller-test", commands).unwrap();
+        let endpoint = caller_endpoint(connection.endpoint(), Some("abc"));
+        let token = connection.token.clone();
+        let server_task = tokio::spawn(server.run());
+
+        let responder = tokio::spawn(async move {
+            let mut callers = Vec::new();
+            for _ in 0..2 {
+                let envelope = requests.recv().await.expect("missing bridged request");
+                let operation = match &envelope.operation {
+                    TaskControlOperation::List(_) => "list",
+                    TaskControlOperation::UpdateHandoff(_) => "handoff",
+                    other => panic!("unexpected bridged operation: {other:?}"),
+                };
+                callers.push((operation, envelope.caller.clone()));
+                envelope.reply.send(Ok(serde_json::json!({ "tasks": [] })));
+            }
+            callers
+        });
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(endpoint).auth_header(token),
+        );
+        let client = tokio::time::timeout(Duration::from_secs(5), ().serve(transport))
+            .await
+            .expect("MCP initialization timed out")
+            .expect("MCP initialization failed");
+        let list = client
+            .call_tool(rmcp::model::CallToolRequestParams::new("task_list"))
+            .await
+            .unwrap();
+        assert!(!list.is_error.unwrap_or(false));
+        let handoff = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("task_update_handoff").with_arguments(
+                    serde_json::Map::from_iter([
+                        ("task_id".to_string(), Value::from("task-1")),
+                        ("summary".to_string(), Value::from("done")),
+                    ]),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(!handoff.is_error.unwrap_or(false));
+        assert_eq!(
+            responder.await.unwrap(),
+            vec![
+                ("list", Some("abc".to_string())),
+                ("handoff", Some("abc".to_string())),
+            ]
+        );
         client.cancel().await.unwrap();
 
         drop(connection);

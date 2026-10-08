@@ -2874,6 +2874,9 @@ pub struct PendingTaskLaunch {
     resolved_worktree_path: Option<PathBuf>,
     request: PrepareTaskWorktreeRequest,
     control_reply: Option<TaskControlReply>,
+    /// `session_uid` of the tab whose MCP call created this task, recorded
+    /// as `TaskCreator.session_id`. `None` for manual creation.
+    creator_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3018,6 +3021,10 @@ struct TabState {
     task_id: Option<String>,
     // Durable identity of this child session inside its task.
     task_session_id: Option<String>,
+    // Durable caller identity of this tab (uuid v4), persisted in
+    // workspaces.json. Carried as `?caller=` on the task MCP URL every
+    // harness in this tab receives, so the task server knows which tab called.
+    session_uid: String,
     // Live execution signal for the task session this tab hosts; None when
     // nothing is observably running (or the tab is not task-linked).
     task_live_state: Option<TaskSessionLiveState>,
@@ -3080,6 +3087,7 @@ impl TabState {
             chat_session_id: None,
             task_id: None,
             task_session_id: None,
+            session_uid: uuid::Uuid::new_v4().to_string(),
             task_live_state: None,
             task_last_activity: None,
             attention: None,
@@ -4127,6 +4135,40 @@ fn task_tab_indices(workspace: &Workspace, task_id: &str) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, tab)| (tab.task_id.as_deref() == Some(task_id)).then_some(index))
         .collect()
+}
+
+/// Who wrote a `task_update_handoff`, as recorded in
+/// `TaskHandoff.updated_by_session_id`. An explicit `session_id` must be one
+/// of the task's sessions. Without one the calling tab (`caller`, its
+/// `session_uid`) is the writer: the task session it hosts when that tab
+/// belongs to this task, otherwise (a coordinator tab outside the task) its
+/// `session_uid` itself. No explicit id and no caller records nobody.
+fn handoff_writer(
+    workspaces: &[Workspace],
+    task_id: &str,
+    task_sessions: &[String],
+    explicit_session_id: Option<&str>,
+    caller: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(session_id) = explicit_session_id.map(str::trim) {
+        return if task_sessions.iter().any(|known| known == session_id) {
+            Ok(Some(session_id.to_string()))
+        } else {
+            Err(format!(
+                "Task {task_id} does not contain session {session_id}"
+            ))
+        };
+    }
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    let hosted_session = workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tabs.iter())
+        .find(|tab| tab.session_uid == caller && tab.task_id.as_deref() == Some(task_id))
+        .and_then(|tab| tab.task_session_id.clone())
+        .filter(|session_id| task_sessions.contains(session_id));
+    Ok(Some(hosted_session.unwrap_or_else(|| caller.to_string())))
 }
 
 fn find_task_session_tab(workspaces: &[Workspace], session_id: &str) -> Option<(usize, usize)> {
@@ -5924,6 +5966,7 @@ impl App {
                         chat_session_id: tab.chat_session_id.clone(),
                         task_id: tab.task_id.clone(),
                         task_session_id: tab.task_session_id.clone(),
+                        session_uid: Some(tab.session_uid.clone()),
                     })
                     .collect(),
                 run_command: ws.console.run_command.clone(),
@@ -7607,6 +7650,7 @@ impl App {
         &self,
         input: McpCreateTaskRequest,
         reply: TaskControlReply,
+        caller: Option<String>,
     ) -> Result<PendingTaskLaunch, String> {
         let title = input.title.trim().to_string();
         let objective = input.objective.trim().to_string();
@@ -7680,6 +7724,7 @@ impl App {
             resolved_worktree_path: None,
             request,
             control_reply: Some(reply),
+            creator_session_id: caller,
         })
     }
 
@@ -9657,6 +9702,15 @@ impl App {
                     }
                 } else {
                     for tab_config in &ws_config.tabs {
+                        // Tabs saved before caller identity existed get a
+                        // fresh uid (TabState::new); save once so it sticks.
+                        let restored_session_uid = tab_config.session_uid.clone();
+                        if restored_session_uid.is_none() {
+                            app.workspaces_dirty = true;
+                            app.next_workspace_save_at = Some(
+                                Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS),
+                            );
+                        }
                         if workspace_is_remote_agent {
                             let Some(root) = remote_agent_root.as_deref() else {
                                 continue;
@@ -9671,6 +9725,7 @@ impl App {
                                     local_cwd,
                                     Some(PathBuf::from(&tab_config.dir)),
                                     tab_config.startup_command.clone(),
+                                    restored_session_uid,
                                 );
                                 continue;
                             }
@@ -9685,6 +9740,11 @@ impl App {
                                 root.to_string(),
                                 Some(tab_config.dir.clone()),
                             );
+                            if let (Some(uid), Some(tab)) =
+                                (restored_session_uid, workspace.tabs.last_mut())
+                            {
+                                tab.session_uid = uid;
+                            }
                             remote_agent_files_tab_added = true;
                             continue;
                         }
@@ -9808,6 +9868,13 @@ impl App {
                                     Some(current_dir),
                                     agent_config.clone(),
                                 );
+                                // No terminal: the chat process (and its MCP
+                                // URL) starts on the first prompt.
+                                if let (Some(uid), Some(tab)) =
+                                    (restored_session_uid.clone(), workspace.tabs.last_mut())
+                                {
+                                    tab.session_uid = uid;
+                                }
                             }
                             (Some("agent"), None) => {
                                 eprintln!(
@@ -9819,6 +9886,7 @@ impl App {
                                     repo_dir,
                                     Some(current_dir),
                                     startup_command.clone(),
+                                    restored_session_uid.clone(),
                                 );
                             }
                             (Some(other), _) if other != "terminal" => {
@@ -9832,6 +9900,7 @@ impl App {
                                     repo_dir,
                                     Some(current_dir),
                                     startup_command.clone(),
+                                    restored_session_uid.clone(),
                                 );
                             }
                             _ => {
@@ -9840,6 +9909,7 @@ impl App {
                                     repo_dir,
                                     Some(current_dir),
                                     startup_command.clone(),
+                                    restored_session_uid.clone(),
                                 );
                             }
                         }
@@ -10003,12 +10073,14 @@ impl App {
         repo_path: PathBuf,
         current_dir: Option<PathBuf>,
         startup_command: Option<String>,
+        session_uid: Option<String>,
     ) {
         let startup_command_for_title = startup_command.clone();
-        let mut tab = self.create_tab_for_workspace(
+        let mut tab = self.create_tab_with_session_uid(
             repo_path.clone(),
             startup_command,
             Some(&workspace.name.clone()),
+            session_uid,
         );
         tab.set_local_dir(current_dir.unwrap_or(repo_path));
         if let Some(session) = self.remote_session_for_workspace(workspace) {
@@ -10438,6 +10510,28 @@ fi
         startup_command: Option<String>,
         workspace_name: Option<&str>,
     ) -> TabState {
+        self.create_tab_with_session_uid(repo_path, startup_command, workspace_name, None)
+    }
+
+    /// `create_tab_for_workspace` for a tab whose durable `session_uid` is
+    /// already known (workspace restore). The uid must be fixed before the
+    /// terminal starts: it is baked into the task MCP URL in its environment.
+    fn create_tab_with_session_uid(
+        &mut self,
+        repo_path: PathBuf,
+        startup_command: Option<String>,
+        workspace_name: Option<&str>,
+        session_uid: Option<String>,
+    ) -> TabState {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+
+        let mut tab = TabState::new(id, repo_path.clone());
+        if let Some(session_uid) = session_uid {
+            tab.session_uid = session_uid;
+        }
+        tab.set_startup_command(startup_command.clone());
+
         // Read env fresh from the global workspaces.json. Caller passes the workspace name
         // explicitly so this works correctly during init (before active_workspace is set).
         let ws_name = workspace_name
@@ -10457,18 +10551,12 @@ fi
             extra_env.extend(connection.terminal_environment());
         }
         if let Some(connection) = &self.task_mcp {
-            extra_env.extend(connection.terminal_environment());
+            extra_env.extend(connection.terminal_environment(Some(&tab.session_uid)));
         }
         let extra_env_refs: Vec<(&str, &str)> = extra_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-
-        let mut tab = TabState::new(id, repo_path.clone());
-        tab.set_startup_command(startup_command.clone());
 
         let settings = Self::build_terminal_settings(
             &repo_path,
@@ -10505,7 +10593,8 @@ fi
             extra_env.extend(connection.terminal_environment());
         }
         if let Some(connection) = &self.task_mcp {
-            extra_env.extend(connection.terminal_environment());
+            // Bottom-panel terminals are not tabs and have no caller identity.
+            extra_env.extend(connection.terminal_environment(None));
         }
         let extra_env_refs: Vec<(&str, &str)> = extra_env
             .iter()
@@ -11600,14 +11689,17 @@ fi
                     envelope.reply.send(result);
                 }
                 TaskControlOperation::Create(request) => {
-                    let pending =
-                        match self.pending_task_from_control(request, envelope.reply.clone()) {
-                            Ok(pending) => pending,
-                            Err(error) => {
-                                envelope.reply.send(Err(error));
-                                return Task::none();
-                            }
-                        };
+                    let pending = match self.pending_task_from_control(
+                        request,
+                        envelope.reply.clone(),
+                        envelope.caller.clone(),
+                    ) {
+                        Ok(pending) => pending,
+                        Err(error) => {
+                            envelope.reply.send(Err(error));
+                            return Task::none();
+                        }
+                    };
                     let worktree_request = pending.request.clone();
                     return Task::perform(
                         resolve_task_preparation(worktree_request),
@@ -11675,21 +11767,25 @@ fi
                     };
                     let timestamp = chrono::Utc::now().to_rfc3339();
                     let result = if let Some(store) = self.task_store.as_mut() {
-                        let session_valid = request.session_id.as_ref().is_none_or(|session_id| {
-                            store.get(&request.task_id).is_some_and(|task| {
+                        let task_sessions = store
+                            .get(&request.task_id)
+                            .map(|task| {
                                 task.sessions
                                     .iter()
-                                    .any(|session| session.task_session_id == session_id.trim())
+                                    .map(|session| session.task_session_id.clone())
+                                    .collect::<Vec<_>>()
                             })
-                        });
-                        if !session_valid {
-                            Err(format!(
-                                "Task {} does not contain session {}",
-                                request.task_id,
-                                request.session_id.as_deref().unwrap_or_default()
-                            ))
-                        } else {
-                            store
+                            .unwrap_or_default();
+                        let writer = handoff_writer(
+                            &self.workspaces,
+                            &request.task_id,
+                            &task_sessions,
+                            request.session_id.as_deref(),
+                            envelope.caller.as_deref(),
+                        );
+                        match writer {
+                            Err(error) => Err(error),
+                            Ok(updated_by_session_id) => store
                                 .update_handoff(
                                     &request.task_id,
                                     TaskHandoff {
@@ -11697,9 +11793,7 @@ fi
                                         decisions: clean(request.decisions),
                                         next_steps: clean(request.next_steps),
                                         blockers: clean(request.blockers),
-                                        updated_by_session_id: request
-                                            .session_id
-                                            .map(|session_id| session_id.trim().to_string()),
+                                        updated_by_session_id,
                                         updated_at: timestamp.clone(),
                                     },
                                     &timestamp,
@@ -11712,7 +11806,7 @@ fi
                                             request.task_id
                                         )
                                     })
-                                })
+                                }),
                         }
                     } else {
                         Err("GitTerm's task store is unavailable".to_string())
@@ -12715,10 +12809,16 @@ fi
                 let mut claude_spawned = false;
                 // A native Claude spawn gets the same GitTerm MCP servers a
                 // terminal-launched `claude` does.
+                let caller = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .map(|t| t.session_uid.clone());
                 let mut claude_mcp_servers: Vec<gitterm::harness::claude::ClaudeMcpServer> = self
                     .task_mcp
                     .iter()
-                    .map(TaskMcpConnection::claude_mcp_server)
+                    .map(|connection| connection.claude_mcp_server(caller.as_deref()))
                     .chain(
                         self.browser_mcp
                             .iter()
@@ -14636,6 +14736,7 @@ fi
                     resolved_worktree_path: None,
                     request: request.clone(),
                     control_reply: None,
+                    creator_session_id: None,
                 };
                 form.submitting = true;
                 form.error = None;
@@ -14694,7 +14795,7 @@ fi
                     } else {
                         TaskCreatorKind::Manual
                     },
-                    session_id: None,
+                    session_id: pending.creator_session_id.clone(),
                     harness_label: None,
                     created_at: timestamp.clone(),
                 });
@@ -17442,6 +17543,7 @@ fi
                     path,
                     None,
                     Some("claude".to_string()),
+                    None,
                 );
                 self.workspaces.push(workspace);
                 self.active_workspace_idx = self.workspaces.len() - 1;
@@ -30480,6 +30582,58 @@ mod tests {
             Some((0, 1))
         );
         assert_eq!(find_task_session_tab(&workspaces, "missing"), None);
+    }
+
+    #[test]
+    fn handoff_writer_attributes_the_calling_tab() {
+        let mut workspace = Workspace::new(
+            "GitTerm".to_string(),
+            PathBuf::from("/repo"),
+            WorkspaceColor::Blue,
+        );
+        let mut worker = TabState::new(1, PathBuf::from("/worktree"));
+        worker.task_id = Some("task-1".to_string());
+        worker.task_session_id = Some("session-1".to_string());
+        worker.session_uid = "uid-worker".to_string();
+        let mut coordinator = TabState::new(2, PathBuf::from("/repo"));
+        coordinator.session_uid = "uid-coordinator".to_string();
+        workspace.tabs.extend([worker, coordinator]);
+        let workspaces = vec![workspace];
+        let sessions = vec!["session-1".to_string()];
+        let writer = |explicit: Option<&str>, caller: Option<&str>| {
+            handoff_writer(&workspaces, "task-1", &sessions, explicit, caller)
+        };
+
+        // The worker's tab maps to its task session id.
+        assert_eq!(
+            writer(None, Some("uid-worker")),
+            Ok(Some("session-1".to_string()))
+        );
+        // A tab outside the task is recorded by its session_uid.
+        assert_eq!(
+            writer(None, Some("uid-coordinator")),
+            Ok(Some("uid-coordinator".to_string()))
+        );
+        // An explicit id wins and is still validated.
+        assert_eq!(
+            writer(Some(" session-1 "), Some("uid-coordinator")),
+            Ok(Some("session-1".to_string()))
+        );
+        assert!(writer(Some("uid-worker"), None).is_err());
+        assert_eq!(writer(None, None), Ok(None));
+        // The same uid on another task's handoff is not that task's session.
+        assert_eq!(
+            handoff_writer(&workspaces, "task-2", &[], None, Some("uid-worker")),
+            Ok(Some("uid-worker".to_string()))
+        );
+    }
+
+    #[test]
+    fn every_tab_gets_a_distinct_session_uid() {
+        let first = TabState::new(1, PathBuf::from("/repo"));
+        let second = TabState::new(2, PathBuf::from("/repo"));
+        assert!(uuid::Uuid::parse_str(&first.session_uid).is_ok());
+        assert_ne!(first.session_uid, second.session_uid);
     }
 
     #[test]
