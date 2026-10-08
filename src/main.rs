@@ -4475,6 +4475,11 @@ pub enum Event {
     /// A resumed Claude chat tab's earlier timeline, read back from its
     /// transcript (TRU-140). Empty when the transcript is missing.
     AgentHistoryLoaded(usize, Vec<tab::AgentEvent>),
+    /// The Agent surface finished building its page for this tab. The tab's
+    /// buffer is replayed now, from live state, so events that arrived while
+    /// the page was under construction (transcript read-back, a fast first
+    /// turn) are not lost.
+    AgentWebviewCreated(usize),
     /// Step 3-only debug entry point: spawn an in-memory agent tab in the
     /// active workspace, submit a hardcoded prompt, log events to stderr.
     /// Bound to a hidden keyboard shortcut for verifying the subprocess
@@ -12703,6 +12708,35 @@ fi
                 }
                 return Task::none();
             }
+            Event::AgentWebviewCreated(tab_id) => {
+                if self.webview_agent_tab_id != Some(tab_id) {
+                    // The user moved on before the page finished building;
+                    // the surface will be reset and replayed for the tab it
+                    // now mirrors.
+                    eprintln!(
+                        "[agent-webview] create finished for tab={} but surface now mirrors {:?}",
+                        tab_id, self.webview_agent_tab_id
+                    );
+                    return Task::none();
+                }
+                let Some(session) = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                else {
+                    return Task::none();
+                };
+                eprintln!(
+                    "[agent-webview] create OK for tab={}, replaying {} events",
+                    tab_id,
+                    session.conversation.len()
+                );
+                set_agent_webview_tab_id(tab_id, session.configured_permission_mode().as_deref());
+                replay_agent_conversation_in_webview(&session.conversation);
+                return Task::none();
+            }
             Event::AgentHistoryLoaded(tab_id, history) => {
                 let is_active_in_webview = self.webview_agent_tab_id == Some(tab_id);
                 let Some(session) = self
@@ -17726,15 +17760,11 @@ fi
                 );
                 self.webview_agent_tab_id = Some(tab_id);
 
-                // After construction, set the tab id on the JS side and replay
-                // buffered events. Both happen via evaluate_script after
-                // `try_create_with_window` runs. Using Arc because Task::then's
-                // closure is FnMut, so the Vec can't be moved out of the
-                // captured environment on each call.
-                let conversation = std::sync::Arc::new(conversation);
+                // After construction, `AgentWebviewCreated` sets the tab id on
+                // the JS side and replays the buffer as it is *then*; a copy
+                // taken here would miss anything that lands while the page is
+                // being built (the transcript read-back arrives in a few ms).
                 iced::window::oldest().then(move |opt_id| {
-                    let conversation = std::sync::Arc::clone(&conversation);
-                    let permission_mode = permission_mode.clone();
                     if let Some(id) = opt_id {
                         iced::window::run(id, move |window| {
                             eprintln!("[agent-webview] try_create_with_window for tab={}", tab_id);
@@ -17744,6 +17774,7 @@ fi
                                         "[agent-webview] create FAILED for tab={}: {}",
                                         tab_id, e
                                     );
+                                    false
                                 }
                                 Ok(false) => {
                                     // A later staging's task already built the
@@ -17753,19 +17784,18 @@ fi
                                         "[agent-webview] nothing staged for tab={}; skipping replay",
                                         tab_id
                                     );
+                                    false
                                 }
-                                Ok(true) => {
-                                    eprintln!(
-                                        "[agent-webview] create OK for tab={}, replaying {} events",
-                                        tab_id,
-                                        conversation.len()
-                                    );
-                                    set_agent_webview_tab_id(tab_id, permission_mode.as_deref());
-                                    replay_agent_conversation_in_webview(&conversation);
-                                }
+                                Ok(true) => true,
                             }
                         })
-                        .discard()
+                        .then(move |created| {
+                            if created {
+                                Task::done(Event::AgentWebviewCreated(tab_id))
+                            } else {
+                                Task::none()
+                            }
+                        })
                     } else {
                         eprintln!("[agent-webview] no window available; skipping create");
                         Task::none()
