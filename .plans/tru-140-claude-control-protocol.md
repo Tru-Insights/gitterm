@@ -331,9 +331,8 @@ came to well under $0.05.
 
 ## Open questions
 
-- **Entrypoint value.** Should GitTerm set `CLAUDE_CODE_ENTRYPOINT=sdk-ts` as
-  the SDK does, or its own value? The probe mirrors `sdk-ts`. Unknown which
-  CLI behaviours depend on it.
+- **Entrypoint value.** Resolved in Phase B: GitTerm stays on `sdk-ts` (see
+  the Phase B decisions).
 - **`supportedDialogKinds` / `request_user_dialog`.** Which dialog kinds exist,
   and should the chat UI render any? The probe did not declare any, so none
   were sent.
@@ -367,8 +366,15 @@ the per-turn path, and the old `claude --print` command builder is gone.
 
 - `CLAUDE_CODE_ENTRYPOINT=sdk-ts` and `CLAUDE_CODE_SDK_READS_SESSION_STATE=1`
   stay as tested, with `CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_PID` and
-  `NODE_OPTIONS` stripped. **Revisit:** whether GitTerm should claim its own
-  entrypoint value.
+  `NODE_OPTIONS` stripped. GitTerm does not claim its own entrypoint: CLI
+  2.1.294 keys behaviour on the exact values `sdk-ts`/`sdk-py`/`sdk-cli`,
+  not the `sdk` prefix. A smoke run with `sdk-gitterm` kept permission
+  prompts and MCP identical but changed the handshake: `Artifact*` tools,
+  artifact skills, `/slides` and the `claude-code-guide` agent appeared, and
+  the client type became `cli` (markdown AskUserQuestion previews). Instead,
+  the Chats index (`chats.rs`) indexes `sdk-ts` transcripts as
+  conversations and skips other `sdk*` values (hook `claude -p` runs are
+  `sdk-cli`), so chat-tab sessions appear in the Chats panel.
 - `TurnStarted` comes from `system/init`, which fires every turn. It carries
   `session_id` and `model`, because `initialize` does not return the session
   id for a fresh session. `Ready.session_id` is only the id being resumed.

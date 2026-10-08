@@ -281,9 +281,13 @@ struct HeadScan {
     /// True when the session was started headlessly (`claude -p` / SDK —
     /// entrypoint "sdk-cli" etc.), e.g. hook-spawned review runs. These
     /// are one-shot automation, not conversations to go back to, so the
-    /// index skips them. A missing entrypoint counts as interactive.
+    /// index skips them. A missing entrypoint counts as interactive, and
+    /// so does `sdk-ts` (GitTerm's own chat tabs).
     headless: bool,
 }
+
+/// Entrypoint GitTerm's native chat tabs run under (the Agent SDK's value).
+const SDK_TS_ENTRYPOINT: &str = "sdk-ts";
 
 fn scan_head(path: &Path) -> std::io::Result<HeadScan> {
     let file = std::fs::File::open(path)?;
@@ -306,7 +310,13 @@ fn scan_head(path: &Path) -> std::io::Result<HeadScan> {
             continue;
         };
         if let Some(entrypoint) = &meta.entrypoint {
-            if entrypoint.starts_with("sdk") {
+            // GitTerm chat tabs spawn `claude` as `sdk-ts` and are real
+            // conversations; hook review runs (`claude -p`) are `sdk-cli`.
+            // GitTerm cannot claim its own value: the CLI keys real
+            // behaviour (artifact tools, question preview format, client
+            // type) on the exact entrypoint, so anything but `sdk-ts`
+            // changes the session.
+            if entrypoint.starts_with("sdk") && entrypoint != SDK_TS_ENTRYPOINT {
                 out.headless = true;
                 break;
             }
@@ -897,6 +907,37 @@ mod tests {
             &[r#"{"type":"queue-operation"}"#, sdk_user.as_str()],
         );
         assert!(index_transcript(&path, ChatBackend::Claude).is_none());
+    }
+
+    #[test]
+    fn index_skips_sdk_py_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sdk_user = serde_json::json!({
+            "type": "user", "entrypoint": "sdk-py", "cwd": "/tmp/x", "gitBranch": "main",
+            "message": {"role": "user", "content": "Summarise the build log."}
+        })
+        .to_string();
+        let path = write_transcript(dir.path(), "py.jsonl", &[sdk_user.as_str()]);
+        assert!(index_transcript(&path, ChatBackend::Claude).is_none());
+    }
+
+    #[test]
+    fn index_keeps_gitterm_chat_tab_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat_user = serde_json::json!({
+            "type": "user", "entrypoint": "sdk-ts", "cwd": "/tmp/x", "gitBranch": "feat/chat",
+            "message": {"role": "user", "content": "Why does the backfill skip March?"}
+        })
+        .to_string();
+        let path = write_transcript(
+            dir.path(),
+            "chat.jsonl",
+            &[r#"{"type":"queue-operation"}"#, chat_user.as_str()],
+        );
+        let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
+        assert_eq!(entry.title, "Why does the backfill skip March?");
+        assert_eq!(entry.cwd, PathBuf::from("/tmp/x"));
+        assert_eq!(entry.branch.as_deref(), Some("feat/chat"));
     }
 
     fn codex_meta_line(id: &str, cwd: &str, branch: &str, originator: &str) -> String {
