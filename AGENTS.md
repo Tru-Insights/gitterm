@@ -229,14 +229,23 @@ Windows CI exists.
   lines). Don't split into submodules unless the change is large and contained.
 - **Supporting modules**: `src/log_server.rs` (warp localhost server),
   `src/plans_viewer.rs` (plans viewer routes), `src/markdown.rs`,
-  `src/webview.rs` (two wry WebView surfaces), `src/services.rs`, `src/agent.rs`,
+  `src/webview.rs` (wry WebView surfaces), `src/services.rs`, `src/agent.rs`,
   `src/tab/` (TabKind enum + AgentSession), `src/events.rs`, `src/config.rs`,
   `src/theme.rs`.
-- **Embedded WebView**: two wry child `WebView` surfaces keyed by
-  `webview::WebviewSurface`. `Agent` hosts the Claude chat page (IPC handler
-  installed at construction) and stays alive, hidden, while `Viewer` shows
-  markdown / HTML / Excalidraw or the plans viewer; at most one is visible,
-  Viewer over Agent (`visible_webview_surface` in `main.rs`). See
+- **Embedded WebView**: wry child `WebView` surfaces keyed by
+  `webview::WebviewSurface`. `Agent(tab_id)` is one agent tab's chat page (its
+  own IPC handler installed at construction; the page holds its tab id via
+  `window.__setTabId`). Each chat tab keeps its own page alive, hidden, while
+  another tab, a file or the plans viewer is shown, and keeps receiving the
+  tab's events, so switching back is show/hide with scroll, tool cards and
+  composer draft intact. At most `MAX_AGENT_PAGES` (4) pages live per process
+  (`App::agent_pages`, most recently shown first, `promote_agent_page`); the
+  least recently shown is destroyed and rebuilt and replayed from
+  `AgentSession.conversation` (the source of truth) on its next show, via
+  `AgentWebviewCreated`. A closed tab's page is destroyed
+  (`prune_agent_pages`). `Viewer` shows markdown / HTML / Excalidraw or the
+  plans viewer. At most one surface is visible, Viewer over the agent page
+  (`visible_webview_surface` in `main.rs`). See
   `webview::set_pending_content`, `set_pending_url`, `navigate_to_url`.
 - **Terminal**: uses `iced_term` fork at `../iced_term_fork`. The Windows CI
   workflow clones from `https://github.com/Tru-Insights/iced_term.git` master

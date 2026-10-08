@@ -267,51 +267,61 @@ fn agent_chat_html() -> String {
     )
 }
 
-/// Push one `AgentEvent` into the live webview via `window.__appendEvent(...)`.
-/// Caller is responsible for ensuring the Agent surface mirrors this event's
-/// tab; this is a no-op if the Agent surface doesn't exist.
-fn push_agent_event_to_webview(ev: &tab::AgentEvent) {
+/// Push one `AgentEvent` into tab `tab_id`'s chat page via
+/// `window.__appendEvent(...)`, visible or hidden. No-op if the tab has no
+/// live page; its buffer is replayed when the page is (re)created.
+fn push_agent_event_to_webview(tab_id: usize, ev: &tab::AgentEvent) {
+    if !webview::is_active(WebviewSurface::Agent(tab_id)) {
+        return;
+    }
     let Some(payload) = ev.webview_payload() else {
         return;
     };
     webview::evaluate_script(
-        WebviewSurface::Agent,
+        WebviewSurface::Agent(tab_id),
         &format!("window.__appendEvent({payload})"),
     );
 }
 
-/// Replay a tab's whole conversation buffer in one script call. The page
-/// renders it without live timing (elapsed counters, auto-follow jitter).
-fn replay_agent_conversation_in_webview(conversation: &[tab::AgentEvent]) {
+/// Replay a tab's whole conversation buffer into its page in one script call.
+/// The page renders it without live timing (elapsed counters, auto-follow
+/// jitter).
+fn replay_agent_conversation_in_webview(tab_id: usize, conversation: &[tab::AgentEvent]) {
     let payloads: Vec<serde_json::Value> = conversation
         .iter()
         .filter_map(tab::AgentEvent::webview_payload)
         .collect();
     let json = serde_json::Value::Array(payloads);
-    webview::evaluate_script(WebviewSurface::Agent, &format!("window.__replay({json})"));
+    webview::evaluate_script(
+        WebviewSurface::Agent(tab_id),
+        &format!("window.__replay({json})"),
+    );
 }
 
-/// Set the active tab id on the JS side. The webview tags every IPC message
-/// with this id so the Rust dispatcher can route the prompt/stop to the
-/// correct tab (multiple agent tabs share the Agent surface, swapping in and
-/// out via tab activation). `permission_mode` is the Claude tab's configured
-/// mode (what the next spawn passes); the replayed buffer's `ready` and
-/// `permission_mode_changed` events override it. `None` (pi tabs) hides the
-/// mode chip.
+/// Tell a freshly built chat page which tab it belongs to. The page tags every
+/// IPC message with this id so the Rust dispatcher routes the prompt/stop to
+/// the right tab; each tab has its own page, so this runs once per page.
+/// `permission_mode` is the Claude tab's configured mode (what the next spawn
+/// passes); the replayed buffer's `ready` and `permission_mode_changed` events
+/// override it. `None` (pi tabs) hides the mode chip.
 fn set_agent_webview_tab_id(tab_id: usize, permission_mode: Option<&str>) {
     let mode = serde_json::to_string(&permission_mode).unwrap_or_else(|e| {
         eprintln!("[agent-webview] tab {tab_id}: cannot encode mode {permission_mode:?}: {e}");
         "null".to_string()
     });
     webview::evaluate_script(
-        WebviewSurface::Agent,
+        WebviewSurface::Agent(tab_id),
         &format!("window.__setTabId({tab_id}, {mode})"),
     );
 }
 
-/// Reset the chat surface: clears all rendered messages and sets status to Idle.
-fn reset_agent_webview() {
-    webview::evaluate_script(WebviewSurface::Agent, "window.__resetConversation()");
+/// Reset a tab's chat page: clears all rendered messages and sets status to
+/// Idle.
+fn reset_agent_webview(tab_id: usize) {
+    webview::evaluate_script(
+        WebviewSurface::Agent(tab_id),
+        "window.__resetConversation()",
+    );
 }
 
 /// Build the IPC handler closure to install at agent-webview creation. Parses
@@ -4475,7 +4485,7 @@ pub enum Event {
     /// A resumed Claude chat tab's earlier timeline, read back from its
     /// transcript (TRU-140). Empty when the transcript is missing.
     AgentHistoryLoaded(usize, Vec<tab::AgentEvent>),
-    /// The Agent surface finished building its page for this tab. The tab's
+    /// The Agent surface finished building this tab's page. The tab's
     /// buffer is replayed now, from live state, so events that arrived while
     /// the page was under construction (transcript read-back, a fast first
     /// turn) are not lost.
@@ -4858,16 +4868,17 @@ struct App {
     stt_transcribing: bool,
     /// What the Viewer webview surface is presenting (`None` = hidden).
     viewer_webview: ViewerWebview,
-    /// The agent tab whose conversation the Agent webview surface's DOM holds.
-    /// The surface keeps mirroring this tab while hidden (events keep being
-    /// pushed), so revealing it again needs no reset or replay. Set at staging
-    /// time; `webview::is_active(WebviewSurface::Agent)` says whether the
-    /// surface has actually been created.
-    webview_agent_tab_id: Option<usize>,
+    /// Agent tabs that own a chat page (`WebviewSurface::Agent(tab_id)`),
+    /// most recently shown first, at most `MAX_AGENT_PAGES`. A page keeps
+    /// receiving its tab's events while hidden, so showing it again needs no
+    /// reset or replay. A tab enters at staging time;
+    /// `webview::is_active(WebviewSurface::Agent(tab_id))` says whether its
+    /// page has actually been built.
+    agent_pages: Vec<usize>,
 }
 
-/// What the Viewer webview surface is presenting. The Agent surface (chat)
-/// is tracked separately via `App::webview_agent_tab_id`.
+/// What the Viewer webview surface is presenting. The agent chat pages are
+/// tracked separately via `App::agent_pages`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewerWebview {
     /// Hidden.
@@ -4918,28 +4929,50 @@ fn visible_webview_surface(
     }
 }
 
+/// How many agent chat pages may be alive at once. Showing a tab without a
+/// page beyond this destroys the least recently shown one; that tab is
+/// rebuilt and replayed from its buffer when it is next shown.
+const MAX_AGENT_PAGES: usize = 4;
+
 /// How `App::show_agent_webview` brings an agent tab's chat on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentSurfaceAction {
-    /// The live Agent surface already mirrors this tab: show it, DOM intact.
+    /// This tab's page is alive and was the last one shown: show it, DOM intact.
     Reveal,
-    /// The live Agent surface mirrors another tab: reset it and replay this one.
+    /// This tab's page is alive but another tab's page was shown last: hide
+    /// that one and show this one. No reset, no replay.
     SwitchTab,
-    /// No live Agent surface: create it and replay this tab's conversation.
+    /// This tab has no live page: build one and replay the tab's conversation
+    /// (evicting the least recently shown page past `MAX_AGENT_PAGES`).
     Create,
 }
 
+/// `page_alive`: whether `tab_id`'s page has been built. `front_page`: the
+/// tab whose page was shown last (`App::agent_pages[0]`).
 fn agent_surface_action(
-    alive: bool,
-    mirrored_tab: Option<usize>,
+    page_alive: bool,
+    front_page: Option<usize>,
     tab_id: usize,
 ) -> AgentSurfaceAction {
-    if !alive {
+    if !page_alive {
         AgentSurfaceAction::Create
-    } else if mirrored_tab == Some(tab_id) {
+    } else if front_page == Some(tab_id) {
         AgentSurfaceAction::Reveal
     } else {
         AgentSurfaceAction::SwitchTab
+    }
+}
+
+/// Move `tab_id` to the front of `pages` (most recently shown first), adding
+/// it if absent, and return the tabs pushed past `cap`, whose pages the
+/// caller destroys. Least recently shown is evicted first.
+fn promote_agent_page(pages: &mut Vec<usize>, tab_id: usize, cap: usize) -> Vec<usize> {
+    pages.retain(|&id| id != tab_id);
+    pages.insert(0, tab_id);
+    if pages.len() > cap {
+        pages.split_off(cap.max(1))
+    } else {
+        Vec::new()
     }
 }
 
@@ -9290,7 +9323,7 @@ impl App {
             #[cfg(feature = "stt")]
             stt_transcribing: false,
             viewer_webview: ViewerWebview::None,
-            webview_agent_tab_id: None,
+            agent_pages: Vec::new(),
             chat_index: Vec::new(),
             chat_index_loading: false,
             chat_index_loaded_at: None,
@@ -12266,8 +12299,8 @@ fi
                 let refresh_worktrees_task = self.refresh_worktrees_for_active_tab();
                 let scroll_task = self.scroll_to_active_tab();
                 // The tab's file viewer HTML (Viewer surface) wins over an agent
-                // tab's chat (Agent surface); returning to the agent tab the
-                // Agent surface already mirrors reveals it without a replay.
+                // tab's chat (its Agent page); an agent tab whose page is still
+                // alive is shown without a reset or replay.
                 return Task::batch([
                     scroll_task,
                     refresh_worktrees_task,
@@ -12546,11 +12579,8 @@ fi
                 if let Some(task_id) = task_started {
                     self.apply_task_session_signal(&task_id, None);
                 }
-                // Also push the echo into the webview if this tab is the one
-                // currently rendered there.
-                if self.webview_agent_tab_id == Some(tab_id) {
-                    push_agent_event_to_webview(&echo);
-                }
+                // Also push the echo into the tab's chat page, if it has one.
+                push_agent_event_to_webview(tab_id, &echo);
                 if let Some(rx) = bridge {
                     use tokio_stream::wrappers::UnboundedReceiverStream;
                     let stream = UnboundedReceiverStream::new(rx);
@@ -12595,7 +12625,6 @@ fi
                     eprintln!("AgentSetPermissionMode: tab {tab_id}: unknown mode {mode:?}");
                     return Task::none();
                 }
-                let is_active_in_webview = self.webview_agent_tab_id == Some(tab_id);
                 let Some(session) = self
                     .workspaces
                     .iter_mut()
@@ -12636,9 +12665,7 @@ fi
                     (HarnessEvent::PermissionModeChanged(mode), true)
                 };
                 let ev = tab::AgentEvent::Harness(ev);
-                if is_active_in_webview {
-                    push_agent_event_to_webview(&ev);
-                }
+                push_agent_event_to_webview(tab_id, &ev);
                 session.record(ev);
                 if config_changed {
                     self.mark_workspaces_dirty();
@@ -12709,13 +12736,12 @@ fi
                 return Task::none();
             }
             Event::AgentWebviewCreated(tab_id) => {
-                if self.webview_agent_tab_id != Some(tab_id) {
-                    // The user moved on before the page finished building;
-                    // the surface will be reset and replayed for the tab it
-                    // now mirrors.
+                if !self.agent_pages.contains(&tab_id) {
+                    // Evicted or closed before the page finished building;
+                    // its slot is already gone.
                     eprintln!(
-                        "[agent-webview] create finished for tab={} but surface now mirrors {:?}",
-                        tab_id, self.webview_agent_tab_id
+                        "[agent-webview] create finished for tab={} but its page was dropped; pages={:?}",
+                        tab_id, self.agent_pages
                     );
                     return Task::none();
                 }
@@ -12733,12 +12759,14 @@ fi
                     tab_id,
                     session.conversation.len()
                 );
+                // Reset first: an event that arrived between the build and
+                // this message was already pushed live and is in the buffer.
+                reset_agent_webview(tab_id);
                 set_agent_webview_tab_id(tab_id, session.configured_permission_mode().as_deref());
-                replay_agent_conversation_in_webview(&session.conversation);
+                replay_agent_conversation_in_webview(tab_id, &session.conversation);
                 return Task::none();
             }
             Event::AgentHistoryLoaded(tab_id, history) => {
-                let is_active_in_webview = self.webview_agent_tab_id == Some(tab_id);
                 let Some(session) = self
                     .workspaces
                     .iter_mut()
@@ -12760,18 +12788,20 @@ fi
                 // read; whatever is buffered already comes after the history.
                 let live = std::mem::replace(&mut session.conversation, history);
                 session.conversation.extend(live);
-                if is_active_in_webview {
-                    reset_agent_webview();
-                    replay_agent_conversation_in_webview(&session.conversation);
+                // A page still being built replays the merged buffer when
+                // it is done (`AgentWebviewCreated`).
+                if webview::is_active(WebviewSurface::Agent(tab_id)) {
+                    reset_agent_webview(tab_id);
+                    replay_agent_conversation_in_webview(tab_id, &session.conversation);
                 }
                 return Task::none();
             }
             Event::AgentEventReceived(tab_id, ev) => {
-                // Append to the conversation buffer; if this tab's webview is
-                // currently visible, also push the event live for rendering.
-                // The Agent surface keeps mirroring its tab while hidden behind
-                // a viewer, so push regardless of visibility.
-                let is_active_in_webview = self.webview_agent_tab_id == Some(tab_id);
+                // Append to the conversation buffer and push the event live
+                // into the tab's chat page, visible or hidden, so a hidden page
+                // is current when it is shown again. The tab whose page was
+                // shown last counts as being read (completion is not unread).
+                let is_front_page = self.agent_pages.first() == Some(&tab_id);
                 let attention_reason = agent_event_attention_reason(&ev);
                 // Progress capture: what the session last said it was doing.
                 // Only meaningful events feed this — streaming deltas don't.
@@ -12914,9 +12944,7 @@ fi
                                         }
                                     }
                                 }
-                                if is_active_in_webview {
-                                    push_agent_event_to_webview(&ev);
-                                }
+                                push_agent_event_to_webview(tab_id, &ev);
                                 session.record(ev);
                             }
                             if let Some(id) = new_session_id {
@@ -12952,7 +12980,7 @@ fi
                                 }
                             }
                             match attention_reason {
-                                Some(AttentionReason::CompletedUnread) if is_active_in_webview => {
+                                Some(AttentionReason::CompletedUnread) if is_front_page => {
                                     t.attention = None;
                                 }
                                 Some(reason) => t.set_attention(reason),
@@ -17119,7 +17147,7 @@ fi
                 self.attention_view_open = !self.attention_view_open;
                 if self.attention_view_open {
                     webview::set_visible(WebviewSurface::Viewer, false);
-                    webview::set_visible(WebviewSurface::Agent, false);
+                    webview::hide_agent_pages();
                     return Task::none();
                 }
                 return self.restore_webview_after_attention();
@@ -17279,11 +17307,13 @@ fi
         )
     }
 
-    /// Re-apply the layout's webview bounds to both surfaces (no-op for a
-    /// surface that hasn't been created).
+    /// Re-apply the layout's webview bounds to the Viewer and every agent
+    /// page (no-op for a surface that hasn't been created).
     fn sync_webview_bounds(&self) {
         let (x, y, width, height) = self.calculate_webview_bounds();
-        webview::update_bounds(WebviewSurface::Agent, x, y, width, height);
+        for &tab_id in &self.agent_pages {
+            webview::update_bounds(WebviewSurface::Agent(tab_id), x, y, width, height);
+        }
         webview::update_bounds(WebviewSurface::Viewer, x, y, width, height);
     }
 
@@ -17477,29 +17507,71 @@ fi
         Task::none()
     }
 
-    /// Synchronously show or hide the Agent surface per
-    /// `visible_webview_surface`. Never creates or replays: the surface is
-    /// revealed only when it is alive and already mirrors the active agent
-    /// tab, otherwise it is hidden.
+    /// Synchronously show or hide the agent pages per
+    /// `visible_webview_surface`. Never creates or replays: the active agent
+    /// tab's page is shown only when it is alive, otherwise all are hidden.
     fn settle_agent_surface(&mut self) {
+        self.prune_agent_pages();
         if let VisibleSurface::AgentChat(tab_id) = self.visible_webview_surface() {
-            let alive = webview::is_active(WebviewSurface::Agent);
-            if agent_surface_action(alive, self.webview_agent_tab_id, tab_id)
-                == AgentSurfaceAction::Reveal
+            let alive = webview::is_active(WebviewSurface::Agent(tab_id));
+            if agent_surface_action(alive, self.agent_pages.first().copied(), tab_id)
+                != AgentSurfaceAction::Create
             {
-                let (x, y, width, height) = self.calculate_webview_bounds();
-                webview::update_bounds(WebviewSurface::Agent, x, y, width, height);
-                webview::set_visible(WebviewSurface::Agent, true);
+                self.reveal_agent_page(tab_id);
                 return;
             }
         }
-        webview::set_visible(WebviewSurface::Agent, false);
+        webview::hide_agent_pages();
+    }
+
+    /// Show `tab_id`'s live page at the current bounds, hide every other
+    /// agent page, and mark it most recently shown.
+    fn reveal_agent_page(&mut self, tab_id: usize) {
+        let (x, y, width, height) = self.calculate_webview_bounds();
+        webview::update_bounds(WebviewSurface::Agent(tab_id), x, y, width, height);
+        webview::show_only_agent_page(Some(tab_id));
+        // The tab already has a page, so nothing is pushed past the cap.
+        for evicted in promote_agent_page(&mut self.agent_pages, tab_id, MAX_AGENT_PAGES) {
+            self.destroy_agent_page(evicted, "evicted");
+        }
+    }
+
+    /// Destroy `tab_id`'s chat page and forget it.
+    fn destroy_agent_page(&mut self, tab_id: usize, reason: &str) {
+        self.agent_pages.retain(|&id| id != tab_id);
+        webview::destroy(WebviewSurface::Agent(tab_id));
+        eprintln!(
+            "[agent-webview] destroy tab={} reason={} pages={:?}",
+            tab_id, reason, self.agent_pages
+        );
+    }
+
+    /// Destroy the pages of tabs that are gone or no longer agent tabs. Tabs
+    /// leave through several paths (close, task stop, workspace close), so
+    /// every surface update runs this rather than each removal site.
+    fn prune_agent_pages(&mut self) {
+        let gone: Vec<usize> = self
+            .agent_pages
+            .iter()
+            .copied()
+            .filter(|&tab_id| {
+                !self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .any(|t| t.id == tab_id && matches!(t.kind, TabKind::Agent(_)))
+            })
+            .collect();
+        for tab_id in gone {
+            self.destroy_agent_page(tab_id, "tab closed");
+        }
     }
 
     /// Bring both surfaces in line with the active tab: its inline file viewer
-    /// HTML on the Viewer surface, else its chat on the Agent surface (created
-    /// or replayed only if it isn't already mirroring this tab), else nothing.
+    /// HTML on the Viewer surface, else its chat page (built and replayed only
+    /// if the tab has no live page), else nothing.
     fn present_active_tab_surfaces(&mut self) -> Task<Event> {
+        self.prune_agent_pages();
         if let Some(html) = self.active_inline_webview_html() {
             let bounds = self.calculate_webview_bounds();
             return self.show_webview(html, bounds);
@@ -17512,9 +17584,10 @@ fi
     /// Show the surface `visible_webview_surface` selects and hide the other,
     /// keeping whatever the Viewer surface currently presents.
     fn apply_webview_surfaces(&mut self) -> Task<Event> {
+        self.prune_agent_pages();
         match self.visible_webview_surface() {
             VisibleSurface::Viewer => {
-                webview::set_visible(WebviewSurface::Agent, false);
+                webview::hide_agent_pages();
                 self.sync_webview_bounds();
                 webview::set_visible(WebviewSurface::Viewer, true);
                 Task::none()
@@ -17525,7 +17598,7 @@ fi
             }
             VisibleSurface::None => {
                 webview::set_visible(WebviewSurface::Viewer, false);
-                webview::set_visible(WebviewSurface::Agent, false);
+                webview::hide_agent_pages();
                 Task::none()
             }
         }
@@ -17559,8 +17632,8 @@ fi
     }
 
     /// Create or update the Viewer surface with static HTML content
-    /// (markdown, excalidraw, html file viewer). The Agent surface is only
-    /// hidden, never destroyed, so its chat DOM survives the visit.
+    /// (markdown, excalidraw, html file viewer). The agent pages are only
+    /// hidden, never destroyed, so their chat DOM survives the visit.
     fn show_webview(&mut self, html: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
         perf_log!(
             "webview mode={} html_bytes={} bounds=({}, {}, {}, {})",
@@ -17575,7 +17648,7 @@ fi
             bounds.2,
             bounds.3
         );
-        webview::set_visible(WebviewSurface::Agent, false);
+        webview::hide_agent_pages();
         self.viewer_webview = ViewerWebview::File;
         // Reuse the existing WebView when possible to avoid expensive recreation churn.
         if webview::is_active(WebviewSurface::Viewer) {
@@ -17664,7 +17737,7 @@ fi
             bounds.2,
             bounds.3
         );
-        webview::set_visible(WebviewSurface::Agent, false);
+        webview::hide_agent_pages();
         self.viewer_webview = ViewerWebview::PlansViewer;
         if webview::is_active(WebviewSurface::Viewer) {
             webview::update_bounds(
@@ -17683,82 +17756,65 @@ fi
         Self::create_staged_viewer_surface()
     }
 
-    /// Show the agent chat for `tab_id` on the Agent surface. If the surface
-    /// already mirrors this tab it is just revealed (no reset, no replay); if
-    /// it mirrors another agent tab it is reset and this tab's buffer is
-    /// replayed; if it doesn't exist yet it is created with the chat page and
-    /// IPC handler. Callers hide the Viewer surface first.
+    /// Show the agent chat for `tab_id`. Each agent tab has its own page
+    /// (`WebviewSurface::Agent(tab_id)`): a live one is just shown, every other
+    /// page hidden, DOM intact (no reset, no replay); a tab without one gets a
+    /// page built with the chat HTML and IPC handler, replayed from the tab's
+    /// buffer once built (`AgentWebviewCreated`), and the least recently shown
+    /// page past `MAX_AGENT_PAGES` is destroyed. Callers hide the Viewer
+    /// surface first.
     fn show_agent_webview(&mut self, tab_id: usize) -> Task<Event> {
+        self.prune_agent_pages();
         let bounds = self.calculate_webview_bounds();
-        let alive = webview::is_active(WebviewSurface::Agent);
-        let action = agent_surface_action(alive, self.webview_agent_tab_id, tab_id);
+        let alive = webview::is_active(WebviewSurface::Agent(tab_id));
+        let front = self.agent_pages.first().copied();
+        let action = agent_surface_action(alive, front, tab_id);
         let history_task = self.start_agent_history_load(tab_id);
-
-        // Find the conversation buffer to replay (not needed to reveal).
-        let session = self
+        let buffered = self
             .workspaces
             .iter()
             .flat_map(|ws| ws.tabs.iter())
             .find(|t| t.id == tab_id)
-            .and_then(|t| t.agent_session());
-        let conversation: Vec<tab::AgentEvent> = if action == AgentSurfaceAction::Reveal {
-            Vec::new()
+            .and_then(|t| t.agent_session())
+            .map_or(0, |s| s.conversation.len());
+        let evicted = if action == AgentSurfaceAction::Create {
+            promote_agent_page(&mut self.agent_pages, tab_id, MAX_AGENT_PAGES)
         } else {
-            session.map(|s| s.conversation.clone()).unwrap_or_default()
+            Vec::new()
         };
-        let permission_mode = session.and_then(tab::AgentSession::configured_permission_mode);
 
         eprintln!(
-            "[agent-webview] show tab={} mirrored={:?} alive={} action={:?} bounds=({},{},{},{}) replay_len={}",
+            "[agent-webview] show tab={} front={:?} alive={} action={:?} pages={:?} evicted={:?} bounds=({},{},{},{}) buffered={}",
             tab_id,
-            self.webview_agent_tab_id,
+            front,
             alive,
             action,
+            self.agent_pages,
+            evicted,
             bounds.0,
             bounds.1,
             bounds.2,
             bounds.3,
-            conversation.len()
+            buffered
         );
+        for evicted_tab in evicted {
+            self.destroy_agent_page(evicted_tab, "evicted");
+        }
 
         let surface_task = match action {
-            AgentSurfaceAction::Reveal => {
-                webview::update_bounds(
-                    WebviewSurface::Agent,
-                    bounds.0,
-                    bounds.1,
-                    bounds.2,
-                    bounds.3,
-                );
-                webview::set_visible(WebviewSurface::Agent, true);
-                Task::none()
-            }
-            AgentSurfaceAction::SwitchTab => {
-                // Different agent tab on the live Agent surface — reset it and
-                // replay this tab's events. No recreate needed (the IPC
-                // handler routes by tabId, set per activation).
-                webview::update_bounds(
-                    WebviewSurface::Agent,
-                    bounds.0,
-                    bounds.1,
-                    bounds.2,
-                    bounds.3,
-                );
-                webview::set_visible(WebviewSurface::Agent, true);
-                reset_agent_webview();
-                set_agent_webview_tab_id(tab_id, permission_mode.as_deref());
-                replay_agent_conversation_in_webview(&conversation);
-                self.webview_agent_tab_id = Some(tab_id);
+            AgentSurfaceAction::Reveal | AgentSurfaceAction::SwitchTab => {
+                self.reveal_agent_page(tab_id);
                 Task::none()
             }
             AgentSurfaceAction::Create => {
                 webview::set_pending_content_with_ipc(
-                    WebviewSurface::Agent,
+                    WebviewSurface::Agent(tab_id),
                     agent_chat_html(),
                     bounds,
                     Some(agent_ipc_handler()),
                 );
-                self.webview_agent_tab_id = Some(tab_id);
+                // The staged page is visible; hide the one shown before.
+                webview::show_only_agent_page(Some(tab_id));
 
                 // After construction, `AgentWebviewCreated` sets the tab id on
                 // the JS side and replays the buffer as it is *then*; a copy
@@ -17768,7 +17824,10 @@ fi
                     if let Some(id) = opt_id {
                         iced::window::run(id, move |window| {
                             eprintln!("[agent-webview] try_create_with_window for tab={}", tab_id);
-                            match webview::try_create_with_window(WebviewSurface::Agent, window) {
+                            match webview::try_create_with_window(
+                                WebviewSurface::Agent(tab_id),
+                                window,
+                            ) {
                                 Err(e) => {
                                     eprintln!(
                                         "[agent-webview] create FAILED for tab={}: {}",
@@ -17778,8 +17837,9 @@ fi
                                 }
                                 Ok(false) => {
                                     // A later staging's task already built the
-                                    // page and replayed; replaying again here
-                                    // would duplicate the conversation.
+                                    // page and replayed (replaying again here
+                                    // would duplicate the conversation), or the
+                                    // page was evicted or closed first.
                                     eprintln!(
                                         "[agent-webview] nothing staged for tab={}; skipping replay",
                                         tab_id
@@ -30864,11 +30924,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_surface_reveals_same_tab_without_replay() {
+    fn agent_surface_reveals_live_pages_without_replay() {
+        // The page shown last comes back as is.
         assert_eq!(
             agent_surface_action(true, Some(4), 4),
             AgentSurfaceAction::Reveal
         );
+        // Another tab's page was shown last, but this tab's page is alive:
+        // show/hide only, no reset or replay.
         assert_eq!(
             agent_surface_action(true, Some(4), 5),
             AgentSurfaceAction::SwitchTab
@@ -30877,15 +30940,57 @@ mod tests {
             agent_surface_action(true, None, 4),
             AgentSurfaceAction::SwitchTab
         );
-        // Not created yet (or creation failed): build it, whatever the bookkeeping says.
+        // No page yet (never shown, evicted, or creation failed): build it,
+        // whatever the bookkeeping says.
         assert_eq!(
             agent_surface_action(false, Some(4), 4),
+            AgentSurfaceAction::Create
+        );
+        assert_eq!(
+            agent_surface_action(false, Some(4), 5),
             AgentSurfaceAction::Create
         );
         assert_eq!(
             agent_surface_action(false, None, 4),
             AgentSurfaceAction::Create
         );
+    }
+
+    #[test]
+    fn agent_pages_evict_least_recently_shown_past_cap() {
+        let mut pages = Vec::new();
+        for tab_id in [1, 2, 3, 4] {
+            assert!(promote_agent_page(&mut pages, tab_id, 4).is_empty());
+        }
+        assert_eq!(pages, vec![4, 3, 2, 1]);
+
+        // Showing a tab that already has a page reorders, never evicts.
+        assert!(promote_agent_page(&mut pages, 2, 4).is_empty());
+        assert_eq!(pages, vec![2, 4, 3, 1]);
+
+        // A fifth page pushes out the least recently shown one.
+        assert_eq!(promote_agent_page(&mut pages, 5, 4), vec![1]);
+        assert_eq!(pages, vec![5, 2, 4, 3]);
+
+        // The evicted tab comes back as a new page and evicts the next oldest.
+        assert_eq!(promote_agent_page(&mut pages, 1, 4), vec![3]);
+        assert_eq!(pages, vec![1, 5, 2, 4]);
+
+        // The front page re-shown is a no-op.
+        assert!(promote_agent_page(&mut pages, 1, 4).is_empty());
+        assert_eq!(pages, vec![1, 5, 2, 4]);
+    }
+
+    #[test]
+    fn agent_pages_cap_holds_at_process_limit() {
+        let mut pages = Vec::new();
+        let mut evicted = Vec::new();
+        for tab_id in 0..(MAX_AGENT_PAGES + 3) {
+            evicted.extend(promote_agent_page(&mut pages, tab_id, MAX_AGENT_PAGES));
+            assert!(pages.len() <= MAX_AGENT_PAGES);
+        }
+        assert_eq!(pages.len(), MAX_AGENT_PAGES);
+        assert_eq!(evicted, vec![0, 1, 2]);
     }
 
     #[test]

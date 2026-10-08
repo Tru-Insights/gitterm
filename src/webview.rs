@@ -1,10 +1,13 @@
 // WebView module for embedded markdown/mermaid rendering and the agent chat UI.
 //
-// Two independent child webviews ("surfaces") share the main window:
+// Independent child webviews ("surfaces") share the main window:
 //
-// - `WebviewSurface::Agent` hosts the native Claude chat page with its IPC
-//   handler. It stays alive (hidden) while a viewer is shown so the chat DOM
-//   survives a file or plans-viewer visit.
+// - `WebviewSurface::Agent(tab_id)` is one agent tab's chat page, with its own
+//   IPC handler. Each chat tab gets its own page, kept alive (hidden) while
+//   another tab, a file or the plans viewer is shown, so switching back is a
+//   show/hide with the DOM (scroll position, open tool cards, composer draft)
+//   intact. main.rs caps how many pages live at once and destroys the least
+//   recently shown one (`promote_agent_page`).
 // - `WebviewSurface::Viewer` hosts markdown / HTML / excalidraw HTML and the
 //   plans-viewer URL.
 //
@@ -15,6 +18,7 @@
 // the WebViews must be created and managed on the main thread.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 type WebViewBounds = (f32, f32, f32, f32);
 
@@ -23,11 +27,12 @@ type WebViewBounds = (f32, f32, f32, f32);
 /// the handler from the platform's web-process callback path.
 pub type IpcHandler = Box<dyn Fn(String) + Send + 'static>;
 
-/// Which of the two child webviews an operation targets.
+/// Which child webview an operation targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebviewSurface {
-    /// Native Claude chat page; IPC handler installed at construction.
-    Agent,
+    /// The chat page of the agent tab with this id; IPC handler installed at
+    /// construction.
+    Agent(usize),
     /// File viewer HTML (markdown / HTML / excalidraw) and the plans viewer URL.
     Viewer,
 }
@@ -63,17 +68,38 @@ impl SurfaceSlot {
     };
 }
 
-// One RefCell per surface so an operation on one surface can never trip a
-// borrow held by the other.
+// The agent pages share one map keyed by tab id; the Viewer has its own
+// RefCell so an operation on it can never trip a borrow held by the pages.
 thread_local! {
-    static AGENT_SURFACE: RefCell<SurfaceSlot> = const { RefCell::new(SurfaceSlot::EMPTY) };
+    static AGENT_PAGES: RefCell<HashMap<usize, SurfaceSlot>> = RefCell::new(HashMap::new());
     static VIEWER_SURFACE: RefCell<SurfaceSlot> = const { RefCell::new(SurfaceSlot::EMPTY) };
 }
 
+/// Run `f` on `surface`'s slot, creating an empty agent page slot on demand.
+/// Only staging uses this; everything else goes through `with_existing_slot`
+/// so a query or a script for a tab without a page never leaves a slot behind.
 fn with_slot<R>(surface: WebviewSurface, f: impl FnOnce(&mut SurfaceSlot) -> R) -> R {
     match surface {
-        WebviewSurface::Agent => AGENT_SURFACE.with(|slot| f(&mut slot.borrow_mut())),
+        WebviewSurface::Agent(tab_id) => AGENT_PAGES.with(|pages| {
+            f(pages
+                .borrow_mut()
+                .entry(tab_id)
+                .or_insert(SurfaceSlot::EMPTY))
+        }),
         WebviewSurface::Viewer => VIEWER_SURFACE.with(|slot| f(&mut slot.borrow_mut())),
+    }
+}
+
+/// Run `f` on `surface`'s slot if it has one (the Viewer always does).
+fn with_existing_slot<R>(
+    surface: WebviewSurface,
+    f: impl FnOnce(&mut SurfaceSlot) -> R,
+) -> Option<R> {
+    match surface {
+        WebviewSurface::Agent(tab_id) => {
+            AGENT_PAGES.with(|pages| pages.borrow_mut().get_mut(&tab_id).map(f))
+        }
+        WebviewSurface::Viewer => VIEWER_SURFACE.with(|slot| Some(f(&mut slot.borrow_mut()))),
     }
 }
 
@@ -114,7 +140,7 @@ pub fn set_pending_content(surface: WebviewSurface, html: String, bounds: (f32, 
 /// The handler is consumed (taken) by the next `try_create_with_window` call for
 /// the same surface. If that surface's webview already exists, the handler is
 /// dropped — wry doesn't support replacing an IPC handler post-construction,
-/// which is why the chat lives on its own surface.
+/// which is why each chat page lives on its own surface.
 #[allow(dead_code)]
 pub fn set_pending_content_with_ipc(
     surface: WebviewSurface,
@@ -147,7 +173,7 @@ pub fn set_pending_url(surface: WebviewSurface, url: String, bounds: (f32, f32, 
 /// and you want to swap its location without recreating the surface.
 #[allow(dead_code)]
 pub fn navigate_to_url(surface: WebviewSurface, url: &str) {
-    with_slot(surface, |slot| {
+    with_existing_slot(surface, |slot| {
         if let Some(webview) = slot.webview.as_ref() {
             if let Err(e) = webview.load_url(url) {
                 eprintln!("[webview] {surface:?} load_url({url}) failed: {e}");
@@ -161,13 +187,14 @@ pub fn navigate_to_url(surface: WebviewSurface, url: &str) {
 ///
 /// Returns `Ok(true)` when staged content was loaded (into a new or the existing
 /// webview) and `Ok(false)` when nothing was staged — e.g. a second create task
-/// for the same staging already consumed it.
+/// for the same staging already consumed it, or the agent page was destroyed
+/// before its create task ran.
 #[allow(dead_code)]
 pub fn try_create_with_window(
     surface: WebviewSurface,
     window: &dyn HasWindowHandle,
 ) -> Result<bool, String> {
-    with_slot(surface, |slot| {
+    with_existing_slot(surface, |slot| {
         let Some((content, bounds)) = slot.pending.take() else {
             return Ok(false);
         };
@@ -226,11 +253,12 @@ pub fn try_create_with_window(
         slot.webview = Some(webview);
         Ok(true)
     })
+    .unwrap_or(Ok(false))
 }
 
 /// Update the bounds (position and size) of `surface`'s webview.
 pub fn update_bounds(surface: WebviewSurface, x: f32, y: f32, width: f32, height: f32) {
-    with_slot(surface, |slot| {
+    with_existing_slot(surface, |slot| {
         if let Some(webview) = slot.webview.as_ref() {
             let _ = webview.set_bounds(logical_rect((x, y, width, height)));
         }
@@ -239,7 +267,7 @@ pub fn update_bounds(surface: WebviewSurface, x: f32, y: f32, width: f32, height
 
 /// Replace the HTML shown on `surface`.
 pub fn update_content(surface: WebviewSurface, html: &str) {
-    with_slot(surface, |slot| {
+    with_existing_slot(surface, |slot| {
         if let Some(webview) = slot.webview.as_ref() {
             if let Err(e) = webview.load_html(html) {
                 eprintln!("[webview] {surface:?} load_html failed: {e}");
@@ -255,33 +283,61 @@ pub fn update_content(surface: WebviewSurface, html: &str) {
 /// `set_pending_content_with_ipc`.
 #[allow(dead_code)]
 pub fn evaluate_script(surface: WebviewSurface, script: &str) {
-    with_slot(surface, |slot| {
+    with_existing_slot(surface, |slot| {
         if let Some(webview) = slot.webview.as_ref() {
             let _ = webview.evaluate_script(script);
         }
     });
 }
 
-/// Show or hide `surface`. Recorded even when the webview doesn't exist yet, so
-/// a pending create honours the latest request.
+fn apply_visible(slot: &mut SurfaceSlot, visible: bool) {
+    slot.visible = visible;
+    if let Some(webview) = slot.webview.as_ref() {
+        let _ = webview.set_visible(visible);
+    }
+}
+
+/// Show or hide `surface`. Recorded even when the webview doesn't exist yet
+/// (but is staged), so a pending create honours the latest request.
 pub fn set_visible(surface: WebviewSurface, visible: bool) {
-    with_slot(surface, |slot| {
-        slot.visible = visible;
-        if let Some(webview) = slot.webview.as_ref() {
-            let _ = webview.set_visible(visible);
+    with_existing_slot(surface, |slot| apply_visible(slot, visible));
+}
+
+/// Show the page of agent tab `tab_id` (if it has one) and hide every other
+/// agent page; `None` hides them all. Keeps the at-most-one-visible rule for
+/// the agent pages in one place.
+pub fn show_only_agent_page(tab_id: Option<usize>) {
+    AGENT_PAGES.with(|pages| {
+        for (id, slot) in pages.borrow_mut().iter_mut() {
+            apply_visible(slot, Some(*id) == tab_id);
         }
     });
 }
 
-/// Check whether `surface`'s webview exists.
-pub fn is_active(surface: WebviewSurface) -> bool {
-    with_slot(surface, |slot| slot.webview.is_some())
+/// Hide every agent page.
+pub fn hide_agent_pages() {
+    show_only_agent_page(None);
 }
 
-/// Destroy `surface`'s webview (and drop anything staged for it).
+/// Check whether `surface`'s webview exists.
+pub fn is_active(surface: WebviewSurface) -> bool {
+    with_existing_slot(surface, |slot| slot.webview.is_some()).unwrap_or(false)
+}
+
+/// Destroy `surface`'s webview (and drop anything staged for it). An agent
+/// page's slot is removed outright.
 #[allow(dead_code)]
 pub fn destroy(surface: WebviewSurface) {
-    with_slot(surface, |slot| {
-        *slot = SurfaceSlot::EMPTY;
-    });
+    match surface {
+        WebviewSurface::Agent(tab_id) => {
+            // Drop the WebView after the map borrow ends.
+            let removed = AGENT_PAGES.with(|pages| pages.borrow_mut().remove(&tab_id));
+            drop(removed);
+        }
+        WebviewSurface::Viewer => {
+            let old = VIEWER_SURFACE
+                .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), SurfaceSlot::EMPTY));
+            drop(old);
+        }
+    }
 }
