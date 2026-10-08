@@ -658,13 +658,19 @@ fn claude_home_dir() -> PathBuf {
 /// Code writes `<projects>/<cwd-slug>/<session-id>.jsonl` on the first
 /// message, so a preassigned session id may never materialize on disk.
 pub fn claude_session_exists(session_id: &str) -> bool {
+    claude_session_path(session_id).is_some()
+}
+
+/// The transcript file for a Claude session id, if it exists on this
+/// machine. Looks across project slugs because the id alone does not say
+/// which cwd the session ran in.
+pub fn claude_session_path(session_id: &str) -> Option<PathBuf> {
     let file_name = format!("{session_id}.jsonl");
-    let Ok(entries) = std::fs::read_dir(claude_home_dir().join("projects")) else {
-        return false;
-    };
-    entries
+    std::fs::read_dir(claude_home_dir().join("projects"))
+        .ok()?
         .flatten()
-        .any(|entry| entry.path().join(&file_name).is_file())
+        .map(|entry| entry.path().join(&file_name))
+        .find(|path| path.is_file())
 }
 
 /// Which of these codex conversation ids belong to subagent rollouts

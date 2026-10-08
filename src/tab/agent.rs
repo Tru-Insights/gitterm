@@ -18,6 +18,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use gitterm::harness::claude::{ClaudeSession, ClaudeSessionConfig};
+use gitterm::harness::transcript::TranscriptEntry;
 use gitterm::harness::HarnessEvent;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -126,6 +127,11 @@ pub enum AgentEvent {
 }
 
 impl AgentEvent {
+    /// The echo of a prompt the human submitted, as the chat page renders it.
+    pub(crate) fn user_prompt(text: &str) -> Self {
+        Self::Other(serde_json::json!({"type": "user_prompt", "text": text}))
+    }
+
     /// The JSON the chat webview's `__appendEvent` receives. Harness events
     /// are wrapped so the page can tell them from pi's raw stream shapes.
     pub(crate) fn webview_payload(&self) -> Option<serde_json::Value> {
@@ -142,6 +148,24 @@ impl AgentEvent {
             _ => None,
         }
     }
+}
+
+impl From<TranscriptEntry> for AgentEvent {
+    fn from(entry: TranscriptEntry) -> Self {
+        match entry {
+            TranscriptEntry::UserPrompt(text) => Self::user_prompt(&text),
+            TranscriptEntry::Harness(ev) => Self::Harness(ev),
+        }
+    }
+}
+
+/// Whether a resumed session's earlier timeline has been read back from
+/// its transcript (Claude backend; TRU-140).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryLoad {
+    NotLoaded,
+    Loading,
+    Loaded,
 }
 
 /// Live agent-tab session state. The conversation buffer here is the source of
@@ -163,6 +187,8 @@ pub(crate) struct AgentSession {
     pub(crate) claude: Option<ClaudeSession>,
     /// Runtime requests (permission prompts, questions) awaiting the human.
     pub(crate) pending_requests: Vec<String>,
+    /// Transcript read-back for a session restored from `workspaces.json`.
+    pub(crate) history: HistoryLoad,
 }
 
 impl AgentSession {
@@ -177,7 +203,18 @@ impl AgentSession {
             task_handle: None,
             claude: None,
             pending_requests: Vec::new(),
+            history: HistoryLoad::NotLoaded,
         }
+    }
+
+    /// The session id whose transcript should be read back before this tab
+    /// is shown: a resumed session whose timeline is still empty.
+    pub(crate) fn history_to_load(&self) -> Option<&str> {
+        (self.backend() == AgentBackend::Claude
+            && self.history == HistoryLoad::NotLoaded
+            && self.conversation.is_empty())
+        .then_some(self.session_id.as_deref())
+        .flatten()
     }
 
     /// Append an event to the conversation buffer, merging consecutive

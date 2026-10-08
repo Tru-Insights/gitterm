@@ -20,6 +20,7 @@
 //! maps these events onto tabs and the webview.
 
 pub mod claude;
+pub mod transcript;
 
 use std::collections::BTreeMap;
 

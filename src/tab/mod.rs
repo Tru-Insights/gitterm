@@ -16,7 +16,7 @@ mod agent;
 #[allow(unused_imports)]
 pub(crate) use agent::{
     spawn_agent_task, AgentBackend, AgentBackendConfig, AgentEvent, AgentInput, AgentSession,
-    AgentSessionState, AgentTaskHandle, DEFAULT_CLAUDE_PERMISSION_MODE,
+    AgentSessionState, AgentTaskHandle, HistoryLoad, DEFAULT_CLAUDE_PERMISSION_MODE,
 };
 
 use std::path::PathBuf;

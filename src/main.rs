@@ -4448,6 +4448,9 @@ pub enum Event {
     /// One streaming event from the agent subprocess (Step 4 will refine the
     /// payload once the parser lands; today every line arrives as `Other`).
     AgentEventReceived(usize, tab::AgentEvent),
+    /// A resumed Claude chat tab's earlier timeline, read back from its
+    /// transcript (TRU-140). Empty when the transcript is missing.
+    AgentHistoryLoaded(usize, Vec<tab::AgentEvent>),
     /// Step 3-only debug entry point: spawn an in-memory agent tab in the
     /// active workspace, submit a hardcoded prompt, log events to stderr.
     /// Bound to a hidden keyboard shortcut for verifying the subprocess
@@ -12410,10 +12413,7 @@ fi
                 // Synthetic event so the user sees their own prompt rendered
                 // immediately (the agent stream takes a few hundred ms before
                 // the first system event arrives).
-                let echo = tab::AgentEvent::Other(serde_json::json!({
-                    "type": "user_prompt",
-                    "text": prompt,
-                }));
+                let echo = tab::AgentEvent::user_prompt(&prompt);
                 let mut task_started: Option<String> = None;
                 let mut harness_bridge: Option<tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>> =
                     None;
@@ -12603,6 +12603,35 @@ fi
                 }
                 if let Some(task_id) = task_signal {
                     self.apply_task_session_signal(&task_id, Some((TaskLifecycle::Stopped, None)));
+                }
+                return Task::none();
+            }
+            Event::AgentHistoryLoaded(tab_id, history) => {
+                let is_active_in_webview = self.webview_agent_tab_id == Some(tab_id);
+                let Some(session) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session_mut())
+                else {
+                    return Task::none();
+                };
+                session.history = tab::HistoryLoad::Loaded;
+                if history.is_empty() {
+                    return Task::none();
+                }
+                eprintln!(
+                    "[agent] tab {tab_id}: read back {} events from the session transcript",
+                    history.len()
+                );
+                // The human may have sent a prompt while the file was being
+                // read; whatever is buffered already comes after the history.
+                let live = std::mem::replace(&mut session.conversation, history);
+                session.conversation.extend(live);
+                if is_active_in_webview {
+                    reset_agent_webview();
+                    replay_agent_conversation_in_webview(&session.conversation);
                 }
                 return Task::none();
             }
@@ -17519,6 +17548,7 @@ fi
         let bounds = self.calculate_webview_bounds();
         let alive = webview::is_active(WebviewSurface::Agent);
         let action = agent_surface_action(alive, self.webview_agent_tab_id, tab_id);
+        let history_task = self.start_agent_history_load(tab_id);
 
         // Find the conversation buffer to replay (not needed to reveal).
         let conversation: Vec<tab::AgentEvent> = if action == AgentSurfaceAction::Reveal {
@@ -17546,7 +17576,7 @@ fi
             conversation.len()
         );
 
-        match action {
+        let surface_task = match action {
             AgentSurfaceAction::Reveal => {
                 webview::update_bounds(
                     WebviewSurface::Agent,
@@ -17630,7 +17660,51 @@ fi
                     }
                 })
             }
-        }
+        };
+        Task::batch([surface_task, history_task])
+    }
+
+    /// Kick off the transcript read-back for a resumed chat tab the first
+    /// time it is shown. The file can be megabytes, so it is parsed off the
+    /// UI thread and arrives as `AgentHistoryLoaded`.
+    fn start_agent_history_load(&mut self, tab_id: usize) -> Task<Event> {
+        let Some(session) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.agent_session_mut())
+        else {
+            return Task::none();
+        };
+        let Some(session_id) = session.history_to_load().map(str::to_string) else {
+            return Task::none();
+        };
+        session.history = tab::HistoryLoad::Loading;
+        Task::perform(
+            async move {
+                let id = session_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let Some(path) = chats::claude_session_path(&id) else {
+                        eprintln!("[agent] Claude session {id} has no transcript to read back");
+                        return Vec::new();
+                    };
+                    match gitterm::harness::transcript::load_claude_history(&path) {
+                        Ok(entries) => entries.into_iter().map(tab::AgentEvent::from).collect(),
+                        Err(e) => {
+                            eprintln!("[agent] could not read transcript {}: {e}", path.display());
+                            Vec::new()
+                        }
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("[agent] transcript read-back for {session_id} panicked: {e}");
+                    Vec::new()
+                })
+            },
+            move |events| Event::AgentHistoryLoaded(tab_id, events),
+        )
     }
 
     fn recreate_terminals(&mut self) {
