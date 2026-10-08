@@ -423,6 +423,10 @@ the per-turn path, and the old `claude --print` command builder is gone.
 
 - The `--resume` path from the UI after an app restart has not been exercised
   live.
+- The Chats panel's "Resume as Chat" (local Claude chats) opens the session
+  in a chat tab through the same restored-tab path (history read-back, then
+  `--resume` on the first prompt). Covered by unit tests only; not exercised
+  live.
 - The Edit menu (needed for Cmd+V in WKWebView) has not been checked against
   the terminal's own Cmd+C/V handling in the running app.
 - Task and browser MCP servers are not attached to chat-tab sessions

@@ -2787,6 +2787,39 @@ fn conversation_backend_glyph(backend: HarnessConversationBackend) -> &'static s
     }
 }
 
+/// Whether the Chats panel offers "Resume as Chat" for an entry: a local
+/// Claude conversation whose recorded directory still exists and that no tab
+/// owns yet (an owned one shows "Go to Session"). Codex and pi chats, remote
+/// chats and dead-cwd chats keep only their existing action.
+fn can_resume_as_chat(entry: &chats::ChatIndexEntry, is_remote: bool, is_live: bool) -> bool {
+    entry.backend == chats::ChatBackend::Claude && !is_remote && !is_live && !entry.dead_cwd
+}
+
+/// The config a new Claude chat tab starts with: the remembered or configured
+/// model and effort ("default" leaves the model to the user's Claude
+/// settings) and the default permission mode.
+fn new_claude_chat_config(chat_config: &config::ChatDefaults) -> AgentBackendConfig {
+    let selection = chat_config.new_chat_selection();
+    AgentBackendConfig::Claude {
+        model: selection.model,
+        permission_mode: Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
+        effort: selection.effort,
+    }
+}
+
+/// The session of a chat tab resuming Claude session `session_id`: the new
+/// chat config, with the id set the way a restored chat tab has it, so the
+/// transcript is read back when the tab is shown and the first prompt
+/// resumes the session.
+fn resumed_claude_chat_session(
+    chat_config: &config::ChatDefaults,
+    session_id: &str,
+) -> AgentSession {
+    let mut session = AgentSession::new(new_claude_chat_config(chat_config));
+    session.session_id = Some(session_id.to_string());
+    session
+}
+
 /// Shell command that reopens a recorded task conversation with its
 /// full history. Derived from the task store alone — the Chats index
 /// is only built when the Chats panel opens, so resume must not
@@ -4940,6 +4973,9 @@ pub enum Event {
     /// Resume a conversation as a new tab in its recorded cwd (registry
     /// rule: focuses the existing tab instead if one owns the session).
     ResumeChatAsTab(String),
+    /// Resume a local Claude conversation in a native chat tab (an Agent
+    /// tab) in its recorded cwd; same registry rule as `ResumeChatAsTab`.
+    ResumeChatAsChat(String),
     /// Dead-cwd rescue: recreate the recorded directory, then resume.
     /// (`claude --resume` is cwd-scoped — verified 2026-07-04 — so the
     /// session can only be found from its original directory.)
@@ -9139,6 +9175,67 @@ impl App {
             tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
         }
         tasks.push(self.scroll_to_active_tab());
+        Task::batch(tasks)
+    }
+
+    /// "Resume as Chat": open a local Claude conversation in a native chat
+    /// tab. Registry rule first (a tab that owns the session is focused).
+    /// The tab lands in the workspace `resume_chat_as_tab` would pick, runs
+    /// in the recorded cwd (`claude --resume` is cwd-scoped, and the native
+    /// process spawns in the tab's `repo_path`), and carries the session id,
+    /// so showing it reads the transcript back (`start_agent_history_load`)
+    /// and its first prompt spawns Claude with `--resume`.
+    fn resume_chat_as_chat_tab(&mut self, id: String) -> Task<Event> {
+        if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
+            return self.focus_workspace_tab(ws_idx, tab_idx);
+        }
+        let Some((remote_id, entry)) = self.find_chat_entry(&id) else {
+            eprintln!("[chats] cannot resume {id} as a chat: not in any machine's index");
+            return Task::none();
+        };
+        if !can_resume_as_chat(entry, remote_id.is_some(), false) {
+            eprintln!(
+                "[chats] cannot resume {id} as a chat: only a local Claude chat whose directory exists can be (backend {}, remote {:?}, dead cwd {})",
+                entry.backend.label(),
+                remote_id,
+                entry.dead_cwd
+            );
+            return Task::none();
+        }
+        let cwd = entry.cwd.clone();
+        let repo_root = entry.repo_root.clone();
+        let repo_name = entry.group_name();
+        if !cwd.exists() {
+            eprintln!(
+                "[chats] not resuming {id} as a chat: recorded cwd {} is gone (use the rescue action)",
+                cwd.display()
+            );
+            return Task::none();
+        }
+
+        let mut tasks = Vec::new();
+        let ws_idx = self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name);
+        if ws_idx != self.active_workspace_idx {
+            tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
+        }
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let mut tab = TabState::new(tab_id, cwd.clone());
+        tab.kind = TabKind::Agent(resumed_claude_chat_session(&self.chat_config, &id));
+        tab.set_local_dir(cwd);
+        tab.chat_session_id = Some(id.clone());
+        tab.git_status_loading = true;
+        let repo_path = tab.repo_path.clone();
+        let workspace = &mut self.workspaces[self.active_workspace_idx];
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+        eprintln!("[agent] opened Claude chat tab id={tab_id} resuming {id}");
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
+        tasks.push(self.scroll_to_active_tab());
+        // Builds the chat page: history read-back, replay, composer focus.
+        tasks.push(self.present_active_tab_surfaces());
         Task::batch(tasks)
     }
 
@@ -14961,14 +15058,7 @@ fi
             }
             Event::NewClaudeChatTab => {
                 self.tab_picker_visible = false;
-                // The remembered or configured model and effort ("default"
-                // leaves the model to the user's Claude settings).
-                let selection = self.chat_config.new_chat_selection();
-                let config = tab::AgentBackendConfig::Claude {
-                    model: selection.model,
-                    permission_mode: Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
-                    effort: selection.effort,
-                };
+                let config = new_claude_chat_config(&self.chat_config);
                 let (repo_path, current_dir) = match self.active_workspace() {
                     Some(ws) => {
                         let cd = ws
@@ -18274,6 +18364,9 @@ fi
             }
             Event::ResumeChatRecreateDir(id) => {
                 return self.resume_chat_as_tab(id, true);
+            }
+            Event::ResumeChatAsChat(id) => {
+                return self.resume_chat_as_chat_tab(id);
             }
             Event::FocusChatTab(id) => {
                 if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
@@ -27755,6 +27848,13 @@ fi
                 theme.accent(),
                 Event::ResumeChatAsTab(entry.id.clone()),
             ));
+            if can_resume_as_chat(entry, is_remote, is_live) {
+                actions = actions.push(action_button(
+                    "Resume as Chat",
+                    theme.accent(),
+                    Event::ResumeChatAsChat(entry.id.clone()),
+                ));
+            }
             if entry.possibly_running() {
                 actions = actions.push(
                     text("◐ transcript is still growing — may be running in a terminal GitTerm didn't start")
@@ -33693,5 +33793,88 @@ mod tests {
         );
         tab.close_file_viewer();
         assert!(tab.file_viewer().is_none());
+    }
+
+    fn chat_entry(backend: chats::ChatBackend, dead_cwd: bool) -> chats::ChatIndexEntry {
+        chats::ChatIndexEntry {
+            id: "3f2a".to_string(),
+            backend,
+            path: PathBuf::from("/tmp/3f2a.jsonl"),
+            cwd: PathBuf::from("/tmp/repo/sub"),
+            repo_root: Some(PathBuf::from("/tmp/repo")),
+            is_worktree: false,
+            branch: Some("main".to_string()),
+            title: "a chat".to_string(),
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 1,
+            dead_cwd,
+        }
+    }
+
+    #[test]
+    fn resume_as_chat_is_offered_only_for_local_unowned_claude_chats_with_a_live_cwd() {
+        let claude = chat_entry(chats::ChatBackend::Claude, false);
+        assert!(can_resume_as_chat(&claude, false, false));
+        assert!(!can_resume_as_chat(&claude, true, false), "remote chat");
+        assert!(
+            !can_resume_as_chat(&claude, false, true),
+            "a tab owns it: Go to Session instead"
+        );
+        assert!(
+            !can_resume_as_chat(&chat_entry(chats::ChatBackend::Claude, true), false, false),
+            "dead cwd: only the rescue action"
+        );
+        for backend in [chats::ChatBackend::Codex, chats::ChatBackend::Pi] {
+            assert!(!can_resume_as_chat(
+                &chat_entry(backend, false),
+                false,
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn resumed_chat_session_uses_new_chat_defaults_and_resumes_with_history() {
+        let mut defaults = config::ChatDefaults {
+            default_model: "opus".to_string(),
+            default_effort: Some("high".to_string()),
+            remember_last: false,
+            last: Some(config::ChatSelection {
+                model: "sonnet".to_string(),
+                effort: None,
+            }),
+        };
+        let session = resumed_claude_chat_session(&defaults, "3f2a");
+        let tab::AgentBackendConfig::Claude {
+            model,
+            permission_mode,
+            effort,
+        } = &session.config
+        else {
+            panic!("expected a Claude config, got {:?}", session.config);
+        };
+        assert_eq!(model, "opus");
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(
+            permission_mode.as_deref(),
+            Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE)
+        );
+        // Same path a restored chat tab takes: `show_agent_webview` calls
+        // `start_agent_history_load`, which reads `history_to_load`.
+        assert_eq!(session.history_to_load(), Some("3f2a"));
+        // The first prompt spawns Claude with `--resume=<id>`.
+        let spawn = session
+            .claude_session_config(PathBuf::from("/tmp/repo/sub"), Vec::new())
+            .expect("claude config");
+        assert_eq!(spawn.resume.as_deref(), Some("3f2a"));
+        assert_eq!(spawn.model.as_deref(), Some("opus"));
+
+        // A remembered selection wins, exactly as for "New chat".
+        defaults.remember_last = true;
+        let session = resumed_claude_chat_session(&defaults, "3f2a");
+        assert!(matches!(
+            &session.config,
+            tab::AgentBackendConfig::Claude { model, effort: None, .. } if model == "sonnet"
+        ));
     }
 }
