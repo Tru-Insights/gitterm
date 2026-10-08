@@ -414,3 +414,11 @@ only ever called from it (subagents, `codex exec review`, task workers in termin
 chat adapter is dropped: nothing in this plan needs Codex in the coordinator seat. Composer chips (model, effort,
 permission mode, checkout) and the single "New chat" entry are TRU-143. S6 (`delegate_task`) must accept any
 configured preset and, for Claude workers, a model.
+
+**Model policy (TRU-144), stated by Tracey 2026-10-08:** she decides the coordinator; today that is Opus 5.5.
+For complicated brainstorming and architecture reviews she wants Astra (Codex) or Fable (Claude). So the
+specialist role covers review, investigation *and* consultation. Fable is reachable now via a Claude subagent;
+Astra needs the Codex runner to accept a free-form brief, not only `codex exec review`. S3 therefore grows a
+`consult` delegation kind: `codex exec --json` with the brief, result = the final agent message as the handoff
+summary (no findings contract). The Review… popover gains a sibling "Consult…" (or one popover with a kind
+switch) defaulting to the specialist model of the chosen provider.
