@@ -144,6 +144,12 @@ impl ClaudeFrameParser {
                 })]
             }
             "stream_event" if !from_subagent => self.parse_stream_event(&v["event"]),
+            // Slash-command replies (`/model sonnet`, `/effort high`, ...) are
+            // synthetic assistant messages with no stream deltas; surface
+            // their text or the turn looks like it produced nothing.
+            "assistant" if !from_subagent && str_at("/message/model") == Some("<synthetic>") => {
+                parse_synthetic_assistant(&v)
+            }
             "user" if !from_subagent => parse_tool_results(&v),
             "result" => vec![ParsedFrame::Event(parse_result(&v))],
             "control_request" => parse_control_request(&v),
@@ -303,6 +309,22 @@ fn tool_result_text(content: &Value) -> String {
         Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// Text blocks of a synthetic assistant message, as deltas.
+fn parse_synthetic_assistant(v: &Value) -> Vec<ParsedFrame> {
+    v.pointer("/message/content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b["type"] == "text")
+                .filter_map(|b| b["text"].as_str())
+                .filter(|t| !t.is_empty())
+                .map(|t| ParsedFrame::Event(HarnessEvent::TextDelta(t.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_result(v: &Value) -> HarnessEvent {
@@ -1059,6 +1081,8 @@ mod tests {
 
     const INIT_REPLY: &str = include_str!("../../tests/fixtures/claude/initialize_reply.jsonl");
     const TURN_TEXT: &str = include_str!("../../tests/fixtures/claude/turn_text.jsonl");
+    const TURN_SLASH_COMMAND: &str =
+        include_str!("../../tests/fixtures/claude/turn_slash_command.jsonl");
     const TURN_BASH_ALLOW: &str = include_str!("../../tests/fixtures/claude/turn_bash_allow.jsonl");
     const TURN_BASH_DENY: &str = include_str!("../../tests/fixtures/claude/turn_bash_deny.jsonl");
     const TURN_QUESTION: &str = include_str!("../../tests/fixtures/claude/turn_question.jsonl");
@@ -1096,6 +1120,22 @@ mod tests {
         ));
         // A response nobody asked for is ignored.
         assert!(parse_fixture(&mut p, INIT_REPLY).is_empty());
+    }
+
+    #[test]
+    fn slash_command_reply_surfaces_synthetic_text() {
+        let mut p = ClaudeFrameParser::new();
+        let evs = events(&parse_fixture(&mut p, TURN_SLASH_COMMAND));
+        assert!(evs.contains(&HarnessEvent::TextDelta(
+            "Set model to `Sonnet 5.5` for this session only".into()
+        )));
+        assert!(matches!(
+            evs.last(),
+            Some(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
     }
 
     #[test]
