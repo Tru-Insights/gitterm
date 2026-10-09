@@ -4954,6 +4954,15 @@ pub enum Event {
     ChatsRelevanceToggled,
     /// A Jev relevance ranking of the local chats landed (TRU-141).
     ChatsRanked(Result<gitterm::jev::Ranking, gitterm::jev::JevError>),
+    /// Usage panel (TRU-145): pick the 7 / 30 / 90 day window.
+    UsageWindowSelected(gitterm::usage::UsageWindow),
+    /// Usage panel: chart cost (false) or tokens (true).
+    UsageChartTokens(bool),
+    /// Usage panel: show or hide headless (SDK / exec) runs.
+    UsageHeadlessToggled,
+    UsageRefresh,
+    /// A usage scan finished: the report, or why the scan task failed.
+    UsageScanned(Result<gitterm::usage::UsageReport, String>),
     RemoteChatIndexLoaded(String, Result<Vec<chats::ChatIndexEntry>, String>),
     /// Expand/collapse one machine section in the Everywhere scope
     /// ("local" or a remote id).
@@ -5275,6 +5284,21 @@ struct App {
     /// Ranking snippets per transcript (path, mtime, size), shared with
     /// the ranking task that reads them off the UI thread.
     chat_snippets: Arc<Mutex<chat_rank::SnippetCache>>,
+    /// Usage panel (TRU-145). Price overrides from config.json, written
+    /// back on save.
+    usage_config: gitterm::usage::UsageConfig,
+    usage_window: gitterm::usage::UsageWindow,
+    /// Chart tokens instead of cost.
+    usage_chart_tokens: bool,
+    /// Include headless (SDK / exec) runs in the totals.
+    usage_show_headless: bool,
+    /// The last finished scan; kept on screen while a new one runs.
+    usage_report: Option<gitterm::usage::UsageReport>,
+    usage_scanning: bool,
+    usage_error: Option<String>,
+    /// Parsed transcripts per (path, mtime, size), shared with the scan
+    /// task that reads them off the UI thread.
+    usage_cache: Arc<Mutex<gitterm::usage::UsageCache>>,
     // Track whether the window has focus (skip terminal processing when unfocused)
     window_focused: bool,
     terminal_redraws: TerminalRedrawQueue,
@@ -6197,6 +6221,7 @@ impl App {
             review: self.review_config.clone(),
             chat: self.chat_config.clone(),
             policy: self.model_policy.clone(),
+            usage: self.usage_config.clone(),
         };
         config.save();
         let elapsed = started.elapsed();
@@ -6837,6 +6862,55 @@ impl App {
                 gitterm::jev::rank_chats(&client, &ctx, &candidates).await
             },
             Event::ChatsRanked,
+        )
+    }
+
+    /// Scan transcripts for the Usage panel's window off the UI thread.
+    /// One scan at a time: a window change during a scan is picked up
+    /// when it lands (`Event::UsageScanned`).
+    fn request_usage_scan(&mut self) -> Task<Event> {
+        if self.usage_scanning {
+            return Task::none();
+        }
+        let Some(sources) = gitterm::usage::UsageSources::local() else {
+            self.usage_error = Some("cannot find the home directory".to_string());
+            return Task::none();
+        };
+        self.usage_scanning = true;
+        let window = self.usage_window;
+        let pricing = gitterm::usage::Pricing::with_overrides(&self.usage_config);
+        let cache = self.usage_cache.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut cache = match cache.lock() {
+                        Ok(cache) => cache,
+                        Err(poisoned) => {
+                            eprintln!("[usage] an earlier scan panicked; starting from an empty cache");
+                            let mut cache = poisoned.into_inner();
+                            *cache = gitterm::usage::UsageCache::default();
+                            cache
+                        }
+                    };
+                    let report = gitterm::usage::scan_usage(&sources, window, &pricing, &mut cache);
+                    let s = &report.stats;
+                    eprintln!(
+                        "[usage] {} scan: {} files ({} parsed, {} resumed, {} cached, {} unreadable), {} responses in {:?}",
+                        window.label(),
+                        s.files_seen - s.files_outside_window,
+                        s.files_parsed,
+                        s.files_resumed,
+                        s.files_cached,
+                        s.files_unreadable,
+                        s.responses,
+                        s.elapsed
+                    );
+                    Ok(report)
+                })
+                .await
+                .map_err(|err| format!("usage scan task failed: {err}"))?
+            },
+            Event::UsageScanned,
         )
     }
 
@@ -11075,6 +11149,14 @@ impl App {
             jev_client: gitterm::jev::JevClient::from_env(),
             chat_rank: chat_rank::ChatRankState::default(),
             chat_snippets: Arc::new(Mutex::new(chat_rank::SnippetCache::default())),
+            usage_config: config.usage.clone(),
+            usage_window: gitterm::usage::UsageWindow::default(),
+            usage_chart_tokens: false,
+            usage_show_headless: true,
+            usage_report: None,
+            usage_scanning: false,
+            usage_error: None,
+            usage_cache: Arc::new(Mutex::new(gitterm::usage::UsageCache::default())),
         };
 
         if let Some(remote_file) = RemoteSessionsFile::load() {
@@ -17477,6 +17559,15 @@ fi
             Event::SetSidebarMode(mode) => {
                 let task = self.set_sidebar_mode(mode);
                 self.settle_agent_surface();
+                // The Usage panel re-scans whenever it is shown; unchanged
+                // transcripts come from the cache.
+                if mode == SidebarMode::Usage
+                    && self
+                        .active_tab()
+                        .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Usage)
+                {
+                    return Task::batch([task, self.request_usage_scan()]);
+                }
                 return task;
             }
             Event::SetGitViewMode(mode) => {
@@ -18285,6 +18376,33 @@ fi
             Event::ChatsRanked(result) => {
                 if self.chat_rank.finish(result) {
                     return self.request_chat_rank();
+                }
+            }
+            Event::UsageWindowSelected(window) => {
+                if self.usage_window != window {
+                    self.usage_window = window;
+                    return self.request_usage_scan();
+                }
+            }
+            Event::UsageChartTokens(tokens) => self.usage_chart_tokens = tokens,
+            Event::UsageHeadlessToggled => self.usage_show_headless = !self.usage_show_headless,
+            Event::UsageRefresh => return self.request_usage_scan(),
+            Event::UsageScanned(result) => {
+                self.usage_scanning = false;
+                match result {
+                    Ok(report) => {
+                        let stale = report.window != self.usage_window;
+                        self.usage_report = Some(report);
+                        self.usage_error = None;
+                        // The window changed while this scan ran.
+                        if stale {
+                            return self.request_usage_scan();
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[usage] {err}");
+                        self.usage_error = Some(err);
+                    }
                 }
             }
             Event::ToggleMachineGroup(key) => {
@@ -19911,7 +20029,7 @@ fi
                         let refresh = self.refresh_chat_index_if_stale();
                         return Task::batch([refresh, self.request_chat_rank()]);
                     }
-                    SidebarMode::Tasks => {
+                    SidebarMode::Tasks | SidebarMode::Usage => {
                         tab.agent_sidebar.selected_capture_idx = None;
                         tab.agent_sidebar.conversation = None;
                         tab.close_file_viewer();
@@ -24695,6 +24813,18 @@ fi
             Event::SetSidebarMode(SidebarMode::Chats),
         );
 
+        let usage_active = tab.sidebar_mode == SidebarMode::Usage;
+        let usage_text_color = if usage_active {
+            theme.text_primary()
+        } else {
+            theme.subtext0()
+        };
+        let usage_tab = self.view_sidebar_tab(
+            text("Usage").size(font).color(usage_text_color).into(),
+            usage_active,
+            Event::SetSidebarMode(SidebarMode::Usage),
+        );
+
         let mut tabs = Row::new()
             .spacing(0)
             .push(git_tab)
@@ -24702,7 +24832,8 @@ fi
             .push(tasks_tab)
             .push(agent_tab)
             .push(chats_tab)
-            .push(plans_tab);
+            .push(plans_tab)
+            .push(usage_tab);
 
         if workspace_is_remote {
             let remote_text_color = if remote_active {
@@ -24793,6 +24924,9 @@ fi
             }
             SidebarMode::Tasks => {
                 freeze_time!("view_task_rail", { self.view_task_rail() })
+            }
+            SidebarMode::Usage => {
+                freeze_time!("view_usage_sidebar", { self.view_usage_sidebar() })
             }
             SidebarMode::Remote => {
                 freeze_time!("view_remote_sidebar", { self.view_remote_sidebar() })
@@ -24909,6 +25043,7 @@ fi
             ("\u{2726}", SidebarMode::Claude), // ✦ sparkle
             ("\u{224B}", SidebarMode::Chats),  // ≋ conversation history
             ("\u{25A4}", SidebarMode::Plans),  // ▤ plans
+            ("$", SidebarMode::Usage),         // token usage and cost
         ];
         if workspace_is_remote {
             modes.push(("\u{2601}", SidebarMode::Remote)); // cloud
@@ -27148,6 +27283,419 @@ fi
     /// Sidebar for the Chats tab (TRU-78 slice 1): search, scope toggle,
     /// conversations grouped by repo. Pure render over `self.chat_index`;
     /// all file IO happened in the background index task.
+    /// Usage panel (TRU-145): estimated cost and token usage across
+    /// Claude Code, Codex and Pi, from this Mac's transcripts. The numbers
+    /// come from `gitterm::usage`; this only lays them out.
+    fn view_usage_sidebar<'a>(&'a self) -> Element<'a, Event, Theme, iced::Renderer> {
+        use gitterm::usage::{format_cost, format_tokens, harness_index, Bucket, UsageWindow};
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let font_tiny = font_small - 1.0;
+        let muted = theme.text_muted();
+        let secondary = theme.text_secondary();
+        let primary = theme.text_primary();
+
+        let segment = |label: &'static str, active: bool, on_press: Event| {
+            let bg = active.then(|| theme.surface0().into());
+            let color = if active { primary } else { secondary };
+            button(text(label).size(font_tiny).color(color))
+                .style(move |_theme, _status| button::Style {
+                    background: bg,
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .padding([3, 8])
+                .on_press(on_press)
+        };
+        let fill = || iced::widget::Space::new().width(Length::Fill);
+
+        let mut window_row = Row::new().spacing(2).align_y(iced::Alignment::Center);
+        for window in UsageWindow::ALL {
+            window_row = window_row.push(segment(
+                window.label(),
+                self.usage_window == window,
+                Event::UsageWindowSelected(window),
+            ));
+        }
+        window_row = window_row.push(fill()).push(segment(
+            if self.usage_scanning {
+                "scanning…"
+            } else {
+                "refresh"
+            },
+            false,
+            Event::UsageRefresh,
+        ));
+        let mode_row = row![
+            segment(
+                "Cost",
+                !self.usage_chart_tokens,
+                Event::UsageChartTokens(false)
+            ),
+            segment(
+                "Tokens",
+                self.usage_chart_tokens,
+                Event::UsageChartTokens(true)
+            ),
+            fill(),
+            segment(
+                if self.usage_show_headless {
+                    "headless shown"
+                } else {
+                    "headless hidden"
+                },
+                self.usage_show_headless,
+                Event::UsageHeadlessToggled,
+            ),
+        ]
+        .spacing(2)
+        .align_y(iced::Alignment::Center);
+
+        let mut content = Column::new()
+            .spacing(10)
+            .padding(10)
+            .push(window_row)
+            .push(mode_row);
+
+        if let Some(err) = &self.usage_error {
+            content = content.push(
+                text(format!("Usage scan failed: {err}"))
+                    .size(font_tiny)
+                    .color(theme.danger()),
+            );
+        }
+        let Some(report) = &self.usage_report else {
+            content = content.push(
+                text("Reading transcripts…")
+                    .size(font_small)
+                    .color(secondary),
+            );
+            return scrollable(content)
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .into();
+        };
+        let view = report.view(self.usage_show_headless);
+        let totals = &view.totals;
+        let tokens_mode = self.usage_chart_tokens;
+        let no_wrap = iced::widget::text::Wrapping::None;
+        let cell = |value: String, width: f32| {
+            text(value)
+                .size(font_tiny)
+                .color(secondary)
+                .wrapping(no_wrap)
+                .width(Length::Fixed(width))
+                .align_x(iced::alignment::Horizontal::Right)
+        };
+        let heading = |label: &'static str| text(label).size(font_small).color(primary);
+        let cost_label = |bucket: &Bucket| {
+            if bucket.cost == 0.0 && bucket.unpriced_tokens > 0 {
+                "unpriced".to_string()
+            } else {
+                format_cost(bucket.cost)
+            }
+        };
+
+        // Totals.
+        let mut totals_col = Column::new().spacing(3).push(
+            row![
+                text(format_cost(totals.cost))
+                    .size(font + 6.0)
+                    .color(primary),
+                text(format!("{} days", report.window.days()))
+                    .size(font_tiny)
+                    .color(muted),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::End),
+        );
+        totals_col = totals_col.push(
+            text("estimate, if billed at full API list rates")
+                .size(font_tiny)
+                .color(muted),
+        );
+        if totals.unpriced_tokens > 0 {
+            totals_col = totals_col.push(
+                text(format!(
+                    "+ {} tokens on unpriced models",
+                    format_tokens(totals.unpriced_tokens)
+                ))
+                .size(font_tiny)
+                .color(theme.warning()),
+            );
+        }
+        let stat = |label: &'static str, value: u64| {
+            row![
+                text(label)
+                    .size(font_tiny)
+                    .color(secondary)
+                    .width(Length::Fill),
+                text(format_tokens(value)).size(font_tiny).color(primary),
+            ]
+        };
+        let t = &totals.tokens;
+        totals_col = totals_col
+            .push(stat("Processed", t.processed()))
+            .push(stat("Cached input", t.cache_read))
+            .push(stat("Uncached input", t.uncached_input))
+            .push(stat("Cache writes", t.cache_write))
+            .push(stat("Output", t.output));
+        content = content.push(totals_col);
+
+        // Daily chart, stacked by harness (Claude at the bottom).
+        const CHART_HEIGHT: f32 = 72.0;
+        let value = |bucket: &Bucket| {
+            if tokens_mode {
+                bucket.tokens.processed() as f64
+            } else {
+                bucket.cost
+            }
+        };
+        let peak = view
+            .days
+            .iter()
+            .map(|day| day.by_harness.iter().map(value).sum::<f64>())
+            .fold(0.0, f64::max);
+        let mut bars = Row::new()
+            .spacing(if view.days.len() > 30 { 0 } else { 1 })
+            .height(Length::Fixed(CHART_HEIGHT))
+            .align_y(iced::Alignment::End);
+        for day in &view.days {
+            let mut stack = Column::new().width(Length::FillPortion(1));
+            for backend in chats::ChatBackend::ALL.iter().rev() {
+                let v = value(&day.by_harness[harness_index(*backend)]);
+                let height = if peak > 0.0 {
+                    (v / peak) as f32 * CHART_HEIGHT
+                } else {
+                    0.0
+                };
+                if height >= 0.5 {
+                    let color = self.chat_backend_color(*backend);
+                    stack = stack.push(
+                        container(iced::widget::Space::new())
+                            .width(Length::Fill)
+                            .height(Length::Fixed(height))
+                            .style(move |_| container::Style {
+                                background: Some(color.into()),
+                                ..Default::default()
+                            }),
+                    );
+                }
+            }
+            bars = bars.push(stack);
+        }
+        let baseline_color = theme.surface1();
+        let baseline = container(iced::widget::Space::new())
+            .width(Length::Fill)
+            .height(Length::Fixed(1.0))
+            .style(move |_| container::Style {
+                background: Some(baseline_color.into()),
+                ..Default::default()
+            });
+        let chart = Column::new().push(bars).push(baseline);
+        let peak_label = if tokens_mode {
+            format!("peak {} / day", format_tokens(peak as u64))
+        } else {
+            format!("peak {} / day", format_cost(peak))
+        };
+        let mut legend = Row::new().spacing(8).align_y(iced::Alignment::Center);
+        for backend in chats::ChatBackend::ALL {
+            let bucket = &view.by_harness[harness_index(backend)];
+            let figure = if tokens_mode {
+                format_tokens(bucket.tokens.processed())
+            } else {
+                cost_label(bucket)
+            };
+            legend = legend.push(
+                row![
+                    text("●").size(7).color(self.chat_backend_color(backend)),
+                    text(format!("{} {figure}", backend.label()))
+                        .size(font_tiny)
+                        .color(secondary)
+                        .wrapping(no_wrap),
+                ]
+                .spacing(3)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        content = content.push(
+            Column::new()
+                .spacing(4)
+                .push(row![
+                    heading(if tokens_mode {
+                        "Daily tokens"
+                    } else {
+                        "Daily cost"
+                    }),
+                    fill(),
+                    text(peak_label).size(font_tiny).color(muted),
+                ])
+                .push(chart)
+                .push(row![
+                    text(report.start.format("%b %-d").to_string())
+                        .size(font_tiny)
+                        .color(muted),
+                    fill(),
+                    text(report.end.format("%b %-d").to_string())
+                        .size(font_tiny)
+                        .color(muted),
+                ])
+                .push(legend),
+        );
+
+        // Share of the window's cost, or of its tokens in Tokens mode.
+        let share = |bucket: &Bucket| {
+            let (part, whole) = if tokens_mode {
+                (
+                    bucket.tokens.processed() as f64,
+                    totals.tokens.processed() as f64,
+                )
+            } else {
+                (bucket.cost, totals.cost)
+            };
+            if whole > 0.0 && part > 0.0 {
+                format!("{:.0}%", part / whole * 100.0)
+            } else {
+                "—".to_string()
+            }
+        };
+        let header = |first: &'static str| {
+            row![
+                text(first).size(font_tiny).color(muted).width(Length::Fill),
+                text("Cost")
+                    .size(font_tiny)
+                    .color(muted)
+                    .width(Length::Fixed(60.0))
+                    .align_x(iced::alignment::Horizontal::Right),
+                text("Share")
+                    .size(font_tiny)
+                    .color(muted)
+                    .width(Length::Fixed(38.0))
+                    .align_x(iced::alignment::Horizontal::Right),
+                text("Tokens")
+                    .size(font_tiny)
+                    .color(muted)
+                    .width(Length::Fixed(48.0))
+                    .align_x(iced::alignment::Horizontal::Right),
+            ]
+            .spacing(4)
+        };
+
+        let mut models = Column::new()
+            .spacing(3)
+            .push(heading("By model"))
+            .push(header("Model"));
+        for model in &view.models {
+            models = models.push(
+                row![
+                    text("●")
+                        .size(7)
+                        .color(self.chat_backend_color(model.harness)),
+                    text(model.model.as_str())
+                        .size(font_tiny)
+                        .color(primary)
+                        .wrapping(no_wrap)
+                        .width(Length::Fill),
+                    cell(cost_label(&model.usage), 60.0),
+                    cell(share(&model.usage), 38.0),
+                    cell(format_tokens(model.usage.tokens.processed()), 48.0),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        if view.models.is_empty() {
+            models = models.push(
+                text("No usage in this window.")
+                    .size(font_tiny)
+                    .color(muted),
+            );
+        }
+        content = content.push(models);
+
+        const REPO_ROWS: usize = 25;
+        let mut repos = Column::new()
+            .spacing(3)
+            .push(heading("By repo"))
+            .push(header("Repo"));
+        for repo in view.repos.iter().take(REPO_ROWS) {
+            let name = if repo.resolved {
+                repo.name.clone()
+            } else {
+                format!("{} (no repo)", repo.name)
+            };
+            let label = text(name)
+                .size(font_tiny)
+                .color(if repo.resolved { primary } else { secondary })
+                .wrapping(no_wrap)
+                .width(Length::Fill);
+            repos = repos.push(
+                row![
+                    label,
+                    cell(cost_label(&repo.usage), 60.0),
+                    cell(share(&repo.usage), 38.0),
+                    cell(format_tokens(repo.usage.tokens.processed()), 48.0),
+                ]
+                .spacing(4),
+            );
+        }
+        if view.repos.len() > REPO_ROWS {
+            repos = repos.push(
+                text(format!("{} more", view.repos.len() - REPO_ROWS))
+                    .size(font_tiny)
+                    .color(muted),
+            );
+        }
+        content = content.push(repos);
+
+        let stats = &report.stats;
+        let mut footer = Column::new().spacing(2).push(
+            text(format!(
+                "{} transcripts · {} responses · scanned in {:.1}s",
+                stats.files_seen - stats.files_outside_window,
+                format_tokens(stats.responses),
+                stats.elapsed.as_secs_f64()
+            ))
+            .size(font_tiny)
+            .color(muted),
+        );
+        if report.headless_responses > 0 {
+            footer = footer.push(
+                text(format!(
+                    "{} headless responses (SDK, exec, harness subagents) {}",
+                    format_tokens(report.headless_responses),
+                    if self.usage_show_headless {
+                        "included"
+                    } else {
+                        "hidden"
+                    }
+                ))
+                .size(font_tiny)
+                .color(muted),
+            );
+        }
+        if stats.files_unreadable > 0 {
+            footer = footer.push(
+                text(format!(
+                    "{} transcripts could not be read (see log)",
+                    stats.files_unreadable
+                ))
+                .size(font_tiny)
+                .color(theme.warning()),
+            );
+        }
+        content = content.push(footer);
+
+        scrollable(content)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    }
+
     fn view_chats_sidebar<'a>(
         &'a self,
         tab: &'a TabState,

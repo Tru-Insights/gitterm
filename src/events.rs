@@ -16,6 +16,8 @@ pub enum SidebarMode {
     Chats,
     /// Durable cross-workspace task registry and launch surface.
     Tasks,
+    /// Token usage and estimated cost across harnesses (TRU-145).
+    Usage,
     /// Lists persistent remote tmux sessions reachable over SSH.
     Remote,
 }

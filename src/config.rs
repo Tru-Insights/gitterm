@@ -245,6 +245,24 @@ mod tests {
     }
 
     #[test]
+    fn usage_price_overrides_load_and_survive_a_save() {
+        // An older config without `usage` has no overrides.
+        let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(config.usage, gitterm::usage::UsageConfig::default());
+        let config: Config = serde_json::from_str(
+            r#"{"theme":"dark","usage":{"pricing":{
+                "gpt-6-astra":{"input":1.0,"output":8.0,"cache_read":0.1,"cache_write":0.0},
+                "claude-haiku-5-5":null}}}"#,
+        )
+        .unwrap();
+        let astra = config.usage.pricing["gpt-6-astra"].unwrap();
+        assert_eq!((astra.input, astra.output), (1.0, 8.0));
+        assert_eq!(config.usage.pricing["claude-haiku-5-5"], None);
+        let saved: Config = serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(saved.usage, config.usage);
+    }
+
+    #[test]
     fn new_chats_use_the_defaults_until_something_is_picked() {
         // An older config without `chat` gets the defaults.
         let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
@@ -490,6 +508,10 @@ pub struct Config {
     /// see `gitterm::workers::ModelPolicy`.
     #[serde(default)]
     pub policy: gitterm::workers::ModelPolicy,
+    /// Usage panel settings: per-model price overrides (TRU-145); see
+    /// `gitterm::usage::UsageConfig`.
+    #[serde(default)]
+    pub usage: gitterm::usage::UsageConfig,
 }
 
 fn default_chat_model() -> String {
@@ -745,6 +767,7 @@ impl Default for Config {
             review: ReviewConfig::default(),
             chat: ChatDefaults::default(),
             policy: gitterm::workers::ModelPolicy::default(),
+            usage: gitterm::usage::UsageConfig::default(),
         }
     }
 }
