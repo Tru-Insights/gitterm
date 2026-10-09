@@ -67,6 +67,20 @@ pub enum TurnStatus {
     Failed(String),
 }
 
+/// Where a user message is in the harness's command queue. Claude reports
+/// this as `command_lifecycle {command_uuid, state}` for every user message
+/// sent with a `uuid`: `queued` on receipt, `started` when a turn takes it
+/// (the next turn, or the running one at its next tool boundary),
+/// `completed` when that turn ends, or `cancelled` once withdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageState {
+    Queued,
+    Started,
+    Completed,
+    Cancelled,
+}
+
 /// One normalized event from a harness session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -131,6 +145,19 @@ pub enum HarnessEvent {
     SubagentEvent {
         parent_tool_use_id: String,
         event: Box<HarnessEvent>,
+    },
+    /// A user message GitTerm sent with an id moved through the harness's
+    /// queue. The chat clears a message's "queued" marker on `Started` and
+    /// drops the message on `Cancelled`.
+    MessageLifecycle {
+        id: String,
+        state: MessageState,
+    },
+    /// A withdraw (`WithdrawQueuedMessage`) did not take: the message was
+    /// already picked up, or the harness refused. It stays sent.
+    MessageWithdrawRefused {
+        id: String,
+        reason: String,
     },
     /// The harness confirmed a permission mode change GitTerm requested.
     /// Carries the mode now in effect.
@@ -245,11 +272,14 @@ pub fn validate_images(images: &[ImageAttachment]) -> Result<(), String> {
 }
 
 /// A user message: the composer's text plus any images pasted or dropped
-/// into it.
+/// into it. `id`, when set, is sent as the message's `uuid`; Claude then
+/// reports the message's queue state (`MessageLifecycle`) under it and it
+/// can be withdrawn while still queued.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UserPrompt {
     pub text: String,
     pub images: Vec<ImageAttachment>,
+    pub id: Option<String>,
 }
 
 impl From<String> for UserPrompt {
@@ -257,6 +287,7 @@ impl From<String> for UserPrompt {
         Self {
             text,
             images: Vec::new(),
+            id: None,
         }
     }
 }
@@ -270,7 +301,13 @@ impl From<&str> for UserPrompt {
 /// Commands the UI sends into a harness session.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HarnessCommand {
+    /// Claude accepts a message at any time: one sent mid-turn is queued
+    /// by the CLI and reaches the running turn at its next tool boundary,
+    /// or starts the next turn when none comes.
     SendUserMessage(UserPrompt),
+    /// Drop a message (by its `UserPrompt::id`) the harness has queued but
+    /// not yet picked up. Does not interrupt the running turn.
+    WithdrawQueuedMessage(String),
     Answer {
         request_id: String,
         decision: RuntimeDecision,
@@ -308,6 +345,27 @@ mod tests {
             json!({"type": "turn_completed", "data": {
                 "status": {"state": "failed", "message": "boom"},
                 "usage": {}, "cost_usd": 0.5}})
+        );
+    }
+
+    #[test]
+    fn message_lifecycle_serializes_for_the_page() {
+        assert_eq!(
+            serde_json::to_value(HarnessEvent::MessageLifecycle {
+                id: "u1".into(),
+                state: MessageState::Started
+            })
+            .unwrap(),
+            json!({"type": "message_lifecycle", "data": {"id": "u1", "state": "started"}})
+        );
+        assert_eq!(
+            serde_json::to_value(HarnessEvent::MessageWithdrawRefused {
+                id: "u1".into(),
+                reason: "already picked up".into()
+            })
+            .unwrap(),
+            json!({"type": "message_withdraw_refused",
+                   "data": {"id": "u1", "reason": "already picked up"}})
         );
     }
 

@@ -5,7 +5,7 @@
 // and an interrupted long turn.
 //
 //   cargo run --example claude_harness_smoke -- --workdir <empty dir> [--model haiku]
-//       [--scenario all|permission-mode|review|model|image] [--reviewer-model haiku]
+//       [--scenario all|permission-mode|review|model|image|midturn] [--reviewer-model haiku]
 //
 // `--scenario permission-mode` runs only the mode switch (no model turns).
 // `--scenario image` (TRU-140) sends a solid red PNG drawn in code as a
@@ -20,6 +20,10 @@
 // prompt (`gitterm::review::review_prompt`), and checks that the subagent's
 // activity arrives as nested `SubagentEvent`s under the parent's Agent tool
 // call and that the relayed report has F1 with a `file:line` in the repo.
+// `--scenario midturn` (TRU-140) writes user messages while a turn runs:
+// during a multi-Bash turn (answered at the next tool boundary, one
+// withdrawn while queued) and during a text-only turn (run as the next
+// turn). See `midturn_scenario`; it prints the event order as `[seq]`.
 // Prints every HarnessEvent as JSON and exits 1 if a step fails.
 
 use std::collections::HashMap;
@@ -28,8 +32,8 @@ use std::time::{Duration, Instant};
 
 use gitterm::harness::claude::{ClaudeSession, ClaudeSessionConfig};
 use gitterm::harness::{
-    HarnessCommand, HarnessEvent, ImageAttachment, ItemKind, RuntimeDecision, RuntimeRequestKind,
-    TurnStatus, UserPrompt,
+    HarnessCommand, HarnessEvent, ImageAttachment, ItemKind, MessageState, RuntimeDecision,
+    RuntimeRequestKind, TurnStatus, UserPrompt,
 };
 use gitterm::review::{review_prompt, ReviewRequest, ReviewTarget};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -165,9 +169,18 @@ async fn main() {
     let workdir = PathBuf::from(arg("--workdir").expect("--workdir <dir> is required"));
     std::fs::create_dir_all(&workdir).expect("create workdir");
     let scenario = arg("--scenario").unwrap_or_else(|| "all".into());
-    if !["all", "permission-mode", "review", "model", "image"].contains(&scenario.as_str()) {
+    if ![
+        "all",
+        "permission-mode",
+        "review",
+        "model",
+        "image",
+        "midturn",
+    ]
+    .contains(&scenario.as_str())
+    {
         eprintln!(
-            "unknown --scenario {scenario:?} (expected all, permission-mode, review, model or image)"
+            "unknown --scenario {scenario:?} (expected all, permission-mode, review, model, image or midturn)"
         );
         std::process::exit(2);
     }
@@ -218,6 +231,11 @@ async fn main() {
     }
     if scenario == "image" {
         image_turn(&session, &mut events, &mut check).await;
+        finish(session, events, failures).await;
+        return;
+    }
+    if scenario == "midturn" {
+        midturn_scenario(&session, &mut events, &mut check).await;
         finish(session, events, failures).await;
         return;
     }
@@ -426,6 +444,256 @@ async fn model_scenario(
     }
 }
 
+/// Messages written while a turn is running (TRU-140). Two runs:
+///
+/// 1. A turn that makes several Bash calls. Once the first tool call starts,
+///    three messages go out with ids: a question (the current year), an
+///    image with a question about it, and a third that is withdrawn at once
+///    (`cancel_async_message`). Expected: the first two reach the running
+///    turn at a tool boundary (`started` before its `result`, answered in
+///    the same turn), the third is `cancelled` and never starts.
+/// 2. A text-only turn. A message sent at the first text delta has no tool
+///    boundary to ride; expected: it starts its own turn after the first
+///    `result`, with no further send from the host.
+///
+/// Prints the observed order as `[seq]` lines.
+async fn midturn_scenario(
+    session: &ClaudeSession,
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    check: &mut impl FnMut(&str, bool, String),
+) {
+    use base64::Engine as _;
+    let year = |t: &str| ["2025", "2026", "2027"].iter().any(|y| t.contains(y));
+
+    // Run 1: tool boundaries.
+    let image = ImageAttachment {
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(solid_png(64, 64, [220, 20, 20])),
+    };
+    let mid = vec![
+        UserPrompt {
+            text: "Also, before you finish, tell me the current year".into(),
+            images: Vec::new(),
+            id: Some("00000000-0000-4000-8000-00000000000b".into()),
+        },
+        UserPrompt {
+            text: "And tell me in one word what colour this image is".into(),
+            images: vec![image],
+            id: Some("00000000-0000-4000-8000-00000000000c".into()),
+        },
+        UserPrompt {
+            text: "And tell me what the capital of France is".into(),
+            images: Vec::new(),
+            id: Some("00000000-0000-4000-8000-00000000000d".into()),
+        },
+    ];
+    let withdraw = mid[2].id.clone();
+    match midturn_run(
+        session,
+        events,
+        "Run `sleep 2` three times with separate Bash calls, then say done.",
+        |ev| matches!(ev, HarnessEvent::ItemStarted { .. }),
+        mid,
+        withdraw,
+    )
+    .await
+    {
+        Ok(run) => {
+            let first = run.turn_text.first().cloned().unwrap_or_default();
+            let lower = first.to_lowercase();
+            let b = run.states("00000000-0000-4000-8000-00000000000b");
+            let c = run.states("00000000-0000-4000-8000-00000000000c");
+            let d = run.states("00000000-0000-4000-8000-00000000000d");
+            check(
+                "midturn at a tool boundary",
+                run.results == 1 && year(&first) && lower.contains("red"),
+                format!(
+                    "results={} year={} red={} text={:?}",
+                    run.results,
+                    year(&first),
+                    lower.contains("red"),
+                    first.trim()
+                ),
+            );
+            check(
+                "midturn lifecycle",
+                b.contains(&MessageState::Started)
+                    && c.contains(&MessageState::Started)
+                    && b.first() == Some(&MessageState::Queued),
+                format!("b={b:?} c={c:?}"),
+            );
+            check(
+                "midturn withdraw",
+                d.contains(&MessageState::Cancelled)
+                    && !d.contains(&MessageState::Started)
+                    && !lower.contains("paris"),
+                format!("d={d:?} paris={}", lower.contains("paris")),
+            );
+        }
+        Err(e) => check("midturn at a tool boundary", false, e),
+    }
+
+    // Run 2: no tool boundary.
+    let mid = vec![UserPrompt {
+        text: "Also, tell me the current year".into(),
+        images: Vec::new(),
+        id: Some("00000000-0000-4000-8000-00000000000e".into()),
+    }];
+    match midturn_run(
+        session,
+        events,
+        "Count from 1 to 40 in digits, one per line. Do not use any tools.",
+        |ev| matches!(ev, HarnessEvent::TextDelta(_)),
+        mid,
+        None,
+    )
+    .await
+    {
+        Ok(run) => {
+            let e = run.states("00000000-0000-4000-8000-00000000000e");
+            let answered_later = run.turn_text.iter().skip(1).any(|t| year(t));
+            check(
+                "midturn without a tool boundary",
+                run.results == 2 && answered_later && e.contains(&MessageState::Started),
+                format!(
+                    "results={} answered_in_second_turn={answered_later} e={e:?}",
+                    run.results
+                ),
+            );
+        }
+        Err(e) => check("midturn without a tool boundary", false, e),
+    }
+}
+
+struct MidturnRun {
+    results: usize,
+    turn_text: Vec<String>,
+    lifecycle: Vec<(String, MessageState)>,
+}
+
+impl MidturnRun {
+    fn states(&self, id: &str) -> Vec<MessageState> {
+        self.lifecycle
+            .iter()
+            .filter(|(i, _)| i == id)
+            .map(|(_, s)| *s)
+            .collect()
+    }
+}
+
+/// Sends `first`, then each of `mid` when `trigger` first matches (and
+/// withdraws `withdraw` right after). Allows every permission prompt. Runs
+/// until 20 s pass with nothing after a `result`.
+async fn midturn_run(
+    session: &ClaudeSession,
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    first: &str,
+    trigger: impl Fn(&HarnessEvent) -> bool,
+    mid: Vec<UserPrompt>,
+    withdraw: Option<String>,
+) -> Result<MidturnRun, String> {
+    println!("\n>> {first}");
+    session.send(HarnessCommand::SendUserMessage(first.into()))?;
+    let mut mid = Some(mid);
+    let mut seq: Vec<String> = Vec::new();
+    let mut run = MidturnRun {
+        results: 0,
+        turn_text: vec![String::new()],
+        lifecycle: Vec::new(),
+    };
+    let mut last_text = false;
+    loop {
+        let wait = if run.results == 0 {
+            STEP_TIMEOUT
+        } else {
+            Duration::from_secs(20)
+        };
+        let ev = match tokio::time::timeout(wait, events.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => return Err("event channel closed".into()),
+            Err(_) if run.results > 0 => break,
+            Err(_) => return Err("timed out".into()),
+        };
+        show(&ev);
+        let label = match &ev {
+            HarnessEvent::TextDelta(t) => {
+                run.turn_text[run.results].push_str(t);
+                (!last_text).then(|| "text".to_string())
+            }
+            HarnessEvent::TurnStarted { .. } => Some("turn_started".into()),
+            HarnessEvent::ItemStarted {
+                kind: ItemKind::ToolCall { name, .. },
+                ..
+            } => Some(format!("tool_started({name})")),
+            HarnessEvent::ItemCompleted { is_error, .. } => {
+                Some(format!("tool_done(error={is_error})"))
+            }
+            HarnessEvent::RuntimeRequest { .. } => Some("permission".into()),
+            HarnessEvent::MessageLifecycle { id, state } => {
+                run.lifecycle.push((id.clone(), *state));
+                Some(format!("lifecycle({}:{state:?})", &id[id.len() - 1..]))
+            }
+            HarnessEvent::MessageWithdrawRefused { id, reason } => {
+                Some(format!("withdraw_refused({id}: {reason})"))
+            }
+            HarnessEvent::TurnCompleted { status, .. } => Some(format!("result({status:?})")),
+            HarnessEvent::Error(e) => Some(format!("error({e})")),
+            HarnessEvent::ProcessExited { code } => {
+                return Err(format!("claude exited {code:?}"));
+            }
+            _ => None,
+        };
+        last_text = matches!(ev, HarnessEvent::TextDelta(_));
+        if let Some(label) = label {
+            seq.push(label);
+        }
+        if trigger(&ev) {
+            if let Some(mid) = mid.take() {
+                for prompt in mid {
+                    let id = prompt.id.clone().unwrap_or_default();
+                    println!(
+                        "\n>> (mid-turn, id …{}) {}",
+                        &id[id.len().saturating_sub(1)..],
+                        prompt.text
+                    );
+                    seq.push(format!("SENT({})", &id[id.len().saturating_sub(1)..]));
+                    session.send(HarnessCommand::SendUserMessage(prompt))?;
+                }
+                if let Some(id) = &withdraw {
+                    seq.push(format!("WITHDRAW({})", &id[id.len() - 1..]));
+                    session.send(HarnessCommand::WithdrawQueuedMessage(id.clone()))?;
+                }
+            }
+        }
+        match ev {
+            HarnessEvent::RuntimeRequest { request_id, .. } => {
+                session.send(HarnessCommand::Answer {
+                    request_id,
+                    decision: RuntimeDecision::Allow {
+                        updated_input: None,
+                        remember: None,
+                    },
+                })?;
+            }
+            HarnessEvent::TurnCompleted { .. } => {
+                run.results += 1;
+                run.turn_text.push(String::new());
+            }
+            _ => {}
+        }
+    }
+    println!("[seq] {}", seq.join(" -> "));
+    for (i, t) in run
+        .turn_text
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.is_empty())
+    {
+        println!("[turn {i} text] {:?}", t.trim());
+    }
+    Ok(run)
+}
+
 /// One turn whose user message carries a text block and a base64 PNG image
 /// block, checking the model saw the image (TRU-140 paste/drop).
 async fn image_turn(
@@ -441,6 +709,7 @@ async fn image_turn(
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(&png),
         }],
+        id: None,
     };
     println!(
         "[wire] {}",
@@ -450,6 +719,7 @@ async fn image_turn(
                 media_type: "image/png".into(),
                 data: format!("<{} base64 chars>", prompt.images[0].data.len()),
             }],
+            id: None,
         })
     );
     let deny_all = |_: &RuntimeRequestKind| RuntimeDecision::Deny {

@@ -21,8 +21,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use super::{
-    HarnessCommand, HarnessEvent, ItemKind, RuntimeDecision, RuntimeRequestKind, TurnStatus,
-    UserPrompt,
+    HarnessCommand, HarnessEvent, ItemKind, MessageState, RuntimeDecision, RuntimeRequestKind,
+    TurnStatus, UserPrompt,
 };
 
 /// The tool whose `can_use_tool` request is a question for the user rather
@@ -66,6 +66,10 @@ pub enum HostRequest {
     /// `get_settings`, sent after a successful `SetEffort` to read back what
     /// the session's flag settings now hold.
     ConfirmEffort(Option<String>),
+    /// `cancel_async_message {message_uuid}`: withdraw a queued user
+    /// message. The reply is `{cancelled: bool}`; a successful cancel also
+    /// arrives as a `command_lifecycle` `cancelled` frame.
+    WithdrawMessage(String),
 }
 
 /// One thing the parser found in a CLI stdout line.
@@ -218,6 +222,24 @@ impl ClaudeFrameParser {
             }
             "user" => parse_tool_results(&v),
             "result" => vec![ParsedFrame::Event(parse_result(&v))],
+            // Queue state of a user message sent with a `uuid` (CLI
+            // capability `msg_lifecycle_v1`). Other states are ignored.
+            "command_lifecycle" => {
+                let state = match str_at("/state") {
+                    Some("queued") => MessageState::Queued,
+                    Some("started") => MessageState::Started,
+                    Some("completed") => MessageState::Completed,
+                    Some("cancelled") => MessageState::Cancelled,
+                    _ => return Vec::new(),
+                };
+                match str_at("/command_uuid") {
+                    Some(id) => vec![ParsedFrame::Event(HarnessEvent::MessageLifecycle {
+                        id: id.to_string(),
+                        state,
+                    })],
+                    None => Vec::new(),
+                }
+            }
             "control_request" => parse_control_request(&v),
             "control_response" => self.parse_control_response(&v),
             "control_cancel_request" => match str_at("/request_id") {
@@ -359,6 +381,20 @@ impl ClaudeFrameParser {
                 out.push(ParsedFrame::Event(confirm_effort(requested, body)));
             }
             (HostRequest::Interrupt, Ok(_)) => {}
+            // A cancel that took is reported by its `cancelled` lifecycle.
+            (HostRequest::WithdrawMessage(_), Ok(body)) if body["cancelled"] == true => {}
+            (HostRequest::WithdrawMessage(id), Ok(_)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::MessageWithdrawRefused {
+                    id: id.clone(),
+                    reason: "Claude had already picked it up".into(),
+                }))
+            }
+            (HostRequest::WithdrawMessage(id), Err(e)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::MessageWithdrawRefused {
+                    id: id.clone(),
+                    reason: format!("Claude refused: {e}"),
+                }))
+            }
         }
         out.push(ParsedFrame::HostRequestDone {
             request_id: request_id.to_string(),
@@ -623,6 +659,8 @@ enum ControlResponseBody {
 /// is the text block first (left out when the text is empty, since the API
 /// rejects empty text blocks) followed by one `image` block per attachment:
 /// `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`.
+/// A prompt with an `id` carries it as the frame's `uuid`, which turns on
+/// the CLI's `command_lifecycle` reports for it.
 pub fn user_message_frame(prompt: &UserPrompt) -> String {
     let mut content = Vec::with_capacity(1 + prompt.images.len());
     if prompt.images.is_empty() || !prompt.text.is_empty() {
@@ -634,13 +672,16 @@ pub fn user_message_frame(prompt: &UserPrompt) -> String {
             "source": {"type": "base64", "media_type": image.media_type, "data": image.data},
         }));
     }
-    json!({
+    let mut frame = json!({
         "type": "user",
         "session_id": "",
         "message": {"role": "user", "content": content},
         "parent_tool_use_id": null
-    })
-    .to_string()
+    });
+    if let Some(id) = &prompt.id {
+        frame["uuid"] = json!(id);
+    }
+    frame.to_string()
 }
 
 fn control_request_frame(request_id: &str, request: Value) -> String {
@@ -1068,6 +1109,9 @@ async fn run_session(
         format!("gitterm_{pid}_{next_id}")
     };
     let mut interrupt_requested = false;
+    // Between `system/init` and `result`. A message sent mid-turn must not
+    // clear an interrupt that turn is still answering.
+    let mut in_turn = false;
 
     // Handshake. Its reply becomes `Ready`.
     let init_id = new_request_id();
@@ -1110,7 +1154,12 @@ async fn run_session(
                     match frame {
                         ParsedFrame::Event(ev) => {
                             let ev = match ev {
+                                HarnessEvent::TurnStarted { session_id, model } => {
+                                    in_turn = true;
+                                    HarnessEvent::TurnStarted { session_id, model }
+                                }
                                 HarnessEvent::TurnCompleted { status, usage, cost_usd } => {
+                                    in_turn = false;
                                     let status = match status {
                                         TurnStatus::Failed(_) if interrupt_requested => {
                                             TurnStatus::Interrupted
@@ -1196,12 +1245,25 @@ async fn run_session(
                 let result = match cmd {
                     HarnessCommand::SendUserMessage(prompt) => {
                         harness_log(&format!(
-                            "user message ({} chars, {} images)",
+                            "user message ({} chars, {} images, id {:?})",
                             prompt.text.len(),
-                            prompt.images.len()
+                            prompt.images.len(),
+                            prompt.id
                         ));
-                        interrupt_requested = false;
+                        if !in_turn {
+                            interrupt_requested = false;
+                        }
                         io.write(user_message_frame(&prompt)).await
+                    }
+                    HarnessCommand::WithdrawQueuedMessage(message_id) => {
+                        let id = new_request_id();
+                        harness_log(&format!("cancel_async_message {message_id} ({id})"));
+                        parser.register_host_request(id.clone(), HostRequest::WithdrawMessage(message_id.clone()));
+                        io.write(control_request_frame(
+                            &id,
+                            json!({"subtype": "cancel_async_message", "message_uuid": message_id}),
+                        ))
+                        .await
                     }
                     HarnessCommand::Answer { request_id, decision } => {
                         match pending.remove(&request_id) {
@@ -1376,6 +1438,7 @@ mod tests {
                     data: "BBBB".into(),
                 },
             ],
+            id: None,
         };
         let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
         assert_eq!(
@@ -1397,6 +1460,7 @@ mod tests {
                 media_type: "image/png".into(),
                 data: "AAAA".into(),
             }],
+            id: None,
         };
         let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
         let content = v["message"]["content"].as_array().unwrap();
@@ -1427,6 +1491,13 @@ mod tests {
     const TURN_BASH_DENY: &str = include_str!("../../tests/fixtures/claude/turn_bash_deny.jsonl");
     const TURN_QUESTION: &str = include_str!("../../tests/fixtures/claude/turn_question.jsonl");
     const TURN_INTERRUPT: &str = include_str!("../../tests/fixtures/claude/turn_interrupt.jsonl");
+    // Captured from `claude_harness_smoke --scenario midturn` (TRU-140): a
+    // Bash turn with three messages sent after its first tool call starts
+    // (…b, …c, then …d withdrawn at once via request gitterm_5166_2).
+    // Trimmed to the lifecycle frames, the cancel reply, tool results and
+    // the result.
+    const TURN_MIDTURN_MESSAGES: &str =
+        include_str!("../../tests/fixtures/claude/turn_midturn_messages.jsonl");
     const SET_PERMISSION_MODE_REPLY: &str =
         include_str!("../../tests/fixtures/claude/set_permission_mode_reply.jsonl");
     // Captured from `claude_harness_smoke --scenario model` (TRU-143):
@@ -1977,6 +2048,112 @@ mod tests {
         assert!(
             matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("bogus"))
         );
+    }
+
+    #[test]
+    fn prompt_id_rides_as_the_frame_uuid() {
+        let prompt = UserPrompt {
+            text: "hi".into(),
+            images: Vec::new(),
+            id: Some("00000000-0000-4000-8000-00000000000b".into()),
+        };
+        let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
+        assert_eq!(v["uuid"], "00000000-0000-4000-8000-00000000000b");
+        assert_eq!(
+            v["message"]["content"],
+            json!([{"type": "text", "text": "hi"}])
+        );
+        let plain: Value = serde_json::from_str(&user_message_frame(&"hi".into())).unwrap();
+        assert!(plain.get("uuid").is_none());
+    }
+
+    #[test]
+    fn midturn_messages_report_their_queue_state() {
+        use crate::harness::MessageState::*;
+        let mut parser = ClaudeFrameParser::new();
+        parser.register_host_request(
+            "gitterm_5166_2".into(),
+            HostRequest::WithdrawMessage("00000000-0000-4000-8000-00000000000d".into()),
+        );
+        let frames = parse_fixture(&mut parser, TURN_MIDTURN_MESSAGES);
+        let lifecycle: Vec<(char, MessageState)> = events(&frames)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                HarnessEvent::MessageLifecycle { id, state } => {
+                    Some((id.chars().last().unwrap(), state))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lifecycle,
+            [
+                ('b', Queued),
+                ('c', Queued),
+                ('d', Queued),
+                ('d', Cancelled),
+                ('b', Started),
+                ('c', Started),
+                ('b', Completed),
+                ('c', Completed),
+            ]
+        );
+        // The cancel took: its lifecycle says so, the reply adds nothing.
+        assert!(!events(&frames)
+            .iter()
+            .any(|ev| matches!(ev, HarnessEvent::MessageWithdrawRefused { .. })));
+        assert!(frames.iter().any(|f| matches!(
+            f,
+            ParsedFrame::HostRequestDone {
+                request: HostRequest::WithdrawMessage(_),
+                result: Ok(_),
+                ..
+            }
+        )));
+        // Folded into the running turn: one result for all of it.
+        let results = events(&frames)
+            .iter()
+            .filter(|ev| matches!(ev, HarnessEvent::TurnCompleted { .. }))
+            .count();
+        assert_eq!(results, 1);
+    }
+
+    #[test]
+    fn a_withdraw_too_late_or_refused_is_reported() {
+        let mut parser = ClaudeFrameParser::new();
+        parser.register_host_request("w1".into(), HostRequest::WithdrawMessage("m1".into()));
+        parser.register_host_request("w2".into(), HostRequest::WithdrawMessage("m2".into()));
+        let frames = parse_fixture(
+            &mut parser,
+            concat!(
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"w1","response":{"cancelled":false}}}"#,
+                "\n",
+                r#"{"type":"control_response","response":{"subtype":"error","request_id":"w2","error":"Unsupported control request subtype: cancel_async_message"}}"#,
+            ),
+        );
+        assert_eq!(
+            events(&frames),
+            [
+                HarnessEvent::MessageWithdrawRefused {
+                    id: "m1".into(),
+                    reason: "Claude had already picked it up".into()
+                },
+                HarnessEvent::MessageWithdrawRefused {
+                    id: "m2".into(),
+                    reason:
+                        "Claude refused: Unsupported control request subtype: cancel_async_message"
+                            .into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_lifecycle_states_are_ignored() {
+        let mut parser = ClaudeFrameParser::new();
+        assert!(parser
+            .parse_line(r#"{"type":"command_lifecycle","command_uuid":"m1","state":"folded"}"#)
+            .is_empty());
     }
 
     #[test]

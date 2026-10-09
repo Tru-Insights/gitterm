@@ -125,6 +125,12 @@ pub enum AgentIpcMessage {
     Stop {
         tab_id: usize,
     },
+    /// The human withdrew a queued message (its × in the timeline) before
+    /// Claude picked it up. Does not interrupt the running turn.
+    Withdraw {
+        tab_id: usize,
+        id: String,
+    },
     /// The human answered a runtime request (permission or question).
     Answer {
         tab_id: usize,
@@ -615,6 +621,16 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                 }
             }
             "stop" => AgentIpcMessage::Stop { tab_id },
+            "withdraw" => {
+                let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] withdraw without id: {}", body);
+                    return;
+                };
+                AgentIpcMessage::Withdraw {
+                    tab_id,
+                    id: id.to_string(),
+                }
+            }
             "answer" => {
                 let Some(request_id) = value.get("requestId").and_then(|v| v.as_str()) else {
                     eprintln!("[agent-ipc] answer without requestId: {}", body);
@@ -14815,11 +14831,44 @@ fi
                         };
                         Task::done(Event::AgentSubmitPrompt(
                             tab_id,
-                            UserPrompt { text, images },
+                            UserPrompt {
+                                text,
+                                images,
+                                id: None,
+                            },
                         ))
                     }
                     AgentIpcMessage::Stop { tab_id } => {
                         Task::done(Event::AgentStopRequested(tab_id))
+                    }
+                    AgentIpcMessage::Withdraw { tab_id, id } => {
+                        let claude = self
+                            .workspaces
+                            .iter()
+                            .flat_map(|ws| ws.tabs.iter())
+                            .find(|t| t.id == tab_id)
+                            .and_then(|t| t.agent_session())
+                            .and_then(|session| session.claude.as_ref());
+                        match claude {
+                            Some(claude) => {
+                                if let Err(e) =
+                                    claude.send(HarnessCommand::WithdrawQueuedMessage(id.clone()))
+                                {
+                                    eprintln!("[agent-ipc] tab {tab_id}: withdraw {id}: {e}");
+                                    agent_webview_note(tab_id, &format!("Not withdrawn: {e}"));
+                                }
+                            }
+                            None => {
+                                eprintln!(
+                                    "[agent-ipc] tab {tab_id}: withdraw {id}: no Claude process"
+                                );
+                                agent_webview_note(
+                                    tab_id,
+                                    "Not withdrawn: Claude is not running in this tab.",
+                                );
+                            }
+                        }
+                        Task::none()
                     }
                     AgentIpcMessage::Answer {
                         tab_id,
@@ -14901,7 +14950,10 @@ fi
                 // Synthetic event so the user sees their own prompt rendered
                 // immediately (the agent stream takes a few hundred ms before
                 // the first system event arrives).
-                let mut echo = tab::AgentEvent::submitted_prompt(&prompt);
+                // Claude gets every message with an id, so the CLI reports
+                // its queue state and a queued one can be withdrawn.
+                let mut prompt = prompt;
+                let mut echo = tab::AgentEvent::submitted_prompt(&prompt, false);
                 // Images a non-Claude backend could not take (pi has no
                 // image input here); the chat says so instead of dropping
                 // them silently.
@@ -14966,6 +15018,14 @@ fi
                                 harness_bridge = Some(rx);
                                 claude_spawned = true;
                             }
+                            // Mid-turn the CLI queues the message itself and
+                            // hands it to the running turn at its next tool
+                            // boundary, or runs it as the next turn.
+                            let queued = !claude_spawned && session.submit_queues();
+                            if prompt.id.is_none() {
+                                prompt.id = Some(uuid::Uuid::new_v4().to_string());
+                            }
+                            echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
                             let mut submitted = false;
                             if let Some(claude) = session.claude.as_ref() {
                                 match claude.send(HarnessCommand::SendUserMessage(prompt.clone())) {
@@ -15816,6 +15876,12 @@ fi
                             let mut new_session_id: Option<String> = None;
                             if let Some(session) = t.agent_session_mut() {
                                 if let tab::AgentEvent::Harness(harness_event) = &ev {
+                                    // A turn the CLI starts on its own (a
+                                    // queued message, a finished background
+                                    // subagent) is in flight like any other.
+                                    if matches!(harness_event, HarnessEvent::TurnStarted { .. }) {
+                                        session.state = tab::AgentSessionState::Streaming;
+                                    }
                                     match harness_event {
                                         HarnessEvent::TurnStarted {
                                             session_id: Some(id),
@@ -34350,6 +34416,89 @@ mod tests {
     fn agent_chat_page_exposes_composer_insert() {
         let html = agent_chat_html();
         assert!(html.contains("window.__insertComposerText = function (text)"));
+    }
+
+    #[test]
+    fn agent_chat_page_sends_while_claude_works() {
+        let html = agent_chat_html();
+        // Claude tabs send mid-turn; a pending request still blocks.
+        assert!(html.contains("submitBtn.disabled = !sendAllowed(busy, pending.size, steerable);"));
+        assert!(html.contains("return pendingCount === 0 && (!isBusy || canSteer);"));
+        assert!(html.contains("steerable = permissionMode != null;"));
+        // Queued markers: withdraw, lifecycle, refused withdraw, exit.
+        assert!(html.contains("postIpc({ type: 'withdraw', id });"));
+        assert!(html.contains("case 'message_lifecycle':"));
+        assert!(html.contains("case 'message_withdraw_refused':"));
+        assert!(html.contains("dropQueued();"));
+    }
+
+    #[test]
+    fn claude_submit_queues_only_while_a_turn_runs() {
+        use tab::{AgentBackend, AgentSessionState};
+        let queues = |backend, running, state: AgentSessionState| {
+            tab::submit_queues(backend, running, &state)
+        };
+        assert!(queues(
+            AgentBackend::Claude,
+            true,
+            AgentSessionState::Streaming
+        ));
+        // No process: the submit spawns one and starts a turn.
+        assert!(!queues(
+            AgentBackend::Claude,
+            false,
+            AgentSessionState::Streaming
+        ));
+        for idle in [
+            AgentSessionState::Idle,
+            AgentSessionState::Stopped,
+            AgentSessionState::Errored("x".into()),
+        ] {
+            assert!(!queues(AgentBackend::Claude, true, idle));
+        }
+        // pi never queues: its composer waits for the turn.
+        assert!(!queues(
+            AgentBackend::Pi,
+            true,
+            AgentSessionState::Streaming
+        ));
+        let session = AgentSession::new(tab::AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        assert!(!session.submit_queues());
+    }
+
+    #[test]
+    fn queued_prompt_echo_carries_id_and_marker() {
+        let prompt = UserPrompt {
+            text: "also this".into(),
+            images: Vec::new(),
+            id: Some("u1".into()),
+        };
+        let payload = tab::AgentEvent::submitted_prompt(&prompt, true)
+            .webview_payload()
+            .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"type": "user_prompt", "text": "also this", "id": "u1", "queued": true})
+        );
+        let payload = tab::AgentEvent::submitted_prompt(&prompt, false)
+            .webview_payload()
+            .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"type": "user_prompt", "text": "also this", "id": "u1"})
+        );
+        // pi's plain echo is unchanged.
+        let payload = tab::AgentEvent::submitted_prompt(&"hi".into(), false)
+            .webview_payload()
+            .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"type": "user_prompt", "text": "hi"})
+        );
     }
 
     #[test]

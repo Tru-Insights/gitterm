@@ -13,6 +13,8 @@ mod agent;
 // Re-exports. Step 3 of TRU-29 added the subprocess manager (`spawn_agent_task` and
 // `AgentTaskHandle`); Step 4 will wire the chat UI to the IPC handler and consume the
 // AgentEvent variants in earnest.
+#[cfg(test)]
+pub(crate) use agent::submit_queues;
 #[allow(unused_imports)]
 pub(crate) use agent::{
     checkout_choices, checkout_label, spawn_agent_task, AgentBackend, AgentBackendConfig,

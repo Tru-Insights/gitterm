@@ -321,6 +321,13 @@
   .att img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .att button { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; padding: 0;
                 border-radius: 9px; font-size: 12px; line-height: 16px; background: rgba(17,17,27,0.8); }
+  /* A message sent while Claude works, until Claude picks it up (TRU-140). */
+  .user-msg.queued { border-style: dashed; color: var(--fg-muted); }
+  .user-msg.unsent { border-style: dashed; color: var(--fg-muted); opacity: 0.7; }
+  .queued-tag { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px;
+                color: var(--fg-muted); white-space: normal; }
+  .queued-tag button { width: 18px; height: 18px; padding: 0; border-radius: 9px; font-size: 12px;
+                       line-height: 16px; }
   .user-images { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
   .user-images:last-child { margin-bottom: 0; }
   .user-images img { max-width: 160px; max-height: 120px; border-radius: 6px; display: block;
@@ -580,6 +587,8 @@
   window.__currentTabId = null;
   window.__setTabId = function (id, permissionMode, composer) {
     window.__currentTabId = id;
+    // Only Claude takes a message while it works (pi waits for the turn).
+    steerable = permissionMode != null;
     resetMode(permissionMode == null ? null : permissionMode);
     // Only Claude tabs have a permission mode, and only they can review.
     setReviewAvailable(permissionMode != null);
@@ -600,6 +609,8 @@
 
   // ---- state -------------------------------------------------------------
   let busy = false;           // a turn is in flight
+  let steerable = false;      // the harness takes messages mid-turn (Claude)
+  const queued = new Map();   // message id -> {msg, tag, x}: sent mid-turn, not yet picked up
   let replaying = false;      // __replay is feeding the buffer
   let follow = true;          // live-follow: stick to the bottom
   let segment = null;         // current assistant text segment
@@ -1007,9 +1018,25 @@
   }
 
   // ---- composer ----------------------------------------------------------
+  // Whether Send / Enter may send now. A pending permission or question
+  // always waits for its answer. Mid-turn, Claude queues the message and
+  // reads it at its next tool call (or as the next turn); pi cannot.
+  function sendAllowed(isBusy, pendingCount, canSteer) {
+    return pendingCount === 0 && (!isBusy || canSteer);
+  }
+  // What a message_lifecycle state does to a queued message's marker:
+  // 'delivered' (Claude has it), 'remove' (withdrawn), or null (no change).
+  function queuedMarkerAction(state) {
+    if (state === 'started' || state === 'completed') return 'delivered';
+    if (state === 'cancelled') return 'remove';
+    return null;
+  }
   function refreshComposer() {
     // Typing stays possible while a request is pending; sending waits.
-    submitBtn.disabled = busy || pending.size > 0;
+    submitBtn.disabled = !sendAllowed(busy, pending.size, steerable);
+    submitBtn.title = busy && !submitBtn.disabled
+      ? 'Claude is working: the message is queued and Claude reads it at its next step'
+      : '';
     stopBtn.disabled = !busy;
     if (typeof refreshReviewSubmit === 'function') refreshReviewSubmit();
     for (const card of cards.values()) refreshCardSend(card);
@@ -2254,6 +2281,58 @@
     renderPanel();
   }
 
+  // ---- queued messages (TRU-140) -----------------------------------------
+  function markQueued(msg, id) {
+    msg.classList.add('queued');
+    const tag = el('div', 'queued-tag');
+    const label = el('span', null, 'Queued · Claude reads it at its next step');
+    const x = el('button', null, '\u00d7');
+    x.type = 'button';
+    x.title = 'Withdraw this message (Claude keeps working)';
+    x.addEventListener('click', () => {
+      x.disabled = true;
+      label.textContent = 'Withdrawing…';
+      postIpc({ type: 'withdraw', id });
+    });
+    tag.append(label, x);
+    msg.append(tag);
+    queued.set(id, { msg, tag, label, x });
+  }
+  function queuedLifecycle(id, state) {
+    const q = queued.get(id);
+    if (!q) return;
+    const action = queuedMarkerAction(state);
+    if (action === 'delivered') {
+      q.tag.remove();
+      q.msg.classList.remove('queued');
+      queued.delete(id);
+    } else if (action === 'remove') {
+      q.msg.remove();
+      queued.delete(id);
+    }
+  }
+  function queuedWithdrawRefused(id, reason) {
+    const q = queued.get(id);
+    if (!q) return;
+    q.label.textContent = 'Queued · Claude reads it at its next step';
+    q.x.disabled = false;
+    note('Not withdrawn: ' + reason, 'warn');
+  }
+  // Claude exited: its queue went with it.
+  function dropQueued() {
+    if (!queued.size) return;
+    const n = queued.size;
+    for (const q of queued.values()) {
+      q.msg.classList.remove('queued');
+      q.msg.classList.add('unsent');
+      q.label.textContent = 'Not sent: Claude exited before reading it';
+      q.x.remove();
+    }
+    queued.clear();
+    note(n === 1 ? 'A queued message was not delivered because Claude exited; send it again.'
+                 : n + ' queued messages were not delivered because Claude exited; send them again.', 'warn');
+  }
+
   // ---- harness events ----------------------------------------------------
   function note(text, cls) { append(el('div', 'note' + (cls ? ' ' + cls : ''), text)); }
   function errorBlock(text) { endSegment(); append(el('div', 'error-block', text)); }
@@ -2310,6 +2389,12 @@
         setBusy(false);
         break;
       }
+      case 'message_lifecycle':
+        queuedLifecycle(d.id, d.state);
+        break;
+      case 'message_withdraw_refused':
+        queuedWithdrawRefused(d.id, d.reason);
+        break;
       case 'permission_mode_changed':
         confirmMode(d);
         note('Permission mode · ' + modeLabel(d));
@@ -2336,6 +2421,7 @@
         clearPendingChips();
         if (busy) finishActivity('Claude exited', 'failed');
         note('Claude process exited' + (d.code != null ? ' (code ' + d.code + ')' : '') + '. The next message resumes the session.');
+        dropQueued();
         setBusy(false);
         break;
       default:
@@ -2397,8 +2483,13 @@
           msg.append(strip);
         }
         if (event.text) msg.append(document.createTextNode(event.text));
+        // Sent while Claude works: it joins Claude's queue and the turn
+        // (and its activity clock) carries on.
+        const isQueued = event.queued === true && typeof event.id === 'string';
+        if (isQueued) markQueued(msg, event.id);
         append(msg);
         follow = true;
+        if (isQueued && busy) return;
         setBusy(true);
         startActivity('Starting');
         return;
@@ -2433,7 +2524,7 @@
   window.__resetConversation = function () {
     messagesEl.innerHTML = '';
     segment = null; thinking = null;
-    items.clear(); pending.clear(); subTools.clear();
+    items.clear(); pending.clear(); subTools.clear(); queued.clear();
     resetDelegations();
     if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
     activityEl.className = 'activity';

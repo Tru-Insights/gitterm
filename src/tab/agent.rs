@@ -148,16 +148,25 @@ impl AgentEvent {
 
     /// The echo of a submitted prompt. Attached images ride along as
     /// `images: [{media_type, data}]` so the page can show thumbnails in
-    /// the human's own message; a text-only prompt is the plain echo.
-    pub(crate) fn submitted_prompt(prompt: &UserPrompt) -> Self {
-        if prompt.images.is_empty() {
+    /// the human's own message. A prompt with an id carries it as `id`, and
+    /// one sent while a turn runs is marked `queued: true`: the page shows
+    /// it as queued, with a withdraw button, until its `message_lifecycle`
+    /// says Claude picked it up. A plain text prompt is the plain echo.
+    pub(crate) fn submitted_prompt(prompt: &UserPrompt, queued: bool) -> Self {
+        if prompt.images.is_empty() && prompt.id.is_none() && !queued {
             return Self::user_prompt(&prompt.text);
         }
-        Self::Other(serde_json::json!({
-            "type": "user_prompt",
-            "text": prompt.text,
-            "images": prompt.images,
-        }))
+        let mut echo = serde_json::json!({"type": "user_prompt", "text": prompt.text});
+        if !prompt.images.is_empty() {
+            echo["images"] = serde_json::json!(prompt.images);
+        }
+        if let Some(id) = &prompt.id {
+            echo["id"] = serde_json::json!(id);
+        }
+        if queued {
+            echo["queued"] = serde_json::json!(true);
+        }
+        Self::Other(echo)
     }
 
     /// The JSON the chat webview's `__appendEvent` receives. Harness events
@@ -292,6 +301,14 @@ impl AgentSession {
         self.config.backend()
     }
 
+    /// Whether a prompt submitted now joins Claude's queue instead of
+    /// starting a turn: a Claude process is running a turn. The CLI takes
+    /// it at the running turn's next tool boundary, or as the next turn.
+    /// A pi tab never gets here mid-turn (its composer waits for the turn).
+    pub(crate) fn submit_queues(&self) -> bool {
+        submit_queues(self.backend(), self.claude.is_some(), &self.state)
+    }
+
     /// The permission mode the next Claude spawn passes; `None` for pi.
     pub(crate) fn configured_permission_mode(&self) -> Option<String> {
         match &self.config {
@@ -305,6 +322,17 @@ impl AgentSession {
             AgentBackendConfig::Pi { .. } => None,
         }
     }
+}
+
+/// See `AgentSession::submit_queues`: a Claude process is running a turn.
+pub(crate) fn submit_queues(
+    backend: AgentBackend,
+    process_running: bool,
+    state: &AgentSessionState,
+) -> bool {
+    backend == AgentBackend::Claude
+        && process_running
+        && matches!(state, AgentSessionState::Streaming)
 }
 
 /// One task's worktree as the chat's checkout chip sees it (TRU-143).
