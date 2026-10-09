@@ -396,6 +396,25 @@ fn native_paste(_webview: &WebView, tab_id: usize) {
     eprintln!("[agent-webview] paste for tab={tab_id} ignored: native paste is macOS only");
 }
 
+/// Give keyboard focus back to GitTerm's own view, the window view every
+/// webview is a child of. Call when the user clicks a terminal: AppKit does
+/// not move first responder off a WKWebView when the click lands on the
+/// Iced view beside it, so the page that last had focus keeps receiving
+/// keys first. Plain typing still reached the terminal (the page leaves it
+/// alone and AppKit passes it up to the window view), but a chat page takes
+/// Cmd+V for itself (`isHostShortcut`), so pasting into the terminal did
+/// nothing. A no-op when no webview exists.
+pub fn focus_app_view() {
+    let focus_parent =
+        |slot: &mut SurfaceSlot| slot.webview.as_ref().map(|webview| webview.focus_parent());
+    let result = AGENT_PAGES
+        .with(|pages| pages.borrow_mut().values_mut().find_map(focus_parent))
+        .or_else(|| VIEWER_SURFACE.with(|slot| focus_parent(&mut slot.borrow_mut())));
+    if let Some(Err(e)) = result {
+        eprintln!("[webview] giving keyboard focus back to the app view failed: {e}");
+    }
+}
+
 /// Hide every agent page.
 pub fn hide_agent_pages() {
     show_only_agent_page(None);

@@ -14586,11 +14586,16 @@ fi
                 self.sync_pending_terminal_redraws();
             }
             Event::MainTerminalClicked => {
+                // A webview clicked earlier still holds AppKit focus.
+                webview::focus_app_view();
                 if self.bottom_panel_focused {
                     return self.focus_main_terminal();
                 }
             }
             Event::BottomTerminalClicked(idx) => {
+                // Below a chat tab the chat page keeps AppKit focus after
+                // the click and takes Cmd+V for itself; hand focus back.
+                webview::focus_app_view();
                 if !self.bottom_panel_focused {
                     return self.focus_bottom_terminal(idx);
                 }
