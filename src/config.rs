@@ -263,6 +263,21 @@ mod tests {
     }
 
     #[test]
+    fn needs_you_notifications_default_on_and_can_be_switched_off() {
+        // An older config without `notifications` notifies.
+        let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(config.notifications.needs_you);
+        let config: Config =
+            serde_json::from_str(r#"{"theme":"dark","notifications":{}}"#).unwrap();
+        assert!(config.notifications.needs_you);
+        let config: Config =
+            serde_json::from_str(r#"{"theme":"dark","notifications":{"needs_you":false}}"#)
+                .unwrap();
+        assert!(!config.notifications.needs_you);
+        assert!(Config::default().notifications.needs_you);
+    }
+
+    #[test]
     fn new_chats_use_the_defaults_until_something_is_picked() {
         // An older config without `chat` gets the defaults.
         let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
@@ -512,6 +527,31 @@ pub struct Config {
     /// `gitterm::usage::UsageConfig`.
     #[serde(default)]
     pub usage: gitterm::usage::UsageConfig,
+    /// macOS notifications (TRU-148).
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+}
+
+/// Which macOS notifications GitTerm posts (TRU-148). Edit the
+/// `notifications` object in `config.json`:
+///
+/// ```json
+/// "notifications": { "needs_you": true }
+/// ```
+///
+/// `needs_you`: notify when a tab that is not in front starts waiting on the
+/// human (an input or approval request, a blocked worker, a task needing
+/// input).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    #[serde(default = "default_true")]
+    pub needs_you: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self { needs_you: true }
+    }
 }
 
 fn default_chat_model() -> String {
@@ -768,6 +808,7 @@ impl Default for Config {
             chat: ChatDefaults::default(),
             policy: gitterm::workers::ModelPolicy::default(),
             usage: gitterm::usage::UsageConfig::default(),
+            notifications: NotificationsConfig::default(),
         }
     }
 }

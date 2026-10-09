@@ -2697,7 +2697,7 @@ enum AttentionReason {
 }
 
 impl AttentionReason {
-    /// Rank on the shared inbox scale: 0 input needed · 1 failed ·
+    /// Rank on the shared attention scale: 0 input needed · 1 failed ·
     /// 2 interrupted (task-only) · 3 ready to review. Failures outrank
     /// completions by construction.
     fn priority(self) -> u8 {
@@ -2748,14 +2748,14 @@ impl TabAttention {
     }
 }
 
-/// Where an attention inbox row leads when selected.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Where an attention row leads when selected.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AttentionTarget {
     Tab(usize),
     Task(String),
 }
 
-/// One row in the attention inbox: a session tab's live attention, or a
+/// One attention row (rail dots, TRU-148): a session tab's live attention, or a
 /// task whose durable attention no open tab is already surfacing.
 #[derive(Debug, Clone)]
 struct AttentionItem {
@@ -2763,10 +2763,8 @@ struct AttentionItem {
     /// The open workspace this row belongs to: always set for a tab row;
     /// a task row has one only when its local workspace is open.
     workspace_idx: Option<usize>,
-    workspace_name: String,
-    machine_name: String,
     title: String,
-    /// The shared inbox scale — see [`AttentionReason::priority`].
+    /// The shared attention scale — see [`AttentionReason::priority`].
     priority: u8,
     icon: &'static str,
     label: &'static str,
@@ -2778,14 +2776,8 @@ struct AttentionItem {
 }
 
 impl AttentionItem {
-    /// The inbox row for a tab's live attention, aged against `now`.
-    fn for_tab(
-        tab: &TabState,
-        workspace_idx: usize,
-        workspace_name: &str,
-        machine_name: &str,
-        now: Instant,
-    ) -> Option<Self> {
+    /// The attention row for a tab's live attention, aged against `now`.
+    fn for_tab(tab: &TabState, workspace_idx: usize, now: Instant) -> Option<Self> {
         let attention = tab.attention?;
         let title = tab
             .terminal_title()
@@ -2796,8 +2788,6 @@ impl AttentionItem {
         Some(Self {
             target: AttentionTarget::Tab(tab.id),
             workspace_idx: Some(workspace_idx),
-            workspace_name: workspace_name.to_string(),
-            machine_name: machine_name.to_string(),
             title,
             priority: attention.reason.priority(),
             icon: attention.reason.icon(),
@@ -2925,6 +2915,150 @@ fn aggregate_task_live_states(
     working.then_some(TaskLifecycle::Running)
 }
 
+/// One look at something that can need the human, fed to
+/// [`NeedsYouNotifier::observe`] (TRU-148).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NeedsYouObservation {
+    target: AttentionTarget,
+    /// The needs-you reason's label while it waits on the human.
+    needs_you: Option<&'static str>,
+    /// Mid-turn right now.
+    running: bool,
+    /// In front of the user (the active tab of the active workspace).
+    front: bool,
+    /// Its needs-you only counts after it was seen working: a harness
+    /// title's "✳" also means idle at the prompt, which a restored tab
+    /// shows on boot without anything having happened.
+    requires_work: bool,
+}
+
+/// A needs-you transition worth a notification: where, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NeedsYouNudge {
+    target: AttentionTarget,
+    label: &'static str,
+}
+
+/// Detects background tabs and tasks turning to needs-you, for the macOS
+/// notification (TRU-148). Level-triggered: each observation is compared
+/// with the last, so a reason that stays raised never repeats; one that
+/// clears and comes back is a new transition, held to one notification
+/// per target and reason every [`Self::REPEAT_AFTER`].
+#[derive(Debug)]
+struct NeedsYouNotifier {
+    started: Instant,
+    raised: HashSet<(AttentionTarget, &'static str)>,
+    seen_working: HashSet<AttentionTarget>,
+    last_fired: HashMap<(AttentionTarget, &'static str), Instant>,
+}
+
+impl NeedsYouNotifier {
+    /// Restored tabs settle (titles, requests, task states) in the first
+    /// seconds after launch; nothing then is news.
+    const LAUNCH_GRACE: Duration = Duration::from_secs(5);
+    const REPEAT_AFTER: Duration = Duration::from_secs(60);
+
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            raised: HashSet::new(),
+            seen_working: HashSet::new(),
+            last_fired: HashMap::new(),
+        }
+    }
+
+    /// Record what is raised now and return the transitions to announce:
+    /// newly raised, not in front, past the launch grace, worked first when
+    /// that is required, and not announced for the same reason within
+    /// [`Self::REPEAT_AFTER`].
+    fn observe(
+        &mut self,
+        now: Instant,
+        observations: impl IntoIterator<Item = NeedsYouObservation>,
+    ) -> Vec<NeedsYouNudge> {
+        let in_grace = now.saturating_duration_since(self.started) < Self::LAUNCH_GRACE;
+        self.last_fired
+            .retain(|_, fired| now.saturating_duration_since(*fired) < Self::REPEAT_AFTER);
+        let mut raised = HashSet::new();
+        let mut nudges = Vec::new();
+        for observation in observations {
+            if observation.running {
+                self.seen_working.insert(observation.target.clone());
+            }
+            let Some(label) = observation.needs_you else {
+                continue;
+            };
+            let key = (observation.target.clone(), label);
+            raised.insert(key.clone());
+            if self.raised.contains(&key) {
+                continue;
+            }
+            // A transition spends the working mark, announced or not.
+            let worked = self.seen_working.remove(&observation.target);
+            if in_grace
+                || observation.front
+                || (observation.requires_work && !worked)
+                || self.last_fired.contains_key(&key)
+            {
+                continue;
+            }
+            self.last_fired.insert(key, now);
+            nudges.push(NeedsYouNudge {
+                target: observation.target,
+                label,
+            });
+        }
+        self.raised = raised;
+        nudges
+    }
+}
+
+/// `text` as an AppleScript string literal.
+fn applescript_string(text: &str) -> String {
+    let mut literal = String::with_capacity(text.len() + 2);
+    literal.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\n' | '\r' => literal.push(' '),
+            _ => literal.push(ch),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
+/// The `osascript` source that posts a needs-you notification.
+fn needs_you_notification_script(title: &str, body: &str) -> String {
+    format!(
+        "display notification {} with title {}",
+        applescript_string(body),
+        applescript_string(title)
+    )
+}
+
+/// Post a macOS notification off the UI thread. A plain notification:
+/// `osascript` owns it, so clicking it cannot focus GitTerm's tab.
+fn post_needs_you_notification(title: &str, body: &str) {
+    let script = needs_you_notification_script(title, body);
+    std::thread::spawn(move || {
+        match std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => eprintln!(
+                "[notify] osascript exited {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => eprintln!("[notify] could not run osascript: {error}"),
+        }
+    });
+}
+
 /// One row of the Chats panel's Open section (TRU-148): an open tab, where
 /// it lives, and what orders it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3002,7 +3136,7 @@ fn strip_title_status_glyphs(title: &str) -> &str {
         .trim_end()
 }
 
-/// Inbox presentation for a task attention reason on the shared priority
+/// Row presentation for a task attention reason on the shared priority
 /// scale: (priority, icon, label).
 fn task_attention_presentation(reason: TaskAttentionReason) -> (u8, &'static str, &'static str) {
     match reason {
@@ -5254,13 +5388,8 @@ pub enum Event {
     // Attention system events
     AttentionPulseTick,
     AttentionJumpNext,
-    AttentionViewToggle,
-    AttentionViewClose,
-    AttentionItemSelect(usize),
     /// A workspace dot on the rail was clicked (TRU-148).
     WorkspaceDotPressed(usize),
-    AttentionTaskSelect(String),
-    AttentionDismiss(AttentionTarget),
     // Launch agent preset by index
     AgentActivityLoaded(usize, Result<agent::AgentActivity, String>),
     AgentConversationLoaded(usize, agent::Conversation),
@@ -5674,7 +5803,10 @@ struct App {
     edge_peek_right: bool,
     // Attention pulse animation (toggles every 500ms)
     attention_pulse_bright: bool,
-    attention_view_open: bool,
+    /// Background needs-you transitions → macOS notifications (TRU-148).
+    needs_you_notifier: NeedsYouNotifier,
+    /// `notifications` from config.json, written back on save.
+    notifications_config: config::NotificationsConfig,
     // Track modifier state for filtering terminal writes
     current_modifiers: Modifiers,
     // Help modal
@@ -5840,8 +5972,7 @@ enum VisibleSurface {
 }
 
 /// Pick the visible webview surface: at most one, Viewer over Agent, nothing
-/// while the attention view or the Usage view covers the content area
-/// (`overlay_open`).
+/// while the Usage view covers the content area (`overlay_open`).
 fn visible_webview_surface(
     viewer: ViewerWebview,
     active: ActiveTabSurface,
@@ -6730,6 +6861,7 @@ impl App {
             chat: self.chat_config.clone(),
             policy: self.model_policy.clone(),
             usage: self.usage_config.clone(),
+            notifications: self.notifications_config.clone(),
         };
         config.save();
         let elapsed = started.elapsed();
@@ -7374,7 +7506,7 @@ impl App {
     }
 
     /// Bring the webview surfaces in line with the Usage view: hidden while
-    /// it covers the content area (as the attention view does), restored as
+    /// it covers the content area, restored as
     /// they were when it closes. Opening rescans; unchanged transcripts come
     /// from the cache.
     fn usage_view_changed(&mut self) -> Task<Event> {
@@ -7966,21 +8098,6 @@ impl App {
     fn acknowledge_active_task_attention(&mut self) {
         if let Some(task_id) = self.active_task_context_id().map(str::to_string) {
             self.acknowledge_task_attention(&task_id);
-        }
-    }
-
-    /// The user dismissed the task's inbox row: drop its attention outright,
-    /// state-backed reasons included — the lifecycle still tells the truth
-    /// in the task rail.
-    fn dismiss_task_attention(&mut self, task_id: &str) {
-        let Some(store) = self.task_store.as_mut() else {
-            return;
-        };
-        if store.get(task_id).is_none() {
-            return;
-        }
-        if let Err(error) = store.dismiss_attention(task_id, &chrono::Utc::now().to_rfc3339()) {
-            eprintln!("GitTerm V5 dropped a task attention dismissal: {error}");
         }
     }
 
@@ -11146,7 +11263,7 @@ impl App {
 
     /// A worker reported done or blocked: mirror it on the task and the
     /// worker's tab, and tell the parent chat (attention unless it is in
-    /// front, the inbox row that follows from it, and the card).
+    /// front, the rail dot that follows from it, and the card).
     fn worker_reported(
         &mut self,
         delegation_id: &str,
@@ -11718,7 +11835,8 @@ impl App {
             edge_peek_left: false,
             edge_peek_right: false,
             attention_pulse_bright: false,
-            attention_view_open: false,
+            needs_you_notifier: NeedsYouNotifier::new(Instant::now()),
+            notifications_config: config.notifications.clone(),
             current_modifiers: Modifiers::empty(),
             show_help: false,
             workspace_settings_open: false,
@@ -13560,28 +13678,13 @@ fi
     }
 
     /// Tasks whose open session tabs already surface live attention — their
-    /// tab rows are the more precise inbox entries for the same thing.
+    /// tab rows are the more precise attention rows for the same thing.
     fn task_ids_with_tab_attention(&self) -> HashSet<&str> {
         self.workspaces
             .iter()
             .flat_map(|workspace| workspace.tabs.iter())
             .filter(|tab| tab.attention.is_some())
             .filter_map(|tab| tab.task_id.as_deref())
-            .collect()
-    }
-
-    /// Attention reasons of the tasks that reach the inbox as their own rows.
-    fn rail_only_task_attention_reasons(&self) -> Vec<TaskAttentionReason> {
-        let Some(store) = self.task_store.as_ref() else {
-            return Vec::new();
-        };
-        let tabbed = self.task_ids_with_tab_attention();
-        store
-            .tasks()
-            .iter()
-            .filter(|task| task.lifecycle != TaskLifecycle::Archived)
-            .filter(|task| !tabbed.contains(task.task_id.as_str()))
-            .filter_map(|task| task.attention.reason)
             .collect()
     }
 
@@ -13593,22 +13696,13 @@ fi
             .iter()
             .enumerate()
             .flat_map(|(workspace_idx, workspace)| {
-                let machine_name = match &workspace.location {
-                    WorkspaceLocation::Local { .. } => "Local".to_string(),
-                    WorkspaceLocation::RemoteAgent { remote_id, .. } => self
-                        .remote_agent_config_by_id(remote_id)
-                        .map(|agent| agent.name.clone())
-                        .unwrap_or_else(|| remote_id.clone()),
-                    WorkspaceLocation::LegacyRemoteSession { session_name, .. } => {
-                        session_name.clone()
-                    }
-                };
-                workspace.tabs.iter().filter_map(move |tab| {
-                    AttentionItem::for_tab(tab, workspace_idx, &workspace.name, &machine_name, now)
-                })
+                workspace
+                    .tabs
+                    .iter()
+                    .filter_map(move |tab| AttentionItem::for_tab(tab, workspace_idx, now))
             })
             .collect::<Vec<_>>();
-        // Tasks with durable attention join the inbox unless one of their
+        // Tasks with durable attention join the rows unless one of their
         // open session tabs is already surfacing live attention — then the
         // tab row above is the more precise entry for the same thing.
         if let Some(store) = self.task_store.as_ref() {
@@ -13625,7 +13719,7 @@ fi
                 let (priority, icon, label) = task_attention_presentation(reason);
                 // Age from when the reason was raised, not `updated_at` —
                 // that bumps on every progress write and would walk the row
-                // around the inbox while the agent works (TRU-133). Records
+                // around the list while the agent works (TRU-133). Records
                 // written before `since` existed fall back to `updated_at`.
                 let raised_at = task.attention.since.as_deref().unwrap_or(&task.updated_at);
                 let waiting = chrono::DateTime::parse_from_rfc3339(raised_at)
@@ -13637,13 +13731,6 @@ fi
                             .ok()
                     })
                     .unwrap_or_default();
-                let machine_name = match &task.workspace.location {
-                    WorkspaceLocationIdentity::Local { .. } => "Local".to_string(),
-                    WorkspaceLocationIdentity::RemoteAgent { remote_id, .. } => self
-                        .remote_agent_config_by_id(remote_id)
-                        .map(|agent| agent.name.clone())
-                        .unwrap_or_else(|| remote_id.clone()),
-                };
                 let title = match &task.issue {
                     Some(issue) => format!("{} {}", issue.key, task.title),
                     None => task.title.clone(),
@@ -13657,8 +13744,6 @@ fi
                 items.push(AttentionItem {
                     target: AttentionTarget::Task(task.task_id.clone()),
                     workspace_idx,
-                    workspace_name: task.workspace.name.clone(),
-                    machine_name,
                     title,
                     priority,
                     icon,
@@ -13707,6 +13792,105 @@ fi
             .collect::<Vec<_>>();
         sort_open_tab_rows(&mut rows);
         rows
+    }
+
+    /// What a tab is called outside its strip: the chat's own title when
+    /// the index knows it, then the harness topic, then the repo.
+    fn tab_display_title<'a>(&'a self, tab: &'a TabState) -> &'a str {
+        let terminal_title = tab
+            .terminal_title()
+            .map(strip_title_status_glyphs)
+            .filter(|title| !title.is_empty());
+        tab.chat_session_id
+            .as_deref()
+            .and_then(|id| self.chat_index.iter().find(|entry| entry.id == id))
+            .map(|entry| entry.title.as_str())
+            .or(terminal_title)
+            .unwrap_or(tab.repo_name.as_str())
+    }
+
+    /// Feed the needs-you notifier what can need the human right now and
+    /// post a macOS notification for each background transition (TRU-148).
+    /// Runs on the menu poll; off when `notifications.needs_you` is false.
+    fn observe_needs_you(&mut self) {
+        if !self.notifications_config.needs_you {
+            return;
+        }
+        let front = self.front_tab_id();
+        let front_task = self
+            .active_workspace()
+            .and_then(Workspace::active_tab)
+            .and_then(|tab| tab.task_id.clone());
+        let mut observations = Vec::new();
+        for tab in self.workspaces.iter().flat_map(|workspace| &workspace.tabs) {
+            let reason = tab
+                .attention
+                .map(|attention| attention.reason)
+                .filter(|reason| {
+                    matches!(
+                        reason,
+                        AttentionReason::HumanInputRequired | AttentionReason::DelegationBlocked(_)
+                    )
+                });
+            observations.push(NeedsYouObservation {
+                target: AttentionTarget::Tab(tab.id),
+                needs_you: reason.map(AttentionReason::label),
+                running: tab.is_running(),
+                front: front == Some(tab.id),
+                requires_work: reason == Some(AttentionReason::HumanInputRequired)
+                    && tab.agent_session().is_none(),
+            });
+        }
+        // A task whose tab already raised attention is that tab's news.
+        if let Some(store) = self.task_store.as_ref() {
+            let tabbed = self.task_ids_with_tab_attention();
+            for task in store.tasks() {
+                if task.lifecycle == TaskLifecycle::Archived
+                    || tabbed.contains(task.task_id.as_str())
+                    || task.attention.reason != Some(TaskAttentionReason::RequiresInput)
+                {
+                    continue;
+                }
+                observations.push(NeedsYouObservation {
+                    target: AttentionTarget::Task(task.task_id.clone()),
+                    needs_you: Some(
+                        task_attention_presentation(TaskAttentionReason::RequiresInput).2,
+                    ),
+                    running: false,
+                    front: front_task.as_deref() == Some(task.task_id.as_str()),
+                    requires_work: false,
+                });
+            }
+        }
+        for nudge in self
+            .needs_you_notifier
+            .observe(Instant::now(), observations)
+        {
+            let title = match &nudge.target {
+                AttentionTarget::Tab(tab_id) => self
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.tabs)
+                    .find(|tab| tab.id == *tab_id)
+                    .map(|tab| self.tab_display_title(tab).to_string()),
+                AttentionTarget::Task(task_id) => self
+                    .task_store
+                    .as_ref()
+                    .and_then(|store| store.get(task_id))
+                    .map(|task| match &task.issue {
+                        Some(issue) => format!("{} {}", issue.key, task.title),
+                        None => task.title.clone(),
+                    }),
+            };
+            let Some(title) = title else {
+                eprintln!(
+                    "[notify] needs-you target {:?} vanished before posting",
+                    nudge.target
+                );
+                continue;
+            };
+            post_needs_you_notification(&title, nudge.label);
+        }
     }
 
     /// The tab in front of the user: the active tab of the active
@@ -13771,10 +13955,6 @@ fi
             }
             AttentionTarget::Task(task_id) => self.enter_task_context(&task_id),
         }
-    }
-
-    fn restore_webview_after_attention(&mut self) -> Task<Event> {
-        self.apply_webview_surfaces()
     }
 
     fn title(&self) -> String {
@@ -14863,6 +15043,8 @@ fi
                 }
 
                 let _menu_poll_elapsed = _check_menu_start.elapsed();
+
+                self.observe_needs_you();
 
                 // Drain console output for all workspaces
                 let _drain_start = std::time::Instant::now();
@@ -16944,14 +17126,6 @@ fi
                     return Task::none();
                 }
 
-                // Attention flyout: Escape closes, all other keys are consumed.
-                if self.attention_view_open {
-                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
-                        return self.update(Event::AttentionViewClose);
-                    }
-                    return Task::none();
-                }
-
                 if self.task_switcher_open {
                     if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
                         return Task::done(Event::TaskSwitcherClose);
@@ -17168,10 +17342,6 @@ fi
                     // Search shortcuts
                     if modifiers.command() {
                         if let Key::Character(c) = key.as_ref() {
-                            // Cmd+Shift+A - Toggle the global attention view
-                            if (c == "a" || c == "A") && modifiers.shift() {
-                                return Task::done(Event::AttentionViewToggle);
-                            }
                             // Cmd+F - Toggle search
                             if c == "f" {
                                 return Task::done(Event::ToggleSearch);
@@ -20667,39 +20837,6 @@ fi
             Event::AttentionPulseTick => {
                 self.attention_pulse_bright = !self.attention_pulse_bright;
             }
-            Event::AttentionViewToggle => {
-                self.attention_view_open = !self.attention_view_open;
-                if self.attention_view_open {
-                    webview::set_visible(WebviewSurface::Viewer, false);
-                    webview::hide_agent_pages();
-                    return Task::none();
-                }
-                return self.restore_webview_after_attention();
-            }
-            Event::AttentionViewClose => {
-                if self.attention_view_open {
-                    self.attention_view_open = false;
-                    return self.restore_webview_after_attention();
-                }
-            }
-            Event::AttentionItemSelect(tab_id) => {
-                let target =
-                    self.workspaces
-                        .iter()
-                        .enumerate()
-                        .find_map(|(workspace_idx, workspace)| {
-                            workspace
-                                .tabs
-                                .iter()
-                                .position(|tab| tab.id == tab_id)
-                                .map(|tab_idx| (workspace_idx, tab_idx))
-                        });
-                self.attention_view_open = false;
-                if let Some((workspace_idx, tab_idx)) = target {
-                    return self.focus_workspace_tab(workspace_idx, tab_idx);
-                }
-                return self.restore_webview_after_attention();
-            }
             Event::WorkspaceDotPressed(workspace_idx) => {
                 // A dot with something waiting lands on its most urgent
                 // row; an empty one, or an Option-click, just switches.
@@ -20707,33 +20844,17 @@ fi
                 let (rows, _) = self.workspace_rail_state(&items, workspace_idx);
                 return match rail_click_target(&rows) {
                     Some(target) if !self.current_modifiers.alt() => {
-                        self.jump_to_attention_target(target)
+                        // The Usage view closes for a jump the way a rail
+                        // selection closes it, even within this workspace.
+                        let close_usage = if self.usage_view.open {
+                            self.update(Event::WorkspaceSelect(workspace_idx))
+                        } else {
+                            Task::none()
+                        };
+                        Task::batch([close_usage, self.jump_to_attention_target(target)])
                     }
                     _ => self.update(Event::WorkspaceSelect(workspace_idx)),
                 };
-            }
-            Event::AttentionTaskSelect(task_id) => {
-                self.attention_view_open = false;
-                return self.enter_task_context(&task_id);
-            }
-            Event::AttentionDismiss(target) => {
-                // The panel stays open — dismissing several rows in a row is
-                // the whole point of a manual dismiss control.
-                match target {
-                    AttentionTarget::Tab(tab_id) => {
-                        if let Some(tab) = self
-                            .workspaces
-                            .iter_mut()
-                            .flat_map(|ws| ws.tabs.iter_mut())
-                            .find(|t| t.id == tab_id)
-                        {
-                            tab.attention = None;
-                        }
-                    }
-                    AttentionTarget::Task(task_id) => {
-                        self.dismiss_task_attention(&task_id);
-                    }
-                }
             }
             Event::AttentionJumpNext => {
                 // Round-robin search for next tab needing attention
@@ -20842,7 +20963,7 @@ fi
         visible_webview_surface(
             self.viewer_webview,
             self.active_tab_surface(),
-            self.attention_view_open || self.usage_view.open,
+            self.usage_view.open,
         )
     }
 
@@ -21672,13 +21793,6 @@ fi
             Stack::new()
                 .push(main_view)
                 .push(self.view_browser_evidence())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else if self.attention_view_open {
-            Stack::new()
-                .push(main_view)
-                .push(self.view_attention_panel())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -22686,7 +22800,6 @@ fi
         content_col = content_col.push(shortcut_row("Cmd + T", "Switch General/task context"));
         content_col = content_col.push(shortcut_row("Cmd + ↑", "Return to General"));
         content_col = content_col.push(shortcut_row("Cmd + 0", "Open task overview"));
-        content_col = content_col.push(shortcut_row("Cmd + Shift + A", "Open attention view"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + U", "Open usage view"));
         content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to next needs-you"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + W", "Close workspace"));
@@ -24179,63 +24292,10 @@ fi
                 ..Default::default()
             });
 
-        let rail_task_reasons = self.rail_only_task_attention_reasons();
-        let attention_count = self
-            .workspaces
-            .iter()
-            .map(Workspace::attention_count)
-            .sum::<usize>()
-            + rail_task_reasons.len();
-        let attention_priority = self
-            .workspaces
-            .iter()
-            .filter_map(Workspace::highest_priority_attention)
-            .map(AttentionReason::priority)
-            .chain(
-                rail_task_reasons
-                    .iter()
-                    .map(|reason| task_attention_presentation(*reason).0),
-            )
-            .min();
-        let attention_color = match attention_priority {
-            Some(0) => {
-                if self.attention_pulse_bright {
-                    theme.peach()
-                } else {
-                    theme.warning()
-                }
-            }
-            Some(1) => theme.danger(),
-            Some(2) => theme.peach(),
-            Some(_) => theme.success(),
-            None => theme.text_muted(),
-        };
-        let attention_hover = theme.surface0();
-        let attention_active = self.attention_view_open;
-        let attention_btn = button(
-            text(format!("⚡ {attention_count}"))
-                .size(11)
-                .color(attention_color)
-                .font(iced::Font::with_name("Menlo")),
-        )
-        .style(move |_theme, status| button::Style {
-            background: if attention_active || matches!(status, button::Status::Hovered) {
-                Some(attention_hover.into())
-            } else {
-                Some(iced::Color::TRANSPARENT.into())
-            },
-            text_color: attention_color,
-            border: iced::Border::default(),
-            ..Default::default()
-        })
-        .padding([6, 10])
-        .on_press(Event::AttentionViewToggle);
-
         let bar_inner = row![
             scrollable_bar,
             control_separator,
             container(browser_controls).padding([0, 6]),
-            attention_btn,
             help_btn
         ]
         .spacing(0)
@@ -24251,245 +24311,6 @@ fi
                 });
 
         column![top_border, bar_container].into()
-    }
-
-    fn view_attention_panel(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let bg = theme.bg_surface();
-        let row_bg = theme.bg_base();
-        let hover_bg = theme.surface0();
-        let border_color = theme.border();
-        let text_primary = theme.text_primary();
-        let text_secondary = theme.text_secondary();
-        let text_muted = theme.text_muted();
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-        let mono = iced::Font::with_name("Menlo");
-        let items = self.attention_items();
-        let item_count = items.len();
-
-        let close_btn = button(text("×").size(font + 2.0).color(text_secondary))
-            .style(move |_theme, status| button::Style {
-                background: matches!(status, button::Status::Hovered).then_some(hover_bg.into()),
-                text_color: text_secondary,
-                border: iced::Border::default(),
-                ..Default::default()
-            })
-            .padding([2, 7])
-            .on_press(Event::AttentionViewClose);
-
-        let header = column![
-            row![
-                text("Attention")
-                    .size(font + 1.0)
-                    .color(text_primary)
-                    .font(mono),
-                iced::widget::Space::new().width(Length::Fill),
-                close_btn,
-            ]
-            .align_y(iced::Alignment::Center),
-            text(if item_count == 1 {
-                "1 item needs you".to_string()
-            } else {
-                format!("{item_count} items need you")
-            })
-            .size(font_small)
-            .color(text_secondary),
-        ]
-        .spacing(2);
-
-        let mut item_list = Column::new().spacing(5).width(Length::Fill);
-        if items.is_empty() {
-            item_list =
-                item_list.push(
-                    container(
-                        column![
-                        text("You're caught up")
-                            .size(font)
-                            .color(text_primary)
-                            .font(mono),
-                        text("Input requests, failures, and completed agent work will appear here.")
-                            .size(font_small)
-                            .color(text_secondary),
-                    ]
-                        .spacing(6),
-                    )
-                    .padding([24, 10]),
-                );
-        } else {
-            let mut actionable_heading_added = false;
-            let mut review_heading_added = false;
-            for item in items {
-                // Items arrive priority-sorted, so review rows (the highest
-                // priority value) always trail the actionable ones.
-                if item.priority == 3 {
-                    if !review_heading_added {
-                        item_list = item_list.push(
-                            text("READY TO REVIEW")
-                                .size(font_small - 1.0)
-                                .color(text_muted)
-                                .font(mono),
-                        );
-                        review_heading_added = true;
-                    }
-                } else if !actionable_heading_added {
-                    item_list = item_list.push(
-                        text("NEEDS YOU")
-                            .size(font_small - 1.0)
-                            .color(text_muted)
-                            .font(mono),
-                    );
-                    actionable_heading_added = true;
-                }
-
-                let reason_color = match item.priority {
-                    0 => theme.warning(),
-                    1 => theme.danger(),
-                    2 => theme.peach(),
-                    _ => theme.success(),
-                };
-                let age = format_attention_age(item.waiting.as_secs());
-                let location = format!("{} · {}", item.machine_name, item.workspace_name);
-                let tab_name = if item.title.chars().count() > 44 {
-                    format!("{}…", truncate_str(&item.title, 43))
-                } else {
-                    item.title
-                };
-
-                let status_line = row![
-                    text(item.icon).size(font_small).color(reason_color),
-                    text(item.label)
-                        .size(font_small)
-                        .color(reason_color)
-                        .font(mono),
-                    iced::widget::Space::new().width(Length::Fill),
-                    text(age).size(font_small).color(text_muted).font(mono),
-                ]
-                .spacing(6)
-                .align_y(iced::Alignment::Center);
-
-                let dismiss_target = item.target.clone();
-                let item_button = button(
-                    column![
-                        status_line,
-                        text(tab_name).size(font).color(text_primary).font(mono),
-                        text(location).size(font_small).color(text_secondary),
-                    ]
-                    .spacing(3)
-                    .width(Length::Fill),
-                )
-                .style(move |_theme, status| button::Style {
-                    background: Some(
-                        if matches!(status, button::Status::Hovered) {
-                            hover_bg
-                        } else {
-                            row_bg
-                        }
-                        .into(),
-                    ),
-                    text_color: text_primary,
-                    border: iced::Border {
-                        color: border_color,
-                        width: 1.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                })
-                .padding([8, 10])
-                .width(Length::Fill)
-                .on_press(match item.target {
-                    AttentionTarget::Tab(tab_id) => Event::AttentionItemSelect(tab_id),
-                    AttentionTarget::Task(task_id) => Event::AttentionTaskSelect(task_id),
-                });
-                // A sibling, not a nested button — dismiss clears the row
-                // without visiting it.
-                let dismiss_button = button(text("✕").size(font_small).font(mono))
-                    .style(move |_theme, status| button::Style {
-                        background: Some(
-                            if matches!(status, button::Status::Hovered) {
-                                hover_bg
-                            } else {
-                                row_bg
-                            }
-                            .into(),
-                        ),
-                        text_color: if matches!(status, button::Status::Hovered) {
-                            text_primary
-                        } else {
-                            text_muted
-                        },
-                        border: iced::Border {
-                            color: border_color,
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        ..Default::default()
-                    })
-                    .padding([8, 8])
-                    .on_press(Event::AttentionDismiss(dismiss_target));
-                item_list = item_list.push(
-                    row![item_button, dismiss_button]
-                        .spacing(4)
-                        .align_y(iced::Alignment::Center),
-                );
-            }
-        }
-
-        let separator = container(iced::widget::Space::new().height(0))
-            .width(Length::Fill)
-            .height(Length::Fixed(1.0))
-            .style(move |_| container::Style {
-                background: Some(border_color.into()),
-                ..Default::default()
-            });
-        let panel = container(
-            column![
-                header,
-                separator,
-                scrollable(item_list.padding([4, 0])).height(Length::Fixed(340.0)),
-            ]
-            .spacing(10),
-        )
-        .width(Length::Fixed(390.0))
-        .padding(14)
-        .style(move |_| container::Style {
-            background: Some(bg.into()),
-            border: iced::Border {
-                color: border_color,
-                width: 1.0,
-                radius: 9.0.into(),
-            },
-            shadow: iced::Shadow {
-                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 16.0,
-            },
-            ..Default::default()
-        });
-
-        let backdrop = iced::widget::mouse_area(
-            container(iced::widget::Space::new())
-                .width(Length::Fill)
-                .height(Length::Fill),
-        )
-        .on_press(Event::AttentionViewClose);
-
-        Stack::new()
-            .push(backdrop)
-            .push(
-                container(panel)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(iced::Alignment::End)
-                    .align_y(iced::Alignment::End)
-                    .padding(iced::Padding {
-                        top: 0.0,
-                        right: 12.0,
-                        bottom: 40.0,
-                        left: 0.0,
-                    }),
-            )
-            .into()
     }
 
     fn view_spine(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -29077,19 +28898,7 @@ fi
             let workspace = &self.workspaces[row_state.workspace_idx];
             let tab = &workspace.tabs[row_state.tab_idx];
             let is_front = front == Some(row_state.tab_id);
-            let terminal_title = tab
-                .terminal_title()
-                .map(strip_title_status_glyphs)
-                .filter(|title| !title.is_empty());
-            // A chat's own title when the index knows it, then the
-            // harness topic, then the repo.
-            let title = tab
-                .chat_session_id
-                .as_deref()
-                .and_then(|id| self.chat_index.iter().find(|entry| entry.id == id))
-                .map(|entry| entry.title.as_str())
-                .or(terminal_title)
-                .unwrap_or(tab.repo_name.as_str());
+            let title = self.tab_display_title(tab);
             let title = if title.chars().count() > 34 {
                 format!("{}…", truncate_str(title, 33))
             } else {
@@ -35174,7 +34983,7 @@ mod tests {
             let now = base + Duration::from_millis(1_000 + 100 * frame as u64);
             let mut items = [&parent, &younger, &older]
                 .into_iter()
-                .filter_map(|tab| AttentionItem::for_tab(tab, 0, "ws", "Local", now))
+                .filter_map(|tab| AttentionItem::for_tab(tab, 0, now))
                 .collect::<Vec<_>>();
             sort_attention_items(&mut items);
             for item in &items {
@@ -35209,8 +35018,6 @@ mod tests {
         AttentionItem {
             target,
             workspace_idx: Some(0),
-            workspace_name: "ws".to_string(),
-            machine_name: "Local".to_string(),
             title: "row".to_string(),
             priority,
             icon: "●",
@@ -35334,6 +35141,152 @@ mod tests {
         assert!(!open_section_includes(false, false));
     }
 
+    fn needs_you_seen(
+        tab_id: usize,
+        needs_you: Option<&'static str>,
+        running: bool,
+        front: bool,
+        requires_work: bool,
+    ) -> NeedsYouObservation {
+        NeedsYouObservation {
+            target: AttentionTarget::Tab(tab_id),
+            needs_you,
+            running,
+            front,
+            requires_work,
+        }
+    }
+
+    #[test]
+    fn needs_you_notifies_once_per_background_transition() {
+        const INPUT: &str = "Input or approval needed";
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut notifier = NeedsYouNotifier::new(start);
+
+        // Raised during the launch grace: restored state, never news —
+        // and still raised afterwards, so it is no transition later either.
+        assert!(notifier
+            .observe(at(1), [needs_you_seen(1, Some(INPUT), true, false, false)])
+            .is_empty());
+        assert!(notifier
+            .observe(
+                at(10),
+                [needs_you_seen(1, Some(INPUT), false, false, false)]
+            )
+            .is_empty());
+
+        // A background chat tab raises a request: one nudge, then quiet
+        // while it stays raised.
+        let nudge = notifier.observe(
+            at(10),
+            [
+                needs_you_seen(1, Some(INPUT), false, false, false),
+                needs_you_seen(2, Some(INPUT), true, false, false),
+            ],
+        );
+        assert_eq!(
+            nudge,
+            vec![NeedsYouNudge {
+                target: AttentionTarget::Tab(2),
+                label: INPUT
+            }]
+        );
+        assert!(notifier
+            .observe(at(11), [needs_you_seen(2, Some(INPUT), true, false, false)])
+            .is_empty());
+
+        // Cleared and raised again within a minute: debounced.
+        notifier.observe(at(12), [needs_you_seen(2, None, true, false, false)]);
+        assert!(notifier
+            .observe(at(20), [needs_you_seen(2, Some(INPUT), true, false, false)])
+            .is_empty());
+
+        // ...but a minute after the last nudge it is news again.
+        notifier.observe(at(30), [needs_you_seen(2, None, true, false, false)]);
+        assert_eq!(
+            notifier
+                .observe(at(71), [needs_you_seen(2, Some(INPUT), true, false, false)])
+                .len(),
+            1
+        );
+
+        // A different reason on the same tab is its own transition.
+        let blocked =
+            AttentionReason::DelegationBlocked(gitterm::tasks::DelegationKind::Implement).label();
+        assert_eq!(
+            notifier
+                .observe(
+                    at(72),
+                    [needs_you_seen(2, Some(blocked), false, false, false)]
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn needs_you_skips_the_front_tab_and_unworked_idle_titles() {
+        const INPUT: &str = "Input or approval needed";
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut notifier = NeedsYouNotifier::new(start);
+
+        // Raised while in front: no nudge, and switching away later is not
+        // a transition.
+        assert!(notifier
+            .observe(at(10), [needs_you_seen(1, Some(INPUT), true, true, false)])
+            .is_empty());
+        assert!(notifier
+            .observe(
+                at(11),
+                [needs_you_seen(1, Some(INPUT), false, false, false)]
+            )
+            .is_empty());
+
+        // A terminal booting to "✳" without ever working: quiet.
+        notifier.observe(at(12), [needs_you_seen(3, None, false, false, true)]);
+        assert!(notifier
+            .observe(at(13), [needs_you_seen(3, Some(INPUT), false, false, true)])
+            .is_empty());
+
+        // Worked ("◐"), then idle ("✳") in the background: news.
+        notifier.observe(at(14), [needs_you_seen(3, None, true, false, true)]);
+        assert_eq!(
+            notifier.observe(at(15), [needs_you_seen(3, Some(INPUT), false, false, true)]),
+            vec![NeedsYouNudge {
+                target: AttentionTarget::Tab(3),
+                label: INPUT
+            }]
+        );
+
+        // The working mark is spent by that transition: going idle again
+        // after the debounce without new work stays quiet.
+        notifier.observe(at(80), [needs_you_seen(3, None, false, false, true)]);
+        assert!(notifier
+            .observe(at(81), [needs_you_seen(3, Some(INPUT), false, false, true)])
+            .is_empty());
+
+        // A task needing input is news without any working signal.
+        let task = NeedsYouObservation {
+            target: AttentionTarget::Task("task-1".to_string()),
+            needs_you: Some("Input or approval needed"),
+            running: false,
+            front: false,
+            requires_work: false,
+        };
+        assert_eq!(notifier.observe(at(90), [task]).len(), 1);
+    }
+
+    #[test]
+    fn notification_script_quotes_its_text() {
+        assert_eq!(
+            needs_you_notification_script("Fix \"the\" inbox", "Worker blocked"),
+            r#"display notification "Worker blocked" with title "Fix \"the\" inbox""#
+        );
+        assert_eq!(applescript_string("a\\b\nc"), r#""a\\b c""#);
+    }
+
     #[test]
     fn working_titles_are_running_and_idle_titles_are_not() {
         assert!(terminal_title_shows_working("◐ Fix the inbox"));
@@ -35375,8 +35328,7 @@ mod tests {
         assert_eq!(strip_title_status_glyphs("✳"), "");
         let mut tab = TabState::new(1, PathBuf::from("/tmp/inbox-fallback"));
         tab.observe_terminal_title("✳ ".to_string());
-        let item = AttentionItem::for_tab(&tab, 0, "ws", "Local", Instant::now())
-            .expect("✳ raises attention");
+        let item = AttentionItem::for_tab(&tab, 0, Instant::now()).expect("✳ raises attention");
         assert_eq!(item.title, "inbox-fallback");
     }
 
