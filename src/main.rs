@@ -2767,7 +2767,51 @@ struct AttentionItem {
     priority: u8,
     icon: &'static str,
     label: &'static str,
-    age_secs: u64,
+    /// How long this row has been waiting, unrounded. Ordering on whole
+    /// seconds let two rows raised under a second apart tie on some frames
+    /// and not on others, so they swapped places every half second
+    /// (TRU-133); the exact duration keeps their gap — and order — fixed.
+    waiting: Duration,
+}
+
+impl AttentionItem {
+    /// The inbox row for a tab's live attention, aged against `now`.
+    fn for_tab(
+        tab: &TabState,
+        workspace_name: &str,
+        machine_name: &str,
+        now: Instant,
+    ) -> Option<Self> {
+        let attention = tab.attention?;
+        let title = tab
+            .terminal_title()
+            .map(strip_title_status_glyphs)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(tab.repo_name.as_str())
+            .to_string();
+        Some(Self {
+            target: AttentionTarget::Tab(tab.id),
+            workspace_name: workspace_name.to_string(),
+            machine_name: machine_name.to_string(),
+            title,
+            priority: attention.reason.priority(),
+            icon: attention.reason.icon(),
+            label: attention.reason.label(),
+            waiting: now.saturating_duration_since(attention.since),
+        })
+    }
+}
+
+/// Inbox order: priority, then longest-waiting first, then the target id.
+/// Every key is fixed while a row's attention is unchanged, so rows never
+/// trade places between frames.
+fn sort_attention_items(items: &mut [AttentionItem]) {
+    items.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then(right.waiting.cmp(&left.waiting))
+            .then_with(|| left.target.cmp(&right.target))
+    });
 }
 
 fn format_attention_age(elapsed_secs: u64) -> String {
@@ -2820,6 +2864,24 @@ fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
     title
         .starts_with('✳')
         .then_some(AttentionReason::HumanInputRequired)
+}
+
+/// A harness title with its leading status glyphs removed. Claude Code
+/// writes "✳ <topic>" while it is not working and alternates "◐ <topic>" /
+/// "◑ <topic>" every ~1s while it is; older builds and other harnesses use
+/// the "·✢✶✻✽" sparkle set or braille spinners, and shells may prefix "*".
+/// The topic after the glyph is what a row or progress line should show —
+/// the glyph changes every frame and would make the text churn.
+fn strip_title_status_glyphs(title: &str) -> &str {
+    title
+        .trim_start_matches(|ch: char| {
+            matches!(
+                ch,
+                '✳' | '✢' | '✶' | '✻' | '✽' | '·' | '◐' | '◑' | '◒' | '◓' | '*'
+            ) || ('\u{2800}'..='\u{28FF}').contains(&ch)
+                || ch.is_whitespace()
+        })
+        .trim_end()
 }
 
 /// Inbox presentation for a task attention reason on the shared priority
@@ -3601,6 +3663,24 @@ impl TabState {
             .is_none_or(|attention| attention.reason != reason)
         {
             self.attention = Some(TabAttention::new(reason));
+        }
+    }
+
+    /// Record a new terminal title and apply the title adapter: Claude Code
+    /// prefixes its title with "✳" (U+2733) whenever it is not working —
+    /// idle at the prompt or waiting on an approval — and animates "◐"/"◑"
+    /// while it is. A ✳ raises input-needed only on a tab with no other
+    /// attention: replacing a delegation result would restamp `since` and
+    /// jump the row to the top, and the next working frame would then clear
+    /// it — the result's row gone before its card was read (TRU-133).
+    /// Re-sent ✳ frames (topic renames) keep the original `since`.
+    fn observe_terminal_title(&mut self, title: String) {
+        let waiting = terminal_title_attention_reason(&title);
+        self.set_terminal_title(Some(title));
+        match waiting {
+            Some(reason) if self.attention.is_none() => self.set_attention(reason),
+            Some(_) => {}
+            None => self.clear_attention(AttentionReason::HumanInputRequired),
         }
     }
 
@@ -13363,6 +13443,7 @@ fi
 
     fn attention_items(&self) -> Vec<AttentionItem> {
         let now = Instant::now();
+        let now_utc = chrono::Utc::now();
         let mut items = self
             .workspaces
             .iter()
@@ -13378,23 +13459,7 @@ fi
                     }
                 };
                 workspace.tabs.iter().filter_map(move |tab| {
-                    let attention = tab.attention?;
-                    let title = tab
-                        .terminal_title()
-                        .unwrap_or(tab.repo_name.as_str())
-                        .trim_start_matches('✳')
-                        .trim()
-                        .to_string();
-                    Some(AttentionItem {
-                        target: AttentionTarget::Tab(tab.id),
-                        workspace_name: workspace.name.clone(),
-                        machine_name: machine_name.clone(),
-                        title,
-                        priority: attention.reason.priority(),
-                        icon: attention.reason.icon(),
-                        label: attention.reason.label(),
-                        age_secs: now.saturating_duration_since(attention.since).as_secs(),
-                    })
+                    AttentionItem::for_tab(tab, &workspace.name, &machine_name, now)
                 })
             })
             .collect::<Vec<_>>();
@@ -13418,15 +13483,15 @@ fi
                 // around the inbox while the agent works (TRU-133). Records
                 // written before `since` existed fall back to `updated_at`.
                 let raised_at = task.attention.since.as_deref().unwrap_or(&task.updated_at);
-                let age_secs = chrono::DateTime::parse_from_rfc3339(raised_at)
+                let waiting = chrono::DateTime::parse_from_rfc3339(raised_at)
                     .ok()
-                    .map(|updated| {
-                        chrono::Utc::now()
-                            .signed_duration_since(updated.with_timezone(&chrono::Utc))
-                            .num_seconds()
-                            .max(0) as u64
+                    .and_then(|raised| {
+                        now_utc
+                            .signed_duration_since(raised.with_timezone(&chrono::Utc))
+                            .to_std()
+                            .ok()
                     })
-                    .unwrap_or(0);
+                    .unwrap_or_default();
                 let machine_name = match &task.workspace.location {
                     WorkspaceLocationIdentity::Local { .. } => "Local".to_string(),
                     WorkspaceLocationIdentity::RemoteAgent { remote_id, .. } => self
@@ -13446,18 +13511,11 @@ fi
                     priority,
                     icon,
                     label,
-                    age_secs,
+                    waiting,
                 });
             }
         }
-        // Oldest-waiting first within a priority; the target id breaks ties
-        // so two rows with equal ages never swap between frames.
-        items.sort_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
-                .then(right.age_secs.cmp(&left.age_secs))
-                .then_with(|| left.target.cmp(&right.target))
-        });
+        sort_attention_items(&mut items);
         items
     }
 
@@ -14246,22 +14304,14 @@ fi
                                     );
                             }
                             iced_term::actions::Action::ChangeTitle(title) => {
-                                // Set tab-specific title
-                                tab.set_terminal_title(Some(title.clone()));
-                                // Compatibility adapter: Claude Code prefixes its title with
-                                // "✳" (U+2733) while waiting for input or approval.
-                                if let Some(reason) = terminal_title_attention_reason(&title) {
-                                    tab.set_attention(reason);
-                                } else {
-                                    tab.clear_attention(AttentionReason::HumanInputRequired);
-                                }
+                                tab.observe_terminal_title(title.clone());
                                 if let Some(task_id) = tab.task_id.clone() {
                                     // Progress capture: the title is the
                                     // session's own latest self-description
                                     // (Claude Code writes its topic there).
                                     // cwd-style titles from plain shells are
                                     // not progress.
-                                    let update_line = title.trim_start_matches('✳').trim();
+                                    let update_line = strip_title_status_glyphs(&title);
                                     if !update_line.is_empty()
                                         && !update_line.starts_with('/')
                                         && !update_line.starts_with('~')
@@ -24026,7 +24076,7 @@ fi
                     2 => theme.peach(),
                     _ => theme.success(),
                 };
-                let age = format_attention_age(item.age_secs);
+                let age = format_attention_age(item.waiting.as_secs());
                 let location = format!("{} · {}", item.machine_name, item.workspace_name);
                 let tab_name = if item.title.chars().count() > 44 {
                     format!("{}…", truncate_str(&item.title, 43))
@@ -34618,6 +34668,121 @@ mod tests {
         assert_eq!(format_attention_age(90), "1m");
         assert_eq!(format_attention_age(2 * 60 * 60), "2h");
         assert_eq!(format_attention_age(3 * 24 * 60 * 60), "3d");
+    }
+
+    #[test]
+    fn attention_inbox_rows_hold_still_while_agents_work() {
+        use gitterm::tasks::DelegationKind;
+        let base = Instant::now();
+        let topic = |glyph: &str| format!("{glyph} Fix the inbox");
+
+        // Two Claude tabs that went idle 500ms apart, as restored sessions
+        // do when GitTerm relaunches them together. The older one has the
+        // higher tab id, so a whole-second tie hands the tie-breaker to the
+        // younger one: with seconds as the key their order flipped twice a
+        // second.
+        let mut older = TabState::new(2, PathBuf::from("/tmp/inbox-older"));
+        older.observe_terminal_title(topic("✳"));
+        older.attention = older.attention.map(|attention| TabAttention {
+            since: base,
+            ..attention
+        });
+        let mut younger = TabState::new(1, PathBuf::from("/tmp/inbox-younger"));
+        younger.observe_terminal_title(topic("✳"));
+        younger.attention = younger.attention.map(|attention| TabAttention {
+            since: base + Duration::from_millis(500),
+            ..attention
+        });
+        let older_since = older.attention.map(|attention| attention.since);
+        let younger_since = younger.attention.map(|attention| attention.since);
+
+        // A third tab whose delegated review came back while its Claude
+        // works on: the spinner animates the title every frame and Claude
+        // goes idle (✳) partway through.
+        let mut parent = TabState::new(3, PathBuf::from("/tmp/inbox-parent"));
+        parent.set_attention(AttentionReason::DelegationReady(DelegationKind::Review));
+        let parent_since = parent.attention.map(|attention| attention.since);
+
+        let frames = ["◐", "◑", "◐", "✳", "◑", "◐", "✳", "✳", "◑", "◐"];
+        let mut seen_orders = std::collections::BTreeSet::new();
+        for (frame, glyph) in frames.iter().enumerate() {
+            // Idle tabs re-send their ✳ title (topic renames); the parent
+            // animates.
+            older.observe_terminal_title(topic("✳"));
+            younger.observe_terminal_title(topic("✳"));
+            parent.observe_terminal_title(topic(glyph));
+            assert_eq!(older.attention.map(|a| a.since), older_since);
+            assert_eq!(younger.attention.map(|a| a.since), younger_since);
+            assert_eq!(
+                parent.attention.map(|a| (a.reason, a.since)),
+                parent_since.map(|since| {
+                    (
+                        AttentionReason::DelegationReady(DelegationKind::Review),
+                        since,
+                    )
+                }),
+                "frame {frame} ({glyph}) must not displace or restamp the delegation row"
+            );
+
+            let now = base + Duration::from_millis(1_000 + 100 * frame as u64);
+            let mut items = [&parent, &younger, &older]
+                .into_iter()
+                .filter_map(|tab| AttentionItem::for_tab(tab, "ws", "Local", now))
+                .collect::<Vec<_>>();
+            sort_attention_items(&mut items);
+            for item in &items {
+                assert_eq!(
+                    item.title, "Fix the inbox",
+                    "frame {frame}: spinner glyph in title"
+                );
+            }
+            seen_orders.insert(
+                items
+                    .iter()
+                    .map(|item| item.target.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            seen_orders.into_iter().collect::<Vec<_>>(),
+            vec![vec![
+                AttentionTarget::Tab(2),
+                AttentionTarget::Tab(1),
+                AttentionTarget::Tab(3),
+            ]],
+            "rows must keep one order across frames"
+        );
+
+        // A working frame on an idle tab is a real state change: it clears.
+        older.observe_terminal_title(topic("◐"));
+        assert!(!older.needs_attention());
+    }
+
+    #[test]
+    fn title_status_glyphs_strip_to_the_topic() {
+        assert_eq!(
+            strip_title_status_glyphs("✳ Fix the inbox"),
+            "Fix the inbox"
+        );
+        assert_eq!(
+            strip_title_status_glyphs("◑ Fix the inbox"),
+            "Fix the inbox"
+        );
+        assert_eq!(
+            strip_title_status_glyphs("✻ Fix the inbox "),
+            "Fix the inbox"
+        );
+        assert_eq!(
+            strip_title_status_glyphs("⠐ Fix the inbox"),
+            "Fix the inbox"
+        );
+        assert_eq!(strip_title_status_glyphs("* shell"), "shell");
+        assert_eq!(strip_title_status_glyphs("✳"), "");
+        let mut tab = TabState::new(1, PathBuf::from("/tmp/inbox-fallback"));
+        tab.observe_terminal_title("✳ ".to_string());
+        let item = AttentionItem::for_tab(&tab, "ws", "Local", Instant::now())
+            .expect("✳ raises attention");
+        assert_eq!(item.title, "inbox-fallback");
     }
 
     #[test]
