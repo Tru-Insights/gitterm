@@ -28899,23 +28899,56 @@ fi
             let tab = &workspace.tabs[row_state.tab_idx];
             let is_front = front == Some(row_state.tab_id);
             let title = self.tab_display_title(tab);
-            let title = if title.chars().count() > 34 {
-                format!("{}…", truncate_str(title, 33))
+            let title = if title.chars().count() > 48 {
+                format!("{}…", truncate_str(title, 47))
             } else {
                 title.to_string()
             };
             let (icon, icon_color) =
                 self.session_tab_icon(tab, is_front, tab.terminal_title().unwrap_or_default());
+            // Second line: where the tab lives and what it is about, since a
+            // click jumps straight there with no preview in between.
+            let mut place = workspace.name.clone();
+            if tab.is_git_repo && !tab.branch_name.is_empty() {
+                place.push_str(" · ");
+                place.push_str(&tab.branch_name);
+            }
+            let about: Option<String> = match &tab.kind {
+                TabKind::Agent(session) => {
+                    chat_rank::last_prompt(&session.conversation).map(str::to_string)
+                }
+                _ => tab
+                    .chat_session_id
+                    .as_deref()
+                    .and_then(|id| self.find_chat_entry(id))
+                    .map(|(_, entry)| entry.title.clone()),
+            };
+            let about = about
+                .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|t| !t.is_empty() && t != &title);
+            let mut detail = place;
+            if let Some(about) = about {
+                detail.push_str(" — ");
+                detail.push_str(&about);
+            }
+            let detail = if detail.chars().count() > 72 {
+                format!("{}…", truncate_str(&detail, 71))
+            } else {
+                detail
+            };
             let content = row![
                 text(icon.trim_end()).size(font_small).color(icon_color),
-                text(title).size(font_small).color(theme.text_primary()),
-                iced::widget::Space::new().width(Length::Fill),
-                text(workspace.name.clone())
-                    .size(font_small - 1.0)
-                    .color(theme.text_muted()),
+                column![
+                    text(title).size(font_small).color(theme.text_primary()),
+                    text(detail)
+                        .size(font_small - 1.0)
+                        .color(theme.text_muted()),
+                ]
+                .spacing(1)
+                .width(Length::Fill),
             ]
             .spacing(6)
-            .align_y(iced::Alignment::Center);
+            .align_y(iced::Alignment::Start);
             let btn = button(content)
                 .padding([4, 8])
                 .width(Length::Fill)
