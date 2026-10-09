@@ -37,9 +37,10 @@
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
     font-size: 14px;
     /* Iced draws the rest of the app without CoreText stem darkening, so
-       regular SF in WebKit reads heavy beside it; light weight and a
-       slightly dimmer text colour bring the chat in line. */
-    font-weight: 300;
+       regular SF in WebKit reads heavy beside it; a slightly dimmer text
+       colour (--fg) softens that without going to a light weight, which
+       Tracey found too thin. */
+    font-weight: 400;
     /* Light text on a dark background renders visibly heavier with
        subpixel smoothing in WebKit; grayscale antialiasing keeps the
        regular weight looking regular. */
