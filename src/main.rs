@@ -188,6 +188,13 @@ pub enum AgentIpcMessage {
         tab_id: usize,
         path: PathBuf,
     },
+    /// A global shortcut typed while the chat page had keyboard focus, so
+    /// the key never reached the Iced key handler (TRU-140). Only chords
+    /// `global_shortcut` knows get here.
+    HostKey {
+        key: Key,
+        modifiers: Modifiers,
+    },
 }
 
 /// Where a delegation request came from, so its acceptance or refusal
@@ -436,6 +443,97 @@ fn reset_agent_webview(tab_id: usize) {
     );
 }
 
+/// A chord with the same app-wide meaning whatever has focus. The Iced key
+/// handler acts on these (resolving them against app state: which tabs are
+/// visible, how many workspaces exist, which overlay is open), and a chat
+/// page forwards exactly these when it has keyboard focus, since its keys
+/// never reach the handler (TRU-140).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalShortcut {
+    /// Ctrl+Space: start or stop dictation (`stt` builds).
+    Dictation,
+    /// Ctrl+1…9: the nth workspace.
+    SelectWorkspace(usize),
+    /// Cmd+1…9: the nth visible tab.
+    SelectTab(usize),
+    /// Cmd+Shift+U: the Usage view.
+    UsageView,
+    /// Cmd+T: the task switcher.
+    TaskSwitcher,
+    /// Escape with no modifiers: dismiss the topmost app overlay. The key
+    /// handler resolves Escape against app state itself; it is listed here
+    /// so a chat page can forward it.
+    Escape,
+}
+
+/// Which global shortcut `key` with `modifiers` is, if any. Pure, so the
+/// Iced key handler and the chat page's forwarded keys share one table.
+fn global_shortcut(key: &Key, modifiers: Modifiers) -> Option<GlobalShortcut> {
+    match key.as_ref() {
+        Key::Named(key::Named::Space)
+            if modifiers.control()
+                && !modifiers.command()
+                && !modifiers.shift()
+                && !modifiers.alt() =>
+        {
+            Some(GlobalShortcut::Dictation)
+        }
+        Key::Named(key::Named::Escape) if modifiers.is_empty() => Some(GlobalShortcut::Escape),
+        Key::Character(c) => {
+            let digit = c.parse::<usize>().ok().filter(|n| (1..=9).contains(n));
+            if let Some(num) = digit {
+                if modifiers.control() && !modifiers.command() {
+                    return Some(GlobalShortcut::SelectWorkspace(num));
+                }
+                if modifiers.command() {
+                    return Some(GlobalShortcut::SelectTab(num));
+                }
+                return None;
+            }
+            if modifiers.command() && modifiers.shift() && c.eq_ignore_ascii_case("u") {
+                return Some(GlobalShortcut::UsageView);
+            }
+            if modifiers.command()
+                && !modifiers.shift()
+                && !modifiers.control()
+                && c.eq_ignore_ascii_case("t")
+            {
+                return Some(GlobalShortcut::TaskSwitcher);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Read a chord a chat page forwarded (`{type: "hostkey", key, code, meta,
+/// ctrl, shift, alt}`) as the key and modifiers the Iced key handler would
+/// have seen. `key` is the DOM `KeyboardEvent.key` (the logical key, as
+/// Iced reports it); `code` is not needed.
+fn hostkey_chord(value: &serde_json::Value) -> Result<(Key, Modifiers), String> {
+    let name = value.get("key").and_then(|v| v.as_str()).ok_or("no key")?;
+    let key = match name {
+        "Escape" => Key::Named(key::Named::Escape),
+        " " => Key::Named(key::Named::Space),
+        c if c.chars().count() == 1 => Key::Character(c.into()),
+        other => return Err(format!("unsupported key {other:?}")),
+    };
+    let mut modifiers = Modifiers::empty();
+    for (field, flag) in [
+        ("meta", Modifiers::LOGO),
+        ("ctrl", Modifiers::CTRL),
+        ("shift", Modifiers::SHIFT),
+        ("alt", Modifiers::ALT),
+    ] {
+        match value.get(field) {
+            Some(serde_json::Value::Bool(true)) => modifiers.insert(flag),
+            Some(serde_json::Value::Bool(false)) => {}
+            _ => return Err(format!("no boolean {field}")),
+        }
+    }
+    Ok((key, modifiers))
+}
+
 /// Build the IPC handler closure to install at agent-webview creation. Parses
 /// each `window.ipc.postMessage(...)` body and forwards as a typed message
 /// into the global IPC channel for the Iced subscription to pick up.
@@ -600,6 +698,22 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     tab_id,
                     path: PathBuf::from(path),
                 }
+            }
+            "hostkey" => {
+                let (key, modifiers) = match hostkey_chord(&value) {
+                    Ok(chord) => chord,
+                    Err(e) => {
+                        eprintln!("[agent-ipc] tab {tab_id}: bad hostkey ({e}): {body}");
+                        return;
+                    }
+                };
+                if global_shortcut(&key, modifiers).is_none() {
+                    eprintln!(
+                        "[agent-ipc] tab {tab_id}: ignoring hostkey {key:?} {modifiers:?}, not a global shortcut"
+                    );
+                    return;
+                }
+                AgentIpcMessage::HostKey { key, modifiers }
             }
             "open_url" => {
                 let url = value.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -14661,6 +14775,17 @@ fi
                     AgentIpcMessage::OpenFile { tab_id, path } => {
                         Task::done(Event::DelegationOpenFile(tab_id, path))
                     }
+                    AgentIpcMessage::HostKey { key, modifiers } => {
+                        // Run the chord through the Iced key handler, so it
+                        // means exactly what it means anywhere else. The
+                        // handler records the chord's modifiers as held;
+                        // Iced never saw them pressed and will not report
+                        // their release, so restore what it last reported.
+                        let held = self.current_modifiers;
+                        let task = self.update(Event::KeyPressed(key, modifiers));
+                        self.current_modifiers = held;
+                        task
+                    }
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
@@ -16371,17 +16496,16 @@ fi
                     if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
                         return self.update(Event::UsageViewClose);
                     }
-                    if let Key::Character(c) = key.as_ref() {
-                        if modifiers.command() && modifiers.shift() && c.eq_ignore_ascii_case("u") {
+                    match global_shortcut(&key, modifiers) {
+                        Some(GlobalShortcut::UsageView) => {
                             return self.update(Event::UsageViewToggle);
                         }
-                        if modifiers.control() && !modifiers.command() {
-                            if let Ok(num) = c.parse::<usize>() {
-                                if (1..=9).contains(&num) && num <= self.workspaces.len() {
-                                    return Task::done(Event::WorkspaceSelect(num - 1));
-                                }
-                            }
+                        Some(GlobalShortcut::SelectWorkspace(num))
+                            if num <= self.workspaces.len() =>
+                        {
+                            return Task::done(Event::WorkspaceSelect(num - 1));
                         }
+                        _ => {}
                     }
                     return Task::none();
                 }
@@ -16501,7 +16625,7 @@ fi
                         }
                         // Cmd+T - repository task switcher (exactly ⌘T:
                         // Ctrl/Shift combos stay free for other bindings)
-                        if (c == "t" || c == "T") && !modifiers.shift() && !modifiers.control() {
+                        if global_shortcut(&key, modifiers) == Some(GlobalShortcut::TaskSwitcher) {
                             return Task::done(Event::TaskSwitcherOpen);
                         }
                         // Cmd+B - Toggle sidebar
@@ -16521,7 +16645,7 @@ fi
                             return Task::done(Event::WorkspaceClose(self.active_workspace_idx));
                         }
                         // Cmd+Shift+U - Open the Usage view
-                        if (c == "u" || c == "U") && modifiers.shift() {
+                        if global_shortcut(&key, modifiers) == Some(GlobalShortcut::UsageView) {
                             return Task::done(Event::UsageViewToggle);
                         }
                     }
@@ -16629,14 +16753,8 @@ fi
 
                 // Ctrl+Space — toggle speech-to-text recording
                 #[cfg(feature = "stt")]
-                if modifiers.control()
-                    && !modifiers.command()
-                    && !modifiers.shift()
-                    && !modifiers.alt()
-                {
-                    if let Key::Named(key::Named::Space) = key.as_ref() {
-                        return Task::done(Event::SttToggle);
-                    }
+                if global_shortcut(&key, modifiers) == Some(GlobalShortcut::Dictation) {
+                    return Task::done(Event::SttToggle);
                 }
 
                 // Ctrl+backtick — jump to next attention tab
@@ -16670,13 +16788,10 @@ fi
                 }
 
                 // Workspace switching with Ctrl+1-9
-                if modifiers.control() && !modifiers.command() {
-                    if let Key::Character(c) = key.as_ref() {
-                        if let Ok(num) = c.parse::<usize>() {
-                            if (1..=9).contains(&num) && num <= self.workspaces.len() {
-                                return Task::done(Event::WorkspaceSelect(num - 1));
-                            }
-                        }
+                if let Some(GlobalShortcut::SelectWorkspace(num)) = global_shortcut(&key, modifiers)
+                {
+                    if num <= self.workspaces.len() {
+                        return Task::done(Event::WorkspaceSelect(num - 1));
                     }
                 }
 
@@ -16703,7 +16818,9 @@ fi
                             }
                         } else if c == "0" && self.active_task_context_id().is_some() {
                             return Task::done(Event::TaskOverview);
-                        } else if let Ok(num) = c.parse::<usize>() {
+                        } else if let Some(GlobalShortcut::SelectTab(num)) =
+                            global_shortcut(&key, modifiers)
+                        {
                             let visible_indices =
                                 self.active_workspace().map_or_else(Vec::new, |workspace| {
                                     self.active_task_context_id().map_or_else(
@@ -16720,7 +16837,7 @@ fi
                                         |task_id| task_tab_indices(workspace, task_id),
                                     )
                                 });
-                            if (1..=9).contains(&num) && num <= visible_indices.len() {
+                            if num <= visible_indices.len() {
                                 return Task::done(Event::TabSelect(visible_indices[num - 1]));
                             }
                         }
@@ -33851,6 +33968,155 @@ mod tests {
             Some("Fix the build. And add a test.")
         );
         assert_eq!(held.get(&9).map(String::as_str), Some("Other tab"));
+    }
+
+    fn chord(key: Key, modifiers: Modifiers) -> Option<GlobalShortcut> {
+        global_shortcut(&key, modifiers)
+    }
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    #[test]
+    fn global_shortcut_knows_the_app_wide_chords() {
+        let space = Key::Named(key::Named::Space);
+        let escape = Key::Named(key::Named::Escape);
+        assert_eq!(
+            chord(space.clone(), Modifiers::CTRL),
+            Some(GlobalShortcut::Dictation)
+        );
+        assert_eq!(
+            chord(ch("1"), Modifiers::CTRL),
+            Some(GlobalShortcut::SelectWorkspace(1))
+        );
+        assert_eq!(
+            chord(ch("9"), Modifiers::CTRL),
+            Some(GlobalShortcut::SelectWorkspace(9))
+        );
+        assert_eq!(
+            chord(ch("3"), Modifiers::COMMAND),
+            Some(GlobalShortcut::SelectTab(3))
+        );
+        // The key handler has always let Cmd win when Ctrl is also held.
+        assert_eq!(
+            chord(ch("2"), Modifiers::COMMAND | Modifiers::CTRL),
+            Some(GlobalShortcut::SelectTab(2))
+        );
+        for u in ["u", "U"] {
+            assert_eq!(
+                chord(ch(u), Modifiers::COMMAND | Modifiers::SHIFT),
+                Some(GlobalShortcut::UsageView)
+            );
+        }
+        for t in ["t", "T"] {
+            assert_eq!(
+                chord(ch(t), Modifiers::COMMAND),
+                Some(GlobalShortcut::TaskSwitcher)
+            );
+        }
+        assert_eq!(
+            chord(escape.clone(), Modifiers::empty()),
+            Some(GlobalShortcut::Escape)
+        );
+    }
+
+    #[test]
+    fn global_shortcut_leaves_other_chords_alone() {
+        let space = Key::Named(key::Named::Space);
+        let escape = Key::Named(key::Named::Escape);
+        let enter = Key::Named(key::Named::Enter);
+        assert_eq!(chord(space.clone(), Modifiers::empty()), None);
+        assert_eq!(
+            chord(space.clone(), Modifiers::CTRL | Modifiers::SHIFT),
+            None
+        );
+        assert_eq!(chord(space, Modifiers::CTRL | Modifiers::COMMAND), None);
+        assert_eq!(chord(ch("0"), Modifiers::COMMAND), None);
+        assert_eq!(chord(ch("0"), Modifiers::CTRL), None);
+        assert_eq!(chord(ch("1"), Modifiers::empty()), None);
+        assert_eq!(chord(ch("1"), Modifiers::ALT), None);
+        assert_eq!(chord(ch("u"), Modifiers::COMMAND), None);
+        // Cmd+Shift+T is the theme toggle; Ctrl+Cmd+T stays free.
+        assert_eq!(chord(ch("t"), Modifiers::COMMAND | Modifiers::SHIFT), None);
+        assert_eq!(chord(ch("t"), Modifiers::COMMAND | Modifiers::CTRL), None);
+        assert_eq!(chord(ch("w"), Modifiers::COMMAND), None);
+        assert_eq!(chord(escape, Modifiers::SHIFT), None);
+        assert_eq!(chord(enter.clone(), Modifiers::empty()), None);
+        assert_eq!(chord(enter.clone(), Modifiers::SHIFT), None);
+        assert_eq!(chord(enter, Modifiers::COMMAND), None);
+    }
+
+    fn hostkey(key: &str, meta: bool, ctrl: bool, shift: bool, alt: bool) -> serde_json::Value {
+        serde_json::json!({
+            "type": "hostkey", "tabId": 4, "key": key, "code": "",
+            "meta": meta, "ctrl": ctrl, "shift": shift, "alt": alt,
+        })
+    }
+
+    #[test]
+    fn hostkey_chord_reads_what_the_page_forwards() {
+        let cases = [
+            (
+                hostkey(" ", false, true, false, false),
+                GlobalShortcut::Dictation,
+            ),
+            (
+                hostkey("4", false, true, false, false),
+                GlobalShortcut::SelectWorkspace(4),
+            ),
+            (
+                hostkey("2", true, false, false, false),
+                GlobalShortcut::SelectTab(2),
+            ),
+            (
+                hostkey("u", true, false, true, false),
+                GlobalShortcut::UsageView,
+            ),
+            (
+                hostkey("U", true, false, true, false),
+                GlobalShortcut::UsageView,
+            ),
+            (
+                hostkey("t", true, false, false, false),
+                GlobalShortcut::TaskSwitcher,
+            ),
+            (
+                hostkey("Escape", false, false, false, false),
+                GlobalShortcut::Escape,
+            ),
+        ];
+        for (value, expected) in cases {
+            let (key, modifiers) = hostkey_chord(&value).expect("chord");
+            assert_eq!(global_shortcut(&key, modifiers), Some(expected), "{value}");
+        }
+        let (key, modifiers) = hostkey_chord(&hostkey(" ", false, true, false, false)).unwrap();
+        assert_eq!(key, Key::Named(key::Named::Space));
+        assert_eq!(modifiers, Modifiers::CTRL);
+        let (key, modifiers) = hostkey_chord(&hostkey("1", true, false, false, false)).unwrap();
+        assert_eq!(key, ch("1"));
+        assert_eq!(modifiers, Modifiers::LOGO);
+    }
+
+    #[test]
+    fn hostkey_chord_rejects_malformed_messages() {
+        assert!(hostkey_chord(&hostkey("Enter", false, false, false, false)).is_err());
+        assert!(hostkey_chord(&hostkey("", true, false, false, false)).is_err());
+        assert!(hostkey_chord(&serde_json::json!({ "key": "1", "meta": true })).is_err());
+        assert!(hostkey_chord(&serde_json::json!({
+            "meta": true, "ctrl": false, "shift": false, "alt": false
+        }))
+        .is_err());
+        // Well formed but not a global shortcut: the dispatcher drops it.
+        let (key, modifiers) = hostkey_chord(&hostkey("k", true, false, false, false)).unwrap();
+        assert_eq!(global_shortcut(&key, modifiers), None);
+    }
+
+    #[test]
+    fn agent_chat_page_forwards_global_shortcuts() {
+        let html = agent_chat_html();
+        assert!(html.contains("postIpc({ type: 'hostkey', key: e.key, code: e.code"));
+        assert!(html.contains("function pageHasOpenLayer()"));
     }
 
     #[test]

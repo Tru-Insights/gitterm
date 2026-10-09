@@ -2293,6 +2293,40 @@
     promptEl.focus();
   };
 
+  // ---- global shortcuts (TRU-140) -----------------------------------------
+  // While this page has keyboard focus its keys never reach GitTerm's own
+  // key handler, so the app-wide chords are handed to it instead. The list
+  // is fixed and matches `global_shortcut` in main.rs; every other key
+  // (Enter, Shift+Enter, Cmd+Enter, Shift+Tab, editing keys) stays here.
+  // Escape goes to GitTerm only when nothing on this page is open for it to
+  // close. Capture phase, so this sees the page's state before the page's
+  // own Escape handlers close anything.
+  function pageHasOpenLayer() {
+    return modeMenuEl.classList.contains('visible')
+      || CHIP_MENUS.some((m) => m.classList.contains('visible'))
+      || reviewPopEl.classList.contains('visible')
+      || panelEl.classList.contains('visible');
+  }
+  function isHostShortcut(e) {
+    const k = e.key;
+    const digit = /^[1-9]$/.test(k);
+    const ctrlOnly = e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey;
+    const cmdOnly = e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
+    if (ctrlOnly && (k === ' ' || digit)) return true; // Ctrl+Space, Ctrl+1…9
+    if (cmdOnly && (digit || k.toLowerCase() === 't')) return true; // Cmd+1…9, Cmd+T
+    if (e.metaKey && e.shiftKey && !e.ctrlKey && !e.altKey && k.toLowerCase() === 'u') return true; // Cmd+Shift+U
+    if (k === 'Escape' && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) return !pageHasOpenLayer();
+    return false;
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.isComposing || !isHostShortcut(e)) return;
+    e.preventDefault();
+    // A held chord auto-repeats; act once per press (Ctrl+Space would
+    // otherwise toggle dictation on and off).
+    if (e.repeat) return;
+    postIpc({ type: 'hostkey', key: e.key, code: e.code, meta: e.metaKey, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey });
+  }, true);
+
   refreshComposer();
   promptEl.focus();
 })();
