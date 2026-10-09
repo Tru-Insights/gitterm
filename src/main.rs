@@ -70,6 +70,9 @@ use gitterm::tasks::{
     TaskRecord, TaskSessionRecord, TaskStore, TaskStoreError, TaskWorktree, TaskWorktreeState,
     VerificationState, WorkspaceIdentity as TaskWorkspaceIdentity, WorkspaceLocationIdentity,
 };
+use gitterm::worktree_follow::{
+    self, CacheLookup, WorktreeFollow, WorktreeInfo, WorktreeListCache,
+};
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{
     AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
@@ -3248,6 +3251,10 @@ struct TabState {
     // Last PTY output instant for task-linked tabs. Stamped on the terminal
     // hot path, so it must stay a bare Instant — no string or store work.
     task_last_activity: Option<Instant>,
+    // Worktree this chat tab's agent works in, and whether the Git and
+    // Files panels follow it (TRU-146). Derived from the tool stream; never
+    // persisted. `repo_path` / `current_dir` stay on the workspace root.
+    worktree_follow: WorktreeFollow,
     is_git_repo: bool,
 }
 
@@ -3310,6 +3317,7 @@ impl TabState {
             attention: None,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
+            worktree_follow: WorktreeFollow::default(),
             is_git_repo,
         }
     }
@@ -4944,6 +4952,12 @@ pub enum Event {
     BottomTerminalClicked(usize),
     GitStatusLoaded(GitStatusSnapshot),
     GitWorktreesLoaded(GitWorktreesSnapshot),
+    /// A repository's worktree list for chat-tab worktree following
+    /// (TRU-146): the repo root it was listed from, and the list.
+    FollowWorktreesListed(PathBuf, Result<Vec<WorktreeInfo>, String>),
+    /// The header chip: flip the active tab between following its agent's
+    /// worktree and the workspace root (TRU-146).
+    ToggleWorktreeFollow,
     // Chats panel (TRU-78)
     RefreshChatIndex,
     ChatIndexLoaded(Vec<chats::ChatIndexEntry>),
@@ -5177,6 +5191,8 @@ struct App {
     rail_worktrees: Vec<GitWorktreeEntry>,
     rail_worktrees_repo_path: Option<PathBuf>,
     rail_worktrees_loading: bool,
+    /// Worktree listings for chat-tab worktree following (TRU-146).
+    worktree_list_cache: WorktreeListCache,
     last_rail_worktrees_poll: Instant,
     unmanaged_worktree_ops: HashMap<PathBuf, UnmanagedWorktreeOp>,
     theme: AppTheme,
@@ -7092,6 +7108,109 @@ impl App {
             return None;
         }
         task.worktree.path.clone().filter(|path| path.is_dir())
+    }
+
+    /// The worktree the active chat tab's agent works in, while the tab
+    /// follows it (TRU-146). Local workspaces only.
+    fn followed_worktree_root(&self) -> Option<PathBuf> {
+        if self.active_workspace_is_remote() {
+            return None;
+        }
+        self.active_tab()?
+            .worktree_follow
+            .panel_root()
+            .map(Path::to_path_buf)
+    }
+
+    /// The directory the Git and Files panels are rooted in when it is not
+    /// the active tab's own repo: the task worktree in task context, else
+    /// the worktree a chat tab's agent works in.
+    fn panel_context_root(&self) -> Option<PathBuf> {
+        self.task_context_worktree_root()
+            .or_else(|| self.followed_worktree_root())
+    }
+
+    /// Resolve a chat tab's candidate paths against its repository's
+    /// worktree list, listing it first when the cache says so (TRU-146).
+    fn consider_worktree_candidates(
+        &mut self,
+        tab_id: usize,
+        repo_root: PathBuf,
+        candidates: Vec<PathBuf>,
+    ) -> Task<Event> {
+        let candidates: Vec<PathBuf> = candidates
+            .iter()
+            .map(|path| worktree_follow::resolve_for_match(path))
+            .collect();
+        match self.worktree_list_cache.lookup(
+            &repo_root,
+            tab_id,
+            candidates.clone(),
+            Instant::now(),
+        ) {
+            CacheLookup::Ready(worktrees) => {
+                self.apply_worktree_candidates(tab_id, &repo_root, &worktrees, &candidates)
+            }
+            CacheLookup::Queued => Task::none(),
+            CacheLookup::Fetch => {
+                let listed_root = repo_root.clone();
+                Task::perform(
+                    async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            worktree_follow::list_worktrees(&listed_root)
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(format!("worktree listing task failed: {error}"))
+                        });
+                        (repo_root, result)
+                    },
+                    |(repo_root, result)| Event::FollowWorktreesListed(repo_root, result),
+                )
+            }
+        }
+    }
+
+    /// Decide what a chat tab's candidates mean and update its followed
+    /// worktree; re-points the panels when the active tab's root moved.
+    fn apply_worktree_candidates(
+        &mut self,
+        tab_id: usize,
+        repo_root: &Path,
+        worktrees: &[WorktreeInfo],
+        candidates: &[PathBuf],
+    ) -> Task<Event> {
+        let own_root = worktree_follow::resolve_for_match(repo_root);
+        let decision = worktree_follow::decide_all(candidates, &own_root, worktrees);
+        let label = match &decision {
+            worktree_follow::FollowDecision::Follow(active) => {
+                Some(worktree_follow::short_worktree_label(
+                    &active.path,
+                    worktrees,
+                    dirs::home_dir().as_deref(),
+                ))
+            }
+            _ => None,
+        };
+        let is_active_tab = self.active_tab().is_some_and(|tab| tab.id == tab_id);
+        let before = if is_active_tab {
+            self.panel_context_root()
+        } else {
+            None
+        };
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|tab| tab.id == tab_id && tab.task_id.is_none())
+        else {
+            return Task::none();
+        };
+        let changed = tab.worktree_follow.apply(decision, label);
+        if changed && is_active_tab && self.panel_context_root() != before {
+            return self.refresh_panels_for_context(before);
+        }
+        Task::none()
     }
 
     /// The task (if any) whose registered worktree is `path`. Archived tasks
@@ -11046,6 +11165,7 @@ impl App {
             rail_worktrees: Vec::new(),
             rail_worktrees_repo_path: None,
             rail_worktrees_loading: false,
+            worktree_list_cache: WorktreeListCache::default(),
             last_rail_worktrees_poll: Instant::now(),
             unmanaged_worktree_ops: HashMap::new(),
             theme,
@@ -12483,8 +12603,9 @@ fi
                 // which terminal cwd tracking keeps up to date. In a task
                 // context every panel looks at the task's worktree instead:
                 // clicking a task means "show me that worktree", whichever
-                // tab is focused.
-                let root = self.task_context_worktree_root().unwrap_or_else(|| {
+                // tab is focused. A chat tab whose agent works in another
+                // worktree shows that worktree while it follows it.
+                let root = self.panel_context_root().unwrap_or_else(|| {
                     workspace
                         .active_tab()
                         .map(|tab| tab.repo_path.clone())
@@ -12520,6 +12641,7 @@ fi
     fn browse_active_tab_to(&mut self, dir: SourcePath) -> Task<Event> {
         let source = self.source_for_active_tab();
         let show_hidden = self.show_hidden;
+        let followed_root = self.followed_worktree_root();
         let Some(tab) = self.active_tab_mut() else {
             return Task::none();
         };
@@ -12532,9 +12654,16 @@ fi
             _ => dir,
         };
         // Keep the tab-local working directory mirrored while browsing local
-        // dirs; remote browsing must never touch it.
+        // dirs; remote browsing must never touch it. Browsing a followed
+        // agent worktree does not move it either: new terminals and task
+        // adoption keep reading the workspace side.
         if let Some(local) = dir.as_local() {
-            tab.current_dir = local.to_path_buf();
+            if !followed_root
+                .as_ref()
+                .is_some_and(|root| local.starts_with(root))
+            {
+                tab.current_dir = local.to_path_buf();
+            }
         }
         let seq = tab.files.begin_request(dir.clone());
         let tab_id = tab.id;
@@ -12594,6 +12723,14 @@ fi
     /// is outside the context root (task worktrees never nest inside the
     /// checkout, so containment is a reliable test).
     fn refresh_panels_for_task_context(&mut self) -> Task<Event> {
+        self.refresh_panels_for_context(None)
+    }
+
+    /// `refresh_panels_for_task_context`, also moving the file browser out
+    /// of `leaving` (the previous context root): a followed agent worktree
+    /// can sit inside the checkout (`.claude/worktrees/`), so containment in
+    /// the new root alone would leave the browser in the old tree.
+    fn refresh_panels_for_context(&mut self, leaving: Option<PathBuf>) -> Task<Event> {
         let Ok(WorkspaceSource::Local { root }) = self.source_for_active_tab() else {
             return Task::none();
         };
@@ -12607,7 +12744,10 @@ fi
             tab.last_git_status_hash = None;
             git_task = Self::request_local_git_status(tab.id, root.clone());
             if let SourcePath::Local(dir) = &tab.files.dir {
-                if !dir.starts_with(&root) {
+                let left_old_root = leaving
+                    .as_ref()
+                    .is_some_and(|old| old != &root && dir.starts_with(old));
+                if !dir.starts_with(&root) || left_old_root {
                     files_jump = Some(SourcePath::Local(root));
                 }
             }
@@ -14196,7 +14336,7 @@ fi
             }
             Event::TabSelect(idx) => {
                 let task_rail_pinned = self.task_rail_pinned;
-                let context_root_before = self.task_context_worktree_root();
+                let context_root_before = self.panel_context_root();
                 let mut focused_task_id = None;
                 let mut focused = false;
                 if let Some(ws) = self.active_workspace_mut() {
@@ -14220,8 +14360,8 @@ fi
                 // Crossing a context boundary (task ↔ General, or between
                 // tasks) re-points the panels; ordinary tab switches leave
                 // the per-tab poll cadence alone.
-                let panels_task = if self.task_context_worktree_root() != context_root_before {
-                    self.refresh_panels_for_task_context()
+                let panels_task = if self.panel_context_root() != context_root_before {
+                    self.refresh_panels_for_context(context_root_before)
                 } else {
                     Task::none()
                 };
@@ -15304,12 +15444,33 @@ fi
                 let mut config_changed = false;
                 let mut chat_config_changed = false;
                 let mut task_signal: Option<(String, Option<TaskSessionOutcome>)> = None;
+                // Worktree following (TRU-146): paths this event's tool call
+                // says the agent works at, with the tab's repo root.
+                let mut worktree_candidates: Option<(PathBuf, Vec<PathBuf>)> = None;
+                let home = dirs::home_dir();
                 'outer_event: for ws in &mut self.workspaces {
+                    let local_workspace = matches!(ws.location, WorkspaceLocation::Local { .. });
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
                             if t.task_id.is_some() {
                                 t.task_last_activity = Some(Instant::now());
                                 progress_task = t.task_id.clone();
+                            }
+                            // Task session tabs already follow their task
+                            // worktree; only general chat tabs detect.
+                            if let (tab::AgentEvent::Harness(harness_event), true) =
+                                (&ev, local_workspace && t.task_id.is_none())
+                            {
+                                if matches!(t.kind, TabKind::Agent(_)) {
+                                    let candidates = t
+                                        .worktree_follow
+                                        .tracker
+                                        .observe(harness_event, home.as_deref());
+                                    if !candidates.is_empty() {
+                                        worktree_candidates =
+                                            Some((t.repo_path.clone(), candidates));
+                                    }
+                                }
                             }
                             // The agent session's own end states translate
                             // directly into task session outcomes.
@@ -15512,11 +15673,46 @@ fi
                 if chat_config_changed {
                     self.save_config();
                 }
+                let follow_task = match worktree_candidates {
+                    Some((repo_root, candidates)) => {
+                        self.consider_worktree_candidates(tab_id, repo_root, candidates)
+                    }
+                    None => Task::none(),
+                };
                 if turn_ended {
                     return Task::batch([
                         self.flush_held_delegation(tab_id),
                         self.refresh_delegation_head(tab_id),
+                        follow_task,
                     ]);
+                }
+                return follow_task;
+            }
+            Event::FollowWorktreesListed(repo_root, result) => {
+                if let Err(message) = &result {
+                    eprintln!(
+                        "[worktree-follow] listing worktrees of {} failed: {message}",
+                        repo_root.display()
+                    );
+                }
+                let (worktrees, waiting) =
+                    self.worktree_list_cache
+                        .complete(&repo_root, result, Instant::now());
+                let tasks: Vec<Task<Event>> = waiting
+                    .into_iter()
+                    .map(|(tab_id, candidates)| {
+                        self.apply_worktree_candidates(tab_id, &repo_root, &worktrees, &candidates)
+                    })
+                    .collect();
+                return Task::batch(tasks);
+            }
+            Event::ToggleWorktreeFollow => {
+                let before = self.panel_context_root();
+                let changed = self
+                    .active_tab_mut()
+                    .is_some_and(|tab| tab.worktree_follow.toggle());
+                if changed && self.panel_context_root() != before {
+                    return self.refresh_panels_for_context(before);
                 }
                 return Task::none();
             }
@@ -18506,6 +18702,8 @@ fi
                                 .is_some_and(|path| paths_equal(path, &snapshot.repo_path))
                         })
                     });
+                let is_active_tab = self.active_tab().is_some_and(|t| t.id == snapshot.tab_id);
+                let context_root_before = self.panel_context_root();
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
@@ -18513,6 +18711,21 @@ fi
                     .find(|t| t.id == snapshot.tab_id)
                 {
                     tab.git_status_loading = false;
+                    // A followed agent worktree that was removed (merged,
+                    // cleaned up) drops the tab back to its root with a note
+                    // (TRU-146). When the panels were following it, this
+                    // snapshot read the vanished tree: it is discarded and
+                    // the root is read instead.
+                    let was_following = tab.worktree_follow.panel_root().is_some();
+                    if tab.worktree_follow.check_removed(Path::is_dir) && was_following {
+                        tab.git_status_error = None;
+                        if is_active_tab {
+                            return self.refresh_panels_for_context(context_root_before);
+                        }
+                        // Polled again (from the root) once it is active.
+                        tab.last_git_status_hash = None;
+                        return Task::none();
+                    }
                     tab.git_status_error = snapshot.error.clone();
                     if snapshot.error.is_some() {
                         // Keep the last good status visible alongside the error;
@@ -18521,9 +18734,15 @@ fi
                     }
                     {
                         // Self-heal: if the worker discovered a different repo root, update
+                        // Nor may a followed agent worktree (TRU-146): the
+                        // chat's Claude process is spawned in repo_path.
                         if snapshot.repo_path != tab.repo_path
                             && snapshot.is_git_repo
                             && !(tab.task_id.is_none() && snapshot_root_is_task_worktree)
+                            && !tab
+                                .worktree_follow
+                                .followed_paths()
+                                .any(|path| paths_equal(path, &snapshot.repo_path))
                         {
                             tab.repo_path = snapshot.repo_path.clone();
                             tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
@@ -24074,7 +24293,62 @@ fi
             }
         }
 
-        metadata_row = metadata_row.push(branch_copy);
+        // A chat tab whose agent works in another worktree (TRU-146): the
+        // branch line names it and a click flips the Git and Files panels
+        // between that worktree and the workspace root.
+        let followed = task_context_id
+            .is_none()
+            .then(|| self.active_tab())
+            .flatten()
+            .filter(|_| !self.active_workspace_is_remote())
+            .and_then(|tab| {
+                let follow = &tab.worktree_follow;
+                follow.active.as_ref().map(|active| (tab, follow, active))
+            });
+        if let Some((tab, follow, active)) = followed {
+            let label = follow
+                .label
+                .clone()
+                .unwrap_or_else(|| active.path.display().to_string());
+            let chip_text = if follow.follow {
+                format!(
+                    "\u{2387} {} \u{b7} worktree {label}",
+                    active.branch.as_deref().unwrap_or("detached")
+                )
+            } else {
+                format!(
+                    "\u{2387} {} \u{b7} workspace root \u{b7} follow worktree {label}",
+                    tab.branch_name
+                )
+            };
+            let chip_color = if follow.follow {
+                theme.accent()
+            } else {
+                theme.text_muted()
+            };
+            let hover_bg = theme.surface0();
+            let chip = button(
+                text(chip_text)
+                    .size(11)
+                    .color(chip_color)
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .padding([2, 6])
+            .style(move |_theme, status| button::Style {
+                background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                    .then(|| hover_bg.into()),
+                text_color: chip_color,
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .on_press(Event::ToggleWorktreeFollow);
+            metadata_row = metadata_row.push(chip);
+        } else {
+            metadata_row = metadata_row.push(branch_copy);
+        }
 
         let strip = row![
             container(stamp_row).padding(iced::Padding {
@@ -30578,6 +30852,14 @@ fi
             left: 8.0,
         });
         header = header.push(self.view_git_mode_toggle(tab));
+        // The followed agent worktree went away (TRU-146).
+        if let Some(note) = &tab.worktree_follow.note {
+            header = header.push(
+                text(note)
+                    .size(self.ui_font_small())
+                    .color(self.theme.text_muted()),
+            );
+        }
         if matches!(tab.git_view_mode, GitViewMode::Worktrees) && self.git_source_matches(tab) {
             if let Some(actions) = self.view_git_selection_actions(tab) {
                 header = header.push(actions);
