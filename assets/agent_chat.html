@@ -9,8 +9,11 @@
     --bg: #1e1e2e;
     --bg-alt: #181825;
     --bg-block: #313244;
+    /* The strip below the timeline (status, roster, composer): a dark grey
+       panel so it reads as one control surface apart from the messages. */
+    --bg-footer: #2a2b3d;
     --bg-input: #181825;
-    --fg: #cdd6f4;
+    --fg: #bac2de;
     --fg-muted: #7f849c;
     --accent: #89b4fa;
     --border: #45475a;
@@ -33,7 +36,10 @@
     color: var(--fg);
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
     font-size: 14px;
-    font-weight: 400;
+    /* Iced draws the rest of the app without CoreText stem darkening, so
+       regular SF in WebKit reads heavy beside it; light weight and a
+       slightly dimmer text colour bring the chat in line. */
+    font-weight: 300;
     /* Light text on a dark background renders visibly heavier with
        subpixel smoothing in WebKit; grayscale antialiasing keeps the
        regular weight looking regular. */
@@ -46,6 +52,8 @@
     padding: 10px;
     gap: 8px;
   }
+  /* Status line, roster and composer share one grey panel. */
+  #footer { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px 8px; background: var(--bg-footer); border: 1px solid var(--border); border-radius: 10px; }
   #timeline-wrap { flex: 1; position: relative; min-height: 0; }
   #messages {
     position: absolute;
@@ -218,10 +226,9 @@
     display: none;
     align-items: center;
     gap: 10px;
-    padding: 6px 12px;
-    background: var(--bg-block);
-    border: 1px solid var(--border);
-    border-radius: 8px;
+    padding: 4px 6px 0;
+    background: transparent;
+    border: 0;
     color: var(--fg-muted);
     font-size: 12px;
     font-family: var(--mono);
@@ -292,7 +299,7 @@
   #composer { display: flex; flex-direction: column; gap: 6px; }
   #prompt {
     width: 100%;
-    min-height: 36px;
+    min-height: 56px;
     max-height: 200px;
     padding: 8px 10px;
     background: var(--bg-input);
@@ -483,7 +490,7 @@
   .dlg-actions .dlg-note { color: var(--fg-muted); font-size: 11.5px; }
 
   /* Agent roster: live subagents and delegations (above the composer) */
-  #roster { display: none; flex-direction: column; gap: 2px; padding: 4px 6px; background: var(--bg-block); border: 1px solid var(--border); border-radius: 8px; max-height: 132px; overflow-y: auto; }
+  #roster { display: none; flex-direction: column; gap: 2px; padding: 4px 6px 6px; background: transparent; border: 0; border-top: 1px solid var(--border); border-radius: 0; max-height: 132px; overflow-y: auto; }
   #roster.visible { display: flex; }
   .ro-row { display: flex; gap: 8px; align-items: baseline; font-size: 12px; font-family: var(--mono); color: var(--fg-muted); cursor: pointer; padding: 1px 4px; border-radius: 4px; }
   .ro-row:hover { background: var(--border); }
@@ -518,6 +525,7 @@
     <div id="messages"></div>
     <button id="jump">&darr; Latest</button>
   </div>
+  <div id="footer">
   <div id="activity" class="activity">
     <span class="activity-dot"></span>
     <span class="activity-label">Starting</span>
@@ -527,7 +535,7 @@
   <div id="roster"></div>
   <div id="composer">
     <div id="attachments"></div>
-    <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+    <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
     <div id="toolbar">
       <div class="tb-chips">
         <div class="review-wrap">
@@ -557,6 +565,7 @@
       </div>
     </div>
   </div>
+  </div><!-- /footer -->
 <script>
 (function () {
   'use strict';
