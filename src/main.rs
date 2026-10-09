@@ -2760,6 +2760,9 @@ pub enum AttentionTarget {
 #[derive(Debug, Clone)]
 struct AttentionItem {
     target: AttentionTarget,
+    /// The open workspace this row belongs to: always set for a tab row;
+    /// a task row has one only when its local workspace is open.
+    workspace_idx: Option<usize>,
     workspace_name: String,
     machine_name: String,
     title: String,
@@ -2778,6 +2781,7 @@ impl AttentionItem {
     /// The inbox row for a tab's live attention, aged against `now`.
     fn for_tab(
         tab: &TabState,
+        workspace_idx: usize,
         workspace_name: &str,
         machine_name: &str,
         now: Instant,
@@ -2791,6 +2795,7 @@ impl AttentionItem {
             .to_string();
         Some(Self {
             target: AttentionTarget::Tab(tab.id),
+            workspace_idx: Some(workspace_idx),
             workspace_name: workspace_name.to_string(),
             machine_name: machine_name.to_string(),
             title,
@@ -2802,16 +2807,76 @@ impl AttentionItem {
     }
 }
 
-/// Inbox order: priority, then longest-waiting first, then the target id.
-/// Every key is fixed while a row's attention is unchanged, so rows never
-/// trade places between frames.
+/// Attention order: priority, then longest-waiting first, then the target
+/// id. Every key is fixed while a row's attention is unchanged, so rows
+/// never trade places between frames.
+fn attention_item_order(left: &AttentionItem, right: &AttentionItem) -> std::cmp::Ordering {
+    left.priority
+        .cmp(&right.priority)
+        .then(right.waiting.cmp(&left.waiting))
+        .then_with(|| left.target.cmp(&right.target))
+}
+
 fn sort_attention_items(items: &mut [AttentionItem]) {
-    items.sort_by(|left, right| {
-        left.priority
-            .cmp(&right.priority)
-            .then(right.waiting.cmp(&left.waiting))
-            .then_with(|| left.target.cmp(&right.target))
-    });
+    items.sort_by(attention_item_order);
+}
+
+/// How much a workspace wants the human, as its rail dot shows it
+/// (TRU-148): the attention scale of [`AttentionReason::priority`] and
+/// [`task_attention_presentation`], then a running turn below all of them.
+/// Declaration order is urgency order — the smallest value wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RailUrgency {
+    NeedsYou,
+    Failed,
+    Interrupted,
+    Review,
+    Running,
+}
+
+impl RailUrgency {
+    fn from_priority(priority: u8) -> Self {
+        match priority {
+            0 => Self::NeedsYou,
+            1 => Self::Failed,
+            2 => Self::Interrupted,
+            _ => Self::Review,
+        }
+    }
+}
+
+/// The most urgent reason among one workspace's attention rows, or
+/// Running when nothing waits but a turn is in flight. None keeps the dot's
+/// plain look.
+fn workspace_rail_urgency(items: &[AttentionItem], any_running: bool) -> Option<RailUrgency> {
+    items
+        .iter()
+        .map(|item| RailUrgency::from_priority(item.priority))
+        .min()
+        .or_else(|| any_running.then_some(RailUrgency::Running))
+}
+
+/// Where a click on a workspace's rail dot lands: its most urgent row, on
+/// the same order the rows are listed in. None means nothing waits and the
+/// click is a plain workspace switch.
+fn rail_click_target(items: &[AttentionItem]) -> Option<AttentionTarget> {
+    items
+        .iter()
+        .min_by(|left, right| attention_item_order(left, right))
+        .map(|item| item.target.clone())
+}
+
+/// The colour a rail dot (and its hover rows) gives an urgency level.
+/// Needs-you pulses between peach and amber like the tab strip's dot.
+fn rail_urgency_color(theme: &AppTheme, urgency: RailUrgency, pulse_bright: bool) -> iced::Color {
+    match urgency {
+        RailUrgency::NeedsYou if pulse_bright => theme.peach(),
+        RailUrgency::NeedsYou => theme.warning(),
+        RailUrgency::Failed => theme.danger(),
+        RailUrgency::Interrupted => theme.peach(),
+        RailUrgency::Review => theme.success(),
+        RailUrgency::Running => theme.blue(),
+    }
 }
 
 fn format_attention_age(elapsed_secs: u64) -> String {
@@ -2858,6 +2923,16 @@ fn aggregate_task_live_states(
         }
     }
     working.then_some(TaskLifecycle::Running)
+}
+
+/// Whether a harness title says it is working: the leading glyph is one of
+/// the spinner frames [`strip_title_status_glyphs`] documents ("◐"/"◑", the
+/// older sparkle set, braille spinners) — not the idle "✳" or a shell's "*".
+fn terminal_title_shows_working(title: &str) -> bool {
+    title.trim_start().chars().next().is_some_and(|ch| {
+        matches!(ch, '◐' | '◑' | '◒' | '◓' | '✢' | '✶' | '✻' | '✽' | '·')
+            || ('\u{2800}'..='\u{28FF}').contains(&ch)
+    })
 }
 
 fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
@@ -3695,6 +3770,17 @@ impl TabState {
 
     fn needs_attention(&self) -> bool {
         self.attention.is_some()
+    }
+
+    /// Whether this tab's session is observably mid-turn: a chat turn
+    /// streaming, a task session working, or a harness title spinning.
+    fn is_running(&self) -> bool {
+        self.agent_session()
+            .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming))
+            || self.task_live_state == Some(TaskSessionLiveState::Working)
+            || self
+                .terminal_title()
+                .is_some_and(terminal_title_shows_working)
     }
 
     fn mark_visited(&mut self) {
@@ -4653,10 +4739,6 @@ impl Workspace {
         self.tabs.iter().filter(|tab| tab.needs_attention()).count()
     }
 
-    fn has_attention(&self) -> bool {
-        self.tabs.iter().any(TabState::needs_attention)
-    }
-
     fn highest_priority_attention(&self) -> Option<AttentionReason> {
         self.tabs
             .iter()
@@ -5132,6 +5214,8 @@ pub enum Event {
     AttentionViewToggle,
     AttentionViewClose,
     AttentionItemSelect(usize),
+    /// A workspace dot on the rail was clicked (TRU-148).
+    WorkspaceDotPressed(usize),
     AttentionTaskSelect(String),
     AttentionDismiss(AttentionTarget),
     // Launch agent preset by index
@@ -9540,12 +9624,27 @@ impl App {
     /// or a fresh workspace rooted at the chat's repo. Reopen/create
     /// paths push the workspace, activate it, and leave it tabless; the
     /// caller adds the resume tab in the same update pass.
+    /// The open local workspace that holds `cwd` or `repo_root` (task
+    /// worktrees resolve to the repo they were made from), without opening
+    /// one.
+    fn open_local_workspace_index(&self, cwd: &Path, repo_root: &Path) -> Option<usize> {
+        let canonical_cwd = self.canonical_task_workspace_directory(cwd);
+        let canonical_repo_root = self.canonical_task_workspace_directory(repo_root);
+        self.workspaces.iter().position(|ws| {
+            matches!(ws.location, WorkspaceLocation::Local { .. })
+                && (canonical_cwd.starts_with(&ws.dir) || canonical_repo_root.starts_with(&ws.dir))
+        })
+    }
+
     fn ensure_local_workspace_for_chat(
         &mut self,
         cwd: &Path,
         repo_root: Option<&Path>,
         repo_name: &str,
     ) -> usize {
+        if let Some(idx) = self.open_local_workspace_index(cwd, repo_root.unwrap_or(cwd)) {
+            return idx;
+        }
         let canonical_cwd = self.canonical_task_workspace_directory(cwd);
         let canonical_repo_root = repo_root
             .map(|root| self.canonical_task_workspace_directory(root))
@@ -9553,11 +9652,6 @@ impl App {
         let cwd = canonical_cwd.as_path();
         let repo_root = canonical_repo_root.as_path();
         let contains = |dir: &Path| cwd.starts_with(dir) || repo_root.starts_with(dir);
-        if let Some(idx) = self.workspaces.iter().position(|ws| {
-            matches!(ws.location, WorkspaceLocation::Local { .. }) && contains(&ws.dir)
-        }) {
-            return idx;
-        }
         let closed_idx = self.closed_workspace_configs.iter().position(|cfg| {
             matches!(
                 cfg.location,
@@ -13447,7 +13541,8 @@ fi
         let mut items = self
             .workspaces
             .iter()
-            .flat_map(|workspace| {
+            .enumerate()
+            .flat_map(|(workspace_idx, workspace)| {
                 let machine_name = match &workspace.location {
                     WorkspaceLocation::Local { .. } => "Local".to_string(),
                     WorkspaceLocation::RemoteAgent { remote_id, .. } => self
@@ -13459,7 +13554,7 @@ fi
                     }
                 };
                 workspace.tabs.iter().filter_map(move |tab| {
-                    AttentionItem::for_tab(tab, &workspace.name, &machine_name, now)
+                    AttentionItem::for_tab(tab, workspace_idx, &workspace.name, &machine_name, now)
                 })
             })
             .collect::<Vec<_>>();
@@ -13503,8 +13598,15 @@ fi
                     Some(issue) => format!("{} {}", issue.key, task.title),
                     None => task.title.clone(),
                 };
+                let workspace_idx = match &task.workspace.location {
+                    WorkspaceLocationIdentity::Local { directory } => {
+                        self.open_local_workspace_index(directory, directory)
+                    }
+                    WorkspaceLocationIdentity::RemoteAgent { .. } => None,
+                };
                 items.push(AttentionItem {
                     target: AttentionTarget::Task(task.task_id.clone()),
+                    workspace_idx,
                     workspace_name: task.workspace.name.clone(),
                     machine_name,
                     title,
@@ -13517,6 +13619,70 @@ fi
         }
         sort_attention_items(&mut items);
         items
+    }
+
+    /// The tab in front of the user: the active tab of the active
+    /// workspace. Its state is already on screen, so the rail does not
+    /// count it.
+    fn front_tab_id(&self) -> Option<usize> {
+        self.active_workspace()
+            .and_then(Workspace::active_tab)
+            .map(|tab| tab.id)
+    }
+
+    /// What one workspace's rail dot reports (TRU-148): its attention rows
+    /// in order, and whether any of its tabs is mid-turn — both leaving out
+    /// the tab in front of the user.
+    fn workspace_rail_state(
+        &self,
+        items: &[AttentionItem],
+        workspace_idx: usize,
+    ) -> (Vec<AttentionItem>, bool) {
+        let front = self.front_tab_id();
+        let rows = items
+            .iter()
+            .filter(|item| item.workspace_idx == Some(workspace_idx))
+            .filter(|item| front.is_none_or(|id| item.target != AttentionTarget::Tab(id)))
+            .cloned()
+            .collect();
+        let running = self.workspaces.get(workspace_idx).is_some_and(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .filter(|tab| Some(tab.id) != front)
+                .any(TabState::is_running)
+        });
+        (rows, running)
+    }
+
+    /// Go where an attention row points: a tab (switching workspace first
+    /// when needed) or a task's context.
+    fn jump_to_attention_target(&mut self, target: AttentionTarget) -> Task<Event> {
+        match target {
+            AttentionTarget::Tab(tab_id) => {
+                let found =
+                    self.workspaces
+                        .iter()
+                        .enumerate()
+                        .find_map(|(workspace_idx, workspace)| {
+                            workspace
+                                .tabs
+                                .iter()
+                                .position(|tab| tab.id == tab_id)
+                                .map(|tab_idx| (workspace_idx, tab_idx))
+                        });
+                match found {
+                    Some((workspace_idx, tab_idx)) => {
+                        self.focus_workspace_tab(workspace_idx, tab_idx)
+                    }
+                    None => {
+                        eprintln!("[attention] jump: tab {tab_id} is no longer open");
+                        Task::none()
+                    }
+                }
+            }
+            AttentionTarget::Task(task_id) => self.enter_task_context(&task_id),
+        }
     }
 
     fn restore_webview_after_attention(&mut self) -> Task<Event> {
@@ -20440,6 +20606,18 @@ fi
                 }
                 return self.restore_webview_after_attention();
             }
+            Event::WorkspaceDotPressed(workspace_idx) => {
+                // A dot with something waiting lands on its most urgent
+                // row; an empty one, or an Option-click, just switches.
+                let items = self.attention_items();
+                let (rows, _) = self.workspace_rail_state(&items, workspace_idx);
+                return match rail_click_target(&rows) {
+                    Some(target) if !self.current_modifiers.alt() => {
+                        self.jump_to_attention_target(target)
+                    }
+                    _ => self.update(Event::WorkspaceSelect(workspace_idx)),
+                };
+            }
             Event::AttentionTaskSelect(task_id) => {
                 self.attention_view_open = false;
                 return self.enter_task_context(&task_id);
@@ -24300,68 +24478,136 @@ fi
         })
         .padding([8, 0])
         .on_press(Event::UsageViewToggle);
-        let tip_bg = theme.bg_surface();
-        let tip_border = theme.border();
-        let tip = container(
+        let tip = self.rail_tooltip(
             text("Usage  ⌘⇧U")
                 .size(self.ui_font_small())
                 .color(theme.text_primary()),
-        )
-        .padding([4, 8])
-        .style(move |_| container::Style {
-            background: Some(tip_bg.into()),
-            border: iced::Border {
-                color: tip_border,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            ..Default::default()
-        });
+        );
         iced::widget::tooltip(btn, tip, iced::widget::tooltip::Position::Right).into()
+    }
+
+    /// The rail's tooltip card, shared by the Usage glyph and the
+    /// workspace dots.
+    fn rail_tooltip<'a>(
+        &self,
+        content: impl Into<Element<'a, Event, Theme, iced::Renderer>>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let tip_bg = self.theme.bg_surface();
+        let tip_border = self.theme.border();
+        container(content)
+            .padding([4, 8])
+            .style(move |_| container::Style {
+                background: Some(tip_bg.into()),
+                border: iced::Border {
+                    color: tip_border,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// A workspace dot's hover card: the workspace name, then what waits in
+    /// it — up to five rows, most urgent first — or that a turn is running.
+    fn workspace_dot_tooltip(
+        &self,
+        workspace: &Workspace,
+        rows: &[AttentionItem],
+        running: bool,
+    ) -> Element<'_, Event, Theme, iced::Renderer> {
+        const SHOWN: usize = 5;
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let mono = iced::Font::with_name("Menlo");
+        let mut card = Column::new().spacing(3).push(
+            text(workspace.name.clone())
+                .size(font_small)
+                .color(theme.text_primary())
+                .font(mono),
+        );
+        for item in rows.iter().take(SHOWN) {
+            let reason_color = rail_urgency_color(
+                theme,
+                RailUrgency::from_priority(item.priority),
+                self.attention_pulse_bright,
+            );
+            let title = if item.title.chars().count() > 32 {
+                format!("{}…", truncate_str(&item.title, 31))
+            } else {
+                item.title.clone()
+            };
+            card = card.push(
+                row![
+                    text(item.icon).size(font_small).color(reason_color),
+                    text(title)
+                        .size(font_small)
+                        .color(theme.text_primary())
+                        .font(mono),
+                    text(item.label).size(font_small).color(reason_color),
+                    text(format_attention_age(item.waiting.as_secs()))
+                        .size(font_small)
+                        .color(theme.text_muted())
+                        .font(mono),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        if rows.len() > SHOWN {
+            card = card.push(
+                text(format!("+{} more", rows.len() - SHOWN))
+                    .size(font_small)
+                    .color(theme.text_muted()),
+            );
+        }
+        if rows.is_empty() && running {
+            card = card.push(
+                text("▶ Turn running")
+                    .size(font_small)
+                    .color(rail_urgency_color(theme, RailUrgency::Running, false)),
+            );
+        }
+        self.rail_tooltip(card)
     }
 
     fn view_workspace_dot_column(&self) -> Column<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let pulse_bright = self.attention_pulse_bright;
         let mut dots = Column::new().spacing(8).align_x(iced::Alignment::Center);
+        let items = self.attention_items();
 
         for (idx, ws) in self.workspaces.iter().enumerate() {
             let is_active = idx == self.active_workspace_idx;
             let ws_color = ws.color.color(theme);
             let inactive_color = theme.surface2();
 
-            let has_attention = ws.has_attention();
-            let attention_reason = ws.highest_priority_attention();
+            // The tab in front is left out: its state is already on screen.
+            let (rows, running) = self.workspace_rail_state(&items, idx);
+            let urgency = workspace_rail_urgency(&rows, running);
+            let pending = urgency.filter(|urgency| *urgency != RailUrgency::Running);
             let has_error = ws.console.status == ConsoleStatus::Error;
 
-            // Larger dot for attention/error when inactive
+            // Larger dot for something waiting or a console error when
+            // inactive; the active workspace keeps its tall bar.
             let (dot_w, dot_h) = if is_active {
                 (4.0, 18.0)
-            } else if has_attention || has_error {
+            } else if pending.is_some() || has_error {
                 (6.0, 6.0)
             } else {
                 (4.0, 4.0)
             };
 
-            // Color: error (red) > attention (pulsing amber) > active (ws color) > inactive
-            let dot_color = if (has_error
-                || matches!(
-                    attention_reason,
-                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))
-                ))
-                && !is_active
-            {
+            // Color: console error (inactive) > most urgent waiting reason >
+            // a running turn (inactive only — the active bar keeps its
+            // workspace colour, which the tab strip's stamp matches) >
+            // active (ws color) > inactive.
+            let dot_color = if has_error && !is_active {
                 theme.danger()
-            } else if matches!(
-                attention_reason,
-                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_))
-            ) && !is_active
-            {
-                theme.success()
-            } else if has_attention && !is_active && pulse_bright {
-                theme.peach()
-            } else if has_attention && !is_active {
-                theme.warning()
+            } else if let Some(urgency) = pending {
+                rail_urgency_color(theme, urgency, pulse_bright)
+            } else if urgency == Some(RailUrgency::Running) && !is_active {
+                rail_urgency_color(theme, RailUrgency::Running, pulse_bright)
             } else if is_active {
                 ws_color
             } else {
@@ -24401,9 +24647,14 @@ fi
                 }
             })
             .padding([4, 0])
-            .on_press(Event::WorkspaceSelect(idx));
+            .on_press(Event::WorkspaceDotPressed(idx));
 
-            dots = dots.push(dot_btn);
+            let tip = self.workspace_dot_tooltip(ws, &rows, running);
+            dots = dots.push(iced::widget::tooltip(
+                dot_btn,
+                tip,
+                iced::widget::tooltip::Position::Right,
+            ));
         }
 
         dots
@@ -34727,7 +34978,7 @@ mod tests {
             let now = base + Duration::from_millis(1_000 + 100 * frame as u64);
             let mut items = [&parent, &younger, &older]
                 .into_iter()
-                .filter_map(|tab| AttentionItem::for_tab(tab, "ws", "Local", now))
+                .filter_map(|tab| AttentionItem::for_tab(tab, 0, "ws", "Local", now))
                 .collect::<Vec<_>>();
             sort_attention_items(&mut items);
             for item in &items {
@@ -34758,6 +35009,94 @@ mod tests {
         assert!(!older.needs_attention());
     }
 
+    fn rail_item(target: AttentionTarget, priority: u8, waiting_secs: u64) -> AttentionItem {
+        AttentionItem {
+            target,
+            workspace_idx: Some(0),
+            workspace_name: "ws".to_string(),
+            machine_name: "Local".to_string(),
+            title: "row".to_string(),
+            priority,
+            icon: "●",
+            label: "label",
+            waiting: Duration::from_secs(waiting_secs),
+        }
+    }
+
+    #[test]
+    fn rail_urgency_is_the_most_urgent_row_then_running() {
+        assert_eq!(workspace_rail_urgency(&[], false), None);
+        assert_eq!(
+            workspace_rail_urgency(&[], true),
+            Some(RailUrgency::Running)
+        );
+        let review = rail_item(AttentionTarget::Tab(1), 3, 10);
+        let failed = rail_item(AttentionTarget::Tab(2), 1, 5);
+        let input = rail_item(AttentionTarget::Task("t".to_string()), 0, 1);
+        let interrupted = rail_item(AttentionTarget::Task("i".to_string()), 2, 1);
+        assert_eq!(
+            workspace_rail_urgency(std::slice::from_ref(&review), true),
+            Some(RailUrgency::Review),
+            "anything waiting outranks a running turn"
+        );
+        assert_eq!(
+            workspace_rail_urgency(&[review.clone(), failed.clone()], false),
+            Some(RailUrgency::Failed)
+        );
+        assert_eq!(
+            workspace_rail_urgency(&[review.clone(), input, failed], true),
+            Some(RailUrgency::NeedsYou)
+        );
+        assert_eq!(
+            workspace_rail_urgency(&[review, interrupted], false),
+            Some(RailUrgency::Interrupted)
+        );
+    }
+
+    #[test]
+    fn rail_click_lands_on_the_most_urgent_longest_waiting_row() {
+        assert_eq!(rail_click_target(&[]), None);
+        let rows = [
+            rail_item(AttentionTarget::Tab(1), 3, 600),
+            rail_item(AttentionTarget::Tab(2), 0, 5),
+            rail_item(AttentionTarget::Tab(3), 0, 90),
+            rail_item(AttentionTarget::Tab(4), 1, 900),
+        ];
+        assert_eq!(rail_click_target(&rows), Some(AttentionTarget::Tab(3)));
+        // Order of the input does not matter.
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        assert_eq!(rail_click_target(&reversed), Some(AttentionTarget::Tab(3)));
+        // A task row can be the target.
+        let task_first = [
+            rail_item(AttentionTarget::Task("t".to_string()), 0, 30),
+            rail_item(AttentionTarget::Tab(9), 3, 3_000),
+        ];
+        assert_eq!(
+            rail_click_target(&task_first),
+            Some(AttentionTarget::Task("t".to_string()))
+        );
+    }
+
+    #[test]
+    fn working_titles_are_running_and_idle_titles_are_not() {
+        assert!(terminal_title_shows_working("◐ Fix the inbox"));
+        assert!(terminal_title_shows_working("◑ Fix the inbox"));
+        assert!(terminal_title_shows_working("✻ Fix the inbox"));
+        assert!(terminal_title_shows_working("⠐ Fix the inbox"));
+        assert!(!terminal_title_shows_working("✳ Fix the inbox"));
+        assert!(!terminal_title_shows_working("* shell"));
+        assert!(!terminal_title_shows_working("zsh"));
+        assert!(!terminal_title_shows_working(""));
+
+        let mut tab = TabState::new(1, PathBuf::from("/tmp/rail-running"));
+        assert!(!tab.is_running());
+        tab.observe_terminal_title("◐ Fix the inbox".to_string());
+        assert!(tab.is_running());
+        tab.observe_terminal_title("✳ Fix the inbox".to_string());
+        assert!(!tab.is_running());
+    }
+
     #[test]
     fn title_status_glyphs_strip_to_the_topic() {
         assert_eq!(
@@ -34780,7 +35119,7 @@ mod tests {
         assert_eq!(strip_title_status_glyphs("✳"), "");
         let mut tab = TabState::new(1, PathBuf::from("/tmp/inbox-fallback"));
         tab.observe_terminal_title("✳ ".to_string());
-        let item = AttentionItem::for_tab(&tab, "ws", "Local", Instant::now())
+        let item = AttentionItem::for_tab(&tab, 0, "ws", "Local", Instant::now())
             .expect("✳ raises attention");
         assert_eq!(item.title, "inbox-fallback");
     }
