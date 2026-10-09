@@ -2784,6 +2784,37 @@ fn task_attention_presentation(reason: TaskAttentionReason) -> (u8, &'static str
     }
 }
 
+/// What a chat tab's icon in the session strip says about its live session
+/// (TRU-140). Terminal tabs get this from Claude's own title; a chat tab
+/// has no title, so the strip reads the agent session instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatTabMarker {
+    /// A permission prompt or question waits on the human: the strip's
+    /// "needs you" dot. `pulse` is off on the tab in front, whose page
+    /// already shows the request card.
+    NeedsYou { pulse: bool },
+    /// A turn is running: the strip's ▶ marker.
+    Running,
+}
+
+/// The marker for a chat tab: a pending request outranks a running turn
+/// (the human is the blocker); neither means the tab falls back to its
+/// attention icon or the idle chat glyph. Clears as soon as the requests
+/// are answered and the turn ends, since both inputs are live state.
+fn chat_tab_marker(
+    turn_running: bool,
+    pending_requests: usize,
+    is_active: bool,
+) -> Option<ChatTabMarker> {
+    if pending_requests > 0 {
+        Some(ChatTabMarker::NeedsYou { pulse: !is_active })
+    } else if turn_running {
+        Some(ChatTabMarker::Running)
+    } else {
+        None
+    }
+}
+
 fn agent_event_attention_reason(event: &tab::AgentEvent) -> Option<AttentionReason> {
     match event {
         tab::AgentEvent::Harness(harness_event) => match harness_event {
@@ -24419,11 +24450,32 @@ fi
                 }
             });
             let is_claude = display_title.to_lowercase().contains("claude");
+            let chat_session = tab.agent_session();
+            let chat_marker = chat_session.and_then(|session| {
+                chat_tab_marker(
+                    matches!(session.state, tab::AgentSessionState::Streaming),
+                    session.pending_requests.len(),
+                    is_active,
+                )
+            });
 
-            // Icon prefix — attention overrides normal icon
-            let (icon_str, icon_color) = match attention_reason {
-                Some(
-                    AttentionReason::HumanInputRequired | AttentionReason::DelegationBlocked(_),
+            // Icon prefix — a chat tab's live session first, then attention
+            // overrides the normal icon.
+            let (icon_str, icon_color) = match (chat_marker, attention_reason) {
+                (Some(ChatTabMarker::NeedsYou { pulse }), _) => (
+                    "● ",
+                    if pulse && pulse_bright {
+                        theme.peach()
+                    } else {
+                        theme.warning()
+                    },
+                ),
+                (Some(ChatTabMarker::Running), _) => ("▶ ", theme.success()),
+                (
+                    None,
+                    Some(
+                        AttentionReason::HumanInputRequired | AttentionReason::DelegationBlocked(_),
+                    ),
                 ) => (
                     "● ",
                     if pulse_bright {
@@ -24432,14 +24484,18 @@ fi
                         theme.warning()
                     },
                 ),
-                Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)) => {
-                    ("! ", theme.danger())
-                }
-                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_)) => {
-                    ("✓ ", theme.success())
-                }
-                None if is_claude => ("✦ ", theme.peach()),
-                None => ("▶ ", theme.success()),
+                (
+                    None,
+                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)),
+                ) => ("! ", theme.danger()),
+                (
+                    None,
+                    Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_)),
+                ) => ("✓ ", theme.success()),
+                // An idle chat tab: ▶ is reserved for a running turn.
+                (None, None) if chat_session.is_some() => ("✦ ", theme.text_muted()),
+                (None, None) if is_claude => ("✦ ", theme.peach()),
+                (None, None) => ("▶ ", theme.success()),
             };
 
             // Tab label - strip leading "*" when attention (redundant with visual indicator),
@@ -33957,6 +34013,34 @@ mod tests {
         let second = TabState::new(2, PathBuf::from("/repo"));
         assert!(uuid::Uuid::parse_str(&first.session_uid).is_ok());
         assert_ne!(first.session_uid, second.session_uid);
+    }
+
+    #[test]
+    fn chat_tab_marker_shows_needs_you_over_running_and_clears_when_idle() {
+        // Idle with nothing pending: no marker, active or not.
+        assert_eq!(chat_tab_marker(false, 0, false), None);
+        assert_eq!(chat_tab_marker(false, 0, true), None);
+        // A running turn shows ▶ whether or not the tab is in front.
+        assert_eq!(
+            chat_tab_marker(true, 0, false),
+            Some(ChatTabMarker::Running)
+        );
+        assert_eq!(chat_tab_marker(true, 0, true), Some(ChatTabMarker::Running));
+        // A pending request outranks the running turn; it pulses only on a
+        // background tab.
+        assert_eq!(
+            chat_tab_marker(true, 1, false),
+            Some(ChatTabMarker::NeedsYou { pulse: true })
+        );
+        assert_eq!(
+            chat_tab_marker(true, 2, true),
+            Some(ChatTabMarker::NeedsYou { pulse: false })
+        );
+        // A request left over without a running turn still needs the human.
+        assert_eq!(
+            chat_tab_marker(false, 1, false),
+            Some(ChatTabMarker::NeedsYou { pulse: true })
+        );
     }
 
     #[test]
