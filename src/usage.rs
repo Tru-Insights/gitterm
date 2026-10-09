@@ -185,6 +185,18 @@ impl ModelPrice {
         }
     }
 
+    /// Rates for a provider with no 1-hour cache tier: 1-hour writes bill
+    /// at the plain cache-write rate.
+    const fn flat(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Self {
+        ModelPrice {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cache_write_1h: None,
+        }
+    }
+
     /// USD for `tokens` at these rates.
     pub fn cost(&self, tokens: &Tokens) -> f64 {
         let one_hour = tokens.cache_write_1h.min(tokens.cache_write);
@@ -253,10 +265,19 @@ pub const SEED_PRICES: &[(&str, Option<ModelPrice>)] = &[
     // $0.50 / $2.50 above it; its cache-read rate is not published per
     // model, and a single rate per category cannot express the tier.
     ("claude-haiku-5-5", None),
-    // OpenAI list prices for these were not verifiable offline.
-    ("gpt-6.1-sol", None),
-    ("gpt-6-luna", None),
-    ("gpt-6-astra", None),
+    // OpenAI standard-tier list prices, collected online 2026-10-08 from
+    // OpenAI's GPT-6.1 Sol launch post and two price trackers updated
+    // 2026-10-06 (pricepertoken.com, cloudzero.com). Prompts over 272K
+    // input tokens reprice the whole request (2x input, 1.5x output); not
+    // modelled. OpenAI has no 1-hour cache tier.
+    // Sol's cached-input rate is launch pricing, noted as promotional
+    // through 2026-11-21; override in config.json if it changes.
+    ("gpt-6.1-sol", Some(ModelPrice::flat(2.0, 10.0, 0.10, 2.5))),
+    (
+        "gpt-6-luna",
+        Some(ModelPrice::flat(0.10, 0.50, 0.01, 0.125)),
+    ),
+    ("gpt-6-astra", Some(ModelPrice::flat(10.0, 50.0, 1.0, 12.5))),
 ];
 
 /// The `usage` object in config.json:
@@ -1416,13 +1437,14 @@ mod tests {
         assert_eq!(report.start, NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
         assert_eq!(all.days.len(), 7);
         // Claude A (last partial wins) 0.01124 + B (1h writes) 0.0935 +
-        // C (headless) 0.003; Pi a1 0.0048. Codex and the unknown Claude
-        // model are unpriced.
-        assert!(close(all.totals.cost, 0.11254), "{}", all.totals.cost);
+        // C (headless) 0.003; Pi a1 0.0048; Codex astra 0.0078 + sol
+        // 0.00372 + luna 0.000045. Only the unknown Claude model is
+        // unpriced.
+        assert!(close(all.totals.cost, 0.124105), "{}", all.totals.cost);
         assert_eq!(all.totals.responses, 8);
-        assert_eq!(all.totals.unpriced_tokens, 100 + 1100 + 2200 + 330);
+        assert_eq!(all.totals.unpriced_tokens, 100);
         assert_eq!(report.headless_responses, 1);
-        assert!(close(report.interactive.totals.cost, 0.10954));
+        assert!(close(report.interactive.totals.cost, 0.121105));
         assert_eq!(report.interactive.totals.responses, 7);
 
         let opus = model(all, "claude-opus-5-5");
@@ -1457,7 +1479,9 @@ mod tests {
             "last_token_usage, not the total"
         );
         assert_eq!(sol.usage.tokens.cache_read, 1200);
-        assert!(!sol.priced);
+        assert!(sol.priced);
+        assert!(close(sol.usage.cost, 0.00372), "{}", sol.usage.cost);
+        assert!(close(astra.usage.cost, 0.0078), "{}", astra.usage.cost);
 
         let pi_sonnet = all
             .models
@@ -1478,7 +1502,8 @@ mod tests {
         assert_eq!(all.days[2].by_harness[2].responses, 1, "pi a1 on Oct 3");
 
         let names: Vec<&str> = all.repos.iter().map(|row| row.name.as_str()).collect();
-        assert_eq!(names, ["alpha", "gamma", "beta"], "costliest first");
+        // beta is the Codex-only repo; priced Codex now puts it ahead of gamma.
+        assert_eq!(names, ["alpha", "beta", "gamma"], "costliest first");
         assert!(all.repos.iter().all(|row| !row.resolved));
     }
 
@@ -1601,7 +1626,11 @@ mod tests {
         let astra = pricing.price_for("gpt-6-astra").unwrap();
         assert_eq!(astra.cache_write_1h, None);
         assert_eq!(pricing.price_for("claude-opus-5-5"), None);
-        assert_eq!(pricing.price_for("gpt-6-luna"), None, "seeded unpriced");
+        assert_eq!(
+            pricing.price_for("claude-haiku-5-5"),
+            None,
+            "seeded unpriced"
+        );
         assert_eq!(pricing.price_for("never-heard-of-it"), None);
         assert_eq!(
             pricing.price_for("claude-haiku-4-5-20251001"),
