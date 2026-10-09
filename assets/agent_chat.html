@@ -33,6 +33,12 @@
     color: var(--fg);
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
     font-size: 14px;
+    font-weight: 400;
+    /* Light text on a dark background renders visibly heavier with
+       subpixel smoothing in WebKit; grayscale antialiasing keeps the
+       regular weight looking regular. */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
   body {
     display: flex;
@@ -76,6 +82,8 @@
     word-break: break-word;
   }
   .assistant { margin: 6px 0 10px; word-break: break-word; }
+  /* Claude bolds freely; semibold keeps emphasis without shouting. */
+  .assistant strong { font-weight: 600; }
   .assistant .tail { white-space: pre-wrap; }
   .assistant p { margin: 0 0 8px; }
   .assistant p:last-child { margin-bottom: 0; }
