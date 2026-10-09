@@ -606,7 +606,7 @@ fn index_pi_transcript(path: &Path) -> Option<ChatIndexEntry> {
 }
 
 /// Resolved git identity of a cwd: (main-repo root, is_worktree).
-fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
+pub(crate) fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
     let out = crate::agentd::git::git_command()
         .args([
             "--no-optional-locks",
@@ -634,7 +634,7 @@ fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
 
 /// All .jsonl files up to `depth` directory levels below `root`
 /// (claude/pi: slug/file = 1; codex: YYYY/MM/DD/file = 3).
-fn jsonl_files_under(root: &Path, depth: usize) -> Vec<PathBuf> {
+pub(crate) fn jsonl_files_under(root: &Path, depth: usize) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut dirs = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, level)) = dirs.pop() {
