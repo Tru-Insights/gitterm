@@ -201,6 +201,12 @@ pub enum AgentIpcMessage {
         key: Key,
         modifiers: Modifiers,
     },
+    /// Cmd+V typed in tab `tab_id`'s chat page (TRU-140). With no Edit
+    /// menu WebKit does nothing with it, so the app sends the page the
+    /// native `paste:` action.
+    PastePage {
+        tab_id: usize,
+    },
 }
 
 /// Where a delegation request came from, so its acceptance or refusal
@@ -512,6 +518,33 @@ fn global_shortcut(key: &Key, modifiers: Modifiers) -> Option<GlobalShortcut> {
     }
 }
 
+/// What a chord a chat page forwarded asks the app to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardedKey {
+    /// An app-wide chord, run through the Iced key handler.
+    Global(GlobalShortcut),
+    /// Cmd+V: paste into the page that forwarded it. Not a global shortcut:
+    /// in the terminal Cmd+V is the terminal's own paste, which the Iced
+    /// key handler leaves to iced_term.
+    Paste,
+}
+
+/// Which forwarded chord `key` with `modifiers` is, if any: the chat page's
+/// `isHostShortcut` allow-list as the host reads it. Pure, for tests.
+fn forwarded_key(key: &Key, modifiers: Modifiers) -> Option<ForwardedKey> {
+    if let Key::Character(c) = key.as_ref() {
+        if c.eq_ignore_ascii_case("v")
+            && modifiers.command()
+            && !modifiers.shift()
+            && !modifiers.control()
+            && !modifiers.alt()
+        {
+            return Some(ForwardedKey::Paste);
+        }
+    }
+    global_shortcut(key, modifiers).map(ForwardedKey::Global)
+}
+
 /// Read a chord a chat page forwarded (`{type: "hostkey", key, code, meta,
 /// ctrl, shift, alt}`) as the key and modifiers the Iced key handler would
 /// have seen. `key` is the DOM `KeyboardEvent.key` (the logical key, as
@@ -723,13 +756,16 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                         return;
                     }
                 };
-                if global_shortcut(&key, modifiers).is_none() {
-                    eprintln!(
-                        "[agent-ipc] tab {tab_id}: ignoring hostkey {key:?} {modifiers:?}, not a global shortcut"
-                    );
-                    return;
+                match forwarded_key(&key, modifiers) {
+                    Some(ForwardedKey::Global(_)) => AgentIpcMessage::HostKey { key, modifiers },
+                    Some(ForwardedKey::Paste) => AgentIpcMessage::PastePage { tab_id },
+                    None => {
+                        eprintln!(
+                            "[agent-ipc] tab {tab_id}: ignoring hostkey {key:?} {modifiers:?}, not a forwarded chord"
+                        );
+                        return;
+                    }
                 }
-                AgentIpcMessage::HostKey { key, modifiers }
             }
             "open_url" => {
                 let url = value.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -14848,6 +14884,10 @@ fi
                         let task = self.update(Event::KeyPressed(key, modifiers));
                         self.current_modifiers = held;
                         task
+                    }
+                    AgentIpcMessage::PastePage { tab_id } => {
+                        webview::paste_into_agent_page(tab_id);
+                        Task::none()
                     }
                 };
             }
@@ -34176,6 +34216,10 @@ mod tests {
         assert_eq!(chord(ch("t"), Modifiers::COMMAND | Modifiers::SHIFT), None);
         assert_eq!(chord(ch("t"), Modifiers::COMMAND | Modifiers::CTRL), None);
         assert_eq!(chord(ch("w"), Modifiers::COMMAND), None);
+        // Cmd+C / Cmd+V belong to whatever has focus (the terminal copies
+        // and pastes them itself); a chat page's Cmd+V is `forwarded_key`'s.
+        assert_eq!(chord(ch("c"), Modifiers::COMMAND), None);
+        assert_eq!(chord(ch("v"), Modifiers::COMMAND), None);
         assert_eq!(chord(escape, Modifiers::SHIFT), None);
         assert_eq!(chord(enter.clone(), Modifiers::empty()), None);
         assert_eq!(chord(enter.clone(), Modifiers::SHIFT), None);
@@ -34234,6 +34278,51 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_key_reads_cmd_v_as_paste_and_passes_the_rest_through() {
+        let forwarded = |value: serde_json::Value| {
+            let (key, modifiers) = hostkey_chord(&value).expect("chord");
+            forwarded_key(&key, modifiers)
+        };
+        // What the page posts for Cmd+V (also with Caps Lock on).
+        assert_eq!(
+            forwarded(hostkey("v", true, false, false, false)),
+            Some(ForwardedKey::Paste)
+        );
+        assert_eq!(
+            forwarded(hostkey("V", true, false, false, false)),
+            Some(ForwardedKey::Paste)
+        );
+        // Only Command alone.
+        for (meta, ctrl, shift, alt) in [
+            (false, false, false, false),
+            (false, true, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, false, false, true),
+        ] {
+            assert_eq!(forwarded(hostkey("v", meta, ctrl, shift, alt)), None);
+        }
+        // The page edits Cmd+C/X/A/Z itself; were they forwarded, the host
+        // would drop them.
+        for k in ["c", "x", "a", "z"] {
+            assert_eq!(forwarded(hostkey(k, true, false, false, false)), None);
+        }
+        // Every global shortcut still means itself.
+        assert_eq!(
+            forwarded(hostkey(" ", false, true, false, false)),
+            Some(ForwardedKey::Global(GlobalShortcut::Dictation))
+        );
+        assert_eq!(
+            forwarded(hostkey("2", true, false, false, false)),
+            Some(ForwardedKey::Global(GlobalShortcut::SelectTab(2)))
+        );
+        assert_eq!(
+            forwarded(hostkey("Escape", false, false, false, false)),
+            Some(ForwardedKey::Global(GlobalShortcut::Escape))
+        );
+    }
+
+    #[test]
     fn hostkey_chord_rejects_malformed_messages() {
         assert!(hostkey_chord(&hostkey("Enter", false, false, false, false)).is_err());
         assert!(hostkey_chord(&hostkey("", true, false, false, false)).is_err());
@@ -34242,9 +34331,9 @@ mod tests {
             "meta": true, "ctrl": false, "shift": false, "alt": false
         }))
         .is_err());
-        // Well formed but not a global shortcut: the dispatcher drops it.
+        // Well formed but not a forwarded chord: the dispatcher drops it.
         let (key, modifiers) = hostkey_chord(&hostkey("k", true, false, false, false)).unwrap();
-        assert_eq!(global_shortcut(&key, modifiers), None);
+        assert_eq!(forwarded_key(&key, modifiers), None);
     }
 
     #[test]
@@ -34252,6 +34341,9 @@ mod tests {
         let html = agent_chat_html();
         assert!(html.contains("postIpc({ type: 'hostkey', key: e.key, code: e.code"));
         assert!(html.contains("function pageHasOpenLayer()"));
+        assert!(html.contains("if (cmdOnly && k.toLowerCase() === 'v') return true;"));
+        assert!(html.contains("function editingCommand(e)"));
+        assert!(html.contains("document.execCommand(command);"));
     }
 
     #[test]

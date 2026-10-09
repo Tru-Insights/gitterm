@@ -57,6 +57,11 @@ schemars = "1.0"
 whisper-rs = { version = "0.15", optional = true }
 cpal = { version = "0.15", optional = true }
 
+# Sends the native paste: action to a chat page's WKWebView (src/webview.rs).
+# The version wry 0.48 itself uses, so it adds no crates.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+
 [features]
 default = ["stt"]
 stt = ["whisper-rs", "cpal"]

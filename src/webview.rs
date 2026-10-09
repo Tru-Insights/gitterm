@@ -359,6 +359,43 @@ pub fn insert_agent_composer_text(tab_id: usize, text: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Paste the system pasteboard into agent tab `tab_id`'s page, where its
+/// focus or selection is, as an Edit menu's Paste would: the page forwards
+/// Cmd+V (GitTerm has no Edit menu, so WebKit never gets `paste:` from the
+/// key), and this sends the native `paste:` action to its WKWebView. WebKit
+/// then fires a trusted `paste` event carrying the pasteboard, image files
+/// included, before inserting any text.
+pub fn paste_into_agent_page(tab_id: usize) {
+    let found = with_existing_slot(WebviewSurface::Agent(tab_id), |slot| {
+        let Some(webview) = slot.webview.as_ref() else {
+            return false;
+        };
+        native_paste(webview, tab_id);
+        true
+    });
+    if found != Some(true) {
+        eprintln!("[agent-webview] paste for tab={tab_id} dropped: the tab has no chat page");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_paste(webview: &WebView, _tab_id: usize) {
+    use wry::WebViewExtMacOS;
+    let wk = webview.webview();
+    // SAFETY: `paste:` is the NSResponder action WKWebView implements for
+    // the Edit menu; it takes the sender (nil here) and returns nothing.
+    // Called on the main thread, where the webview lives.
+    unsafe {
+        let _: () = objc2::msg_send![&*wk, paste: std::ptr::null::<objc2::runtime::AnyObject>()];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_paste(_webview: &WebView, tab_id: usize) {
+    // Only macOS pages forward Cmd+V; WebView2 pastes Ctrl+V itself.
+    eprintln!("[agent-webview] paste for tab={tab_id} ignored: native paste is macOS only");
+}
+
 /// Hide every agent page.
 pub fn hide_agent_pages() {
     show_only_agent_page(None);

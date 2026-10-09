@@ -2457,14 +2457,28 @@
     promptEl.focus();
   };
 
-  // ---- global shortcuts (TRU-140) -----------------------------------------
+  // ---- global shortcuts and editing chords (TRU-140) ----------------------
   // While this page has keyboard focus its keys never reach GitTerm's own
   // key handler, so the app-wide chords are handed to it instead. The list
-  // is fixed and matches `global_shortcut` in main.rs; every other key
-  // (Enter, Shift+Enter, Cmd+Enter, Shift+Tab, editing keys) stays here.
-  // Escape goes to GitTerm only when nothing on this page is open for it to
-  // close. Capture phase, so this sees the page's state before the page's
-  // own Escape handlers close anything.
+  // (isHostShortcut) is fixed and matches `forwarded_key` in main.rs:
+  // `global_shortcut`'s chords plus Cmd+V. Every other key (Enter,
+  // Shift+Enter, Cmd+Enter, Shift+Tab, the editing chords below) stays
+  // here. Escape goes to GitTerm only when nothing on this page is open for
+  // it to close. Capture phase, so this sees the page's state before the
+  // page's own Escape handlers close anything.
+  //
+  // Editing chords. GitTerm has no Edit menu: a menu key equivalent for
+  // Cmd+C / Cmd+V would take those keys from the terminal, which copies and
+  // pastes through its own key handling. AppKit only turns Cmd+C/X/V/A/Z
+  // into copy: / cut: / paste: / selectAll: / undo: through a menu, so
+  // without one WebKit does nothing with them. The page runs them itself
+  // (editingCommand), on whatever has focus (the composer, the Review
+  // popover's fields, the deny reason) or, for copy, on a transcript
+  // selection; a keydown is a user gesture, so execCommand('copy'|'cut')
+  // may write the pasteboard. Cmd+V is the exception: a script cannot read
+  // the pasteboard, so it is forwarded, and GitTerm sends the native
+  // paste: action to this page's WKWebView. The page then gets a real paste
+  // event (text, or image files for the composer's paste handler).
   function pageHasOpenLayer() {
     return modeMenuEl.classList.contains('visible')
       || CHIP_MENUS.some((m) => m.classList.contains('visible'))
@@ -2478,12 +2492,37 @@
     const cmdOnly = e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
     if (ctrlOnly && (k === ' ' || digit)) return true; // Ctrl+Space, Ctrl+1…9
     if (cmdOnly && (digit || k.toLowerCase() === 't')) return true; // Cmd+1…9, Cmd+T
+    if (cmdOnly && k.toLowerCase() === 'v') return true; // Cmd+V: paste, sent back as the native paste: action
     if (e.metaKey && e.shiftKey && !e.ctrlKey && !e.altKey && k.toLowerCase() === 'u') return true; // Cmd+Shift+U
     if (k === 'Escape' && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) return !pageHasOpenLayer();
     return false;
   }
+  // The execCommand for an editing chord, or null. Command alone (Shift
+  // only for redo), as the Edit menu binds them.
+  function editingCommand(e) {
+    if (!e.metaKey || e.ctrlKey || e.altKey) return null;
+    const k = e.key.toLowerCase();
+    if (k === 'z') return e.shiftKey ? 'redo' : 'undo'; // Cmd+Z, Cmd+Shift+Z
+    if (e.shiftKey) return null;
+    if (k === 'c') return 'copy'; // Cmd+C
+    if (k === 'x') return 'cut'; // Cmd+X
+    if (k === 'a') return 'selectAll'; // Cmd+A
+    return null;
+  }
   document.addEventListener('keydown', (e) => {
-    if (e.isComposing || !isHostShortcut(e)) return;
+    if (e.isComposing) return;
+    const command = editingCommand(e);
+    if (command) {
+      // Always taken: WebKit hands a key the page leaves alone back to
+      // AppKit, which passes it on to GitTerm's own view (where Cmd+C/V
+      // would reach the terminal). execCommand's false only means nothing
+      // to act on (no selection, nothing to undo), as a disabled Edit menu
+      // item would.
+      e.preventDefault();
+      document.execCommand(command);
+      return;
+    }
+    if (!isHostShortcut(e)) return;
     e.preventDefault();
     // A held chord auto-repeats; act once per press (Ctrl+Space would
     // otherwise toggle dictation on and off).
