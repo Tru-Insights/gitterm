@@ -2925,6 +2925,49 @@ fn aggregate_task_live_states(
     working.then_some(TaskLifecycle::Running)
 }
 
+/// One row of the Chats panel's Open section (TRU-148): an open tab, where
+/// it lives, and what orders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenTabRow {
+    workspace_idx: usize,
+    tab_idx: usize,
+    tab_id: usize,
+    /// Its attention on the shared scale and how long it has waited.
+    attention: Option<(u8, Duration)>,
+    running: bool,
+}
+
+/// Whether an open tab belongs in the Open section: a tab with a chat
+/// session (a chat page or a CLI harness the Chats registry knows) always;
+/// a plain terminal only while it has attention.
+fn open_section_includes(has_chat_session: bool, has_attention: bool) -> bool {
+    has_chat_session || has_attention
+}
+
+/// Open-section order: tabs that want the human first (most urgent, then
+/// longest waiting), then running, then idle; ties keep workspace and tab
+/// order. Every key is fixed while a tab's state is unchanged, so rows do
+/// not trade places between frames.
+fn sort_open_tab_rows(rows: &mut [OpenTabRow]) {
+    rows.sort_by_key(|row| {
+        let class = if row.attention.is_some() {
+            0
+        } else if row.running {
+            1
+        } else {
+            2
+        };
+        let (priority, waiting) = row.attention.unwrap_or((u8::MAX, Duration::ZERO));
+        (
+            class,
+            priority,
+            std::cmp::Reverse(waiting),
+            row.workspace_idx,
+            row.tab_idx,
+        )
+    });
+}
+
 /// Whether a harness title says it is working: the leading glyph is one of
 /// the spinner frames [`strip_title_status_glyphs`] documents ("◐"/"◑", the
 /// older sparkle set, braille spinners) — not the idle "✳" or a shell's "*".
@@ -5374,6 +5417,10 @@ pub enum Event {
     /// Expand/collapse one machine section in the Everywhere scope
     /// ("local" or a remote id).
     ToggleChatMachine(String),
+    /// Fold or unfold the Chats panel's Open section (TRU-148).
+    ToggleChatOpenSection,
+    /// Focus an open tab by id, switching workspace when needed.
+    FocusTabById(usize),
     /// Fold/unfold one machine group in the workspace bar.
     ToggleMachineGroup(String),
     /// Open/close the machine label menu in the workspace bar.
@@ -5675,6 +5722,8 @@ struct App {
     /// remote id). Sections start collapsed so the machine list itself
     /// is scannable; an active search overrides collapse.
     chat_expanded_machines: std::collections::HashSet<String>,
+    /// The Chats panel's Open section is folded (TRU-148); per app run.
+    chat_open_section_collapsed: bool,
     /// Workspace-bar machine groups the user folded (session-only).
     collapsed_machine_groups: std::collections::HashSet<String>,
     /// Machine label menu open in the workspace bar (group key).
@@ -11729,6 +11778,7 @@ impl App {
             chat_scope: chats::ChatScope::default(),
             chat_backend_filter: None,
             chat_expanded_machines: std::collections::HashSet::new(),
+            chat_open_section_collapsed: false,
             collapsed_machine_groups: std::collections::HashSet::new(),
             machine_menu: None,
             remote_chat_indexes: HashMap::new(),
@@ -13619,6 +13669,44 @@ fi
         }
         sort_attention_items(&mut items);
         items
+    }
+
+    /// Every open tab across the local workspaces that the Chats panel's
+    /// Open section lists, in its order (TRU-148).
+    fn open_tab_rows(&self) -> Vec<OpenTabRow> {
+        let now = Instant::now();
+        let mut rows = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| matches!(workspace.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|(workspace_idx, workspace)| {
+                workspace
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tab)| {
+                        open_section_includes(
+                            tab.agent_session().is_some() || tab.chat_session_id.is_some(),
+                            tab.attention.is_some(),
+                        )
+                    })
+                    .map(move |(tab_idx, tab)| OpenTabRow {
+                        workspace_idx,
+                        tab_idx,
+                        tab_id: tab.id,
+                        attention: tab.attention.map(|attention| {
+                            (
+                                attention.reason.priority(),
+                                now.saturating_duration_since(attention.since),
+                            )
+                        }),
+                        running: tab.is_running(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        sort_open_tab_rows(&mut rows);
+        rows
     }
 
     /// The tab in front of the user: the active tab of the active
@@ -19286,6 +19374,12 @@ fi
                     self.chat_expanded_machines.insert(key);
                 }
             }
+            Event::ToggleChatOpenSection => {
+                self.chat_open_section_collapsed = !self.chat_open_section_collapsed;
+            }
+            Event::FocusTabById(tab_id) => {
+                return self.jump_to_attention_target(AttentionTarget::Tab(tab_id));
+            }
             Event::RemoteChatIndexLoaded(remote_id, result) => {
                 let state = self
                     .remote_chat_indexes
@@ -24660,6 +24754,62 @@ fi
         dots
     }
 
+    /// The session strip's icon for a tab: a chat tab's live session
+    /// first, then attention overrides the normal icon. The Chats panel's
+    /// Open rows reuse it so both read the same (TRU-148).
+    fn session_tab_icon(
+        &self,
+        tab: &TabState,
+        is_active: bool,
+        display_title: &str,
+    ) -> (&'static str, iced::Color) {
+        let theme = &self.theme;
+        let pulse_bright = self.attention_pulse_bright;
+        let attention_reason = tab.attention.map(|attention| attention.reason);
+        let is_claude = display_title.to_lowercase().contains("claude");
+        let chat_session = tab.agent_session();
+        let chat_marker = chat_session.and_then(|session| {
+            chat_tab_marker(
+                matches!(session.state, tab::AgentSessionState::Streaming),
+                session.pending_requests.len(),
+                is_active,
+            )
+        });
+        match (chat_marker, attention_reason) {
+            (Some(ChatTabMarker::NeedsYou { pulse }), _) => (
+                "● ",
+                if pulse && pulse_bright {
+                    theme.peach()
+                } else {
+                    theme.warning()
+                },
+            ),
+            (Some(ChatTabMarker::Running), _) => ("▶ ", theme.success()),
+            (
+                None,
+                Some(AttentionReason::HumanInputRequired | AttentionReason::DelegationBlocked(_)),
+            ) => (
+                "● ",
+                if pulse_bright {
+                    theme.peach()
+                } else {
+                    theme.warning()
+                },
+            ),
+            (None, Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))) => {
+                ("! ", theme.danger())
+            }
+            (
+                None,
+                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_)),
+            ) => ("✓ ", theme.success()),
+            // An idle chat tab: ▶ is reserved for a running turn.
+            (None, None) if chat_session.is_some() => ("✦ ", theme.text_muted()),
+            (None, None) if is_claude => ("✦ ", theme.peach()),
+            (None, None) => ("▶ ", theme.success()),
+        }
+    }
+
     fn view_tab_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         self.view_session_bar()
     }
@@ -24856,54 +25006,7 @@ fi
                     tab.terminal_title().unwrap_or(tab.repo_name.as_str())
                 }
             });
-            let is_claude = display_title.to_lowercase().contains("claude");
-            let chat_session = tab.agent_session();
-            let chat_marker = chat_session.and_then(|session| {
-                chat_tab_marker(
-                    matches!(session.state, tab::AgentSessionState::Streaming),
-                    session.pending_requests.len(),
-                    is_active,
-                )
-            });
-
-            // Icon prefix — a chat tab's live session first, then attention
-            // overrides the normal icon.
-            let (icon_str, icon_color) = match (chat_marker, attention_reason) {
-                (Some(ChatTabMarker::NeedsYou { pulse }), _) => (
-                    "● ",
-                    if pulse && pulse_bright {
-                        theme.peach()
-                    } else {
-                        theme.warning()
-                    },
-                ),
-                (Some(ChatTabMarker::Running), _) => ("▶ ", theme.success()),
-                (
-                    None,
-                    Some(
-                        AttentionReason::HumanInputRequired | AttentionReason::DelegationBlocked(_),
-                    ),
-                ) => (
-                    "● ",
-                    if pulse_bright {
-                        theme.peach()
-                    } else {
-                        theme.warning()
-                    },
-                ),
-                (
-                    None,
-                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)),
-                ) => ("! ", theme.danger()),
-                (
-                    None,
-                    Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_)),
-                ) => ("✓ ", theme.success()),
-                // An idle chat tab: ▶ is reserved for a running turn.
-                (None, None) if chat_session.is_some() => ("✦ ", theme.text_muted()),
-                (None, None) if is_claude => ("✦ ", theme.peach()),
-                (None, None) => ("▶ ", theme.success()),
-            };
+            let (icon_str, icon_color) = self.session_tab_icon(tab, is_active, display_title);
 
             // Tab label - strip leading "*" when attention (redundant with visual indicator),
             // shorten path-like titles to last component, truncate at 20 chars
@@ -28935,6 +29038,96 @@ fi
     /// Sidebar for the Chats tab (TRU-78 slice 1): search, scope toggle,
     /// conversations grouped by repo. Pure render over `self.chat_index`;
     /// all file IO happened in the background index task.
+    /// The Chats panel's Open section (TRU-148): every open chat and CLI tab
+    /// across the local workspaces — plus plain terminals that want the
+    /// human — wanting-you first, then running, then idle. Each row carries
+    /// the session strip's marker and jumps to its tab. None when nothing is
+    /// open.
+    fn view_chats_open_section(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+        let rows = self.open_tab_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let front = self.front_tab_id();
+        let expanded = !self.chat_open_section_collapsed;
+        let chevron = if expanded { "▾" } else { "▸" };
+        let header = row![
+            text(chevron).size(10).color(theme.text_secondary()),
+            text("OPEN").size(10).color(theme.text_secondary()),
+            text(format!("{}", rows.len()))
+                .size(10)
+                .color(theme.text_muted()),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        let mut section = Column::new().spacing(2).push(
+            button(header)
+                .style(self.ghost_button_style())
+                .padding([6, 6])
+                .width(Length::Fill)
+                .on_press(Event::ToggleChatOpenSection),
+        );
+        if !expanded {
+            return Some(section.into());
+        }
+        let selected_bg = theme.surface0();
+        for row_state in rows {
+            let workspace = &self.workspaces[row_state.workspace_idx];
+            let tab = &workspace.tabs[row_state.tab_idx];
+            let is_front = front == Some(row_state.tab_id);
+            let terminal_title = tab
+                .terminal_title()
+                .map(strip_title_status_glyphs)
+                .filter(|title| !title.is_empty());
+            // A chat's own title when the index knows it, then the
+            // harness topic, then the repo.
+            let title = tab
+                .chat_session_id
+                .as_deref()
+                .and_then(|id| self.chat_index.iter().find(|entry| entry.id == id))
+                .map(|entry| entry.title.as_str())
+                .or(terminal_title)
+                .unwrap_or(tab.repo_name.as_str());
+            let title = if title.chars().count() > 34 {
+                format!("{}…", truncate_str(title, 33))
+            } else {
+                title.to_string()
+            };
+            let (icon, icon_color) =
+                self.session_tab_icon(tab, is_front, tab.terminal_title().unwrap_or_default());
+            let content = row![
+                text(icon.trim_end()).size(font_small).color(icon_color),
+                text(title).size(font_small).color(theme.text_primary()),
+                iced::widget::Space::new().width(Length::Fill),
+                text(workspace.name.clone())
+                    .size(font_small - 1.0)
+                    .color(theme.text_muted()),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            let btn = button(content)
+                .padding([4, 8])
+                .width(Length::Fill)
+                .on_press(Event::FocusTabById(row_state.tab_id));
+            let btn = if is_front {
+                btn.style(move |_theme, _status| button::Style {
+                    background: Some(selected_bg.into()),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            } else {
+                btn.style(self.ghost_button_style())
+            };
+            section = section.push(btn);
+        }
+        Some(section.into())
+    }
+
     fn view_chats_sidebar<'a>(
         &'a self,
         tab: &'a TabState,
@@ -29110,6 +29303,9 @@ fi
         }
 
         let mut list = Column::new().spacing(2).padding([4, 6]);
+        if let Some(open_section) = self.view_chats_open_section() {
+            list = list.push(open_section);
+        }
         if self.chat_index_loading && self.chat_index.is_empty() {
             list = list.push(
                 text("indexing conversations…")
@@ -35076,6 +35272,66 @@ mod tests {
             rail_click_target(&task_first),
             Some(AttentionTarget::Task("t".to_string()))
         );
+    }
+
+    fn open_row(
+        workspace_idx: usize,
+        tab_idx: usize,
+        attention: Option<(u8, u64)>,
+        running: bool,
+    ) -> OpenTabRow {
+        OpenTabRow {
+            workspace_idx,
+            tab_idx,
+            tab_id: workspace_idx * 100 + tab_idx,
+            attention: attention
+                .map(|(priority, waiting)| (priority, Duration::from_secs(waiting))),
+            running,
+        }
+    }
+
+    #[test]
+    fn open_section_orders_needs_you_then_running_then_idle() {
+        let idle_first = open_row(0, 0, None, false);
+        let running = open_row(0, 1, None, true);
+        let review = open_row(0, 2, Some((3, 900)), false);
+        let input_recent = open_row(1, 0, Some((0, 10)), true);
+        let input_old = open_row(2, 3, Some((0, 600)), false);
+        let failed = open_row(1, 4, Some((1, 5)), false);
+        let idle_later = open_row(2, 0, None, false);
+        let running_later = open_row(2, 1, None, true);
+        let mut rows = vec![
+            idle_later.clone(),
+            running_later.clone(),
+            idle_first.clone(),
+            review.clone(),
+            running.clone(),
+            input_recent.clone(),
+            failed.clone(),
+            input_old.clone(),
+        ];
+        sort_open_tab_rows(&mut rows);
+        assert_eq!(
+            rows,
+            vec![
+                input_old,
+                input_recent,
+                failed,
+                review,
+                running,
+                running_later,
+                idle_first,
+                idle_later,
+            ]
+        );
+    }
+
+    #[test]
+    fn open_section_lists_plain_terminals_only_with_attention() {
+        assert!(open_section_includes(true, false));
+        assert!(open_section_includes(true, true));
+        assert!(open_section_includes(false, true));
+        assert!(!open_section_includes(false, false));
     }
 
     #[test]
