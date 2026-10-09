@@ -60,6 +60,7 @@
 //! [`UsageCache`] keeps each file's parsed records keyed by (path, mtime,
 //! size); a file that only grew is parsed from where the last scan stopped.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -477,12 +478,17 @@ pub struct ModelRow {
     pub usage: Bucket,
 }
 
+/// What a repo row, and a repo filter, is keyed by: the main repo root
+/// when resolved, else the recorded cwd; None for records with no cwd.
+pub type RepoKey = Option<PathBuf>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoRow {
     /// Display name: the repo root's (or cwd's) last component.
     pub name: String,
-    /// Main repo root when resolved, else the recorded cwd.
-    pub path: Option<PathBuf>,
+    /// Main repo root when resolved, else the recorded cwd. The row's
+    /// [`RepoKey`].
+    pub path: RepoKey,
     /// False when the cwd is gone or not in a git repo.
     pub resolved: bool,
     pub usage: Bucket,
@@ -500,6 +506,16 @@ pub struct UsageView {
     pub models: Vec<ModelRow>,
     /// Costliest first, then by tokens.
     pub repos: Vec<RepoRow>,
+    /// The same view narrowed to each repo in `repos`, so a repo filter
+    /// needs no rescan. Empty in a narrowed view.
+    pub per_repo: HashMap<RepoKey, UsageView>,
+}
+
+impl UsageView {
+    /// This view narrowed to `repo`, if it has usage in it.
+    pub fn for_repo(&self, repo: &RepoKey) -> Option<&UsageView> {
+        self.per_repo.get(repo)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -538,6 +554,21 @@ impl UsageReport {
             &self.all
         } else {
             &self.interactive
+        }
+    }
+
+    /// [`Self::view`] narrowed to `repo` when given: totals, harness split,
+    /// days and models count only that repo's responses. A repo with no
+    /// usage in this population (say only headless runs, now hidden) gets
+    /// an empty view over the window.
+    pub fn view_for(&self, include_headless: bool, repo: Option<&RepoKey>) -> Cow<'_, UsageView> {
+        let view = self.view(include_headless);
+        match repo {
+            None => Cow::Borrowed(view),
+            Some(repo) => match view.for_repo(repo) {
+                Some(narrowed) => Cow::Borrowed(narrowed),
+                None => Cow::Owned(ViewBuilder::new(self.start, self.end).finish()),
+            },
         }
     }
 }
@@ -703,11 +734,14 @@ fn repo_key(
 
 struct ViewBuilder {
     start: NaiveDate,
+    end: NaiveDate,
     totals: Bucket,
     by_harness: [Bucket; 3],
     days: Vec<DayRow>,
     models: HashMap<(ChatBackend, String), (bool, Bucket)>,
-    repos: HashMap<Option<PathBuf>, (String, bool, Bucket)>,
+    repos: HashMap<RepoKey, (String, bool, Bucket)>,
+    /// One builder per repo, fed the same records (top level only).
+    per_repo: HashMap<RepoKey, ViewBuilder>,
 }
 
 impl ViewBuilder {
@@ -722,11 +756,13 @@ impl ViewBuilder {
             .collect();
         ViewBuilder {
             start,
+            end,
             totals: Bucket::default(),
             by_harness: [Bucket::default(); 3],
             days,
             models: HashMap::new(),
             repos: HashMap::new(),
+            per_repo: HashMap::new(),
         }
     }
 
@@ -736,7 +772,23 @@ impl ViewBuilder {
         date: NaiveDate,
         record: &UsageRecord,
         price: Option<ModelPrice>,
-        repo: &(String, Option<PathBuf>, bool),
+        repo: &(String, RepoKey, bool),
+    ) {
+        self.add_flat(backend, date, record, price, repo);
+        let (start, end) = (self.start, self.end);
+        self.per_repo
+            .entry(repo.1.clone())
+            .or_insert_with(|| ViewBuilder::new(start, end))
+            .add_flat(backend, date, record, price, repo);
+    }
+
+    fn add_flat(
+        &mut self,
+        backend: ChatBackend,
+        date: NaiveDate,
+        record: &UsageRecord,
+        price: Option<ModelPrice>,
+        repo: &(String, RepoKey, bool),
     ) {
         let harness = harness_index(backend);
         self.totals.add(&record.tokens, price);
@@ -783,12 +835,18 @@ impl ViewBuilder {
             })
             .collect();
         repos.sort_by(|a, b| by_spend(&a.usage, &b.usage).then(a.name.cmp(&b.name)));
+        let per_repo = self
+            .per_repo
+            .into_iter()
+            .map(|(key, builder)| (key, builder.finish()))
+            .collect();
         UsageView {
             totals: self.totals,
             by_harness: self.by_harness,
             days: self.days,
             models,
             repos,
+            per_repo,
         }
     }
 }
@@ -1422,6 +1480,98 @@ mod tests {
         let names: Vec<&str> = all.repos.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["alpha", "gamma", "beta"], "costliest first");
         assert!(all.repos.iter().all(|row| !row.resolved));
+    }
+
+    #[test]
+    fn a_repo_filter_narrows_totals_days_and_models_to_that_repo() {
+        let report = scan(
+            &fixture_sources(),
+            UsageWindow::Days7,
+            &mut UsageCache::default(),
+        );
+        for include_headless in [true, false] {
+            let view = report.view(include_headless);
+            let mut responses = 0;
+            let mut cost = 0.0;
+            for repo in &view.repos {
+                let narrowed = report.view_for(include_headless, Some(&repo.path));
+                // The narrowed totals are the repo row, and every slice of
+                // the narrowed view adds back up to them.
+                assert_eq!(narrowed.totals, repo.usage, "{}", repo.name);
+                let day_responses: u64 = narrowed
+                    .days
+                    .iter()
+                    .flat_map(|day| day.by_harness.iter())
+                    .map(|bucket| bucket.responses)
+                    .sum();
+                assert_eq!(day_responses, repo.usage.responses);
+                let model_responses: u64 =
+                    narrowed.models.iter().map(|row| row.usage.responses).sum();
+                assert_eq!(model_responses, repo.usage.responses);
+                let model_cost: f64 = narrowed.models.iter().map(|row| row.usage.cost).sum();
+                assert!(close(model_cost, repo.usage.cost));
+                assert_eq!(narrowed.days.len(), view.days.len());
+                assert_eq!(narrowed.repos.len(), 1);
+                assert_eq!(narrowed.repos[0].path, repo.path);
+                assert!(narrowed.per_repo.is_empty());
+                responses += narrowed.totals.responses;
+                cost += narrowed.totals.cost;
+            }
+            assert_eq!(responses, view.totals.responses);
+            assert!(close(cost, view.totals.cost));
+        }
+
+        // beta is the Codex rollout: only its models, only on Codex.
+        let beta = report
+            .all
+            .repos
+            .iter()
+            .find(|row| row.name == "beta")
+            .unwrap();
+        let narrowed = report.view_for(true, Some(&beta.path));
+        let mut models: Vec<&str> = narrowed
+            .models
+            .iter()
+            .map(|row| row.model.as_str())
+            .collect();
+        models.sort();
+        assert_eq!(models, ["gpt-6-astra", "gpt-6.1-sol"]);
+        assert_eq!(
+            narrowed.by_harness[harness_index(ChatBackend::Claude)].responses,
+            0
+        );
+        assert_eq!(
+            narrowed.by_harness[harness_index(ChatBackend::Pi)].responses,
+            0
+        );
+        assert_eq!(
+            narrowed.by_harness[harness_index(ChatBackend::Codex)],
+            narrowed.totals
+        );
+
+        // alpha's headless run drops out of the interactive population.
+        let alpha_key = report
+            .all
+            .repos
+            .iter()
+            .find(|row| row.name == "alpha")
+            .unwrap()
+            .path
+            .clone();
+        let all_alpha = report.view_for(true, Some(&alpha_key));
+        let interactive_alpha = report.view_for(false, Some(&alpha_key));
+        assert_eq!(
+            all_alpha.totals.responses,
+            interactive_alpha.totals.responses + 1
+        );
+
+        // No filter is the unfiltered view; a repo with no usage in the
+        // population is an empty view over the whole window.
+        assert_eq!(*report.view_for(true, None), report.all);
+        let nowhere = report.view_for(true, Some(&Some(PathBuf::from("/nowhere"))));
+        assert_eq!(nowhere.totals, Bucket::default());
+        assert_eq!(nowhere.days.len(), 7);
+        assert!(nowhere.models.is_empty() && nowhere.repos.is_empty());
     }
 
     #[test]

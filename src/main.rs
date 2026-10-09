@@ -4968,6 +4968,13 @@ pub enum Event {
     ChatsRelevanceToggled,
     /// A Jev relevance ranking of the local chats landed (TRU-141).
     ChatsRanked(Result<gitterm::jev::Ranking, gitterm::jev::JevError>),
+    /// Open or close the full-window Usage view (TRU-145): the rail glyph
+    /// and Cmd+Shift+U.
+    UsageViewToggle,
+    /// Esc in the Usage view.
+    UsageViewClose,
+    /// Narrow the Usage view to one repo (key, display name), or clear it.
+    UsageRepoFilter(Option<(gitterm::usage::RepoKey, String)>),
     /// Usage panel (TRU-145): pick the 7 / 30 / 90 day window.
     UsageWindowSelected(gitterm::usage::UsageWindow),
     /// Usage panel: chart cost (false) or tokens (true).
@@ -5303,6 +5310,8 @@ struct App {
     /// Usage panel (TRU-145). Price overrides from config.json, written
     /// back on save.
     usage_config: gitterm::usage::UsageConfig,
+    /// The full-window Usage view: open or not, and its repo filter.
+    usage_view: UsageViewState,
     usage_window: gitterm::usage::UsageWindow,
     /// Chart tokens instead of cost.
     usage_chart_tokens: bool,
@@ -5391,13 +5400,14 @@ enum VisibleSurface {
 }
 
 /// Pick the visible webview surface: at most one, Viewer over Agent, nothing
-/// while the attention view covers the content area.
+/// while the attention view or the Usage view covers the content area
+/// (`overlay_open`).
 fn visible_webview_surface(
     viewer: ViewerWebview,
     active: ActiveTabSurface,
-    attention_open: bool,
+    overlay_open: bool,
 ) -> VisibleSurface {
-    if attention_open {
+    if overlay_open {
         return VisibleSurface::None;
     }
     if viewer != ViewerWebview::None {
@@ -5407,6 +5417,48 @@ fn visible_webview_surface(
         ActiveTabSurface::AgentChat(tab_id) => VisibleSurface::AgentChat(tab_id),
         ActiveTabSurface::Other | ActiveTabSurface::AgentFileOverlay => VisibleSurface::None,
     }
+}
+
+/// The full-window Usage view (TRU-145), opened from the bottom of the
+/// workspace rail. It never touches the workspace or tab selection, so
+/// closing it lands on exactly what was showing.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct UsageViewState {
+    open: bool,
+    /// The repo the view is narrowed to: its row key and display name.
+    repo: Option<(gitterm::usage::RepoKey, String)>,
+}
+
+/// What can happen to the Usage view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageViewInput {
+    /// The rail glyph or Cmd+Shift+U.
+    Toggle,
+    /// Esc.
+    Close,
+    /// A workspace button on the rail (or Ctrl+1-9).
+    SelectWorkspace(usize),
+}
+
+/// Apply `input` to the Usage view while `active_workspace` is showing and
+/// return the workspace to show next. Opening and closing keep the
+/// selection; selecting a workspace closes the view. Closing drops the
+/// repo filter, so the view reopens app-wide.
+fn usage_view_step(
+    state: &mut UsageViewState,
+    active_workspace: usize,
+    input: UsageViewInput,
+) -> usize {
+    let (open, workspace) = match input {
+        UsageViewInput::Toggle => (!state.open, active_workspace),
+        UsageViewInput::Close => (false, active_workspace),
+        UsageViewInput::SelectWorkspace(target) => (false, target),
+    };
+    state.open = open;
+    if !open {
+        state.repo = None;
+    }
+    workspace
 }
 
 /// How many agent chat pages may be alive at once. Showing a tab without a
@@ -6879,6 +6931,19 @@ impl App {
             },
             Event::ChatsRanked,
         )
+    }
+
+    /// Bring the webview surfaces in line with the Usage view: hidden while
+    /// it covers the content area (as the attention view does), restored as
+    /// they were when it closes. Opening rescans; unchanged transcripts come
+    /// from the cache.
+    fn usage_view_changed(&mut self) -> Task<Event> {
+        if self.usage_view.open {
+            webview::set_visible(WebviewSurface::Viewer, false);
+            webview::hide_agent_pages();
+            return self.request_usage_scan();
+        }
+        self.apply_webview_surfaces()
     }
 
     /// Scan transcripts for the Usage panel's window off the UI thread.
@@ -11270,6 +11335,7 @@ impl App {
             chat_rank: chat_rank::ChatRankState::default(),
             chat_snippets: Arc::new(Mutex::new(chat_rank::SnippetCache::default())),
             usage_config: config.usage.clone(),
+            usage_view: UsageViewState::default(),
             usage_window: gitterm::usage::UsageWindow::default(),
             usage_chart_tokens: false,
             usage_show_headless: true,
@@ -16276,6 +16342,28 @@ fi
                     return Task::none();
                 }
 
+                // Usage view: Escape or Cmd+Shift+U closes it, Ctrl+1-9
+                // switches workspace (which closes it too); every other key
+                // is consumed, since the tab it would reach is hidden.
+                if self.usage_view.open {
+                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
+                        return self.update(Event::UsageViewClose);
+                    }
+                    if let Key::Character(c) = key.as_ref() {
+                        if modifiers.command() && modifiers.shift() && c.eq_ignore_ascii_case("u") {
+                            return self.update(Event::UsageViewToggle);
+                        }
+                        if modifiers.control() && !modifiers.command() {
+                            if let Ok(num) = c.parse::<usize>() {
+                                if (1..=9).contains(&num) && num <= self.workspaces.len() {
+                                    return Task::done(Event::WorkspaceSelect(num - 1));
+                                }
+                            }
+                        }
+                    }
+                    return Task::none();
+                }
+
                 // Workspace settings: Escape closes
                 if self.workspace_settings_open
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
@@ -16409,6 +16497,10 @@ fi
                         // Cmd+Shift+W - Close current workspace
                         if (c == "w" || c == "W") && modifiers.shift() {
                             return Task::done(Event::WorkspaceClose(self.active_workspace_idx));
+                        }
+                        // Cmd+Shift+U - Open the Usage view
+                        if (c == "u" || c == "U") && modifiers.shift() {
+                            return Task::done(Event::UsageViewToggle);
                         }
                     }
                 }
@@ -17755,15 +17847,6 @@ fi
             Event::SetSidebarMode(mode) => {
                 let task = self.set_sidebar_mode(mode);
                 self.settle_agent_surface();
-                // The Usage panel re-scans whenever it is shown; unchanged
-                // transcripts come from the cache.
-                if mode == SidebarMode::Usage
-                    && self
-                        .active_tab()
-                        .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Usage)
-                {
-                    return Task::batch([task, self.request_usage_scan()]);
-                }
                 return task;
             }
             Event::SetGitViewMode(mode) => {
@@ -18574,6 +18657,25 @@ fi
                     return self.request_chat_rank();
                 }
             }
+            Event::UsageViewToggle => {
+                usage_view_step(
+                    &mut self.usage_view,
+                    self.active_workspace_idx,
+                    UsageViewInput::Toggle,
+                );
+                return self.usage_view_changed();
+            }
+            Event::UsageViewClose => {
+                if self.usage_view.open {
+                    usage_view_step(
+                        &mut self.usage_view,
+                        self.active_workspace_idx,
+                        UsageViewInput::Close,
+                    );
+                    return self.usage_view_changed();
+                }
+            }
+            Event::UsageRepoFilter(repo) => self.usage_view.repo = repo,
             Event::UsageWindowSelected(window) => {
                 if self.usage_window != window {
                     self.usage_window = window;
@@ -19312,6 +19414,19 @@ fi
             }
             Event::WorkspaceSelect(idx) => {
                 self.editing_console_command = None;
+                if self.usage_view.open {
+                    usage_view_step(
+                        &mut self.usage_view,
+                        self.active_workspace_idx,
+                        UsageViewInput::SelectWorkspace(idx),
+                    );
+                    // Re-selecting the workspace that was showing just
+                    // closes the view; a different one switches below,
+                    // which presents its surfaces.
+                    if idx >= self.workspaces.len() || idx == self.active_workspace_idx {
+                        return self.usage_view_changed();
+                    }
+                }
                 if idx < self.workspaces.len() && idx != self.active_workspace_idx {
                     let viewport_width = self.content_viewport_width();
                     let target = idx as f32 * viewport_width;
@@ -20074,7 +20189,7 @@ fi
         visible_webview_surface(
             self.viewer_webview,
             self.active_tab_surface(),
-            self.attention_view_open,
+            self.attention_view_open || self.usage_view.open,
         )
     }
 
@@ -20248,7 +20363,7 @@ fi
                         let refresh = self.refresh_chat_index_if_stale();
                         return Task::batch([refresh, self.request_chat_rank()]);
                     }
-                    SidebarMode::Tasks | SidebarMode::Usage => {
+                    SidebarMode::Tasks => {
                         tab.agent_sidebar.selected_capture_idx = None;
                         tab.agent_sidebar.conversation = None;
                         tab.close_file_viewer();
@@ -20302,8 +20417,14 @@ fi
     fn reveal_agent_page(&mut self, tab_id: usize) {
         let (x, y, width, height) = self.calculate_webview_bounds();
         webview::update_bounds(WebviewSurface::Agent(tab_id), x, y, width, height);
-        webview::show_only_agent_page(Some(tab_id));
-        webview::focus_agent_composer(tab_id);
+        if self.usage_view.open {
+            // Something landed behind the Usage view; closing it shows the
+            // page (apply_webview_surfaces).
+            webview::hide_agent_pages();
+        } else {
+            webview::show_only_agent_page(Some(tab_id));
+            webview::focus_agent_composer(tab_id);
+        }
         // The tab already has a page, so nothing is pushed past the cap.
         for evicted in promote_agent_page(&mut self.agent_pages, tab_id, MAX_AGENT_PAGES) {
             self.destroy_agent_page(evicted, "evicted");
@@ -20434,7 +20555,8 @@ fi
                 bounds.3,
             );
             webview::update_content(WebviewSurface::Viewer, &html);
-            webview::set_visible(WebviewSurface::Viewer, true);
+            // Kept hidden behind the Usage view until it closes.
+            webview::set_visible(WebviewSurface::Viewer, !self.usage_view.open);
             return Task::none();
         }
 
@@ -20798,9 +20920,12 @@ fi
         }
     }
 
-    fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        heartbeat("view");
-        let spine = freeze_time!("view_spine", { self.view_spine() });
+    /// The workspace layout right of the rail: tab strip, workspace
+    /// content, bottom panel and workspace bar.
+    fn view_main<'a>(
+        &'a self,
+        spine: Element<'a, Event, Theme, iced::Renderer>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
         let tab_bar = freeze_time!("view_tab_bar", { self.view_tab_bar() });
         let content = freeze_time!("view_workspace_slide", { self.view_workspace_slide() });
         let console_panel = freeze_time!("view_bottom_panel", { self.view_bottom_panel() });
@@ -20843,11 +20968,28 @@ fi
         let workspace_bar = self.view_workspace_bar();
         main_col = main_col.push(workspace_bar);
 
-        let main_view: Element<'_, Event, Theme, iced::Renderer> = row![spine, main_col]
+        row![spine, main_col]
             .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
-            .into();
+            .into()
+    }
+
+    fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        heartbeat("view");
+        let spine = freeze_time!("view_spine", { self.view_spine() });
+
+        // The Usage view (TRU-145) takes everything right of the rail.
+        let main_view: Element<'_, Event, Theme, iced::Renderer> = if self.usage_view.open {
+            let usage = freeze_time!("view_usage_page", { self.view_usage_page() });
+            row![spine, usage]
+                .spacing(0)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            self.view_main(spine)
+        };
 
         if self.browser_evidence_open {
             Stack::new()
@@ -21868,6 +22010,7 @@ fi
         content_col = content_col.push(shortcut_row("Cmd + ↑", "Return to General"));
         content_col = content_col.push(shortcut_row("Cmd + 0", "Open task overview"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + A", "Open attention view"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + U", "Open usage view"));
         content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to next needs-you"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + W", "Close workspace"));
         content_col = content_col.push(shortcut_row("Cmd + B", "Toggle sidebar"));
@@ -23679,13 +23822,19 @@ fi
         let bg = theme.bg_crust();
         let border_color = theme.surface0();
 
-        let spine_content = container(container(dots).height(Length::Fill).center_y(Length::Fill))
-            .width(Length::Fixed(SPINE_WIDTH))
-            .height(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(bg.into()),
-                ..Default::default()
-            });
+        let spine_content = container(
+            column![
+                container(dots).height(Length::Fill).center_y(Length::Fill),
+                self.view_usage_rail_button(),
+            ]
+            .align_x(iced::Alignment::Center),
+        )
+        .width(Length::Fixed(SPINE_WIDTH))
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        });
 
         // Right border as a separate 1px column
         let border_line = container(iced::widget::Space::new().width(0).height(0))
@@ -23697,6 +23846,73 @@ fi
             });
 
         row![spine_content, border_line].into()
+    }
+
+    /// Bar-chart glyph pinned at the bottom of the workspace rail: opens or
+    /// closes the Usage view (TRU-145).
+    fn view_usage_rail_button(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let open = self.usage_view.open;
+        let bar_color = if open {
+            theme.accent()
+        } else {
+            theme.subtext0()
+        };
+        let mut glyph = Row::new().spacing(2).align_y(iced::Alignment::End);
+        for height in [6.0, 12.0, 9.0] {
+            glyph = glyph.push(
+                container(iced::widget::Space::new())
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(height))
+                    .style(move |_| container::Style {
+                        background: Some(bar_color.into()),
+                        border: iced::Border {
+                            radius: 1.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+        let hover_bg = theme.surface0();
+        let btn = button(
+            container(glyph)
+                .width(Length::Fixed(SPINE_WIDTH - 1.0))
+                .center_x(Length::Fixed(SPINE_WIDTH - 1.0))
+                .center_y(Length::Fixed(16.0)),
+        )
+        .style(move |_theme, status| button::Style {
+            background: Some(
+                if open || matches!(status, button::Status::Hovered) {
+                    hover_bg
+                } else {
+                    iced::Color::TRANSPARENT
+                }
+                .into(),
+            ),
+            border: iced::Border::default(),
+            ..Default::default()
+        })
+        .padding([8, 0])
+        .on_press(Event::UsageViewToggle);
+        let tip_bg = theme.bg_surface();
+        let tip_border = theme.border();
+        let tip = container(
+            text("Usage  ⌘⇧U")
+                .size(self.ui_font_small())
+                .color(theme.text_primary()),
+        )
+        .padding([4, 8])
+        .style(move |_| container::Style {
+            background: Some(tip_bg.into()),
+            border: iced::Border {
+                color: tip_border,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        });
+        iced::widget::tooltip(btn, tip, iced::widget::tooltip::Position::Right).into()
     }
 
     fn view_workspace_dot_column(&self) -> Column<'_, Event, Theme, iced::Renderer> {
@@ -25087,18 +25303,6 @@ fi
             Event::SetSidebarMode(SidebarMode::Chats),
         );
 
-        let usage_active = tab.sidebar_mode == SidebarMode::Usage;
-        let usage_text_color = if usage_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let usage_tab = self.view_sidebar_tab(
-            text("Usage").size(font).color(usage_text_color).into(),
-            usage_active,
-            Event::SetSidebarMode(SidebarMode::Usage),
-        );
-
         let mut tabs = Row::new()
             .spacing(0)
             .push(git_tab)
@@ -25106,8 +25310,7 @@ fi
             .push(tasks_tab)
             .push(agent_tab)
             .push(chats_tab)
-            .push(plans_tab)
-            .push(usage_tab);
+            .push(plans_tab);
 
         if workspace_is_remote {
             let remote_text_color = if remote_active {
@@ -25198,9 +25401,6 @@ fi
             }
             SidebarMode::Tasks => {
                 freeze_time!("view_task_rail", { self.view_task_rail() })
-            }
-            SidebarMode::Usage => {
-                freeze_time!("view_usage_sidebar", { self.view_usage_sidebar() })
             }
             SidebarMode::Remote => {
                 freeze_time!("view_remote_sidebar", { self.view_remote_sidebar() })
@@ -25317,7 +25517,6 @@ fi
             ("\u{2726}", SidebarMode::Claude), // ✦ sparkle
             ("\u{224B}", SidebarMode::Chats),  // ≋ conversation history
             ("\u{25A4}", SidebarMode::Plans),  // ▤ plans
-            ("$", SidebarMode::Usage),         // token usage and cost
         ];
         if workspace_is_remote {
             modes.push(("\u{2601}", SidebarMode::Remote)); // cloud
@@ -27552,15 +27751,11 @@ fi
             .into()
     }
 
-    /// Sidebar list of markdown files from the active workspace's `.plans/`
-    /// and `docs/` directories. Reads fresh on render; cache if it grows.
-    /// Sidebar for the Chats tab (TRU-78 slice 1): search, scope toggle,
-    /// conversations grouped by repo. Pure render over `self.chat_index`;
-    /// all file IO happened in the background index task.
-    /// Usage panel (TRU-145): estimated cost and token usage across
-    /// Claude Code, Codex and Pi, from this Mac's transcripts. The numbers
-    /// come from `gitterm::usage`; this only lays them out.
-    fn view_usage_sidebar<'a>(&'a self) -> Element<'a, Event, Theme, iced::Renderer> {
+    /// The full-window Usage view (TRU-145): estimated cost and token usage
+    /// across Claude Code, Codex and Pi, from this Mac's transcripts, for
+    /// every repo or the one picked in the repo table. The numbers come from
+    /// `gitterm::usage`; this only lays them out.
+    fn view_usage_page<'a>(&'a self) -> Element<'a, Event, Theme, iced::Renderer> {
         use gitterm::usage::{format_cost, format_tokens, harness_index, Bucket, UsageWindow};
         let theme = &self.theme;
         let font = self.ui_font();
@@ -27569,11 +27764,14 @@ fi
         let muted = theme.text_muted();
         let secondary = theme.text_secondary();
         let primary = theme.text_primary();
+        let card_bg = theme.bg_surface();
+        let card_border = theme.surface0();
+        let page_bg = theme.bg_base();
 
         let segment = |label: &'static str, active: bool, on_press: Event| {
             let bg = active.then(|| theme.surface0().into());
             let color = if active { primary } else { secondary };
-            button(text(label).size(font_tiny).color(color))
+            button(text(label).size(font_small).color(color))
                 .style(move |_theme, _status| button::Style {
                     background: bg,
                     border: iced::Border {
@@ -27582,41 +27780,84 @@ fi
                     },
                     ..Default::default()
                 })
-                .padding([3, 8])
+                .padding([4, 10])
                 .on_press(on_press)
         };
         let fill = || iced::widget::Space::new().width(Length::Fill);
+        let gap = || iced::widget::Space::new().width(Length::Fixed(12.0));
+        let card = move |body: Element<'a, Event, Theme, iced::Renderer>| {
+            container(body)
+                .padding(14)
+                .style(move |_| container::Style {
+                    background: Some(card_bg.into()),
+                    border: iced::Border {
+                        color: card_border,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                })
+        };
 
-        let mut window_row = Row::new().spacing(2).align_y(iced::Alignment::Center);
+        // Header: title, repo filter chip, window, chart mode, headless,
+        // refresh.
+        let mut header = Row::new()
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+            .push(text("Usage").size(font + 6.0).color(primary))
+            .push(gap());
+        match &self.usage_view.repo {
+            Some((_, name)) => {
+                let chip_bg = theme.surface0();
+                header = header.push(
+                    container(
+                        row![
+                            text(name.as_str()).size(font_small).color(primary),
+                            button(text("×").size(font_small).color(secondary))
+                                .style(|_theme, _status| button::Style::default())
+                                .padding([0, 2])
+                                .on_press(Event::UsageRepoFilter(None)),
+                        ]
+                        .spacing(6)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding([3, 10])
+                    .style(move |_| container::Style {
+                        background: Some(chip_bg.into()),
+                        border: iced::Border {
+                            radius: 10.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            None => {
+                header = header.push(text("All repos").size(font_small).color(muted));
+            }
+        }
+        header = header.push(fill());
         for window in UsageWindow::ALL {
-            window_row = window_row.push(segment(
+            header = header.push(segment(
                 window.label(),
                 self.usage_window == window,
                 Event::UsageWindowSelected(window),
             ));
         }
-        window_row = window_row.push(fill()).push(segment(
-            if self.usage_scanning {
-                "scanning…"
-            } else {
-                "refresh"
-            },
-            false,
-            Event::UsageRefresh,
-        ));
-        let mode_row = row![
-            segment(
+        header = header
+            .push(gap())
+            .push(segment(
                 "Cost",
                 !self.usage_chart_tokens,
-                Event::UsageChartTokens(false)
-            ),
-            segment(
+                Event::UsageChartTokens(false),
+            ))
+            .push(segment(
                 "Tokens",
                 self.usage_chart_tokens,
-                Event::UsageChartTokens(true)
-            ),
-            fill(),
-            segment(
+                Event::UsageChartTokens(true),
+            ))
+            .push(gap())
+            .push(segment(
                 if self.usage_show_headless {
                     "headless shown"
                 } else {
@@ -27624,48 +27865,59 @@ fi
                 },
                 self.usage_show_headless,
                 Event::UsageHeadlessToggled,
-            ),
-        ]
-        .spacing(2)
-        .align_y(iced::Alignment::Center);
+            ))
+            .push(segment(
+                if self.usage_scanning {
+                    "scanning…"
+                } else {
+                    "refresh"
+                },
+                false,
+                Event::UsageRefresh,
+            ));
 
-        let mut content = Column::new()
-            .spacing(10)
-            .padding(10)
-            .push(window_row)
-            .push(mode_row);
+        let mut content = Column::new().spacing(16).padding(24).push(header);
 
         if let Some(err) = &self.usage_error {
             content = content.push(
                 text(format!("Usage scan failed: {err}"))
-                    .size(font_tiny)
+                    .size(font_small)
                     .color(theme.danger()),
             );
         }
-        let Some(report) = &self.usage_report else {
-            content = content.push(
-                text("Reading transcripts…")
-                    .size(font_small)
-                    .color(secondary),
-            );
-            return scrollable(content)
-                .height(Length::Fill)
+        let page = |content: Column<'a, Event, Theme, iced::Renderer>| {
+            container(scrollable(content).height(Length::Fill).width(Length::Fill))
                 .width(Length::Fill)
-                .into();
+                .height(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(page_bg.into()),
+                    ..Default::default()
+                })
+                .into()
         };
-        let view = report.view(self.usage_show_headless);
-        let totals = &view.totals;
+        let Some(report) = &self.usage_report else {
+            content = content.push(text("Reading transcripts…").size(font).color(secondary));
+            return page(content);
+        };
+        // Everything above the repo table follows the repo filter; the repo
+        // table always lists every repo.
+        let all_repos = report.view(self.usage_show_headless);
+        let view = report.view_for(
+            self.usage_show_headless,
+            self.usage_view.repo.as_ref().map(|(key, _)| key),
+        );
+        let totals = view.totals;
         let tokens_mode = self.usage_chart_tokens;
         let no_wrap = iced::widget::text::Wrapping::None;
         let cell = |value: String, width: f32| {
             text(value)
-                .size(font_tiny)
+                .size(font_small)
                 .color(secondary)
                 .wrapping(no_wrap)
                 .width(Length::Fixed(width))
                 .align_x(iced::alignment::Horizontal::Right)
         };
-        let heading = |label: &'static str| text(label).size(font_small).color(primary);
+        let heading = |label: &'static str| text(label).size(font).color(primary);
         let cost_label = |bucket: &Bucket| {
             if bucket.cost == 0.0 && bucket.unpriced_tokens > 0 {
                 "unpriced".to_string()
@@ -27674,26 +27926,25 @@ fi
             }
         };
 
-        // Totals.
-        let mut totals_col = Column::new().spacing(3).push(
-            row![
+        // Totals, one box each.
+        let mut cost_box = Column::new()
+            .spacing(4)
+            .push(text("Estimated cost").size(font_tiny).color(muted))
+            .push(
                 text(format_cost(totals.cost))
-                    .size(font + 6.0)
+                    .size(font + 10.0)
                     .color(primary),
-                text(format!("{} days", report.window.days()))
-                    .size(font_tiny)
-                    .color(muted),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::End),
-        );
-        totals_col = totals_col.push(
-            text("estimate, if billed at full API list rates")
+            )
+            .push(
+                text(format!(
+                    "{} days at full API list rates",
+                    report.window.days()
+                ))
                 .size(font_tiny)
                 .color(muted),
-        );
+            );
         if totals.unpriced_tokens > 0 {
-            totals_col = totals_col.push(
+            cost_box = cost_box.push(
                 text(format!(
                     "+ {} tokens on unpriced models",
                     format_tokens(totals.unpriced_tokens)
@@ -27702,26 +27953,33 @@ fi
                 .color(theme.warning()),
             );
         }
-        let stat = |label: &'static str, value: u64| {
-            row![
-                text(label)
-                    .size(font_tiny)
-                    .color(secondary)
-                    .width(Length::Fill),
-                text(format_tokens(value)).size(font_tiny).color(primary),
-            ]
+        let token_box = |label: &'static str, value: u64| {
+            card(
+                Column::new()
+                    .spacing(4)
+                    .push(text(label).size(font_tiny).color(muted))
+                    .push(text(format_tokens(value)).size(font + 6.0).color(primary))
+                    .into(),
+            )
+            .width(Length::FillPortion(2))
+            .height(Length::Fill)
         };
         let t = &totals.tokens;
-        totals_col = totals_col
-            .push(stat("Processed", t.processed()))
-            .push(stat("Cached input", t.cache_read))
-            .push(stat("Uncached input", t.uncached_input))
-            .push(stat("Cache writes", t.cache_write))
-            .push(stat("Output", t.output));
-        content = content.push(totals_col);
+        let totals_row = row![
+            // Shrink-high and first, so the token boxes stretch to it.
+            card(cost_box.into()).width(Length::FillPortion(3)),
+            token_box("Processed", t.processed()),
+            token_box("Cached input", t.cache_read),
+            token_box("Uncached input", t.uncached_input),
+            token_box("Cache writes", t.cache_write),
+            token_box("Output", t.output),
+        ]
+        .spacing(12)
+        .height(Length::Shrink);
+        content = content.push(totals_row);
 
         // Daily chart, stacked by harness (Claude at the bottom).
-        const CHART_HEIGHT: f32 = 72.0;
+        const CHART_HEIGHT: f32 = 180.0;
         let value = |bucket: &Bucket| {
             if tokens_mode {
                 bucket.tokens.processed() as f64
@@ -27735,7 +27993,7 @@ fi
             .map(|day| day.by_harness.iter().map(value).sum::<f64>())
             .fold(0.0, f64::max);
         let mut bars = Row::new()
-            .spacing(if view.days.len() > 30 { 0 } else { 1 })
+            .spacing(if view.days.len() > 30 { 1 } else { 3 })
             .height(Length::Fixed(CHART_HEIGHT))
             .align_y(iced::Alignment::End);
         for day in &view.days {
@@ -27770,13 +28028,12 @@ fi
                 background: Some(baseline_color.into()),
                 ..Default::default()
             });
-        let chart = Column::new().push(bars).push(baseline);
         let peak_label = if tokens_mode {
             format!("peak {} / day", format_tokens(peak as u64))
         } else {
             format!("peak {} / day", format_cost(peak))
         };
-        let mut legend = Row::new().spacing(8).align_y(iced::Alignment::Center);
+        let mut legend = Row::new().spacing(16).align_y(iced::Alignment::Center);
         for backend in chats::ChatBackend::ALL {
             let bucket = &view.by_harness[harness_index(backend)];
             let figure = if tokens_mode {
@@ -27786,19 +28043,19 @@ fi
             };
             legend = legend.push(
                 row![
-                    text("●").size(7).color(self.chat_backend_color(backend)),
+                    text("●").size(9).color(self.chat_backend_color(backend)),
                     text(format!("{} {figure}", backend.label()))
-                        .size(font_tiny)
+                        .size(font_small)
                         .color(secondary)
                         .wrapping(no_wrap),
                 ]
-                .spacing(3)
+                .spacing(4)
                 .align_y(iced::Alignment::Center),
             );
         }
-        content = content.push(
+        content = content.push(card(
             Column::new()
-                .spacing(4)
+                .spacing(8)
                 .push(row![
                     heading(if tokens_mode {
                         "Daily tokens"
@@ -27806,9 +28063,9 @@ fi
                         "Daily cost"
                     }),
                     fill(),
-                    text(peak_label).size(font_tiny).color(muted),
+                    text(peak_label).size(font_small).color(muted),
                 ])
-                .push(chart)
+                .push(Column::new().push(bars).push(baseline))
                 .push(row![
                     text(report.start.format("%b %-d").to_string())
                         .size(font_tiny)
@@ -27818,18 +28075,19 @@ fi
                         .size(font_tiny)
                         .color(muted),
                 ])
-                .push(legend),
-        );
+                .push(legend)
+                .into(),
+        ));
 
-        // Share of the window's cost, or of its tokens in Tokens mode.
-        let share = |bucket: &Bucket| {
+        // Share of `whole`'s cost, or of its tokens in Tokens mode.
+        let share = move |bucket: &Bucket, whole: &Bucket| {
             let (part, whole) = if tokens_mode {
                 (
                     bucket.tokens.processed() as f64,
-                    totals.tokens.processed() as f64,
+                    whole.tokens.processed() as f64,
                 )
             } else {
-                (bucket.cost, totals.cost)
+                (bucket.cost, whole.cost)
             };
             if whole > 0.0 && part > 0.0 {
                 format!("{:.0}%", part / whole * 100.0)
@@ -27837,94 +28095,118 @@ fi
                 "—".to_string()
             }
         };
-        let header = |first: &'static str| {
+        const COST_W: f32 = 80.0;
+        const SHARE_W: f32 = 50.0;
+        const TOKENS_W: f32 = 70.0;
+        let table_header = |first: &'static str| {
             row![
                 text(first).size(font_tiny).color(muted).width(Length::Fill),
-                text("Cost")
-                    .size(font_tiny)
-                    .color(muted)
-                    .width(Length::Fixed(60.0))
-                    .align_x(iced::alignment::Horizontal::Right),
-                text("Share")
-                    .size(font_tiny)
-                    .color(muted)
-                    .width(Length::Fixed(38.0))
-                    .align_x(iced::alignment::Horizontal::Right),
-                text("Tokens")
-                    .size(font_tiny)
-                    .color(muted)
-                    .width(Length::Fixed(48.0))
-                    .align_x(iced::alignment::Horizontal::Right),
+                cell("Cost".to_string(), COST_W).color(muted),
+                cell("Share".to_string(), SHARE_W).color(muted),
+                cell("Tokens".to_string(), TOKENS_W).color(muted),
             ]
-            .spacing(4)
+            .spacing(8)
         };
 
         let mut models = Column::new()
-            .spacing(3)
+            .spacing(6)
             .push(heading("By model"))
-            .push(header("Model"));
+            .push(table_header("Model"));
         for model in &view.models {
             models = models.push(
                 row![
                     text("●")
-                        .size(7)
+                        .size(9)
                         .color(self.chat_backend_color(model.harness)),
-                    text(model.model.as_str())
-                        .size(font_tiny)
+                    text(model.model.clone())
+                        .size(font_small)
                         .color(primary)
                         .wrapping(no_wrap)
                         .width(Length::Fill),
-                    cell(cost_label(&model.usage), 60.0),
-                    cell(share(&model.usage), 38.0),
-                    cell(format_tokens(model.usage.tokens.processed()), 48.0),
+                    cell(cost_label(&model.usage), COST_W),
+                    cell(share(&model.usage, &totals), SHARE_W),
+                    cell(format_tokens(model.usage.tokens.processed()), TOKENS_W),
                 ]
-                .spacing(4)
+                .spacing(8)
                 .align_y(iced::Alignment::Center),
             );
         }
         if view.models.is_empty() {
             models = models.push(
                 text("No usage in this window.")
-                    .size(font_tiny)
+                    .size(font_small)
                     .color(muted),
             );
         }
-        content = content.push(models);
 
-        const REPO_ROWS: usize = 25;
+        let selected = self.usage_view.repo.as_ref().map(|(key, _)| key);
+        let row_hover = theme.surface0();
+        let row_selected = theme.surface1();
         let mut repos = Column::new()
-            .spacing(3)
+            .spacing(2)
             .push(heading("By repo"))
-            .push(header("Repo"));
-        for repo in view.repos.iter().take(REPO_ROWS) {
+            .push(container(table_header("Repo")).padding([4, 6]));
+        for repo in &all_repos.repos {
             let name = if repo.resolved {
                 repo.name.clone()
             } else {
                 format!("{} (no repo)", repo.name)
             };
+            let is_selected = selected == Some(&repo.path);
+            // Clicking the selected repo again goes back to every repo.
+            let on_press = if is_selected {
+                Event::UsageRepoFilter(None)
+            } else {
+                Event::UsageRepoFilter(Some((repo.path.clone(), name.clone())))
+            };
             let label = text(name)
-                .size(font_tiny)
+                .size(font_small)
                 .color(if repo.resolved { primary } else { secondary })
                 .wrapping(no_wrap)
                 .width(Length::Fill);
             repos = repos.push(
-                row![
-                    label,
-                    cell(cost_label(&repo.usage), 60.0),
-                    cell(share(&repo.usage), 38.0),
-                    cell(format_tokens(repo.usage.tokens.processed()), 48.0),
-                ]
-                .spacing(4),
+                button(
+                    row![
+                        label,
+                        cell(cost_label(&repo.usage), COST_W),
+                        cell(share(&repo.usage, &all_repos.totals), SHARE_W),
+                        cell(format_tokens(repo.usage.tokens.processed()), TOKENS_W),
+                    ]
+                    .spacing(8),
+                )
+                .style(move |_theme, status| button::Style {
+                    background: if is_selected {
+                        Some(row_selected.into())
+                    } else if matches!(status, button::Status::Hovered) {
+                        Some(row_hover.into())
+                    } else {
+                        None
+                    },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .padding([4, 6])
+                .width(Length::Fill)
+                .on_press(on_press),
             );
         }
-        if view.repos.len() > REPO_ROWS {
+        if all_repos.repos.is_empty() {
             repos = repos.push(
-                text(format!("{} more", view.repos.len() - REPO_ROWS))
-                    .size(font_tiny)
+                text("No usage in this window.")
+                    .size(font_small)
                     .color(muted),
             );
         }
-        content = content.push(repos);
+        content = content.push(
+            row![
+                card(models.into()).width(Length::FillPortion(1)),
+                card(repos.into()).width(Length::FillPortion(1)),
+            ]
+            .spacing(16),
+        );
 
         let stats = &report.stats;
         let mut footer = Column::new().spacing(2).push(
@@ -27964,12 +28246,14 @@ fi
         }
         content = content.push(footer);
 
-        scrollable(content)
-            .height(Length::Fill)
-            .width(Length::Fill)
-            .into()
+        page(content)
     }
 
+    /// Sidebar list of markdown files from the active workspace's `.plans/`
+    /// and `docs/` directories. Reads fresh on render; cache if it grows.
+    /// Sidebar for the Chats tab (TRU-78 slice 1): search, scope toggle,
+    /// conversations grouped by repo. Pure render over `self.chat_index`;
+    /// all file IO happened in the background index task.
     fn view_chats_sidebar<'a>(
         &'a self,
         tab: &'a TabState,
@@ -34534,6 +34818,60 @@ mod tests {
                 visible_webview_surface(viewer, ActiveTabSurface::AgentChat(1), true),
                 VisibleSurface::None
             );
+        }
+    }
+
+    #[test]
+    fn usage_view_open_and_close_keep_the_selection() {
+        let mut state = UsageViewState::default();
+        // Workspace B (1) is showing; the glyph opens the view over it.
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Toggle), 1);
+        assert!(state.open);
+        state.repo = Some((Some(PathBuf::from("/repo/alpha")), "alpha".to_string()));
+        // Esc closes it on the same workspace, app-wide again next time.
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Close), 1);
+        assert_eq!(state, UsageViewState::default());
+        // The glyph again (or Cmd+Shift+U) toggles it open and shut.
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Toggle), 1);
+        assert!(state.open);
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Toggle), 1);
+        assert!(!state.open);
+        // Esc with the view shut changes nothing.
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Close), 1);
+        assert!(!state.open);
+    }
+
+    #[test]
+    fn a_workspace_click_closes_the_usage_view() {
+        let mut state = UsageViewState::default();
+        usage_view_step(&mut state, 1, UsageViewInput::Toggle);
+        state.repo = Some((None, "(no cwd)".to_string()));
+        // Opened from workspace B (1); clicking A (0) on the rail selects A
+        // and closes the view.
+        assert_eq!(
+            usage_view_step(&mut state, 1, UsageViewInput::SelectWorkspace(0)),
+            0
+        );
+        assert_eq!(state, UsageViewState::default());
+        // Clicking the workspace that was showing just closes it.
+        usage_view_step(&mut state, 1, UsageViewInput::Toggle);
+        assert_eq!(
+            usage_view_step(&mut state, 1, UsageViewInput::SelectWorkspace(1)),
+            1
+        );
+        assert!(!state.open);
+    }
+
+    #[test]
+    fn the_usage_view_hides_every_surface_like_the_attention_view() {
+        // App::visible_webview_surface passes attention || usage open.
+        for active in [ActiveTabSurface::AgentChat(2), ActiveTabSurface::Other] {
+            for viewer in [ViewerWebview::File, ViewerWebview::PlansViewer] {
+                assert_eq!(
+                    visible_webview_surface(viewer, active, true),
+                    VisibleSurface::None
+                );
+            }
         }
     }
 
