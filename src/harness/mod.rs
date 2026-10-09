@@ -176,10 +176,101 @@ pub enum RuntimeDecision {
     },
 }
 
+/// One image attached to a user message, already encoded the way the
+/// Anthropic content block wants it: a `media_type` such as `image/png` or
+/// `image/jpeg` and the bytes as standard base64 (no `data:` prefix).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// Debug output names the type and size, never the base64 payload.
+impl std::fmt::Debug for ImageAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageAttachment")
+            .field("media_type", &self.media_type)
+            .field("bytes", &self.decoded_len())
+            .finish()
+    }
+}
+
+/// Most images one message may carry (the composer enforces the same cap).
+pub const MAX_IMAGES_PER_MESSAGE: usize = 4;
+/// Largest decoded image the composer may send, after its downscale.
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+/// The image types the Anthropic API accepts in a base64 image block.
+pub const IMAGE_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+impl ImageAttachment {
+    /// Size of the image once the base64 is decoded (padding excluded).
+    pub fn decoded_len(&self) -> usize {
+        let padding = self.data.bytes().rev().take_while(|&b| b == b'=').count();
+        (self.data.len() / 4 * 3).saturating_sub(padding)
+    }
+}
+
+/// Checks a message's attachments against the composer's caps: at most
+/// `MAX_IMAGES_PER_MESSAGE` images, each an accepted media type, non-empty,
+/// and at most `MAX_IMAGE_BYTES` decoded. The error names the first
+/// offending image so the chat can say why nothing was sent.
+pub fn validate_images(images: &[ImageAttachment]) -> Result<(), String> {
+    if images.len() > MAX_IMAGES_PER_MESSAGE {
+        return Err(format!(
+            "{} images attached; a message can carry at most {MAX_IMAGES_PER_MESSAGE}",
+            images.len()
+        ));
+    }
+    for (i, image) in images.iter().enumerate() {
+        let n = i + 1;
+        if !IMAGE_MEDIA_TYPES.contains(&image.media_type.as_str()) {
+            return Err(format!(
+                "image {n} is {:?}; only PNG, JPEG, GIF and WebP can be sent",
+                image.media_type
+            ));
+        }
+        if image.data.is_empty() {
+            return Err(format!("image {n} is empty"));
+        }
+        let bytes = image.decoded_len();
+        if bytes > MAX_IMAGE_BYTES {
+            return Err(format!(
+                "image {n} is {:.1} MB; the limit is {} MB",
+                bytes as f64 / (1024.0 * 1024.0),
+                MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A user message: the composer's text plus any images pasted or dropped
+/// into it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserPrompt {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+}
+
+impl From<String> for UserPrompt {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for UserPrompt {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
 /// Commands the UI sends into a harness session.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HarnessCommand {
-    SendUserMessage(String),
+    SendUserMessage(UserPrompt),
     Answer {
         request_id: String,
         decision: RuntimeDecision,
@@ -234,6 +325,51 @@ mod tests {
             .unwrap(),
             json!({"type": "effort_changed", "data": {"effort": null, "applied": "medium"}})
         );
+    }
+
+    fn image(media_type: &str, decoded_bytes: usize) -> ImageAttachment {
+        // Base64 length for `decoded_bytes` whole 3-byte groups.
+        ImageAttachment {
+            media_type: media_type.into(),
+            data: "A".repeat(decoded_bytes.div_ceil(3) * 4),
+        }
+    }
+
+    #[test]
+    fn image_caps_allow_four_images_up_to_five_megabytes() {
+        let four = vec![image("image/jpeg", MAX_IMAGE_BYTES / 3 * 3); 4];
+        assert_eq!(validate_images(&four), Ok(()));
+        assert_eq!(validate_images(&[]), Ok(()));
+    }
+
+    #[test]
+    fn image_caps_reject_a_fifth_image_an_oversize_one_and_odd_types() {
+        let five = vec![image("image/png", 10); 5];
+        assert!(validate_images(&five).unwrap_err().contains("at most 4"));
+        let big = [
+            image("image/png", 10),
+            image("image/png", MAX_IMAGE_BYTES + 3),
+        ];
+        assert!(validate_images(&big)
+            .unwrap_err()
+            .starts_with("image 2 is 5.0 MB"));
+        assert!(validate_images(&[image("image/tiff", 10)])
+            .unwrap_err()
+            .contains("only PNG, JPEG, GIF and WebP"));
+        assert!(validate_images(&[image("image/png", 0)])
+            .unwrap_err()
+            .contains("empty"));
+    }
+
+    #[test]
+    fn decoded_len_discounts_base64_padding() {
+        let one = ImageAttachment {
+            media_type: "image/png".into(),
+            data: "QQ==".into(),
+        };
+        assert_eq!(one.decoded_len(), 1);
+        assert!(format!("{one:?}").contains("bytes: 1"));
+        assert!(!format!("{one:?}").contains("QQ=="));
     }
 
     #[test]

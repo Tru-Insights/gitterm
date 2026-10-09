@@ -304,6 +304,19 @@
     resize: none;
   }
   #prompt:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  #composer.dropping #prompt { outline: 2px dashed var(--accent); border-color: var(--accent); }
+  /* Pasted / dropped images waiting to be sent (TRU-140). */
+  #attachments { display: none; gap: 6px; flex-wrap: wrap; }
+  #attachments.visible { display: flex; }
+  .att { position: relative; width: 56px; height: 56px; border-radius: 6px; overflow: hidden;
+         border: 1px solid var(--border-strong); background: var(--bg-input); }
+  .att img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .att button { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; padding: 0;
+                border-radius: 9px; font-size: 12px; line-height: 16px; background: rgba(17,17,27,0.8); }
+  .user-images { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .user-images:last-child { margin-bottom: 0; }
+  .user-images img { max-width: 160px; max-height: 120px; border-radius: 6px; display: block;
+                     border: 1px solid var(--border); }
   #toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   #toolbar .tb-chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
   #toolbar .tb-send { display: flex; gap: 6px; margin-left: auto; }
@@ -513,6 +526,7 @@
   <div id="request-panel"></div>
   <div id="roster"></div>
   <div id="composer">
+    <div id="attachments"></div>
     <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
     <div id="toolbar">
       <div class="tb-chips">
@@ -994,12 +1008,139 @@
   function submitPrompt() {
     if (submitBtn.disabled) return;
     const text = promptEl.value.trim();
-    if (!text) return;
-    postIpc({ type: 'submit', text });
+    if (!text && !attachments.length) return;
+    const payload = { type: 'submit', text };
+    if (attachments.length) {
+      payload.images = attachments.map((a) => ({ media_type: a.media_type, data: a.data }));
+    }
+    postIpc(payload);
     promptEl.value = '';
     promptEl.style.height = 'auto';
+    attachments = [];
+    renderAttachments();
     follow = true;
   }
+
+  // ---- image attachments (TRU-140) ---------------------------------------
+  // Pasted or dropped images, downscaled so the longest edge is at most
+  // MAX_IMAGE_EDGE and re-encoded as JPEG (PNG kept when it has
+  // transparency). The host checks the same caps (harness::validate_images).
+  const MAX_IMAGES = 4;
+  const MAX_IMAGE_EDGE = 1568;
+  const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+  const JPEG_QUALITY = 0.85;
+  const attachmentsEl = document.getElementById('attachments');
+  const composerEl = document.getElementById('composer');
+  let attachments = [];               // {media_type, data}
+  let attachQueue = Promise.resolve(); // one paste/drop at a time keeps the cap exact
+
+  function renderAttachments() {
+    attachmentsEl.innerHTML = '';
+    attachments.forEach((a, i) => {
+      const box = el('div', 'att');
+      const img = el('img');
+      img.src = 'data:' + a.media_type + ';base64,' + a.data;
+      img.alt = 'attached image ' + (i + 1);
+      const x = el('button', null, '\u00d7');
+      x.title = 'Remove image';
+      x.addEventListener('click', () => { attachments.splice(i, 1); renderAttachments(); promptEl.focus(); });
+      box.append(img, x);
+      attachmentsEl.append(box);
+    });
+    attachmentsEl.classList.toggle('visible', attachments.length > 0);
+  }
+  function loadImage(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('the image could not be decoded')); };
+      img.src = url;
+    });
+  }
+  function hasTransparency(ctx, w, h) {
+    const px = ctx.getImageData(0, 0, w, h).data;
+    for (let i = 3; i < px.length; i += 4) if (px[i] < 255) return true;
+    return false;
+  }
+  async function prepareImage(file) {
+    const img = await loadImage(file);
+    const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * scale));
+    const h = Math.max(1, Math.round(img.naturalHeight * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    const keepPng = file.type === 'image/png' && hasTransparency(ctx, w, h);
+    const media_type = keepPng ? 'image/png' : 'image/jpeg';
+    const url = keepPng ? canvas.toDataURL('image/png') : canvas.toDataURL('image/jpeg', JPEG_QUALITY);
+    const data = url.slice(url.indexOf(',') + 1);
+    const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+    return { media_type, data, bytes: Math.floor(data.length / 4) * 3 - padding };
+  }
+  async function attachFiles(files) {
+    for (const file of files) {
+      const name = file.name || 'image';
+      if (attachments.length >= MAX_IMAGES) {
+        note('A message can carry at most ' + MAX_IMAGES + ' images; ' + name + ' was not attached.', 'warn');
+        continue;
+      }
+      try {
+        const a = await prepareImage(file);
+        if (a.bytes > MAX_IMAGE_BYTES) {
+          note(name + ' is ' + (a.bytes / 1048576).toFixed(1) + ' MB after downscaling; the limit is 5 MB.', 'warn');
+          continue;
+        }
+        attachments.push({ media_type: a.media_type, data: a.data });
+        renderAttachments();
+      } catch (e) {
+        console.error('could not attach image', name, e);
+        note('Could not attach ' + name + ': ' + (e && e.message ? e.message : e), 'warn');
+      }
+    }
+  }
+  function queueAttach(files) {
+    attachQueue = attachQueue.then(() => attachFiles(files));
+  }
+  function imageFiles(list) {
+    return Array.from(list || []).filter((f) => f && f.type && f.type.startsWith('image/'));
+  }
+  // Paste: image items become attachments (and the paste of their text
+  // form, such as a file name, is suppressed); text-only pastes are left
+  // to the textarea.
+  promptEl.addEventListener('paste', (e) => {
+    const items = e.clipboardData ? Array.from(e.clipboardData.items || []) : [];
+    const files = imageFiles(items.filter((it) => it.kind === 'file').map((it) => it.getAsFile()));
+    if (!files.length) return;
+    e.preventDefault();
+    queueAttach(files);
+  });
+  function dragHasFiles(e) {
+    return !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+  }
+  // A file dropped anywhere else would navigate the page to it; swallow
+  // those, and take image drops on the composer.
+  document.addEventListener('dragover', (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+  document.addEventListener('drop', (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+  composerEl.addEventListener('dragover', (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    composerEl.classList.add('dropping');
+  });
+  composerEl.addEventListener('dragleave', (e) => {
+    if (!composerEl.contains(e.relatedTarget)) composerEl.classList.remove('dropping');
+  });
+  composerEl.addEventListener('drop', (e) => {
+    composerEl.classList.remove('dropping');
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    const files = imageFiles(e.dataTransfer.files);
+    if (!files.length) { note('Only images can be attached.', 'warn'); return; }
+    queueAttach(files);
+    promptEl.focus();
+  });
   submitBtn.addEventListener('click', submitPrompt);
   stopBtn.addEventListener('click', () => postIpc({ type: 'stop' }));
   promptEl.addEventListener('keydown', (e) => {
@@ -2233,7 +2374,20 @@
       if (event.kind === 'delegation') { delegationEvent(event); return; }
       if (event.type === 'user_prompt') {
         endSegment(); endThinking();
-        append(el('div', 'user-msg', event.text || ''));
+        const msg = el('div', 'user-msg');
+        if (Array.isArray(event.images) && event.images.length) {
+          const strip = el('div', 'user-images');
+          for (const im of event.images) {
+            const img = el('img');
+            img.src = 'data:' + im.media_type + ';base64,' + im.data;
+            img.alt = 'attached image';
+            img.onload = scrollIfFollowing;
+            strip.append(img);
+          }
+          msg.append(strip);
+        }
+        if (event.text) msg.append(document.createTextNode(event.text));
+        append(msg);
         follow = true;
         setBusy(true);
         startActivity('Starting');

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSession, ClaudeSessionConfig};
 use gitterm::harness::transcript::TranscriptEntry;
-use gitterm::harness::HarnessEvent;
+use gitterm::harness::{HarnessEvent, UserPrompt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -144,6 +144,20 @@ impl AgentEvent {
     /// The echo of a prompt the human submitted, as the chat page renders it.
     pub(crate) fn user_prompt(text: &str) -> Self {
         Self::Other(serde_json::json!({"type": "user_prompt", "text": text}))
+    }
+
+    /// The echo of a submitted prompt. Attached images ride along as
+    /// `images: [{media_type, data}]` so the page can show thumbnails in
+    /// the human's own message; a text-only prompt is the plain echo.
+    pub(crate) fn submitted_prompt(prompt: &UserPrompt) -> Self {
+        if prompt.images.is_empty() {
+            return Self::user_prompt(&prompt.text);
+        }
+        Self::Other(serde_json::json!({
+            "type": "user_prompt",
+            "text": prompt.text,
+            "images": prompt.images,
+        }))
     }
 
     /// The JSON the chat webview's `__appendEvent` receives. Harness events

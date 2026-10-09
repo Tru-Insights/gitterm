@@ -5,9 +5,12 @@
 // and an interrupted long turn.
 //
 //   cargo run --example claude_harness_smoke -- --workdir <empty dir> [--model haiku]
-//       [--scenario all|permission-mode|review|model] [--reviewer-model haiku]
+//       [--scenario all|permission-mode|review|model|image] [--reviewer-model haiku]
 //
 // `--scenario permission-mode` runs only the mode switch (no model turns).
+// `--scenario image` (TRU-140) sends a solid red PNG drawn in code as a
+// base64 image content block after the text block, and checks the reply
+// names the colour (the composer's paste/drop path).
 // `--scenario model` (TRU-143) switches the model to sonnet after Ready
 // (`set_model`), pins the effort to low and back to auto
 // (`apply_flag_settings` then `get_settings`), and checks that the next turn
@@ -25,7 +28,8 @@ use std::time::{Duration, Instant};
 
 use gitterm::harness::claude::{ClaudeSession, ClaudeSessionConfig};
 use gitterm::harness::{
-    HarnessCommand, HarnessEvent, ItemKind, RuntimeDecision, RuntimeRequestKind, TurnStatus,
+    HarnessCommand, HarnessEvent, ImageAttachment, ItemKind, RuntimeDecision, RuntimeRequestKind,
+    TurnStatus, UserPrompt,
 };
 use gitterm::review::{review_prompt, ReviewRequest, ReviewTarget};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -70,12 +74,17 @@ fn show(ev: &HarnessEvent) {
 async fn turn(
     session: &ClaudeSession,
     events: &mut UnboundedReceiver<HarnessEvent>,
-    prompt: &str,
+    prompt: impl Into<UserPrompt>,
     mut answer: impl FnMut(&RuntimeRequestKind) -> RuntimeDecision,
     interrupt_after_text: Option<usize>,
 ) -> Result<(TurnStatus, String, usize), String> {
-    println!("\n>> {prompt}");
-    session.send(HarnessCommand::SendUserMessage(prompt.to_string()))?;
+    let prompt = prompt.into();
+    if prompt.images.is_empty() {
+        println!("\n>> {}", prompt.text);
+    } else {
+        println!("\n>> {} (+{} images)", prompt.text, prompt.images.len());
+    }
+    session.send(HarnessCommand::SendUserMessage(prompt))?;
     let mut text = String::new();
     let mut requests = 0;
     let mut interrupted = false;
@@ -156,9 +165,9 @@ async fn main() {
     let workdir = PathBuf::from(arg("--workdir").expect("--workdir <dir> is required"));
     std::fs::create_dir_all(&workdir).expect("create workdir");
     let scenario = arg("--scenario").unwrap_or_else(|| "all".into());
-    if !["all", "permission-mode", "review", "model"].contains(&scenario.as_str()) {
+    if !["all", "permission-mode", "review", "model", "image"].contains(&scenario.as_str()) {
         eprintln!(
-            "unknown --scenario {scenario:?} (expected all, permission-mode, review or model)"
+            "unknown --scenario {scenario:?} (expected all, permission-mode, review, model or image)"
         );
         std::process::exit(2);
     }
@@ -207,6 +216,11 @@ async fn main() {
         finish(session, events, failures).await;
         return;
     }
+    if scenario == "image" {
+        image_turn(&session, &mut events, &mut check).await;
+        finish(session, events, failures).await;
+        return;
+    }
     // The chat page's Shift+Tab cycle, ending back where it started.
     for mode in ["acceptEdits", "plan", "auto", "default"] {
         match set_mode(&session, &mut events, mode).await {
@@ -239,6 +253,7 @@ async fn main() {
         ),
         Err(e) => check("text turn", false, e),
     }
+    image_turn(&session, &mut events, &mut check).await;
 
     let allow = |kind: &RuntimeRequestKind| match kind {
         RuntimeRequestKind::Permission { .. } => RuntimeDecision::Allow {
@@ -411,6 +426,105 @@ async fn model_scenario(
     }
 }
 
+/// One turn whose user message carries a text block and a base64 PNG image
+/// block, checking the model saw the image (TRU-140 paste/drop).
+async fn image_turn(
+    session: &ClaudeSession,
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    check: &mut impl FnMut(&str, bool, String),
+) {
+    use base64::Engine as _;
+    let png = solid_png(64, 64, [220, 20, 20]);
+    let prompt = UserPrompt {
+        text: "What colour is this image? Answer with one word.".into(),
+        images: vec![ImageAttachment {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(&png),
+        }],
+    };
+    println!(
+        "[wire] {}",
+        gitterm::harness::claude::user_message_frame(&UserPrompt {
+            text: prompt.text.clone(),
+            images: vec![ImageAttachment {
+                media_type: "image/png".into(),
+                data: format!("<{} base64 chars>", prompt.images[0].data.len()),
+            }],
+        })
+    );
+    let deny_all = |_: &RuntimeRequestKind| RuntimeDecision::Deny {
+        message: "smoke test did not expect a prompt".into(),
+    };
+    match turn(session, events, prompt, deny_all, None).await {
+        Ok((status, text, _)) => check(
+            "image turn",
+            status == TurnStatus::Completed && text.to_lowercase().contains("red"),
+            format!("{status:?} {:?}", text.trim()),
+        ),
+        Err(e) => check("image turn", false, e),
+    }
+}
+
+/// A minimal RGB PNG of one colour: IHDR, one IDAT holding a zlib stream of
+/// stored (uncompressed) deflate blocks, IEND. No image crate needed.
+fn solid_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+    // Raw scanlines: filter byte 0 then the pixels.
+    let mut raw = Vec::new();
+    for _ in 0..height {
+        raw.push(0);
+        for _ in 0..width {
+            raw.extend_from_slice(&rgb);
+        }
+    }
+    let mut zlib = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
+    for (i, block) in blocks.iter().enumerate() {
+        zlib.push(u8::from(i + 1 == blocks.len()));
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + u32::from(byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, no interlace
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &zlib);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
 /// Shuts the session down, drains its last events, and sets the exit code.
 async fn finish(
     session: ClaudeSession,
@@ -578,7 +692,7 @@ async fn review_scenario(workdir: &Path) {
     })
     .expect("review prompt builds");
     println!("\n>> review prompt ({} chars)", prompt.len());
-    if let Err(e) = session.send(HarnessCommand::SendUserMessage(prompt)) {
+    if let Err(e) = session.send(HarnessCommand::SendUserMessage(prompt.into())) {
         check("send review prompt", false, e);
     }
 

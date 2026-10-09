@@ -95,6 +95,9 @@ fn turn_completed() -> HarnessEvent {
 /// its own injected messages (`<local-command-caveat>`, `<system-reminder>`
 /// wrappers, ...) as user text starting with `<`; those are not the
 /// human's words and are dropped.
+/// What an image block reads as in restored text.
+const IMAGE_MARKER: &str = "[image]";
+
 fn user_entries(content: &Value) -> Vec<TranscriptEntry> {
     match content {
         Value::String(text) => human_prompt(text).into_iter().collect(),
@@ -112,6 +115,14 @@ fn user_entries(content: &Value) -> Vec<TranscriptEntry> {
                                 text.push_str(t);
                             }
                         }
+                    }
+                    // A pasted or dropped image (TRU-140) shows as a
+                    // marker in the restored prompt.
+                    Some("image") => {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(IMAGE_MARKER);
                     }
                     Some("tool_result") => {
                         if let Some(id) = block["tool_use_id"].as_str() {
@@ -165,7 +176,7 @@ fn result_text_full(content: &Value) -> String {
             .iter()
             .map(|b| match b["type"].as_str() {
                 Some("text") => b["text"].as_str().unwrap_or("").to_string(),
-                Some("image") => "[image]".to_string(),
+                Some("image") => IMAGE_MARKER.to_string(),
                 _ => String::new(),
             })
             .filter(|s| !s.is_empty())
@@ -304,6 +315,28 @@ mod tests {
         assert_eq!(result_text(&content), "one\n[image]\ntwo");
         assert_eq!(result_text(&json!("plain")), "plain");
         assert_eq!(result_text(&Value::Null), "");
+    }
+
+    #[test]
+    fn user_image_blocks_restore_as_an_image_marker() {
+        let lines = [
+            line(json!({"type":"user","isSidechain":false,"message":{"role":"user","content":[
+                {"type":"text","text":"What colour is this?"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
+                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"BBBB"}}
+            ]}})),
+            line(json!({"type":"user","isSidechain":false,"message":{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
+            ]}})),
+        ]
+        .join("\n");
+        assert_eq!(
+            parse_claude_transcript(&lines),
+            vec![
+                TranscriptEntry::UserPrompt("What colour is this?\n[image]\n[image]".into()),
+                TranscriptEntry::UserPrompt("[image]".into()),
+            ]
+        );
     }
 
     #[test]

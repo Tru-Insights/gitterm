@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 
 use super::{
     HarnessCommand, HarnessEvent, ItemKind, RuntimeDecision, RuntimeRequestKind, TurnStatus,
+    UserPrompt,
 };
 
 /// The tool whose `can_use_tool` request is a question for the user rather
@@ -617,11 +618,26 @@ enum ControlResponseBody {
     Error { request_id: String, error: String },
 }
 
-fn user_message_frame(text: &str) -> String {
+/// The stream-json `user` line for one prompt. Without images the content
+/// is a single text block (the shape every fixture records). With images it
+/// is the text block first (left out when the text is empty, since the API
+/// rejects empty text blocks) followed by one `image` block per attachment:
+/// `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`.
+pub fn user_message_frame(prompt: &UserPrompt) -> String {
+    let mut content = Vec::with_capacity(1 + prompt.images.len());
+    if prompt.images.is_empty() || !prompt.text.is_empty() {
+        content.push(json!({"type": "text", "text": prompt.text}));
+    }
+    for image in &prompt.images {
+        content.push(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": image.media_type, "data": image.data},
+        }));
+    }
     json!({
         "type": "user",
         "session_id": "",
-        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        "message": {"role": "user", "content": content},
         "parent_tool_use_id": null
     })
     .to_string()
@@ -1178,10 +1194,14 @@ async fn run_session(
                     continue;
                 };
                 let result = match cmd {
-                    HarnessCommand::SendUserMessage(text) => {
-                        harness_log(&format!("user message ({} chars)", text.len()));
+                    HarnessCommand::SendUserMessage(prompt) => {
+                        harness_log(&format!(
+                            "user message ({} chars, {} images)",
+                            prompt.text.len(),
+                            prompt.images.len()
+                        ));
                         interrupt_requested = false;
-                        io.write(user_message_frame(&text)).await
+                        io.write(user_message_frame(&prompt)).await
                     }
                     HarnessCommand::Answer { request_id, decision } => {
                         match pending.remove(&request_id) {
@@ -1332,6 +1352,57 @@ async fn answer_unhandled_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::ImageAttachment;
+
+    #[test]
+    fn text_only_prompt_keeps_the_single_text_block_line() {
+        assert_eq!(
+            user_message_frame(&"hi".into()),
+            r#"{"message":{"content":[{"text":"hi","type":"text"}],"role":"user"},"parent_tool_use_id":null,"session_id":"","type":"user"}"#
+        );
+    }
+
+    #[test]
+    fn image_prompt_puts_text_first_then_base64_image_blocks() {
+        let prompt = UserPrompt {
+            text: "What colour?".into(),
+            images: vec![
+                ImageAttachment {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+                ImageAttachment {
+                    media_type: "image/jpeg".into(),
+                    data: "BBBB".into(),
+                },
+            ],
+        };
+        let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
+        assert_eq!(
+            v["message"]["content"],
+            json!([
+                {"type": "text", "text": "What colour?"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}},
+            ])
+        );
+        assert_eq!(v["type"], "user");
+    }
+
+    #[test]
+    fn image_only_prompt_leaves_out_the_empty_text_block() {
+        let prompt = UserPrompt {
+            text: String::new(),
+            images: vec![ImageAttachment {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        };
+        let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
+        let content = v["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
+    }
 
     fn parse_fixture(parser: &mut ClaudeFrameParser, fixture: &str) -> Vec<ParsedFrame> {
         fixture.lines().flat_map(|l| parser.parse_line(l)).collect()

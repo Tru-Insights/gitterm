@@ -49,7 +49,9 @@ use gitterm::browser_control::{
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
 use gitterm::gh_identity::GH_ACCOUNT_ENV_KEY;
-use gitterm::harness::{HarnessCommand, HarnessEvent, RuntimeDecision, TurnStatus};
+use gitterm::harness::{
+    HarnessCommand, HarnessEvent, ImageAttachment, RuntimeDecision, TurnStatus, UserPrompt,
+};
 use gitterm::task_mcp::{
     self, CreateTaskRequest as McpCreateTaskRequest, TaskControlEnvelope, TaskControlOperation,
     TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
@@ -115,6 +117,10 @@ pub enum AgentIpcMessage {
     Submit {
         tab_id: usize,
         text: String,
+        /// Images pasted or dropped into the composer (TRU-140). `Err`
+        /// carries why the page's images were malformed or over the caps;
+        /// nothing is sent then.
+        images: Result<Vec<ImageAttachment>, String>,
     },
     Stop {
         tab_id: usize,
@@ -563,7 +569,17 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                AgentIpcMessage::Submit { tab_id, text }
+                let images = match value.get("images") {
+                    None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+                    Some(images) => serde_json::from_value::<Vec<ImageAttachment>>(images.clone())
+                        .map_err(|e| format!("the attached images were malformed ({e})")),
+                }
+                .and_then(|images| gitterm::harness::validate_images(&images).map(|()| images));
+                AgentIpcMessage::Submit {
+                    tab_id,
+                    text,
+                    images,
+                }
             }
             "stop" => AgentIpcMessage::Stop { tab_id },
             "answer" => {
@@ -4965,8 +4981,9 @@ pub enum Event {
     // Resume agent preset session by index
     ResumeAgentPreset(usize),
     // Live agent tab (TabKind::Agent) — Step 3 of TRU-29.
-    /// User submitted a prompt for the agent tab with this id.
-    AgentSubmitPrompt(usize, String),
+    /// User submitted a prompt (text plus any attached images) for the
+    /// agent tab with this id.
+    AgentSubmitPrompt(usize, UserPrompt),
     /// User clicked the stop button on the agent tab with this id.
     AgentStopRequested(usize),
     /// User answered a pending runtime request (Claude permission prompt
@@ -11065,7 +11082,7 @@ impl App {
             return Task::none();
         }
         self.push_delegation_card(delegation_id);
-        Task::done(Event::AgentSubmitPrompt(tab_id, message))
+        Task::done(Event::AgentSubmitPrompt(tab_id, message.into()))
     }
 
     /// After the parent's turn ends: send the oldest held message.
@@ -14716,8 +14733,23 @@ fi
                 // (from window.__currentTabId in the JS). Translate into the
                 // existing AgentSubmitPrompt / AgentStopRequested handlers.
                 return match msg {
-                    AgentIpcMessage::Submit { tab_id, text } => {
-                        Task::done(Event::AgentSubmitPrompt(tab_id, text))
+                    AgentIpcMessage::Submit {
+                        tab_id,
+                        text,
+                        images,
+                    } => {
+                        let images = match images {
+                            Ok(images) => images,
+                            Err(e) => {
+                                eprintln!("[agent-ipc] tab {tab_id}: submit rejected: {e}");
+                                agent_webview_note(tab_id, &format!("Not sent: {e}"));
+                                return Task::none();
+                            }
+                        };
+                        Task::done(Event::AgentSubmitPrompt(
+                            tab_id,
+                            UserPrompt { text, images },
+                        ))
                     }
                     AgentIpcMessage::Stop { tab_id } => {
                         Task::done(Event::AgentStopRequested(tab_id))
@@ -14798,7 +14830,11 @@ fi
                 // Synthetic event so the user sees their own prompt rendered
                 // immediately (the agent stream takes a few hundred ms before
                 // the first system event arrives).
-                let echo = tab::AgentEvent::user_prompt(&prompt);
+                let mut echo = tab::AgentEvent::submitted_prompt(&prompt);
+                // Images a non-Claude backend could not take (pi has no
+                // image input here); the chat says so instead of dropping
+                // them silently.
+                let mut images_not_sent = 0;
                 let mut task_started: Option<String> = None;
                 let mut harness_bridge: Option<tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>> =
                     None;
@@ -14878,6 +14914,10 @@ fi
                             }
                             break 'outer_submit;
                         }
+                        if !prompt.images.is_empty() {
+                            images_not_sent = prompt.images.len();
+                            echo = tab::AgentEvent::user_prompt(&prompt.text);
+                        }
                         if session.task_handle.is_none() {
                             let handle = tab::spawn_agent_task(session.config.clone(), repo_path);
                             // Take the receiver up-front so this turn can wire
@@ -14887,7 +14927,7 @@ fi
                         }
                         let mut submitted = false;
                         if let Some(handle) = session.task_handle.as_ref() {
-                            if let Err(e) = handle.submit_prompt(prompt.clone()) {
+                            if let Err(e) = handle.submit_prompt(prompt.text.clone()) {
                                 eprintln!("AgentSubmitPrompt failed: {}", e);
                             } else {
                                 session.state = tab::AgentSessionState::Streaming;
@@ -14909,6 +14949,17 @@ fi
                 }
                 // Also push the echo into the tab's chat page, if it has one.
                 push_agent_event_to_webview(tab_id, &echo);
+                if images_not_sent > 0 {
+                    eprintln!(
+                        "AgentSubmitPrompt: tab {tab_id}: {images_not_sent} image(s) not sent (non-Claude backend)"
+                    );
+                    agent_webview_note(
+                        tab_id,
+                        &format!(
+                            "Images are only sent to Claude; this message went without its {images_not_sent} image(s)."
+                        ),
+                    );
+                }
                 if claude_spawned {
                     // The session is now bound to its directory.
                     if let Some(state) = self.chat_checkout_state(tab_id) {
@@ -15273,7 +15324,7 @@ fi
                 }
                 let prompt = request.and_then(|r| gitterm::review::review_prompt(&r));
                 return match prompt {
-                    Ok(prompt) => Task::done(Event::AgentSubmitPrompt(tab_id, prompt)),
+                    Ok(prompt) => Task::done(Event::AgentSubmitPrompt(tab_id, prompt.into())),
                     Err(e) => {
                         eprintln!("AgentReviewRequested: tab {tab_id}: {e}");
                         agent_webview_note(tab_id, &format!("Review not sent: {e}"));
@@ -15317,7 +15368,7 @@ fi
                     return self.request_delegation(new, DelegationOrigin::Page(tab_id));
                 }
                 return match gitterm::review::consult_prompt(&request) {
-                    Ok(prompt) => Task::done(Event::AgentSubmitPrompt(tab_id, prompt)),
+                    Ok(prompt) => Task::done(Event::AgentSubmitPrompt(tab_id, prompt.into())),
                     Err(e) => {
                         eprintln!("AgentConsultRequested: tab {tab_id}: {e}");
                         agent_webview_note(tab_id, &format!("Consult not sent: {e}"));
