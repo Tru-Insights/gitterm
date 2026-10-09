@@ -461,7 +461,7 @@
   details.dlg.blocked .dlg-kind, details.dlg.waiting .dlg-kind { color: var(--warn); }
   details.dlg.waiting .dlg-state, details.dlg.blocked .dlg-state { color: var(--warn); }
   .dlg-path { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); word-break: break-all; margin: 2px 0 6px; }
-  details.dlg.flash { outline: 1px solid var(--accent); }
+  details.dlg.flash, details.tool.flash { outline: 1px solid var(--accent); }
   details.dlg > summary {
     cursor: pointer; user-select: none; list-style: none;
     padding: 6px 10px; display: flex; gap: 8px; align-items: baseline;
@@ -1996,6 +1996,7 @@
       what: (input.description ? input.description + ' — ' : '') + doing,
       meta: parts.join(' · '),
       target: sub.item.card,
+      details: sub.details,
       live: sub.state === 'running',
     };
   }
@@ -2058,30 +2059,64 @@
     }
     return rows.filter((row) => !rosterHidden.has(row.key));
   }
+  // Row elements by key, updated in place. The roster re-renders every
+  // second while anything runs and on every subagent event; rebuilding the
+  // rows each time swapped the element out between a click's mousedown and
+  // mouseup, so the click never fired.
+  const rosterRowEls = new Map();
+  function setText(node, text) { if (node.textContent !== text) node.textContent = text; }
+  function makeRosterRow(key) {
+    const r = el('div', 'ro-row');
+    r.dataset.key = key;
+    r.appendChild(el('span', 'ro-dot'));
+    const v = {
+      r, row: null,
+      name: r.appendChild(el('span', 'ro-name')),
+      what: r.appendChild(el('span', 'ro-what')),
+      meta: r.appendChild(el('span', 'ro-meta')),
+      x: r.appendChild(el('button', 'ro-x', '×')),
+    };
+    v.x.title = 'Hide from this list';
+    v.x.addEventListener('click', (e) => { e.stopPropagation(); rosterHidden.add(key); renderRoster(); });
+    r.addEventListener('click', () => revealRosterTarget(v.row));
+    return v;
+  }
+  // Show what a roster row stands for: open its card (and a subagent's own
+  // activity block), stop following the latest message so the next event
+  // does not scroll it away, and flash it.
+  function revealRosterTarget(row) {
+    if (!row) return;
+    const target = row.target;
+    if (target.tagName === 'DETAILS') target.open = true;
+    if (row.details) row.details.open = true;
+    follow = false;
+    jumpBtn.classList.add('visible');
+    target.scrollIntoView({ block: row.details ? 'start' : 'nearest' });
+    target.classList.add('flash');
+    setTimeout(() => target.classList.remove('flash'), 900);
+  }
   function renderRoster() {
     const rows = rosterRows();
-    rosterEl.innerHTML = '';
     rosterEl.classList.toggle('visible', rows.length > 0);
     let live = false;
-    for (const row of rows) {
+    const keys = new Set();
+    rows.forEach((row, i) => {
       live = live || row.live;
-      const r = rosterEl.appendChild(el('div', 'ro-row ' + row.cls));
-      r.dataset.key = row.key;
-      r.appendChild(el('span', 'ro-dot'));
-      r.appendChild(el('span', 'ro-name', row.name));
-      r.appendChild(el('span', 'ro-what', row.what));
-      if (row.meta) r.appendChild(el('span', 'ro-meta', row.meta));
-      if (!row.live) {
-        const x = r.appendChild(el('button', 'ro-x', '×'));
-        x.title = 'Hide from this list';
-        x.addEventListener('click', (e) => { e.stopPropagation(); rosterHidden.add(row.key); renderRoster(); });
-      }
-      r.addEventListener('click', () => {
-        if (row.target.tagName === 'DETAILS') row.target.open = true;
-        row.target.scrollIntoView({ block: 'nearest' });
-        row.target.classList.add('flash');
-        setTimeout(() => row.target.classList.remove('flash'), 900);
-      });
+      keys.add(row.key);
+      let v = rosterRowEls.get(row.key);
+      if (!v) { v = makeRosterRow(row.key); rosterRowEls.set(row.key, v); }
+      v.row = row;
+      const cls = 'ro-row ' + row.cls;
+      if (v.r.className !== cls) v.r.className = cls;
+      setText(v.name, row.name);
+      setText(v.what, row.what);
+      setText(v.meta, row.meta || '');
+      v.meta.style.display = row.meta ? '' : 'none';
+      v.x.style.display = row.live ? 'none' : '';
+      if (rosterEl.children[i] !== v.r) rosterEl.insertBefore(v.r, rosterEl.children[i] || null);
+    });
+    for (const [key, v] of rosterRowEls) {
+      if (!keys.has(key)) { v.r.remove(); rosterRowEls.delete(key); }
     }
     // Timers tick while something runs.
     const anyRunningCard = Array.from(cards.values()).some((c) => c.data && state(c.data) === 'running' && !c.data.dismissed_at);
