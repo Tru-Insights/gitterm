@@ -377,6 +377,14 @@ fn replay_agent_conversation_in_webview(
     );
 }
 
+/// Queue dictated `text` for chat tab `tab_id` until its page is built.
+/// Successive dictations join exactly as they do in a terminal, which gets
+/// each transcript verbatim with no separator.
+#[cfg(feature = "stt")]
+fn hold_composer_dictation(held: &mut HashMap<usize, String>, tab_id: usize, text: &str) {
+    held.entry(tab_id).or_default().push_str(text);
+}
+
 /// Tell a freshly built chat page which tab it belongs to. The page tags every
 /// IPC message with this id so the Rust dispatcher routes the prompt/stop to
 /// the right tab; each tab has its own page, so this runs once per page.
@@ -5355,6 +5363,11 @@ struct App {
     stt_sample_rate: u32,
     #[cfg(feature = "stt")]
     stt_transcribing: bool,
+    /// Dictated text for chat tabs whose page was not built when the
+    /// transcript arrived, delivered to the composer on
+    /// `AgentWebviewCreated`. Entries for closed tabs are pruned with the
+    /// pages (`prune_agent_pages`).
+    dictation_held: HashMap<usize, String>,
     /// What the Viewer webview surface is presenting (`None` = hidden).
     viewer_webview: ViewerWebview,
     /// Agent tabs that own a chat page (`WebviewSurface::Agent(tab_id)`),
@@ -11318,6 +11331,7 @@ impl App {
             stt_sample_rate: 48000,
             #[cfg(feature = "stt")]
             stt_transcribing: false,
+            dictation_held: HashMap::new(),
             viewer_webview: ViewerWebview::None,
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
@@ -15438,6 +15452,14 @@ fi
                 let cards = self.delegation_cards_for_tab(tab_id);
                 replay_agent_conversation_in_webview(tab_id, &session.conversation, cards);
                 webview::focus_agent_composer(tab_id);
+                if let Some(text) = self.dictation_held.remove(&tab_id) {
+                    eprintln!(
+                        "[STT] delivering {} held chars to the composer of tab={}",
+                        text.chars().count(),
+                        tab_id
+                    );
+                    webview::insert_agent_composer_text(tab_id, &text);
+                }
                 return self.refresh_delegation_head(tab_id);
             }
             Event::AgentHistoryLoaded(tab_id, history) => {
@@ -19394,8 +19416,10 @@ fi
             Event::SttTranscriptReady(text) => {
                 self.stt_transcribing = false;
                 if !text.is_empty() {
-                    // Inject transcribed text into the active tab's terminal
+                    // Inject transcribed text into the active tab: its
+                    // terminal, or a chat tab's composer.
                     if let Some(tab) = self.active_tab_mut() {
+                        let tab_id = tab.id;
                         if let Some(term) = tab.terminal_mut() {
                             Self::handle_terminal_backend_command(
                                 term,
@@ -19403,6 +19427,8 @@ fi
                                 "stt_transcript_inject",
                                 true, // user-initiated, always redraw
                             );
+                        } else {
+                            self.dictate_into_composer(tab_id, &text);
                         }
                     }
                 }
@@ -20460,6 +20486,30 @@ fi
         for tab_id in gone {
             self.destroy_agent_page(tab_id, "tab closed");
         }
+        let workspaces = &self.workspaces;
+        self.dictation_held.retain(|&tab_id, _| {
+            workspaces
+                .iter()
+                .flat_map(|ws| ws.tabs.iter())
+                .any(|t| t.id == tab_id && matches!(t.kind, TabKind::Agent(_)))
+        });
+    }
+
+    /// Put a dictation transcript into chat tab `tab_id`'s composer at the
+    /// caret, verbatim as the terminal path writes it. A page still being
+    /// built (or not built since the tab opened) gets it on
+    /// `AgentWebviewCreated`.
+    #[cfg(feature = "stt")]
+    fn dictate_into_composer(&mut self, tab_id: usize, text: &str) {
+        if webview::insert_agent_composer_text(tab_id, text) {
+            return;
+        }
+        eprintln!(
+            "[STT] chat page for tab={} not built yet; holding {} chars for its composer",
+            tab_id,
+            text.chars().count()
+        );
+        hold_composer_dictation(&mut self.dictation_held, tab_id, text);
     }
 
     /// Bring both surfaces in line with the active tab: its inline file viewer
@@ -33787,6 +33837,26 @@ mod tests {
         );
         assert_eq!(harness(completed(TurnStatus::Interrupted)), None);
         assert_eq!(harness(HarnessEvent::TextDelta("hi".into())), None);
+    }
+
+    #[cfg(feature = "stt")]
+    #[test]
+    fn held_dictation_joins_like_the_terminal_per_tab() {
+        let mut held = HashMap::new();
+        hold_composer_dictation(&mut held, 7, "Fix the build.");
+        hold_composer_dictation(&mut held, 9, "Other tab");
+        hold_composer_dictation(&mut held, 7, " And add a test.");
+        assert_eq!(
+            held.get(&7).map(String::as_str),
+            Some("Fix the build. And add a test.")
+        );
+        assert_eq!(held.get(&9).map(String::as_str), Some("Other tab"));
+    }
+
+    #[test]
+    fn agent_chat_page_exposes_composer_insert() {
+        let html = agent_chat_html();
+        assert!(html.contains("window.__insertComposerText = function (text)"));
     }
 
     #[test]

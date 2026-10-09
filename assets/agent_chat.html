@@ -2281,6 +2281,18 @@
 
   window.__focusComposer = function () { promptEl.focus(); };
 
+  // Dictated text (voice input): insert at the caret, replacing any
+  // selection, as typing would; the synthetic `input` event runs the
+  // auto-grow above. Focus stays in the composer.
+  window.__insertComposerText = function (text) {
+    if (typeof text !== 'string' || text === '') return;
+    const start = promptEl.selectionStart ?? promptEl.value.length;
+    const end = promptEl.selectionEnd ?? start;
+    promptEl.setRangeText(text, start, end, 'end');
+    promptEl.dispatchEvent(new Event('input', { bubbles: true }));
+    promptEl.focus();
+  };
+
   refreshComposer();
   promptEl.focus();
 })();

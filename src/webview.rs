@@ -328,6 +328,37 @@ pub fn focus_agent_composer(tab_id: usize) {
     });
 }
 
+/// The script that inserts `text` at the composer caret of an agent chat page
+/// (`window.__insertComposerText`). The text is JSON-encoded, so quotes,
+/// backslashes, newlines and `</script>` arrive as literal characters.
+fn insert_composer_text_script(text: &str) -> String {
+    let literal = serde_json::Value::String(text.to_string());
+    format!("window.__insertComposerText && window.__insertComposerText({literal})")
+}
+
+/// Insert dictated `text` at the caret of agent tab `tab_id`'s composer
+/// (replacing any selection) and give the page keyboard focus. Returns
+/// whether the page existed; the caller holds the text otherwise.
+pub fn insert_agent_composer_text(tab_id: usize, text: &str) -> bool {
+    let script = insert_composer_text_script(text);
+    with_existing_slot(WebviewSurface::Agent(tab_id), |slot| {
+        let Some(webview) = slot.webview.as_ref() else {
+            return false;
+        };
+        if let Err(e) = webview.focus() {
+            eprintln!("[agent-webview] focus failed for tab={tab_id}: {e}");
+        }
+        if let Err(e) = webview.evaluate_script(&script) {
+            eprintln!(
+                "[agent-webview] composer insert failed for tab={tab_id} ({} chars): {e}",
+                text.chars().count()
+            );
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
 /// Hide every agent page.
 pub fn hide_agent_pages() {
     show_only_agent_page(None);
@@ -353,5 +384,48 @@ pub fn destroy(surface: WebviewSurface) {
                 .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), SurfaceSlot::EMPTY));
             drop(old);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::insert_composer_text_script;
+
+    /// The argument the page receives, decoded as the JS engine would read
+    /// the JSON literal.
+    fn decoded_argument(script: &str) -> String {
+        let prefix = "window.__insertComposerText && window.__insertComposerText(";
+        let literal = script
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(')'))
+            .expect("script shape");
+        serde_json::from_str(literal).expect("argument is a JSON string literal")
+    }
+
+    #[test]
+    fn composer_insert_script_round_trips_awkward_text() {
+        for text in [
+            "plain words",
+            "say \"hi\" and it's fine",
+            "back\\slash \\n not a newline",
+            "two\nlines\r\nand a\ttab",
+            "</script><script>alert(1)</script>",
+            "${template} `tick` ); window.x = 1; (",
+            "caf\u{e9} \u{2028} \u{2029} \u{1f399}",
+        ] {
+            assert_eq!(decoded_argument(&insert_composer_text_script(text)), text);
+        }
+    }
+
+    #[test]
+    fn composer_insert_script_keeps_text_inside_one_string_literal() {
+        let script = insert_composer_text_script("a\") ; evil(); (\"");
+        // Every quote and newline in the text is escaped, so the call has
+        // exactly one argument and nothing runs outside it.
+        assert!(!script.contains('\n'));
+        assert_eq!(
+            script,
+            r#"window.__insertComposerText && window.__insertComposerText("a\") ; evil(); (\"")"#
+        );
     }
 }
