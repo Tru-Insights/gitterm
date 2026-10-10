@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 
 use crate::agentd::git::git_command;
 use crate::codex_runner::{describe_target, CodexRun, CodexRunKind};
+use crate::harness::transcript::{TimedEntry, TranscriptEntry};
+use crate::harness::{HarnessEvent, ItemKind};
 use crate::review::{is_commit_sha, is_model_name, is_safe_ref};
 use crate::task_mcp::{
     ConsultDelegationRequest, HandoffStatus, ReviewDelegationRequest, ReviewTargetKind,
@@ -1027,6 +1029,82 @@ pub fn anchor_payload(delegation_id: &str) -> Value {
     json!({ "kind": "delegation_anchor", "delegation_id": delegation_id })
 }
 
+/// The task tools whose result returns a new delegation's id.
+const REQUEST_TOOLS: [&str; 3] = ["review_request", "consult_request", "delegate_task"];
+
+/// Where a chat's delegation cards go in a timeline read back from its
+/// transcript, as (index to insert the anchor at, delegation id), by
+/// index. The anchors recorded live are only in memory, so without this
+/// every card lands at the end after a restart. A delegation Claude asked
+/// for goes right after the tool result that returned its id; one asked
+/// for from the page (Review…, Re-run) goes before the first entry written
+/// after its `created_at`. One placed by neither is left out, and its card
+/// goes at the end. `delegations` are (id, created_at), oldest first.
+pub fn history_anchor_positions(
+    entries: &[TimedEntry],
+    delegations: &[(String, String)],
+) -> Vec<(usize, String)> {
+    let mut request_calls: HashSet<&str> = HashSet::new();
+    let mut request_results: Vec<(usize, &str)> = Vec::new();
+    for (index, timed) in entries.iter().enumerate() {
+        match &timed.entry {
+            TranscriptEntry::Harness(HarnessEvent::ItemStarted {
+                id,
+                kind: ItemKind::ToolCall { name, .. },
+            }) if is_request_tool(name) => {
+                request_calls.insert(id);
+            }
+            TranscriptEntry::Harness(HarnessEvent::ItemCompleted {
+                id,
+                output,
+                is_error: false,
+            }) if request_calls.contains(id.as_str()) => request_results.push((index, output)),
+            _ => {}
+        }
+    }
+    let mut positions: Vec<(usize, String)> = delegations
+        .iter()
+        .filter_map(|(id, created_at)| {
+            let after_result = request_results
+                .iter()
+                .find(|(_, output)| output.contains(id.as_str()))
+                .map(|(index, _)| index + 1);
+            let by_time = || {
+                let created = parse_time(created_at)?;
+                Some(
+                    entries
+                        .iter()
+                        .position(|timed| {
+                            timed
+                                .at
+                                .as_deref()
+                                .and_then(parse_time)
+                                .is_some_and(|at| at > created)
+                        })
+                        .unwrap_or(entries.len()),
+                )
+            };
+            after_result
+                .or_else(by_time)
+                .map(|index| (index, id.clone()))
+        })
+        .collect();
+    // Stable: delegations at one index keep their oldest-first order.
+    positions.sort_by_key(|(index, _)| *index);
+    positions
+}
+
+/// A Claude tool name for one of `REQUEST_TOOLS` on GitTerm's task server
+/// (MCP tools reach Claude as `mcp__<server>__<tool>`).
+fn is_request_tool(name: &str) -> bool {
+    name.strip_prefix("mcp__gitterm_tasks__")
+        .is_some_and(|tool| REQUEST_TOOLS.contains(&tool))
+}
+
+fn parse_time(text: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(text).ok()
+}
+
 /// A ready local task with its worktree at `worktree`, for the tests of
 /// this crate that exercise workers.
 #[cfg(test)]
@@ -1795,5 +1873,114 @@ mod tests {
         let row = delegation_summary(&worker);
         assert_eq!(row["task_id"], "task-1");
         assert_eq!(row["kind"], "implement");
+    }
+
+    fn timed(at: &str, event: HarnessEvent) -> TimedEntry {
+        TimedEntry {
+            at: Some(at.into()),
+            entry: TranscriptEntry::Harness(event),
+        }
+    }
+
+    fn tool_call(at: &str, id: &str, name: &str) -> TimedEntry {
+        timed(
+            at,
+            HarnessEvent::ItemStarted {
+                id: id.into(),
+                kind: ItemKind::ToolCall {
+                    name: name.into(),
+                    input: Value::Null,
+                },
+            },
+        )
+    }
+
+    fn tool_result(at: &str, id: &str, output: &str) -> TimedEntry {
+        timed(
+            at,
+            HarnessEvent::ItemCompleted {
+                id: id.into(),
+                output: output.into(),
+                is_error: false,
+            },
+        )
+    }
+
+    #[test]
+    fn history_anchors_follow_the_request_result_or_the_creation_time() {
+        let entries = vec![
+            TimedEntry {
+                at: Some("2026-10-09T10:00:00Z".into()),
+                entry: TranscriptEntry::UserPrompt("review it".into()),
+            },
+            tool_call(
+                "2026-10-09T10:00:01Z",
+                "t1",
+                "mcp__gitterm_tasks__review_request",
+            ),
+            tool_result("2026-10-09T10:00:02Z", "t1", r#"{"delegation_id":"d-mcp"}"#),
+            // A later delegation_get mentions the id again; the request
+            // result is the place, and this tool is not a request.
+            tool_call(
+                "2026-10-09T10:05:00Z",
+                "t2",
+                "mcp__gitterm_tasks__delegation_get",
+            ),
+            tool_result("2026-10-09T10:05:01Z", "t2", r#"{"delegation_id":"d-mcp"}"#),
+            timed(
+                "2026-10-09T10:06:00Z",
+                HarnessEvent::TextDelta("done".into()),
+            ),
+            TimedEntry {
+                at: Some("2026-10-09T10:10:00Z".into()),
+                entry: TranscriptEntry::UserPrompt("next".into()),
+            },
+        ];
+        let delegations = vec![
+            ("d-mcp".to_string(), "2026-10-09T10:00:01.500Z".to_string()),
+            // Re-run from the page between the reply and the next prompt.
+            (
+                "d-page".to_string(),
+                "2026-10-09T10:07:00+00:00".to_string(),
+            ),
+            // Newer than the whole transcript.
+            ("d-late".to_string(), "2026-10-09T11:00:00Z".to_string()),
+            ("d-bad".to_string(), "not a time".to_string()),
+        ];
+        assert_eq!(
+            history_anchor_positions(&entries, &delegations),
+            vec![
+                (3, "d-mcp".to_string()),
+                (6, "d-page".to_string()),
+                (7, "d-late".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_anchors_skip_failed_requests_and_other_servers() {
+        let entries = vec![
+            tool_call("2026-10-09T10:00:00Z", "t1", "mcp__other__review_request"),
+            tool_result("2026-10-09T10:00:01Z", "t1", "d-1"),
+            tool_call(
+                "2026-10-09T10:00:02Z",
+                "t2",
+                "mcp__gitterm_tasks__consult_request",
+            ),
+            timed(
+                "2026-10-09T10:00:03Z",
+                HarnessEvent::ItemCompleted {
+                    id: "t2".into(),
+                    output: "d-1 failed".into(),
+                    is_error: true,
+                },
+            ),
+        ];
+        // Neither result places d-1, so its creation time does.
+        let delegations = vec![("d-1".to_string(), "2026-10-09T10:00:00.500Z".to_string())];
+        assert_eq!(
+            history_anchor_positions(&entries, &delegations),
+            vec![(1, "d-1".to_string())]
+        );
     }
 }

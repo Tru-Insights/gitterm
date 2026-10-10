@@ -402,6 +402,30 @@ fn replay_agent_conversation_in_webview(
     );
 }
 
+/// A transcript read-back as a chat timeline, with each delegation card's
+/// anchor put back where the card was requested
+/// (`delegations::history_anchor_positions`).
+fn history_timeline(
+    entries: Vec<gitterm::harness::transcript::TimedEntry>,
+    delegations: &[(String, String)],
+) -> Vec<tab::AgentEvent> {
+    let anchors = gitterm::delegations::history_anchor_positions(&entries, delegations);
+    let mut anchors = anchors.into_iter().peekable();
+    let mut timeline = Vec::with_capacity(entries.len() + delegations.len());
+    for (index, timed) in entries.into_iter().enumerate() {
+        while let Some((_, id)) = anchors.next_if(|(at, _)| *at == index) {
+            timeline.push(tab::AgentEvent::Other(
+                gitterm::delegations::anchor_payload(&id),
+            ));
+        }
+        timeline.push(tab::AgentEvent::from(timed.entry));
+    }
+    timeline.extend(
+        anchors.map(|(_, id)| tab::AgentEvent::Other(gitterm::delegations::anchor_payload(&id))),
+    );
+    timeline
+}
+
 /// Queue dictated `text` for chat tab `tab_id` until its page is built.
 /// Successive dictations join exactly as they do in a terminal, which gets
 /// each transcript verbatim with no separator.
@@ -11456,6 +11480,35 @@ impl App {
             .collect()
     }
 
+    /// (id, created_at) of every delegation of a chat tab, oldest first,
+    /// for placing their cards in a transcript read-back.
+    fn delegation_times_for_tab(&self, tab_id: usize) -> Vec<(String, String)> {
+        let Some(session_uid) = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.session_uid.as_str())
+        else {
+            return Vec::new();
+        };
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let mut delegations: Vec<(String, String)> = store
+            .delegations_for_parent(session_uid)
+            .into_iter()
+            .map(|delegation| {
+                (
+                    delegation.delegation_id.clone(),
+                    delegation.created_at.clone(),
+                )
+            })
+            .collect();
+        delegations.reverse();
+        delegations
+    }
+
     /// Reads the chat tab's HEAD for its cards' "branch has moved" banner.
     fn refresh_delegation_head(&self, tab_id: usize) -> Task<Event> {
         let Some(tab) = self
@@ -21612,6 +21665,9 @@ fi
     /// time it is shown. The file can be megabytes, so it is parsed off the
     /// UI thread and arrives as `AgentHistoryLoaded`.
     fn start_agent_history_load(&mut self, tab_id: usize) -> Task<Event> {
+        // The tab's delegation cards are not in the transcript; they are
+        // anchored back where they were requested (TRU-142).
+        let delegations = self.delegation_times_for_tab(tab_id);
         let Some(session) = self
             .workspaces
             .iter_mut()
@@ -21634,7 +21690,7 @@ fi
                         return Vec::new();
                     };
                     match gitterm::harness::transcript::load_claude_history(&path) {
-                        Ok(entries) => entries.into_iter().map(tab::AgentEvent::from).collect(),
+                        Ok(entries) => history_timeline(entries, &delegations),
                         Err(e) => {
                             eprintln!("[agent] could not read transcript {}: {e}", path.display());
                             Vec::new()

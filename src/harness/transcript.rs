@@ -31,15 +31,34 @@ pub enum TranscriptEntry {
     Harness(HarnessEvent),
 }
 
+/// A timeline entry and when its transcript line was written (the line's
+/// RFC 3339 `timestamp`, when it has one). The time places delegation
+/// cards, which are not in the transcript, back where they were (TRU-142).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedEntry {
+    pub at: Option<String>,
+    pub entry: TranscriptEntry,
+}
+
 /// Read and parse a transcript file.
-pub fn load_claude_history(path: &Path) -> std::io::Result<Vec<TranscriptEntry>> {
+pub fn load_claude_history(path: &Path) -> std::io::Result<Vec<TimedEntry>> {
     let text = std::fs::read_to_string(path)?;
-    Ok(parse_claude_transcript(&text))
+    Ok(parse_claude_transcript_timed(&text))
 }
 
 /// Parse transcript lines into timeline entries. Unparseable lines are
 /// skipped: the file is append-only and the last line may be partial.
 pub fn parse_claude_transcript(text: &str) -> Vec<TranscriptEntry> {
+    parse_claude_transcript_timed(text)
+        .into_iter()
+        .map(|timed| timed.entry)
+        .collect()
+}
+
+/// `parse_claude_transcript`, keeping each entry's line time. The turn end
+/// closed by a new prompt takes that prompt's time; the one closing the
+/// file has none.
+pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
     let mut out = Vec::new();
     // Whether assistant activity has been emitted since the last turn end;
     // the transcript has no turn markers, so a new user prompt (or the end
@@ -52,19 +71,24 @@ pub fn parse_claude_transcript(text: &str) -> Vec<TranscriptEntry> {
         if v["isMeta"].as_bool().unwrap_or(false) || v["isSidechain"].as_bool().unwrap_or(false) {
             continue;
         }
+        let at = v["timestamp"].as_str().map(str::to_string);
+        let timed = |entry| TimedEntry {
+            at: at.clone(),
+            entry,
+        };
         match v["type"].as_str() {
             Some("user") => {
                 for entry in user_entries(&v["message"]["content"]) {
                     match &entry {
                         TranscriptEntry::UserPrompt(_) => {
                             if turn_open {
-                                out.push(TranscriptEntry::Harness(turn_completed()));
+                                out.push(timed(TranscriptEntry::Harness(turn_completed())));
                                 turn_open = false;
                             }
                         }
                         TranscriptEntry::Harness(_) => turn_open = true,
                     }
-                    out.push(entry);
+                    out.push(timed(entry));
                 }
             }
             Some("assistant") => {
@@ -72,13 +96,20 @@ pub fn parse_claude_transcript(text: &str) -> Vec<TranscriptEntry> {
                 if !events.is_empty() {
                     turn_open = true;
                 }
-                out.extend(events.into_iter().map(TranscriptEntry::Harness));
+                out.extend(
+                    events
+                        .into_iter()
+                        .map(|event| timed(TranscriptEntry::Harness(event))),
+                );
             }
             _ => {}
         }
     }
     if turn_open {
-        out.push(TranscriptEntry::Harness(turn_completed()));
+        out.push(TimedEntry {
+            at: None,
+            entry: TranscriptEntry::Harness(turn_completed()),
+        });
     }
     out
 }

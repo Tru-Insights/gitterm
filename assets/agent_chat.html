@@ -498,9 +498,11 @@
   .dlg-actions .dlg-note { color: var(--fg-muted); font-size: 11.5px; }
 
   /* Agent roster: live subagents and delegations (above the composer) */
-  #roster { display: none; flex-direction: column; gap: 2px; padding: 4px 6px 6px; background: transparent; border: 0; border-top: 1px solid var(--border); border-radius: 0; max-height: 132px; overflow-y: auto; }
+  #roster { display: none; flex-direction: column; gap: 2px; padding: 4px 6px 6px; background: transparent; border: 0; border-top: 1px solid var(--border); border-radius: 0; max-height: 98px; overflow-y: auto; }
   #roster.visible { display: flex; }
-  .ro-row { display: flex; gap: 8px; align-items: baseline; font-size: 12px; font-family: var(--mono); color: var(--fg-muted); cursor: pointer; padding: 1px 4px; border-radius: 4px; }
+  /* 18px rows + 2px gaps: the roster's 98px shows four and a half rows,
+     so a fifth peeks out when it scrolls. */
+  .ro-row { display: flex; gap: 8px; align-items: baseline; font-size: 12px; line-height: 16px; font-family: var(--mono); color: var(--fg-muted); cursor: pointer; padding: 1px 4px; border-radius: 4px; }
   .ro-row:hover { background: var(--border); }
   .ro-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
   .ro-row.done .ro-dot { animation: none; background: var(--result); }
@@ -2045,11 +2047,15 @@
       what, meta, target: card.root, live,
     };
   }
+  // Finished subagents read back after a restart: the latest few stay so
+  // the roster reads as it did before; older ones are history.
+  const ROSTER_REPLAYED_SUBAGENTS = 10;
   function rosterRows() {
     const rows = [];
+    const replayedDone = subagents.filter((sub) => sub.fromReplay && sub.state !== 'running');
+    const oldReplayed = new Set(replayedDone.slice(0, Math.max(0, replayedDone.length - ROSTER_REPLAYED_SUBAGENTS)));
     for (const sub of subagents) {
-      // Finished subagents read back from history are not news.
-      if (sub.fromReplay && sub.state !== 'running') continue;
+      if (oldReplayed.has(sub)) continue;
       rows.push(subagentRow(sub));
     }
     for (const card of cards.values()) {
@@ -2057,7 +2063,11 @@
       if (!d || d.dismissed_at || d.delivered_at) continue;
       rows.push(delegationRow(card));
     }
-    return rows.filter((row) => !rosterHidden.has(row.key));
+    // Running rows first, so work in progress is in view above the
+    // finished rows in the short roster (the sort is stable).
+    return rows
+      .filter((row) => !rosterHidden.has(row.key))
+      .sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0));
   }
   // Row elements by key, updated in place. The roster re-renders every
   // second while anything runs and on every subagent event; rebuilding the
