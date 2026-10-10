@@ -5,21 +5,42 @@
 // and an interrupted long turn.
 //
 //   cargo run --example claude_harness_smoke -- --workdir <empty dir> [--model haiku]
-//       [--scenario all|permission-mode]
+//       [--scenario all|permission-mode|review|model|image|midturn] [--reviewer-model haiku]
 //
 // `--scenario permission-mode` runs only the mode switch (no model turns).
+// `--scenario image` (TRU-140) sends a solid red PNG drawn in code as a
+// base64 image content block after the text block, and checks the reply
+// names the colour (the composer's paste/drop path).
+// `--scenario model` (TRU-143) switches the model to sonnet after Ready
+// (`set_model`), pins the effort to low and back to auto
+// (`apply_flag_settings` then `get_settings`), and checks that the next turn
+// runs on sonnet.
+// `--scenario review` (TRU-142 R1) builds a scratch git repo under the
+// workdir with a planted bug in an uncommitted change, sends the Review…
+// prompt (`gitterm::review::review_prompt`), and checks that the subagent's
+// activity arrives as nested `SubagentEvent`s under the parent's Agent tool
+// call and that the relayed report has F1 with a `file:line` in the repo.
+// `--scenario midturn` (TRU-140) writes user messages while a turn runs:
+// during a multi-Bash turn (answered at the next tool boundary, one
+// withdrawn while queued) and during a text-only turn (run as the next
+// turn). See `midturn_scenario`; it prints the event order as `[seq]`.
 // Prints every HarnessEvent as JSON and exits 1 if a step fails.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use gitterm::harness::claude::{ClaudeSession, ClaudeSessionConfig};
 use gitterm::harness::{
-    HarnessCommand, HarnessEvent, RuntimeDecision, RuntimeRequestKind, TurnStatus,
+    HarnessCommand, HarnessEvent, ImageAttachment, ItemKind, MessageState, RuntimeDecision,
+    RuntimeRequestKind, TurnStatus, UserPrompt,
 };
+use gitterm::review::{review_prompt, ReviewRequest, ReviewTarget};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(180);
+/// A review turn spawns a subagent that reads the diff; give it longer.
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn arg(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
@@ -31,6 +52,13 @@ fn arg(name: &str) -> Option<String> {
 fn show(ev: &HarnessEvent) {
     match ev {
         HarnessEvent::TextDelta(_) | HarnessEvent::ItemInputDelta { .. } => {}
+        HarnessEvent::SubagentEvent { event, .. }
+            if matches!(
+                **event,
+                HarnessEvent::TextDelta(_)
+                    | HarnessEvent::ThinkingDelta(_)
+                    | HarnessEvent::ItemInputDelta { .. }
+            ) => {}
         HarnessEvent::Ready {
             session_id,
             permission_mode,
@@ -50,12 +78,17 @@ fn show(ev: &HarnessEvent) {
 async fn turn(
     session: &ClaudeSession,
     events: &mut UnboundedReceiver<HarnessEvent>,
-    prompt: &str,
+    prompt: impl Into<UserPrompt>,
     mut answer: impl FnMut(&RuntimeRequestKind) -> RuntimeDecision,
     interrupt_after_text: Option<usize>,
 ) -> Result<(TurnStatus, String, usize), String> {
-    println!("\n>> {prompt}");
-    session.send(HarnessCommand::SendUserMessage(prompt.to_string()))?;
+    let prompt = prompt.into();
+    if prompt.images.is_empty() {
+        println!("\n>> {}", prompt.text);
+    } else {
+        println!("\n>> {} (+{} images)", prompt.text, prompt.images.len());
+    }
+    session.send(HarnessCommand::SendUserMessage(prompt))?;
     let mut text = String::new();
     let mut requests = 0;
     let mut interrupted = false;
@@ -135,6 +168,26 @@ async fn set_mode(
 async fn main() {
     let workdir = PathBuf::from(arg("--workdir").expect("--workdir <dir> is required"));
     std::fs::create_dir_all(&workdir).expect("create workdir");
+    let scenario = arg("--scenario").unwrap_or_else(|| "all".into());
+    if ![
+        "all",
+        "permission-mode",
+        "review",
+        "model",
+        "image",
+        "midturn",
+    ]
+    .contains(&scenario.as_str())
+    {
+        eprintln!(
+            "unknown --scenario {scenario:?} (expected all, permission-mode, review, model, image or midturn)"
+        );
+        std::process::exit(2);
+    }
+    if scenario == "review" {
+        review_scenario(&workdir).await;
+        return;
+    }
     let (session, mut events) = ClaudeSession::spawn(ClaudeSessionConfig {
         cwd: workdir.clone(),
         model: Some(arg("--model").unwrap_or_else(|| "haiku".into())),
@@ -155,12 +208,6 @@ async fn main() {
         message: "smoke test did not expect a prompt".into(),
     };
 
-    let scenario = arg("--scenario").unwrap_or_else(|| "all".into());
-    if scenario != "all" && scenario != "permission-mode" {
-        eprintln!("unknown --scenario {scenario:?} (expected all or permission-mode)");
-        std::process::exit(2);
-    }
-
     // The handshake reply arrives without a prompt; switch modes after it.
     match wait_for(&mut events, |ev| match ev {
         HarnessEvent::Ready {
@@ -176,6 +223,21 @@ async fn main() {
             format!("mode={mode:?}"),
         ),
         Err(e) => check("ready", false, e),
+    }
+    if scenario == "model" {
+        model_scenario(&session, &mut events, &mut check).await;
+        finish(session, events, failures).await;
+        return;
+    }
+    if scenario == "image" {
+        image_turn(&session, &mut events, &mut check).await;
+        finish(session, events, failures).await;
+        return;
+    }
+    if scenario == "midturn" {
+        midturn_scenario(&session, &mut events, &mut check).await;
+        finish(session, events, failures).await;
+        return;
     }
     // The chat page's Shift+Tab cycle, ending back where it started.
     for mode in ["acceptEdits", "plan", "auto", "default"] {
@@ -209,6 +271,7 @@ async fn main() {
         ),
         Err(e) => check("text turn", false, e),
     }
+    image_turn(&session, &mut events, &mut check).await;
 
     let allow = |kind: &RuntimeRequestKind| match kind {
         RuntimeRequestKind::Permission { .. } => RuntimeDecision::Allow {
@@ -306,6 +369,432 @@ async fn main() {
     finish(session, events, failures).await;
 }
 
+/// The composer's model and effort chips against the live CLI (TRU-143).
+async fn model_scenario(
+    session: &ClaudeSession,
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    check: &mut impl FnMut(&str, bool, String),
+) {
+    println!("\n>> set model sonnet");
+    let changed = async {
+        session.send(HarnessCommand::SetModel("sonnet".into()))?;
+        wait_for(events, |ev| match ev {
+            HarnessEvent::ModelChanged(m) => Some(m.clone()),
+            _ => None,
+        })
+        .await
+    }
+    .await;
+    match changed {
+        Ok(model) => check(
+            "model sonnet",
+            model == "sonnet",
+            format!("confirmed={model:?}"),
+        ),
+        Err(e) => check("model sonnet", false, e),
+    }
+    for effort in [Some("low"), None] {
+        println!("\n>> set effort {effort:?}");
+        let changed = async {
+            session.send(HarnessCommand::SetEffort(effort.map(str::to_string)))?;
+            wait_for(events, |ev| match ev {
+                HarnessEvent::EffortChanged { effort, applied } => {
+                    Some((effort.clone(), applied.clone()))
+                }
+                _ => None,
+            })
+            .await
+        }
+        .await;
+        let name = format!("effort {}", effort.unwrap_or("auto"));
+        match changed {
+            Ok((pinned, applied)) => check(
+                &name,
+                pinned.as_deref() == effort && (effort.is_none() || applied.as_deref() == effort),
+                format!("effort={pinned:?} applied={applied:?}"),
+            ),
+            Err(e) => check(&name, false, e),
+        }
+    }
+    println!("\n>> Reply with exactly: ok");
+    let model = async {
+        session.send(HarnessCommand::SendUserMessage(
+            "Reply with exactly: ok".into(),
+        ))?;
+        let model = wait_for(events, |ev| match ev {
+            HarnessEvent::TurnStarted { model, .. } => Some(model.clone()),
+            _ => None,
+        })
+        .await?;
+        wait_for(events, |ev| match ev {
+            HarnessEvent::TurnCompleted { .. } => Some(()),
+            _ => None,
+        })
+        .await?;
+        Ok::<_, String>(model)
+    }
+    .await;
+    match model {
+        Ok(model) => check(
+            "turn on sonnet",
+            model.as_deref().is_some_and(|m| m.contains("sonnet")),
+            format!("model={model:?}"),
+        ),
+        Err(e) => check("turn on sonnet", false, e),
+    }
+}
+
+/// Messages written while a turn is running (TRU-140). Two runs:
+///
+/// 1. A turn that makes several Bash calls. Once the first tool call starts,
+///    three messages go out with ids: a question (the current year), an
+///    image with a question about it, and a third that is withdrawn at once
+///    (`cancel_async_message`). Expected: the first two reach the running
+///    turn at a tool boundary (`started` before its `result`, answered in
+///    the same turn), the third is `cancelled` and never starts.
+/// 2. A text-only turn. A message sent at the first text delta has no tool
+///    boundary to ride; expected: it starts its own turn after the first
+///    `result`, with no further send from the host.
+///
+/// Prints the observed order as `[seq]` lines.
+async fn midturn_scenario(
+    session: &ClaudeSession,
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    check: &mut impl FnMut(&str, bool, String),
+) {
+    use base64::Engine as _;
+    let year = |t: &str| ["2025", "2026", "2027"].iter().any(|y| t.contains(y));
+
+    // Run 1: tool boundaries.
+    let image = ImageAttachment {
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(solid_png(64, 64, [220, 20, 20])),
+    };
+    let mid = vec![
+        UserPrompt {
+            text: "Also, before you finish, tell me the current year".into(),
+            images: Vec::new(),
+            id: Some("00000000-0000-4000-8000-00000000000b".into()),
+        },
+        UserPrompt {
+            text: "And tell me in one word what colour this image is".into(),
+            images: vec![image],
+            id: Some("00000000-0000-4000-8000-00000000000c".into()),
+        },
+        UserPrompt {
+            text: "And tell me what the capital of France is".into(),
+            images: Vec::new(),
+            id: Some("00000000-0000-4000-8000-00000000000d".into()),
+        },
+    ];
+    let withdraw = mid[2].id.clone();
+    match midturn_run(
+        session,
+        events,
+        "Run `sleep 2` three times with separate Bash calls, then say done.",
+        |ev| matches!(ev, HarnessEvent::ItemStarted { .. }),
+        mid,
+        withdraw,
+    )
+    .await
+    {
+        Ok(run) => {
+            let first = run.turn_text.first().cloned().unwrap_or_default();
+            let lower = first.to_lowercase();
+            let b = run.states("00000000-0000-4000-8000-00000000000b");
+            let c = run.states("00000000-0000-4000-8000-00000000000c");
+            let d = run.states("00000000-0000-4000-8000-00000000000d");
+            check(
+                "midturn at a tool boundary",
+                run.results == 1 && year(&first) && lower.contains("red"),
+                format!(
+                    "results={} year={} red={} text={:?}",
+                    run.results,
+                    year(&first),
+                    lower.contains("red"),
+                    first.trim()
+                ),
+            );
+            check(
+                "midturn lifecycle",
+                b.contains(&MessageState::Started)
+                    && c.contains(&MessageState::Started)
+                    && b.first() == Some(&MessageState::Queued),
+                format!("b={b:?} c={c:?}"),
+            );
+            check(
+                "midturn withdraw",
+                d.contains(&MessageState::Cancelled)
+                    && !d.contains(&MessageState::Started)
+                    && !lower.contains("paris"),
+                format!("d={d:?} paris={}", lower.contains("paris")),
+            );
+        }
+        Err(e) => check("midturn at a tool boundary", false, e),
+    }
+
+    // Run 2: no tool boundary.
+    let mid = vec![UserPrompt {
+        text: "Also, tell me the current year".into(),
+        images: Vec::new(),
+        id: Some("00000000-0000-4000-8000-00000000000e".into()),
+    }];
+    match midturn_run(
+        session,
+        events,
+        "Count from 1 to 40 in digits, one per line. Do not use any tools.",
+        |ev| matches!(ev, HarnessEvent::TextDelta(_)),
+        mid,
+        None,
+    )
+    .await
+    {
+        Ok(run) => {
+            let e = run.states("00000000-0000-4000-8000-00000000000e");
+            let answered_later = run.turn_text.iter().skip(1).any(|t| year(t));
+            check(
+                "midturn without a tool boundary",
+                run.results == 2 && answered_later && e.contains(&MessageState::Started),
+                format!(
+                    "results={} answered_in_second_turn={answered_later} e={e:?}",
+                    run.results
+                ),
+            );
+        }
+        Err(e) => check("midturn without a tool boundary", false, e),
+    }
+}
+
+struct MidturnRun {
+    results: usize,
+    turn_text: Vec<String>,
+    lifecycle: Vec<(String, MessageState)>,
+}
+
+impl MidturnRun {
+    fn states(&self, id: &str) -> Vec<MessageState> {
+        self.lifecycle
+            .iter()
+            .filter(|(i, _)| i == id)
+            .map(|(_, s)| *s)
+            .collect()
+    }
+}
+
+/// Sends `first`, then each of `mid` when `trigger` first matches (and
+/// withdraws `withdraw` right after). Allows every permission prompt. Runs
+/// until 20 s pass with nothing after a `result`.
+async fn midturn_run(
+    session: &ClaudeSession,
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    first: &str,
+    trigger: impl Fn(&HarnessEvent) -> bool,
+    mid: Vec<UserPrompt>,
+    withdraw: Option<String>,
+) -> Result<MidturnRun, String> {
+    println!("\n>> {first}");
+    session.send(HarnessCommand::SendUserMessage(first.into()))?;
+    let mut mid = Some(mid);
+    let mut seq: Vec<String> = Vec::new();
+    let mut run = MidturnRun {
+        results: 0,
+        turn_text: vec![String::new()],
+        lifecycle: Vec::new(),
+    };
+    let mut last_text = false;
+    loop {
+        let wait = if run.results == 0 {
+            STEP_TIMEOUT
+        } else {
+            Duration::from_secs(20)
+        };
+        let ev = match tokio::time::timeout(wait, events.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => return Err("event channel closed".into()),
+            Err(_) if run.results > 0 => break,
+            Err(_) => return Err("timed out".into()),
+        };
+        show(&ev);
+        let label = match &ev {
+            HarnessEvent::TextDelta(t) => {
+                run.turn_text[run.results].push_str(t);
+                (!last_text).then(|| "text".to_string())
+            }
+            HarnessEvent::TurnStarted { .. } => Some("turn_started".into()),
+            HarnessEvent::ItemStarted {
+                kind: ItemKind::ToolCall { name, .. },
+                ..
+            } => Some(format!("tool_started({name})")),
+            HarnessEvent::ItemCompleted { is_error, .. } => {
+                Some(format!("tool_done(error={is_error})"))
+            }
+            HarnessEvent::RuntimeRequest { .. } => Some("permission".into()),
+            HarnessEvent::MessageLifecycle { id, state } => {
+                run.lifecycle.push((id.clone(), *state));
+                Some(format!("lifecycle({}:{state:?})", &id[id.len() - 1..]))
+            }
+            HarnessEvent::MessageWithdrawRefused { id, reason } => {
+                Some(format!("withdraw_refused({id}: {reason})"))
+            }
+            HarnessEvent::TurnCompleted { status, .. } => Some(format!("result({status:?})")),
+            HarnessEvent::Error(e) => Some(format!("error({e})")),
+            HarnessEvent::ProcessExited { code } => {
+                return Err(format!("claude exited {code:?}"));
+            }
+            _ => None,
+        };
+        last_text = matches!(ev, HarnessEvent::TextDelta(_));
+        if let Some(label) = label {
+            seq.push(label);
+        }
+        if trigger(&ev) {
+            if let Some(mid) = mid.take() {
+                for prompt in mid {
+                    let id = prompt.id.clone().unwrap_or_default();
+                    println!(
+                        "\n>> (mid-turn, id …{}) {}",
+                        &id[id.len().saturating_sub(1)..],
+                        prompt.text
+                    );
+                    seq.push(format!("SENT({})", &id[id.len().saturating_sub(1)..]));
+                    session.send(HarnessCommand::SendUserMessage(prompt))?;
+                }
+                if let Some(id) = &withdraw {
+                    seq.push(format!("WITHDRAW({})", &id[id.len() - 1..]));
+                    session.send(HarnessCommand::WithdrawQueuedMessage(id.clone()))?;
+                }
+            }
+        }
+        match ev {
+            HarnessEvent::RuntimeRequest { request_id, .. } => {
+                session.send(HarnessCommand::Answer {
+                    request_id,
+                    decision: RuntimeDecision::Allow {
+                        updated_input: None,
+                        remember: None,
+                    },
+                })?;
+            }
+            HarnessEvent::TurnCompleted { .. } => {
+                run.results += 1;
+                run.turn_text.push(String::new());
+            }
+            _ => {}
+        }
+    }
+    println!("[seq] {}", seq.join(" -> "));
+    for (i, t) in run
+        .turn_text
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.is_empty())
+    {
+        println!("[turn {i} text] {:?}", t.trim());
+    }
+    Ok(run)
+}
+
+/// One turn whose user message carries a text block and a base64 PNG image
+/// block, checking the model saw the image (TRU-140 paste/drop).
+async fn image_turn(
+    session: &ClaudeSession,
+    events: &mut UnboundedReceiver<HarnessEvent>,
+    check: &mut impl FnMut(&str, bool, String),
+) {
+    use base64::Engine as _;
+    let png = solid_png(64, 64, [220, 20, 20]);
+    let prompt = UserPrompt {
+        text: "What colour is this image? Answer with one word.".into(),
+        images: vec![ImageAttachment {
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(&png),
+        }],
+        id: None,
+    };
+    println!(
+        "[wire] {}",
+        gitterm::harness::claude::user_message_frame(&UserPrompt {
+            text: prompt.text.clone(),
+            images: vec![ImageAttachment {
+                media_type: "image/png".into(),
+                data: format!("<{} base64 chars>", prompt.images[0].data.len()),
+            }],
+            id: None,
+        })
+    );
+    let deny_all = |_: &RuntimeRequestKind| RuntimeDecision::Deny {
+        message: "smoke test did not expect a prompt".into(),
+    };
+    match turn(session, events, prompt, deny_all, None).await {
+        Ok((status, text, _)) => check(
+            "image turn",
+            status == TurnStatus::Completed && text.to_lowercase().contains("red"),
+            format!("{status:?} {:?}", text.trim()),
+        ),
+        Err(e) => check("image turn", false, e),
+    }
+}
+
+/// A minimal RGB PNG of one colour: IHDR, one IDAT holding a zlib stream of
+/// stored (uncompressed) deflate blocks, IEND. No image crate needed.
+fn solid_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+    // Raw scanlines: filter byte 0 then the pixels.
+    let mut raw = Vec::new();
+    for _ in 0..height {
+        raw.push(0);
+        for _ in 0..width {
+            raw.extend_from_slice(&rgb);
+        }
+    }
+    let mut zlib = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
+    for (i, block) in blocks.iter().enumerate() {
+        zlib.push(u8::from(i + 1 == blocks.len()));
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + u32::from(byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, no interlace
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &zlib);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
 /// Shuts the session down, drains its last events, and sets the exit code.
 async fn finish(
     session: ClaudeSession,
@@ -322,4 +811,310 @@ async fn finish(
         println!("\nFAILED: {failures:?}");
         std::process::exit(1);
     }
+}
+
+/// The scratch file with the planted bug, before and after the change.
+const PLANTED_FILE: &str = "calc.py";
+const PLANTED_ORIGINAL: &str = "def average(values):
+    \"\"\"Return the arithmetic mean of a non-empty list of numbers.\"\"\"
+    total = 0
+    for v in values:
+        total += v
+    return total / len(values)
+";
+/// The uncommitted change skips the first value but still divides by the
+/// full length.
+const PLANTED_CHANGE: &str = "def average(values):
+    \"\"\"Return the arithmetic mean of a non-empty list of numbers.\"\"\"
+    total = 0
+    for v in values[1:]:
+        total += v
+    return total / len(values)
+";
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed in {}", dir.display());
+}
+
+/// A fresh repo with one commit and the planted bug left uncommitted.
+fn plant_review_repo(workdir: &Path) -> PathBuf {
+    let repo = workdir.join("review-repo");
+    if repo.exists() {
+        eprintln!(
+            "{} already exists; pass a fresh --workdir for the review scenario",
+            repo.display()
+        );
+        std::process::exit(2);
+    }
+    std::fs::create_dir_all(&repo).expect("create review repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "smoke@example.com"]);
+    git(&repo, &["config", "user.name", "smoke"]);
+    std::fs::write(repo.join(PLANTED_FILE), PLANTED_ORIGINAL).expect("write original");
+    git(&repo, &["add", PLANTED_FILE]);
+    git(&repo, &["commit", "-q", "-m", "Add average"]);
+    std::fs::write(repo.join(PLANTED_FILE), PLANTED_CHANGE).expect("plant the bug");
+    repo
+}
+
+/// Read-only tools the reviewer may use; anything else is denied, which
+/// also proves the brief's "do not edit" holds.
+fn review_answer(kind: &RuntimeRequestKind) -> RuntimeDecision {
+    let allow = RuntimeDecision::Allow {
+        updated_input: None,
+        remember: None,
+    };
+    match kind {
+        RuntimeRequestKind::Permission {
+            tool_name, input, ..
+        } => match tool_name.as_str() {
+            "Read" | "Grep" | "Glob" | "LS" | "Agent" | "Task" => allow,
+            "Bash" => {
+                let command = input["command"].as_str().unwrap_or("");
+                let read_only = [
+                    "git status",
+                    "git diff",
+                    "git ls-files",
+                    "git log",
+                    "git show",
+                    "cat ",
+                    "ls",
+                ]
+                .iter()
+                .any(|prefix| command.trim_start().starts_with(prefix));
+                if read_only {
+                    allow
+                } else {
+                    RuntimeDecision::Deny {
+                        message: format!(
+                            "review smoke: only read-only git commands, not {command:?}"
+                        ),
+                    }
+                }
+            }
+            other => RuntimeDecision::Deny {
+                message: format!("review smoke: {other} is not a read-only tool"),
+            },
+        },
+        RuntimeRequestKind::Question { .. } => RuntimeDecision::Deny {
+            message: "review smoke: no questions expected".into(),
+        },
+    }
+}
+
+/// `path:line` references in `text` whose path is a file in `repo`.
+fn repo_file_lines(text: &str, repo: &Path) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || "`*()[],".contains(c))
+        .filter_map(|word| {
+            let (path, rest) = word.split_once(':')?;
+            let line: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            (!path.is_empty() && !line.is_empty() && repo.join(path).is_file())
+                .then(|| format!("{path}:{line}"))
+        })
+        .collect()
+}
+
+async fn review_scenario(workdir: &Path) {
+    let started = Instant::now();
+    let repo = plant_review_repo(workdir);
+    let model = arg("--model").unwrap_or_else(|| "haiku".into());
+    let reviewer_model = arg("--reviewer-model").unwrap_or_else(|| "haiku".into());
+    let (session, mut events) = ClaudeSession::spawn(ClaudeSessionConfig {
+        cwd: repo.clone(),
+        model: Some(model.clone()),
+        permission_mode: "default".into(),
+        effort: None,
+        resume: None,
+        wire_log_dir: Some(workdir.join("review-wire")),
+        mcp_servers: Vec::new(),
+    });
+    let mut failures = Vec::new();
+    let mut check = |name: &str, ok: bool, detail: String| {
+        println!("{} {name}: {detail}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            failures.push(name.to_string());
+        }
+    };
+
+    match wait_for(&mut events, |ev| {
+        matches!(ev, HarnessEvent::Ready { .. }).then_some(())
+    })
+    .await
+    {
+        Ok(()) => check(
+            "ready",
+            true,
+            format!("parent model {model}, reviewer {reviewer_model}"),
+        ),
+        Err(e) => check("ready", false, e),
+    }
+
+    let prompt = review_prompt(&ReviewRequest {
+        target: ReviewTarget::Uncommitted,
+        focus: None,
+        reviewer: gitterm::review::PopoverReviewer::ClaudeSubagent,
+        model: reviewer_model.clone(),
+    })
+    .expect("review prompt builds");
+    println!("\n>> review prompt ({} chars)", prompt.len());
+    if let Err(e) = session.send(HarnessCommand::SendUserMessage(prompt.into())) {
+        check("send review prompt", false, e);
+    }
+
+    // Parent tool calls by id -> (name, accumulated input JSON).
+    let mut parent_tools: HashMap<String, (String, String)> = HashMap::new();
+    let mut parent_text = String::new();
+    let mut nested: Vec<(String, HarnessEvent)> = Vec::new();
+    // Subagents that reported task_started and have not finished. A
+    // background subagent outlives the turn that spawned it; Claude then
+    // starts a follow-up turn on its own, so wait for that one too.
+    let mut running: Vec<String> = Vec::new();
+    let mut turns = 0;
+    let status = loop {
+        let ev = match tokio::time::timeout(REVIEW_TIMEOUT, events.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => break Err("event channel closed".to_string()),
+            Err(_) => break Err("timed out".to_string()),
+        };
+        show(&ev);
+        match ev {
+            HarnessEvent::TextDelta(t) => parent_text.push_str(&t),
+            HarnessEvent::ItemStarted {
+                id,
+                kind: ItemKind::ToolCall { name, .. },
+            } => {
+                parent_tools.insert(id, (name, String::new()));
+            }
+            HarnessEvent::ItemInputDelta { id, partial_json } => {
+                if let Some((_, input)) = parent_tools.get_mut(&id) {
+                    input.push_str(&partial_json);
+                }
+            }
+            HarnessEvent::SubagentEvent {
+                parent_tool_use_id,
+                event,
+            } => {
+                match *event {
+                    HarnessEvent::TurnStarted { .. } => running.push(parent_tool_use_id.clone()),
+                    HarnessEvent::TurnCompleted { .. } => {
+                        running.retain(|id| *id != parent_tool_use_id)
+                    }
+                    _ => {}
+                }
+                nested.push((parent_tool_use_id, *event));
+            }
+            HarnessEvent::RuntimeRequest {
+                request_id, kind, ..
+            } => {
+                let decision = review_answer(&kind);
+                println!(">> answer {request_id}: {decision:?}");
+                if let Err(e) = session.send(HarnessCommand::Answer {
+                    request_id,
+                    decision,
+                }) {
+                    break Err(e);
+                }
+            }
+            HarnessEvent::TurnCompleted { status, .. } => {
+                turns += 1;
+                if running.is_empty() || status != TurnStatus::Completed {
+                    break Ok(status);
+                }
+                println!(
+                    ">> turn ended with {} subagent(s) still running; waiting",
+                    running.len()
+                );
+            }
+            HarnessEvent::ProcessExited { code } => break Err(format!("claude exited {code:?}")),
+            _ => {}
+        }
+    };
+    match &status {
+        Ok(s) => check(
+            "review turn",
+            *s == TurnStatus::Completed,
+            format!("{s:?} after {turns} turn(s) (1 means the subagent ran in the foreground)"),
+        ),
+        Err(e) => check("review turn", false, e.clone()),
+    }
+
+    let agent_calls: Vec<(&String, &(String, String))> = parent_tools
+        .iter()
+        .filter(|(_, (name, _))| name == "Agent" || name == "Task")
+        .collect();
+    let agent_models: Vec<String> = agent_calls
+        .iter()
+        .map(|(_, (_, input))| {
+            serde_json::from_str::<serde_json::Value>(input)
+                .ok()
+                .and_then(|v| v["model"].as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("<no model in {input}>"))
+        })
+        .collect();
+    check(
+        "one Agent call with the reviewer model",
+        agent_calls.len() == 1 && agent_models == [reviewer_model.clone()],
+        format!("{} call(s), models {agent_models:?}", agent_calls.len()),
+    );
+    let orphans = nested
+        .iter()
+        .filter(|(parent, _)| !agent_calls.iter().any(|(id, _)| *id == parent))
+        .count();
+    let nested_tools: Vec<String> = nested
+        .iter()
+        .filter_map(|(_, ev)| match ev {
+            HarnessEvent::ItemStarted {
+                kind: ItemKind::ToolCall { name, .. },
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let nested_completed = nested
+        .iter()
+        .filter(|(_, ev)| matches!(ev, HarnessEvent::ItemCompleted { .. }))
+        .count();
+    let nested_text: String = nested
+        .iter()
+        .filter_map(|(_, ev)| match ev {
+            HarnessEvent::TextDelta(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    check(
+        "subagent events nest under the Agent call",
+        !nested.is_empty() && orphans == 0,
+        format!(
+            "{} nested events, {orphans} without a parent Agent call",
+            nested.len()
+        ),
+    );
+    check(
+        "nested events parse into tool calls and text",
+        !nested_tools.is_empty() && nested_completed > 0 && !nested_text.trim().is_empty(),
+        format!(
+            "tools {nested_tools:?}, {nested_completed} completed, {} chars of text",
+            nested_text.len()
+        ),
+    );
+    let refs = repo_file_lines(&parent_text, &repo);
+    check(
+        "report has F1 and a file:line in the repo",
+        parent_text.contains("F1") && !refs.is_empty(),
+        format!("refs {refs:?}"),
+    );
+    let after = std::fs::read_to_string(repo.join(PLANTED_FILE)).unwrap_or_default();
+    check(
+        "reviewer edited nothing",
+        after == PLANTED_CHANGE,
+        format!("{PLANTED_FILE} unchanged: {}", after == PLANTED_CHANGE),
+    );
+    println!("\n--- parent reply ---\n{}\n---", parent_text.trim());
+    println!("elapsed {:.1}s", started.elapsed().as_secs_f64());
+    finish(session, events, failures).await;
 }

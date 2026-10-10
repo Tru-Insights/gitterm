@@ -9,8 +9,11 @@
     --bg: #1e1e2e;
     --bg-alt: #181825;
     --bg-block: #313244;
+    /* The strip below the timeline (status, roster, composer): a dark grey
+       panel so it reads as one control surface apart from the messages. */
+    --bg-footer: #2a2b3d;
     --bg-input: #181825;
-    --fg: #cdd6f4;
+    --fg: #bac2de;
     --fg-muted: #7f849c;
     --accent: #89b4fa;
     --border: #45475a;
@@ -33,6 +36,16 @@
     color: var(--fg);
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
     font-size: 14px;
+    /* Iced draws the rest of the app without CoreText stem darkening, so
+       regular SF in WebKit reads heavy beside it; a slightly dimmer text
+       colour (--fg) softens that without going to a light weight, which
+       Tracey found too thin. */
+    font-weight: 400;
+    /* Light text on a dark background renders visibly heavier with
+       subpixel smoothing in WebKit; grayscale antialiasing keeps the
+       regular weight looking regular. */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
   body {
     display: flex;
@@ -40,6 +53,8 @@
     padding: 10px;
     gap: 8px;
   }
+  /* Status line, roster and composer share one grey panel. */
+  #footer { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px 8px; background: var(--bg-footer); border: 1px solid var(--border); border-radius: 10px; }
   #timeline-wrap { flex: 1; position: relative; min-height: 0; }
   #messages {
     position: absolute;
@@ -76,6 +91,8 @@
     word-break: break-word;
   }
   .assistant { margin: 6px 0 10px; word-break: break-word; }
+  /* Claude bolds freely; semibold keeps emphasis without shouting. */
+  .assistant strong { font-weight: 600; }
   .assistant .tail { white-space: pre-wrap; }
   .assistant p { margin: 0 0 8px; }
   .assistant p:last-child { margin-bottom: 0; }
@@ -152,6 +169,38 @@
   }
   .tool-body pre.err { color: var(--err); }
 
+  /* Subagent block nested in an Agent tool card */
+  details.subagent {
+    margin: 6px 0 2px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 5px;
+    background: var(--bg-alt);
+    font-size: 12.5px;
+  }
+  details.subagent.done { border-left-color: var(--result); }
+  details.subagent.failed { border-left-color: var(--err); }
+  details.subagent.stopped { border-left-color: var(--fg-muted); }
+  details.subagent summary {
+    cursor: pointer; user-select: none; list-style: none;
+    padding: 4px 8px; display: flex; gap: 8px; align-items: baseline;
+  }
+  details.subagent summary::-webkit-details-marker { display: none; }
+  details.subagent summary::before { content: '\25B8'; color: var(--fg-muted); font-size: 10px; }
+  details.subagent[open] summary::before { content: '\25BE'; }
+  .sa-label { font-weight: 600; color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  details.subagent.done .sa-label { color: var(--result); }
+  details.subagent.failed .sa-label { color: var(--err); }
+  .sa-desc { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sa-state { font-size: 11px; color: var(--fg-muted); white-space: nowrap; font-family: var(--mono); }
+  details.subagent.running .sa-state { color: var(--accent); }
+  .sa-latest { padding: 0 8px 4px 22px; color: var(--fg-muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sa-body { padding: 2px 8px 6px 22px; }
+  .sa-tools { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; }
+  .sa-tool { font-family: var(--mono); font-size: 11px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--border); color: var(--tool); }
+  .sa-tool.done { color: var(--result); } .sa-tool.error { color: var(--err); }
+  .sa-text { white-space: pre-wrap; word-break: break-word; font-size: 12px; max-height: 240px; overflow: auto; margin-top: 4px; }
+
   .note { color: var(--fg-muted); font-size: 12px; margin: 6px 0; }
   .note.warn { color: var(--warn); }
   .error-block {
@@ -178,10 +227,9 @@
     display: none;
     align-items: center;
     gap: 10px;
-    padding: 6px 12px;
-    background: var(--bg-block);
-    border: 1px solid var(--border);
-    border-radius: 8px;
+    padding: 4px 6px 0;
+    background: transparent;
+    border: 0;
     color: var(--fg-muted);
     font-size: 12px;
     font-family: var(--mono);
@@ -247,10 +295,12 @@
   .rq-sending { color: var(--fg-muted); font-size: 12px; }
 
   /* Composer */
-  #composer { display: flex; gap: 6px; align-items: flex-end; }
+  /* Composer (T3 Code layout): the message box full width on top, a
+     toolbar of compact chips below it with Send/Stop on the right. */
+  #composer { display: flex; flex-direction: column; gap: 6px; }
   #prompt {
-    flex: 1;
-    min-height: 36px;
+    width: 100%;
+    min-height: 56px;
     max-height: 200px;
     padding: 8px 10px;
     background: var(--bg-input);
@@ -262,6 +312,31 @@
     resize: none;
   }
   #prompt:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  #composer.dropping #prompt { outline: 2px dashed var(--accent); border-color: var(--accent); }
+  /* Pasted / dropped images waiting to be sent (TRU-140). */
+  #attachments { display: none; gap: 6px; flex-wrap: wrap; }
+  #attachments.visible { display: flex; }
+  .att { position: relative; width: 56px; height: 56px; border-radius: 6px; overflow: hidden;
+         border: 1px solid var(--border-strong); background: var(--bg-input); }
+  .att img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .att button { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; padding: 0;
+                border-radius: 9px; font-size: 12px; line-height: 16px; background: rgba(17,17,27,0.8); }
+  /* A message sent while Claude works, until Claude picks it up (TRU-140). */
+  .user-msg.queued { border-style: dashed; color: var(--fg-muted); }
+  .user-msg.unsent { border-style: dashed; color: var(--fg-muted); opacity: 0.7; }
+  .queued-tag { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px;
+                color: var(--fg-muted); white-space: normal; }
+  .queued-tag button { width: 18px; height: 18px; padding: 0; border-radius: 9px; font-size: 12px;
+                       line-height: 16px; }
+  .user-images { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .user-images:last-child { margin-bottom: 0; }
+  .user-images img { max-width: 160px; max-height: 120px; border-radius: 6px; display: block;
+                     border: 1px solid var(--border); }
+  #toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  #toolbar .tb-chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
+  #toolbar .tb-send { display: flex; gap: 6px; margin-left: auto; }
+  #toolbar .tb-send button { padding: 5px 14px; }
+  .chip svg, #mode svg, #review svg { width: 12px; height: 12px; flex: none; }
   button {
     padding: 7px 14px;
     background: var(--bg-block);
@@ -282,7 +357,7 @@
   /* Permission mode chip (left of Send) and its menu */
   .mode-wrap { position: relative; display: none; }
   .mode-wrap.visible { display: block; }
-  #mode { padding: 7px 10px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
+  #mode { padding: 4px 8px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; }
   #mode[data-mode=acceptEdits] { color: var(--accent); border-color: var(--accent); }
   #mode[data-mode=plan] { color: var(--result); border-color: var(--result); }
   #mode[data-mode=auto] { color: var(--warn); border-color: var(--warn); }
@@ -291,7 +366,7 @@
   #mode-menu {
     display: none;
     position: absolute;
-    right: 0;
+    left: 0;
     bottom: calc(100% + 6px);
     min-width: 190px;
     padding: 4px;
@@ -305,6 +380,140 @@
   #mode-menu button:hover { background: var(--bg-block); }
   #mode-menu .mark { width: 12px; color: var(--accent); }
   #mode-menu .hint { padding: 4px 8px 2px; color: var(--fg-muted); font-size: 11px; white-space: nowrap; }
+
+  /* Model, effort and checkout chips (TRU-143); menus like the mode chip's */
+  .chip-wrap { position: relative; display: none; }
+  .chip-wrap.visible { display: block; }
+  .chip { padding: 4px 8px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; display: inline-flex; align-items: center; gap: 5px; }
+  .chip .lbl { overflow: hidden; text-overflow: ellipsis; }
+  .chip.pending { opacity: 0.65; }
+  .chip.locked { cursor: default; }
+  .chip.locked:hover { background: var(--bg-block); }
+  .chip-menu {
+    display: none;
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 6px);
+    min-width: 210px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding: 4px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    z-index: 10;
+  }
+  .chip-menu.visible { display: block; }
+  .chip-menu button { display: flex; width: 100%; gap: 8px; border: none; background: transparent; text-align: left; font-size: 12.5px; padding: 5px 8px; align-items: baseline; }
+  .chip-menu button:hover { background: var(--bg-block); }
+  .chip-menu .mark { width: 12px; flex: none; color: var(--accent); }
+  .chip-menu .sub { color: var(--fg-muted); font-size: 11px; margin-left: auto; padding-left: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+  .chip-menu .hint { padding: 4px 8px 2px; color: var(--fg-muted); font-size: 11px; white-space: nowrap; }
+  .chip-menu .section { padding: 6px 8px 2px; color: var(--fg-muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; border-top: 1px solid var(--border); margin-top: 4px; }
+  .chip-menu .section:first-child { border-top: none; margin-top: 0; }
+  .chip-menu button:disabled { opacity: 0.45; }
+
+  /* Review… button and popover (left of the mode chip) */
+  .review-wrap { position: relative; display: none; }
+  .review-wrap.visible { display: block; }
+  #review { padding: 4px 8px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; }
+  #review-pop {
+    display: none;
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 6px);
+    width: 340px;
+    padding: 10px 12px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    z-index: 10;
+    font-size: 12.5px;
+  }
+  #review-pop.visible { display: block; }
+  #review-pop .rv-title { font-weight: 600; margin-bottom: 6px; }
+  #review-pop .rv-row { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+  #review-pop .rv-row input[type=text], #review-pop textarea, #review-pop select {
+    flex: 1; min-width: 0; padding: 4px 6px; font-size: 12px;
+    background: var(--bg-input); color: var(--fg);
+    border: 1px solid var(--border-strong); border-radius: 5px; font-family: inherit;
+  }
+  #review-pop textarea { width: 100%; resize: vertical; min-height: 44px; }
+  #review-pop label { display: flex; gap: 6px; align-items: center; cursor: pointer; white-space: nowrap; }
+  #review-pop .rv-hint { color: var(--fg-muted); font-size: 11px; margin: 0 0 4px 22px; }
+  #review-pop .rv-hint.warn { color: var(--warn); }
+  #review-pop .rv-label { color: var(--fg-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin: 8px 0 3px; }
+  #review-pop .rv-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; }
+
+  /* Delegation cards (Codex review / consult, TRU-142) */
+  details.dlg {
+    margin: 8px 0;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    background: var(--bg);
+    font-size: 13px;
+  }
+  details.dlg.completed, details.dlg.done { border-left-color: var(--result); }
+  details.dlg.failed, details.dlg.interrupted, details.dlg.exited { border-left-color: var(--err); }
+  details.dlg.cancelled, details.dlg.dismissed { border-left-color: var(--fg-muted); }
+  details.dlg.blocked, details.dlg.waiting { border-left-color: var(--warn); }
+  details.dlg.blocked .dlg-kind, details.dlg.waiting .dlg-kind { color: var(--warn); }
+  details.dlg.waiting .dlg-state, details.dlg.blocked .dlg-state { color: var(--warn); }
+  .dlg-path { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); word-break: break-all; margin: 2px 0 6px; }
+  details.dlg.flash, details.tool.flash { outline: 1px solid var(--accent); }
+  details.dlg > summary {
+    cursor: pointer; user-select: none; list-style: none;
+    padding: 6px 10px; display: flex; gap: 8px; align-items: baseline;
+  }
+  details.dlg > summary::-webkit-details-marker { display: none; }
+  details.dlg > summary::before { content: '\25B8'; color: var(--fg-muted); font-size: 10px; }
+  details.dlg[open] > summary::before { content: '\25BE'; }
+  .dlg-kind { font-weight: 600; color: var(--accent); font-size: 12.5px; white-space: nowrap; }
+  details.dlg.completed .dlg-kind, details.dlg.done .dlg-kind { color: var(--result); }
+  details.dlg.failed .dlg-kind, details.dlg.interrupted .dlg-kind { color: var(--err); }
+  .dlg-what { flex: 1; min-width: 0; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dlg-state { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; }
+  details.dlg.running .dlg-state, details.dlg.requested .dlg-state { color: var(--accent); }
+  .dlg-body { padding: 0 10px 8px 22px; }
+  .dlg-line { color: var(--fg-muted); font-size: 12px; margin: 2px 0 6px; }
+  .dlg-activity { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dlg-banner { margin: 4px 0 6px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--warn); color: var(--warn); font-size: 12px; }
+  .dlg-error { margin: 4px 0 6px; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--err); color: var(--err); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow: auto; }
+  .dlg-summary { margin: 4px 0 6px; white-space: pre-wrap; word-break: break-word; }
+  .dlg-findings { list-style: none; margin: 4px 0; padding: 0; }
+  .dlg-finding { display: flex; gap: 6px; align-items: flex-start; padding: 4px 0; border-top: 1px solid var(--border); }
+  .dlg-finding:first-child { border-top: none; }
+  .dlg-finding input { margin-top: 3px; }
+  .dlg-fmain { flex: 1; min-width: 0; }
+  .dlg-ftitle { font-weight: 600; }
+  .dlg-fid { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); }
+  .sev { font-family: var(--mono); font-size: 10.5px; padding: 0 5px; border-radius: 4px; color: var(--bg); background: var(--fg-muted); }
+  .sev.P0 { background: var(--err); } .sev.P1 { background: var(--tool); } .sev.P2 { background: var(--warn); } .sev.P3 { background: var(--border-strong); color: var(--fg); }
+  .dlg-loc { font-family: var(--mono); font-size: 11.5px; color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+  .dlg-fbody { color: var(--fg-muted); font-size: 12px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
+  .dlg-section { margin: 6px 0 2px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-muted); }
+  .dlg-actions { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .dlg-actions button { padding: 4px 10px; font-size: 12px; }
+  .dlg-actions .dlg-note { color: var(--fg-muted); font-size: 11.5px; }
+
+  /* Agent roster: live subagents and delegations (above the composer) */
+  #roster { display: none; flex-direction: column; gap: 2px; padding: 4px 6px 6px; background: transparent; border: 0; border-top: 1px solid var(--border); border-radius: 0; max-height: 98px; overflow-y: auto; }
+  #roster.visible { display: flex; }
+  /* 18px rows + 2px gaps: the roster's 98px shows four and a half rows,
+     so a fifth peeks out when it scrolls. */
+  .ro-row { display: flex; gap: 8px; align-items: baseline; font-size: 12px; line-height: 16px; font-family: var(--mono); color: var(--fg-muted); cursor: pointer; padding: 1px 4px; border-radius: 4px; }
+  .ro-row:hover { background: var(--border); }
+  .ro-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; align-self: center; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+  .ro-row.done .ro-dot { animation: none; background: var(--result); }
+  .ro-row.failed .ro-dot { animation: none; background: var(--err); }
+  .ro-row.queued .ro-dot { animation: none; background: var(--fg-muted); }
+  .ro-row.waiting .ro-dot { animation: none; background: var(--warn); }
+  .ro-name { color: var(--fg); white-space: nowrap; }
+  .ro-what { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ro-meta { white-space: nowrap; }
+  .ro-x { border: none; background: transparent; padding: 0 4px; font-size: 12px; color: var(--fg-muted); }
+  .ro-x:hover { color: var(--fg); background: transparent; }
 
   /* highlight.js tokens (Catppuccin Mocha) */
   .hljs-keyword, .hljs-selector-tag, .hljs-built_in { color: #cba6f7; }
@@ -326,21 +535,47 @@
     <div id="messages"></div>
     <button id="jump">&darr; Latest</button>
   </div>
+  <div id="footer">
   <div id="activity" class="activity">
     <span class="activity-dot"></span>
     <span class="activity-label">Starting</span>
     <span class="activity-meta"></span>
   </div>
   <div id="request-panel"></div>
+  <div id="roster"></div>
   <div id="composer">
-    <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
-    <div class="mode-wrap">
-      <div id="mode-menu"></div>
-      <button id="mode" title="Permission mode (Shift+Tab in the message box cycles)"></button>
+    <div id="attachments"></div>
+    <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
+    <div id="toolbar">
+      <div class="tb-chips">
+        <div class="review-wrap">
+          <div id="review-pop"></div>
+          <button id="review" title="Ask a Claude subagent or Codex to review this checkout, or consult them">Review / Consult…</button>
+        </div>
+        <div class="chip-wrap" id="model-wrap">
+          <div class="chip-menu" id="model-menu"></div>
+          <button class="chip" id="model" title="Model"></button>
+        </div>
+        <div class="chip-wrap" id="effort-wrap">
+          <div class="chip-menu" id="effort-menu"></div>
+          <button class="chip" id="effort" title="Effort and context window"></button>
+        </div>
+        <div class="mode-wrap">
+          <div id="mode-menu"></div>
+          <button id="mode" title="Permission mode (Shift+Tab in the message box cycles)"></button>
+        </div>
+        <div class="chip-wrap" id="checkout-wrap">
+          <div class="chip-menu" id="checkout-menu"></div>
+          <button class="chip" id="checkout"></button>
+        </div>
+      </div>
+      <div class="tb-send">
+        <button id="submit" class="primary">Send</button>
+        <button id="stop" class="danger" disabled>Stop</button>
+      </div>
     </div>
-    <button id="submit" class="primary">Send</button>
-    <button id="stop" class="danger" disabled>Stop</button>
   </div>
+  </div><!-- /footer -->
 <script>
 (function () {
   'use strict';
@@ -348,11 +583,18 @@
   // Every IPC message carries it so Rust routes to the right tab.
   // `permissionMode` is the Claude tab's configured mode (null for other
   // backends); the replayed buffer's ready/permission_mode_changed events
-  // override it.
+  // override it. `composer` (null for other backends) is the Claude tab's
+  // configured {model, effort, checkout}; replayed model_changed /
+  // effort_changed events override the first two.
   window.__currentTabId = null;
-  window.__setTabId = function (id, permissionMode) {
+  window.__setTabId = function (id, permissionMode, composer) {
     window.__currentTabId = id;
+    // Only Claude takes a message while it works (pi waits for the turn).
+    steerable = permissionMode != null;
     resetMode(permissionMode == null ? null : permissionMode);
+    // Only Claude tabs have a permission mode, and only they can review.
+    setReviewAvailable(permissionMode != null);
+    resetComposerChips(composer || null);
   };
 
   const messagesEl = document.getElementById('messages');
@@ -369,6 +611,8 @@
 
   // ---- state -------------------------------------------------------------
   let busy = false;           // a turn is in flight
+  let steerable = false;      // the harness takes messages mid-turn (Claude)
+  const queued = new Map();   // message id -> {msg, tag, x}: sent mid-turn, not yet picked up
   let replaying = false;      // __replay is feeding the buffer
   let follow = true;          // live-follow: stick to the bottom
   let segment = null;         // current assistant text segment
@@ -384,6 +628,17 @@
   }
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  // Chip glyphs (inline SVG, currentColor).
+  const ICONS = {
+    model: '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0.8l1.7 4.6 4.7 1.6-4.7 1.7L8 13.4 6.3 8.7 1.6 7l4.7-1.6z"/></svg>',
+    lock: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7.5" rx="1.5"/><path d="M5.2 7V5a2.8 2.8 0 0 1 5.6 0v2"/></svg>',
+    folder: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M1.5 4.2c0-.7.5-1.2 1.2-1.2h3.4l1.6 1.7h5.6c.7 0 1.2.5 1.2 1.2v6.4c0 .7-.5 1.2-1.2 1.2H2.7c-.7 0-1.2-.5-1.2-1.2z"/></svg>',
+    gauge: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M2.5 11.5a5.5 5.5 0 1 1 11 0"/><path d="M8 11.5l2.6-3.4"/></svg>',
+    review: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.4 10.4l3.6 3.6"/></svg>',
+  };
+  function setChip(btn, icon, text) {
+    btn.innerHTML = (ICONS[icon] || '') + '<span class="lbl">' + escapeHtml(text) + '</span>';
   }
   function postIpc(payload) {
     if (!window.ipc || typeof window.ipc.postMessage !== 'function') return;
@@ -560,6 +815,7 @@
     endSegment(); endThinking();
     const name = kind && kind.name ? kind.name : 'tool';
     const d = append(el('details', 'tool running'));
+    d.dataset.toolId = id;
     d.open = true;
     const summary = d.appendChild(el('summary'));
     summary.appendChild(el('span', 'tool-name', name));
@@ -568,15 +824,17 @@
     const body = d.appendChild(el('div', 'tool-body'));
     body.appendChild(el('div', 'tool-label', 'Input'));
     const inputEl = body.appendChild(el('pre'));
-    const item = { card: d, name, brief, badge, body, inputEl, outputEl: null, raw: '', input: kind && kind.input };
+    const item = { card: d, name, brief, badge, body, inputEl, outputEl: null, raw: '', input: kind && kind.input, sub: null };
     items.set(id, item);
     if (item.input && Object.keys(item.input).length) showInput(item, item.input);
+    if (name === 'Agent' || name === 'Task') ensureSubagent(item);
     setActivity('Calling ' + name);
   }
   function showInput(item, input) {
     item.input = input;
     item.brief.textContent = salient(item.name, input);
     item.inputEl.textContent = JSON.stringify(input, null, 2);
+    if (item.sub) renderSubagent(item.sub);
   }
   function itemInputDelta(id, partial) {
     const item = items.get(id);
@@ -597,7 +855,126 @@
     item.outputEl = item.body.appendChild(el('pre', isError ? 'err' : null, text));
     item.badge.textContent = '';
     item.card.open = false;
+    // A foreground subagent is done when its Agent call returns, even if
+    // the harness sent no completion of its own. A background one only
+    // finishes on its own completion event.
+    if (item.sub && item.sub.state === 'running' && !item.sub.tracked) {
+      item.sub.state = isError ? 'failed' : 'done';
+      renderSubagent(item.sub);
+    }
     setActivity('Thinking');
+    scrollIfFollowing();
+  }
+
+  // ---- subagents (nested under the parent's Agent tool card) -------------
+  // tool_use id of a tool a subagent called -> the root Agent call's id, so
+  // permission prompts and nested subagents land in the right block.
+  const subTools = new Map();
+  function ensureSubagent(item) {
+    if (item.sub) return item.sub;
+    const d = el('details', 'subagent running');
+    item.card.insertBefore(d, item.body);
+    const summary = d.appendChild(el('summary'));
+    const sub = {
+      details: d,
+      item,
+      label: summary.appendChild(el('span', 'sa-label', 'Subagent')),
+      desc: summary.appendChild(el('span', 'sa-desc')),
+      stateEl: summary.appendChild(el('span', 'sa-state')),
+      latestEl: item.card.insertBefore(el('div', 'sa-latest'), item.body),
+      toolsEl: null, textEl: null,
+      state: 'running', tracked: false, waiting: false,
+      tools: [], text: '', model: null,
+      // Roster: elapsed is only known for subagents seen live.
+      startMs: replaying ? null : Date.now(), endMs: null, tokens: null, fromReplay: replaying,
+    };
+    subagents.push(sub);
+    const body = d.appendChild(el('div', 'sa-body'));
+    sub.toolsEl = body.appendChild(el('div', 'sa-tools'));
+    sub.textEl = body.appendChild(el('div', 'sa-text'));
+    item.sub = sub;
+    renderSubagent(sub);
+    return sub;
+  }
+  function lastLine(text) {
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+    const line = lines.length ? lines[lines.length - 1] : '';
+    return line.length > 200 ? line.slice(0, 200) + '…' : line;
+  }
+  function renderSubagent(sub) {
+    const input = sub.item.input || {};
+    const parts = [];
+    if (input.description) parts.push(input.description);
+    if (input.subagent_type) parts.push(input.subagent_type);
+    const model = input.model || sub.model;
+    if (model) parts.push(model);
+    sub.desc.textContent = parts.join(' · ');
+    const states = { running: sub.waiting ? 'waiting for approval' : 'running', done: 'done', failed: 'failed', stopped: 'stopped' };
+    const n = sub.tools.length;
+    sub.stateEl.textContent = states[sub.state] + (n ? ' · ' + n + (n === 1 ? ' tool' : ' tools') : '');
+    sub.details.className = 'subagent ' + sub.state;
+    sub.latestEl.textContent = lastLine(sub.text);
+    sub.latestEl.style.display = sub.text ? '' : 'none';
+    if (sub.state !== 'running' && sub.startMs != null && sub.endMs == null) sub.endMs = Date.now();
+    if (!replaying) renderRoster();
+  }
+  function subagentEvent(parentId, ev) {
+    const rootId = items.has(parentId) ? parentId : subTools.get(parentId);
+    const item = rootId && items.get(rootId);
+    if (!item) { console.warn('subagent event for unknown tool call', parentId, ev); return; }
+    const sub = ensureSubagent(item);
+    const d = ev.data;
+    switch (ev.type) {
+      case 'turn_started':
+        sub.tracked = true;
+        sub.state = 'running';
+        if (d && d.model) sub.model = d.model;
+        break;
+      case 'turn_completed': {
+        const st = (d && d.status && d.status.state) || 'completed';
+        sub.state = st === 'completed' ? 'done' : st === 'interrupted' ? 'stopped' : 'failed';
+        const usage = (d && d.usage) || {};
+        const tokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : (typeof usage.total_tokens === 'number' ? usage.total_tokens : null);
+        if (tokens != null) sub.tokens = tokens;
+        if (st === 'failed' && d.status.message) sub.text += (sub.text ? '\n' : '') + d.status.message;
+        break;
+      }
+      case 'text_delta':
+        sub.text += d;
+        sub.textEl.textContent = sub.text;
+        setActivity('Subagent responding');
+        break;
+      case 'thinking_delta':
+        setActivity('Subagent thinking');
+        break;
+      case 'item_started': {
+        const name = d.kind && d.kind.name ? d.kind.name : 'tool';
+        subTools.set(d.id, rootId);
+        const chip = sub.toolsEl.appendChild(el('span', 'sa-tool', name));
+        const toolInput = (d.kind && d.kind.input) || {};
+        chip.title = salient(name, toolInput) || name;
+        // The roster shows what the subagent is doing as the CLI does: the
+        // tool call's own description, else its salient argument.
+        const desc = toolInput.description || salient(name, toolInput);
+        sub.tools.push({ id: d.id, name, chip, desc: desc ? name + ': ' + desc : name });
+        // Separate the text before and after each tool call.
+        if (sub.text && !sub.text.endsWith('\n')) sub.text += '\n';
+        setActivity('Subagent: ' + name);
+        break;
+      }
+      case 'item_completed': {
+        const tool = sub.tools.find((t) => t.id === d.id);
+        if (tool) tool.chip.classList.add(d.is_error ? 'error' : 'done');
+        break;
+      }
+      case 'subagent_event':
+        // A subagent's own subagent rolls up into the same block.
+        subagentEvent(d.parent_tool_use_id, d.event);
+        return;
+      default:
+        break;
+    }
+    renderSubagent(sub);
     scrollIfFollowing();
   }
 
@@ -643,21 +1020,166 @@
   }
 
   // ---- composer ----------------------------------------------------------
+  // Whether Send / Enter may send now. A pending permission or question
+  // always waits for its answer. Mid-turn, Claude queues the message and
+  // reads it at its next tool call (or as the next turn); pi cannot.
+  function sendAllowed(isBusy, pendingCount, canSteer) {
+    return pendingCount === 0 && (!isBusy || canSteer);
+  }
+  // What a message_lifecycle state does to a queued message's marker:
+  // 'delivered' (Claude has it), 'remove' (withdrawn), or null (no change).
+  function queuedMarkerAction(state) {
+    if (state === 'started' || state === 'completed') return 'delivered';
+    if (state === 'cancelled') return 'remove';
+    return null;
+  }
   function refreshComposer() {
     // Typing stays possible while a request is pending; sending waits.
-    submitBtn.disabled = busy || pending.size > 0;
+    submitBtn.disabled = !sendAllowed(busy, pending.size, steerable);
+    submitBtn.title = busy && !submitBtn.disabled
+      ? 'Claude is working: the message is queued and Claude reads it at its next step'
+      : '';
     stopBtn.disabled = !busy;
+    if (typeof refreshReviewSubmit === 'function') refreshReviewSubmit();
+    for (const card of cards.values()) refreshCardSend(card);
   }
   function setBusy(b) { busy = b; refreshComposer(); }
   function submitPrompt() {
     if (submitBtn.disabled) return;
     const text = promptEl.value.trim();
-    if (!text) return;
-    postIpc({ type: 'submit', text });
+    if (!text && !attachments.length) return;
+    const payload = { type: 'submit', text };
+    if (attachments.length) {
+      payload.images = attachments.map((a) => ({ media_type: a.media_type, data: a.data }));
+    }
+    postIpc(payload);
     promptEl.value = '';
     promptEl.style.height = 'auto';
+    attachments = [];
+    renderAttachments();
     follow = true;
   }
+
+  // ---- image attachments (TRU-140) ---------------------------------------
+  // Pasted or dropped images, downscaled so the longest edge is at most
+  // MAX_IMAGE_EDGE and re-encoded as JPEG (PNG kept when it has
+  // transparency). The host checks the same caps (harness::validate_images).
+  const MAX_IMAGES = 4;
+  const MAX_IMAGE_EDGE = 1568;
+  const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+  const JPEG_QUALITY = 0.85;
+  const attachmentsEl = document.getElementById('attachments');
+  const composerEl = document.getElementById('composer');
+  let attachments = [];               // {media_type, data}
+  let attachQueue = Promise.resolve(); // one paste/drop at a time keeps the cap exact
+
+  function renderAttachments() {
+    attachmentsEl.innerHTML = '';
+    attachments.forEach((a, i) => {
+      const box = el('div', 'att');
+      const img = el('img');
+      img.src = 'data:' + a.media_type + ';base64,' + a.data;
+      img.alt = 'attached image ' + (i + 1);
+      const x = el('button', null, '\u00d7');
+      x.title = 'Remove image';
+      x.addEventListener('click', () => { attachments.splice(i, 1); renderAttachments(); promptEl.focus(); });
+      box.append(img, x);
+      attachmentsEl.append(box);
+    });
+    attachmentsEl.classList.toggle('visible', attachments.length > 0);
+  }
+  function loadImage(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('the image could not be decoded')); };
+      img.src = url;
+    });
+  }
+  function hasTransparency(ctx, w, h) {
+    const px = ctx.getImageData(0, 0, w, h).data;
+    for (let i = 3; i < px.length; i += 4) if (px[i] < 255) return true;
+    return false;
+  }
+  async function prepareImage(file) {
+    const img = await loadImage(file);
+    const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * scale));
+    const h = Math.max(1, Math.round(img.naturalHeight * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    const keepPng = file.type === 'image/png' && hasTransparency(ctx, w, h);
+    const media_type = keepPng ? 'image/png' : 'image/jpeg';
+    const url = keepPng ? canvas.toDataURL('image/png') : canvas.toDataURL('image/jpeg', JPEG_QUALITY);
+    const data = url.slice(url.indexOf(',') + 1);
+    const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+    return { media_type, data, bytes: Math.floor(data.length / 4) * 3 - padding };
+  }
+  async function attachFiles(files) {
+    for (const file of files) {
+      const name = file.name || 'image';
+      if (attachments.length >= MAX_IMAGES) {
+        note('A message can carry at most ' + MAX_IMAGES + ' images; ' + name + ' was not attached.', 'warn');
+        continue;
+      }
+      try {
+        const a = await prepareImage(file);
+        if (a.bytes > MAX_IMAGE_BYTES) {
+          note(name + ' is ' + (a.bytes / 1048576).toFixed(1) + ' MB after downscaling; the limit is 5 MB.', 'warn');
+          continue;
+        }
+        attachments.push({ media_type: a.media_type, data: a.data });
+        renderAttachments();
+      } catch (e) {
+        console.error('could not attach image', name, e);
+        note('Could not attach ' + name + ': ' + (e && e.message ? e.message : e), 'warn');
+      }
+    }
+  }
+  function queueAttach(files) {
+    attachQueue = attachQueue.then(() => attachFiles(files));
+  }
+  function imageFiles(list) {
+    return Array.from(list || []).filter((f) => f && f.type && f.type.startsWith('image/'));
+  }
+  // Paste: image items become attachments (and the paste of their text
+  // form, such as a file name, is suppressed); text-only pastes are left
+  // to the textarea.
+  promptEl.addEventListener('paste', (e) => {
+    const items = e.clipboardData ? Array.from(e.clipboardData.items || []) : [];
+    const files = imageFiles(items.filter((it) => it.kind === 'file').map((it) => it.getAsFile()));
+    if (!files.length) return;
+    e.preventDefault();
+    queueAttach(files);
+  });
+  function dragHasFiles(e) {
+    return !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+  }
+  // A file dropped anywhere else would navigate the page to it; swallow
+  // those, and take image drops on the composer.
+  document.addEventListener('dragover', (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+  document.addEventListener('drop', (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+  composerEl.addEventListener('dragover', (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    composerEl.classList.add('dropping');
+  });
+  composerEl.addEventListener('dragleave', (e) => {
+    if (!composerEl.contains(e.relatedTarget)) composerEl.classList.remove('dropping');
+  });
+  composerEl.addEventListener('drop', (e) => {
+    composerEl.classList.remove('dropping');
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    const files = imageFiles(e.dataTransfer.files);
+    if (!files.length) { note('Only images can be attached.', 'warn'); return; }
+    queueAttach(files);
+    promptEl.focus();
+  });
   submitBtn.addEventListener('click', submitPrompt);
   stopBtn.addEventListener('click', () => postIpc({ type: 'stop' }));
   promptEl.addEventListener('keydown', (e) => {
@@ -697,7 +1219,7 @@
     if (mode.current == null) { modeMenuEl.classList.remove('visible'); return; }
     modeBtn.dataset.mode = mode.current;
     modeBtn.classList.toggle('pending', mode.pending != null);
-    modeBtn.textContent = modeLabel(mode.current) + (mode.pending != null ? ' → ' + modeLabel(mode.pending) + '…' : '');
+    setChip(modeBtn, 'lock', modeLabel(mode.current) + (mode.pending != null ? ' → ' + modeLabel(mode.pending) + '…' : ''));
     modeMenuEl.innerHTML = '';
     modeMenuEl.appendChild(el('div', 'hint', 'Permission mode · Shift+Tab cycles'));
     for (const m of modeList()) {
@@ -738,6 +1260,7 @@
   }
   modeBtn.addEventListener('click', (e) => {
     e.stopPropagation();
+    closeChipMenus(null);
     modeMenuEl.classList.toggle('visible');
   });
   document.addEventListener('click', (e) => {
@@ -746,6 +1269,884 @@
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') modeMenuEl.classList.remove('visible');
   });
+
+
+  // ---- model, effort and checkout chips (TRU-143) -----------------------
+  // Like the mode chip, `current` is only ever a value the harness confirmed
+  // (model_changed / effort_changed) or the tab's configured value before
+  // its process starts (Rust confirms those itself). `pending` is the last
+  // value asked for and not yet confirmed.
+  // Until the CLI's initialize reply lists its models, offer the common ones.
+  const FALLBACK_MODELS = [
+    { value: 'default', displayName: 'Default', description: 'Your Claude settings decide' },
+    { value: 'opus', displayName: 'Opus' },
+    { value: 'sonnet', displayName: 'Sonnet' },
+    { value: 'haiku', displayName: 'Haiku' },
+    { value: 'fable', displayName: 'Fable' },
+  ];
+  const FALLBACK_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+  const modelWrapEl = document.getElementById('model-wrap');
+  const modelBtn = document.getElementById('model');
+  const modelMenuEl = document.getElementById('model-menu');
+  const effortWrapEl = document.getElementById('effort-wrap');
+  const effortBtn = document.getElementById('effort');
+  const effortMenuEl = document.getElementById('effort-menu');
+  const checkoutWrapEl = document.getElementById('checkout-wrap');
+  const checkoutBtn = document.getElementById('checkout');
+  const checkoutMenuEl = document.getElementById('checkout-menu');
+  const chips = {
+    enabled: false,
+    models: null,                                  // from `ready`
+    model: { current: null, pending: null },
+    // effort.current: a level or null (the model's default); pending is
+    // {value} while a change is in flight so null can be pending too.
+    effort: { current: null, pending: null, applied: null },
+    checkout: null,                                // {label, path, locked, reason, choices}
+    checkoutPending: null,
+  };
+  const CHIP_MENUS = [modelMenuEl, effortMenuEl, checkoutMenuEl];
+  function closeChipMenus(except) {
+    for (const m of CHIP_MENUS) if (m !== except) m.classList.remove('visible');
+  }
+  function modelList() {
+    const list = (chips.models && chips.models.length ? chips.models : FALLBACK_MODELS)
+      .filter((m) => m && typeof m.value === 'string');
+    const cur = chips.model.current;
+    if (cur && !list.some((m) => m.value === cur)) return [{ value: cur, displayName: cur }].concat(list);
+    return list;
+  }
+  function modelInfo(value) { return modelList().find((m) => m.value === value) || null; }
+  // Context window: Claude lists the 1M-context variant of a model as its
+  // own value, `<model>[1m]`. The effort chip switches between the two.
+  const ONE_M = '[1m]';
+  function is1m(v) { return typeof v === 'string' && v.endsWith(ONE_M); }
+  function baseModel(v) { return is1m(v) ? v.slice(0, -ONE_M.length) : v; }
+  function oneMVariant(v) {
+    if (!chips.models || !v) return null;
+    const want = baseModel(v) + ONE_M;
+    return chips.models.some((m) => m && m.value === want) ? want : null;
+  }
+  // What the model chip reads: the CLI's display name once `ready` listed
+  // the models (for `default`, the entry's description, which names the
+  // model it resolves to); before that, the configured value itself.
+  function modelLabel(value) {
+    const base = baseModel(value);
+    if (!chips.models) return base === 'default' ? 'Claude settings' : base;
+    const m = chips.models.find((x) => x && x.value === base) || modelInfo(value);
+    if (!m) return base;
+    if (base === 'default') {
+      const desc = String(m.description || '').split(/\s[·—-]\s/)[0].trim();
+      return desc || 'Claude settings';
+    }
+    return m.displayName || base;
+  }
+  function effortLevels() {
+    const m = modelInfo(chips.model.current);
+    if (m && Array.isArray(m.supportedEffortLevels) && m.supportedEffortLevels.length) return m.supportedEffortLevels;
+    return FALLBACK_EFFORTS;
+  }
+  // A model the CLI lists without effort support (supportsEffort absent).
+  function effortSupported() {
+    if (!chips.models) return true;
+    const m = modelInfo(chips.model.current);
+    return !m || m.supportsEffort === true;
+  }
+  function effortLabel(v) { return v == null ? 'auto' : v; }
+  const EFFORT_NAMES = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'X-High', max: 'Max' };
+  function effortName(v) { return v == null ? 'Auto' : (EFFORT_NAMES[v] || v); }
+  function menuItem(menu, marked, label, sub, onPick, disabled) {
+    const b = el('button');
+    if (disabled) b.disabled = true;
+    b.appendChild(el('span', 'mark', marked));
+    b.appendChild(el('span', null, label));
+    if (sub) b.appendChild(el('span', 'sub', sub));
+    b.addEventListener('click', (e) => { e.stopPropagation(); menu.classList.remove('visible'); onPick(); promptEl.focus(); });
+    menu.appendChild(b);
+  }
+  function renderModel() {
+    modelWrapEl.classList.toggle('visible', chips.enabled && chips.model.current != null);
+    if (!chips.enabled || chips.model.current == null) { modelMenuEl.classList.remove('visible'); return; }
+    const m = chips.model;
+    modelBtn.classList.toggle('pending', m.pending != null);
+    setChip(modelBtn, 'model', modelLabel(m.current) + (m.pending != null ? ' → ' + modelLabel(m.pending) + '…' : ''));
+    modelBtn.title = 'Model: ' + m.current;
+    modelMenuEl.innerHTML = '';
+    modelMenuEl.appendChild(el('div', 'hint', chips.models ? 'Model' : 'Model · full list after the session starts'));
+    // 1M variants are picked on the effort chip's Context window section.
+    const values = new Set(modelList().map((x) => x.value));
+    const wide = is1m(m.current);
+    for (const info of modelList()) {
+      if (is1m(info.value) && values.has(baseModel(info.value))) continue;
+      const cur = baseModel(m.current) === info.value || m.current === info.value;
+      // Keep the 1M context when the new model has it too.
+      const target = wide && oneMVariant(info.value) ? oneMVariant(info.value) : info.value;
+      menuItem(modelMenuEl, cur ? '✓' : (m.pending != null && baseModel(m.pending) === info.value ? '…' : ''),
+        info.displayName || info.value, info.description || '', () => requestModel(target));
+    }
+  }
+  function renderEffort() {
+    const on = chips.enabled && chips.model.current != null;
+    effortWrapEl.classList.toggle('visible', on);
+    if (!on) { effortMenuEl.classList.remove('visible'); return; }
+    const e = chips.effort;
+    const supported = effortSupported();
+    effortBtn.classList.toggle('pending', e.pending != null);
+    effortBtn.classList.toggle('locked', !supported);
+    const cur = chips.model.current;
+    const context = is1m(cur) ? '1M' : '200k';
+    let label = supported ? effortName(e.current) : '';
+    if (supported && e.pending != null) label += ' → ' + effortName(e.pending.value) + '…';
+    label = label ? label + ' · ' + context : context;
+    setChip(effortBtn, 'gauge', label);
+    effortBtn.classList.remove('locked');
+    effortBtn.title = (supported ? 'Effort' + (e.current == null && e.applied ? ' (auto runs at ' + e.applied + ')' : '') : 'This model has no effort setting') + ' · context window ' + context;
+    effortMenuEl.innerHTML = '';
+    effortMenuEl.appendChild(el('div', 'section', 'Effort'));
+    if (supported) {
+      const isPending = (v) => e.pending != null && e.pending.value === v;
+      menuItem(effortMenuEl, e.current == null ? '✓' : (isPending(null) ? '…' : ''), 'Auto', "the model's default", () => requestEffort(null));
+      for (const level of effortLevels()) {
+        menuItem(effortMenuEl, level === e.current ? '✓' : (isPending(level) ? '…' : ''), effortName(level), '', () => requestEffort(level));
+      }
+    } else {
+      effortMenuEl.appendChild(el('div', 'hint', 'This model has no effort setting'));
+    }
+    effortMenuEl.appendChild(el('div', 'section', 'Context window'));
+    const variant = oneMVariant(cur);
+    const pendingModel = chips.model.pending;
+    menuItem(effortMenuEl, !is1m(cur) ? '✓' : (pendingModel != null && !is1m(pendingModel) ? '…' : ''), '200k', '',
+      () => requestModel(baseModel(cur)));
+    menuItem(effortMenuEl, is1m(cur) ? '✓' : (pendingModel != null && is1m(pendingModel) ? '…' : ''), '1M',
+      is1m(cur) || variant ? '' : (chips.models ? 'not offered for this model' : 'after the session starts'),
+      () => requestModel(variant || cur), !is1m(cur) && !variant);
+  }
+  function renderCheckout() {
+    const c = chips.checkout;
+    checkoutWrapEl.classList.toggle('visible', chips.enabled && c != null);
+    if (!chips.enabled || c == null) { checkoutMenuEl.classList.remove('visible'); return; }
+    checkoutBtn.classList.toggle('pending', chips.checkoutPending != null);
+    checkoutBtn.classList.toggle('locked', !!c.locked);
+    setChip(checkoutBtn, 'folder', c.label + (chips.checkoutPending != null ? '…' : ''));
+    checkoutBtn.title = (c.path || '') + (c.locked ? '\n' + (c.reason || 'Set when the chat started; start a new chat to change it') : '\nWhere this chat runs');
+    if (c.locked) { checkoutMenuEl.classList.remove('visible'); return; }
+    checkoutMenuEl.innerHTML = '';
+    checkoutMenuEl.appendChild(el('div', 'hint', 'Run this chat in'));
+    for (const choice of (c.choices || [])) {
+      const current = choice.path === c.path;
+      menuItem(checkoutMenuEl, current ? '✓' : (choice.path === chips.checkoutPending ? '…' : ''),
+        choice.label, choice.detail || '', () => requestCheckout(choice.path));
+    }
+  }
+  function renderChips() { renderModel(); renderEffort(); renderCheckout(); }
+  function resetComposerChips(composer) {
+    chips.enabled = composer != null;
+    chips.models = null;
+    chips.model = { current: composer ? composer.model || 'default' : null, pending: null };
+    chips.effort = { current: composer ? (composer.effort == null ? null : composer.effort) : null, pending: null, applied: null };
+    chips.checkout = composer ? composer.checkout || null : null;
+    chips.checkoutPending = null;
+    renderChips();
+  }
+  function confirmModel(v) {
+    chips.model.current = v;
+    // The level the old model ran at says nothing about the new one.
+    chips.effort.applied = null;
+    if (chips.model.pending === v) chips.model.pending = null;
+    renderModel(); renderEffort();
+  }
+  function confirmEffort(v, applied) {
+    chips.effort.current = v == null ? null : v;
+    chips.effort.applied = applied || null;
+    if (chips.effort.pending != null && chips.effort.pending.value === chips.effort.current) chips.effort.pending = null;
+    renderEffort();
+  }
+  function clearPendingChips() {
+    if (chips.model.pending == null && chips.effort.pending == null) return;
+    chips.model.pending = null; chips.effort.pending = null;
+    renderModel(); renderEffort();
+  }
+  function requestModel(v) {
+    const m = chips.model;
+    if (m.current == null || v === (m.pending != null ? m.pending : m.current)) return;
+    m.pending = v;
+    renderModel(); renderEffort();
+    postIpc({ type: 'set_model', model: v });
+  }
+  function requestEffort(v) {
+    const e = chips.effort;
+    if (!effortSupported() || v === (e.pending != null ? e.pending.value : e.current)) return;
+    e.pending = { value: v };
+    renderEffort();
+    postIpc({ type: 'set_effort', effort: v });
+  }
+  function requestCheckout(path) {
+    const c = chips.checkout;
+    if (!c || c.locked || path === c.path) return;
+    chips.checkoutPending = path;
+    renderCheckout();
+    postIpc({ type: 'set_checkout', path });
+  }
+  // Rust pushes the checkout chip's state: on a checkout_context request,
+  // after a pick, and when the session starts (it locks).
+  window.__setCheckout = function (state) {
+    chips.checkout = state || null;
+    chips.checkoutPending = null;
+    renderCheckout();
+  };
+  function toggleChipMenu(menu, e) {
+    e.stopPropagation();
+    const open = !menu.classList.contains('visible');
+    closeChipMenus(menu);
+    modeMenuEl.classList.remove('visible');
+    menu.classList.toggle('visible', open);
+    return open;
+  }
+  modelBtn.addEventListener('click', (e) => toggleChipMenu(modelMenuEl, e));
+  effortBtn.addEventListener('click', (e) => toggleChipMenu(effortMenuEl, e));
+  checkoutBtn.addEventListener('click', (e) => {
+    if (chips.checkout && chips.checkout.locked) { e.stopPropagation(); return; }
+    // Task worktrees come and go; ask for fresh choices while it is open.
+    if (toggleChipMenu(checkoutMenuEl, e)) postIpc({ type: 'checkout_context' });
+  });
+  for (const m of CHIP_MENUS) m.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => closeChipMenus(null));
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeChipMenus(null); });
+
+  // ---- Review… and Consult… (TRU-142) --------------------------------------
+  // The popover only collects the request. With a Claude subagent, Rust
+  // builds the prompt and sends it as a normal user message, so the
+  // transcript shows exactly what Claude was asked. With Codex, Rust starts
+  // a GitTerm-run delegation directly (no agent turn) and a card appears.
+  const reviewWrapEl = document.querySelector('.review-wrap');
+  const reviewBtn = document.getElementById('review');
+  const reviewPopEl = document.getElementById('review-pop');
+  const CLAUDE_MODELS = ['opus', 'sonnet', 'haiku', 'fable'];
+  const BASE_SOURCES = { task: "this task's base", 'agent-workflow': 'agent-workflow.config.json', inferred: 'inferred from the repository' };
+  const review = { available: false, ctx: null, form: null, kind: 'review', reviewer: null };
+  let reviewSubmitBtn = null;
+  function setReviewAvailable(on) {
+    review.available = !!on;
+    reviewWrapEl.classList.toggle('visible', review.available);
+    if (!review.available) closeReview();
+  }
+  function closeReview() { reviewPopEl.classList.remove('visible'); }
+  function refreshReviewSubmit() {
+    if (!reviewSubmitBtn || !review.form) return;
+    const f = review.form;
+    const codex = f.reviewer.value === 'codex';
+    let missing = false;
+    if (review.kind === 'review') {
+      const target = f.target();
+      missing = (target === 'branch' && !f.base.value.trim()) || (target === 'commit' && !f.sha.value.trim());
+    } else {
+      missing = !f.brief.value.trim();
+    }
+    // A Claude subagent is spawned by this chat's Claude, so it waits for
+    // the turn; Codex runs on its own.
+    const blocked = !codex && (busy || pending.size > 0);
+    reviewSubmitBtn.disabled = blocked || missing;
+    reviewSubmitBtn.title = blocked ? 'Waits until Claude finishes this turn'
+      : (missing ? (review.kind === 'review' ? 'Fill in the target first' : 'Write the brief first') : '');
+  }
+  function renderReview() {
+    reviewPopEl.innerHTML = '';
+    const r = review.ctx;
+    const head = reviewPopEl.appendChild(el('div', 'rv-row'));
+    for (const [kind, label] of [['review', 'Review'], ['consult', 'Consult']]) {
+      const l = head.appendChild(el('label'));
+      const input = l.appendChild(el('input'));
+      input.type = 'radio'; input.name = 'rv-kind'; input.value = kind; input.checked = review.kind === kind;
+      input.addEventListener('change', () => { review.kind = kind; renderReview(); });
+      l.appendChild(el('span', 'rv-title', label));
+    }
+    if (!r) { reviewPopEl.appendChild(el('div', 'rv-hint', 'Reading the repository…')); review.form = null; reviewSubmitBtn = null; return; }
+    const c = r.context || {};
+    const form = { target: () => 'uncommitted' };
+
+    reviewPopEl.appendChild(el('div', 'rv-label', review.kind === 'review' ? 'Reviewer' : 'Consultant'));
+    const revRow = reviewPopEl.appendChild(el('div', 'rv-row'));
+    const reviewer = revRow.appendChild(el('select'));
+    for (const [value, label] of [['claude-subagent', 'Claude subagent'], ['codex', 'Codex']]) {
+      const o = reviewer.appendChild(el('option', null, label)); o.value = value;
+    }
+    reviewer.value = review.reviewer || (r.reviewer === 'codex' ? 'codex' : 'claude-subagent');
+    const claudeModel = revRow.appendChild(el('select'));
+    const models = CLAUDE_MODELS.includes(r.model) || !r.model ? CLAUDE_MODELS : [r.model].concat(CLAUDE_MODELS);
+    for (const m of models) { const o = claudeModel.appendChild(el('option', null, m)); o.value = m; }
+    claudeModel.value = r.model || 'opus';
+    const codexModel = revRow.appendChild(el('input'));
+    codexModel.type = 'text'; codexModel.placeholder = 'Codex default model'; codexModel.value = r.codex_model || '';
+    codexModel.title = 'codex -m; empty uses GitTerm\'s review.codex_model or Codex\'s own default';
+    const revHint = reviewPopEl.appendChild(el('div', 'rv-hint'));
+    function syncReviewer() {
+      review.reviewer = reviewer.value;
+      const codex = reviewer.value === 'codex';
+      claudeModel.style.display = codex ? 'none' : '';
+      codexModel.style.display = codex ? '' : 'none';
+      revHint.textContent = codex
+        ? 'Runs in the background in this checkout; a card shows its progress and result. No Claude turn is spent.'
+        : 'Claude spawns one subagent in this chat; its report comes back as a reply.';
+      if (form.syncTarget) form.syncTarget();
+      refreshReviewSubmit();
+    }
+    reviewer.addEventListener('change', syncReviewer);
+    form.reviewer = reviewer; form.claudeModel = claudeModel; form.codexModel = codexModel;
+
+    if (review.kind === 'review') {
+      if (c.error) reviewPopEl.appendChild(el('div', 'rv-hint warn', c.error));
+      reviewPopEl.appendChild(el('div', 'rv-label', 'Target'));
+      const radios = {};
+      function radio(value, text) {
+        const row = reviewPopEl.appendChild(el('div', 'rv-row'));
+        const label = row.appendChild(el('label'));
+        const input = label.appendChild(el('input'));
+        input.type = 'radio'; input.name = 'rv-target'; input.value = value;
+        label.appendChild(document.createTextNode(text));
+        input.addEventListener('change', () => { form.syncTarget(); refreshReviewSubmit(); });
+        radios[value] = input;
+        return row;
+      }
+      const branchRow = radio('branch', 'Branch vs');
+      const base = branchRow.appendChild(el('input'));
+      base.type = 'text'; base.placeholder = 'base branch'; base.value = c.base || '';
+      base.addEventListener('input', () => { radios.branch.checked = true; form.syncTarget(); refreshReviewSubmit(); });
+      let baseHint;
+      if (c.base) {
+        baseHint = 'Base from ' + (BASE_SOURCES[c.base_source] || c.base_source || '?') +
+          (typeof c.ahead === 'number' ? ' · ' + c.ahead + (c.ahead === 1 ? ' commit' : ' commits') + ' ahead' : '');
+      } else {
+        baseHint = 'No base branch found; enter one.';
+      }
+      reviewPopEl.appendChild(el('div', 'rv-hint' + (c.base ? '' : ' warn'), baseHint));
+      const codexBaseHint = reviewPopEl.appendChild(el('div', 'rv-hint', 'Codex compares the working tree with the merge base, so uncommitted changes are included.'));
+      radio('uncommitted', 'Uncommitted changes');
+      reviewPopEl.appendChild(el('div', 'rv-hint', c.dirty ? 'Staged, unstaged and untracked changes against HEAD' : 'The working tree is clean'));
+      const commitRow = radio('commit', 'Commit');
+      const sha = commitRow.appendChild(el('input'));
+      sha.type = 'text'; sha.placeholder = 'SHA'; sha.value = c.head || '';
+      sha.addEventListener('input', () => { radios.commit.checked = true; refreshReviewSubmit(); });
+      // Branch vs base when the branch has commits of its own, else the
+      // uncommitted changes.
+      const initial = c.base && c.ahead > 0 ? 'branch' : (c.dirty || !c.base ? 'uncommitted' : 'branch');
+      radios[initial].checked = true;
+      reviewPopEl.appendChild(el('div', 'rv-label', 'Focus (optional)'));
+      const focus = reviewPopEl.appendChild(el('textarea'));
+      focus.placeholder = 'e.g. error handling in the webview lifecycle';
+      form.base = base; form.sha = sha; form.focus = focus;
+      form.target = () => (Object.keys(radios).find((k) => radios[k].checked) || 'uncommitted');
+      form.syncTarget = () => { codexBaseHint.style.display = reviewer.value === 'codex' && form.target() === 'branch' ? '' : 'none'; };
+    } else {
+      reviewPopEl.appendChild(el('div', 'rv-label', 'Brief'));
+      const brief = reviewPopEl.appendChild(el('textarea'));
+      brief.placeholder = 'The question, the context it needs, and the answer you want. The consultant cannot see this chat.';
+      brief.style.minHeight = '90px';
+      brief.addEventListener('input', refreshReviewSubmit);
+      form.brief = brief;
+    }
+
+    const actions = reviewPopEl.appendChild(el('div', 'rv-actions'));
+    const cancel = actions.appendChild(el('button', null, 'Cancel'));
+    cancel.addEventListener('click', () => { closeReview(); promptEl.focus(); });
+    reviewSubmitBtn = actions.appendChild(el('button', 'primary', review.kind === 'review' ? 'Start review' : 'Ask'));
+    review.form = form;
+    reviewSubmitBtn.addEventListener('click', submitReview);
+    syncReviewer();
+  }
+  function submitReview() {
+    const f = review.form;
+    if (!f || !reviewSubmitBtn || reviewSubmitBtn.disabled) return;
+    const reviewer = f.reviewer.value;
+    const model = reviewer === 'codex' ? f.codexModel.value.trim() : f.claudeModel.value;
+    if (review.kind === 'review') {
+      const kind = f.target();
+      const target = kind === 'branch' ? { kind, base: f.base.value.trim() }
+        : kind === 'commit' ? { kind, sha: f.sha.value.trim() } : { kind };
+      const focus = f.focus.value.trim();
+      postIpc({ type: 'review_request', target, focus: focus || null, reviewer, model });
+    } else {
+      postIpc({ type: 'consult_request', brief: f.brief.value.trim(), reviewer, model });
+    }
+    closeReview();
+    follow = true;
+  }
+  reviewBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (reviewPopEl.classList.contains('visible')) { closeReview(); return; }
+    // Each opening starts from the configured reviewer.
+    review.ctx = null;
+    review.reviewer = null;
+    renderReview();
+    reviewPopEl.classList.add('visible');
+    postIpc({ type: 'review_context' });
+  });
+  reviewPopEl.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', () => closeReview());
+  reviewPopEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { closeReview(); promptEl.focus(); }
+    else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submitReview(); }
+  });
+  // Rust answers review_context with {context, reviewer, model, codex_model}.
+  window.__setReviewContext = function (payload) {
+    if (!reviewPopEl.classList.contains('visible')) return;
+    review.ctx = payload || {};
+    renderReview();
+    const f = review.form;
+    if (!f) return;
+    if (review.kind === 'consult') f.brief.focus();
+    else (f.target() === 'branch' && !f.base.value ? f.base : f.focus).focus();
+  };
+  // Why a review, consult or delegation action was not done (bad target,
+  // not a git checkout, ...).
+  window.__reviewNote = function (text) { note(text, 'warn'); };
+
+  // ---- delegation cards (Codex review / consult, TRU-142) ------------------
+  // Rust sends {"kind":"delegation_anchor", delegation_id} into the
+  // conversation where the request was made, and {"kind":"delegation",
+  // delegation, activity, held} whenever the record changes (and after a
+  // replay, since cards are not in Claude's transcript). A card is created
+  // at its anchor, or at the end of the timeline when it has none.
+  const cards = new Map();       // delegation_id -> card
+  let checkoutHead = null;       // the tab's current HEAD (__setDelegationHead)
+  const SEVERITIES = ['P0', 'P1', 'P2', 'P3'];
+  function shortHead(h) { return h ? String(h).slice(0, 7) : '?'; }
+  function parseTime(t) { const ms = Date.parse(t || ''); return isNaN(ms) ? null : ms; }
+  function fmtClock(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+  function newCard(id) {
+    endSegment(); endThinking();
+    const root = el('details', 'dlg requested');
+    root.open = true;
+    root.dataset.delegationId = id;
+    const summary = root.appendChild(el('summary'));
+    const card = {
+      id, root, data: null, activity: null, held: false, selected: null,
+      kindEl: summary.appendChild(el('span', 'dlg-kind', 'Codex')),
+      whatEl: summary.appendChild(el('span', 'dlg-what')),
+      stateEl: summary.appendChild(el('span', 'dlg-state', 'requested')),
+      body: root.appendChild(el('div', 'dlg-body')),
+      wasDismissed: false,
+    };
+    cards.set(id, card);
+    append(root);
+    return card;
+  }
+  function delegationAnchor(id) {
+    if (!id || cards.has(id)) return;
+    newCard(id);
+  }
+  function delegationEvent(ev) {
+    const d = ev.delegation;
+    if (!d || !d.delegation_id) { console.warn('delegation event without a record', ev); return; }
+    const card = cards.get(d.delegation_id) || newCard(d.delegation_id);
+    card.data = d;
+    card.activity = ev.activity || null;
+    card.held = !!ev.held;
+    card.worker = ev.worker || null;
+    renderCard(card);
+    renderRoster();
+  }
+  function kindLabel(d) { return d.kind === 'consult' ? 'Codex consult' : d.kind === 'review' ? 'Codex review' : d.kind === 'implement' ? 'Worker' : 'Delegation'; }
+  function childModel(d) { return (d.child && d.child.model) || 'default model'; }
+  // ---- worker cards (delegate_task, TRU-142 S6) ----
+  // The worker part of the payload ({preset, model, role, title, issue_key,
+  // worktree_path, branch, session_state, progress, tab_open}) mirrors the
+  // task session; the record's status carries done / blocked.
+  function isWorker(d) { return d.kind === 'implement'; }
+  function workerState(card) { return (card.worker && card.worker.session_state) || state(card.data); }
+  function workerHead(card) {
+    const w = card.worker || {};
+    const parts = ['Worker', w.preset || (card.data.child && card.data.child.preset_name) || 'agent'];
+    parts.push(w.model || childModel(card.data));
+    if (w.role) parts.push(w.role);
+    return parts.join(' · ');
+  }
+  function workerWhat(card) {
+    const w = card.worker || {};
+    const title = w.title || (card.data.brief || '').split('\n')[0];
+    return (w.issue_key ? w.issue_key + ' · ' : '') + title;
+  }
+  const WORKER_STATE_TEXT = {
+    queued: 'queued', starting: 'starting', waiting: 'needs you', exited: 'worker exited',
+    interrupted: 'interrupted', done: 'done', blocked: 'blocked', failed: 'failed', cancelled: 'cancelled',
+  };
+  function workerStateText(card) {
+    const ws = workerState(card);
+    if (ws === 'running') {
+      const start = parseTime(card.data.created_at);
+      return 'running ' + (start != null ? fmtClock(Date.now() - start) : '');
+    }
+    return WORKER_STATE_TEXT[ws] || ws;
+  }
+  function renderWorkerBody(card, body) {
+    const d = card.data;
+    const w = card.worker || {};
+    const ws = workerState(card);
+    if (w.worktree_path || w.branch) {
+      body.appendChild(el('div', 'dlg-path', (w.branch || '') + (w.worktree_path ? ' · ' + w.worktree_path : '')));
+    }
+    if (ws === 'waiting') body.appendChild(el('div', 'dlg-banner', 'The worker is waiting for you. Open its tab to answer.'));
+    else if (ws === 'exited') body.appendChild(el('div', 'dlg-banner', 'The worker stopped without reporting. Open its tab, or the task, to resume it.'));
+    else if (ws === 'interrupted') body.appendChild(el('div', 'dlg-line', 'GitTerm restarted; the worker tab is back. Resume it there.'));
+    else if (ws === 'queued') body.appendChild(el('div', 'dlg-line', 'Waiting for a free task slot.'));
+    else if (ws === 'blocked') body.appendChild(el('div', 'dlg-banner', 'The worker is blocked and needs you.'));
+    else if (ws === 'failed') body.appendChild(el('div', 'dlg-error', (d.status && d.status.message) || 'The worker failed'));
+    else if (ws === 'cancelled') body.appendChild(el('div', 'dlg-line', 'No longer tracked. The worker tab and task are untouched.'));
+    if (state(d) === 'completed' || state(d) === 'blocked') {
+      renderResult(card, body);
+    } else if (w.progress) {
+      body.appendChild(el('div', 'dlg-activity', 'Latest: ' + w.progress));
+    }
+  }
+  function targetText(d) {
+    const t = d.target;
+    if (!t || !t.mode) return d.kind === 'consult' ? d.brief : '';
+    const m = t.mode;
+    const scope = m.type === 'uncommitted' ? 'uncommitted changes'
+      : m.type === 'base' ? 'vs ' + m.reference + ' (+ uncommitted)'
+      : m.type === 'commit' ? 'commit ' + shortHead(m.sha) : m.type;
+    return scope + (t.focus ? ' · focus: ' + t.focus : '');
+  }
+  function state(d) { return (d.status && d.status.state) || 'requested'; }
+  function findingsOf(d) { return (d.result && d.result.findings) || null; }
+  function severityCounts(list) {
+    const counts = {};
+    for (const f of list) counts[f.severity] = (counts[f.severity] || 0) + 1;
+    return SEVERITIES.filter((s) => counts[s]).map((s) => counts[s] + ' ' + s).join(', ');
+  }
+  function stateText(card) {
+    const d = card.data;
+    if (isWorker(d)) return workerStateText(card);
+    const st = state(d);
+    if (st === 'running') {
+      const start = parseTime(d.updated_at);
+      return 'running ' + (start != null ? fmtClock(Date.now() - start) : '');
+    }
+    if (st === 'requested') return 'queued';
+    if (st === 'completed') {
+      const f = findingsOf(d);
+      if (f) return f.findings.length ? f.findings.length + (f.findings.length === 1 ? ' finding' : ' findings') + ' (' + severityCounts(f.findings) + ')' : 'no findings';
+      return 'answered';
+    }
+    return st;
+  }
+  function openFinding(f) {
+    // Opens the file viewer over the chat (line numbers are shown, the view
+    // does not scroll to the line).
+    postIpc({ type: 'open_file', path: f.file });
+  }
+  function renderCard(card) {
+    const d = card.data;
+    if (!d) return;
+    const st = state(d);
+    const dismissed = !!d.dismissed_at;
+    const worker = isWorker(d);
+    card.root.className = 'dlg ' + (worker ? workerState(card) : st) + (dismissed ? ' dismissed' : '');
+    if (dismissed && !card.wasDismissed) card.root.open = false;
+    card.wasDismissed = dismissed;
+    card.kindEl.textContent = worker ? workerHead(card) : kindLabel(d) + ' · ' + childModel(d);
+    card.whatEl.textContent = worker ? workerWhat(card) : targetText(d);
+    card.stateEl.textContent = (dismissed ? 'dismissed · ' : '') + stateText(card);
+    const body = card.body;
+    body.innerHTML = '';
+    if (worker) {
+      renderWorkerBody(card, body);
+    } else if (st === 'running' || st === 'requested') {
+      body.appendChild(el('div', 'dlg-activity', card.activity || (st === 'requested' ? 'Waiting for a free Codex slot' : 'Starting Codex…')));
+    } else if (st === 'failed') {
+      body.appendChild(el('div', 'dlg-error', (d.status && d.status.message) || 'Codex failed'));
+    } else if (st === 'interrupted') {
+      body.appendChild(el('div', 'dlg-line', 'GitTerm restarted while this was running. Re-run it to try again.'));
+    } else if (st === 'cancelled') {
+      body.appendChild(el('div', 'dlg-line', 'Cancelled.'));
+    } else if (st === 'completed') {
+      renderResult(card, body);
+    }
+    const actions = body.appendChild(el('div', 'dlg-actions'));
+    if (worker && st !== 'cancelled') {
+      const open = actions.appendChild(el('button', workerState(card) === 'waiting' ? 'primary' : null, 'Open worker tab'));
+      open.title = (card.worker && card.worker.tab_open) ? 'Switch to the worker\'s terminal tab' : 'The worker tab is not open';
+      open.addEventListener('click', () => postIpc({ type: 'delegation_open_worker', delegationId: d.delegation_id }));
+    }
+    const sendable = st === 'completed' || (worker && st === 'blocked');
+    if (sendable && !dismissed) {
+      const send = actions.appendChild(el('button', 'primary', 'Send to Claude'));
+      card.sendBtn = send;
+      if (d.delivered_at) {
+        send.textContent = 'Sent to Claude';
+        send.disabled = true;
+      } else if (card.held) {
+        send.textContent = 'Queued, sends when Claude finishes';
+        send.disabled = true;
+      } else {
+        send.title = busy ? 'Claude is working; it is sent when this turn ends' : (worker ? 'Send the worker\'s report as a message' : 'Send the selected findings as a message');
+        send.addEventListener('click', () => sendCard(card));
+      }
+    } else {
+      card.sendBtn = null;
+    }
+    if (!worker && st !== 'running' && st !== 'requested') {
+      const rerun = actions.appendChild(el('button', null, 'Re-run'));
+      rerun.addEventListener('click', () => postIpc({ type: 'delegation_rerun', delegationId: d.delegation_id }));
+    }
+    if (!dismissed) {
+      const live = st === 'running' || st === 'requested' || st === 'interrupted';
+      const dismiss = actions.appendChild(el('button', null, worker ? (live ? 'Stop tracking' : 'Dismiss') : (st === 'running' || st === 'requested' ? 'Cancel' : 'Dismiss')));
+      if (worker && live) dismiss.title = 'Stop waiting for this worker\'s report; its tab and task stay as they are';
+      dismiss.addEventListener('click', () => postIpc({ type: 'delegation_dismiss', delegationId: d.delegation_id }));
+    }
+    actions.appendChild(el('span', 'dlg-note', d.delegation_id.slice(0, 8)));
+    refreshCardSend(card);
+  }
+  function renderResult(card, body) {
+    const d = card.data;
+    const result = d.result || {};
+    const reviewed = result.reviewed;
+    if (reviewed) {
+      body.appendChild(el('div', 'dlg-line', 'Reviewed at ' + shortHead(reviewed.head) + (reviewed.dirty ? ', dirty' : '') +
+        (reviewed.target_description && reviewed.target_description !== 'consult' ? ' · ' + reviewed.target_description : '')));
+      if (checkoutHead && reviewed.head && checkoutHead !== reviewed.head) {
+        body.appendChild(el('div', 'dlg-banner', 'The branch has moved since (now at ' + shortHead(checkoutHead) + '); line numbers may have drifted.'));
+      }
+    }
+    const f = findingsOf(d);
+    if (f) {
+      body.appendChild(el('div', 'dlg-line', 'Verdict: ' + (f.verdict || 'unknown').replace('_', ' ') + (f.structured ? '' : ' · unstructured reply')));
+      if (f.summary) body.appendChild(el('div', 'dlg-summary', f.summary));
+      if (card.selected == null) card.selected = new Set(f.findings.map((x) => x.id));
+      const list = body.appendChild(el('ul', 'dlg-findings'));
+      for (const finding of f.findings) {
+        const li = list.appendChild(el('li', 'dlg-finding'));
+        const box = li.appendChild(el('input'));
+        box.type = 'checkbox';
+        box.checked = card.selected.has(finding.id);
+        box.disabled = !!d.delivered_at;
+        box.addEventListener('change', () => {
+          if (box.checked) card.selected.add(finding.id); else card.selected.delete(finding.id);
+          refreshCardSend(card);
+        });
+        const main = li.appendChild(el('div', 'dlg-fmain'));
+        const top = main.appendChild(el('div'));
+        top.appendChild(el('span', 'sev ' + finding.severity, finding.severity));
+        top.appendChild(document.createTextNode(' '));
+        top.appendChild(el('span', 'dlg-fid', finding.id + ' '));
+        top.appendChild(el('span', 'dlg-ftitle', finding.title));
+        if (finding.file) {
+          const lines = finding.line_start ? ':' + finding.line_start + (finding.line_end && finding.line_end !== finding.line_start ? '-' + finding.line_end : '') : '';
+          const loc = main.appendChild(el('div'));
+          const link = loc.appendChild(el('span', 'dlg-loc', finding.file + lines));
+          link.title = 'Open ' + finding.file + ' in the file viewer';
+          link.addEventListener('click', (e) => { e.preventDefault(); openFinding(finding); });
+        }
+        if (finding.body) main.appendChild(el('div', 'dlg-fbody', finding.body));
+      }
+      return;
+    }
+    const handoff = result.handoff;
+    if (handoff) {
+      const summary = body.appendChild(el('div', 'assistant'));
+      summary.innerHTML = renderMarkdown(handoff.summary || '');
+      for (const [title, items] of [['Decisions', handoff.decisions], ['Next steps', handoff.next_steps], ['Blockers', handoff.blockers]]) {
+        if (!Array.isArray(items) || !items.length) continue;
+        body.appendChild(el('div', 'dlg-section', title));
+        const ul = body.appendChild(el('ul'));
+        for (const item of items) ul.appendChild(el('li', null, item));
+      }
+    }
+  }
+  function refreshCardSend(card) {
+    const btn = card.sendBtn;
+    const d = card.data;
+    if (!btn || !d || d.delivered_at || card.held) return;
+    const f = findingsOf(d);
+    const none = f && f.findings.length > 0 && card.selected && card.selected.size === 0;
+    btn.disabled = !!none;
+    if (none) btn.title = 'Select at least one finding';
+    else btn.title = busy ? 'Claude is working; it is sent when this turn ends' : 'Send the selected findings as a message';
+  }
+  function sendCard(card) {
+    const d = card.data;
+    const f = findingsOf(d);
+    const ids = f ? f.findings.map((x) => x.id).filter((id) => card.selected && card.selected.has(id)) : [];
+    postIpc({ type: 'delegation_send', delegationId: d.delegation_id, findingIds: ids });
+    if (card.sendBtn) { card.sendBtn.disabled = true; card.sendBtn.textContent = busy ? 'Queued, sends when Claude finishes' : 'Sending…'; }
+  }
+  window.__setDelegationHead = function (head) {
+    checkoutHead = head || null;
+    for (const card of cards.values()) if (card.data && state(card.data) === 'completed') renderCard(card);
+  };
+
+  // ---- agent roster (live subagents and delegations) -----------------------
+  const rosterEl = document.getElementById('roster');
+  const subagents = [];          // sub objects in start order
+  const rosterHidden = new Set(); // row keys the human closed
+  let rosterTimer = null;
+  function subagentRow(sub) {
+    const input = sub.item.input || {};
+    const last = sub.tools.length ? sub.tools[sub.tools.length - 1] : null;
+    const doing = sub.state === 'running'
+      ? (sub.waiting ? 'waiting for approval' : (last ? (last.desc || last.name) : (lastLine(sub.text) || 'starting')))
+      : (sub.state === 'done' ? 'done' : sub.state);
+    const parts = [];
+    if (sub.startMs != null) parts.push(fmtDur((sub.endMs != null ? sub.endMs : Date.now()) - sub.startMs));
+    if (sub.tokens != null) parts.push('↓ ' + sub.tokens + ' tokens');
+    return {
+      key: 'sub:' + sub.item.card.dataset.toolId,
+      cls: sub.state === 'running' ? 'running' : sub.state === 'done' ? 'done' : 'failed',
+      name: (input.subagent_type || 'Subagent') + ((input.model || sub.model) ? ' · ' + (input.model || sub.model) : ''),
+      what: (input.description ? input.description + ' — ' : '') + doing,
+      meta: parts.join(' · '),
+      target: sub.item.card,
+      details: sub.details,
+      live: sub.state === 'running',
+    };
+  }
+  function workerRow(card) {
+    const d = card.data;
+    const w = card.worker || {};
+    const ws = workerState(card);
+    const live = ['queued', 'starting', 'running', 'waiting'].includes(ws);
+    let what;
+    if (ws === 'done' || ws === 'blocked') {
+      const h = d.result && d.result.handoff;
+      what = (card.held ? 'sends when Claude finishes · ' : '') + ws + (h && h.summary ? ' · ' + lastLine(h.summary.split('\n')[0]) : '');
+    } else {
+      what = workerStateText(card) + (w.progress ? ' · ' + w.progress : '');
+    }
+    const created = parseTime(d.created_at);
+    const updated = parseTime(d.updated_at);
+    let meta = '';
+    if (live && created != null) meta = fmtDur(Date.now() - created);
+    else if (created != null && updated != null) meta = fmtDur(updated - created);
+    return {
+      key: 'dlg:' + d.delegation_id,
+      cls: ws === 'waiting' || ws === 'blocked' ? 'waiting' : ws === 'queued' || ws === 'starting' ? 'queued' : live ? 'running' : ws === 'done' ? 'done' : 'failed',
+      name: 'Worker · ' + (w.preset || 'agent') + ' · ' + (w.model || childModel(d)),
+      what, meta, target: card.root, live,
+    };
+  }
+  function delegationRow(card) {
+    const d = card.data;
+    if (isWorker(d)) return workerRow(card);
+    const st = state(d);
+    const live = st === 'running' || st === 'requested';
+    let what;
+    if (live) what = card.activity || (st === 'requested' ? 'queued' : 'starting');
+    else if (st === 'completed') what = (card.held ? 'sends when Claude finishes · ' : 'ready · ') + stateText(card);
+    else what = st;
+    const created = parseTime(d.created_at);
+    const updated = parseTime(d.updated_at);
+    let meta = '';
+    if (st === 'running' && updated != null) meta = fmtDur(Date.now() - updated);
+    else if (!live && created != null && updated != null) meta = fmtDur(updated - created);
+    return {
+      key: 'dlg:' + d.delegation_id,
+      cls: live ? (st === 'requested' ? 'queued' : 'running') : st === 'completed' ? 'done' : 'failed',
+      name: kindLabel(d) + ' · ' + childModel(d),
+      what, meta, target: card.root, live,
+    };
+  }
+  // Finished subagents read back after a restart: the latest few stay so
+  // the roster reads as it did before; older ones are history.
+  const ROSTER_REPLAYED_SUBAGENTS = 10;
+  function rosterRows() {
+    const rows = [];
+    const replayedDone = subagents.filter((sub) => sub.fromReplay && sub.state !== 'running');
+    const oldReplayed = new Set(replayedDone.slice(0, Math.max(0, replayedDone.length - ROSTER_REPLAYED_SUBAGENTS)));
+    for (const sub of subagents) {
+      if (oldReplayed.has(sub)) continue;
+      rows.push(subagentRow(sub));
+    }
+    for (const card of cards.values()) {
+      const d = card.data;
+      if (!d || d.dismissed_at || d.delivered_at) continue;
+      rows.push(delegationRow(card));
+    }
+    // Running rows first, so work in progress is in view above the
+    // finished rows in the short roster (the sort is stable).
+    return rows
+      .filter((row) => !rosterHidden.has(row.key))
+      .sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0));
+  }
+  // Row elements by key, updated in place. The roster re-renders every
+  // second while anything runs and on every subagent event; rebuilding the
+  // rows each time swapped the element out between a click's mousedown and
+  // mouseup, so the click never fired.
+  const rosterRowEls = new Map();
+  function setText(node, text) { if (node.textContent !== text) node.textContent = text; }
+  function makeRosterRow(key) {
+    const r = el('div', 'ro-row');
+    r.dataset.key = key;
+    r.appendChild(el('span', 'ro-dot'));
+    const v = {
+      r, row: null,
+      name: r.appendChild(el('span', 'ro-name')),
+      what: r.appendChild(el('span', 'ro-what')),
+      meta: r.appendChild(el('span', 'ro-meta')),
+      x: r.appendChild(el('button', 'ro-x', '×')),
+    };
+    v.x.title = 'Hide from this list';
+    v.x.addEventListener('click', (e) => { e.stopPropagation(); rosterHidden.add(key); renderRoster(); });
+    r.addEventListener('click', () => revealRosterTarget(v.row));
+    return v;
+  }
+  // Show what a roster row stands for: open its card (and a subagent's own
+  // activity block), stop following the latest message so the next event
+  // does not scroll it away, and flash it.
+  function revealRosterTarget(row) {
+    if (!row) return;
+    const target = row.target;
+    if (target.tagName === 'DETAILS') target.open = true;
+    if (row.details) row.details.open = true;
+    follow = false;
+    jumpBtn.classList.add('visible');
+    target.scrollIntoView({ block: row.details ? 'start' : 'nearest' });
+    target.classList.add('flash');
+    setTimeout(() => target.classList.remove('flash'), 900);
+  }
+  function renderRoster() {
+    const rows = rosterRows();
+    rosterEl.classList.toggle('visible', rows.length > 0);
+    let live = false;
+    const keys = new Set();
+    rows.forEach((row, i) => {
+      live = live || row.live;
+      keys.add(row.key);
+      let v = rosterRowEls.get(row.key);
+      if (!v) { v = makeRosterRow(row.key); rosterRowEls.set(row.key, v); }
+      v.row = row;
+      const cls = 'ro-row ' + row.cls;
+      if (v.r.className !== cls) v.r.className = cls;
+      setText(v.name, row.name);
+      setText(v.what, row.what);
+      setText(v.meta, row.meta || '');
+      v.meta.style.display = row.meta ? '' : 'none';
+      v.x.style.display = row.live ? 'none' : '';
+      if (rosterEl.children[i] !== v.r) rosterEl.insertBefore(v.r, rosterEl.children[i] || null);
+    });
+    for (const [key, v] of rosterRowEls) {
+      if (!keys.has(key)) { v.r.remove(); rosterRowEls.delete(key); }
+    }
+    // Timers tick while something runs.
+    const anyRunningCard = Array.from(cards.values()).some((c) => c.data && state(c.data) === 'running' && !c.data.dismissed_at);
+    if ((live || anyRunningCard) && !rosterTimer) {
+      rosterTimer = setInterval(() => {
+        for (const card of cards.values()) if (card.data && state(card.data) === 'running') card.stateEl.textContent = stateText(card);
+        renderRoster();
+      }, 1000);
+    } else if (!live && !anyRunningCard && rosterTimer) {
+      clearInterval(rosterTimer); rosterTimer = null;
+    }
+  }
+  function resetDelegations() {
+    cards.clear();
+    subagents.length = 0;
+    rosterHidden.clear();
+    if (rosterTimer) { clearInterval(rosterTimer); rosterTimer = null; }
+    renderRoster();
+  }
+
 
   // ---- runtime requests (panel above the composer) -----------------------
   function answer(requestId, decision) {
@@ -899,6 +2300,8 @@
     pending.set(d.request_id, { tool_use_id: d.tool_use_id, kind: d.kind, sending: false });
     const item = items.get(d.tool_use_id);
     if (item) item.badge.textContent = d.kind.type === 'question' ? 'waiting for your answer' : 'waiting for approval';
+    const subRoot = subTools.has(d.tool_use_id) && items.get(subTools.get(d.tool_use_id));
+    if (subRoot && subRoot.sub) { subRoot.sub.waiting = true; renderSubagent(subRoot.sub); }
     setActivity(d.kind.type === 'question' ? 'Waiting for your answer' : 'Waiting for approval: ' + (d.kind.tool_name || ''), 'waiting');
     renderPanel();
   }
@@ -908,15 +2311,71 @@
     pending.delete(requestId);
     const item = items.get(req.tool_use_id);
     if (item) { item.badge.textContent = ''; setActivity('Running ' + item.name); }
+    const subRoot = subTools.has(req.tool_use_id) && items.get(subTools.get(req.tool_use_id));
+    if (subRoot && subRoot.sub) { subRoot.sub.waiting = false; renderSubagent(subRoot.sub); }
     renderPanel();
   }
   function clearPending() {
     for (const req of pending.values()) {
       const item = items.get(req.tool_use_id);
       if (item) item.badge.textContent = '';
+      const subRoot = subTools.has(req.tool_use_id) && items.get(subTools.get(req.tool_use_id));
+      if (subRoot && subRoot.sub) { subRoot.sub.waiting = false; renderSubagent(subRoot.sub); }
     }
     pending.clear();
     renderPanel();
+  }
+
+  // ---- queued messages (TRU-140) -----------------------------------------
+  function markQueued(msg, id) {
+    msg.classList.add('queued');
+    const tag = el('div', 'queued-tag');
+    const label = el('span', null, 'Queued · Claude reads it at its next step');
+    const x = el('button', null, '\u00d7');
+    x.type = 'button';
+    x.title = 'Withdraw this message (Claude keeps working)';
+    x.addEventListener('click', () => {
+      x.disabled = true;
+      label.textContent = 'Withdrawing…';
+      postIpc({ type: 'withdraw', id });
+    });
+    tag.append(label, x);
+    msg.append(tag);
+    queued.set(id, { msg, tag, label, x });
+  }
+  function queuedLifecycle(id, state) {
+    const q = queued.get(id);
+    if (!q) return;
+    const action = queuedMarkerAction(state);
+    if (action === 'delivered') {
+      q.tag.remove();
+      q.msg.classList.remove('queued');
+      queued.delete(id);
+    } else if (action === 'remove') {
+      q.msg.remove();
+      queued.delete(id);
+    }
+  }
+  function queuedWithdrawRefused(id, reason) {
+    const q = queued.get(id);
+    if (!q) return;
+    q.label.textContent = 'Queued · Claude reads it at its next step';
+    q.x.disabled = false;
+    note('Not withdrawn: ' + reason, 'warn');
+  }
+  // Claude exited: its queue went with it.
+  function dropQueued() {
+    if (!queued.size) return;
+    const n = queued.size;
+    for (const q of queued.values()) {
+      q.msg.classList.remove('queued');
+      q.msg.classList.add('unsent');
+      q.label.textContent = 'Not sent: Claude exited before reading it';
+      q.x.remove();
+    }
+    queued.clear();
+    note(n === 1 ? 'A queued message was not delivered because Claude exited; send it again.'
+                 : n + ' queued messages were not delivered because Claude exited; send them again.', 'warn');
   }
 
   // ---- harness events ----------------------------------------------------
@@ -928,10 +2387,17 @@
     switch (ev.type) {
       case 'ready':
         confirmMode(d.permission_mode);
+        if (Array.isArray(d.models) && d.models.length) { chips.models = d.models; renderModel(); renderEffort(); }
         note(d.session_id ? 'Resumed Claude session ' + d.session_id.slice(0, 8) + ' · permission mode ' + (d.permission_mode || '?')
                           : 'Claude session ready · permission mode ' + (d.permission_mode || '?'));
         break;
       case 'turn_started':
+        // Claude starts a turn on its own when a background subagent
+        // finishes; show it as running like any other turn.
+        if (!busy) { endSegment(); endThinking(); setBusy(true); startActivity('Starting'); }
+        break;
+      case 'subagent_event':
+        subagentEvent(d.parent_tool_use_id, d.event);
         break;
       case 'text_delta':
         endThinking();
@@ -968,21 +2434,39 @@
         setBusy(false);
         break;
       }
+      case 'message_lifecycle':
+        queuedLifecycle(d.id, d.state);
+        break;
+      case 'message_withdraw_refused':
+        queuedWithdrawRefused(d.id, d.reason);
+        break;
       case 'permission_mode_changed':
         confirmMode(d);
         note('Permission mode · ' + modeLabel(d));
         break;
+      case 'model_changed':
+        confirmModel(d);
+        note('Model · ' + modelLabel(d));
+        break;
+      case 'effort_changed':
+        confirmEffort(d.effort, d.applied);
+        note('Effort · ' + effortLabel(d.effort) + (d.effort == null && d.applied ? ' (' + d.applied + ')' : ''));
+        break;
       case 'error':
-        // A rejected or undeliverable mode change surfaces as an error.
+        // A rejected or undeliverable mode, model or effort change
+        // surfaces as an error.
         clearPendingMode();
+        clearPendingChips();
         errorBlock(d);
         break;
       case 'process_exited':
         endSegment(); endThinking();
         clearPending();
         clearPendingMode();
+        clearPendingChips();
         if (busy) finishActivity('Claude exited', 'failed');
         note('Claude process exited' + (d.code != null ? ' (code ' + d.code + ')' : '') + '. The next message resumes the session.');
+        dropQueued();
         setBusy(false);
         break;
       default:
@@ -1027,10 +2511,30 @@
     if (!event || typeof event !== 'object') return;
     try {
       if (event.kind === 'harness') { harnessEvent(event.event); return; }
+      if (event.kind === 'delegation_anchor') { delegationAnchor(event.delegation_id); return; }
+      if (event.kind === 'delegation') { delegationEvent(event); return; }
       if (event.type === 'user_prompt') {
         endSegment(); endThinking();
-        append(el('div', 'user-msg', event.text || ''));
+        const msg = el('div', 'user-msg');
+        if (Array.isArray(event.images) && event.images.length) {
+          const strip = el('div', 'user-images');
+          for (const im of event.images) {
+            const img = el('img');
+            img.src = 'data:' + im.media_type + ';base64,' + im.data;
+            img.alt = 'attached image';
+            img.onload = scrollIfFollowing;
+            strip.append(img);
+          }
+          msg.append(strip);
+        }
+        if (event.text) msg.append(document.createTextNode(event.text));
+        // Sent while Claude works: it joins Claude's queue and the turn
+        // (and its activity clock) carries on.
+        const isQueued = event.queued === true && typeof event.id === 'string';
+        if (isQueued) markQueued(msg, event.id);
+        append(msg);
         follow = true;
+        if (isQueued && busy) return;
         setBusy(true);
         startActivity('Starting');
         return;
@@ -1057,6 +2561,7 @@
       if (!activity.timer) activity.timer = setInterval(paintActivity, 500);
     }
     paintActivity();
+    renderRoster();
     follow = true;
     messagesEl.scrollTop = messagesEl.scrollHeight;
   };
@@ -1064,7 +2569,8 @@
   window.__resetConversation = function () {
     messagesEl.innerHTML = '';
     segment = null; thinking = null;
-    items.clear(); pending.clear();
+    items.clear(); pending.clear(); subTools.clear(); queued.clear();
+    resetDelegations();
     if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
     activityEl.className = 'activity';
     follow = true;
@@ -1074,6 +2580,91 @@
   };
 
   window.__focusComposer = function () { promptEl.focus(); };
+
+  // Dictated text (voice input): insert at the caret, replacing any
+  // selection, as typing would; the synthetic `input` event runs the
+  // auto-grow above. Focus stays in the composer.
+  window.__insertComposerText = function (text) {
+    if (typeof text !== 'string' || text === '') return;
+    const start = promptEl.selectionStart ?? promptEl.value.length;
+    const end = promptEl.selectionEnd ?? start;
+    promptEl.setRangeText(text, start, end, 'end');
+    promptEl.dispatchEvent(new Event('input', { bubbles: true }));
+    promptEl.focus();
+  };
+
+  // ---- global shortcuts and editing chords (TRU-140) ----------------------
+  // While this page has keyboard focus its keys never reach GitTerm's own
+  // key handler, so the app-wide chords are handed to it instead. The list
+  // (isHostShortcut) is fixed and matches `forwarded_key` in main.rs:
+  // `global_shortcut`'s chords plus Cmd+V. Every other key (Enter,
+  // Shift+Enter, Cmd+Enter, Shift+Tab, the editing chords below) stays
+  // here. Escape goes to GitTerm only when nothing on this page is open for
+  // it to close. Capture phase, so this sees the page's state before the
+  // page's own Escape handlers close anything.
+  //
+  // Editing chords. GitTerm has no Edit menu: a menu key equivalent for
+  // Cmd+C / Cmd+V would take those keys from the terminal, which copies and
+  // pastes through its own key handling. AppKit only turns Cmd+C/X/V/A/Z
+  // into copy: / cut: / paste: / selectAll: / undo: through a menu, so
+  // without one WebKit does nothing with them. The page runs them itself
+  // (editingCommand), on whatever has focus (the composer, the Review
+  // popover's fields, the deny reason) or, for copy, on a transcript
+  // selection; a keydown is a user gesture, so execCommand('copy'|'cut')
+  // may write the pasteboard. Cmd+V is the exception: a script cannot read
+  // the pasteboard, so it is forwarded, and GitTerm sends the native
+  // paste: action to this page's WKWebView. The page then gets a real paste
+  // event (text, or image files for the composer's paste handler).
+  function pageHasOpenLayer() {
+    return modeMenuEl.classList.contains('visible')
+      || CHIP_MENUS.some((m) => m.classList.contains('visible'))
+      || reviewPopEl.classList.contains('visible')
+      || panelEl.classList.contains('visible');
+  }
+  function isHostShortcut(e) {
+    const k = e.key;
+    const digit = /^[1-9]$/.test(k);
+    const ctrlOnly = e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey;
+    const cmdOnly = e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
+    if (ctrlOnly && (k === ' ' || digit)) return true; // Ctrl+Space, Ctrl+1…9
+    if (cmdOnly && (digit || k.toLowerCase() === 't')) return true; // Cmd+1…9, Cmd+T
+    if (cmdOnly && k.toLowerCase() === 'v') return true; // Cmd+V: paste, sent back as the native paste: action
+    if (e.metaKey && e.shiftKey && !e.ctrlKey && !e.altKey && k.toLowerCase() === 'u') return true; // Cmd+Shift+U
+    if (k === 'Escape' && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) return !pageHasOpenLayer();
+    return false;
+  }
+  // The execCommand for an editing chord, or null. Command alone (Shift
+  // only for redo), as the Edit menu binds them.
+  function editingCommand(e) {
+    if (!e.metaKey || e.ctrlKey || e.altKey) return null;
+    const k = e.key.toLowerCase();
+    if (k === 'z') return e.shiftKey ? 'redo' : 'undo'; // Cmd+Z, Cmd+Shift+Z
+    if (e.shiftKey) return null;
+    if (k === 'c') return 'copy'; // Cmd+C
+    if (k === 'x') return 'cut'; // Cmd+X
+    if (k === 'a') return 'selectAll'; // Cmd+A
+    return null;
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.isComposing) return;
+    const command = editingCommand(e);
+    if (command) {
+      // Always taken: WebKit hands a key the page leaves alone back to
+      // AppKit, which passes it on to GitTerm's own view (where Cmd+C/V
+      // would reach the terminal). execCommand's false only means nothing
+      // to act on (no selection, nothing to undo), as a disabled Edit menu
+      // item would.
+      e.preventDefault();
+      document.execCommand(command);
+      return;
+    }
+    if (!isHostShortcut(e)) return;
+    e.preventDefault();
+    // A held chord auto-repeats; act once per press (Ctrl+Space would
+    // otherwise toggle dictation on and off).
+    if (e.repeat) return;
+    postIpc({ type: 'hostkey', key: e.key, code: e.code, meta: e.metaKey, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey });
+  }, true);
 
   refreshComposer();
   promptEl.focus();

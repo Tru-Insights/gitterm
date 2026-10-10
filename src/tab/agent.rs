@@ -13,13 +13,13 @@
 // Step 4 ships.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSession, ClaudeSessionConfig};
 use gitterm::harness::transcript::TranscriptEntry;
-use gitterm::harness::HarnessEvent;
+use gitterm::harness::{HarnessEvent, UserPrompt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -39,6 +39,9 @@ pub(crate) const CLAUDE_PERMISSION_MODES: [&str; 6] = [
     "dontAsk",
     "bypassPermissions",
 ];
+/// Effort levels the CLI accepts (`claude --help`: `--effort <level>`, and
+/// every model's `supportedEffortLevels` in the initialize reply).
+pub(crate) const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// Set to a directory to log every Claude stdin/stdout frame there.
 const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_CLAUDE_WIRE_LOG_DIR";
 
@@ -143,6 +146,29 @@ impl AgentEvent {
         Self::Other(serde_json::json!({"type": "user_prompt", "text": text}))
     }
 
+    /// The echo of a submitted prompt. Attached images ride along as
+    /// `images: [{media_type, data}]` so the page can show thumbnails in
+    /// the human's own message. A prompt with an id carries it as `id`, and
+    /// one sent while a turn runs is marked `queued: true`: the page shows
+    /// it as queued, with a withdraw button, until its `message_lifecycle`
+    /// says Claude picked it up. A plain text prompt is the plain echo.
+    pub(crate) fn submitted_prompt(prompt: &UserPrompt, queued: bool) -> Self {
+        if prompt.images.is_empty() && prompt.id.is_none() && !queued {
+            return Self::user_prompt(&prompt.text);
+        }
+        let mut echo = serde_json::json!({"type": "user_prompt", "text": prompt.text});
+        if !prompt.images.is_empty() {
+            echo["images"] = serde_json::json!(prompt.images);
+        }
+        if let Some(id) = &prompt.id {
+            echo["id"] = serde_json::json!(id);
+        }
+        if queued {
+            echo["queued"] = serde_json::json!(true);
+        }
+        Self::Other(echo)
+    }
+
     /// The JSON the chat webview's `__appendEvent` receives. Harness events
     /// are wrapped so the page can tell them from pi's raw stream shapes.
     pub(crate) fn webview_payload(&self) -> Option<serde_json::Value> {
@@ -231,29 +257,11 @@ impl AgentSession {
     /// Append an event to the conversation buffer, merging consecutive
     /// streaming fragments so tab switches replay a compact buffer.
     pub(crate) fn record(&mut self, ev: AgentEvent) {
-        use HarnessEvent as H;
         if let (Some(AgentEvent::Harness(last)), AgentEvent::Harness(next)) =
             (self.conversation.last_mut(), &ev)
         {
-            match (last, next) {
-                (H::TextDelta(a), H::TextDelta(b)) | (H::ThinkingDelta(a), H::ThinkingDelta(b)) => {
-                    a.push_str(b);
-                    return;
-                }
-                (
-                    H::ItemInputDelta {
-                        id: a_id,
-                        partial_json: a,
-                    },
-                    H::ItemInputDelta {
-                        id: b_id,
-                        partial_json: b,
-                    },
-                ) if a_id == b_id => {
-                    a.push_str(b);
-                    return;
-                }
-                _ => {}
+            if merge_fragment(last, next) {
+                return;
             }
         }
         self.conversation.push(ev);
@@ -293,6 +301,14 @@ impl AgentSession {
         self.config.backend()
     }
 
+    /// Whether a prompt submitted now joins Claude's queue instead of
+    /// starting a turn: a Claude process is running a turn. The CLI takes
+    /// it at the running turn's next tool boundary, or as the next turn.
+    /// A pi tab never gets here mid-turn (its composer waits for the turn).
+    pub(crate) fn submit_queues(&self) -> bool {
+        submit_queues(self.backend(), self.claude.is_some(), &self.state)
+    }
+
     /// The permission mode the next Claude spawn passes; `None` for pi.
     pub(crate) fn configured_permission_mode(&self) -> Option<String> {
         match &self.config {
@@ -305,6 +321,134 @@ impl AgentSession {
             ),
             AgentBackendConfig::Pi { .. } => None,
         }
+    }
+}
+
+/// See `AgentSession::submit_queues`: a Claude process is running a turn.
+pub(crate) fn submit_queues(
+    backend: AgentBackend,
+    process_running: bool,
+    state: &AgentSessionState,
+) -> bool {
+    backend == AgentBackend::Claude
+        && process_running
+        && matches!(state, AgentSessionState::Streaming)
+}
+
+/// One task's worktree as the chat's checkout chip sees it (TRU-143).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TaskWorktreeInfo<'a> {
+    pub(crate) title: &'a str,
+    /// The task's local workspace directory (`None` for remote workspaces).
+    pub(crate) workspace_dir: Option<&'a Path>,
+    pub(crate) worktree: Option<&'a Path>,
+    /// The worktree is prepared (`TaskWorktreeState::Ready`).
+    pub(crate) ready: bool,
+    pub(crate) archived: bool,
+}
+
+/// A directory a chat can start in.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct CheckoutChoice {
+    pub(crate) label: String,
+    pub(crate) detail: String,
+    pub(crate) path: PathBuf,
+}
+
+/// The label of the workspace's own checkout in the chip.
+pub(crate) const CURRENT_CHECKOUT_LABEL: &str = "Current checkout";
+
+fn dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// What the checkout chip offers before a chat's first message: the
+/// workspace's current checkout, then every prepared, unarchived task
+/// worktree of that workspace, each once. `same_path` compares directories
+/// (the app canonicalises; tests compare literally).
+pub(crate) fn checkout_choices<'a>(
+    workspace_dir: &Path,
+    tasks: impl IntoIterator<Item = TaskWorktreeInfo<'a>>,
+    same_path: impl Fn(&Path, &Path) -> bool,
+) -> Vec<CheckoutChoice> {
+    let mut choices = vec![CheckoutChoice {
+        label: CURRENT_CHECKOUT_LABEL.to_string(),
+        detail: workspace_dir.display().to_string(),
+        path: workspace_dir.to_path_buf(),
+    }];
+    for task in tasks {
+        let (Some(task_workspace), Some(worktree)) = (task.workspace_dir, task.worktree) else {
+            continue;
+        };
+        if !task.ready || task.archived || !same_path(task_workspace, workspace_dir) {
+            continue;
+        }
+        if choices.iter().any(|c| same_path(&c.path, worktree)) {
+            continue;
+        }
+        choices.push(CheckoutChoice {
+            label: dir_name(worktree),
+            detail: task.title.to_string(),
+            path: worktree.to_path_buf(),
+        });
+    }
+    choices
+}
+
+/// The chip's label for a chat running in `tab_dir`: the task worktree's
+/// name for a task-linked tab, "Current checkout" for the workspace's own
+/// directory, else the directory's name (a task worktree picked in the chip).
+pub(crate) fn checkout_label(
+    tab_dir: &Path,
+    task_worktree: Option<&Path>,
+    workspace_dir: &Path,
+    same_path: impl Fn(&Path, &Path) -> bool,
+) -> String {
+    if let Some(worktree) = task_worktree {
+        return dir_name(worktree);
+    }
+    if same_path(tab_dir, workspace_dir) {
+        return CURRENT_CHECKOUT_LABEL.to_string();
+    }
+    dir_name(tab_dir)
+}
+
+/// Fold `next` into `last` when both are fragments of the same stream:
+/// text, thinking, one tool call's input, or any of those from the same
+/// subagent. Returns whether `next` was absorbed.
+fn merge_fragment(last: &mut HarnessEvent, next: &HarnessEvent) -> bool {
+    use HarnessEvent as H;
+    match (last, next) {
+        (H::TextDelta(a), H::TextDelta(b)) | (H::ThinkingDelta(a), H::ThinkingDelta(b)) => {
+            a.push_str(b);
+            true
+        }
+        (
+            H::ItemInputDelta {
+                id: a_id,
+                partial_json: a,
+            },
+            H::ItemInputDelta {
+                id: b_id,
+                partial_json: b,
+            },
+        ) if a_id == b_id => {
+            a.push_str(b);
+            true
+        }
+        (
+            H::SubagentEvent {
+                parent_tool_use_id: a_parent,
+                event: a,
+            },
+            H::SubagentEvent {
+                parent_tool_use_id: b_parent,
+                event: b,
+            },
+        ) if a_parent == b_parent => merge_fragment(a, b),
+        _ => false,
     }
 }
 
@@ -547,5 +691,149 @@ fn build_command(config: &AgentBackendConfig, prompt: &str) -> Result<Command, S
         AgentBackendConfig::Claude { .. } => {
             Err("Claude tabs use the native harness session, not per-turn processes".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(parent: &str, event: HarnessEvent) -> AgentEvent {
+        AgentEvent::Harness(HarnessEvent::SubagentEvent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(event),
+        })
+    }
+
+    fn harness(events: &[AgentEvent]) -> Vec<&HarnessEvent> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Harness(h) => Some(h),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn task<'a>(
+        title: &'a str,
+        workspace: &'a str,
+        worktree: &'a str,
+        ready: bool,
+        archived: bool,
+    ) -> TaskWorktreeInfo<'a> {
+        TaskWorktreeInfo {
+            title,
+            workspace_dir: Some(Path::new(workspace)),
+            worktree: Some(Path::new(worktree)),
+            ready,
+            archived,
+        }
+    }
+
+    #[test]
+    fn checkout_choices_are_the_checkout_then_this_workspaces_ready_worktrees() {
+        let same = |a: &Path, b: &Path| a == b;
+        let ws = Path::new("/repo");
+        let tasks = [
+            task("Add chips", "/repo", "/wt/tru-143-chips", true, false),
+            task("Other repo", "/other", "/wt/other", true, false),
+            task("Not prepared", "/repo", "/wt/preparing", false, false),
+            task("Done", "/repo", "/wt/archived", true, true),
+            task("Same tree again", "/repo", "/wt/tru-143-chips", true, false),
+            TaskWorktreeInfo {
+                title: "Remote",
+                workspace_dir: None,
+                worktree: Some(Path::new("/wt/remote")),
+                ready: true,
+                archived: false,
+            },
+            task("Fix review", "/repo", "/wt/tru-142-review", true, false),
+        ];
+        let choices = checkout_choices(ws, tasks, same);
+        let summary: Vec<(&str, &str, &Path)> = choices
+            .iter()
+            .map(|c| (c.label.as_str(), c.detail.as_str(), c.path.as_path()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Current checkout", "/repo", Path::new("/repo")),
+                ("tru-143-chips", "Add chips", Path::new("/wt/tru-143-chips")),
+                (
+                    "tru-142-review",
+                    "Fix review",
+                    Path::new("/wt/tru-142-review")
+                ),
+            ]
+        );
+        // No tasks: the checkout alone.
+        assert_eq!(checkout_choices(ws, [], same).len(), 1);
+    }
+
+    #[test]
+    fn checkout_label_names_the_task_worktree_or_the_checkout() {
+        let same = |a: &Path, b: &Path| a == b;
+        let ws = Path::new("/repo");
+        assert_eq!(checkout_label(ws, None, ws, same), "Current checkout");
+        assert_eq!(
+            checkout_label(Path::new("/wt/tru-143"), None, ws, same),
+            "tru-143"
+        );
+        assert_eq!(
+            checkout_label(ws, Some(Path::new("/wt/task-tree")), ws, same),
+            "task-tree"
+        );
+    }
+
+    #[test]
+    fn record_coalesces_subagent_deltas_per_parent() {
+        let mut session = AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        session.record(AgentEvent::Harness(HarnessEvent::TextDelta(
+            "parent ".into(),
+        )));
+        session.record(sub("a", HarnessEvent::TextDelta("one ".into())));
+        session.record(sub("a", HarnessEvent::TextDelta("two".into())));
+        // A different subagent, or a non-delta, starts a new entry.
+        session.record(sub("b", HarnessEvent::TextDelta("other".into())));
+        session.record(sub("b", HarnessEvent::ThinkingDelta("hm".into())));
+        session.record(sub("b", HarnessEvent::ThinkingDelta("m".into())));
+        session.record(sub(
+            "b",
+            HarnessEvent::ItemCompleted {
+                id: "t".into(),
+                output: String::new(),
+                is_error: false,
+            },
+        ));
+        session.record(sub(
+            "b",
+            HarnessEvent::ItemCompleted {
+                id: "t2".into(),
+                output: String::new(),
+                is_error: false,
+            },
+        ));
+        // Subagent text does not merge into the parent's text either way.
+        session.record(AgentEvent::Harness(HarnessEvent::TextDelta("more".into())));
+
+        let got = harness(&session.conversation);
+        assert_eq!(got.len(), 7, "{got:?}");
+        assert_eq!(got[0], &HarnessEvent::TextDelta("parent ".into()));
+        let AgentEvent::Harness(expected) = sub("a", HarnessEvent::TextDelta("one two".into()))
+        else {
+            unreachable!()
+        };
+        assert_eq!(got[1], &expected);
+        let AgentEvent::Harness(expected) = sub("b", HarnessEvent::ThinkingDelta("hmm".into()))
+        else {
+            unreachable!()
+        };
+        assert_eq!(got[3], &expected);
+        assert_eq!(got[6], &HarnessEvent::TextDelta("more".into()));
     }
 }

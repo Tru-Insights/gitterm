@@ -220,6 +220,68 @@ All of these are observed.
 | `{"subtype":"set_permission_mode","mode":"not-a-mode"}` | `{"subtype":"error",…,"error":"Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan","error_code":"invalid_mode"}` |
 | `{"subtype":"set_model","model":"haiku"}` (null or `"default"` resets) | `{"subtype":"success",…}` (no payload) |
 | unknown subtype | `{"subtype":"error",…,"error":"Unsupported control request subtype: no_such_subtype"}` |
+| `{"subtype":"set_model","model":"nonsense"}` (TRU-143) | `{"subtype":"error",…,"error":"Model 'nonsense' not found","error_code":"catalog_unknown"}` |
+| `{"subtype":"apply_flag_settings","settings":{"effortLevel":"low"}}` (TRU-143; `null` resets) | `{"subtype":"success",…}` (no payload; an unknown level also succeeds and is not applied) |
+| `{"subtype":"cancel_async_message","message_uuid":"<uuid>"}` (TRU-140) | `{"subtype":"success",…,"response":{"cancelled":true}}` while the message is still queued (a `command_lifecycle` `cancelled` frame comes first); `"cancelled":false` once a turn has taken it |
+| `{"subtype":"get_settings"}` (TRU-143) | `{"subtype":"success",…,"response":{"effective":{…},"sources":[{"source":"userSettings",…},{"source":"flagSettings","settings":{"effortLevel":"low"}}],"applied":{"model":"claude-sonnet-5-5","effort":"low",…}}}` |
+
+There is no `set_effort` subtype (`Unsupported control request subtype: set_effort`). The SDK changes
+effort mid-session with `apply_flag_settings {effortLevel}`; GitTerm confirms it by reading
+`get_settings` back and comparing the `flagSettings` source's `effortLevel` (not `effective`, which
+also carries the user's own `effortLevel`). `applied.effort` is the level in force, which for
+`null` is the model's default. The `get_settings` reply includes the user's whole settings, so it
+is never logged or kept as a fixture untrimmed.
+
+### Mid-turn user messages (TRU-140, observed on claude 2.1.295, haiku)
+
+The CLI accepts a `user` frame at any time. A message written while a
+turn runs is queued by the CLI, not rejected or dropped:
+
+- **A tool boundary comes:** the running turn takes the message after the
+  current tool result and before the next model call. The model answers it
+  inside the same turn, and there is a single `result` for both. This held
+  for two messages sent together, one of which carried a base64 image.
+- **No tool boundary comes** (a text-only turn): the message waits. The
+  CLI then starts it as a turn of its own right after the first `result`
+  (`command_lifecycle started`, a new `system/init`, and later its own
+  `result`). The host sends nothing further.
+
+A `user` frame that carries a `uuid` (any UUID string; the host chooses it)
+gets `command_lifecycle` frames. The CLI advertises this as the
+`msg_lifecycle_v1` capability on `system/init`, and `--replay-user-messages`
+is not needed for it:
+
+```json
+{"type":"command_lifecycle","command_uuid":"<uuid>","state":"queued","uuid":"…","session_id":"…"}
+```
+
+The states are `queued` (on receipt, even when idle), `started` (a turn took
+it), `completed` (that turn ended), and `cancelled` (withdrawn).
+
+Smoke sequence for the tool-boundary case, sending …b, …c (image) and …d
+after the first tool started, then withdrawing …d:
+
+```
+turn_started -> tool_started(Bash) -> SENT(b,c,d) -> WITHDRAW(d)
+-> b queued -> c queued -> d queued -> d cancelled -> tool_done
+-> b started -> c started -> tool_started(Bash) -> tool_done -> tool_started(Bash) -> tool_done
+-> text ("Done. … Red. The year is 2026.") -> b completed -> c completed -> result
+```
+
+For a text-only turn:
+`turn_started -> text -> SENT(e) -> e queued -> text -> result -> e started -> turn_started -> text ("The current year is 2026.") -> result -> e completed`.
+
+An interrupt without `cancel_queued` leaves queued messages in the queue:
+the receipt lists them under `still_queued`, and they run next.
+
+`--replay-user-messages` (probed separately, not used) echoes each `user`
+frame as `{"type":"user",…,"uuid":…,"isReplay":true}` at the moment a turn
+takes it. The lifecycle frames carry the same information.
+
+GitTerm's handling: every chat message goes out with a uuid. If it is sent
+while a turn runs, the page shows it as queued, with a withdraw button,
+until `started` arrives. The withdraw button sends `cancel_async_message`.
+Stop stays a plain interrupt.
 
 After an interrupt the CLI sends these frames, in this order:
 
@@ -384,8 +446,8 @@ the per-turn path, and the old `claude --print` command builder is gone.
   (`chats::claude_session_exists`), the session starts fresh instead of
   failing `--resume`.
 - A model of `"default"` (or empty) omits `--model`, so the user's Claude
-  settings choose. The "Claude chat" entry in the picker uses this, with
-  permission mode `default`.
+  settings choose. (TRU-143: "New chat" now starts on the configured or
+  remembered model, `opus` by default, with permission mode `default`.)
 - Frames carrying a non-null `parent_tool_use_id` (subagent internals) are
   ignored. The parent Task tool card still shows.
 - Any runtime request still open when its turn ends, or when the process
@@ -412,6 +474,10 @@ the per-turn path, and the old `claude --print` command builder is gone.
 **Open:**
 
 - The `--resume` path from the UI after an app restart has not been exercised
+  live.
+- The Chats panel's "Resume as Chat" (local Claude chats) opens the session
+  in a chat tab through the same restored-tab path (history read-back, then
+  `--resume` on the first prompt). Covered by unit tests only; not exercised
   live.
 - The Edit menu (needed for Cmd+V in WKWebView) has not been checked against
   the terminal's own Cmd+C/V handling in the running app.

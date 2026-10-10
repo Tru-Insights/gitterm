@@ -1,0 +1,13 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "car": {
+      "type": "choice",
+      "choice": "a",
+      "probabilities": { "a": 0.95, "none": 0.05, "b": 0 },
+      "confidence": 0.92
+    },
+    "onScreen": { "type": "noul", "noul": 0.82 }
+  },
+  "usage": { "input_tokens": 385, "output_tokens": 58 }
+}

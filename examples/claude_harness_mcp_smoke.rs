@@ -27,6 +27,9 @@ use tokio::sync::mpsc;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(180);
 const SENTINEL: &str = "mcp-smoke-sentinel-7f3a";
+// The chat tab's durable session_uid (TRU-142 S1): carried as `?caller=` on
+// the task MCP URL and expected on every bridged call.
+const CALLER: &str = "mcp-smoke-caller-5b21";
 
 fn arg(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
@@ -46,11 +49,17 @@ async fn main() {
     tokio::spawn(task_server.run());
     let task_lists = Arc::new(AtomicUsize::new(0));
     let counted = task_lists.clone();
+    let attributed_lists = Arc::new(AtomicUsize::new(0));
+    let attributed = attributed_lists.clone();
     tokio::spawn(async move {
         while let Some(envelope) = task_requests.recv().await {
+            println!("[bridge] caller {:?}", envelope.caller);
             match envelope.operation {
                 TaskControlOperation::List(_) => {
                     counted.fetch_add(1, Ordering::SeqCst);
+                    if envelope.caller.as_deref() == Some(CALLER) {
+                        attributed.fetch_add(1, Ordering::SeqCst);
+                    }
                     envelope.reply.send(Ok(serde_json::json!({
                         "tasks": [{ "id": "smoke-1", "title": SENTINEL }],
                     })));
@@ -79,7 +88,10 @@ async fn main() {
         effort: None,
         resume: None,
         wire_log_dir: Some(workdir.with_extension("wire")),
-        mcp_servers: vec![task.claude_mcp_server(), browser.claude_mcp_server()],
+        mcp_servers: vec![
+            task.claude_mcp_server(Some(CALLER)),
+            browser.claude_mcp_server(),
+        ],
     };
     println!("argv: {}", config.args().join(" "));
     let (session, mut events) = ClaudeSession::spawn(config);
@@ -127,10 +139,15 @@ async fn main() {
     println!("\n<< {text}\n");
     drop(session);
     let lists = task_lists.load(Ordering::SeqCst);
+    let attributed_lists = attributed_lists.load(Ordering::SeqCst);
 
     let checks = [
         ("turn completed", status == TurnStatus::Completed),
         ("task_list reached the task server", lists >= 1),
+        (
+            "every task_list carried the chat tab's caller",
+            attributed_lists == lists,
+        ),
         ("reply carries the task title", text.contains(SENTINEL)),
         (
             "reply names browser tools",

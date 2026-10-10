@@ -35,6 +35,7 @@ mod webview;
 
 // New modules
 mod agent;
+mod chat_rank;
 mod config;
 mod events;
 mod tab;
@@ -48,7 +49,9 @@ use gitterm::browser_control::{
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
 use gitterm::chats;
 use gitterm::gh_identity::GH_ACCOUNT_ENV_KEY;
-use gitterm::harness::{HarnessCommand, HarnessEvent, RuntimeDecision, TurnStatus};
+use gitterm::harness::{
+    HarnessCommand, HarnessEvent, ImageAttachment, RuntimeDecision, TurnStatus, UserPrompt,
+};
 use gitterm::task_mcp::{
     self, CreateTaskRequest as McpCreateTaskRequest, TaskControlEnvelope, TaskControlOperation,
     TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
@@ -68,6 +71,9 @@ use gitterm::tasks::{
     TaskAttentionReason, TaskCreator, TaskCreatorKind, TaskHandoff, TaskLifecycle, TaskProgress,
     TaskRecord, TaskSessionRecord, TaskStore, TaskStoreError, TaskWorktree, TaskWorktreeState,
     VerificationState, WorkspaceIdentity as TaskWorkspaceIdentity, WorkspaceLocationIdentity,
+};
+use gitterm::worktree_follow::{
+    self, CacheLookup, WorktreeFollow, WorktreeInfo, WorktreeListCache,
 };
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{
@@ -111,9 +117,19 @@ pub enum AgentIpcMessage {
     Submit {
         tab_id: usize,
         text: String,
+        /// Images pasted or dropped into the composer (TRU-140). `Err`
+        /// carries why the page's images were malformed or over the caps;
+        /// nothing is sent then.
+        images: Result<Vec<ImageAttachment>, String>,
     },
     Stop {
         tab_id: usize,
+    },
+    /// The human withdrew a queued message (its × in the timeline) before
+    /// Claude picked it up. Does not interrupt the running turn.
+    Withdraw {
+        tab_id: usize,
+        id: String,
     },
     /// The human answered a runtime request (permission or question).
     Answer {
@@ -126,6 +142,87 @@ pub enum AgentIpcMessage {
         tab_id: usize,
         mode: String,
     },
+    /// The human picked a model on the composer's model chip (TRU-143).
+    SetModel {
+        tab_id: usize,
+        model: String,
+    },
+    /// The human picked an effort level; `None` is the model's default.
+    SetEffort {
+        tab_id: usize,
+        effort: Option<String>,
+    },
+    /// The checkout chip's menu opened and wants fresh choices.
+    CheckoutContext {
+        tab_id: usize,
+    },
+    /// The human picked a directory on the checkout chip.
+    SetCheckout {
+        tab_id: usize,
+        path: PathBuf,
+    },
+    /// The Review… popover opened and wants its git defaults (TRU-142).
+    ReviewContext {
+        tab_id: usize,
+    },
+    /// The Review… popover was submitted. `Err` carries why the page's
+    /// request could not be read.
+    ReviewRequest {
+        tab_id: usize,
+        request: Result<gitterm::review::ReviewRequest, String>,
+    },
+    /// The popover's Consult… kind was submitted (TRU-142 S5).
+    ConsultRequest {
+        tab_id: usize,
+        request: Result<gitterm::review::ConsultRequest, String>,
+    },
+    /// A delegation card's Send to Claude, with the ticked finding ids.
+    DelegationSend {
+        tab_id: usize,
+        delegation_id: String,
+        finding_ids: Vec<String>,
+    },
+    DelegationRerun {
+        tab_id: usize,
+        delegation_id: String,
+    },
+    DelegationDismiss {
+        tab_id: usize,
+        delegation_id: String,
+    },
+    /// A worker card's Open worker tab (TRU-142 S6).
+    DelegationOpenWorker {
+        tab_id: usize,
+        delegation_id: String,
+    },
+    /// A finding's `file:line` was clicked; relative to the tab's checkout.
+    OpenFile {
+        tab_id: usize,
+        path: PathBuf,
+    },
+    /// A global shortcut typed while the chat page had keyboard focus, so
+    /// the key never reached the Iced key handler (TRU-140). Only chords
+    /// `global_shortcut` knows get here.
+    HostKey {
+        key: Key,
+        modifiers: Modifiers,
+    },
+    /// Cmd+V typed in tab `tab_id`'s chat page (TRU-140). With no Edit
+    /// menu WebKit does nothing with it, so the app sends the page the
+    /// native `paste:` action.
+    PastePage {
+        tab_id: usize,
+    },
+}
+
+/// Where a delegation request came from, so its acceptance or refusal
+/// reaches whoever asked (TRU-142).
+#[derive(Debug, Clone)]
+pub enum DelegationOrigin {
+    /// A `review_request` / `consult_request` tool call.
+    Mcp(TaskControlReply),
+    /// The chat page of this tab (Review… popover, Re-run).
+    Page(usize),
 }
 
 static AGENT_IPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<AgentIpcMessage>> =
@@ -285,11 +382,18 @@ fn push_agent_event_to_webview(tab_id: usize, ev: &tab::AgentEvent) {
 
 /// Replay a tab's whole conversation buffer into its page in one script call.
 /// The page renders it without live timing (elapsed counters, auto-follow
-/// jitter).
-fn replay_agent_conversation_in_webview(tab_id: usize, conversation: &[tab::AgentEvent]) {
+/// jitter). `cards` are the tab's delegation cards (TRU-142): they are not in
+/// the conversation, so they follow it; a card whose anchor is in the
+/// conversation lands at the anchor, any other at the end.
+fn replay_agent_conversation_in_webview(
+    tab_id: usize,
+    conversation: &[tab::AgentEvent],
+    cards: Vec<serde_json::Value>,
+) {
     let payloads: Vec<serde_json::Value> = conversation
         .iter()
         .filter_map(tab::AgentEvent::webview_payload)
+        .chain(cards)
         .collect();
     let json = serde_json::Value::Array(payloads);
     webview::evaluate_script(
@@ -298,20 +402,77 @@ fn replay_agent_conversation_in_webview(tab_id: usize, conversation: &[tab::Agen
     );
 }
 
+/// A transcript read-back as a chat timeline, with each delegation card's
+/// anchor put back where the card was requested
+/// (`delegations::history_anchor_positions`).
+fn history_timeline(
+    entries: Vec<gitterm::harness::transcript::TimedEntry>,
+    delegations: &[(String, String)],
+) -> Vec<tab::AgentEvent> {
+    let anchors = gitterm::delegations::history_anchor_positions(&entries, delegations);
+    let mut anchors = anchors.into_iter().peekable();
+    let mut timeline = Vec::with_capacity(entries.len() + delegations.len());
+    for (index, timed) in entries.into_iter().enumerate() {
+        while let Some((_, id)) = anchors.next_if(|(at, _)| *at == index) {
+            timeline.push(tab::AgentEvent::Other(
+                gitterm::delegations::anchor_payload(&id),
+            ));
+        }
+        timeline.push(tab::AgentEvent::from(timed.entry));
+    }
+    timeline.extend(
+        anchors.map(|(_, id)| tab::AgentEvent::Other(gitterm::delegations::anchor_payload(&id))),
+    );
+    timeline
+}
+
+/// Queue dictated `text` for chat tab `tab_id` until its page is built.
+/// Successive dictations join exactly as they do in a terminal, which gets
+/// each transcript verbatim with no separator.
+#[cfg(feature = "stt")]
+fn hold_composer_dictation(held: &mut HashMap<usize, String>, tab_id: usize, text: &str) {
+    held.entry(tab_id).or_default().push_str(text);
+}
+
 /// Tell a freshly built chat page which tab it belongs to. The page tags every
 /// IPC message with this id so the Rust dispatcher routes the prompt/stop to
 /// the right tab; each tab has its own page, so this runs once per page.
 /// `permission_mode` is the Claude tab's configured mode (what the next spawn
 /// passes); the replayed buffer's `ready` and `permission_mode_changed` events
-/// override it. `None` (pi tabs) hides the mode chip.
-fn set_agent_webview_tab_id(tab_id: usize, permission_mode: Option<&str>) {
+/// override it. `None` (pi tabs) hides the mode chip. `composer` carries the
+/// Claude tab's configured model and effort and its checkout chip state
+/// (`None` for pi tabs hides those chips).
+fn set_agent_webview_tab_id(
+    tab_id: usize,
+    permission_mode: Option<&str>,
+    composer: Option<&serde_json::Value>,
+) {
     let mode = serde_json::to_string(&permission_mode).unwrap_or_else(|e| {
         eprintln!("[agent-webview] tab {tab_id}: cannot encode mode {permission_mode:?}: {e}");
         "null".to_string()
     });
+    let composer = composer.map_or_else(|| "null".to_string(), |c| c.to_string());
     webview::evaluate_script(
         WebviewSurface::Agent(tab_id),
-        &format!("window.__setTabId({tab_id}, {mode})"),
+        &format!("window.__setTabId({tab_id}, {mode}, {composer})"),
+    );
+}
+
+/// Update a chat page's checkout chip (choices, label, lock).
+fn push_checkout_state_to_webview(tab_id: usize, checkout: &serde_json::Value) {
+    webview::evaluate_script(
+        WebviewSurface::Agent(tab_id),
+        &format!("window.__setCheckout({checkout})"),
+    );
+}
+
+/// Show a transient note in a tab's chat page (not recorded in the
+/// conversation buffer), e.g. why a Review… request was not sent.
+fn agent_webview_note(tab_id: usize, text: &str) {
+    let text = serde_json::Value::String(text.to_string());
+    webview::evaluate_script(
+        WebviewSurface::Agent(tab_id),
+        &format!("window.__reviewNote({text})"),
     );
 }
 
@@ -322,6 +483,124 @@ fn reset_agent_webview(tab_id: usize) {
         WebviewSurface::Agent(tab_id),
         "window.__resetConversation()",
     );
+}
+
+/// A chord with the same app-wide meaning whatever has focus. The Iced key
+/// handler acts on these (resolving them against app state: which tabs are
+/// visible, how many workspaces exist, which overlay is open), and a chat
+/// page forwards exactly these when it has keyboard focus, since its keys
+/// never reach the handler (TRU-140).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalShortcut {
+    /// Ctrl+Space: start or stop dictation (`stt` builds).
+    Dictation,
+    /// Ctrl+1…9: the nth workspace.
+    SelectWorkspace(usize),
+    /// Cmd+1…9: the nth visible tab.
+    SelectTab(usize),
+    /// Cmd+Shift+U: the Usage view.
+    UsageView,
+    /// Cmd+T: the task switcher.
+    TaskSwitcher,
+    /// Escape with no modifiers: dismiss the topmost app overlay. The key
+    /// handler resolves Escape against app state itself; it is listed here
+    /// so a chat page can forward it.
+    Escape,
+}
+
+/// Which global shortcut `key` with `modifiers` is, if any. Pure, so the
+/// Iced key handler and the chat page's forwarded keys share one table.
+fn global_shortcut(key: &Key, modifiers: Modifiers) -> Option<GlobalShortcut> {
+    match key.as_ref() {
+        Key::Named(key::Named::Space)
+            if modifiers.control()
+                && !modifiers.command()
+                && !modifiers.shift()
+                && !modifiers.alt() =>
+        {
+            Some(GlobalShortcut::Dictation)
+        }
+        Key::Named(key::Named::Escape) if modifiers.is_empty() => Some(GlobalShortcut::Escape),
+        Key::Character(c) => {
+            let digit = c.parse::<usize>().ok().filter(|n| (1..=9).contains(n));
+            if let Some(num) = digit {
+                if modifiers.control() && !modifiers.command() {
+                    return Some(GlobalShortcut::SelectWorkspace(num));
+                }
+                if modifiers.command() {
+                    return Some(GlobalShortcut::SelectTab(num));
+                }
+                return None;
+            }
+            if modifiers.command() && modifiers.shift() && c.eq_ignore_ascii_case("u") {
+                return Some(GlobalShortcut::UsageView);
+            }
+            if modifiers.command()
+                && !modifiers.shift()
+                && !modifiers.control()
+                && c.eq_ignore_ascii_case("t")
+            {
+                return Some(GlobalShortcut::TaskSwitcher);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// What a chord a chat page forwarded asks the app to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardedKey {
+    /// An app-wide chord, run through the Iced key handler.
+    Global(GlobalShortcut),
+    /// Cmd+V: paste into the page that forwarded it. Not a global shortcut:
+    /// in the terminal Cmd+V is the terminal's own paste, which the Iced
+    /// key handler leaves to iced_term.
+    Paste,
+}
+
+/// Which forwarded chord `key` with `modifiers` is, if any: the chat page's
+/// `isHostShortcut` allow-list as the host reads it. Pure, for tests.
+fn forwarded_key(key: &Key, modifiers: Modifiers) -> Option<ForwardedKey> {
+    if let Key::Character(c) = key.as_ref() {
+        if c.eq_ignore_ascii_case("v")
+            && modifiers.command()
+            && !modifiers.shift()
+            && !modifiers.control()
+            && !modifiers.alt()
+        {
+            return Some(ForwardedKey::Paste);
+        }
+    }
+    global_shortcut(key, modifiers).map(ForwardedKey::Global)
+}
+
+/// Read a chord a chat page forwarded (`{type: "hostkey", key, code, meta,
+/// ctrl, shift, alt}`) as the key and modifiers the Iced key handler would
+/// have seen. `key` is the DOM `KeyboardEvent.key` (the logical key, as
+/// Iced reports it); `code` is not needed.
+fn hostkey_chord(value: &serde_json::Value) -> Result<(Key, Modifiers), String> {
+    let name = value.get("key").and_then(|v| v.as_str()).ok_or("no key")?;
+    let key = match name {
+        "Escape" => Key::Named(key::Named::Escape),
+        " " => Key::Named(key::Named::Space),
+        c if c.chars().count() == 1 => Key::Character(c.into()),
+        other => return Err(format!("unsupported key {other:?}")),
+    };
+    let mut modifiers = Modifiers::empty();
+    for (field, flag) in [
+        ("meta", Modifiers::LOGO),
+        ("ctrl", Modifiers::CTRL),
+        ("shift", Modifiers::SHIFT),
+        ("alt", Modifiers::ALT),
+    ] {
+        match value.get(field) {
+            Some(serde_json::Value::Bool(true)) => modifiers.insert(flag),
+            Some(serde_json::Value::Bool(false)) => {}
+            _ => return Err(format!("no boolean {field}")),
+        }
+    }
+    Ok((key, modifiers))
 }
 
 /// Build the IPC handler closure to install at agent-webview creation. Parses
@@ -353,9 +632,29 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                AgentIpcMessage::Submit { tab_id, text }
+                let images = match value.get("images") {
+                    None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+                    Some(images) => serde_json::from_value::<Vec<ImageAttachment>>(images.clone())
+                        .map_err(|e| format!("the attached images were malformed ({e})")),
+                }
+                .and_then(|images| gitterm::harness::validate_images(&images).map(|()| images));
+                AgentIpcMessage::Submit {
+                    tab_id,
+                    text,
+                    images,
+                }
             }
             "stop" => AgentIpcMessage::Stop { tab_id },
+            "withdraw" => {
+                let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] withdraw without id: {}", body);
+                    return;
+                };
+                AgentIpcMessage::Withdraw {
+                    tab_id,
+                    id: id.to_string(),
+                }
+            }
             "answer" => {
                 let Some(request_id) = value.get("requestId").and_then(|v| v.as_str()) else {
                     eprintln!("[agent-ipc] answer without requestId: {}", body);
@@ -390,6 +689,122 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                 AgentIpcMessage::SetPermissionMode {
                     tab_id,
                     mode: mode.to_string(),
+                }
+            }
+            "set_model" => {
+                let Some(model) = value.get("model").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] set_model without model: {}", body);
+                    return;
+                };
+                AgentIpcMessage::SetModel {
+                    tab_id,
+                    model: model.to_string(),
+                }
+            }
+            "set_effort" => {
+                let effort = match value.get("effort") {
+                    Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(level)) => Some(level.clone()),
+                    _ => {
+                        eprintln!("[agent-ipc] set_effort without effort: {}", body);
+                        return;
+                    }
+                };
+                AgentIpcMessage::SetEffort { tab_id, effort }
+            }
+            "checkout_context" => AgentIpcMessage::CheckoutContext { tab_id },
+            "set_checkout" => {
+                let Some(path) = value.get("path").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] set_checkout without path: {}", body);
+                    return;
+                };
+                AgentIpcMessage::SetCheckout {
+                    tab_id,
+                    path: PathBuf::from(path),
+                }
+            }
+            "review_context" => AgentIpcMessage::ReviewContext { tab_id },
+            "review_request" => AgentIpcMessage::ReviewRequest {
+                tab_id,
+                request: serde_json::from_value(value.clone())
+                    .map_err(|e| format!("could not read the review request: {e}")),
+            },
+            "consult_request" => AgentIpcMessage::ConsultRequest {
+                tab_id,
+                request: serde_json::from_value(value.clone())
+                    .map_err(|e| format!("could not read the consult request: {e}")),
+            },
+            "delegation_send"
+            | "delegation_rerun"
+            | "delegation_dismiss"
+            | "delegation_open_worker" => {
+                let Some(delegation_id) = value
+                    .get("delegationId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                else {
+                    eprintln!("[agent-ipc] {kind} without delegationId: {body}");
+                    return;
+                };
+                match kind {
+                    "delegation_send" => {
+                        let finding_ids = match value.get("findingIds") {
+                            None | Some(serde_json::Value::Null) => Vec::new(),
+                            Some(ids) => match serde_json::from_value::<Vec<String>>(ids.clone()) {
+                                Ok(ids) => ids,
+                                Err(e) => {
+                                    eprintln!("[agent-ipc] bad findingIds in {body}: {e}");
+                                    return;
+                                }
+                            },
+                        };
+                        AgentIpcMessage::DelegationSend {
+                            tab_id,
+                            delegation_id,
+                            finding_ids,
+                        }
+                    }
+                    "delegation_rerun" => AgentIpcMessage::DelegationRerun {
+                        tab_id,
+                        delegation_id,
+                    },
+                    "delegation_open_worker" => AgentIpcMessage::DelegationOpenWorker {
+                        tab_id,
+                        delegation_id,
+                    },
+                    _ => AgentIpcMessage::DelegationDismiss {
+                        tab_id,
+                        delegation_id,
+                    },
+                }
+            }
+            "open_file" => {
+                let Some(path) = value.get("path").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] open_file without path: {body}");
+                    return;
+                };
+                AgentIpcMessage::OpenFile {
+                    tab_id,
+                    path: PathBuf::from(path),
+                }
+            }
+            "hostkey" => {
+                let (key, modifiers) = match hostkey_chord(&value) {
+                    Ok(chord) => chord,
+                    Err(e) => {
+                        eprintln!("[agent-ipc] tab {tab_id}: bad hostkey ({e}): {body}");
+                        return;
+                    }
+                };
+                match forwarded_key(&key, modifiers) {
+                    Some(ForwardedKey::Global(_)) => AgentIpcMessage::HostKey { key, modifiers },
+                    Some(ForwardedKey::Paste) => AgentIpcMessage::PastePage { tab_id },
+                    None => {
+                        eprintln!(
+                            "[agent-ipc] tab {tab_id}: ignoring hostkey {key:?} {modifiers:?}, not a forwarded chord"
+                        );
+                        return;
+                    }
                 }
             }
             "open_url" => {
@@ -2296,17 +2711,24 @@ enum AttentionReason {
     HumanInputRequired,
     AgentFailed,
     CompletedUnread,
+    /// A Codex review or consult this tab requested has its result (TRU-142).
+    DelegationReady(gitterm::tasks::DelegationKind),
+    /// A Codex review or consult this tab requested failed.
+    DelegationFailed(gitterm::tasks::DelegationKind),
+    /// A worker this tab delegated reported itself blocked (TRU-142 S6):
+    /// it needs the human.
+    DelegationBlocked(gitterm::tasks::DelegationKind),
 }
 
 impl AttentionReason {
-    /// Rank on the shared inbox scale: 0 input needed · 1 failed ·
+    /// Rank on the shared attention scale: 0 input needed · 1 failed ·
     /// 2 interrupted (task-only) · 3 ready to review. Failures outrank
     /// completions by construction.
     fn priority(self) -> u8 {
         match self {
-            Self::HumanInputRequired => 0,
-            Self::AgentFailed => 1,
-            Self::CompletedUnread => 3,
+            Self::HumanInputRequired | Self::DelegationBlocked(_) => 0,
+            Self::AgentFailed | Self::DelegationFailed(_) => 1,
+            Self::CompletedUnread | Self::DelegationReady(_) => 3,
         }
     }
 
@@ -2315,14 +2737,22 @@ impl AttentionReason {
             Self::HumanInputRequired => "Input or approval needed",
             Self::AgentFailed => "Agent failed",
             Self::CompletedUnread => "Ready to review",
+            Self::DelegationReady(gitterm::tasks::DelegationKind::Review) => "Review ready",
+            Self::DelegationReady(gitterm::tasks::DelegationKind::Consult) => "Consult ready",
+            Self::DelegationReady(gitterm::tasks::DelegationKind::Implement) => "Worker done",
+            Self::DelegationFailed(gitterm::tasks::DelegationKind::Review) => "Review failed",
+            Self::DelegationFailed(gitterm::tasks::DelegationKind::Consult) => "Consult failed",
+            Self::DelegationFailed(gitterm::tasks::DelegationKind::Implement) => "Worker failed",
+            Self::DelegationBlocked(gitterm::tasks::DelegationKind::Implement) => "Worker blocked",
+            Self::DelegationBlocked(_) => "Delegation blocked",
         }
     }
 
     fn icon(self) -> &'static str {
         match self {
-            Self::HumanInputRequired => "●",
-            Self::AgentFailed => "!",
-            Self::CompletedUnread => "✓",
+            Self::HumanInputRequired | Self::DelegationBlocked(_) => "●",
+            Self::AgentFailed | Self::DelegationFailed(_) => "!",
+            Self::CompletedUnread | Self::DelegationReady(_) => "✓",
         }
     }
 }
@@ -2342,26 +2772,125 @@ impl TabAttention {
     }
 }
 
-/// Where an attention inbox row leads when selected.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Where an attention row leads when selected.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AttentionTarget {
     Tab(usize),
     Task(String),
 }
 
-/// One row in the attention inbox: a session tab's live attention, or a
+/// One attention row (rail dots, TRU-148): a session tab's live attention, or a
 /// task whose durable attention no open tab is already surfacing.
 #[derive(Debug, Clone)]
 struct AttentionItem {
     target: AttentionTarget,
-    workspace_name: String,
-    machine_name: String,
+    /// The open workspace this row belongs to: always set for a tab row;
+    /// a task row has one only when its local workspace is open.
+    workspace_idx: Option<usize>,
     title: String,
-    /// The shared inbox scale — see [`AttentionReason::priority`].
+    /// The shared attention scale — see [`AttentionReason::priority`].
     priority: u8,
     icon: &'static str,
     label: &'static str,
-    age_secs: u64,
+    /// How long this row has been waiting, unrounded. Ordering on whole
+    /// seconds let two rows raised under a second apart tie on some frames
+    /// and not on others, so they swapped places every half second
+    /// (TRU-133); the exact duration keeps their gap — and order — fixed.
+    waiting: Duration,
+}
+
+impl AttentionItem {
+    /// The attention row for a tab's live attention, aged against `now`.
+    fn for_tab(tab: &TabState, workspace_idx: usize, now: Instant) -> Option<Self> {
+        let attention = tab.attention?;
+        let title = tab
+            .terminal_title()
+            .map(strip_title_status_glyphs)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(tab.repo_name.as_str())
+            .to_string();
+        Some(Self {
+            target: AttentionTarget::Tab(tab.id),
+            workspace_idx: Some(workspace_idx),
+            title,
+            priority: attention.reason.priority(),
+            icon: attention.reason.icon(),
+            label: attention.reason.label(),
+            waiting: now.saturating_duration_since(attention.since),
+        })
+    }
+}
+
+/// Attention order: priority, then longest-waiting first, then the target
+/// id. Every key is fixed while a row's attention is unchanged, so rows
+/// never trade places between frames.
+fn attention_item_order(left: &AttentionItem, right: &AttentionItem) -> std::cmp::Ordering {
+    left.priority
+        .cmp(&right.priority)
+        .then(right.waiting.cmp(&left.waiting))
+        .then_with(|| left.target.cmp(&right.target))
+}
+
+fn sort_attention_items(items: &mut [AttentionItem]) {
+    items.sort_by(attention_item_order);
+}
+
+/// How much a workspace wants the human, as its rail dot shows it
+/// (TRU-148): the attention scale of [`AttentionReason::priority`] and
+/// [`task_attention_presentation`], then a running turn below all of them.
+/// Declaration order is urgency order — the smallest value wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RailUrgency {
+    NeedsYou,
+    Failed,
+    Interrupted,
+    Review,
+    Running,
+}
+
+impl RailUrgency {
+    fn from_priority(priority: u8) -> Self {
+        match priority {
+            0 => Self::NeedsYou,
+            1 => Self::Failed,
+            2 => Self::Interrupted,
+            _ => Self::Review,
+        }
+    }
+}
+
+/// The most urgent reason among one workspace's attention rows, or
+/// Running when nothing waits but a turn is in flight. None keeps the dot's
+/// plain look.
+fn workspace_rail_urgency(items: &[AttentionItem], any_running: bool) -> Option<RailUrgency> {
+    items
+        .iter()
+        .map(|item| RailUrgency::from_priority(item.priority))
+        .min()
+        .or_else(|| any_running.then_some(RailUrgency::Running))
+}
+
+/// Where a click on a workspace's rail dot lands: its most urgent row, on
+/// the same order the rows are listed in. None means nothing waits and the
+/// click is a plain workspace switch.
+fn rail_click_target(items: &[AttentionItem]) -> Option<AttentionTarget> {
+    items
+        .iter()
+        .min_by(|left, right| attention_item_order(left, right))
+        .map(|item| item.target.clone())
+}
+
+/// The colour a rail dot (and its hover rows) gives an urgency level.
+/// Needs-you pulses between peach and amber like the tab strip's dot.
+fn rail_urgency_color(theme: &AppTheme, urgency: RailUrgency, pulse_bright: bool) -> iced::Color {
+    match urgency {
+        RailUrgency::NeedsYou if pulse_bright => theme.peach(),
+        RailUrgency::NeedsYou => theme.warning(),
+        RailUrgency::Failed => theme.danger(),
+        RailUrgency::Interrupted => theme.peach(),
+        RailUrgency::Review => theme.success(),
+        RailUrgency::Running => theme.blue(),
+    }
 }
 
 fn format_attention_age(elapsed_secs: u64) -> String {
@@ -2410,13 +2939,228 @@ fn aggregate_task_live_states(
     working.then_some(TaskLifecycle::Running)
 }
 
+/// One look at something that can need the human, fed to
+/// [`NeedsYouNotifier::observe`] (TRU-148).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NeedsYouObservation {
+    target: AttentionTarget,
+    /// The needs-you reason's label while it waits on the human.
+    needs_you: Option<&'static str>,
+    /// Mid-turn right now.
+    running: bool,
+    /// In front of the user (the active tab of the active workspace).
+    front: bool,
+    /// Its needs-you only counts after it was seen working: a harness
+    /// title's "✳" also means idle at the prompt, which a restored tab
+    /// shows on boot without anything having happened.
+    requires_work: bool,
+}
+
+/// A needs-you transition worth a notification: where, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NeedsYouNudge {
+    target: AttentionTarget,
+    label: &'static str,
+}
+
+/// Detects background tabs and tasks turning to needs-you, for the macOS
+/// notification (TRU-148). Level-triggered: each observation is compared
+/// with the last, so a reason that stays raised never repeats; one that
+/// clears and comes back is a new transition, held to one notification
+/// per target and reason every [`Self::REPEAT_AFTER`].
+#[derive(Debug)]
+struct NeedsYouNotifier {
+    started: Instant,
+    raised: HashSet<(AttentionTarget, &'static str)>,
+    seen_working: HashSet<AttentionTarget>,
+    last_fired: HashMap<(AttentionTarget, &'static str), Instant>,
+}
+
+impl NeedsYouNotifier {
+    /// Restored tabs settle (titles, requests, task states) in the first
+    /// seconds after launch; nothing then is news.
+    const LAUNCH_GRACE: Duration = Duration::from_secs(5);
+    const REPEAT_AFTER: Duration = Duration::from_secs(60);
+
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            raised: HashSet::new(),
+            seen_working: HashSet::new(),
+            last_fired: HashMap::new(),
+        }
+    }
+
+    /// Record what is raised now and return the transitions to announce:
+    /// newly raised, not in front, past the launch grace, worked first when
+    /// that is required, and not announced for the same reason within
+    /// [`Self::REPEAT_AFTER`].
+    fn observe(
+        &mut self,
+        now: Instant,
+        observations: impl IntoIterator<Item = NeedsYouObservation>,
+    ) -> Vec<NeedsYouNudge> {
+        let in_grace = now.saturating_duration_since(self.started) < Self::LAUNCH_GRACE;
+        self.last_fired
+            .retain(|_, fired| now.saturating_duration_since(*fired) < Self::REPEAT_AFTER);
+        let mut raised = HashSet::new();
+        let mut nudges = Vec::new();
+        for observation in observations {
+            if observation.running {
+                self.seen_working.insert(observation.target.clone());
+            }
+            let Some(label) = observation.needs_you else {
+                continue;
+            };
+            let key = (observation.target.clone(), label);
+            raised.insert(key.clone());
+            if self.raised.contains(&key) {
+                continue;
+            }
+            // A transition spends the working mark, announced or not.
+            let worked = self.seen_working.remove(&observation.target);
+            if in_grace
+                || observation.front
+                || (observation.requires_work && !worked)
+                || self.last_fired.contains_key(&key)
+            {
+                continue;
+            }
+            self.last_fired.insert(key, now);
+            nudges.push(NeedsYouNudge {
+                target: observation.target,
+                label,
+            });
+        }
+        self.raised = raised;
+        nudges
+    }
+}
+
+/// `text` as an AppleScript string literal.
+fn applescript_string(text: &str) -> String {
+    let mut literal = String::with_capacity(text.len() + 2);
+    literal.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\n' | '\r' => literal.push(' '),
+            _ => literal.push(ch),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
+/// The `osascript` source that posts a needs-you notification.
+fn needs_you_notification_script(title: &str, body: &str) -> String {
+    format!(
+        "display notification {} with title {}",
+        applescript_string(body),
+        applescript_string(title)
+    )
+}
+
+/// Post a macOS notification off the UI thread. A plain notification:
+/// `osascript` owns it, so clicking it cannot focus GitTerm's tab.
+fn post_needs_you_notification(title: &str, body: &str) {
+    let script = needs_you_notification_script(title, body);
+    std::thread::spawn(move || {
+        match std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => eprintln!(
+                "[notify] osascript exited {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => eprintln!("[notify] could not run osascript: {error}"),
+        }
+    });
+}
+
+/// One row of the Chats panel's Open section (TRU-148): an open tab, where
+/// it lives, and what orders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenTabRow {
+    workspace_idx: usize,
+    tab_idx: usize,
+    tab_id: usize,
+    /// Its attention on the shared scale and how long it has waited.
+    attention: Option<(u8, Duration)>,
+    running: bool,
+}
+
+/// Whether an open tab belongs in the Open section: a tab with a chat
+/// session (a chat page or a CLI harness the Chats registry knows) always;
+/// a plain terminal only while it has attention.
+fn open_section_includes(has_chat_session: bool, has_attention: bool) -> bool {
+    has_chat_session || has_attention
+}
+
+/// Open-section order: tabs that want the human first (most urgent, then
+/// longest waiting), then running, then idle; ties keep workspace and tab
+/// order. Every key is fixed while a tab's state is unchanged, so rows do
+/// not trade places between frames.
+fn sort_open_tab_rows(rows: &mut [OpenTabRow]) {
+    rows.sort_by_key(|row| {
+        let class = if row.attention.is_some() {
+            0
+        } else if row.running {
+            1
+        } else {
+            2
+        };
+        let (priority, waiting) = row.attention.unwrap_or((u8::MAX, Duration::ZERO));
+        (
+            class,
+            priority,
+            std::cmp::Reverse(waiting),
+            row.workspace_idx,
+            row.tab_idx,
+        )
+    });
+}
+
+/// Whether a harness title says it is working: the leading glyph is one of
+/// the spinner frames [`strip_title_status_glyphs`] documents ("◐"/"◑", the
+/// older sparkle set, braille spinners) — not the idle "✳" or a shell's "*".
+fn terminal_title_shows_working(title: &str) -> bool {
+    title.trim_start().chars().next().is_some_and(|ch| {
+        matches!(ch, '◐' | '◑' | '◒' | '◓' | '✢' | '✶' | '✻' | '✽' | '·')
+            || ('\u{2800}'..='\u{28FF}').contains(&ch)
+    })
+}
+
 fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
     title
         .starts_with('✳')
         .then_some(AttentionReason::HumanInputRequired)
 }
 
-/// Inbox presentation for a task attention reason on the shared priority
+/// A harness title with its leading status glyphs removed. Claude Code
+/// writes "✳ <topic>" while it is not working and alternates "◐ <topic>" /
+/// "◑ <topic>" every ~1s while it is; older builds and other harnesses use
+/// the "·✢✶✻✽" sparkle set or braille spinners, and shells may prefix "*".
+/// The topic after the glyph is what a row or progress line should show —
+/// the glyph changes every frame and would make the text churn.
+fn strip_title_status_glyphs(title: &str) -> &str {
+    title
+        .trim_start_matches(|ch: char| {
+            matches!(
+                ch,
+                '✳' | '✢' | '✶' | '✻' | '✽' | '·' | '◐' | '◑' | '◒' | '◓' | '*'
+            ) || ('\u{2800}'..='\u{28FF}').contains(&ch)
+                || ch.is_whitespace()
+        })
+        .trim_end()
+}
+
+/// Row presentation for a task attention reason on the shared priority
 /// scale: (priority, icon, label).
 fn task_attention_presentation(reason: TaskAttentionReason) -> (u8, &'static str, &'static str) {
     match reason {
@@ -2427,6 +3171,37 @@ fn task_attention_presentation(reason: TaskAttentionReason) -> (u8, &'static str
         TaskAttentionReason::CompletedUnread | TaskAttentionReason::ReadyForReview => {
             (3, "✓", "Ready to review")
         }
+    }
+}
+
+/// What a chat tab's icon in the session strip says about its live session
+/// (TRU-140). Terminal tabs get this from Claude's own title; a chat tab
+/// has no title, so the strip reads the agent session instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatTabMarker {
+    /// A permission prompt or question waits on the human: the strip's
+    /// "needs you" dot. `pulse` is off on the tab in front, whose page
+    /// already shows the request card.
+    NeedsYou { pulse: bool },
+    /// A turn is running: the strip's ▶ marker.
+    Running,
+}
+
+/// The marker for a chat tab: a pending request outranks a running turn
+/// (the human is the blocker); neither means the tab falls back to its
+/// attention icon or the idle chat glyph. Clears as soon as the requests
+/// are answered and the turn ends, since both inputs are live state.
+fn chat_tab_marker(
+    turn_running: bool,
+    pending_requests: usize,
+    is_active: bool,
+) -> Option<ChatTabMarker> {
+    if pending_requests > 0 {
+        Some(ChatTabMarker::NeedsYou { pulse: !is_active })
+    } else if turn_running {
+        Some(ChatTabMarker::Running)
+    } else {
+        None
     }
 }
 
@@ -2574,10 +3349,79 @@ fn conversation_backend_glyph(backend: HarnessConversationBackend) -> &'static s
     }
 }
 
+/// Whether the Chats panel offers "Resume as Chat" for an entry: a local
+/// Claude conversation whose recorded directory still exists and that no tab
+/// owns yet (an owned one shows "Go to Session"). Codex and pi chats, remote
+/// chats and dead-cwd chats keep only their existing action.
+fn can_resume_as_chat(entry: &chats::ChatIndexEntry, is_remote: bool, is_live: bool) -> bool {
+    entry.backend == chats::ChatBackend::Claude && !is_remote && !is_live && !entry.dead_cwd
+}
+
+/// The config a new Claude chat tab starts with: the remembered or configured
+/// model and effort ("default" leaves the model to the user's Claude
+/// settings) and the default permission mode.
+fn new_claude_chat_config(chat_config: &config::ChatDefaults) -> AgentBackendConfig {
+    let selection = chat_config.new_chat_selection();
+    AgentBackendConfig::Claude {
+        model: selection.model,
+        permission_mode: Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
+        effort: selection.effort,
+    }
+}
+
+/// The session of a chat tab resuming Claude session `session_id`: the new
+/// chat config, with the id set the way a restored chat tab has it, so the
+/// transcript is read back when the tab is shown and the first prompt
+/// resumes the session.
+fn resumed_claude_chat_session(
+    chat_config: &config::ChatDefaults,
+    session_id: &str,
+) -> AgentSession {
+    let mut session = AgentSession::new(new_claude_chat_config(chat_config));
+    session.session_id = Some(session_id.to_string());
+    session
+}
+
 /// Shell command that reopens a recorded task conversation with its
 /// full history. Derived from the task store alone — the Chats index
 /// is only built when the Chats panel opens, so resume must not
 /// depend on it.
+/// A persisted `claude … --session-id <id>` launch whose session has since
+/// been written cannot be re-run: the CLI refuses with "Session ID <id> is
+/// already in use". Returns the resume command (other flags kept) and the
+/// id in that case. None leaves the command alone: not a Claude launch, no
+/// `--session-id`, a quoted command (an embedded brief) or a session that
+/// never got a message, where the fresh launch is still right.
+fn resume_for_preassigned_claude_launch(
+    command: &str,
+    session_exists: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    if command.contains(['"', '\'']) {
+        return None;
+    }
+    let mut words = command.split_whitespace();
+    if words.next() != Some("claude") {
+        return None;
+    }
+    let words: Vec<&str> = words.collect();
+    let idx = words.iter().position(|w| *w == "--session-id")?;
+    let id = *words.get(idx + 1)?;
+    if !session_exists(id) {
+        return None;
+    }
+    let mut out = vec!["claude"];
+    out.extend(
+        words
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx && *i != idx + 1)
+            .map(|(_, w)| *w),
+    );
+    out.push("--resume");
+    out.push(id);
+    Some((out.join(" "), id.to_string()))
+}
+
 fn conversation_resume_command(conversation: &HarnessConversationRef) -> String {
     let backend = conversation_chat_backend(conversation.backend);
     backend.resume_command(backend.label(), &conversation.session_id)
@@ -2603,7 +3447,10 @@ fn preset_conversation_backend(preset: &AgentPreset) -> Option<HarnessConversati
     }
 }
 
-fn task_handoff_prompt(task: &TaskRecord) -> String {
+/// The brief a task session starts with. `report_back` is the worker
+/// delegation this session carries out (TRU-142 S6): the brief then ends with
+/// the Report back section naming it.
+fn task_handoff_prompt(task: &TaskRecord, report_back: Option<&str>) -> String {
     let bullet_list = |items: &[String]| {
         if items.is_empty() {
             "- none recorded".to_string()
@@ -2658,7 +3505,7 @@ fn task_handoff_prompt(task: &TaskRecord) -> String {
             )
         },
     );
-    format!(
+    let brief = format!(
         "Continue GitTerm task {task_id}: {title}\n\n\
 Objective:\n{objective}\n\n\
 Task context:\n\
@@ -2683,7 +3530,14 @@ summary before stopping when that tool is available.",
         base_ref = task.base.reference,
         base_commit = task.base.commit,
         stopping_boundary = stopping_boundary_label(task.stopping_boundary),
-    )
+    );
+    match report_back {
+        Some(delegation_id) => format!(
+            "{brief}\n\n{}",
+            gitterm::delegations::report_back_section(delegation_id, &task.task_id)
+        ),
+        None => brief,
+    }
 }
 
 /// Directory holding composed task briefs. A launch command hands the full
@@ -2710,8 +3564,13 @@ fn backend_accepts_initial_prompt(backend: Option<HarnessConversationBackend>) -
 
 /// Writes the composed brief for one task session and returns its path, or a
 /// launch-safe error. Refuses paths containing a single quote — the path is
-/// embedded single-quoted in the launch command.
-fn write_task_brief(session_id: &str, task: &TaskRecord) -> Result<PathBuf, String> {
+/// embedded single-quoted in the launch command. `report_back` as in
+/// `task_handoff_prompt`.
+fn write_task_brief(
+    session_id: &str,
+    task: &TaskRecord,
+    report_back: Option<&str>,
+) -> Result<PathBuf, String> {
     let dir = task_brief_dir();
     let path = dir.join(format!("{session_id}.md"));
     if path.display().to_string().contains('\'') {
@@ -2721,7 +3580,7 @@ fn write_task_brief(session_id: &str, task: &TaskRecord) -> Result<PathBuf, Stri
         ));
     }
     std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-    std::fs::write(&path, task_handoff_prompt(task))
+    std::fs::write(&path, task_handoff_prompt(task, report_back))
         .map_err(|error| format!("write {}: {error}", path.display()))?;
     Ok(path)
 }
@@ -2782,6 +3641,21 @@ pub struct PendingTaskLaunch {
     resolved_worktree_path: Option<PathBuf>,
     request: PrepareTaskWorktreeRequest,
     control_reply: Option<TaskControlReply>,
+    /// `session_uid` of the tab whose MCP call created this task, recorded
+    /// as `TaskCreator.session_id`. `None` for manual creation.
+    creator_session_id: Option<String>,
+    /// Set by `delegate_task` (TRU-142 S6): once the worktree is ready, a
+    /// worker delegation is recorded and the worker launched, instead of
+    /// replying with the bare task.
+    worker: Option<PendingWorker>,
+}
+
+/// The worker a `delegate_task` call asked for, carried through task
+/// creation.
+#[derive(Debug, Clone)]
+pub struct PendingWorker {
+    caller: gitterm::delegations::CallerTab,
+    choice: gitterm::workers::WorkerChoice,
 }
 
 #[derive(Debug, Clone)]
@@ -2926,12 +3800,20 @@ struct TabState {
     task_id: Option<String>,
     // Durable identity of this child session inside its task.
     task_session_id: Option<String>,
+    // Durable caller identity of this tab (uuid v4), persisted in
+    // workspaces.json. Carried as `?caller=` on the task MCP URL every
+    // harness in this tab receives, so the task server knows which tab called.
+    session_uid: String,
     // Live execution signal for the task session this tab hosts; None when
     // nothing is observably running (or the tab is not task-linked).
     task_live_state: Option<TaskSessionLiveState>,
     // Last PTY output instant for task-linked tabs. Stamped on the terminal
     // hot path, so it must stay a bare Instant — no string or store work.
     task_last_activity: Option<Instant>,
+    // Worktree this chat tab's agent works in, and whether the Git and
+    // Files panels follow it (TRU-146). Derived from the tool stream; never
+    // persisted. `repo_path` / `current_dir` stay on the workspace root.
+    worktree_follow: WorktreeFollow,
     is_git_repo: bool,
 }
 
@@ -2988,11 +3870,13 @@ impl TabState {
             chat_session_id: None,
             task_id: None,
             task_session_id: None,
+            session_uid: uuid::Uuid::new_v4().to_string(),
             task_live_state: None,
             task_last_activity: None,
             attention: None,
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
+            worktree_follow: WorktreeFollow::default(),
             is_git_repo,
         }
     }
@@ -3058,6 +3942,24 @@ impl TabState {
         }
     }
 
+    /// Record a new terminal title and apply the title adapter: Claude Code
+    /// prefixes its title with "✳" (U+2733) whenever it is not working —
+    /// idle at the prompt or waiting on an approval — and animates "◐"/"◑"
+    /// while it is. A ✳ raises input-needed only on a tab with no other
+    /// attention: replacing a delegation result would restamp `since` and
+    /// jump the row to the top, and the next working frame would then clear
+    /// it — the result's row gone before its card was read (TRU-133).
+    /// Re-sent ✳ frames (topic renames) keep the original `since`.
+    fn observe_terminal_title(&mut self, title: String) {
+        let waiting = terminal_title_attention_reason(&title);
+        self.set_terminal_title(Some(title));
+        match waiting {
+            Some(reason) if self.attention.is_none() => self.set_attention(reason),
+            Some(_) => {}
+            None => self.clear_attention(AttentionReason::HumanInputRequired),
+        }
+    }
+
     fn clear_attention(&mut self, reason: AttentionReason) {
         if self
             .attention
@@ -3071,8 +3973,30 @@ impl TabState {
         self.attention.is_some()
     }
 
+    /// Whether this tab's session is observably mid-turn: a chat turn
+    /// streaming, a task session working, or a harness title spinning.
+    fn is_running(&self) -> bool {
+        self.agent_session()
+            .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming))
+            || self.task_live_state == Some(TaskSessionLiveState::Working)
+            || self
+                .terminal_title()
+                .is_some_and(terminal_title_shows_working)
+    }
+
     fn mark_visited(&mut self) {
         self.clear_attention(AttentionReason::CompletedUnread);
+        // A delegation result is read on the card in this tab.
+        if let Some(attention) = self.attention {
+            if matches!(
+                attention.reason,
+                AttentionReason::DelegationReady(_)
+                    | AttentionReason::DelegationFailed(_)
+                    | AttentionReason::DelegationBlocked(_)
+            ) {
+                self.attention = None;
+            }
+        }
     }
 
     /// The startup command requested when this tab was created (e.g. "claude").
@@ -4016,10 +4940,6 @@ impl Workspace {
         self.tabs.iter().filter(|tab| tab.needs_attention()).count()
     }
 
-    fn has_attention(&self) -> bool {
-        self.tabs.iter().any(TabState::needs_attention)
-    }
-
     fn highest_priority_attention(&self) -> Option<AttentionReason> {
         self.tabs
             .iter()
@@ -4035,6 +4955,40 @@ fn task_tab_indices(workspace: &Workspace, task_id: &str) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, tab)| (tab.task_id.as_deref() == Some(task_id)).then_some(index))
         .collect()
+}
+
+/// Who wrote a `task_update_handoff`, as recorded in
+/// `TaskHandoff.updated_by_session_id`. An explicit `session_id` must be one
+/// of the task's sessions. Without one the calling tab (`caller`, its
+/// `session_uid`) is the writer: the task session it hosts when that tab
+/// belongs to this task, otherwise (a coordinator tab outside the task) its
+/// `session_uid` itself. No explicit id and no caller records nobody.
+fn handoff_writer(
+    workspaces: &[Workspace],
+    task_id: &str,
+    task_sessions: &[String],
+    explicit_session_id: Option<&str>,
+    caller: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(session_id) = explicit_session_id.map(str::trim) {
+        return if task_sessions.iter().any(|known| known == session_id) {
+            Ok(Some(session_id.to_string()))
+        } else {
+            Err(format!(
+                "Task {task_id} does not contain session {session_id}"
+            ))
+        };
+    }
+    let Some(caller) = caller else {
+        return Ok(None);
+    };
+    let hosted_session = workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tabs.iter())
+        .find(|tab| tab.session_uid == caller && tab.task_id.as_deref() == Some(task_id))
+        .and_then(|tab| tab.task_session_id.clone())
+        .filter(|session_id| task_sessions.contains(session_id));
+    Ok(Some(hosted_session.unwrap_or_else(|| caller.to_string())))
 }
 
 fn find_task_session_tab(workspaces: &[Workspace], session_id: &str) -> Option<(usize, usize)> {
@@ -4458,11 +5412,8 @@ pub enum Event {
     // Attention system events
     AttentionPulseTick,
     AttentionJumpNext,
-    AttentionViewToggle,
-    AttentionViewClose,
-    AttentionItemSelect(usize),
-    AttentionTaskSelect(String),
-    AttentionDismiss(AttentionTarget),
+    /// A workspace dot on the rail was clicked (TRU-148).
+    WorkspaceDotPressed(usize),
     // Launch agent preset by index
     AgentActivityLoaded(usize, Result<agent::AgentActivity, String>),
     AgentConversationLoaded(usize, agent::Conversation),
@@ -4473,8 +5424,9 @@ pub enum Event {
     // Resume agent preset session by index
     ResumeAgentPreset(usize),
     // Live agent tab (TabKind::Agent) — Step 3 of TRU-29.
-    /// User submitted a prompt for the agent tab with this id.
-    AgentSubmitPrompt(usize, String),
+    /// User submitted a prompt (text plus any attached images) for the
+    /// agent tab with this id.
+    AgentSubmitPrompt(usize, UserPrompt),
     /// User clicked the stop button on the agent tab with this id.
     AgentStopRequested(usize),
     /// User answered a pending runtime request (Claude permission prompt
@@ -4482,8 +5434,51 @@ pub enum Event {
     AgentAnswerRequest(usize, String, RuntimeDecision),
     /// User picked a permission mode for the Claude chat tab with this id.
     AgentSetPermissionMode(usize, String),
-    /// Open a native Claude chat tab in the active workspace (TRU-140).
+    /// The chat tab's Review… popover asked for its git defaults.
+    AgentReviewContextRequested(usize),
+    /// Git defaults for the Review… popover, computed off the UI thread.
+    AgentReviewContextLoaded(usize, gitterm::review::ReviewContext),
+    /// The chat tab's Review… popover was submitted (TRU-142).
+    AgentReviewRequested(usize, Result<gitterm::review::ReviewRequest, String>),
+    /// The popover's Consult… kind was submitted (TRU-142 S5).
+    AgentConsultRequested(usize, Result<gitterm::review::ConsultRequest, String>),
+    /// A delegation request passed (or failed) its checkout checks off the
+    /// UI thread and can be stored and started (TRU-142).
+    DelegationChecked(
+        Box<gitterm::tasks::NewDelegation>,
+        DelegationOrigin,
+        Result<(), String>,
+    ),
+    /// Progress from a running Codex delegation.
+    DelegationProgress(String, gitterm::codex_runner::CodexRunEvent),
+    /// A Codex delegation run ended.
+    DelegationFinished(
+        String,
+        Result<Box<gitterm::codex_runner::CodexRunOutcome>, String>,
+    ),
+    /// The parent tab's checkout HEAD, for the cards' "branch has moved".
+    DelegationHeadLoaded(usize, Result<String, String>),
+    /// A card's Send to Claude: tab, delegation, ticked finding ids.
+    DelegationSendRequested(usize, String, Vec<String>),
+    DelegationRerunRequested(usize, String),
+    DelegationDismissRequested(usize, String),
+    /// A worker card's Open worker tab: tab, delegation.
+    DelegationOpenWorkerRequested(usize, String),
+    /// A finding's file was clicked on the chat page of this tab.
+    DelegationOpenFile(usize, PathBuf),
+    /// User picked a model on the Claude chat tab with this id (TRU-143).
+    AgentSetModel(usize, String),
+    /// User picked an effort level (`None`: the model's default).
+    AgentSetEffort(usize, Option<String>),
+    /// The chat's checkout chip menu opened and wants fresh choices.
+    AgentCheckoutContextRequested(usize),
+    /// User picked the directory a not-yet-started chat runs in.
+    AgentSetCheckout(usize, PathBuf),
+    /// Open a native Claude chat tab in the active workspace (TRU-140),
+    /// the + menu's "New chat".
     NewClaudeChatTab,
+    /// The + menu's "CLI" entry: show the agent presets (TRU-143).
+    ShowTabPickerCli,
     /// One streaming event from the agent subprocess (Step 4 will refine the
     /// payload once the parser lands; today every line arrives as `Other`).
     AgentEventReceived(usize, tab::AgentEvent),
@@ -4539,16 +5534,46 @@ pub enum Event {
     BottomTerminalClicked(usize),
     GitStatusLoaded(GitStatusSnapshot),
     GitWorktreesLoaded(GitWorktreesSnapshot),
+    /// A repository's worktree list for chat-tab worktree following
+    /// (TRU-146): the repo root it was listed from, and the list.
+    FollowWorktreesListed(PathBuf, Result<Vec<WorktreeInfo>, String>),
+    /// The header chip: flip the active tab between following its agent's
+    /// worktree and the workspace root (TRU-146).
+    ToggleWorktreeFollow,
     // Chats panel (TRU-78)
     RefreshChatIndex,
     ChatIndexLoaded(Vec<chats::ChatIndexEntry>),
     ChatsQueryChanged(String),
     ChatsScopeChanged(chats::ChatScope),
     ChatsBackendFilterChanged(Option<chats::ChatBackend>),
+    /// The Chats panel's "Relevant" ordering toggle (TRU-141).
+    ChatsRelevanceToggled,
+    /// A Jev relevance ranking of the local chats landed (TRU-141).
+    ChatsRanked(Result<gitterm::jev::Ranking, gitterm::jev::JevError>),
+    /// Open or close the full-window Usage view (TRU-145): the rail glyph
+    /// and Cmd+Shift+U.
+    UsageViewToggle,
+    /// Esc in the Usage view.
+    UsageViewClose,
+    /// Narrow the Usage view to one repo (key, display name), or clear it.
+    UsageRepoFilter(Option<(gitterm::usage::RepoKey, String)>),
+    /// Usage panel (TRU-145): pick the 7 / 30 / 90 day window.
+    UsageWindowSelected(gitterm::usage::UsageWindow),
+    /// Usage panel: chart cost (false) or tokens (true).
+    UsageChartTokens(bool),
+    /// Usage panel: show or hide headless (SDK / exec) runs.
+    UsageHeadlessToggled,
+    UsageRefresh,
+    /// A usage scan finished: the report, or why the scan task failed.
+    UsageScanned(Result<gitterm::usage::UsageReport, String>),
     RemoteChatIndexLoaded(String, Result<Vec<chats::ChatIndexEntry>, String>),
     /// Expand/collapse one machine section in the Everywhere scope
     /// ("local" or a remote id).
     ToggleChatMachine(String),
+    /// Fold or unfold the Chats panel's Open section (TRU-148).
+    ToggleChatOpenSection,
+    /// Focus an open tab by id, switching workspace when needed.
+    FocusTabById(usize),
     /// Fold/unfold one machine group in the workspace bar.
     ToggleMachineGroup(String),
     /// Open/close the machine label menu in the workspace bar.
@@ -4564,6 +5589,9 @@ pub enum Event {
     /// Resume a conversation as a new tab in its recorded cwd (registry
     /// rule: focuses the existing tab instead if one owns the session).
     ResumeChatAsTab(String),
+    /// Resume a local Claude conversation in a native chat tab (an Agent
+    /// tab) in its recorded cwd; same registry rule as `ResumeChatAsTab`.
+    ResumeChatAsChat(String),
     /// Dead-cwd rescue: recreate the recorded directory, then resume.
     /// (`claude --resume` is cwd-scoped — verified 2026-07-04 — so the
     /// session can only be found from its original directory.)
@@ -4699,6 +5727,20 @@ struct App {
     next_tab_id: usize,
     // Durable task registry and cross-workspace Tasks UI state.
     task_store: Option<TaskStore>,
+    /// Review… button defaults (config `review`, TRU-142).
+    review_config: config::ReviewConfig,
+    /// Worker role → model per provider, for `delegate_task` (TRU-142 S6).
+    model_policy: gitterm::workers::ModelPolicy,
+    /// Codex delegation runs in flight, by delegation id. Aborting a handle
+    /// drops the run, which kills its Codex process (TRU-142).
+    delegation_runs: HashMap<String, iced::task::Handle>,
+    /// Latest Codex activity line per running delegation (not persisted).
+    delegation_activity: HashMap<String, String>,
+    /// Send-to-Claude messages held per chat tab until its turn ends.
+    delegation_held: HashMap<usize, Vec<gitterm::delegations::HeldSend>>,
+    /// New-chat model/effort defaults and the last selection (config
+    /// `chat`, TRU-143).
+    chat_config: config::ChatDefaults,
     task_store_error: Option<String>,
     task_ui_error: Option<String>,
     task_worktree_root: PathBuf,
@@ -4742,6 +5784,8 @@ struct App {
     rail_worktrees: Vec<GitWorktreeEntry>,
     rail_worktrees_repo_path: Option<PathBuf>,
     rail_worktrees_loading: bool,
+    /// Worktree listings for chat-tab worktree following (TRU-146).
+    worktree_list_cache: WorktreeListCache,
     last_rail_worktrees_poll: Instant,
     unmanaged_worktree_ops: HashMap<PathBuf, UnmanagedWorktreeOp>,
     theme: AppTheme,
@@ -4783,7 +5827,10 @@ struct App {
     edge_peek_right: bool,
     // Attention pulse animation (toggles every 500ms)
     attention_pulse_bright: bool,
-    attention_view_open: bool,
+    /// Background needs-you transitions → macOS notifications (TRU-148).
+    needs_you_notifier: NeedsYouNotifier,
+    /// `notifications` from config.json, written back on save.
+    notifications_config: config::NotificationsConfig,
     // Track modifier state for filtering terminal writes
     current_modifiers: Modifiers,
     // Help modal
@@ -4795,6 +5842,8 @@ struct App {
     workspace_settings_new_value: String,
     // Tab picker popup (Option+click on "+")
     tab_picker_visible: bool,
+    /// The + menu shows the CLI presets instead of its top level.
+    tab_picker_cli_open: bool,
     // True only when the picker was opened by "+ Continue" and the task's
     // handoff brief was actually written to the clipboard.
     task_handoff_copied: bool,
@@ -4829,6 +5878,8 @@ struct App {
     /// remote id). Sections start collapsed so the machine list itself
     /// is scannable; an active search overrides collapse.
     chat_expanded_machines: std::collections::HashSet<String>,
+    /// The Chats panel's Open section is folded (TRU-148); per app run.
+    chat_open_section_collapsed: bool,
     /// Workspace-bar machine groups the user folded (session-only).
     collapsed_machine_groups: std::collections::HashSet<String>,
     /// Machine label menu open in the workspace bar (group key).
@@ -4840,6 +5891,30 @@ struct App {
     /// Preview tail for the most recently selected chat, keyed by session
     /// id so a stale load never renders under the wrong chat.
     chat_preview: Option<(String, chats::ChatPreview)>,
+    /// Jev client for relevance ordering (TRU-141); None without
+    /// TYPESAFE_API_KEY, and then the panel offers no toggle.
+    jev_client: Option<gitterm::jev::JevClient>,
+    chat_rank: chat_rank::ChatRankState,
+    /// Ranking snippets per transcript (path, mtime, size), shared with
+    /// the ranking task that reads them off the UI thread.
+    chat_snippets: Arc<Mutex<chat_rank::SnippetCache>>,
+    /// Usage panel (TRU-145). Price overrides from config.json, written
+    /// back on save.
+    usage_config: gitterm::usage::UsageConfig,
+    /// The full-window Usage view: open or not, and its repo filter.
+    usage_view: UsageViewState,
+    usage_window: gitterm::usage::UsageWindow,
+    /// Chart tokens instead of cost.
+    usage_chart_tokens: bool,
+    /// Include headless (SDK / exec) runs in the totals.
+    usage_show_headless: bool,
+    /// The last finished scan; kept on screen while a new one runs.
+    usage_report: Option<gitterm::usage::UsageReport>,
+    usage_scanning: bool,
+    usage_error: Option<String>,
+    /// Parsed transcripts per (path, mtime, size), shared with the scan
+    /// task that reads them off the UI thread.
+    usage_cache: Arc<Mutex<gitterm::usage::UsageCache>>,
     // Track whether the window has focus (skip terminal processing when unfocused)
     window_focused: bool,
     terminal_redraws: TerminalRedrawQueue,
@@ -4871,6 +5946,11 @@ struct App {
     stt_sample_rate: u32,
     #[cfg(feature = "stt")]
     stt_transcribing: bool,
+    /// Dictated text for chat tabs whose page was not built when the
+    /// transcript arrived, delivered to the composer on
+    /// `AgentWebviewCreated`. Entries for closed tabs are pruned with the
+    /// pages (`prune_agent_pages`).
+    dictation_held: HashMap<usize, String>,
     /// What the Viewer webview surface is presenting (`None` = hidden).
     viewer_webview: ViewerWebview,
     /// Agent tabs that own a chat page (`WebviewSurface::Agent(tab_id)`),
@@ -4916,13 +5996,13 @@ enum VisibleSurface {
 }
 
 /// Pick the visible webview surface: at most one, Viewer over Agent, nothing
-/// while the attention view covers the content area.
+/// while the Usage view covers the content area (`overlay_open`).
 fn visible_webview_surface(
     viewer: ViewerWebview,
     active: ActiveTabSurface,
-    attention_open: bool,
+    overlay_open: bool,
 ) -> VisibleSurface {
-    if attention_open {
+    if overlay_open {
         return VisibleSurface::None;
     }
     if viewer != ViewerWebview::None {
@@ -4932,6 +6012,48 @@ fn visible_webview_surface(
         ActiveTabSurface::AgentChat(tab_id) => VisibleSurface::AgentChat(tab_id),
         ActiveTabSurface::Other | ActiveTabSurface::AgentFileOverlay => VisibleSurface::None,
     }
+}
+
+/// The full-window Usage view (TRU-145), opened from the bottom of the
+/// workspace rail. It never touches the workspace or tab selection, so
+/// closing it lands on exactly what was showing.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct UsageViewState {
+    open: bool,
+    /// The repo the view is narrowed to: its row key and display name.
+    repo: Option<(gitterm::usage::RepoKey, String)>,
+}
+
+/// What can happen to the Usage view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageViewInput {
+    /// The rail glyph or Cmd+Shift+U.
+    Toggle,
+    /// Esc.
+    Close,
+    /// A workspace button on the rail (or Ctrl+1-9).
+    SelectWorkspace(usize),
+}
+
+/// Apply `input` to the Usage view while `active_workspace` is showing and
+/// return the workspace to show next. Opening and closing keep the
+/// selection; selecting a workspace closes the view. Closing drops the
+/// repo filter, so the view reopens app-wide.
+fn usage_view_step(
+    state: &mut UsageViewState,
+    active_workspace: usize,
+    input: UsageViewInput,
+) -> usize {
+    let (open, workspace) = match input {
+        UsageViewInput::Toggle => (!state.open, active_workspace),
+        UsageViewInput::Close => (false, active_workspace),
+        UsageViewInput::SelectWorkspace(target) => (false, target),
+    };
+    state.open = open;
+    if !open {
+        state.repo = None;
+    }
+    workspace
 }
 
 /// How many agent chat pages may be alive at once. Showing a tab without a
@@ -5759,6 +6881,11 @@ impl App {
             quick_commands: self.quick_commands.clone(),
             task_worktree_root: self.task_worktree_root.clone(),
             max_concurrent_local_tasks: self.max_concurrent_local_tasks,
+            review: self.review_config.clone(),
+            chat: self.chat_config.clone(),
+            policy: self.model_policy.clone(),
+            usage: self.usage_config.clone(),
+            notifications: self.notifications_config.clone(),
         };
         config.save();
         let elapsed = started.elapsed();
@@ -5806,6 +6933,7 @@ impl App {
                         chat_session_id: tab.chat_session_id.clone(),
                         task_id: tab.task_id.clone(),
                         task_session_id: tab.task_session_id.clone(),
+                        session_uid: Some(tab.session_uid.clone()),
                     })
                     .collect(),
                 run_command: ws.console.run_command.clone(),
@@ -6283,6 +7411,186 @@ impl App {
             .collect()
     }
 
+    /// The local chats the panel shows now (scope, backend filter and
+    /// query applied; newest first) and the workspace root they are
+    /// ranked against. None when the panel shows a remote machine's list
+    /// instead, which relevance ordering does not cover (TRU-141).
+    fn visible_local_chats(&self) -> Option<(PathBuf, Vec<&chats::ChatIndexEntry>)> {
+        let ws = self.active_workspace()?;
+        let remote = self.active_machine_remote_id().is_some();
+        let root = match &ws.location {
+            WorkspaceLocation::RemoteAgent { root, .. } => PathBuf::from(root),
+            _ => ws.dir.clone(),
+        };
+        let query = self.chat_query.to_lowercase();
+        let entries = match self.chat_scope {
+            chats::ChatScope::Workspace if !remote => {
+                self.filter_chat_entries(&self.chat_index, Some(&root), &query)
+            }
+            chats::ChatScope::Machine if !remote => {
+                self.filter_chat_entries(&self.chat_index, None, &query)
+            }
+            chats::ChatScope::Everywhere => {
+                self.filter_chat_entries(&self.chat_index, None, &query)
+            }
+            _ => return None,
+        };
+        Some((root, entries))
+    }
+
+    fn chat_rank_key(&self, root: &Path, entries: &[&chats::ChatIndexEntry]) -> chat_rank::RankKey {
+        chat_rank::RankKey::new(
+            &self.chat_query,
+            self.chat_scope,
+            self.chat_backend_filter,
+            root,
+            entries,
+        )
+    }
+
+    /// Rank the visible local chats with Jev when the "Relevant" toggle is
+    /// on and the cache does not already hold this state. One call at a
+    /// time: a change while one is in flight is ranked when it lands.
+    fn request_chat_rank(&mut self) -> Task<Event> {
+        let Some(client) = self.jev_client.clone() else {
+            return Task::none();
+        };
+        // Only while the toggle is on and the Chats panel is showing; the
+        // panel ranks again when it is opened.
+        let panel_open = self
+            .active_tab()
+            .is_some_and(|t| t.sidebar_mode == SidebarMode::Chats);
+        if !self.chat_rank.active() || !panel_open {
+            return Task::none();
+        }
+        let Some((root, entries)) = self.visible_local_chats() else {
+            return Task::none();
+        };
+        let key = self.chat_rank_key(&root, &entries);
+        let candidates = chat_rank::candidates(&entries);
+        let sources = chat_rank::snippet_sources(&entries);
+        let tab = self.active_tab();
+        let branch = tab
+            .filter(|t| t.is_git_repo && !t.branch_name.is_empty())
+            .map(|t| t.branch_name.clone());
+        let recent_prompt = tab.and_then(|t| match &t.kind {
+            TabKind::Agent(session) => {
+                chat_rank::last_prompt(&session.conversation).map(str::to_string)
+            }
+            TabKind::Terminal(_) => None,
+        });
+        let query = (!self.chat_query.trim().is_empty()).then(|| self.chat_query.clone());
+        let Some(candidates) = self.chat_rank.begin(key, candidates) else {
+            return Task::none();
+        };
+        let ctx = gitterm::jev::RankContext {
+            workspace_dir: root,
+            branch,
+            query,
+            recent_prompt,
+        };
+        let snippets = self.chat_snippets.clone();
+        Task::perform(
+            async move {
+                // Snippets first: bounded tail reads, cached per
+                // (path, mtime, size), on a blocking thread.
+                let started = Instant::now();
+                let bare = candidates.clone();
+                let candidates = match tokio::task::spawn_blocking(move || {
+                    let mut candidates = candidates;
+                    let stats = chat_rank::fill_snippets(&snippets, &mut candidates, &sources);
+                    (candidates, stats)
+                })
+                .await
+                {
+                    Ok((candidates, stats)) => {
+                        if stats.read > 0 || stats.failed > 0 {
+                            eprintln!(
+                                "[chats] ranking snippets: {} read, {} cached, {} unreadable in {:?}",
+                                stats.read,
+                                stats.cached,
+                                stats.failed,
+                                started.elapsed()
+                            );
+                        }
+                        candidates
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[chats] ranking snippet task failed: {err}; ranking {} chats without snippets",
+                            bare.len()
+                        );
+                        bare
+                    }
+                };
+                gitterm::jev::rank_chats(&client, &ctx, &candidates).await
+            },
+            Event::ChatsRanked,
+        )
+    }
+
+    /// Bring the webview surfaces in line with the Usage view: hidden while
+    /// it covers the content area, restored as
+    /// they were when it closes. Opening rescans; unchanged transcripts come
+    /// from the cache.
+    fn usage_view_changed(&mut self) -> Task<Event> {
+        if self.usage_view.open {
+            webview::set_visible(WebviewSurface::Viewer, false);
+            webview::hide_agent_pages();
+            return self.request_usage_scan();
+        }
+        self.apply_webview_surfaces()
+    }
+
+    /// Scan transcripts for the Usage panel's window off the UI thread.
+    /// One scan at a time: a window change during a scan is picked up
+    /// when it lands (`Event::UsageScanned`).
+    fn request_usage_scan(&mut self) -> Task<Event> {
+        if self.usage_scanning {
+            return Task::none();
+        }
+        let Some(sources) = gitterm::usage::UsageSources::local() else {
+            self.usage_error = Some("cannot find the home directory".to_string());
+            return Task::none();
+        };
+        self.usage_scanning = true;
+        let window = self.usage_window;
+        let pricing = gitterm::usage::Pricing::with_overrides(&self.usage_config);
+        let cache = self.usage_cache.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut cache = match cache.lock() {
+                        Ok(cache) => cache,
+                        Err(poisoned) => {
+                            eprintln!("[usage] an earlier scan panicked; starting from an empty cache");
+                            let mut cache = poisoned.into_inner();
+                            *cache = gitterm::usage::UsageCache::default();
+                            cache
+                        }
+                    };
+                    let report = gitterm::usage::scan_usage(&sources, window, &pricing, &mut cache);
+                    let s = &report.stats;
+                    eprintln!(
+                        "[usage] {} scan: {} files ({} parsed, {} resumed, {} cached, {} unreadable), {} responses in {:?}",
+                        window.label(),
+                        s.files_seen - s.files_outside_window,
+                        s.files_parsed,
+                        s.files_resumed,
+                        s.files_cached,
+                        s.files_unreadable,
+                        s.responses,
+                        s.elapsed
+                    );
+                    Ok(report)
+                })
+                .await
+                .map_err(|err| format!("usage scan task failed: {err}"))?
+            },
+            Event::UsageScanned,
+        )
+    }
+
     /// The machine the active workspace lives on (None = local).
     fn active_machine_remote_id(&self) -> Option<&str> {
         self.active_workspace().and_then(|ws| match &ws.location {
@@ -6348,6 +7656,91 @@ impl App {
         })
     }
 
+    /// The checkout chip's state for a Claude chat tab (TRU-143): its label
+    /// and directory, the choices offered before the first message, and
+    /// whether it is locked and why. `None` when the tab is not a Claude chat.
+    fn chat_checkout_state(&self, tab_id: usize) -> Option<serde_json::Value> {
+        let (ws, tab) = self
+            .workspaces
+            .iter()
+            .find_map(|ws| ws.tabs.iter().find(|t| t.id == tab_id).map(|tab| (ws, tab)))?;
+        let session = tab.agent_session()?;
+        if session.backend() != tab::AgentBackend::Claude {
+            return None;
+        }
+        let task_worktree = tab
+            .task_id
+            .as_deref()
+            .and_then(|id| self.task_store.as_ref()?.get(id))
+            .and_then(|task| task.worktree.path.clone());
+        let label = tab::checkout_label(
+            &tab.repo_path,
+            task_worktree.as_deref(),
+            &ws.dir,
+            paths_equal,
+        );
+        // A session that has spawned (or has a conversation to resume) is
+        // bound to the directory it started in.
+        let reason = if tab.task_id.is_some() {
+            Some("This chat belongs to a task and runs in the task's worktree")
+        } else if session.claude.is_some() || session.session_id.is_some() {
+            Some("Set when the chat started; start a new chat to change it")
+        } else {
+            None
+        };
+        let choices = if reason.is_some() {
+            Vec::new()
+        } else {
+            self.checkout_choices_for(&ws.dir)
+        };
+        Some(serde_json::json!({
+            "label": label,
+            "path": tab.repo_path,
+            "locked": reason.is_some(),
+            "reason": reason,
+            "choices": choices,
+        }))
+    }
+
+    /// Where a new chat in this workspace may run: the checkout, then the
+    /// workspace's prepared task worktrees.
+    fn checkout_choices_for(&self, workspace_dir: &Path) -> Vec<tab::CheckoutChoice> {
+        let tasks = self.task_store.as_ref().map_or(&[][..], TaskStore::tasks);
+        tab::checkout_choices(
+            workspace_dir,
+            tasks.iter().map(|task| tab::TaskWorktreeInfo {
+                title: &task.title,
+                workspace_dir: match &task.workspace.location {
+                    WorkspaceLocationIdentity::Local { directory } => Some(directory.as_path()),
+                    WorkspaceLocationIdentity::RemoteAgent { .. } => None,
+                },
+                worktree: task.worktree.path.as_deref(),
+                ready: task.worktree.state == TaskWorktreeState::Ready,
+                archived: task.lifecycle == TaskLifecycle::Archived,
+            }),
+            paths_equal,
+        )
+    }
+
+    /// The composer chips' starting state for a Claude chat page: the tab's
+    /// configured model and effort, and its checkout. `None` for pi tabs.
+    fn chat_composer_state(&self, tab_id: usize) -> Option<serde_json::Value> {
+        let session = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|t| t.id == tab_id)?
+            .agent_session()?;
+        let tab::AgentBackendConfig::Claude { model, effort, .. } = &session.config else {
+            return None;
+        };
+        Some(serde_json::json!({
+            "model": model,
+            "effort": effort,
+            "checkout": self.chat_checkout_state(tab_id)?,
+        }))
+    }
+
     fn active_task_context_id(&self) -> Option<&str> {
         // The context follows the focused session (or, on a host tab, the
         // selected task = Overview state) — never the sidebar panel. Switching
@@ -6376,6 +7769,109 @@ impl App {
             return None;
         }
         task.worktree.path.clone().filter(|path| path.is_dir())
+    }
+
+    /// The worktree the active chat tab's agent works in, while the tab
+    /// follows it (TRU-146). Local workspaces only.
+    fn followed_worktree_root(&self) -> Option<PathBuf> {
+        if self.active_workspace_is_remote() {
+            return None;
+        }
+        self.active_tab()?
+            .worktree_follow
+            .panel_root()
+            .map(Path::to_path_buf)
+    }
+
+    /// The directory the Git and Files panels are rooted in when it is not
+    /// the active tab's own repo: the task worktree in task context, else
+    /// the worktree a chat tab's agent works in.
+    fn panel_context_root(&self) -> Option<PathBuf> {
+        self.task_context_worktree_root()
+            .or_else(|| self.followed_worktree_root())
+    }
+
+    /// Resolve a chat tab's candidate paths against its repository's
+    /// worktree list, listing it first when the cache says so (TRU-146).
+    fn consider_worktree_candidates(
+        &mut self,
+        tab_id: usize,
+        repo_root: PathBuf,
+        candidates: Vec<PathBuf>,
+    ) -> Task<Event> {
+        let candidates: Vec<PathBuf> = candidates
+            .iter()
+            .map(|path| worktree_follow::resolve_for_match(path))
+            .collect();
+        match self.worktree_list_cache.lookup(
+            &repo_root,
+            tab_id,
+            candidates.clone(),
+            Instant::now(),
+        ) {
+            CacheLookup::Ready(worktrees) => {
+                self.apply_worktree_candidates(tab_id, &repo_root, &worktrees, &candidates)
+            }
+            CacheLookup::Queued => Task::none(),
+            CacheLookup::Fetch => {
+                let listed_root = repo_root.clone();
+                Task::perform(
+                    async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            worktree_follow::list_worktrees(&listed_root)
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(format!("worktree listing task failed: {error}"))
+                        });
+                        (repo_root, result)
+                    },
+                    |(repo_root, result)| Event::FollowWorktreesListed(repo_root, result),
+                )
+            }
+        }
+    }
+
+    /// Decide what a chat tab's candidates mean and update its followed
+    /// worktree; re-points the panels when the active tab's root moved.
+    fn apply_worktree_candidates(
+        &mut self,
+        tab_id: usize,
+        repo_root: &Path,
+        worktrees: &[WorktreeInfo],
+        candidates: &[PathBuf],
+    ) -> Task<Event> {
+        let own_root = worktree_follow::resolve_for_match(repo_root);
+        let decision = worktree_follow::decide_all(candidates, &own_root, worktrees);
+        let label = match &decision {
+            worktree_follow::FollowDecision::Follow(active) => {
+                Some(worktree_follow::short_worktree_label(
+                    &active.path,
+                    worktrees,
+                    dirs::home_dir().as_deref(),
+                ))
+            }
+            _ => None,
+        };
+        let is_active_tab = self.active_tab().is_some_and(|tab| tab.id == tab_id);
+        let before = if is_active_tab {
+            self.panel_context_root()
+        } else {
+            None
+        };
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|tab| tab.id == tab_id && tab.task_id.is_none())
+        else {
+            return Task::none();
+        };
+        let changed = tab.worktree_follow.apply(decision, label);
+        if changed && is_active_tab && self.panel_context_root() != before {
+            return self.refresh_panels_for_context(before);
+        }
+        Task::none()
     }
 
     /// The task (if any) whose registered worktree is `path`. Archived tasks
@@ -6603,6 +8099,8 @@ impl App {
         {
             eprintln!("GitTerm V5 dropped a task lifecycle signal: {error}");
         }
+        // A worker card mirrors its task session's live state (S6).
+        self.push_worker_cards(task_id);
     }
 
     /// Visiting a task acknowledges its attention (the unread badge, and a
@@ -6624,21 +8122,6 @@ impl App {
     fn acknowledge_active_task_attention(&mut self) {
         if let Some(task_id) = self.active_task_context_id().map(str::to_string) {
             self.acknowledge_task_attention(&task_id);
-        }
-    }
-
-    /// The user dismissed the task's inbox row: drop its attention outright,
-    /// state-backed reasons included — the lifecycle still tells the truth
-    /// in the task rail.
-    fn dismiss_task_attention(&mut self, task_id: &str) {
-        let Some(store) = self.task_store.as_mut() else {
-            return;
-        };
-        if store.get(task_id).is_none() {
-            return;
-        }
-        if let Err(error) = store.dismiss_attention(task_id, &chrono::Utc::now().to_rfc3339()) {
-            eprintln!("GitTerm V5 dropped a task attention dismissal: {error}");
         }
     }
 
@@ -7404,6 +8887,7 @@ impl App {
         &self,
         input: McpCreateTaskRequest,
         reply: TaskControlReply,
+        caller: Option<String>,
     ) -> Result<PendingTaskLaunch, String> {
         let title = input.title.trim().to_string();
         let objective = input.objective.trim().to_string();
@@ -7477,6 +8961,8 @@ impl App {
             resolved_worktree_path: None,
             request,
             control_reply: Some(reply),
+            creator_session_id: caller,
+            worker: None,
         })
     }
 
@@ -7879,6 +9365,31 @@ impl App {
         } else {
             (None, "Terminal".to_string(), None, None)
         };
+        // TRU-142 S6: a worker delegation open on this task whose session is
+        // not live yet (first launch, a queued launch, or a relaunch after its
+        // tab closed) is carried out by this launch when it runs the
+        // delegation's preset: the model goes on the command, the brief ends
+        // with Report back, and the session is attached after launch.
+        let worker = if command.is_some() {
+            self.worker_awaiting_launch(task_id, &child_label)
+        } else {
+            None
+        };
+        let worker_model = worker.as_ref().and_then(|(_, model)| model.clone());
+        let (command, harness) = match (command, worker_model.as_deref()) {
+            (Some(command), Some(model)) => (
+                Some(
+                    gitterm::workers::with_model_flag(&command, model).map_err(|error| {
+                        format!("The worker model {model} cannot be passed to preset {child_label}: {error}")
+                    })?,
+                ),
+                harness.map(|harness| HarnessSelection {
+                    model: Some(model.to_string()),
+                    ..harness
+                }),
+            ),
+            (command, _) => (command, harness),
+        };
         let (command, chat_session_id) = match command {
             Some(command) => {
                 let (command, session_id) = Self::with_preassigned_session_id(&command);
@@ -7964,7 +9475,13 @@ impl App {
         let pre_injection_command = command.clone();
         let (command, objective_delivery) = match command {
             Some(launch) if backend_accepts_initial_prompt(conversation_backend) => {
-                match write_task_brief(&session_id, &task) {
+                match write_task_brief(
+                    &session_id,
+                    &task,
+                    worker
+                        .as_ref()
+                        .map(|(delegation_id, _)| delegation_id.as_str()),
+                ) {
                     Ok(brief_path) => (
                         Some(command_with_initial_prompt(&launch, &brief_path)),
                         ObjectiveDeliveryState::Delivered,
@@ -8003,7 +9520,12 @@ impl App {
             // The terminal is already running the new-session command. Persist
             // the resume command so an app restart reconnects instead of trying
             // to create the same pre-assigned Claude session again.
-            tab.set_startup_command(Some(format!("claude --resume {chat_session_id}")));
+            // A worker keeps its model across the restart.
+            let model = worker_model
+                .as_deref()
+                .map(|model| format!("--model {model} "))
+                .unwrap_or_default();
+            tab.set_startup_command(Some(format!("claude {model}--resume {chat_session_id}")));
         } else if objective_delivery == ObjectiveDeliveryState::Delivered {
             // Codex/Pi have no persisted resume; a restart re-runs the launch
             // command, which must stay brief-free so the objective is never
@@ -8021,16 +9543,29 @@ impl App {
             task_session_id: session_id.clone(),
             label: child_label.clone(),
             harness: harness.clone(),
-            conversation,
+            conversation: conversation.clone(),
             objective_delivery,
             created_at: timestamp.clone(),
             updated_at: timestamp.clone(),
         };
-        self.task_store
+        let store = self
+            .task_store
             .as_mut()
-            .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?
+            .ok_or_else(|| "GitTerm's task store became unavailable".to_string())?;
+        store
             .upsert_session(task_id, task_session, &timestamp)
             .map_err(|error| error.to_string())?;
+        if let Some((delegation_id, _)) = &worker {
+            // The worker is running; its report reaches the delegation.
+            if let Err(error) =
+                store.attach_worker_session(delegation_id, &session_id, conversation, &timestamp)
+            {
+                eprintln!(
+                    "[delegation] {delegation_id}: worker session {session_id} launched but \
+                     could not be attached: {error}"
+                );
+            }
+        }
         self.workspaces[workspace_idx].tabs.push(tab);
         let tab_idx = self.workspaces[workspace_idx].tabs.len() - 1;
         if focus {
@@ -8279,12 +9814,27 @@ impl App {
     /// or a fresh workspace rooted at the chat's repo. Reopen/create
     /// paths push the workspace, activate it, and leave it tabless; the
     /// caller adds the resume tab in the same update pass.
+    /// The open local workspace that holds `cwd` or `repo_root` (task
+    /// worktrees resolve to the repo they were made from), without opening
+    /// one.
+    fn open_local_workspace_index(&self, cwd: &Path, repo_root: &Path) -> Option<usize> {
+        let canonical_cwd = self.canonical_task_workspace_directory(cwd);
+        let canonical_repo_root = self.canonical_task_workspace_directory(repo_root);
+        self.workspaces.iter().position(|ws| {
+            matches!(ws.location, WorkspaceLocation::Local { .. })
+                && (canonical_cwd.starts_with(&ws.dir) || canonical_repo_root.starts_with(&ws.dir))
+        })
+    }
+
     fn ensure_local_workspace_for_chat(
         &mut self,
         cwd: &Path,
         repo_root: Option<&Path>,
         repo_name: &str,
     ) -> usize {
+        if let Some(idx) = self.open_local_workspace_index(cwd, repo_root.unwrap_or(cwd)) {
+            return idx;
+        }
         let canonical_cwd = self.canonical_task_workspace_directory(cwd);
         let canonical_repo_root = repo_root
             .map(|root| self.canonical_task_workspace_directory(root))
@@ -8292,11 +9842,6 @@ impl App {
         let cwd = canonical_cwd.as_path();
         let repo_root = canonical_repo_root.as_path();
         let contains = |dir: &Path| cwd.starts_with(dir) || repo_root.starts_with(dir);
-        if let Some(idx) = self.workspaces.iter().position(|ws| {
-            matches!(ws.location, WorkspaceLocation::Local { .. }) && contains(&ws.dir)
-        }) {
-            return idx;
-        }
         let closed_idx = self.closed_workspace_configs.iter().position(|cfg| {
             matches!(
                 cfg.location,
@@ -8479,6 +10024,67 @@ impl App {
             tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
         }
         tasks.push(self.scroll_to_active_tab());
+        Task::batch(tasks)
+    }
+
+    /// "Resume as Chat": open a local Claude conversation in a native chat
+    /// tab. Registry rule first (a tab that owns the session is focused).
+    /// The tab lands in the workspace `resume_chat_as_tab` would pick, runs
+    /// in the recorded cwd (`claude --resume` is cwd-scoped, and the native
+    /// process spawns in the tab's `repo_path`), and carries the session id,
+    /// so showing it reads the transcript back (`start_agent_history_load`)
+    /// and its first prompt spawns Claude with `--resume`.
+    fn resume_chat_as_chat_tab(&mut self, id: String) -> Task<Event> {
+        if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
+            return self.focus_workspace_tab(ws_idx, tab_idx);
+        }
+        let Some((remote_id, entry)) = self.find_chat_entry(&id) else {
+            eprintln!("[chats] cannot resume {id} as a chat: not in any machine's index");
+            return Task::none();
+        };
+        if !can_resume_as_chat(entry, remote_id.is_some(), false) {
+            eprintln!(
+                "[chats] cannot resume {id} as a chat: only a local Claude chat whose directory exists can be (backend {}, remote {:?}, dead cwd {})",
+                entry.backend.label(),
+                remote_id,
+                entry.dead_cwd
+            );
+            return Task::none();
+        }
+        let cwd = entry.cwd.clone();
+        let repo_root = entry.repo_root.clone();
+        let repo_name = entry.group_name();
+        if !cwd.exists() {
+            eprintln!(
+                "[chats] not resuming {id} as a chat: recorded cwd {} is gone (use the rescue action)",
+                cwd.display()
+            );
+            return Task::none();
+        }
+
+        let mut tasks = Vec::new();
+        let ws_idx = self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name);
+        if ws_idx != self.active_workspace_idx {
+            tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
+        }
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let mut tab = TabState::new(tab_id, cwd.clone());
+        tab.kind = TabKind::Agent(resumed_claude_chat_session(&self.chat_config, &id));
+        tab.set_local_dir(cwd);
+        tab.chat_session_id = Some(id.clone());
+        tab.git_status_loading = true;
+        let repo_path = tab.repo_path.clone();
+        let workspace = &mut self.workspaces[self.active_workspace_idx];
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+        eprintln!("[agent] opened Claude chat tab id={tab_id} resuming {id}");
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
+        tasks.push(self.scroll_to_active_tab());
+        // Builds the chat page: history read-back, replay, composer focus.
+        tasks.push(self.present_active_tab_surfaces());
         Task::batch(tasks)
     }
 
@@ -9003,6 +10609,1003 @@ impl App {
     }
 }
 
+/// One Codex delegation run as an Iced stream: its progress events, then
+/// `DelegationFinished`. Dropping the stream (an aborted task, app exit)
+/// drops the run, which kills Codex (TRU-142).
+fn delegation_run_stream(
+    delegation_id: String,
+    run: gitterm::codex_runner::CodexRun,
+) -> iced::futures::stream::BoxStream<'static, Event> {
+    use iced::futures::{SinkExt, StreamExt};
+    iced::stream::channel(32, async move |mut output| {
+        let (progress, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let runner = gitterm::codex_runner::run(run, progress);
+        tokio::pin!(runner);
+        let outcome = loop {
+            tokio::select! {
+                Some(event) = events.recv() => {
+                    if output
+                        .send(Event::DelegationProgress(delegation_id.clone(), event))
+                        .await
+                        .is_err()
+                    {
+                        // The app is gone; dropping the runner kills Codex.
+                        return;
+                    }
+                }
+                outcome = &mut runner => break outcome,
+            }
+        };
+        while let Ok(event) = events.try_recv() {
+            let _ = output
+                .send(Event::DelegationProgress(delegation_id.clone(), event))
+                .await;
+        }
+        let outcome = outcome.map(Box::new).map_err(|error| error.to_string());
+        if let Err(error) = output
+            .send(Event::DelegationFinished(delegation_id.clone(), outcome))
+            .await
+        {
+            eprintln!("[delegation] {delegation_id}: the app stopped listening before the result: {error}");
+        }
+    })
+    .boxed()
+}
+
+/// Delegations a chat tab requested (TRU-142 S3b/S4/S5): request, run,
+/// card, attention, send.
+impl App {
+    fn delegation_parent_tab_id(&self, session_uid: &str) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.session_uid == session_uid)
+            .map(|tab| tab.id)
+    }
+
+    /// The open tab a delegation request came from, by its caller identity.
+    fn delegation_caller(
+        &self,
+        session_uid: &str,
+    ) -> Result<gitterm::delegations::CallerTab, String> {
+        for workspace in &self.workspaces {
+            if let Some(tab) = workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.session_uid == session_uid)
+            {
+                return Ok(gitterm::delegations::CallerTab {
+                    session_uid: session_uid.to_string(),
+                    chat_session_id: tab.chat_session_id.clone(),
+                    workspace: workspace.name.clone(),
+                    cwd: tab.repo_path.clone(),
+                    remote: self.workspace_has_remote_identity(workspace),
+                });
+            }
+        }
+        Err(format!(
+            "no open GitTerm tab has session id {session_uid}; a delegation reports back to the open tab that asked"
+        ))
+    }
+
+    fn delegation_caller_for_tab(
+        &self,
+        tab_id: usize,
+    ) -> Result<gitterm::delegations::CallerTab, String> {
+        let session_uid = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.session_uid.clone())
+            .ok_or_else(|| format!("tab {tab_id} is not open"))?;
+        self.delegation_caller(&session_uid)
+    }
+
+    fn delegation_caller_for_tool(
+        &self,
+        caller: Option<&str>,
+        tool: &str,
+    ) -> Result<gitterm::delegations::CallerTab, String> {
+        let caller = caller.ok_or_else(|| task_mcp::missing_caller_error(tool))?;
+        self.delegation_caller(caller)
+    }
+
+    fn report_delegation_error(origin: &DelegationOrigin, error: String) {
+        match origin {
+            DelegationOrigin::Mcp(reply) => reply.send(Err(error)),
+            DelegationOrigin::Page(tab_id) => {
+                eprintln!("[delegation] tab {tab_id}: {error}");
+                agent_webview_note(*tab_id, &format!("Not started: {error}"));
+            }
+        }
+    }
+
+    /// Checks the checkout off the UI thread, then stores and starts the
+    /// delegation (`DelegationChecked`).
+    fn request_delegation(
+        &mut self,
+        new: Result<gitterm::tasks::NewDelegation, String>,
+        origin: DelegationOrigin,
+    ) -> Task<Event> {
+        let new = match new {
+            Ok(new) => new,
+            Err(error) => {
+                Self::report_delegation_error(&origin, error);
+                return Task::none();
+            }
+        };
+        if self.task_store.is_none() {
+            Self::report_delegation_error(&origin, "GitTerm's task store is unavailable".into());
+            return Task::none();
+        }
+        let cwd = new.parent.cwd.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || gitterm::delegations::check_checkout(&cwd))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("the checkout check failed: {error}")))
+            },
+            move |result| Event::DelegationChecked(Box::new(new), origin, result),
+        )
+    }
+
+    fn delegation_checked(
+        &mut self,
+        new: gitterm::tasks::NewDelegation,
+        origin: DelegationOrigin,
+        result: Result<(), String>,
+    ) -> Task<Event> {
+        if let Err(error) = result {
+            Self::report_delegation_error(&origin, error);
+            return Task::none();
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let delegation = gitterm::tasks::Delegation::new_requested(new, now);
+        let delegation_id = delegation.delegation_id.clone();
+        let session_uid = delegation.parent.session_uid.clone();
+        let Some(store) = self.task_store.as_mut() else {
+            Self::report_delegation_error(&origin, "GitTerm's task store is unavailable".into());
+            return Task::none();
+        };
+        if let Err(error) = store.insert_delegation(delegation) {
+            Self::report_delegation_error(&origin, error.to_string());
+            return Task::none();
+        }
+        self.anchor_delegation_card(&session_uid, &delegation_id);
+        let start = self.start_queued_delegations();
+        let queued = !self.delegation_runs.contains_key(&delegation_id);
+        if let DelegationOrigin::Mcp(reply) = &origin {
+            reply.send(Ok(serde_json::json!({
+                "delegation_id": delegation_id,
+                "status": "requested",
+                "queued": queued,
+                "detail": if queued {
+                    "Queued behind other Codex runs; it starts when a slot frees. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
+                } else {
+                    "Codex is working in the background. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
+                },
+            })));
+        }
+        self.push_delegation_card(&delegation_id);
+        start
+    }
+
+    /// Records where in the parent chat the request was made, so the card
+    /// stays there when the page is rebuilt from the conversation buffer.
+    fn anchor_delegation_card(&mut self, session_uid: &str, delegation_id: &str) {
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|tab| tab.session_uid == session_uid)
+        else {
+            return;
+        };
+        let tab_id = tab.id;
+        let Some(session) = tab.agent_session_mut() else {
+            return;
+        };
+        let anchor = tab::AgentEvent::Other(gitterm::delegations::anchor_payload(delegation_id));
+        session.record(anchor.clone());
+        push_agent_event_to_webview(tab_id, &anchor);
+    }
+
+    /// Starts queued Codex runs while slots are free
+    /// (`review.max_concurrent_reviews`).
+    fn start_queued_delegations(&mut self) -> Task<Event> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Task::none();
+        };
+        let running: HashSet<String> = self.delegation_runs.keys().cloned().collect();
+        let config_root = config::global_config_dir();
+        let mut runs = Vec::new();
+        let mut unrunnable = Vec::new();
+        for delegation_id in gitterm::delegations::runs_to_start(
+            store.delegations(),
+            &running,
+            self.review_config.max_concurrent_reviews,
+        ) {
+            let Some(delegation) = store.delegation(&delegation_id) else {
+                continue;
+            };
+            match gitterm::delegations::codex_run(delegation, &config_root) {
+                Ok(run) => runs.push((delegation_id, run)),
+                Err(error) => unrunnable.push((delegation_id, error)),
+            }
+        }
+        let mut tasks = Vec::new();
+        for (delegation_id, run) in runs {
+            eprintln!(
+                "[delegation] starting {delegation_id} in {} (log {})",
+                run.cwd.display(),
+                run.log_path.display()
+            );
+            let (task, handle) =
+                Task::run(delegation_run_stream(delegation_id.clone(), run), |event| {
+                    event
+                })
+                .abortable();
+            self.delegation_runs.insert(delegation_id, handle);
+            tasks.push(task);
+        }
+        for (delegation_id, error) in unrunnable {
+            tasks.push(self.finish_delegation(&delegation_id, Err(error)));
+        }
+        Task::batch(tasks)
+    }
+
+    fn delegation_progress(
+        &mut self,
+        delegation_id: &str,
+        event: gitterm::codex_runner::CodexRunEvent,
+    ) {
+        use gitterm::codex_runner::CodexRunEvent;
+        match event {
+            CodexRunEvent::Started { thread_id } => {
+                let now = chrono::Utc::now().to_rfc3339();
+                if let Some(store) = self.task_store.as_mut() {
+                    if let Err(error) =
+                        store.mark_delegation_started(delegation_id, &thread_id, &now)
+                    {
+                        eprintln!("[delegation] {delegation_id}: {error}");
+                    }
+                }
+            }
+            CodexRunEvent::Activity { description } => {
+                self.delegation_activity
+                    .insert(delegation_id.to_string(), description);
+            }
+            // `DelegationFinished` carries the outcome.
+            CodexRunEvent::Completed | CodexRunEvent::Failed { .. } => return,
+        }
+        self.push_delegation_card(delegation_id);
+    }
+
+    /// Stores a run's outcome, tells the parent tab, and starts the next
+    /// queued run.
+    fn finish_delegation(
+        &mut self,
+        delegation_id: &str,
+        outcome: Result<Box<gitterm::codex_runner::CodexRunOutcome>, String>,
+    ) -> Task<Event> {
+        self.delegation_runs.remove(delegation_id);
+        self.delegation_activity.remove(delegation_id);
+        let now = chrono::Utc::now().to_rfc3339();
+        let Some(store) = self.task_store.as_mut() else {
+            eprintln!("[delegation] {delegation_id} finished but the task store is unavailable");
+            return Task::none();
+        };
+        let Some(delegation) = store.delegation(delegation_id) else {
+            eprintln!("[delegation] {delegation_id} finished but is not in the store");
+            return Task::none();
+        };
+        if !delegation.status.is_active() {
+            eprintln!(
+                "[delegation] {delegation_id} finished after it was {}; the result is dropped",
+                delegation.status.label()
+            );
+            return self.start_queued_delegations();
+        }
+        let kind = delegation.kind;
+        let session_uid = delegation.parent.session_uid.clone();
+        let completed = match outcome {
+            Ok(outcome) => match store.complete_delegation(delegation_id, outcome.result, &now) {
+                Ok(()) => true,
+                Err(error) => {
+                    let message = format!("could not store the Codex result: {error}");
+                    eprintln!("[delegation] {delegation_id}: {message}");
+                    if let Err(error) = store.set_delegation_status(
+                        delegation_id,
+                        gitterm::tasks::DelegationStatus::Failed { message },
+                        &now,
+                    ) {
+                        eprintln!("[delegation] {delegation_id}: {error}");
+                    }
+                    false
+                }
+            },
+            Err(message) => {
+                eprintln!("[delegation] {delegation_id} failed: {message}");
+                if let Err(error) = store.set_delegation_status(
+                    delegation_id,
+                    gitterm::tasks::DelegationStatus::Failed { message },
+                    &now,
+                ) {
+                    eprintln!("[delegation] {delegation_id}: {error}");
+                }
+                false
+            }
+        };
+        let parent_tab = self.delegation_parent_tab_id(&session_uid);
+        if let Some(tab_id) = parent_tab {
+            let reason = if completed {
+                AttentionReason::DelegationReady(kind)
+            } else {
+                AttentionReason::DelegationFailed(kind)
+            };
+            // The tab in front shows the card itself.
+            let in_front = self.active_tab().map(|tab| tab.id) == Some(tab_id);
+            if !in_front {
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id)
+                {
+                    tab.set_attention(reason);
+                }
+                self.mark_log_server_dirty();
+            }
+        }
+        self.push_delegation_card(delegation_id);
+        let head =
+            parent_tab.map_or_else(Task::none, |tab_id| self.refresh_delegation_head(tab_id));
+        Task::batch([self.start_queued_delegations(), head])
+    }
+
+    /// The open worker delegation on `task_id` that a launch of preset
+    /// `preset_name` carries out (TRU-142 S6): its id and model. Only a
+    /// delegation whose session is not live qualifies — none attached yet
+    /// (first or queued launch), or one whose tab is gone (a relaunch).
+    fn worker_awaiting_launch(
+        &self,
+        task_id: &str,
+        preset_name: &str,
+    ) -> Option<(String, Option<String>)> {
+        let store = self.task_store.as_ref()?;
+        store
+            .open_worker_delegations(task_id)
+            .into_iter()
+            .find_map(|delegation| match &delegation.child {
+                gitterm::tasks::DelegationChild::TaskSession {
+                    preset_name: Some(preset),
+                    task_session_id,
+                    model,
+                    ..
+                } if preset == preset_name
+                    && task_session_id.as_deref().is_none_or(|session| {
+                        find_task_session_tab(&self.workspaces, session).is_none()
+                    }) =>
+                {
+                    Some((delegation.delegation_id.clone(), model.clone()))
+                }
+                _ => None,
+            })
+    }
+
+    /// `delegate_task` (TRU-142 S6): resolve the worker, then create the
+    /// task through the same path as `task_create`. The worker is launched
+    /// in `start_delegated_worker` once the worktree is ready.
+    fn delegate_task_requested(
+        &mut self,
+        request: task_mcp::DelegateTaskRequest,
+        caller: Option<String>,
+        reply: TaskControlReply,
+    ) -> Task<Event> {
+        let prepared = (|| {
+            let tab = self.delegation_caller_for_tool(caller.as_deref(), "delegate_task")?;
+            if tab.remote {
+                return Err(format!(
+                    "delegate_task creates a local task worktree from the calling tab's \
+                     repository, and the tab's workspace {:?} is remote; remote workers are not \
+                     supported yet",
+                    tab.workspace
+                ));
+            }
+            let presets: Vec<gitterm::workers::PresetRef<'_>> = self
+                .agent_presets
+                .iter()
+                .map(|preset| gitterm::workers::PresetRef {
+                    name: &preset.name,
+                    command: &preset.command,
+                })
+                .collect();
+            let choice = gitterm::workers::resolve_worker(
+                &presets,
+                request.preset_name.as_deref(),
+                request.role,
+                request.model.as_deref(),
+                &self.model_policy,
+            )?;
+            let create = McpCreateTaskRequest {
+                title: request.title.clone(),
+                objective: request.objective.clone(),
+                repository_path: tab.cwd.clone(),
+                workspace_name: request.workspace_name.clone(),
+                issue_key: request.issue_key.clone(),
+                base_reference: request.base_reference.clone(),
+                stopping_boundary: request.stopping_boundary,
+            };
+            let mut pending =
+                self.pending_task_from_control(create, reply.clone(), caller.clone())?;
+            // Check the delegation's own rules before any worktree exists.
+            gitterm::delegations::worker_delegation(
+                &tab,
+                &pending.task_id,
+                &pending.title,
+                &pending.objective,
+                &choice,
+            )?;
+            pending.worker = Some(PendingWorker {
+                caller: tab,
+                choice,
+            });
+            Ok(pending)
+        })();
+        let pending = match prepared {
+            Ok(pending) => pending,
+            Err(error) => {
+                reply.send(Err(error));
+                return Task::none();
+            }
+        };
+        let worktree_request = pending.request.clone();
+        Task::perform(resolve_task_preparation(worktree_request), move |result| {
+            Event::TaskMetadataResolved(pending, result.map_err(|error| error.to_string()))
+        })
+    }
+
+    /// The delegated task's worktree is ready: record the worker delegation,
+    /// anchor its card in the parent chat, launch the worker in a background
+    /// tab (focus stays where it is), and answer `delegate_task`.
+    fn start_delegated_worker(
+        &mut self,
+        task_id: &str,
+        worker: PendingWorker,
+        reply: TaskControlReply,
+    ) -> Task<Event> {
+        let Some(task) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id))
+            .cloned()
+        else {
+            reply.send(Err(format!(
+                "Task {task_id} disappeared after worktree preparation"
+            )));
+            return Task::none();
+        };
+        let new = match gitterm::delegations::worker_delegation(
+            &worker.caller,
+            task_id,
+            &task.title,
+            &task.objective,
+            &worker.choice,
+        ) {
+            Ok(new) => new,
+            Err(error) => {
+                reply.send(Err(error));
+                return Task::none();
+            }
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let delegation = gitterm::tasks::Delegation::new_requested(new, now);
+        let delegation_id = delegation.delegation_id.clone();
+        let inserted = match self.task_store.as_mut() {
+            Some(store) => store
+                .insert_delegation(delegation)
+                .map_err(|error| error.to_string()),
+            None => Err("GitTerm's task store is unavailable".to_string()),
+        };
+        if let Err(error) = inserted {
+            reply.send(Err(format!(
+                "Created task {task_id}, but could not record the worker delegation: {error}"
+            )));
+            return Task::none();
+        }
+        self.anchor_delegation_card(&worker.caller.session_uid, &delegation_id);
+        let launch = self.try_launch_task_child(task_id, Some(worker.choice.preset_index), false);
+        let (focus, task_session_id, queue_position) = match launch {
+            Ok(TaskChildLaunch::Started(focus, session)) => (
+                focus,
+                session["session_id"].as_str().map(str::to_string),
+                None,
+            ),
+            Ok(TaskChildLaunch::Queued { position }) => (Task::none(), None, Some(position)),
+            Err(error) => {
+                let message = format!("the worker could not start: {error}");
+                eprintln!("[delegation] {delegation_id}: {message}");
+                if let Some(store) = self.task_store.as_mut() {
+                    if let Err(store_error) = store.set_delegation_status(
+                        &delegation_id,
+                        gitterm::tasks::DelegationStatus::Failed {
+                            message: message.clone(),
+                        },
+                        &chrono::Utc::now().to_rfc3339(),
+                    ) {
+                        eprintln!("[delegation] {delegation_id}: {store_error}");
+                    }
+                }
+                self.push_delegation_card(&delegation_id);
+                reply.send(Err(format!(
+                    "Created task {task_id} at {}, but {message}",
+                    task.worktree
+                        .path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                )));
+                return Task::none();
+            }
+        };
+        self.push_delegation_card(&delegation_id);
+        let queued = queue_position.is_some();
+        reply.send(Ok(serde_json::json!({
+            "delegation_id": delegation_id,
+            "task_id": task_id,
+            "task_session_id": task_session_id,
+            "worktree_path": task.worktree.path,
+            "branch": task.branch,
+            "preset_name": worker.choice.preset_name,
+            "model": worker.choice.model,
+            "role": worker.choice.role.label(),
+            "queued": queued,
+            "queue_position": queue_position,
+            "detail": if queued {
+                "The local concurrency limit queued the worker; it starts when a slot frees. Do not wait or poll: its report appears as a card in the requesting chat tab, and delegation_get reads it."
+            } else {
+                "The worker is running in a background tab. Do not wait or poll: its report appears as a card in the requesting chat tab, and delegation_get reads it."
+            },
+        })));
+        focus
+    }
+
+    /// `task_update_handoff` (with TRU-142 S6's `status`). The handoff is
+    /// stored on the task as before; `done` / `blocked` from the worker's own
+    /// tab also snapshot it into the worker delegation and wake its parent.
+    fn update_handoff_requested(
+        &mut self,
+        request: task_mcp::UpdateTaskHandoffRequest,
+        caller: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        use task_mcp::HandoffStatus;
+        let status = request.status.unwrap_or_default();
+        let summary = request.summary.trim().to_string();
+        if summary.is_empty() {
+            return Err("handoff summary is required".to_string());
+        }
+        let clean = |items: Vec<String>| {
+            items
+                .into_iter()
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        };
+        // The task session the calling tab hosts in this task (S1). Only
+        // this, never a typed session id, may report done or blocked.
+        let hosted_session = caller.and_then(|caller| {
+            self.workspaces
+                .iter()
+                .flat_map(|workspace| workspace.tabs.iter())
+                .find(|tab| {
+                    tab.session_uid == caller
+                        && tab.task_id.as_deref() == Some(request.task_id.as_str())
+                })
+                .and_then(|tab| tab.task_session_id.clone())
+        });
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let store = self
+            .task_store
+            .as_mut()
+            .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
+        let task_sessions = store
+            .get(&request.task_id)
+            .map(|task| {
+                task.sessions
+                    .iter()
+                    .map(|session| session.task_session_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let updated_by_session_id = handoff_writer(
+            &self.workspaces,
+            &request.task_id,
+            &task_sessions,
+            request.session_id.as_deref(),
+            caller,
+        )?;
+        let handoff = TaskHandoff {
+            summary,
+            decisions: clean(request.decisions),
+            next_steps: clean(request.next_steps),
+            blockers: clean(request.blockers),
+            updated_by_session_id,
+            updated_at: timestamp.clone(),
+        };
+        let report_to = gitterm::delegations::record_handoff(
+            store,
+            &request.task_id,
+            handoff,
+            status,
+            hosted_session.as_deref(),
+            &timestamp,
+        )?;
+        let delegation_status = report_to.as_deref().and_then(|delegation_id| {
+            store
+                .delegation(delegation_id)
+                .map(|delegation| delegation.status.label())
+        });
+        if let Some(delegation_id) = &report_to {
+            self.worker_reported(
+                delegation_id,
+                &request.task_id,
+                hosted_session.as_deref(),
+                status,
+            );
+        }
+        // A progress line (or any new handoff) shows on the worker cards.
+        self.push_worker_cards(&request.task_id);
+        let task = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(&request.task_id))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "Task {} disappeared after updating its handoff",
+                    request.task_id
+                )
+            })?;
+        let mut value = self.task_control_value(&task)?;
+        value["handoff_status"] = serde_json::Value::String(status.label().to_string());
+        value["delegation_id"] = report_to
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null);
+        value["delegation_status"] = delegation_status
+            .map(|label| serde_json::Value::String(label.to_string()))
+            .unwrap_or(serde_json::Value::Null);
+        if status != HandoffStatus::Progress && value["delegation_id"].is_null() {
+            value["detail"] = serde_json::Value::String(
+                "No worker delegation is open on this task, so nobody was notified; the handoff \
+                 is saved on the task."
+                    .to_string(),
+            );
+        }
+        Ok(value)
+    }
+
+    /// A worker reported done or blocked: mirror it on the task and the
+    /// worker's tab, and tell the parent chat (attention unless it is in
+    /// front, the rail dot that follows from it, and the card).
+    fn worker_reported(
+        &mut self,
+        delegation_id: &str,
+        task_id: &str,
+        worker_session: Option<&str>,
+        status: task_mcp::HandoffStatus,
+    ) {
+        let done = status == task_mcp::HandoffStatus::Done;
+        if let Some(session) = worker_session {
+            if let Some((ws_idx, tab_idx)) = find_task_session_tab(&self.workspaces, session) {
+                let tab = &mut self.workspaces[ws_idx].tabs[tab_idx];
+                if done {
+                    tab.task_live_state = None;
+                } else {
+                    tab.task_live_state = Some(TaskSessionLiveState::AwaitingInput);
+                    tab.set_attention(AttentionReason::HumanInputRequired);
+                }
+            }
+        }
+        let lifecycle = if done {
+            TaskLifecycle::Completed
+        } else {
+            TaskLifecycle::WaitingForInput
+        };
+        if let Some(store) = self.task_store.as_mut() {
+            if let Err(error) = store.record_lifecycle_signal(
+                task_id,
+                lifecycle,
+                None,
+                &chrono::Utc::now().to_rfc3339(),
+            ) {
+                eprintln!("[delegation] {delegation_id}: task lifecycle not updated: {error}");
+            }
+        }
+        let parent = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.delegation(delegation_id))
+            .map(|delegation| delegation.parent.session_uid.clone());
+        if let Some(tab_id) = parent.and_then(|uid| self.delegation_parent_tab_id(&uid)) {
+            let in_front = self.active_tab().map(|tab| tab.id) == Some(tab_id);
+            if !in_front {
+                let reason = if done {
+                    AttentionReason::DelegationReady(gitterm::tasks::DelegationKind::Implement)
+                } else {
+                    AttentionReason::DelegationBlocked(gitterm::tasks::DelegationKind::Implement)
+                };
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id)
+                {
+                    tab.set_attention(reason);
+                }
+            }
+        }
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.push_delegation_card(delegation_id);
+    }
+
+    /// Pushes the cards of every worker delegation on `task_id`, after its
+    /// sessions' live state or handoff changed.
+    fn push_worker_cards(&self, task_id: &str) {
+        let Some(store) = self.task_store.as_ref() else {
+            return;
+        };
+        let ids: Vec<String> = store
+            .delegations()
+            .iter()
+            .filter(|delegation| delegation.dismissed_at.is_none())
+            .filter(|delegation| {
+                matches!(
+                    &delegation.child,
+                    gitterm::tasks::DelegationChild::TaskSession { task_id: child, .. }
+                        if child == task_id
+                )
+            })
+            .map(|delegation| delegation.delegation_id.clone())
+            .collect();
+        for id in ids {
+            self.push_delegation_card(&id);
+        }
+    }
+
+    /// The worker part of a card and of `delegation_get`: the task, its live
+    /// tab state and latest progress line. `None` for Codex delegations.
+    fn worker_info(&self, delegation: &gitterm::tasks::Delegation) -> Option<serde_json::Value> {
+        let gitterm::tasks::DelegationChild::TaskSession {
+            task_id,
+            task_session_id,
+            ..
+        } = &delegation.child
+        else {
+            return None;
+        };
+        let task = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id));
+        let tab = task_session_id
+            .as_deref()
+            .and_then(|session| find_task_session_tab(&self.workspaces, session))
+            .map(
+                |(ws_idx, tab_idx)| match self.workspaces[ws_idx].tabs[tab_idx].task_live_state {
+                    Some(TaskSessionLiveState::AwaitingInput) => {
+                        gitterm::delegations::WorkerTab::AwaitingInput
+                    }
+                    Some(TaskSessionLiveState::Working) => gitterm::delegations::WorkerTab::Working,
+                    None => gitterm::delegations::WorkerTab::Idle,
+                },
+            )
+            .unwrap_or(gitterm::delegations::WorkerTab::Closed);
+        Some(gitterm::delegations::worker_card_info(
+            delegation, task, tab,
+        ))
+    }
+
+    /// Updates (or creates) the delegation's card on its parent's chat page.
+    fn push_delegation_card(&self, delegation_id: &str) {
+        let Some(delegation) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.delegation(delegation_id))
+        else {
+            return;
+        };
+        let Some(tab_id) = self.delegation_parent_tab_id(&delegation.parent.session_uid) else {
+            return;
+        };
+        if !webview::is_active(WebviewSurface::Agent(tab_id)) {
+            return;
+        }
+        match self.delegation_card(tab_id, delegation) {
+            Ok(payload) => webview::evaluate_script(
+                WebviewSurface::Agent(tab_id),
+                &format!("window.__appendEvent({payload})"),
+            ),
+            Err(error) => eprintln!("[delegation] {delegation_id}: {error}"),
+        }
+    }
+
+    fn delegation_card(
+        &self,
+        tab_id: usize,
+        delegation: &gitterm::tasks::Delegation,
+    ) -> Result<serde_json::Value, String> {
+        let id = delegation.delegation_id.as_str();
+        let held = self
+            .delegation_held
+            .get(&tab_id)
+            .is_some_and(|held| held.iter().any(|send| send.delegation_id == id));
+        gitterm::delegations::card_payload(
+            delegation,
+            self.delegation_activity.get(id).map(String::as_str),
+            held,
+            self.worker_info(delegation),
+            &config::global_config_dir(),
+        )
+    }
+
+    /// Every delegation card of a chat tab, oldest first, for a replay.
+    fn delegation_cards_for_tab(&self, tab_id: usize) -> Vec<serde_json::Value> {
+        let Some(session_uid) = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.session_uid.as_str())
+        else {
+            return Vec::new();
+        };
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let mut delegations = store.delegations_for_parent(session_uid);
+        delegations.reverse();
+        delegations
+            .into_iter()
+            .filter_map(
+                |delegation| match self.delegation_card(tab_id, delegation) {
+                    Ok(card) => Some(card),
+                    Err(error) => {
+                        eprintln!("[delegation] {}: {error}", delegation.delegation_id);
+                        None
+                    }
+                },
+            )
+            .collect()
+    }
+
+    /// (id, created_at) of every delegation of a chat tab, oldest first,
+    /// for placing their cards in a transcript read-back.
+    fn delegation_times_for_tab(&self, tab_id: usize) -> Vec<(String, String)> {
+        let Some(session_uid) = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.session_uid.as_str())
+        else {
+            return Vec::new();
+        };
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let mut delegations: Vec<(String, String)> = store
+            .delegations_for_parent(session_uid)
+            .into_iter()
+            .map(|delegation| {
+                (
+                    delegation.delegation_id.clone(),
+                    delegation.created_at.clone(),
+                )
+            })
+            .collect();
+        delegations.reverse();
+        delegations
+    }
+
+    /// Reads the chat tab's HEAD for its cards' "branch has moved" banner.
+    fn refresh_delegation_head(&self, tab_id: usize) -> Task<Event> {
+        let Some(tab) = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+        else {
+            return Task::none();
+        };
+        let has_cards = self
+            .task_store
+            .as_ref()
+            .is_some_and(|store| !store.delegations_for_parent(&tab.session_uid).is_empty());
+        if !has_cards {
+            return Task::none();
+        }
+        let cwd = tab.repo_path.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || gitterm::delegations::current_head(&cwd))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("the HEAD check failed: {error}")))
+            },
+            move |head| Event::DelegationHeadLoaded(tab_id, head),
+        )
+    }
+
+    /// Submits a delegation's message as a user message and stamps it
+    /// delivered, so a replay or restart never sends it again.
+    fn deliver_delegation(
+        &mut self,
+        tab_id: usize,
+        delegation_id: &str,
+        message: String,
+    ) -> Task<Event> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let marked = match self.task_store.as_mut() {
+            Some(store) => store
+                .mark_delegation_delivered(delegation_id, &now)
+                .map_err(|error| error.to_string()),
+            None => Err("GitTerm's task store is unavailable".to_string()),
+        };
+        if let Err(error) = marked {
+            eprintln!("[delegation] {delegation_id}: not sent: {error}");
+            agent_webview_note(tab_id, &format!("Not sent: {error}"));
+            return Task::none();
+        }
+        self.push_delegation_card(delegation_id);
+        Task::done(Event::AgentSubmitPrompt(tab_id, message.into()))
+    }
+
+    /// After the parent's turn ends: send the oldest held message.
+    fn flush_held_delegation(&mut self, tab_id: usize) -> Task<Event> {
+        let streaming = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.agent_session())
+            .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming));
+        let Some(held) = self.delegation_held.get_mut(&tab_id) else {
+            return Task::none();
+        };
+        let Some(next) = gitterm::delegations::next_held_send(held, streaming) else {
+            return Task::none();
+        };
+        self.deliver_delegation(tab_id, &next.delegation_id, next.message)
+    }
+
+    /// The delegation behind a card on `tab_id`'s page, checked to belong
+    /// to that tab.
+    fn tab_delegation(
+        &self,
+        tab_id: usize,
+        delegation_id: &str,
+    ) -> Result<&gitterm::tasks::Delegation, String> {
+        let session_uid = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.session_uid.as_str())
+            .ok_or_else(|| format!("tab {tab_id} is not open"))?;
+        let delegation = self
+            .task_store
+            .as_ref()
+            .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?
+            .delegation(delegation_id)
+            .ok_or_else(|| format!("delegation {delegation_id} does not exist"))?;
+        if delegation.parent.session_uid != session_uid {
+            return Err(format!("delegation {delegation_id} belongs to another tab"));
+        }
+        Ok(delegation)
+    }
+}
+
 fn load_task_store_for_startup(
     path: PathBuf,
     timestamp: &str,
@@ -9218,6 +11821,12 @@ impl App {
             active_workspace_idx: 0,
             next_tab_id: 0,
             task_store,
+            review_config: config.review.clone(),
+            model_policy: config.policy.clone(),
+            delegation_runs: HashMap::new(),
+            delegation_activity: HashMap::new(),
+            delegation_held: HashMap::new(),
+            chat_config: config.chat.clone(),
             task_store_error,
             task_ui_error: None,
             task_worktree_root: config.task_worktree_root.clone(),
@@ -9241,6 +11850,7 @@ impl App {
             rail_worktrees: Vec::new(),
             rail_worktrees_repo_path: None,
             rail_worktrees_loading: false,
+            worktree_list_cache: WorktreeListCache::default(),
             last_rail_worktrees_poll: Instant::now(),
             unmanaged_worktree_ops: HashMap::new(),
             theme,
@@ -9278,7 +11888,8 @@ impl App {
             edge_peek_left: false,
             edge_peek_right: false,
             attention_pulse_bright: false,
-            attention_view_open: false,
+            needs_you_notifier: NeedsYouNotifier::new(Instant::now()),
+            notifications_config: config.notifications.clone(),
             current_modifiers: Modifiers::empty(),
             show_help: false,
             workspace_settings_open: false,
@@ -9286,6 +11897,7 @@ impl App {
             workspace_settings_new_key: String::new(),
             workspace_settings_new_value: String::new(),
             tab_picker_visible: false,
+            tab_picker_cli_open: false,
             task_handoff_copied: false,
             workspace_source_picker_visible: false,
             remote_workspace_picker: None,
@@ -9327,6 +11939,7 @@ impl App {
             stt_sample_rate: 48000,
             #[cfg(feature = "stt")]
             stt_transcribing: false,
+            dictation_held: HashMap::new(),
             viewer_webview: ViewerWebview::None,
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
@@ -9336,10 +11949,23 @@ impl App {
             chat_scope: chats::ChatScope::default(),
             chat_backend_filter: None,
             chat_expanded_machines: std::collections::HashSet::new(),
+            chat_open_section_collapsed: false,
             collapsed_machine_groups: std::collections::HashSet::new(),
             machine_menu: None,
             remote_chat_indexes: HashMap::new(),
             chat_preview: None,
+            jev_client: gitterm::jev::JevClient::from_env(),
+            chat_rank: chat_rank::ChatRankState::default(),
+            chat_snippets: Arc::new(Mutex::new(chat_rank::SnippetCache::default())),
+            usage_config: config.usage.clone(),
+            usage_view: UsageViewState::default(),
+            usage_window: gitterm::usage::UsageWindow::default(),
+            usage_chart_tokens: false,
+            usage_show_headless: true,
+            usage_report: None,
+            usage_scanning: false,
+            usage_error: None,
+            usage_cache: Arc::new(Mutex::new(gitterm::usage::UsageCache::default())),
         };
 
         if let Some(remote_file) = RemoteSessionsFile::load() {
@@ -9451,6 +12077,15 @@ impl App {
                     }
                 } else {
                     for tab_config in &ws_config.tabs {
+                        // Tabs saved before caller identity existed get a
+                        // fresh uid (TabState::new); save once so it sticks.
+                        let restored_session_uid = tab_config.session_uid.clone();
+                        if restored_session_uid.is_none() {
+                            app.workspaces_dirty = true;
+                            app.next_workspace_save_at = Some(
+                                Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS),
+                            );
+                        }
                         if workspace_is_remote_agent {
                             let Some(root) = remote_agent_root.as_deref() else {
                                 continue;
@@ -9465,6 +12100,7 @@ impl App {
                                     local_cwd,
                                     Some(PathBuf::from(&tab_config.dir)),
                                     tab_config.startup_command.clone(),
+                                    restored_session_uid,
                                 );
                                 continue;
                             }
@@ -9479,6 +12115,11 @@ impl App {
                                 root.to_string(),
                                 Some(tab_config.dir.clone()),
                             );
+                            if let (Some(uid), Some(tab)) =
+                                (restored_session_uid, workspace.tabs.last_mut())
+                            {
+                                tab.session_uid = uid;
+                            }
                             remote_agent_files_tab_added = true;
                             continue;
                         }
@@ -9589,6 +12230,20 @@ impl App {
                                     startup_command = Some("claude".to_string());
                                     chat_session_id = None;
                                 }
+                            } else if let Some((resume, session_id)) =
+                                startup_command.as_deref().and_then(|command| {
+                                    resume_for_preassigned_claude_launch(
+                                        command,
+                                        chats::claude_session_exists,
+                                    )
+                                })
+                            {
+                                // A plain `claude --session-id X` launch whose
+                                // session has since been written cannot be
+                                // re-run (the CLI refuses: "Session ID X is
+                                // already in use"); resume it instead.
+                                startup_command = Some(resume);
+                                chat_session_id = Some(session_id);
                             }
                         }
                         match (
@@ -9602,6 +12257,13 @@ impl App {
                                     Some(current_dir),
                                     agent_config.clone(),
                                 );
+                                // No terminal: the chat process (and its MCP
+                                // URL) starts on the first prompt.
+                                if let (Some(uid), Some(tab)) =
+                                    (restored_session_uid.clone(), workspace.tabs.last_mut())
+                                {
+                                    tab.session_uid = uid;
+                                }
                             }
                             (Some("agent"), None) => {
                                 eprintln!(
@@ -9613,6 +12275,7 @@ impl App {
                                     repo_dir,
                                     Some(current_dir),
                                     startup_command.clone(),
+                                    restored_session_uid.clone(),
                                 );
                             }
                             (Some(other), _) if other != "terminal" => {
@@ -9626,6 +12289,7 @@ impl App {
                                     repo_dir,
                                     Some(current_dir),
                                     startup_command.clone(),
+                                    restored_session_uid.clone(),
                                 );
                             }
                             _ => {
@@ -9634,6 +12298,7 @@ impl App {
                                     repo_dir,
                                     Some(current_dir),
                                     startup_command.clone(),
+                                    restored_session_uid.clone(),
                                 );
                             }
                         }
@@ -9797,12 +12462,14 @@ impl App {
         repo_path: PathBuf,
         current_dir: Option<PathBuf>,
         startup_command: Option<String>,
+        session_uid: Option<String>,
     ) {
         let startup_command_for_title = startup_command.clone();
-        let mut tab = self.create_tab_for_workspace(
+        let mut tab = self.create_tab_with_session_uid(
             repo_path.clone(),
             startup_command,
             Some(&workspace.name.clone()),
+            session_uid,
         );
         tab.set_local_dir(current_dir.unwrap_or(repo_path));
         if let Some(session) = self.remote_session_for_workspace(workspace) {
@@ -10232,6 +12899,28 @@ fi
         startup_command: Option<String>,
         workspace_name: Option<&str>,
     ) -> TabState {
+        self.create_tab_with_session_uid(repo_path, startup_command, workspace_name, None)
+    }
+
+    /// `create_tab_for_workspace` for a tab whose durable `session_uid` is
+    /// already known (workspace restore). The uid must be fixed before the
+    /// terminal starts: it is baked into the task MCP URL in its environment.
+    fn create_tab_with_session_uid(
+        &mut self,
+        repo_path: PathBuf,
+        startup_command: Option<String>,
+        workspace_name: Option<&str>,
+        session_uid: Option<String>,
+    ) -> TabState {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+
+        let mut tab = TabState::new(id, repo_path.clone());
+        if let Some(session_uid) = session_uid {
+            tab.session_uid = session_uid;
+        }
+        tab.set_startup_command(startup_command.clone());
+
         // Read env fresh from the global workspaces.json. Caller passes the workspace name
         // explicitly so this works correctly during init (before active_workspace is set).
         let ws_name = workspace_name
@@ -10251,18 +12940,12 @@ fi
             extra_env.extend(connection.terminal_environment());
         }
         if let Some(connection) = &self.task_mcp {
-            extra_env.extend(connection.terminal_environment());
+            extra_env.extend(connection.terminal_environment(Some(&tab.session_uid)));
         }
         let extra_env_refs: Vec<(&str, &str)> = extra_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-
-        let mut tab = TabState::new(id, repo_path.clone());
-        tab.set_startup_command(startup_command.clone());
 
         let settings = Self::build_terminal_settings(
             &repo_path,
@@ -10299,7 +12982,8 @@ fi
             extra_env.extend(connection.terminal_environment());
         }
         if let Some(connection) = &self.task_mcp {
-            extra_env.extend(connection.terminal_environment());
+            // Bottom-panel terminals are not tabs and have no caller identity.
+            extra_env.extend(connection.terminal_environment(None));
         }
         let extra_env_refs: Vec<(&str, &str)> = extra_env
             .iter()
@@ -10608,8 +13292,9 @@ fi
                 // which terminal cwd tracking keeps up to date. In a task
                 // context every panel looks at the task's worktree instead:
                 // clicking a task means "show me that worktree", whichever
-                // tab is focused.
-                let root = self.task_context_worktree_root().unwrap_or_else(|| {
+                // tab is focused. A chat tab whose agent works in another
+                // worktree shows that worktree while it follows it.
+                let root = self.panel_context_root().unwrap_or_else(|| {
                     workspace
                         .active_tab()
                         .map(|tab| tab.repo_path.clone())
@@ -10645,6 +13330,7 @@ fi
     fn browse_active_tab_to(&mut self, dir: SourcePath) -> Task<Event> {
         let source = self.source_for_active_tab();
         let show_hidden = self.show_hidden;
+        let followed_root = self.followed_worktree_root();
         let Some(tab) = self.active_tab_mut() else {
             return Task::none();
         };
@@ -10657,9 +13343,16 @@ fi
             _ => dir,
         };
         // Keep the tab-local working directory mirrored while browsing local
-        // dirs; remote browsing must never touch it.
+        // dirs; remote browsing must never touch it. Browsing a followed
+        // agent worktree does not move it either: new terminals and task
+        // adoption keep reading the workspace side.
         if let Some(local) = dir.as_local() {
-            tab.current_dir = local.to_path_buf();
+            if !followed_root
+                .as_ref()
+                .is_some_and(|root| local.starts_with(root))
+            {
+                tab.current_dir = local.to_path_buf();
+            }
         }
         let seq = tab.files.begin_request(dir.clone());
         let tab_id = tab.id;
@@ -10719,6 +13412,14 @@ fi
     /// is outside the context root (task worktrees never nest inside the
     /// checkout, so containment is a reliable test).
     fn refresh_panels_for_task_context(&mut self) -> Task<Event> {
+        self.refresh_panels_for_context(None)
+    }
+
+    /// `refresh_panels_for_task_context`, also moving the file browser out
+    /// of `leaving` (the previous context root): a followed agent worktree
+    /// can sit inside the checkout (`.claude/worktrees/`), so containment in
+    /// the new root alone would leave the browser in the old tree.
+    fn refresh_panels_for_context(&mut self, leaving: Option<PathBuf>) -> Task<Event> {
         let Ok(WorkspaceSource::Local { root }) = self.source_for_active_tab() else {
             return Task::none();
         };
@@ -10732,7 +13433,10 @@ fi
             tab.last_git_status_hash = None;
             git_task = Self::request_local_git_status(tab.id, root.clone());
             if let SourcePath::Local(dir) = &tab.files.dir {
-                if !dir.starts_with(&root) {
+                let left_old_root = leaving
+                    .as_ref()
+                    .is_some_and(|old| old != &root && dir.starts_with(old));
+                if !dir.starts_with(&root) || left_old_root {
                     files_jump = Some(SourcePath::Local(root));
                 }
             }
@@ -11027,7 +13731,7 @@ fi
     }
 
     /// Tasks whose open session tabs already surface live attention — their
-    /// tab rows are the more precise inbox entries for the same thing.
+    /// tab rows are the more precise attention rows for the same thing.
     fn task_ids_with_tab_attention(&self) -> HashSet<&str> {
         self.workspaces
             .iter()
@@ -11037,59 +13741,21 @@ fi
             .collect()
     }
 
-    /// Attention reasons of the tasks that reach the inbox as their own rows.
-    fn rail_only_task_attention_reasons(&self) -> Vec<TaskAttentionReason> {
-        let Some(store) = self.task_store.as_ref() else {
-            return Vec::new();
-        };
-        let tabbed = self.task_ids_with_tab_attention();
-        store
-            .tasks()
-            .iter()
-            .filter(|task| task.lifecycle != TaskLifecycle::Archived)
-            .filter(|task| !tabbed.contains(task.task_id.as_str()))
-            .filter_map(|task| task.attention.reason)
-            .collect()
-    }
-
     fn attention_items(&self) -> Vec<AttentionItem> {
         let now = Instant::now();
+        let now_utc = chrono::Utc::now();
         let mut items = self
             .workspaces
             .iter()
-            .flat_map(|workspace| {
-                let machine_name = match &workspace.location {
-                    WorkspaceLocation::Local { .. } => "Local".to_string(),
-                    WorkspaceLocation::RemoteAgent { remote_id, .. } => self
-                        .remote_agent_config_by_id(remote_id)
-                        .map(|agent| agent.name.clone())
-                        .unwrap_or_else(|| remote_id.clone()),
-                    WorkspaceLocation::LegacyRemoteSession { session_name, .. } => {
-                        session_name.clone()
-                    }
-                };
-                workspace.tabs.iter().filter_map(move |tab| {
-                    let attention = tab.attention?;
-                    let title = tab
-                        .terminal_title()
-                        .unwrap_or(tab.repo_name.as_str())
-                        .trim_start_matches('✳')
-                        .trim()
-                        .to_string();
-                    Some(AttentionItem {
-                        target: AttentionTarget::Tab(tab.id),
-                        workspace_name: workspace.name.clone(),
-                        machine_name: machine_name.clone(),
-                        title,
-                        priority: attention.reason.priority(),
-                        icon: attention.reason.icon(),
-                        label: attention.reason.label(),
-                        age_secs: now.saturating_duration_since(attention.since).as_secs(),
-                    })
-                })
+            .enumerate()
+            .flat_map(|(workspace_idx, workspace)| {
+                workspace
+                    .tabs
+                    .iter()
+                    .filter_map(move |tab| AttentionItem::for_tab(tab, workspace_idx, now))
             })
             .collect::<Vec<_>>();
-        // Tasks with durable attention join the inbox unless one of their
+        // Tasks with durable attention join the rows unless one of their
         // open session tabs is already surfacing live attention — then the
         // tab row above is the more precise entry for the same thing.
         if let Some(store) = self.task_store.as_ref() {
@@ -11106,54 +13772,242 @@ fi
                 let (priority, icon, label) = task_attention_presentation(reason);
                 // Age from when the reason was raised, not `updated_at` —
                 // that bumps on every progress write and would walk the row
-                // around the inbox while the agent works (TRU-133). Records
+                // around the list while the agent works (TRU-133). Records
                 // written before `since` existed fall back to `updated_at`.
                 let raised_at = task.attention.since.as_deref().unwrap_or(&task.updated_at);
-                let age_secs = chrono::DateTime::parse_from_rfc3339(raised_at)
+                let waiting = chrono::DateTime::parse_from_rfc3339(raised_at)
                     .ok()
-                    .map(|updated| {
-                        chrono::Utc::now()
-                            .signed_duration_since(updated.with_timezone(&chrono::Utc))
-                            .num_seconds()
-                            .max(0) as u64
+                    .and_then(|raised| {
+                        now_utc
+                            .signed_duration_since(raised.with_timezone(&chrono::Utc))
+                            .to_std()
+                            .ok()
                     })
-                    .unwrap_or(0);
-                let machine_name = match &task.workspace.location {
-                    WorkspaceLocationIdentity::Local { .. } => "Local".to_string(),
-                    WorkspaceLocationIdentity::RemoteAgent { remote_id, .. } => self
-                        .remote_agent_config_by_id(remote_id)
-                        .map(|agent| agent.name.clone())
-                        .unwrap_or_else(|| remote_id.clone()),
-                };
+                    .unwrap_or_default();
                 let title = match &task.issue {
                     Some(issue) => format!("{} {}", issue.key, task.title),
                     None => task.title.clone(),
                 };
+                let workspace_idx = match &task.workspace.location {
+                    WorkspaceLocationIdentity::Local { directory } => {
+                        self.open_local_workspace_index(directory, directory)
+                    }
+                    WorkspaceLocationIdentity::RemoteAgent { .. } => None,
+                };
                 items.push(AttentionItem {
                     target: AttentionTarget::Task(task.task_id.clone()),
-                    workspace_name: task.workspace.name.clone(),
-                    machine_name,
+                    workspace_idx,
                     title,
                     priority,
                     icon,
                     label,
-                    age_secs,
+                    waiting,
                 });
             }
         }
-        // Oldest-waiting first within a priority; the target id breaks ties
-        // so two rows with equal ages never swap between frames.
-        items.sort_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
-                .then(right.age_secs.cmp(&left.age_secs))
-                .then_with(|| left.target.cmp(&right.target))
-        });
+        sort_attention_items(&mut items);
         items
     }
 
-    fn restore_webview_after_attention(&mut self) -> Task<Event> {
-        self.apply_webview_surfaces()
+    /// Every open tab across the local workspaces that the Chats panel's
+    /// Open section lists, in its order (TRU-148).
+    fn open_tab_rows(&self) -> Vec<OpenTabRow> {
+        let now = Instant::now();
+        let mut rows = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| matches!(workspace.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|(workspace_idx, workspace)| {
+                workspace
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tab)| {
+                        open_section_includes(
+                            tab.agent_session().is_some() || tab.chat_session_id.is_some(),
+                            tab.attention.is_some(),
+                        )
+                    })
+                    .map(move |(tab_idx, tab)| OpenTabRow {
+                        workspace_idx,
+                        tab_idx,
+                        tab_id: tab.id,
+                        attention: tab.attention.map(|attention| {
+                            (
+                                attention.reason.priority(),
+                                now.saturating_duration_since(attention.since),
+                            )
+                        }),
+                        running: tab.is_running(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        sort_open_tab_rows(&mut rows);
+        rows
+    }
+
+    /// What a tab is called outside its strip: the chat's own title when
+    /// the index knows it, then the harness topic, then the repo.
+    fn tab_display_title<'a>(&'a self, tab: &'a TabState) -> &'a str {
+        let terminal_title = tab
+            .terminal_title()
+            .map(strip_title_status_glyphs)
+            .filter(|title| !title.is_empty());
+        tab.chat_session_id
+            .as_deref()
+            .and_then(|id| self.chat_index.iter().find(|entry| entry.id == id))
+            .map(|entry| entry.title.as_str())
+            .or(terminal_title)
+            .unwrap_or(tab.repo_name.as_str())
+    }
+
+    /// Feed the needs-you notifier what can need the human right now and
+    /// post a macOS notification for each background transition (TRU-148).
+    /// Runs on the menu poll; off when `notifications.needs_you` is false.
+    fn observe_needs_you(&mut self) {
+        if !self.notifications_config.needs_you {
+            return;
+        }
+        let front = self.front_tab_id();
+        let front_task = self
+            .active_workspace()
+            .and_then(Workspace::active_tab)
+            .and_then(|tab| tab.task_id.clone());
+        let mut observations = Vec::new();
+        for tab in self.workspaces.iter().flat_map(|workspace| &workspace.tabs) {
+            let reason = tab
+                .attention
+                .map(|attention| attention.reason)
+                .filter(|reason| {
+                    matches!(
+                        reason,
+                        AttentionReason::HumanInputRequired | AttentionReason::DelegationBlocked(_)
+                    )
+                });
+            observations.push(NeedsYouObservation {
+                target: AttentionTarget::Tab(tab.id),
+                needs_you: reason.map(AttentionReason::label),
+                running: tab.is_running(),
+                front: front == Some(tab.id),
+                requires_work: reason == Some(AttentionReason::HumanInputRequired)
+                    && tab.agent_session().is_none(),
+            });
+        }
+        // A task whose tab already raised attention is that tab's news.
+        if let Some(store) = self.task_store.as_ref() {
+            let tabbed = self.task_ids_with_tab_attention();
+            for task in store.tasks() {
+                if task.lifecycle == TaskLifecycle::Archived
+                    || tabbed.contains(task.task_id.as_str())
+                    || task.attention.reason != Some(TaskAttentionReason::RequiresInput)
+                {
+                    continue;
+                }
+                observations.push(NeedsYouObservation {
+                    target: AttentionTarget::Task(task.task_id.clone()),
+                    needs_you: Some(
+                        task_attention_presentation(TaskAttentionReason::RequiresInput).2,
+                    ),
+                    running: false,
+                    front: front_task.as_deref() == Some(task.task_id.as_str()),
+                    requires_work: false,
+                });
+            }
+        }
+        for nudge in self
+            .needs_you_notifier
+            .observe(Instant::now(), observations)
+        {
+            let title = match &nudge.target {
+                AttentionTarget::Tab(tab_id) => self
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.tabs)
+                    .find(|tab| tab.id == *tab_id)
+                    .map(|tab| self.tab_display_title(tab).to_string()),
+                AttentionTarget::Task(task_id) => self
+                    .task_store
+                    .as_ref()
+                    .and_then(|store| store.get(task_id))
+                    .map(|task| match &task.issue {
+                        Some(issue) => format!("{} {}", issue.key, task.title),
+                        None => task.title.clone(),
+                    }),
+            };
+            let Some(title) = title else {
+                eprintln!(
+                    "[notify] needs-you target {:?} vanished before posting",
+                    nudge.target
+                );
+                continue;
+            };
+            post_needs_you_notification(&title, nudge.label);
+        }
+    }
+
+    /// The tab in front of the user: the active tab of the active
+    /// workspace. Its state is already on screen, so the rail does not
+    /// count it.
+    fn front_tab_id(&self) -> Option<usize> {
+        self.active_workspace()
+            .and_then(Workspace::active_tab)
+            .map(|tab| tab.id)
+    }
+
+    /// What one workspace's rail dot reports (TRU-148): its attention rows
+    /// in order, and whether any of its tabs is mid-turn — both leaving out
+    /// the tab in front of the user.
+    fn workspace_rail_state(
+        &self,
+        items: &[AttentionItem],
+        workspace_idx: usize,
+    ) -> (Vec<AttentionItem>, bool) {
+        let front = self.front_tab_id();
+        let rows = items
+            .iter()
+            .filter(|item| item.workspace_idx == Some(workspace_idx))
+            .filter(|item| front.is_none_or(|id| item.target != AttentionTarget::Tab(id)))
+            .cloned()
+            .collect();
+        let running = self.workspaces.get(workspace_idx).is_some_and(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .filter(|tab| Some(tab.id) != front)
+                .any(TabState::is_running)
+        });
+        (rows, running)
+    }
+
+    /// Go where an attention row points: a tab (switching workspace first
+    /// when needed) or a task's context.
+    fn jump_to_attention_target(&mut self, target: AttentionTarget) -> Task<Event> {
+        match target {
+            AttentionTarget::Tab(tab_id) => {
+                let found =
+                    self.workspaces
+                        .iter()
+                        .enumerate()
+                        .find_map(|(workspace_idx, workspace)| {
+                            workspace
+                                .tabs
+                                .iter()
+                                .position(|tab| tab.id == tab_id)
+                                .map(|tab_idx| (workspace_idx, tab_idx))
+                        });
+                match found {
+                    Some((workspace_idx, tab_idx)) => {
+                        self.focus_workspace_tab(workspace_idx, tab_idx)
+                    }
+                    None => {
+                        eprintln!("[attention] jump: tab {tab_id} is no longer open");
+                        Task::none()
+                    }
+                }
+            }
+            AttentionTarget::Task(task_id) => self.enter_task_context(&task_id),
+        }
     }
 
     fn title(&self) -> String {
@@ -11394,14 +14248,17 @@ fi
                     envelope.reply.send(result);
                 }
                 TaskControlOperation::Create(request) => {
-                    let pending =
-                        match self.pending_task_from_control(request, envelope.reply.clone()) {
-                            Ok(pending) => pending,
-                            Err(error) => {
-                                envelope.reply.send(Err(error));
-                                return Task::none();
-                            }
-                        };
+                    let pending = match self.pending_task_from_control(
+                        request,
+                        envelope.reply.clone(),
+                        envelope.caller.clone(),
+                    ) {
+                        Ok(pending) => pending,
+                        Err(error) => {
+                            envelope.reply.send(Err(error));
+                            return Task::none();
+                        }
+                    };
                     let worktree_request = pending.request.clone();
                     return Task::perform(
                         resolve_task_preparation(worktree_request),
@@ -11453,67 +14310,15 @@ fi
                     }
                 }
                 TaskControlOperation::UpdateHandoff(request) => {
-                    let summary = request.summary.trim().to_string();
-                    if summary.is_empty() {
-                        envelope
-                            .reply
-                            .send(Err("handoff summary is required".to_string()));
-                        return Task::none();
-                    }
-                    let clean = |items: Vec<String>| {
-                        items
-                            .into_iter()
-                            .map(|item| item.trim().to_string())
-                            .filter(|item| !item.is_empty())
-                            .collect::<Vec<_>>()
-                    };
-                    let timestamp = chrono::Utc::now().to_rfc3339();
-                    let result = if let Some(store) = self.task_store.as_mut() {
-                        let session_valid = request.session_id.as_ref().is_none_or(|session_id| {
-                            store.get(&request.task_id).is_some_and(|task| {
-                                task.sessions
-                                    .iter()
-                                    .any(|session| session.task_session_id == session_id.trim())
-                            })
-                        });
-                        if !session_valid {
-                            Err(format!(
-                                "Task {} does not contain session {}",
-                                request.task_id,
-                                request.session_id.as_deref().unwrap_or_default()
-                            ))
-                        } else {
-                            store
-                                .update_handoff(
-                                    &request.task_id,
-                                    TaskHandoff {
-                                        summary,
-                                        decisions: clean(request.decisions),
-                                        next_steps: clean(request.next_steps),
-                                        blockers: clean(request.blockers),
-                                        updated_by_session_id: request
-                                            .session_id
-                                            .map(|session_id| session_id.trim().to_string()),
-                                        updated_at: timestamp.clone(),
-                                    },
-                                    &timestamp,
-                                )
-                                .map_err(|error| error.to_string())
-                                .and_then(|()| {
-                                    store.get(&request.task_id).cloned().ok_or_else(|| {
-                                        format!(
-                                            "Task {} disappeared after updating its handoff",
-                                            request.task_id
-                                        )
-                                    })
-                                })
-                        }
-                    } else {
-                        Err("GitTerm's task store is unavailable".to_string())
-                    };
-                    envelope
-                        .reply
-                        .send(result.and_then(|task| self.task_control_value(&task)));
+                    let result = self.update_handoff_requested(request, envelope.caller.as_deref());
+                    envelope.reply.send(result);
+                }
+                TaskControlOperation::DelegateTask(request) => {
+                    return self.delegate_task_requested(
+                        request,
+                        envelope.caller.clone(),
+                        envelope.reply,
+                    );
                 }
                 TaskControlOperation::SessionEvent(request) => {
                     // Only turn completion carries a lifecycle edge today;
@@ -11521,6 +14326,29 @@ fi
                     if request.event_type != "agent-turn-complete" {
                         envelope.reply.send(Ok(serde_json::json!({
                             "ignored": request.event_type,
+                        })));
+                        return Task::none();
+                    }
+                    // A worker that reported done goes idle at its prompt;
+                    // that turn end is not a request for input (S6).
+                    let reported_done = self.task_store.as_ref().is_some_and(|store| {
+                        store.delegations().iter().any(|delegation| {
+                            delegation.status == gitterm::tasks::DelegationStatus::Completed
+                                && matches!(
+                                    &delegation.child,
+                                    gitterm::tasks::DelegationChild::TaskSession {
+                                        task_session_id: Some(session),
+                                        ..
+                                    } if *session == request.session_id
+                                )
+                        })
+                    });
+                    if reported_done {
+                        envelope.reply.send(Ok(serde_json::json!({
+                            "task_id": request.task_id,
+                            "session_id": request.session_id,
+                            "waiting_for_input": false,
+                            "ignored": "the worker reported done",
                         })));
                         return Task::none();
                     }
@@ -11546,6 +14374,81 @@ fi
                         "session_id": request.session_id,
                         "waiting_for_input": updated,
                     })));
+                }
+                TaskControlOperation::RequestReview(request) => {
+                    let new = self
+                        .delegation_caller_for_tool(envelope.caller.as_deref(), "review_request")
+                        .and_then(|caller| {
+                            gitterm::delegations::review_delegation(
+                                &request,
+                                &caller,
+                                self.review_config.codex_model.as_deref(),
+                                None,
+                            )
+                        });
+                    return self.request_delegation(new, DelegationOrigin::Mcp(envelope.reply));
+                }
+                TaskControlOperation::RequestConsult(request) => {
+                    let new = self
+                        .delegation_caller_for_tool(envelope.caller.as_deref(), "consult_request")
+                        .and_then(|caller| {
+                            gitterm::delegations::consult_delegation(
+                                &request,
+                                &caller,
+                                self.review_config.codex_model.as_deref(),
+                                None,
+                            )
+                        });
+                    return self.request_delegation(new, DelegationOrigin::Mcp(envelope.reply));
+                }
+                TaskControlOperation::GetDelegation(request) => {
+                    let result = envelope
+                        .caller
+                        .as_deref()
+                        .ok_or_else(|| task_mcp::missing_caller_error("delegation_get"))
+                        .and_then(|_| {
+                            self.task_store
+                                .as_ref()
+                                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
+                        })
+                        .and_then(|store| {
+                            store
+                                .delegation(request.delegation_id.trim())
+                                .ok_or_else(|| {
+                                    format!(
+                                        "delegation {} does not exist",
+                                        request.delegation_id.trim()
+                                    )
+                                })
+                        })
+                        .and_then(|delegation| {
+                            let mut record = gitterm::delegations::delegation_record(
+                                delegation,
+                                &config::global_config_dir(),
+                            )?;
+                            if let Some(worker) = self.worker_info(delegation) {
+                                record["worker"] = worker;
+                            }
+                            Ok(record)
+                        });
+                    envelope.reply.send(result);
+                }
+                TaskControlOperation::ListDelegations(request) => {
+                    let result = envelope
+                        .caller
+                        .as_deref()
+                        .ok_or_else(|| task_mcp::missing_caller_error("delegation_list"))
+                        .and_then(|caller| {
+                            let store = self
+                                .task_store
+                                .as_ref()
+                                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
+                            gitterm::delegations::delegation_list(
+                                &store.delegations_for_parent(caller),
+                                request.status.as_deref(),
+                            )
+                        });
+                    envelope.reply.send(result);
                 }
             },
             Event::BrowserMcpStopped(result) => {
@@ -11736,11 +14639,16 @@ fi
                 self.sync_pending_terminal_redraws();
             }
             Event::MainTerminalClicked => {
+                // A webview clicked earlier still holds AppKit focus.
+                webview::focus_app_view();
                 if self.bottom_panel_focused {
                     return self.focus_main_terminal();
                 }
             }
             Event::BottomTerminalClicked(idx) => {
+                // Below a chat tab the chat page keeps AppKit focus after
+                // the click and takes Cmd+V for itself; hand focus back.
+                webview::focus_app_view();
                 if !self.bottom_panel_focused {
                     return self.focus_bottom_terminal(idx);
                 }
@@ -11888,22 +14796,14 @@ fi
                                     );
                             }
                             iced_term::actions::Action::ChangeTitle(title) => {
-                                // Set tab-specific title
-                                tab.set_terminal_title(Some(title.clone()));
-                                // Compatibility adapter: Claude Code prefixes its title with
-                                // "✳" (U+2733) while waiting for input or approval.
-                                if let Some(reason) = terminal_title_attention_reason(&title) {
-                                    tab.set_attention(reason);
-                                } else {
-                                    tab.clear_attention(AttentionReason::HumanInputRequired);
-                                }
+                                tab.observe_terminal_title(title.clone());
                                 if let Some(task_id) = tab.task_id.clone() {
                                     // Progress capture: the title is the
                                     // session's own latest self-description
                                     // (Claude Code writes its topic there).
                                     // cwd-style titles from plain shells are
                                     // not progress.
-                                    let update_line = title.trim_start_matches('✳').trim();
+                                    let update_line = strip_title_status_glyphs(&title);
                                     if !update_line.is_empty()
                                         && !update_line.starts_with('/')
                                         && !update_line.starts_with('~')
@@ -12202,6 +15102,8 @@ fi
 
                 let _menu_poll_elapsed = _check_menu_start.elapsed();
 
+                self.observe_needs_you();
+
                 // Drain console output for all workspaces
                 let _drain_start = std::time::Instant::now();
                 let mut auto_expand = false;
@@ -12272,7 +15174,7 @@ fi
             }
             Event::TabSelect(idx) => {
                 let task_rail_pinned = self.task_rail_pinned;
-                let context_root_before = self.task_context_worktree_root();
+                let context_root_before = self.panel_context_root();
                 let mut focused_task_id = None;
                 let mut focused = false;
                 if let Some(ws) = self.active_workspace_mut() {
@@ -12296,8 +15198,8 @@ fi
                 // Crossing a context boundary (task ↔ General, or between
                 // tasks) re-points the panels; ordinary tab switches leave
                 // the per-tab poll cadence alone.
-                let panels_task = if self.task_context_worktree_root() != context_root_before {
-                    self.refresh_panels_for_task_context()
+                let panels_task = if self.panel_context_root() != context_root_before {
+                    self.refresh_panels_for_context(context_root_before)
                 } else {
                     Task::none()
                 };
@@ -12425,6 +15327,7 @@ fi
                 // Option+click on "+" shows tab picker (but not if picker is already open)
                 if self.current_modifiers.alt() && !self.tab_picker_visible {
                     self.tab_picker_visible = true;
+                    self.tab_picker_cli_open = false;
                     self.task_handoff_copied = false;
                 } else {
                     self.tab_picker_visible = false;
@@ -12457,11 +15360,59 @@ fi
                 // (from window.__currentTabId in the JS). Translate into the
                 // existing AgentSubmitPrompt / AgentStopRequested handlers.
                 return match msg {
-                    AgentIpcMessage::Submit { tab_id, text } => {
-                        Task::done(Event::AgentSubmitPrompt(tab_id, text))
+                    AgentIpcMessage::Submit {
+                        tab_id,
+                        text,
+                        images,
+                    } => {
+                        let images = match images {
+                            Ok(images) => images,
+                            Err(e) => {
+                                eprintln!("[agent-ipc] tab {tab_id}: submit rejected: {e}");
+                                agent_webview_note(tab_id, &format!("Not sent: {e}"));
+                                return Task::none();
+                            }
+                        };
+                        Task::done(Event::AgentSubmitPrompt(
+                            tab_id,
+                            UserPrompt {
+                                text,
+                                images,
+                                id: None,
+                            },
+                        ))
                     }
                     AgentIpcMessage::Stop { tab_id } => {
                         Task::done(Event::AgentStopRequested(tab_id))
+                    }
+                    AgentIpcMessage::Withdraw { tab_id, id } => {
+                        let claude = self
+                            .workspaces
+                            .iter()
+                            .flat_map(|ws| ws.tabs.iter())
+                            .find(|t| t.id == tab_id)
+                            .and_then(|t| t.agent_session())
+                            .and_then(|session| session.claude.as_ref());
+                        match claude {
+                            Some(claude) => {
+                                if let Err(e) =
+                                    claude.send(HarnessCommand::WithdrawQueuedMessage(id.clone()))
+                                {
+                                    eprintln!("[agent-ipc] tab {tab_id}: withdraw {id}: {e}");
+                                    agent_webview_note(tab_id, &format!("Not withdrawn: {e}"));
+                                }
+                            }
+                            None => {
+                                eprintln!(
+                                    "[agent-ipc] tab {tab_id}: withdraw {id}: no Claude process"
+                                );
+                                agent_webview_note(
+                                    tab_id,
+                                    "Not withdrawn: Claude is not running in this tab.",
+                                );
+                            }
+                        }
+                        Task::none()
                     }
                     AgentIpcMessage::Answer {
                         tab_id,
@@ -12470,6 +15421,66 @@ fi
                     } => Task::done(Event::AgentAnswerRequest(tab_id, request_id, decision)),
                     AgentIpcMessage::SetPermissionMode { tab_id, mode } => {
                         Task::done(Event::AgentSetPermissionMode(tab_id, mode))
+                    }
+                    AgentIpcMessage::SetModel { tab_id, model } => {
+                        Task::done(Event::AgentSetModel(tab_id, model))
+                    }
+                    AgentIpcMessage::SetEffort { tab_id, effort } => {
+                        Task::done(Event::AgentSetEffort(tab_id, effort))
+                    }
+                    AgentIpcMessage::CheckoutContext { tab_id } => {
+                        Task::done(Event::AgentCheckoutContextRequested(tab_id))
+                    }
+                    AgentIpcMessage::SetCheckout { tab_id, path } => {
+                        Task::done(Event::AgentSetCheckout(tab_id, path))
+                    }
+                    AgentIpcMessage::ReviewContext { tab_id } => {
+                        Task::done(Event::AgentReviewContextRequested(tab_id))
+                    }
+                    AgentIpcMessage::ReviewRequest { tab_id, request } => {
+                        Task::done(Event::AgentReviewRequested(tab_id, request))
+                    }
+                    AgentIpcMessage::ConsultRequest { tab_id, request } => {
+                        Task::done(Event::AgentConsultRequested(tab_id, request))
+                    }
+                    AgentIpcMessage::DelegationSend {
+                        tab_id,
+                        delegation_id,
+                        finding_ids,
+                    } => Task::done(Event::DelegationSendRequested(
+                        tab_id,
+                        delegation_id,
+                        finding_ids,
+                    )),
+                    AgentIpcMessage::DelegationRerun {
+                        tab_id,
+                        delegation_id,
+                    } => Task::done(Event::DelegationRerunRequested(tab_id, delegation_id)),
+                    AgentIpcMessage::DelegationDismiss {
+                        tab_id,
+                        delegation_id,
+                    } => Task::done(Event::DelegationDismissRequested(tab_id, delegation_id)),
+                    AgentIpcMessage::DelegationOpenWorker {
+                        tab_id,
+                        delegation_id,
+                    } => Task::done(Event::DelegationOpenWorkerRequested(tab_id, delegation_id)),
+                    AgentIpcMessage::OpenFile { tab_id, path } => {
+                        Task::done(Event::DelegationOpenFile(tab_id, path))
+                    }
+                    AgentIpcMessage::HostKey { key, modifiers } => {
+                        // Run the chord through the Iced key handler, so it
+                        // means exactly what it means anywhere else. The
+                        // handler records the chord's modifiers as held;
+                        // Iced never saw them pressed and will not report
+                        // their release, so restore what it last reported.
+                        let held = self.current_modifiers;
+                        let task = self.update(Event::KeyPressed(key, modifiers));
+                        self.current_modifiers = held;
+                        task
+                    }
+                    AgentIpcMessage::PastePage { tab_id } => {
+                        webview::paste_into_agent_page(tab_id);
+                        Task::none()
                     }
                 };
             }
@@ -12483,16 +15494,30 @@ fi
                 // Synthetic event so the user sees their own prompt rendered
                 // immediately (the agent stream takes a few hundred ms before
                 // the first system event arrives).
-                let echo = tab::AgentEvent::user_prompt(&prompt);
+                // Claude gets every message with an id, so the CLI reports
+                // its queue state and a queued one can be withdrawn.
+                let mut prompt = prompt;
+                let mut echo = tab::AgentEvent::submitted_prompt(&prompt, false);
+                // Images a non-Claude backend could not take (pi has no
+                // image input here); the chat says so instead of dropping
+                // them silently.
+                let mut images_not_sent = 0;
                 let mut task_started: Option<String> = None;
                 let mut harness_bridge: Option<tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>> =
                     None;
+                let mut claude_spawned = false;
                 // A native Claude spawn gets the same GitTerm MCP servers a
                 // terminal-launched `claude` does.
+                let caller = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .map(|t| t.session_uid.clone());
                 let mut claude_mcp_servers: Vec<gitterm::harness::claude::ClaudeMcpServer> = self
                     .task_mcp
                     .iter()
-                    .map(TaskMcpConnection::claude_mcp_server)
+                    .map(|connection| connection.claude_mcp_server(caller.as_deref()))
                     .chain(
                         self.browser_mcp
                             .iter()
@@ -12535,7 +15560,16 @@ fi
                                     gitterm::harness::claude::ClaudeSession::spawn(config);
                                 session.claude = Some(claude);
                                 harness_bridge = Some(rx);
+                                claude_spawned = true;
                             }
+                            // Mid-turn the CLI queues the message itself and
+                            // hands it to the running turn at its next tool
+                            // boundary, or runs it as the next turn.
+                            let queued = !claude_spawned && session.submit_queues();
+                            if prompt.id.is_none() {
+                                prompt.id = Some(uuid::Uuid::new_v4().to_string());
+                            }
+                            echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
                             let mut submitted = false;
                             if let Some(claude) = session.claude.as_ref() {
                                 match claude.send(HarnessCommand::SendUserMessage(prompt.clone())) {
@@ -12555,6 +15589,10 @@ fi
                             }
                             break 'outer_submit;
                         }
+                        if !prompt.images.is_empty() {
+                            images_not_sent = prompt.images.len();
+                            echo = tab::AgentEvent::user_prompt(&prompt.text);
+                        }
                         if session.task_handle.is_none() {
                             let handle = tab::spawn_agent_task(session.config.clone(), repo_path);
                             // Take the receiver up-front so this turn can wire
@@ -12564,7 +15602,7 @@ fi
                         }
                         let mut submitted = false;
                         if let Some(handle) = session.task_handle.as_ref() {
-                            if let Err(e) = handle.submit_prompt(prompt.clone()) {
+                            if let Err(e) = handle.submit_prompt(prompt.text.clone()) {
                                 eprintln!("AgentSubmitPrompt failed: {}", e);
                             } else {
                                 session.state = tab::AgentSessionState::Streaming;
@@ -12586,6 +15624,23 @@ fi
                 }
                 // Also push the echo into the tab's chat page, if it has one.
                 push_agent_event_to_webview(tab_id, &echo);
+                if images_not_sent > 0 {
+                    eprintln!(
+                        "AgentSubmitPrompt: tab {tab_id}: {images_not_sent} image(s) not sent (non-Claude backend)"
+                    );
+                    agent_webview_note(
+                        tab_id,
+                        &format!(
+                            "Images are only sent to Claude; this message went without its {images_not_sent} image(s)."
+                        ),
+                    );
+                }
+                if claude_spawned {
+                    // The session is now bound to its directory.
+                    if let Some(state) = self.chat_checkout_state(tab_id) {
+                        push_checkout_state_to_webview(tab_id, &state);
+                    }
+                }
                 if let Some(rx) = bridge {
                     use tokio_stream::wrappers::UnboundedReceiverStream;
                     let stream = UnboundedReceiverStream::new(rx);
@@ -12677,14 +15732,486 @@ fi
                 }
                 return Task::none();
             }
+            Event::AgentSetModel(tab_id, model) => {
+                let model = model.trim().to_string();
+                if model.is_empty() || model.len() > 256 || model.contains(char::is_whitespace) {
+                    eprintln!("AgentSetModel: tab {tab_id}: refusing model {model:?}");
+                    return Task::none();
+                }
+                let Some(session) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session_mut())
+                else {
+                    eprintln!("AgentSetModel: tab {tab_id} is not an agent tab");
+                    return Task::none();
+                };
+                let tab::AgentBackendConfig::Claude {
+                    model: configured, ..
+                } = &mut session.config
+                else {
+                    eprintln!("AgentSetModel: tab {tab_id} is not a Claude tab");
+                    return Task::none();
+                };
+                let (ev, config_changed) = if let Some(claude) = session.claude.as_ref() {
+                    // Live process: the tab config, the last selection and
+                    // the page follow ModelChanged in AgentEventReceived.
+                    match claude.send(HarnessCommand::SetModel(model.clone())) {
+                        Ok(()) => return Task::none(),
+                        Err(e) => {
+                            eprintln!("AgentSetModel {model:?} on tab {tab_id} failed: {e}");
+                            let message = format!("Could not change the model to {model}: {e}");
+                            (HarnessEvent::Error(message), false)
+                        }
+                    }
+                } else {
+                    // No process yet (or it exited): the next spawn passes
+                    // `--model` from this config.
+                    configured.clone_from(&model);
+                    self.chat_config.remember_model(&model);
+                    (HarnessEvent::ModelChanged(model), true)
+                };
+                let ev = tab::AgentEvent::Harness(ev);
+                push_agent_event_to_webview(tab_id, &ev);
+                session.record(ev);
+                if config_changed {
+                    self.mark_workspaces_dirty();
+                    self.save_config();
+                }
+                return Task::none();
+            }
+            Event::AgentSetEffort(tab_id, effort) => {
+                if effort
+                    .as_deref()
+                    .is_some_and(|level| !tab::CLAUDE_EFFORT_LEVELS.contains(&level))
+                {
+                    eprintln!("AgentSetEffort: tab {tab_id}: unknown effort {effort:?}");
+                    return Task::none();
+                }
+                let Some(session) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session_mut())
+                else {
+                    eprintln!("AgentSetEffort: tab {tab_id} is not an agent tab");
+                    return Task::none();
+                };
+                let tab::AgentBackendConfig::Claude {
+                    effort: configured, ..
+                } = &mut session.config
+                else {
+                    eprintln!("AgentSetEffort: tab {tab_id} is not a Claude tab");
+                    return Task::none();
+                };
+                let (ev, config_changed) = if let Some(claude) = session.claude.as_ref() {
+                    // Live process: confirmed by EffortChanged (the
+                    // session reads its settings back after the change).
+                    match claude.send(HarnessCommand::SetEffort(effort.clone())) {
+                        Ok(()) => return Task::none(),
+                        Err(e) => {
+                            eprintln!("AgentSetEffort {effort:?} on tab {tab_id} failed: {e}");
+                            let message = format!(
+                                "Could not change the effort to {}: {e}",
+                                effort.as_deref().unwrap_or("auto")
+                            );
+                            (HarnessEvent::Error(message), false)
+                        }
+                    }
+                } else {
+                    // The next spawn passes `--effort` from this config.
+                    configured.clone_from(&effort);
+                    self.chat_config.remember_effort(effort.as_deref());
+                    (
+                        HarnessEvent::EffortChanged {
+                            effort,
+                            applied: None,
+                        },
+                        true,
+                    )
+                };
+                let ev = tab::AgentEvent::Harness(ev);
+                push_agent_event_to_webview(tab_id, &ev);
+                session.record(ev);
+                if config_changed {
+                    self.mark_workspaces_dirty();
+                    self.save_config();
+                }
+                return Task::none();
+            }
+            Event::AgentCheckoutContextRequested(tab_id) => {
+                match self.chat_checkout_state(tab_id) {
+                    Some(state) => push_checkout_state_to_webview(tab_id, &state),
+                    None => eprintln!(
+                        "AgentCheckoutContextRequested: tab {tab_id} is not a Claude chat"
+                    ),
+                }
+                return Task::none();
+            }
+            Event::AgentSetCheckout(tab_id, path) => {
+                let Some(state) = self.chat_checkout_state(tab_id) else {
+                    eprintln!("AgentSetCheckout: tab {tab_id} is not a Claude chat");
+                    return Task::none();
+                };
+                if state["locked"] == true {
+                    eprintln!("AgentSetCheckout: tab {tab_id}: checkout is locked");
+                    agent_webview_note(
+                        tab_id,
+                        state["reason"]
+                            .as_str()
+                            .unwrap_or("The checkout cannot change now."),
+                    );
+                    push_checkout_state_to_webview(tab_id, &state);
+                    return Task::none();
+                }
+                let Some(workspace_dir) = self
+                    .workspaces
+                    .iter()
+                    .find(|ws| ws.tabs.iter().any(|t| t.id == tab_id))
+                    .map(|ws| ws.dir.clone())
+                else {
+                    return Task::none();
+                };
+                // Only a directory the chip offered: the workspace checkout
+                // or one of its prepared task worktrees.
+                let Some(choice) = self
+                    .checkout_choices_for(&workspace_dir)
+                    .into_iter()
+                    .find(|c| paths_equal(&c.path, &path))
+                else {
+                    eprintln!(
+                        "AgentSetCheckout: tab {tab_id}: {} is not a checkout of this workspace",
+                        path.display()
+                    );
+                    agent_webview_note(
+                        tab_id,
+                        &format!("{} is no longer available.", path.display()),
+                    );
+                    if let Some(state) = self.chat_checkout_state(tab_id) {
+                        push_checkout_state_to_webview(tab_id, &state);
+                    }
+                    return Task::none();
+                };
+                let is_active = self.active_tab().is_some_and(|t| t.id == tab_id);
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                {
+                    tab.repo_path = choice.path.clone();
+                    tab.set_local_dir(choice.path.clone());
+                }
+                eprintln!(
+                    "[agent] tab {tab_id}: chat checkout set to {}",
+                    choice.path.display()
+                );
+                self.mark_workspaces_dirty();
+                if let Some(state) = self.chat_checkout_state(tab_id) {
+                    push_checkout_state_to_webview(tab_id, &state);
+                }
+                if is_active {
+                    return Task::batch([
+                        self.refresh_panels_for_task_context(),
+                        self.refresh_files_for_active_tab(),
+                    ]);
+                }
+                return Task::none();
+            }
+            Event::AgentReviewContextRequested(tab_id) => {
+                let Some(tab) = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                else {
+                    eprintln!("AgentReviewContextRequested: no tab {tab_id}");
+                    return Task::none();
+                };
+                let repo_path = tab.repo_path.clone();
+                // A task tab reviews against the base its task was cut from.
+                let task_base = tab
+                    .task_id
+                    .as_deref()
+                    .and_then(|id| self.task_store.as_ref()?.get(id))
+                    .map(|task| task.base.reference.clone());
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            gitterm::review::review_context(&repo_path, task_base.as_deref())
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            gitterm::review::ReviewContext {
+                                error: Some(format!("review context worker failed: {e}")),
+                                ..Default::default()
+                            }
+                        })
+                    },
+                    move |context| Event::AgentReviewContextLoaded(tab_id, context),
+                );
+            }
+            Event::AgentReviewContextLoaded(tab_id, context) => {
+                if let Some(e) = &context.error {
+                    eprintln!("[review] tab {tab_id}: {e}");
+                }
+                let payload = serde_json::json!({
+                    "context": context,
+                    "reviewer": self.review_config.default_reviewer.as_str(),
+                    "model": self.review_config.subagent_model,
+                    "codex_model": self.review_config.codex_model,
+                });
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!("window.__setReviewContext({payload})"),
+                );
+                return Task::none();
+            }
+            Event::AgentReviewRequested(tab_id, request) => {
+                let is_claude = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                    .is_some_and(|s| s.backend() == tab::AgentBackend::Claude);
+                if !is_claude {
+                    eprintln!("AgentReviewRequested: tab {tab_id} is not a Claude chat tab");
+                    agent_webview_note(tab_id, "Review… needs a Claude chat tab.");
+                    return Task::none();
+                }
+                if let Ok(request) = &request {
+                    if request.reviewer == gitterm::review::PopoverReviewer::Codex {
+                        // A GitTerm-run delegation: no agent turn is spent.
+                        let new = self.delegation_caller_for_tab(tab_id).and_then(|caller| {
+                            gitterm::delegations::review_delegation(
+                                &gitterm::delegations::review_request_from_popover(request),
+                                &caller,
+                                self.review_config.codex_model.as_deref(),
+                                None,
+                            )
+                        });
+                        return self.request_delegation(new, DelegationOrigin::Page(tab_id));
+                    }
+                }
+                let prompt = request.and_then(|r| gitterm::review::review_prompt(&r));
+                return match prompt {
+                    Ok(prompt) => Task::done(Event::AgentSubmitPrompt(tab_id, prompt.into())),
+                    Err(e) => {
+                        eprintln!("AgentReviewRequested: tab {tab_id}: {e}");
+                        agent_webview_note(tab_id, &format!("Review not sent: {e}"));
+                        Task::none()
+                    }
+                };
+            }
+            Event::AgentConsultRequested(tab_id, request) => {
+                let is_claude = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                    .is_some_and(|s| s.backend() == tab::AgentBackend::Claude);
+                if !is_claude {
+                    eprintln!("AgentConsultRequested: tab {tab_id} is not a Claude chat tab");
+                    agent_webview_note(tab_id, "Consult… needs a Claude chat tab.");
+                    return Task::none();
+                }
+                let request = match request {
+                    Ok(request) => request,
+                    Err(e) => {
+                        eprintln!("AgentConsultRequested: tab {tab_id}: {e}");
+                        agent_webview_note(tab_id, &format!("Consult not sent: {e}"));
+                        return Task::none();
+                    }
+                };
+                if request.reviewer == gitterm::review::PopoverReviewer::Codex {
+                    let new = self.delegation_caller_for_tab(tab_id).and_then(|caller| {
+                        gitterm::delegations::consult_delegation(
+                            &task_mcp::ConsultDelegationRequest {
+                                brief: request.brief.clone(),
+                                model: Some(request.model.clone()),
+                            },
+                            &caller,
+                            self.review_config.codex_model.as_deref(),
+                            None,
+                        )
+                    });
+                    return self.request_delegation(new, DelegationOrigin::Page(tab_id));
+                }
+                return match gitterm::review::consult_prompt(&request) {
+                    Ok(prompt) => Task::done(Event::AgentSubmitPrompt(tab_id, prompt.into())),
+                    Err(e) => {
+                        eprintln!("AgentConsultRequested: tab {tab_id}: {e}");
+                        agent_webview_note(tab_id, &format!("Consult not sent: {e}"));
+                        Task::none()
+                    }
+                };
+            }
+            Event::DelegationChecked(new, origin, result) => {
+                return self.delegation_checked(*new, origin, result);
+            }
+            Event::DelegationProgress(delegation_id, event) => {
+                self.delegation_progress(&delegation_id, event);
+                return Task::none();
+            }
+            Event::DelegationFinished(delegation_id, outcome) => {
+                return self.finish_delegation(&delegation_id, outcome);
+            }
+            Event::DelegationHeadLoaded(tab_id, head) => {
+                match head {
+                    Ok(head) => {
+                        let head = serde_json::Value::String(head);
+                        webview::evaluate_script(
+                            WebviewSurface::Agent(tab_id),
+                            &format!("window.__setDelegationHead({head})"),
+                        );
+                    }
+                    Err(error) => eprintln!("[delegation] tab {tab_id}: {error}"),
+                }
+                return Task::none();
+            }
+            Event::DelegationSendRequested(tab_id, delegation_id, finding_ids) => {
+                let streaming = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                    .is_some_and(|s| matches!(s.state, tab::AgentSessionState::Streaming));
+                let prepared = self.tab_delegation(tab_id, &delegation_id).and_then(|d| {
+                    gitterm::delegations::compose_send_message(d, &finding_ids)
+                        .map(|message| (message, d.delivered_at.is_some()))
+                });
+                let (message, delivered) = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        eprintln!("[delegation] send {delegation_id} on tab {tab_id}: {error}");
+                        agent_webview_note(tab_id, &format!("Not sent: {error}"));
+                        return Task::none();
+                    }
+                };
+                let held = self.delegation_held.entry(tab_id).or_default();
+                match gitterm::delegations::decide_send(streaming, delivered, held, &delegation_id)
+                {
+                    gitterm::delegations::SendDecision::SendNow => {
+                        return self.deliver_delegation(tab_id, &delegation_id, message);
+                    }
+                    gitterm::delegations::SendDecision::Hold => {
+                        held.push(gitterm::delegations::HeldSend {
+                            delegation_id: delegation_id.clone(),
+                            message,
+                        });
+                        self.push_delegation_card(&delegation_id);
+                    }
+                    gitterm::delegations::SendDecision::AlreadyDelivered => {
+                        agent_webview_note(tab_id, "That result was already sent to Claude.");
+                    }
+                    gitterm::delegations::SendDecision::AlreadyHeld => {}
+                }
+                return Task::none();
+            }
+            Event::DelegationRerunRequested(tab_id, delegation_id) => {
+                let new = self
+                    .tab_delegation(tab_id, &delegation_id)
+                    .and_then(gitterm::delegations::rerun_delegation);
+                return self.request_delegation(new, DelegationOrigin::Page(tab_id));
+            }
+            Event::DelegationDismissRequested(tab_id, delegation_id) => {
+                let active = match self.tab_delegation(tab_id, &delegation_id) {
+                    Ok(delegation) => delegation.status.is_active(),
+                    Err(error) => {
+                        eprintln!("[delegation] dismiss {delegation_id}: {error}");
+                        agent_webview_note(tab_id, &format!("Not dismissed: {error}"));
+                        return Task::none();
+                    }
+                };
+                // Dismissing a running card stops its Codex run.
+                if let Some(handle) = self.delegation_runs.remove(&delegation_id) {
+                    handle.abort();
+                }
+                self.delegation_activity.remove(&delegation_id);
+                if let Some(held) = self.delegation_held.get_mut(&tab_id) {
+                    held.retain(|send| send.delegation_id != delegation_id);
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                let result = match self.task_store.as_mut() {
+                    Some(store) => {
+                        let cancelled = if active {
+                            store.cancel_delegation(&delegation_id, &now)
+                        } else {
+                            Ok(())
+                        };
+                        cancelled
+                            .and_then(|()| store.dismiss_delegation(&delegation_id, &now))
+                            .map_err(|error| error.to_string())
+                    }
+                    None => Err("GitTerm's task store is unavailable".to_string()),
+                };
+                if let Err(error) = result {
+                    eprintln!("[delegation] dismiss {delegation_id}: {error}");
+                    agent_webview_note(tab_id, &format!("Not dismissed: {error}"));
+                }
+                self.push_delegation_card(&delegation_id);
+                return self.start_queued_delegations();
+            }
+            Event::DelegationOpenWorkerRequested(tab_id, delegation_id) => {
+                let target = self
+                    .tab_delegation(tab_id, &delegation_id)
+                    .and_then(|delegation| match &delegation.child {
+                        gitterm::tasks::DelegationChild::TaskSession {
+                            task_session_id: Some(session),
+                            ..
+                        } => find_task_session_tab(&self.workspaces, session).ok_or_else(|| {
+                            "The worker's tab is closed. Open its task from the Tasks rail to \
+                             resume it."
+                                .to_string()
+                        }),
+                        gitterm::tasks::DelegationChild::TaskSession { .. } => Err(
+                            "The worker has not started yet (it is queued behind other tasks)."
+                                .to_string(),
+                        ),
+                        _ => Err(format!("delegation {delegation_id} has no worker tab")),
+                    });
+                return match target {
+                    Ok((ws_idx, worker_tab_idx)) => {
+                        self.focus_workspace_tab(ws_idx, worker_tab_idx)
+                    }
+                    Err(error) => {
+                        agent_webview_note(tab_id, &error);
+                        Task::none()
+                    }
+                };
+            }
+            Event::DelegationOpenFile(tab_id, path) => {
+                let Some(repo_path) = self
+                    .active_tab()
+                    .filter(|tab| tab.id == tab_id)
+                    .map(|tab| tab.repo_path.clone())
+                else {
+                    eprintln!("[delegation] open_file from tab {tab_id}, which is not in front");
+                    return Task::none();
+                };
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    repo_path.join(path)
+                };
+                if !path.is_file() {
+                    agent_webview_note(
+                        tab_id,
+                        &format!("{} is not a file in this checkout.", path.display()),
+                    );
+                    return Task::none();
+                }
+                return Task::done(Event::ViewFile(SourcePath::Local(path)));
+            }
             Event::NewClaudeChatTab => {
                 self.tab_picker_visible = false;
-                let config = tab::AgentBackendConfig::Claude {
-                    // "default" leaves the model to the user's Claude settings.
-                    model: "default".to_string(),
-                    permission_mode: Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
-                    effort: None,
-                };
+                let config = new_claude_chat_config(&self.chat_config);
                 let (repo_path, current_dir) = match self.active_workspace() {
                     Some(ws) => {
                         let cd = ws
@@ -12767,10 +16294,24 @@ fi
                 // Reset first: an event that arrived between the build and
                 // this message was already pushed live and is in the buffer.
                 reset_agent_webview(tab_id);
-                set_agent_webview_tab_id(tab_id, session.configured_permission_mode().as_deref());
-                replay_agent_conversation_in_webview(tab_id, &session.conversation);
+                let composer = self.chat_composer_state(tab_id);
+                set_agent_webview_tab_id(
+                    tab_id,
+                    session.configured_permission_mode().as_deref(),
+                    composer.as_ref(),
+                );
+                let cards = self.delegation_cards_for_tab(tab_id);
+                replay_agent_conversation_in_webview(tab_id, &session.conversation, cards);
                 webview::focus_agent_composer(tab_id);
-                return Task::none();
+                if let Some(text) = self.dictation_held.remove(&tab_id) {
+                    eprintln!(
+                        "[STT] delivering {} held chars to the composer of tab={}",
+                        text.chars().count(),
+                        tab_id
+                    );
+                    webview::insert_agent_composer_text(tab_id, &text);
+                }
+                return self.refresh_delegation_head(tab_id);
             }
             Event::AgentHistoryLoaded(tab_id, history) => {
                 let Some(session) = self
@@ -12797,8 +16338,11 @@ fi
                 // A page still being built replays the merged buffer when
                 // it is done (`AgentWebviewCreated`).
                 if webview::is_active(WebviewSurface::Agent(tab_id)) {
+                    let conversation = session.conversation.clone();
+                    let cards = self.delegation_cards_for_tab(tab_id);
                     reset_agent_webview(tab_id);
-                    replay_agent_conversation_in_webview(tab_id, &session.conversation);
+                    replay_agent_conversation_in_webview(tab_id, &conversation, cards);
+                    return self.refresh_delegation_head(tab_id);
                 }
                 return Task::none();
             }
@@ -12809,6 +16353,11 @@ fi
                 // shown last counts as being read (completion is not unread).
                 let is_front_page = self.agent_pages.first() == Some(&tab_id);
                 let attention_reason = agent_event_attention_reason(&ev);
+                // A held Send-to-Claude goes out when the turn ends (TRU-142).
+                let turn_ended = matches!(
+                    &ev,
+                    tab::AgentEvent::Harness(HarnessEvent::TurnCompleted { .. })
+                );
                 // Progress capture: what the session last said it was doing.
                 // Only meaningful events feed this — streaming deltas don't.
                 let progress_note: Option<(Option<String>, Option<String>)> = match &ev {
@@ -12832,13 +16381,35 @@ fi
                 let mut progress_task: Option<String> = None;
                 let mut session_id_changed = false;
                 let mut config_changed = false;
+                let mut chat_config_changed = false;
                 let mut task_signal: Option<(String, Option<TaskSessionOutcome>)> = None;
+                // Worktree following (TRU-146): paths this event's tool call
+                // says the agent works at, with the tab's repo root.
+                let mut worktree_candidates: Option<(PathBuf, Vec<PathBuf>)> = None;
+                let home = dirs::home_dir();
                 'outer_event: for ws in &mut self.workspaces {
+                    let local_workspace = matches!(ws.location, WorkspaceLocation::Local { .. });
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
                             if t.task_id.is_some() {
                                 t.task_last_activity = Some(Instant::now());
                                 progress_task = t.task_id.clone();
+                            }
+                            // Task session tabs already follow their task
+                            // worktree; only general chat tabs detect.
+                            if let (tab::AgentEvent::Harness(harness_event), true) =
+                                (&ev, local_workspace && t.task_id.is_none())
+                            {
+                                if matches!(t.kind, TabKind::Agent(_)) {
+                                    let candidates = t
+                                        .worktree_follow
+                                        .tracker
+                                        .observe(harness_event, home.as_deref());
+                                    if !candidates.is_empty() {
+                                        worktree_candidates =
+                                            Some((t.repo_path.clone(), candidates));
+                                    }
+                                }
                             }
                             // The agent session's own end states translate
                             // directly into task session outcomes.
@@ -12849,6 +16420,12 @@ fi
                             let mut new_session_id: Option<String> = None;
                             if let Some(session) = t.agent_session_mut() {
                                 if let tab::AgentEvent::Harness(harness_event) = &ev {
+                                    // A turn the CLI starts on its own (a
+                                    // queued message, a finished background
+                                    // subagent) is in flight like any other.
+                                    if matches!(harness_event, HarnessEvent::TurnStarted { .. }) {
+                                        session.state = tab::AgentSessionState::Streaming;
+                                    }
                                     match harness_event {
                                         HarnessEvent::TurnStarted {
                                             session_id: Some(id),
@@ -12902,6 +16479,33 @@ fi
                                                 *permission_mode = Some(mode.clone());
                                                 config_changed = true;
                                             }
+                                        }
+                                        HarnessEvent::ModelChanged(confirmed) => {
+                                            // Confirmed by the CLI: a respawn
+                                            // starts on this model, and new
+                                            // chats may start on it too.
+                                            if let tab::AgentBackendConfig::Claude {
+                                                model, ..
+                                            } = &mut session.config
+                                            {
+                                                model.clone_from(confirmed);
+                                                config_changed = true;
+                                            }
+                                            self.chat_config.remember_model(confirmed);
+                                            chat_config_changed = true;
+                                        }
+                                        HarnessEvent::EffortChanged {
+                                            effort: confirmed, ..
+                                        } => {
+                                            if let tab::AgentBackendConfig::Claude {
+                                                effort, ..
+                                            } = &mut session.config
+                                            {
+                                                effort.clone_from(confirmed);
+                                                config_changed = true;
+                                            }
+                                            self.chat_config.remember_effort(confirmed.as_deref());
+                                            chat_config_changed = true;
                                         }
                                         HarnessEvent::ProcessExited { code } => {
                                             // Next prompt respawns with --resume.
@@ -13010,6 +16614,50 @@ fi
                 }
                 if session_id_changed || config_changed {
                     self.mark_workspaces_dirty();
+                }
+                if chat_config_changed {
+                    self.save_config();
+                }
+                let follow_task = match worktree_candidates {
+                    Some((repo_root, candidates)) => {
+                        self.consider_worktree_candidates(tab_id, repo_root, candidates)
+                    }
+                    None => Task::none(),
+                };
+                if turn_ended {
+                    return Task::batch([
+                        self.flush_held_delegation(tab_id),
+                        self.refresh_delegation_head(tab_id),
+                        follow_task,
+                    ]);
+                }
+                return follow_task;
+            }
+            Event::FollowWorktreesListed(repo_root, result) => {
+                if let Err(message) = &result {
+                    eprintln!(
+                        "[worktree-follow] listing worktrees of {} failed: {message}",
+                        repo_root.display()
+                    );
+                }
+                let (worktrees, waiting) =
+                    self.worktree_list_cache
+                        .complete(&repo_root, result, Instant::now());
+                let tasks: Vec<Task<Event>> = waiting
+                    .into_iter()
+                    .map(|(tab_id, candidates)| {
+                        self.apply_worktree_candidates(tab_id, &repo_root, &worktrees, &candidates)
+                    })
+                    .collect();
+                return Task::batch(tasks);
+            }
+            Event::ToggleWorktreeFollow => {
+                let before = self.panel_context_root();
+                let changed = self
+                    .active_tab_mut()
+                    .is_some_and(|tab| tab.worktree_follow.toggle());
+                if changed && self.panel_context_root() != before {
+                    return self.refresh_panels_for_context(before);
                 }
                 return Task::none();
             }
@@ -13173,10 +16821,14 @@ fi
             },
             Event::ShowTabPicker => {
                 self.tab_picker_visible = true;
+                self.tab_picker_cli_open = false;
                 self.task_handoff_copied = false;
             }
             Event::HideTabPicker => {
                 self.tab_picker_visible = false;
+            }
+            Event::ShowTabPickerCli => {
+                self.tab_picker_cli_open = true;
             }
             Event::EditFile(path) => {
                 let Some(path) = path.as_local().map(|p| p.to_path_buf()) else {
@@ -13532,14 +17184,6 @@ fi
                     return Task::none();
                 }
 
-                // Attention flyout: Escape closes, all other keys are consumed.
-                if self.attention_view_open {
-                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
-                        return self.update(Event::AttentionViewClose);
-                    }
-                    return Task::none();
-                }
-
                 if self.task_switcher_open {
                     if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
                         return Task::done(Event::TaskSwitcherClose);
@@ -13565,6 +17209,27 @@ fi
                             self.task_switcher_selection = Some(next);
                         }
                         return Task::none();
+                    }
+                    return Task::none();
+                }
+
+                // Usage view: Escape or Cmd+Shift+U closes it, Ctrl+1-9
+                // switches workspace (which closes it too); every other key
+                // is consumed, since the tab it would reach is hidden.
+                if self.usage_view.open {
+                    if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
+                        return self.update(Event::UsageViewClose);
+                    }
+                    match global_shortcut(&key, modifiers) {
+                        Some(GlobalShortcut::UsageView) => {
+                            return self.update(Event::UsageViewToggle);
+                        }
+                        Some(GlobalShortcut::SelectWorkspace(num))
+                            if num <= self.workspaces.len() =>
+                        {
+                            return Task::done(Event::WorkspaceSelect(num - 1));
+                        }
+                        _ => {}
                     }
                     return Task::none();
                 }
@@ -13684,7 +17349,7 @@ fi
                         }
                         // Cmd+T - repository task switcher (exactly ⌘T:
                         // Ctrl/Shift combos stay free for other bindings)
-                        if (c == "t" || c == "T") && !modifiers.shift() && !modifiers.control() {
+                        if global_shortcut(&key, modifiers) == Some(GlobalShortcut::TaskSwitcher) {
                             return Task::done(Event::TaskSwitcherOpen);
                         }
                         // Cmd+B - Toggle sidebar
@@ -13702,6 +17367,10 @@ fi
                         // Cmd+Shift+W - Close current workspace
                         if (c == "w" || c == "W") && modifiers.shift() {
                             return Task::done(Event::WorkspaceClose(self.active_workspace_idx));
+                        }
+                        // Cmd+Shift+U - Open the Usage view
+                        if global_shortcut(&key, modifiers) == Some(GlobalShortcut::UsageView) {
+                            return Task::done(Event::UsageViewToggle);
                         }
                     }
                 }
@@ -13731,10 +17400,6 @@ fi
                     // Search shortcuts
                     if modifiers.command() {
                         if let Key::Character(c) = key.as_ref() {
-                            // Cmd+Shift+A - Toggle the global attention view
-                            if (c == "a" || c == "A") && modifiers.shift() {
-                                return Task::done(Event::AttentionViewToggle);
-                            }
                             // Cmd+F - Toggle search
                             if c == "f" {
                                 return Task::done(Event::ToggleSearch);
@@ -13808,14 +17473,8 @@ fi
 
                 // Ctrl+Space — toggle speech-to-text recording
                 #[cfg(feature = "stt")]
-                if modifiers.control()
-                    && !modifiers.command()
-                    && !modifiers.shift()
-                    && !modifiers.alt()
-                {
-                    if let Key::Named(key::Named::Space) = key.as_ref() {
-                        return Task::done(Event::SttToggle);
-                    }
+                if global_shortcut(&key, modifiers) == Some(GlobalShortcut::Dictation) {
+                    return Task::done(Event::SttToggle);
                 }
 
                 // Ctrl+backtick — jump to next attention tab
@@ -13849,13 +17508,10 @@ fi
                 }
 
                 // Workspace switching with Ctrl+1-9
-                if modifiers.control() && !modifiers.command() {
-                    if let Key::Character(c) = key.as_ref() {
-                        if let Ok(num) = c.parse::<usize>() {
-                            if (1..=9).contains(&num) && num <= self.workspaces.len() {
-                                return Task::done(Event::WorkspaceSelect(num - 1));
-                            }
-                        }
+                if let Some(GlobalShortcut::SelectWorkspace(num)) = global_shortcut(&key, modifiers)
+                {
+                    if num <= self.workspaces.len() {
+                        return Task::done(Event::WorkspaceSelect(num - 1));
                     }
                 }
 
@@ -13882,7 +17538,9 @@ fi
                             }
                         } else if c == "0" && self.active_task_context_id().is_some() {
                             return Task::done(Event::TaskOverview);
-                        } else if let Ok(num) = c.parse::<usize>() {
+                        } else if let Some(GlobalShortcut::SelectTab(num)) =
+                            global_shortcut(&key, modifiers)
+                        {
                             let visible_indices =
                                 self.active_workspace().map_or_else(Vec::new, |workspace| {
                                     self.active_task_context_id().map_or_else(
@@ -13899,7 +17557,7 @@ fi
                                         |task_id| task_tab_indices(workspace, task_id),
                                     )
                                 });
-                            if (1..=9).contains(&num) && num <= visible_indices.len() {
+                            if num <= visible_indices.len() {
                                 return Task::done(Event::TabSelect(visible_indices[num - 1]));
                             }
                         }
@@ -14094,6 +17752,8 @@ fi
                     resolved_worktree_path: None,
                     request: request.clone(),
                     control_reply: None,
+                    creator_session_id: None,
+                    worker: None,
                 };
                 form.submitting = true;
                 form.error = None;
@@ -14152,7 +17812,7 @@ fi
                     } else {
                         TaskCreatorKind::Manual
                     },
-                    session_id: None,
+                    session_id: pending.creator_session_id.clone(),
                     harness_label: None,
                     created_at: timestamp.clone(),
                 });
@@ -14207,6 +17867,15 @@ fi
                     });
                     match persisted {
                         Some(Ok(())) => {
+                            if let (Some(reply), Some(worker)) =
+                                (&pending.control_reply, pending.worker.clone())
+                            {
+                                return self.start_delegated_worker(
+                                    &pending.task_id,
+                                    worker,
+                                    reply.clone(),
+                                );
+                            }
                             if let Some(reply) = &pending.control_reply {
                                 let result = self
                                     .task_store
@@ -14352,9 +18021,10 @@ fi
                     .task_store
                     .as_ref()
                     .and_then(|store| store.get(&task_id))
-                    .map(task_handoff_prompt);
+                    .map(|task| task_handoff_prompt(task, None));
                 self.selected_task_id = Some(task_id);
                 self.tab_picker_visible = true;
+                self.tab_picker_cli_open = false;
                 self.task_handoff_copied = handoff.is_some();
                 if let Some(handoff) = handoff {
                     return iced::clipboard::write(handoff);
@@ -15822,15 +19492,75 @@ fi
                 self.chat_index_loading = false;
                 self.chat_index_loaded_at = Some(Instant::now());
                 self.sync_task_sessions_from_chat_index();
+                return self.request_chat_rank();
             }
             Event::ChatsQueryChanged(query) => {
                 self.chat_query = query;
+                return self.request_chat_rank();
             }
             Event::ChatsScopeChanged(scope) => {
                 self.chat_scope = scope;
+                return self.request_chat_rank();
             }
             Event::ChatsBackendFilterChanged(filter) => {
                 self.chat_backend_filter = filter;
+                return self.request_chat_rank();
+            }
+            Event::ChatsRelevanceToggled => {
+                if self.jev_client.is_some() && self.chat_rank.toggle() {
+                    return self.request_chat_rank();
+                }
+            }
+            Event::ChatsRanked(result) => {
+                if self.chat_rank.finish(result) {
+                    return self.request_chat_rank();
+                }
+            }
+            Event::UsageViewToggle => {
+                usage_view_step(
+                    &mut self.usage_view,
+                    self.active_workspace_idx,
+                    UsageViewInput::Toggle,
+                );
+                return self.usage_view_changed();
+            }
+            Event::UsageViewClose => {
+                if self.usage_view.open {
+                    usage_view_step(
+                        &mut self.usage_view,
+                        self.active_workspace_idx,
+                        UsageViewInput::Close,
+                    );
+                    return self.usage_view_changed();
+                }
+            }
+            Event::UsageRepoFilter(repo) => self.usage_view.repo = repo,
+            Event::UsageWindowSelected(window) => {
+                if self.usage_window != window {
+                    self.usage_window = window;
+                    return self.request_usage_scan();
+                }
+            }
+            Event::UsageChartTokens(tokens) => self.usage_chart_tokens = tokens,
+            Event::UsageHeadlessToggled => self.usage_show_headless = !self.usage_show_headless,
+            Event::UsageRefresh => return self.request_usage_scan(),
+            Event::UsageScanned(result) => {
+                self.usage_scanning = false;
+                match result {
+                    Ok(report) => {
+                        let stale = report.window != self.usage_window;
+                        self.usage_report = Some(report);
+                        self.usage_error = None;
+                        // The window changed while this scan ran.
+                        if stale {
+                            return self.request_usage_scan();
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[usage] {err}");
+                        self.usage_error = Some(err);
+                    }
+                }
             }
             Event::ToggleMachineGroup(key) => {
                 self.machine_menu = None;
@@ -15872,6 +19602,12 @@ fi
                     self.chat_expanded_machines.insert(key);
                 }
             }
+            Event::ToggleChatOpenSection => {
+                self.chat_open_section_collapsed = !self.chat_open_section_collapsed;
+            }
+            Event::FocusTabById(tab_id) => {
+                return self.jump_to_attention_target(AttentionTarget::Tab(tab_id));
+            }
             Event::RemoteChatIndexLoaded(remote_id, result) => {
                 let state = self
                     .remote_chat_indexes
@@ -15910,6 +19646,9 @@ fi
             Event::ResumeChatRecreateDir(id) => {
                 return self.resume_chat_as_tab(id, true);
             }
+            Event::ResumeChatAsChat(id) => {
+                return self.resume_chat_as_chat_tab(id);
+            }
             Event::FocusChatTab(id) => {
                 if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
                     return self.focus_workspace_tab(ws_idx, tab_idx);
@@ -15930,6 +19669,8 @@ fi
                                 .is_some_and(|path| paths_equal(path, &snapshot.repo_path))
                         })
                     });
+                let is_active_tab = self.active_tab().is_some_and(|t| t.id == snapshot.tab_id);
+                let context_root_before = self.panel_context_root();
                 if let Some(tab) = self
                     .workspaces
                     .iter_mut()
@@ -15937,6 +19678,21 @@ fi
                     .find(|t| t.id == snapshot.tab_id)
                 {
                     tab.git_status_loading = false;
+                    // A followed agent worktree that was removed (merged,
+                    // cleaned up) drops the tab back to its root with a note
+                    // (TRU-146). When the panels were following it, this
+                    // snapshot read the vanished tree: it is discarded and
+                    // the root is read instead.
+                    let was_following = tab.worktree_follow.panel_root().is_some();
+                    if tab.worktree_follow.check_removed(Path::is_dir) && was_following {
+                        tab.git_status_error = None;
+                        if is_active_tab {
+                            return self.refresh_panels_for_context(context_root_before);
+                        }
+                        // Polled again (from the root) once it is active.
+                        tab.last_git_status_hash = None;
+                        return Task::none();
+                    }
                     tab.git_status_error = snapshot.error.clone();
                     if snapshot.error.is_some() {
                         // Keep the last good status visible alongside the error;
@@ -15945,9 +19701,15 @@ fi
                     }
                     {
                         // Self-heal: if the worker discovered a different repo root, update
+                        // Nor may a followed agent worktree (TRU-146): the
+                        // chat's Claude process is spawned in repo_path.
                         if snapshot.repo_path != tab.repo_path
                             && snapshot.is_git_repo
                             && !(tab.task_id.is_none() && snapshot_root_is_task_worktree)
+                            && !tab
+                                .worktree_follow
+                                .followed_paths()
+                                .any(|path| paths_equal(path, &snapshot.repo_path))
                         {
                             tab.repo_path = snapshot.repo_path.clone();
                             tab.git_poll_interval_ms = GIT_POLL_FAST_INTERVAL_MS;
@@ -16497,8 +20259,10 @@ fi
             Event::SttTranscriptReady(text) => {
                 self.stt_transcribing = false;
                 if !text.is_empty() {
-                    // Inject transcribed text into the active tab's terminal
+                    // Inject transcribed text into the active tab: its
+                    // terminal, or a chat tab's composer.
                     if let Some(tab) = self.active_tab_mut() {
+                        let tab_id = tab.id;
                         if let Some(term) = tab.terminal_mut() {
                             Self::handle_terminal_backend_command(
                                 term,
@@ -16506,6 +20270,8 @@ fi
                                 "stt_transcript_inject",
                                 true, // user-initiated, always redraw
                             );
+                        } else {
+                            self.dictate_into_composer(tab_id, &text);
                         }
                     }
                 }
@@ -16517,6 +20283,19 @@ fi
             }
             Event::WorkspaceSelect(idx) => {
                 self.editing_console_command = None;
+                if self.usage_view.open {
+                    usage_view_step(
+                        &mut self.usage_view,
+                        self.active_workspace_idx,
+                        UsageViewInput::SelectWorkspace(idx),
+                    );
+                    // Re-selecting the workspace that was showing just
+                    // closes the view; a different one switches below,
+                    // which presents its surfaces.
+                    if idx >= self.workspaces.len() || idx == self.active_workspace_idx {
+                        return self.usage_view_changed();
+                    }
+                }
                 if idx < self.workspaces.len() && idx != self.active_workspace_idx {
                     let viewport_width = self.content_viewport_width();
                     let target = idx as f32 * viewport_width;
@@ -16899,6 +20678,7 @@ fi
                     path,
                     None,
                     Some("claude".to_string()),
+                    None,
                 );
                 self.workspaces.push(workspace);
                 self.active_workspace_idx = self.workspaces.len() - 1;
@@ -17115,61 +20895,24 @@ fi
             Event::AttentionPulseTick => {
                 self.attention_pulse_bright = !self.attention_pulse_bright;
             }
-            Event::AttentionViewToggle => {
-                self.attention_view_open = !self.attention_view_open;
-                if self.attention_view_open {
-                    webview::set_visible(WebviewSurface::Viewer, false);
-                    webview::hide_agent_pages();
-                    return Task::none();
-                }
-                return self.restore_webview_after_attention();
-            }
-            Event::AttentionViewClose => {
-                if self.attention_view_open {
-                    self.attention_view_open = false;
-                    return self.restore_webview_after_attention();
-                }
-            }
-            Event::AttentionItemSelect(tab_id) => {
-                let target =
-                    self.workspaces
-                        .iter()
-                        .enumerate()
-                        .find_map(|(workspace_idx, workspace)| {
-                            workspace
-                                .tabs
-                                .iter()
-                                .position(|tab| tab.id == tab_id)
-                                .map(|tab_idx| (workspace_idx, tab_idx))
-                        });
-                self.attention_view_open = false;
-                if let Some((workspace_idx, tab_idx)) = target {
-                    return self.focus_workspace_tab(workspace_idx, tab_idx);
-                }
-                return self.restore_webview_after_attention();
-            }
-            Event::AttentionTaskSelect(task_id) => {
-                self.attention_view_open = false;
-                return self.enter_task_context(&task_id);
-            }
-            Event::AttentionDismiss(target) => {
-                // The panel stays open — dismissing several rows in a row is
-                // the whole point of a manual dismiss control.
-                match target {
-                    AttentionTarget::Tab(tab_id) => {
-                        if let Some(tab) = self
-                            .workspaces
-                            .iter_mut()
-                            .flat_map(|ws| ws.tabs.iter_mut())
-                            .find(|t| t.id == tab_id)
-                        {
-                            tab.attention = None;
-                        }
+            Event::WorkspaceDotPressed(workspace_idx) => {
+                // A dot with something waiting lands on its most urgent
+                // row; an empty one, or an Option-click, just switches.
+                let items = self.attention_items();
+                let (rows, _) = self.workspace_rail_state(&items, workspace_idx);
+                return match rail_click_target(&rows) {
+                    Some(target) if !self.current_modifiers.alt() => {
+                        // The Usage view closes for a jump the way a rail
+                        // selection closes it, even within this workspace.
+                        let close_usage = if self.usage_view.open {
+                            self.update(Event::WorkspaceSelect(workspace_idx))
+                        } else {
+                            Task::none()
+                        };
+                        Task::batch([close_usage, self.jump_to_attention_target(target)])
                     }
-                    AttentionTarget::Task(task_id) => {
-                        self.dismiss_task_attention(&task_id);
-                    }
-                }
+                    _ => self.update(Event::WorkspaceSelect(workspace_idx)),
+                };
             }
             Event::AttentionJumpNext => {
                 // Round-robin search for next tab needing attention
@@ -17278,7 +21021,7 @@ fi
         visible_webview_surface(
             self.viewer_webview,
             self.active_tab_surface(),
-            self.attention_view_open,
+            self.usage_view.open,
         )
     }
 
@@ -17448,7 +21191,9 @@ fi
                         tab.diff_syntax_lines = None;
                         tab.diff_syntax_notice = None;
                         tab.sidebar_mode = mode;
-                        return self.refresh_chat_index_if_stale();
+                        self.chat_rank.panel_opened();
+                        let refresh = self.refresh_chat_index_if_stale();
+                        return Task::batch([refresh, self.request_chat_rank()]);
                     }
                     SidebarMode::Tasks => {
                         tab.agent_sidebar.selected_capture_idx = None;
@@ -17504,8 +21249,14 @@ fi
     fn reveal_agent_page(&mut self, tab_id: usize) {
         let (x, y, width, height) = self.calculate_webview_bounds();
         webview::update_bounds(WebviewSurface::Agent(tab_id), x, y, width, height);
-        webview::show_only_agent_page(Some(tab_id));
-        webview::focus_agent_composer(tab_id);
+        if self.usage_view.open {
+            // Something landed behind the Usage view; closing it shows the
+            // page (apply_webview_surfaces).
+            webview::hide_agent_pages();
+        } else {
+            webview::show_only_agent_page(Some(tab_id));
+            webview::focus_agent_composer(tab_id);
+        }
         // The tab already has a page, so nothing is pushed past the cap.
         for evicted in promote_agent_page(&mut self.agent_pages, tab_id, MAX_AGENT_PAGES) {
             self.destroy_agent_page(evicted, "evicted");
@@ -17541,6 +21292,30 @@ fi
         for tab_id in gone {
             self.destroy_agent_page(tab_id, "tab closed");
         }
+        let workspaces = &self.workspaces;
+        self.dictation_held.retain(|&tab_id, _| {
+            workspaces
+                .iter()
+                .flat_map(|ws| ws.tabs.iter())
+                .any(|t| t.id == tab_id && matches!(t.kind, TabKind::Agent(_)))
+        });
+    }
+
+    /// Put a dictation transcript into chat tab `tab_id`'s composer at the
+    /// caret, verbatim as the terminal path writes it. A page still being
+    /// built (or not built since the tab opened) gets it on
+    /// `AgentWebviewCreated`.
+    #[cfg(feature = "stt")]
+    fn dictate_into_composer(&mut self, tab_id: usize, text: &str) {
+        if webview::insert_agent_composer_text(tab_id, text) {
+            return;
+        }
+        eprintln!(
+            "[STT] chat page for tab={} not built yet; holding {} chars for its composer",
+            tab_id,
+            text.chars().count()
+        );
+        hold_composer_dictation(&mut self.dictation_held, tab_id, text);
     }
 
     /// Bring both surfaces in line with the active tab: its inline file viewer
@@ -17636,7 +21411,8 @@ fi
                 bounds.3,
             );
             webview::update_content(WebviewSurface::Viewer, &html);
-            webview::set_visible(WebviewSurface::Viewer, true);
+            // Kept hidden behind the Usage view until it closes.
+            webview::set_visible(WebviewSurface::Viewer, !self.usage_view.open);
             return Task::none();
         }
 
@@ -17889,6 +21665,9 @@ fi
     /// time it is shown. The file can be megabytes, so it is parsed off the
     /// UI thread and arrives as `AgentHistoryLoaded`.
     fn start_agent_history_load(&mut self, tab_id: usize) -> Task<Event> {
+        // The tab's delegation cards are not in the transcript; they are
+        // anchored back where they were requested (TRU-142).
+        let delegations = self.delegation_times_for_tab(tab_id);
         let Some(session) = self
             .workspaces
             .iter_mut()
@@ -17911,7 +21690,7 @@ fi
                         return Vec::new();
                     };
                     match gitterm::harness::transcript::load_claude_history(&path) {
-                        Ok(entries) => entries.into_iter().map(tab::AgentEvent::from).collect(),
+                        Ok(entries) => history_timeline(entries, &delegations),
                         Err(e) => {
                             eprintln!("[agent] could not read transcript {}: {e}", path.display());
                             Vec::new()
@@ -18000,9 +21779,12 @@ fi
         }
     }
 
-    fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        heartbeat("view");
-        let spine = freeze_time!("view_spine", { self.view_spine() });
+    /// The workspace layout right of the rail: tab strip, workspace
+    /// content, bottom panel and workspace bar.
+    fn view_main<'a>(
+        &'a self,
+        spine: Element<'a, Event, Theme, iced::Renderer>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
         let tab_bar = freeze_time!("view_tab_bar", { self.view_tab_bar() });
         let content = freeze_time!("view_workspace_slide", { self.view_workspace_slide() });
         let console_panel = freeze_time!("view_bottom_panel", { self.view_bottom_panel() });
@@ -18045,23 +21827,33 @@ fi
         let workspace_bar = self.view_workspace_bar();
         main_col = main_col.push(workspace_bar);
 
-        let main_view: Element<'_, Event, Theme, iced::Renderer> = row![spine, main_col]
+        row![spine, main_col]
             .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
-            .into();
+            .into()
+    }
+
+    fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        heartbeat("view");
+        let spine = freeze_time!("view_spine", { self.view_spine() });
+
+        // The Usage view (TRU-145) takes everything right of the rail.
+        let main_view: Element<'_, Event, Theme, iced::Renderer> = if self.usage_view.open {
+            let usage = freeze_time!("view_usage_page", { self.view_usage_page() });
+            row![spine, usage]
+                .spacing(0)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            self.view_main(spine)
+        };
 
         if self.browser_evidence_open {
             Stack::new()
                 .push(main_view)
                 .push(self.view_browser_evidence())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else if self.attention_view_open {
-            Stack::new()
-                .push(main_view)
-                .push(self.view_attention_panel())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -18866,72 +22658,104 @@ fi
             header = header.push(text("AGENTS").size(9).color(text_secondary).font(mono));
             items = items.push(header.padding([7, 10]));
         }
-        for (idx, preset) in self.agent_presets.iter().enumerate() {
-            let icon = if preset.icon.is_empty() {
-                preset.name.chars().next().unwrap_or('?').to_string()
-            } else {
-                preset.icon.clone()
+        // Outside a task the top level is New chat, CLI (the agent presets,
+        // one level down) and Terminal (TRU-143). Inside a task the presets
+        // launch task sessions, so they stay at the top with Terminal.
+        let cli_list = task_context_id.is_some() || self.tab_picker_cli_open;
+        if !cli_list {
+            let selection = self.chat_config.new_chat_selection();
+            let chat_desc = match &selection.effort {
+                Some(effort) => format!("Claude · {} · {effort} effort", selection.model),
+                None => format!("Claude · {}", selection.model),
             };
-            let accent = preset.color.color(theme);
-            let launch_event = task_context_id
-                .as_ref()
-                .map_or(Event::LaunchAgentPreset(idx), |task_id| {
-                    Event::TaskChildLaunchPreset(task_id.clone(), idx)
-                });
             items = items.push(picker_row(
-                preset.name.clone(),
-                preset.command.clone(),
-                icon.clone(),
-                accent,
-                launch_event,
-            ));
-            // Add resume row if the preset has a resume command
-            if task_context_id.is_none() {
-                if let Some(resume_cmd) = &preset.resume_command {
-                    items = items.push(picker_row(
-                        format!("{} (resume)", preset.name),
-                        resume_cmd.clone(),
-                        "\u{21ba}".to_string(), // ↺ symbol
-                        accent,
-                        Event::ResumeAgentPreset(idx),
-                    ));
-                }
-            }
-        }
-        if task_context_id.is_some() {
-            items = items.push(
-                container(text("TOOLS").size(9).color(text_secondary).font(mono)).padding(
-                    iced::Padding {
-                        top: 8.0,
-                        right: 10.0,
-                        bottom: 3.0,
-                        left: 10.0,
-                    },
-                ),
-            );
-        }
-        if task_context_id.is_none() {
-            items = items.push(picker_row(
-                "Claude chat".to_string(),
-                "Native chat with approvals (preview)".to_string(),
+                "New chat".to_string(),
+                chat_desc,
                 "\u{2733}".to_string(), // ✳
                 theme.accent(),
                 Event::NewClaudeChatTab,
             ));
+            let cli_names: Vec<&str> = self.agent_presets.iter().map(|p| p.name.as_str()).collect();
+            items = items.push(picker_row(
+                "CLI \u{203a}".to_string(), // ›
+                if cli_names.is_empty() {
+                    "No agent presets configured".to_string()
+                } else {
+                    cli_names.join(", ")
+                },
+                "\u{276f}".to_string(), // ❯
+                text_secondary,
+                Event::ShowTabPickerCli,
+            ));
+            items = items.push(picker_row(
+                "Terminal".to_string(),
+                "Plain shell".to_string(),
+                "\u{25b8}".to_string(),
+                text_secondary,
+                Event::NewPlainTab,
+            ));
+        } else {
+            if task_context_id.is_none() {
+                items = items.push(picker_row(
+                    "\u{2039} CLI".to_string(), // ‹
+                    "Back".to_string(),
+                    String::new(),
+                    text_secondary,
+                    Event::ShowTabPicker,
+                ));
+            }
+            for (idx, preset) in self.agent_presets.iter().enumerate() {
+                let icon = if preset.icon.is_empty() {
+                    preset.name.chars().next().unwrap_or('?').to_string()
+                } else {
+                    preset.icon.clone()
+                };
+                let accent = preset.color.color(theme);
+                let launch_event = task_context_id
+                    .as_ref()
+                    .map_or(Event::LaunchAgentPreset(idx), |task_id| {
+                        Event::TaskChildLaunchPreset(task_id.clone(), idx)
+                    });
+                items = items.push(picker_row(
+                    preset.name.clone(),
+                    preset.command.clone(),
+                    icon.clone(),
+                    accent,
+                    launch_event,
+                ));
+                // Add resume row if the preset has a resume command
+                if task_context_id.is_none() {
+                    if let Some(resume_cmd) = &preset.resume_command {
+                        items = items.push(picker_row(
+                            format!("{} (resume)", preset.name),
+                            resume_cmd.clone(),
+                            "\u{21ba}".to_string(), // ↺ symbol
+                            accent,
+                            Event::ResumeAgentPreset(idx),
+                        ));
+                    }
+                }
+            }
+            if let Some(task_id) = task_context_id.as_ref() {
+                items = items.push(
+                    container(text("TOOLS").size(9).color(text_secondary).font(mono)).padding(
+                        iced::Padding {
+                            top: 8.0,
+                            right: 10.0,
+                            bottom: 3.0,
+                            left: 10.0,
+                        },
+                    ),
+                );
+                items = items.push(picker_row(
+                    "Terminal".to_string(),
+                    "Plain shell".to_string(),
+                    "\u{25b8}".to_string(),
+                    text_secondary,
+                    Event::TaskChildLaunchTerminal(task_id.clone()),
+                ));
+            }
         }
-        // Always add plain terminal at the bottom
-        let terminal_event = task_context_id
-            .as_ref()
-            .map_or(Event::NewPlainTab, |task_id| {
-                Event::TaskChildLaunchTerminal(task_id.clone())
-            });
-        items = items.push(picker_row(
-            "Terminal".to_string(),
-            "Plain shell".to_string(),
-            "\u{25b8}".to_string(),
-            text_secondary,
-            terminal_event,
-        ));
 
         let picker_menu = container(items)
             .style(move |_| container::Style {
@@ -19037,7 +22861,7 @@ fi
         content_col = content_col.push(shortcut_row("Cmd + T", "Switch General/task context"));
         content_col = content_col.push(shortcut_row("Cmd + ↑", "Return to General"));
         content_col = content_col.push(shortcut_row("Cmd + 0", "Open task overview"));
-        content_col = content_col.push(shortcut_row("Cmd + Shift + A", "Open attention view"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + U", "Open usage view"));
         content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to next needs-you"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + W", "Close workspace"));
         content_col = content_col.push(shortcut_row("Cmd + B", "Toggle sidebar"));
@@ -20198,9 +24022,16 @@ fi
             let has_error = ws.console.status == ConsoleStatus::Error;
 
             // Colored dot before name — override for attention/error
-            let dot_color = if has_error || attention_reason == Some(AttentionReason::AgentFailed) {
+            let dot_color = if has_error
+                || matches!(
+                    attention_reason,
+                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))
+                ) {
                 theme.danger()
-            } else if attention_reason == Some(AttentionReason::CompletedUnread) {
+            } else if matches!(
+                attention_reason,
+                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_))
+            ) {
                 theme.success()
             } else if has_attention && pulse_bright {
                 theme.peach()
@@ -20278,8 +24109,12 @@ fi
                 );
             } else if has_attention {
                 let badge_bg = match attention_reason {
-                    Some(AttentionReason::AgentFailed) => theme.danger(),
-                    Some(AttentionReason::CompletedUnread) => theme.success(),
+                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)) => {
+                        theme.danger()
+                    }
+                    Some(
+                        AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_),
+                    ) => theme.success(),
                     _ => theme.peach(),
                 };
                 let badge_text_color = theme.bg_crust();
@@ -20518,63 +24353,10 @@ fi
                 ..Default::default()
             });
 
-        let rail_task_reasons = self.rail_only_task_attention_reasons();
-        let attention_count = self
-            .workspaces
-            .iter()
-            .map(Workspace::attention_count)
-            .sum::<usize>()
-            + rail_task_reasons.len();
-        let attention_priority = self
-            .workspaces
-            .iter()
-            .filter_map(Workspace::highest_priority_attention)
-            .map(AttentionReason::priority)
-            .chain(
-                rail_task_reasons
-                    .iter()
-                    .map(|reason| task_attention_presentation(*reason).0),
-            )
-            .min();
-        let attention_color = match attention_priority {
-            Some(0) => {
-                if self.attention_pulse_bright {
-                    theme.peach()
-                } else {
-                    theme.warning()
-                }
-            }
-            Some(1) => theme.danger(),
-            Some(2) => theme.peach(),
-            Some(_) => theme.success(),
-            None => theme.text_muted(),
-        };
-        let attention_hover = theme.surface0();
-        let attention_active = self.attention_view_open;
-        let attention_btn = button(
-            text(format!("⚡ {attention_count}"))
-                .size(11)
-                .color(attention_color)
-                .font(iced::Font::with_name("Menlo")),
-        )
-        .style(move |_theme, status| button::Style {
-            background: if attention_active || matches!(status, button::Status::Hovered) {
-                Some(attention_hover.into())
-            } else {
-                Some(iced::Color::TRANSPARENT.into())
-            },
-            text_color: attention_color,
-            border: iced::Border::default(),
-            ..Default::default()
-        })
-        .padding([6, 10])
-        .on_press(Event::AttentionViewToggle);
-
         let bar_inner = row![
             scrollable_bar,
             control_separator,
             container(browser_controls).padding([0, 6]),
-            attention_btn,
             help_btn
         ]
         .spacing(0)
@@ -20592,245 +24374,6 @@ fi
         column![top_border, bar_container].into()
     }
 
-    fn view_attention_panel(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let bg = theme.bg_surface();
-        let row_bg = theme.bg_base();
-        let hover_bg = theme.surface0();
-        let border_color = theme.border();
-        let text_primary = theme.text_primary();
-        let text_secondary = theme.text_secondary();
-        let text_muted = theme.text_muted();
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-        let mono = iced::Font::with_name("Menlo");
-        let items = self.attention_items();
-        let item_count = items.len();
-
-        let close_btn = button(text("×").size(font + 2.0).color(text_secondary))
-            .style(move |_theme, status| button::Style {
-                background: matches!(status, button::Status::Hovered).then_some(hover_bg.into()),
-                text_color: text_secondary,
-                border: iced::Border::default(),
-                ..Default::default()
-            })
-            .padding([2, 7])
-            .on_press(Event::AttentionViewClose);
-
-        let header = column![
-            row![
-                text("Attention")
-                    .size(font + 1.0)
-                    .color(text_primary)
-                    .font(mono),
-                iced::widget::Space::new().width(Length::Fill),
-                close_btn,
-            ]
-            .align_y(iced::Alignment::Center),
-            text(if item_count == 1 {
-                "1 item needs you".to_string()
-            } else {
-                format!("{item_count} items need you")
-            })
-            .size(font_small)
-            .color(text_secondary),
-        ]
-        .spacing(2);
-
-        let mut item_list = Column::new().spacing(5).width(Length::Fill);
-        if items.is_empty() {
-            item_list =
-                item_list.push(
-                    container(
-                        column![
-                        text("You're caught up")
-                            .size(font)
-                            .color(text_primary)
-                            .font(mono),
-                        text("Input requests, failures, and completed agent work will appear here.")
-                            .size(font_small)
-                            .color(text_secondary),
-                    ]
-                        .spacing(6),
-                    )
-                    .padding([24, 10]),
-                );
-        } else {
-            let mut actionable_heading_added = false;
-            let mut review_heading_added = false;
-            for item in items {
-                // Items arrive priority-sorted, so review rows (the highest
-                // priority value) always trail the actionable ones.
-                if item.priority == 3 {
-                    if !review_heading_added {
-                        item_list = item_list.push(
-                            text("READY TO REVIEW")
-                                .size(font_small - 1.0)
-                                .color(text_muted)
-                                .font(mono),
-                        );
-                        review_heading_added = true;
-                    }
-                } else if !actionable_heading_added {
-                    item_list = item_list.push(
-                        text("NEEDS YOU")
-                            .size(font_small - 1.0)
-                            .color(text_muted)
-                            .font(mono),
-                    );
-                    actionable_heading_added = true;
-                }
-
-                let reason_color = match item.priority {
-                    0 => theme.warning(),
-                    1 => theme.danger(),
-                    2 => theme.peach(),
-                    _ => theme.success(),
-                };
-                let age = format_attention_age(item.age_secs);
-                let location = format!("{} · {}", item.machine_name, item.workspace_name);
-                let tab_name = if item.title.chars().count() > 44 {
-                    format!("{}…", truncate_str(&item.title, 43))
-                } else {
-                    item.title
-                };
-
-                let status_line = row![
-                    text(item.icon).size(font_small).color(reason_color),
-                    text(item.label)
-                        .size(font_small)
-                        .color(reason_color)
-                        .font(mono),
-                    iced::widget::Space::new().width(Length::Fill),
-                    text(age).size(font_small).color(text_muted).font(mono),
-                ]
-                .spacing(6)
-                .align_y(iced::Alignment::Center);
-
-                let dismiss_target = item.target.clone();
-                let item_button = button(
-                    column![
-                        status_line,
-                        text(tab_name).size(font).color(text_primary).font(mono),
-                        text(location).size(font_small).color(text_secondary),
-                    ]
-                    .spacing(3)
-                    .width(Length::Fill),
-                )
-                .style(move |_theme, status| button::Style {
-                    background: Some(
-                        if matches!(status, button::Status::Hovered) {
-                            hover_bg
-                        } else {
-                            row_bg
-                        }
-                        .into(),
-                    ),
-                    text_color: text_primary,
-                    border: iced::Border {
-                        color: border_color,
-                        width: 1.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                })
-                .padding([8, 10])
-                .width(Length::Fill)
-                .on_press(match item.target {
-                    AttentionTarget::Tab(tab_id) => Event::AttentionItemSelect(tab_id),
-                    AttentionTarget::Task(task_id) => Event::AttentionTaskSelect(task_id),
-                });
-                // A sibling, not a nested button — dismiss clears the row
-                // without visiting it.
-                let dismiss_button = button(text("✕").size(font_small).font(mono))
-                    .style(move |_theme, status| button::Style {
-                        background: Some(
-                            if matches!(status, button::Status::Hovered) {
-                                hover_bg
-                            } else {
-                                row_bg
-                            }
-                            .into(),
-                        ),
-                        text_color: if matches!(status, button::Status::Hovered) {
-                            text_primary
-                        } else {
-                            text_muted
-                        },
-                        border: iced::Border {
-                            color: border_color,
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        ..Default::default()
-                    })
-                    .padding([8, 8])
-                    .on_press(Event::AttentionDismiss(dismiss_target));
-                item_list = item_list.push(
-                    row![item_button, dismiss_button]
-                        .spacing(4)
-                        .align_y(iced::Alignment::Center),
-                );
-            }
-        }
-
-        let separator = container(iced::widget::Space::new().height(0))
-            .width(Length::Fill)
-            .height(Length::Fixed(1.0))
-            .style(move |_| container::Style {
-                background: Some(border_color.into()),
-                ..Default::default()
-            });
-        let panel = container(
-            column![
-                header,
-                separator,
-                scrollable(item_list.padding([4, 0])).height(Length::Fixed(340.0)),
-            ]
-            .spacing(10),
-        )
-        .width(Length::Fixed(390.0))
-        .padding(14)
-        .style(move |_| container::Style {
-            background: Some(bg.into()),
-            border: iced::Border {
-                color: border_color,
-                width: 1.0,
-                radius: 9.0.into(),
-            },
-            shadow: iced::Shadow {
-                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 16.0,
-            },
-            ..Default::default()
-        });
-
-        let backdrop = iced::widget::mouse_area(
-            container(iced::widget::Space::new())
-                .width(Length::Fill)
-                .height(Length::Fill),
-        )
-        .on_press(Event::AttentionViewClose);
-
-        Stack::new()
-            .push(backdrop)
-            .push(
-                container(panel)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(iced::Alignment::End)
-                    .align_y(iced::Alignment::End)
-                    .padding(iced::Padding {
-                        top: 0.0,
-                        right: 12.0,
-                        bottom: 40.0,
-                        left: 0.0,
-                    }),
-            )
-            .into()
-    }
-
     fn view_spine(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let dots = self.view_workspace_dot_column();
@@ -20838,13 +24381,19 @@ fi
         let bg = theme.bg_crust();
         let border_color = theme.surface0();
 
-        let spine_content = container(container(dots).height(Length::Fill).center_y(Length::Fill))
-            .width(Length::Fixed(SPINE_WIDTH))
-            .height(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(bg.into()),
-                ..Default::default()
-            });
+        let spine_content = container(
+            column![
+                container(dots).height(Length::Fill).center_y(Length::Fill),
+                self.view_usage_rail_button(),
+            ]
+            .align_x(iced::Alignment::Center),
+        )
+        .width(Length::Fixed(SPINE_WIDTH))
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            ..Default::default()
+        });
 
         // Right border as a separate 1px column
         let border_line = container(iced::widget::Space::new().width(0).height(0))
@@ -20858,40 +24407,183 @@ fi
         row![spine_content, border_line].into()
     }
 
+    /// Bar-chart glyph pinned at the bottom of the workspace rail: opens or
+    /// closes the Usage view (TRU-145).
+    fn view_usage_rail_button(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let open = self.usage_view.open;
+        let bar_color = if open {
+            theme.accent()
+        } else {
+            theme.subtext0()
+        };
+        let mut glyph = Row::new().spacing(2).align_y(iced::Alignment::End);
+        for height in [6.0, 12.0, 9.0] {
+            glyph = glyph.push(
+                container(iced::widget::Space::new())
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(height))
+                    .style(move |_| container::Style {
+                        background: Some(bar_color.into()),
+                        border: iced::Border {
+                            radius: 1.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+        let hover_bg = theme.surface0();
+        let btn = button(
+            container(glyph)
+                .width(Length::Fixed(SPINE_WIDTH - 1.0))
+                .center_x(Length::Fixed(SPINE_WIDTH - 1.0))
+                .center_y(Length::Fixed(16.0)),
+        )
+        .style(move |_theme, status| button::Style {
+            background: Some(
+                if open || matches!(status, button::Status::Hovered) {
+                    hover_bg
+                } else {
+                    iced::Color::TRANSPARENT
+                }
+                .into(),
+            ),
+            border: iced::Border::default(),
+            ..Default::default()
+        })
+        .padding([8, 0])
+        .on_press(Event::UsageViewToggle);
+        let tip = self.rail_tooltip(
+            text("Usage  ⌘⇧U")
+                .size(self.ui_font_small())
+                .color(theme.text_primary()),
+        );
+        iced::widget::tooltip(btn, tip, iced::widget::tooltip::Position::Right).into()
+    }
+
+    /// The rail's tooltip card, shared by the Usage glyph and the
+    /// workspace dots.
+    fn rail_tooltip<'a>(
+        &self,
+        content: impl Into<Element<'a, Event, Theme, iced::Renderer>>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let tip_bg = self.theme.bg_surface();
+        let tip_border = self.theme.border();
+        container(content)
+            .padding([4, 8])
+            .style(move |_| container::Style {
+                background: Some(tip_bg.into()),
+                border: iced::Border {
+                    color: tip_border,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// A workspace dot's hover card: the workspace name, then what waits in
+    /// it — up to five rows, most urgent first — or that a turn is running.
+    fn workspace_dot_tooltip(
+        &self,
+        workspace: &Workspace,
+        rows: &[AttentionItem],
+        running: bool,
+    ) -> Element<'_, Event, Theme, iced::Renderer> {
+        const SHOWN: usize = 5;
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let mono = iced::Font::with_name("Menlo");
+        let mut card = Column::new().spacing(3).push(
+            text(workspace.name.clone())
+                .size(font_small)
+                .color(theme.text_primary())
+                .font(mono),
+        );
+        for item in rows.iter().take(SHOWN) {
+            let reason_color = rail_urgency_color(
+                theme,
+                RailUrgency::from_priority(item.priority),
+                self.attention_pulse_bright,
+            );
+            let title = if item.title.chars().count() > 32 {
+                format!("{}…", truncate_str(&item.title, 31))
+            } else {
+                item.title.clone()
+            };
+            card = card.push(
+                row![
+                    text(item.icon).size(font_small).color(reason_color),
+                    text(title)
+                        .size(font_small)
+                        .color(theme.text_primary())
+                        .font(mono),
+                    text(item.label).size(font_small).color(reason_color),
+                    text(format_attention_age(item.waiting.as_secs()))
+                        .size(font_small)
+                        .color(theme.text_muted())
+                        .font(mono),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        if rows.len() > SHOWN {
+            card = card.push(
+                text(format!("+{} more", rows.len() - SHOWN))
+                    .size(font_small)
+                    .color(theme.text_muted()),
+            );
+        }
+        if rows.is_empty() && running {
+            card = card.push(
+                text("▶ Turn running")
+                    .size(font_small)
+                    .color(rail_urgency_color(theme, RailUrgency::Running, false)),
+            );
+        }
+        self.rail_tooltip(card)
+    }
+
     fn view_workspace_dot_column(&self) -> Column<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let pulse_bright = self.attention_pulse_bright;
         let mut dots = Column::new().spacing(8).align_x(iced::Alignment::Center);
+        let items = self.attention_items();
 
         for (idx, ws) in self.workspaces.iter().enumerate() {
             let is_active = idx == self.active_workspace_idx;
             let ws_color = ws.color.color(theme);
             let inactive_color = theme.surface2();
 
-            let has_attention = ws.has_attention();
-            let attention_reason = ws.highest_priority_attention();
+            // The tab in front is left out: its state is already on screen.
+            let (rows, running) = self.workspace_rail_state(&items, idx);
+            let urgency = workspace_rail_urgency(&rows, running);
+            let pending = urgency.filter(|urgency| *urgency != RailUrgency::Running);
             let has_error = ws.console.status == ConsoleStatus::Error;
 
-            // Larger dot for attention/error when inactive
+            // Larger dot for something waiting or a console error when
+            // inactive; the active workspace keeps its tall bar.
             let (dot_w, dot_h) = if is_active {
                 (4.0, 18.0)
-            } else if has_attention || has_error {
+            } else if pending.is_some() || has_error {
                 (6.0, 6.0)
             } else {
                 (4.0, 4.0)
             };
 
-            // Color: error (red) > attention (pulsing amber) > active (ws color) > inactive
-            let dot_color = if (has_error || attention_reason == Some(AttentionReason::AgentFailed))
-                && !is_active
-            {
+            // Color: console error (inactive) > most urgent waiting reason >
+            // a running turn (inactive only — the active bar keeps its
+            // workspace colour, which the tab strip's stamp matches) >
+            // active (ws color) > inactive.
+            let dot_color = if has_error && !is_active {
                 theme.danger()
-            } else if attention_reason == Some(AttentionReason::CompletedUnread) && !is_active {
-                theme.success()
-            } else if has_attention && !is_active && pulse_bright {
-                theme.peach()
-            } else if has_attention && !is_active {
-                theme.warning()
+            } else if let Some(urgency) = pending {
+                rail_urgency_color(theme, urgency, pulse_bright)
+            } else if urgency == Some(RailUrgency::Running) && !is_active {
+                rail_urgency_color(theme, RailUrgency::Running, pulse_bright)
             } else if is_active {
                 ws_color
             } else {
@@ -20931,12 +24623,73 @@ fi
                 }
             })
             .padding([4, 0])
-            .on_press(Event::WorkspaceSelect(idx));
+            .on_press(Event::WorkspaceDotPressed(idx));
 
-            dots = dots.push(dot_btn);
+            let tip = self.workspace_dot_tooltip(ws, &rows, running);
+            dots = dots.push(iced::widget::tooltip(
+                dot_btn,
+                tip,
+                iced::widget::tooltip::Position::Right,
+            ));
         }
 
         dots
+    }
+
+    /// The session strip's icon for a tab: a chat tab's live session
+    /// first, then attention overrides the normal icon. The Chats panel's
+    /// Open rows reuse it so both read the same (TRU-148).
+    fn session_tab_icon(
+        &self,
+        tab: &TabState,
+        is_active: bool,
+        display_title: &str,
+    ) -> (&'static str, iced::Color) {
+        let theme = &self.theme;
+        let pulse_bright = self.attention_pulse_bright;
+        let attention_reason = tab.attention.map(|attention| attention.reason);
+        let is_claude = display_title.to_lowercase().contains("claude");
+        let chat_session = tab.agent_session();
+        let chat_marker = chat_session.and_then(|session| {
+            chat_tab_marker(
+                matches!(session.state, tab::AgentSessionState::Streaming),
+                session.pending_requests.len(),
+                is_active,
+            )
+        });
+        match (chat_marker, attention_reason) {
+            (Some(ChatTabMarker::NeedsYou { pulse }), _) => (
+                "● ",
+                if pulse && pulse_bright {
+                    theme.peach()
+                } else {
+                    theme.warning()
+                },
+            ),
+            (Some(ChatTabMarker::Running), _) => ("▶ ", theme.success()),
+            (
+                None,
+                Some(AttentionReason::HumanInputRequired | AttentionReason::DelegationBlocked(_)),
+            ) => (
+                "● ",
+                if pulse_bright {
+                    theme.peach()
+                } else {
+                    theme.warning()
+                },
+            ),
+            (None, Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))) => {
+                ("! ", theme.danger())
+            }
+            (
+                None,
+                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_)),
+            ) => ("✓ ", theme.success()),
+            // An idle chat tab: ▶ is reserved for a running turn.
+            (None, None) if chat_session.is_some() => ("✦ ", theme.text_muted()),
+            (None, None) if is_claude => ("✦ ", theme.peach()),
+            (None, None) => ("▶ ", theme.success()),
+        }
     }
 
     fn view_tab_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -21135,23 +24888,7 @@ fi
                     tab.terminal_title().unwrap_or(tab.repo_name.as_str())
                 }
             });
-            let is_claude = display_title.to_lowercase().contains("claude");
-
-            // Icon prefix — attention overrides normal icon
-            let (icon_str, icon_color) = match attention_reason {
-                Some(AttentionReason::HumanInputRequired) => (
-                    "● ",
-                    if pulse_bright {
-                        theme.peach()
-                    } else {
-                        theme.warning()
-                    },
-                ),
-                Some(AttentionReason::AgentFailed) => ("! ", theme.danger()),
-                Some(AttentionReason::CompletedUnread) => ("✓ ", theme.success()),
-                None if is_claude => ("✦ ", theme.peach()),
-                None => ("▶ ", theme.success()),
-            };
+            let (icon_str, icon_color) = self.session_tab_icon(tab, is_active, display_title);
 
             // Tab label - strip leading "*" when attention (redundant with visual indicator),
             // shorten path-like titles to last component, truncate at 20 chars
@@ -21185,8 +24922,12 @@ fi
 
             // Attention background colors
             let attention_base_color = match attention_reason {
-                Some(AttentionReason::AgentFailed) => theme.danger(),
-                Some(AttentionReason::CompletedUnread) => theme.success(),
+                Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)) => {
+                    theme.danger()
+                }
+                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_)) => {
+                    theme.success()
+                }
                 _ => theme.peach(),
             };
             let attn_bg_color = iced::Color {
@@ -21434,7 +25175,62 @@ fi
             }
         }
 
-        metadata_row = metadata_row.push(branch_copy);
+        // A chat tab whose agent works in another worktree (TRU-146): the
+        // branch line names it and a click flips the Git and Files panels
+        // between that worktree and the workspace root.
+        let followed = task_context_id
+            .is_none()
+            .then(|| self.active_tab())
+            .flatten()
+            .filter(|_| !self.active_workspace_is_remote())
+            .and_then(|tab| {
+                let follow = &tab.worktree_follow;
+                follow.active.as_ref().map(|active| (tab, follow, active))
+            });
+        if let Some((tab, follow, active)) = followed {
+            let label = follow
+                .label
+                .clone()
+                .unwrap_or_else(|| active.path.display().to_string());
+            let chip_text = if follow.follow {
+                format!(
+                    "\u{2387} {} \u{b7} worktree {label}",
+                    active.branch.as_deref().unwrap_or("detached")
+                )
+            } else {
+                format!(
+                    "\u{2387} {} \u{b7} workspace root \u{b7} follow worktree {label}",
+                    tab.branch_name
+                )
+            };
+            let chip_color = if follow.follow {
+                theme.accent()
+            } else {
+                theme.text_muted()
+            };
+            let hover_bg = theme.surface0();
+            let chip = button(
+                text(chip_text)
+                    .size(11)
+                    .color(chip_color)
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .padding([2, 6])
+            .style(move |_theme, status| button::Style {
+                background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                    .then(|| hover_bg.into()),
+                text_color: chip_color,
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .on_press(Event::ToggleWorktreeFollow);
+            metadata_row = metadata_row.push(chip);
+        } else {
+            metadata_row = metadata_row.push(branch_copy);
+        }
 
         let strip = row![
             container(stamp_row).padding(iced::Padding {
@@ -24621,11 +28417,620 @@ fi
             .into()
     }
 
+    /// The full-window Usage view (TRU-145): estimated cost and token usage
+    /// across Claude Code, Codex and Pi, from this Mac's transcripts, for
+    /// every repo or the one picked in the repo table. The numbers come from
+    /// `gitterm::usage`; this only lays them out.
+    fn view_usage_page<'a>(&'a self) -> Element<'a, Event, Theme, iced::Renderer> {
+        use gitterm::usage::{format_cost, format_tokens, harness_index, Bucket, UsageWindow};
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let font_tiny = font_small - 1.0;
+        let muted = theme.text_muted();
+        let secondary = theme.text_secondary();
+        let primary = theme.text_primary();
+        let card_bg = theme.bg_surface();
+        let card_border = theme.surface0();
+        let page_bg = theme.bg_base();
+
+        let segment = |label: &'static str, active: bool, on_press: Event| {
+            let bg = active.then(|| theme.surface0().into());
+            let color = if active { primary } else { secondary };
+            button(text(label).size(font_small).color(color))
+                .style(move |_theme, _status| button::Style {
+                    background: bg,
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .padding([4, 10])
+                .on_press(on_press)
+        };
+        let fill = || iced::widget::Space::new().width(Length::Fill);
+        let gap = || iced::widget::Space::new().width(Length::Fixed(12.0));
+        let card = move |body: Element<'a, Event, Theme, iced::Renderer>| {
+            container(body)
+                .padding(14)
+                .style(move |_| container::Style {
+                    background: Some(card_bg.into()),
+                    border: iced::Border {
+                        color: card_border,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                })
+        };
+
+        // Header: title, repo filter chip, window, chart mode, headless,
+        // refresh.
+        let mut header = Row::new()
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+            .push(text("Usage").size(font + 6.0).color(primary))
+            .push(gap());
+        match &self.usage_view.repo {
+            Some((_, name)) => {
+                let chip_bg = theme.surface0();
+                header = header.push(
+                    container(
+                        row![
+                            text(name.as_str()).size(font_small).color(primary),
+                            button(text("×").size(font_small).color(secondary))
+                                .style(|_theme, _status| button::Style::default())
+                                .padding([0, 2])
+                                .on_press(Event::UsageRepoFilter(None)),
+                        ]
+                        .spacing(6)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding([3, 10])
+                    .style(move |_| container::Style {
+                        background: Some(chip_bg.into()),
+                        border: iced::Border {
+                            radius: 10.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            None => {
+                header = header.push(text("All repos").size(font_small).color(muted));
+            }
+        }
+        header = header.push(fill());
+        for window in UsageWindow::ALL {
+            header = header.push(segment(
+                window.label(),
+                self.usage_window == window,
+                Event::UsageWindowSelected(window),
+            ));
+        }
+        header = header
+            .push(gap())
+            .push(segment(
+                "Cost",
+                !self.usage_chart_tokens,
+                Event::UsageChartTokens(false),
+            ))
+            .push(segment(
+                "Tokens",
+                self.usage_chart_tokens,
+                Event::UsageChartTokens(true),
+            ))
+            .push(gap())
+            .push(segment(
+                if self.usage_show_headless {
+                    "headless shown"
+                } else {
+                    "headless hidden"
+                },
+                self.usage_show_headless,
+                Event::UsageHeadlessToggled,
+            ))
+            .push(segment(
+                if self.usage_scanning {
+                    "scanning…"
+                } else {
+                    "refresh"
+                },
+                false,
+                Event::UsageRefresh,
+            ));
+
+        let mut content = Column::new().spacing(16).padding(24).push(header);
+
+        if let Some(err) = &self.usage_error {
+            content = content.push(
+                text(format!("Usage scan failed: {err}"))
+                    .size(font_small)
+                    .color(theme.danger()),
+            );
+        }
+        let page = |content: Column<'a, Event, Theme, iced::Renderer>| {
+            container(scrollable(content).height(Length::Fill).width(Length::Fill))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(page_bg.into()),
+                    ..Default::default()
+                })
+                .into()
+        };
+        let Some(report) = &self.usage_report else {
+            content = content.push(text("Reading transcripts…").size(font).color(secondary));
+            return page(content);
+        };
+        // Everything above the repo table follows the repo filter; the repo
+        // table always lists every repo.
+        let all_repos = report.view(self.usage_show_headless);
+        let view = report.view_for(
+            self.usage_show_headless,
+            self.usage_view.repo.as_ref().map(|(key, _)| key),
+        );
+        let totals = view.totals;
+        let tokens_mode = self.usage_chart_tokens;
+        let no_wrap = iced::widget::text::Wrapping::None;
+        let cell = |value: String, width: f32| {
+            text(value)
+                .size(font_small)
+                .color(secondary)
+                .wrapping(no_wrap)
+                .width(Length::Fixed(width))
+                .align_x(iced::alignment::Horizontal::Right)
+        };
+        let heading = |label: &'static str| text(label).size(font).color(primary);
+        let cost_label = |bucket: &Bucket| {
+            if bucket.cost == 0.0 && bucket.unpriced_tokens > 0 {
+                "unpriced".to_string()
+            } else {
+                format_cost(bucket.cost)
+            }
+        };
+
+        // Totals, one box each.
+        let mut cost_box = Column::new()
+            .spacing(4)
+            .push(text("Estimated cost").size(font_tiny).color(muted))
+            .push(
+                text(format_cost(totals.cost))
+                    .size(font + 10.0)
+                    .color(primary),
+            )
+            .push(
+                text(format!(
+                    "{} days at full API list rates",
+                    report.window.days()
+                ))
+                .size(font_tiny)
+                .color(muted),
+            );
+        if totals.unpriced_tokens > 0 {
+            cost_box = cost_box.push(
+                text(format!(
+                    "+ {} tokens on unpriced models",
+                    format_tokens(totals.unpriced_tokens)
+                ))
+                .size(font_tiny)
+                .color(theme.warning()),
+            );
+        }
+        let token_box = |label: &'static str, value: u64| {
+            card(
+                Column::new()
+                    .spacing(4)
+                    .push(text(label).size(font_tiny).color(muted))
+                    .push(text(format_tokens(value)).size(font + 6.0).color(primary))
+                    .into(),
+            )
+            .width(Length::FillPortion(2))
+            .height(Length::Fill)
+        };
+        let t = &totals.tokens;
+        let totals_row = row![
+            // Shrink-high and first, so the token boxes stretch to it.
+            card(cost_box.into()).width(Length::FillPortion(3)),
+            token_box("Processed", t.processed()),
+            token_box("Cached input", t.cache_read),
+            token_box("Uncached input", t.uncached_input),
+            token_box("Cache writes", t.cache_write),
+            token_box("Output", t.output),
+        ]
+        .spacing(12)
+        .height(Length::Shrink);
+        content = content.push(totals_row);
+
+        // Daily chart, stacked by harness (Claude at the bottom).
+        const CHART_HEIGHT: f32 = 180.0;
+        let value = |bucket: &Bucket| {
+            if tokens_mode {
+                bucket.tokens.processed() as f64
+            } else {
+                bucket.cost
+            }
+        };
+        let peak = view
+            .days
+            .iter()
+            .map(|day| day.by_harness.iter().map(value).sum::<f64>())
+            .fold(0.0, f64::max);
+        let mut bars = Row::new()
+            .spacing(if view.days.len() > 30 { 1 } else { 3 })
+            .height(Length::Fixed(CHART_HEIGHT))
+            .align_y(iced::Alignment::End);
+        for day in &view.days {
+            let mut stack = Column::new().width(Length::FillPortion(1));
+            for backend in chats::ChatBackend::ALL.iter().rev() {
+                let v = value(&day.by_harness[harness_index(*backend)]);
+                let height = if peak > 0.0 {
+                    (v / peak) as f32 * CHART_HEIGHT
+                } else {
+                    0.0
+                };
+                if height >= 0.5 {
+                    let color = self.chat_backend_color(*backend);
+                    stack = stack.push(
+                        container(iced::widget::Space::new())
+                            .width(Length::Fill)
+                            .height(Length::Fixed(height))
+                            .style(move |_| container::Style {
+                                background: Some(color.into()),
+                                ..Default::default()
+                            }),
+                    );
+                }
+            }
+            bars = bars.push(stack);
+        }
+        let baseline_color = theme.surface1();
+        let baseline = container(iced::widget::Space::new())
+            .width(Length::Fill)
+            .height(Length::Fixed(1.0))
+            .style(move |_| container::Style {
+                background: Some(baseline_color.into()),
+                ..Default::default()
+            });
+        let peak_label = if tokens_mode {
+            format!("peak {} / day", format_tokens(peak as u64))
+        } else {
+            format!("peak {} / day", format_cost(peak))
+        };
+        let mut legend = Row::new().spacing(16).align_y(iced::Alignment::Center);
+        for backend in chats::ChatBackend::ALL {
+            let bucket = &view.by_harness[harness_index(backend)];
+            let figure = if tokens_mode {
+                format_tokens(bucket.tokens.processed())
+            } else {
+                cost_label(bucket)
+            };
+            legend = legend.push(
+                row![
+                    text("●").size(9).color(self.chat_backend_color(backend)),
+                    text(format!("{} {figure}", backend.label()))
+                        .size(font_small)
+                        .color(secondary)
+                        .wrapping(no_wrap),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        content = content.push(card(
+            Column::new()
+                .spacing(8)
+                .push(row![
+                    heading(if tokens_mode {
+                        "Daily tokens"
+                    } else {
+                        "Daily cost"
+                    }),
+                    fill(),
+                    text(peak_label).size(font_small).color(muted),
+                ])
+                .push(Column::new().push(bars).push(baseline))
+                .push(row![
+                    text(report.start.format("%b %-d").to_string())
+                        .size(font_tiny)
+                        .color(muted),
+                    fill(),
+                    text(report.end.format("%b %-d").to_string())
+                        .size(font_tiny)
+                        .color(muted),
+                ])
+                .push(legend)
+                .into(),
+        ));
+
+        // Share of `whole`'s cost, or of its tokens in Tokens mode.
+        let share = move |bucket: &Bucket, whole: &Bucket| {
+            let (part, whole) = if tokens_mode {
+                (
+                    bucket.tokens.processed() as f64,
+                    whole.tokens.processed() as f64,
+                )
+            } else {
+                (bucket.cost, whole.cost)
+            };
+            if whole > 0.0 && part > 0.0 {
+                format!("{:.0}%", part / whole * 100.0)
+            } else {
+                "—".to_string()
+            }
+        };
+        const COST_W: f32 = 80.0;
+        const SHARE_W: f32 = 50.0;
+        const TOKENS_W: f32 = 70.0;
+        let table_header = |first: &'static str| {
+            row![
+                text(first).size(font_tiny).color(muted).width(Length::Fill),
+                cell("Cost".to_string(), COST_W).color(muted),
+                cell("Share".to_string(), SHARE_W).color(muted),
+                cell("Tokens".to_string(), TOKENS_W).color(muted),
+            ]
+            .spacing(8)
+        };
+
+        let mut models = Column::new()
+            .spacing(6)
+            .push(heading("By model"))
+            .push(table_header("Model"));
+        for model in &view.models {
+            models = models.push(
+                row![
+                    text("●")
+                        .size(9)
+                        .color(self.chat_backend_color(model.harness)),
+                    text(model.model.clone())
+                        .size(font_small)
+                        .color(primary)
+                        .wrapping(no_wrap)
+                        .width(Length::Fill),
+                    cell(cost_label(&model.usage), COST_W),
+                    cell(share(&model.usage, &totals), SHARE_W),
+                    cell(format_tokens(model.usage.tokens.processed()), TOKENS_W),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        if view.models.is_empty() {
+            models = models.push(
+                text("No usage in this window.")
+                    .size(font_small)
+                    .color(muted),
+            );
+        }
+
+        let selected = self.usage_view.repo.as_ref().map(|(key, _)| key);
+        let row_hover = theme.surface0();
+        let row_selected = theme.surface1();
+        let mut repos = Column::new()
+            .spacing(2)
+            .push(heading("By repo"))
+            .push(container(table_header("Repo")).padding([4, 6]));
+        for repo in &all_repos.repos {
+            let name = if repo.resolved {
+                repo.name.clone()
+            } else {
+                format!("{} (no repo)", repo.name)
+            };
+            let is_selected = selected == Some(&repo.path);
+            // Clicking the selected repo again goes back to every repo.
+            let on_press = if is_selected {
+                Event::UsageRepoFilter(None)
+            } else {
+                Event::UsageRepoFilter(Some((repo.path.clone(), name.clone())))
+            };
+            let label = text(name)
+                .size(font_small)
+                .color(if repo.resolved { primary } else { secondary })
+                .wrapping(no_wrap)
+                .width(Length::Fill);
+            repos = repos.push(
+                button(
+                    row![
+                        label,
+                        cell(cost_label(&repo.usage), COST_W),
+                        cell(share(&repo.usage, &all_repos.totals), SHARE_W),
+                        cell(format_tokens(repo.usage.tokens.processed()), TOKENS_W),
+                    ]
+                    .spacing(8),
+                )
+                .style(move |_theme, status| button::Style {
+                    background: if is_selected {
+                        Some(row_selected.into())
+                    } else if matches!(status, button::Status::Hovered) {
+                        Some(row_hover.into())
+                    } else {
+                        None
+                    },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .padding([4, 6])
+                .width(Length::Fill)
+                .on_press(on_press),
+            );
+        }
+        if all_repos.repos.is_empty() {
+            repos = repos.push(
+                text("No usage in this window.")
+                    .size(font_small)
+                    .color(muted),
+            );
+        }
+        content = content.push(
+            row![
+                card(models.into()).width(Length::FillPortion(1)),
+                card(repos.into()).width(Length::FillPortion(1)),
+            ]
+            .spacing(16),
+        );
+
+        let stats = &report.stats;
+        let mut footer = Column::new().spacing(2).push(
+            text(format!(
+                "{} transcripts · {} responses · scanned in {:.1}s",
+                stats.files_seen - stats.files_outside_window,
+                format_tokens(stats.responses),
+                stats.elapsed.as_secs_f64()
+            ))
+            .size(font_tiny)
+            .color(muted),
+        );
+        if report.headless_responses > 0 {
+            footer = footer.push(
+                text(format!(
+                    "{} headless responses (SDK, exec, harness subagents) {}",
+                    format_tokens(report.headless_responses),
+                    if self.usage_show_headless {
+                        "included"
+                    } else {
+                        "hidden"
+                    }
+                ))
+                .size(font_tiny)
+                .color(muted),
+            );
+        }
+        if stats.files_unreadable > 0 {
+            footer = footer.push(
+                text(format!(
+                    "{} transcripts could not be read (see log)",
+                    stats.files_unreadable
+                ))
+                .size(font_tiny)
+                .color(theme.warning()),
+            );
+        }
+        content = content.push(footer);
+
+        page(content)
+    }
+
     /// Sidebar list of markdown files from the active workspace's `.plans/`
     /// and `docs/` directories. Reads fresh on render; cache if it grows.
     /// Sidebar for the Chats tab (TRU-78 slice 1): search, scope toggle,
     /// conversations grouped by repo. Pure render over `self.chat_index`;
     /// all file IO happened in the background index task.
+    /// The Chats panel's Open section (TRU-148): every open chat and CLI tab
+    /// across the local workspaces — plus plain terminals that want the
+    /// human — wanting-you first, then running, then idle. Each row carries
+    /// the session strip's marker and jumps to its tab. None when nothing is
+    /// open.
+    fn view_chats_open_section(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+        let rows = self.open_tab_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let front = self.front_tab_id();
+        let expanded = !self.chat_open_section_collapsed;
+        let chevron = if expanded { "▾" } else { "▸" };
+        let header = row![
+            text(chevron).size(10).color(theme.text_secondary()),
+            text("OPEN").size(10).color(theme.text_secondary()),
+            text(format!("{}", rows.len()))
+                .size(10)
+                .color(theme.text_muted()),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        let mut section = Column::new().spacing(2).push(
+            button(header)
+                .style(self.ghost_button_style())
+                .padding([6, 6])
+                .width(Length::Fill)
+                .on_press(Event::ToggleChatOpenSection),
+        );
+        if !expanded {
+            return Some(section.into());
+        }
+        let selected_bg = theme.surface0();
+        for row_state in rows {
+            let workspace = &self.workspaces[row_state.workspace_idx];
+            let tab = &workspace.tabs[row_state.tab_idx];
+            let is_front = front == Some(row_state.tab_id);
+            let title = self.tab_display_title(tab);
+            let title = if title.chars().count() > 48 {
+                format!("{}…", truncate_str(title, 47))
+            } else {
+                title.to_string()
+            };
+            let (icon, icon_color) =
+                self.session_tab_icon(tab, is_front, tab.terminal_title().unwrap_or_default());
+            // Second line: where the tab lives and what it is about, since a
+            // click jumps straight there with no preview in between.
+            let mut place = workspace.name.clone();
+            if tab.is_git_repo && !tab.branch_name.is_empty() {
+                place.push_str(" · ");
+                place.push_str(&tab.branch_name);
+            }
+            let about: Option<String> = match &tab.kind {
+                TabKind::Agent(session) => {
+                    chat_rank::last_prompt(&session.conversation).map(str::to_string)
+                }
+                _ => tab
+                    .chat_session_id
+                    .as_deref()
+                    .and_then(|id| self.find_chat_entry(id))
+                    .map(|(_, entry)| entry.title.clone()),
+            };
+            let about = about
+                .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|t| !t.is_empty() && t != &title);
+            let mut detail = place;
+            if let Some(about) = about {
+                detail.push_str(" — ");
+                detail.push_str(&about);
+            }
+            let detail = if detail.chars().count() > 72 {
+                format!("{}…", truncate_str(&detail, 71))
+            } else {
+                detail
+            };
+            let content = row![
+                text(icon.trim_end()).size(font_small).color(icon_color),
+                column![
+                    text(title).size(font_small).color(theme.text_primary()),
+                    text(detail)
+                        .size(font_small - 1.0)
+                        .color(theme.text_muted()),
+                ]
+                .spacing(1)
+                .width(Length::Fill),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Start);
+            let btn = button(content)
+                .padding([4, 8])
+                .width(Length::Fill)
+                .on_press(Event::FocusTabById(row_state.tab_id));
+            let btn = if is_front {
+                btn.style(move |_theme, _status| button::Style {
+                    background: Some(selected_bg.into()),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            } else {
+                btn.style(self.ghost_button_style())
+            };
+            section = section.push(btn);
+        }
+        Some(section.into())
+    }
+
     fn view_chats_sidebar<'a>(
         &'a self,
         tab: &'a TabState,
@@ -24780,7 +29185,30 @@ fi
         let visible_count: usize = sections.iter().map(|(_, entries)| entries.len()).sum();
         let everywhere = self.chat_scope == chats::ChatScope::Everywhere;
 
+        // TRU-141: Jev relevance order for this Mac's list, when the
+        // "Relevant" toggle is on and a confident ranking matches it.
+        let mut relevance_ordered = false;
+        let mut rank_note: Option<String> = None;
+        if self.jev_client.is_some() && self.chat_rank.enabled() {
+            let key = self
+                .visible_local_chats()
+                .map(|(root, entries)| self.chat_rank_key(&root, &entries));
+            if let Some(key) = &key {
+                for (remote_id, entries) in sections.iter_mut() {
+                    if remote_id.is_none() {
+                        let (ordered, ranked) = self.chat_rank.order(key, std::mem::take(entries));
+                        *entries = ordered;
+                        relevance_ordered = ranked;
+                    }
+                }
+            }
+            rank_note = self.chat_rank.note(key.as_ref());
+        }
+
         let mut list = Column::new().spacing(2).padding([4, 6]);
+        if let Some(open_section) = self.view_chats_open_section() {
+            list = list.push(open_section);
+        }
         if self.chat_index_loading && self.chat_index.is_empty() {
             list = list.push(
                 text("indexing conversations…")
@@ -24796,11 +29224,16 @@ fi
             list = list.push(text(msg).size(font_small).color(theme.text_secondary()));
         }
 
-        let live_ids: std::collections::HashSet<&str> = self
+        // Conversations open in a tab, with the workspace that holds them:
+        // the "open" marker doubles as a jump to that tab.
+        let live_in: HashMap<&str, &str> = self
             .workspaces
             .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .filter_map(|t| t.chat_session_id.as_deref())
+            .flat_map(|ws| {
+                ws.tabs
+                    .iter()
+                    .filter_map(move |t| Some((t.chat_session_id.as_deref()?, ws.name.as_str())))
+            })
             .collect();
         let selected_bg = theme.surface0();
         let selected_border = theme.surface1();
@@ -24884,13 +29317,22 @@ fi
                 continue;
             }
 
-            // Group by repo root, preserving most-recent-first order.
+            // Group by repo root, preserving most-recent-first order. In
+            // relevance order a group is a run of adjacent chats, so the
+            // ranking is never reshuffled by repo.
+            let ranked_section = relevance_ordered && section_remote_id.is_none();
             let mut groups: Vec<(&std::path::Path, Vec<&chats::ChatIndexEntry>)> = Vec::new();
             for entry in section_entries {
-                match groups
-                    .iter_mut()
-                    .find(|(root, _)| *root == entry.group_root())
-                {
+                let existing = if ranked_section {
+                    groups
+                        .last_mut()
+                        .filter(|(root, _)| *root == entry.group_root())
+                } else {
+                    groups
+                        .iter_mut()
+                        .find(|(root, _)| *root == entry.group_root())
+                };
+                match existing {
                     Some((_, list)) => list.push(entry),
                     None => groups.push((entry.group_root(), vec![entry])),
                 }
@@ -24927,9 +29369,17 @@ fi
                                 .color(theme.text_secondary()),
                         );
                     }
-                    if live_ids.contains(entry.id.as_str()) {
-                        meta =
-                            meta.push(text("● open").size(font_small - 1.0).color(theme.green()));
+                    if let Some(ws_name) = live_in.get(entry.id.as_str()) {
+                        meta = meta.push(
+                            button(
+                                text(format!("● open in {ws_name}"))
+                                    .size(font_small - 1.0)
+                                    .color(theme.green()),
+                            )
+                            .style(button::text)
+                            .padding(0)
+                            .on_press(Event::FocusChatTab(entry.id.clone())),
+                        );
                     } else if entry.possibly_running() {
                         meta = meta.push(
                             text("◐ possibly running")
@@ -25051,16 +29501,65 @@ fi
             }
         }
 
-        column![
-            container(search).padding([6, 8]),
+        // "Relevant" toggle (TRU-141), only with a TypeSafe key. Disabled
+        // while TypeSafe is down, until the panel is opened again.
+        let header: Element<'a, Event, Theme, iced::Renderer> = if self.jev_client.is_some() {
+            let on = self.chat_rank.enabled() && !self.chat_rank.down();
+            let bg = if on {
+                Some(theme.surface0().into())
+            } else {
+                None
+            };
+            let color = if self.chat_rank.down() {
+                theme.text_muted()
+            } else if on {
+                theme.text_primary()
+            } else {
+                theme.text_secondary()
+            };
+            let border = theme.surface1();
+            let mut toggle = button(text("Relevant").size(font_small - 1.0).color(color))
+                .style(move |_theme, _status| button::Style {
+                    background: bg,
+                    border: iced::Border {
+                        width: 1.0,
+                        color: border,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([4, 8]);
+            if !self.chat_rank.down() {
+                toggle = toggle.on_press(Event::ChatsRelevanceToggled);
+            }
+            row![search, toggle]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into()
+        } else {
+            search.into()
+        };
+
+        let mut panel = column![
+            container(header).padding([6, 8]),
             container(scope_row).padding([0, 8]),
             container(chips_row).padding([2, 8]),
-            scrollable(list).height(Length::Fill),
-        ]
-        .spacing(4)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        ];
+        if let Some(note) = rank_note {
+            let color = if self.chat_rank.has_error() {
+                theme.red()
+            } else {
+                theme.text_muted()
+            };
+            panel = panel
+                .push(container(text(note).size(font_small - 1.0).color(color)).padding([0, 10]));
+        }
+        panel
+            .push(scrollable(list).height(Length::Fill))
+            .spacing(4)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// Main-pane preview for the chat selected in the Chats sidebar:
@@ -25235,6 +29734,13 @@ fi
                 theme.accent(),
                 Event::ResumeChatAsTab(entry.id.clone()),
             ));
+            if can_resume_as_chat(entry, is_remote, is_live) {
+                actions = actions.push(action_button(
+                    "Resume as Chat",
+                    theme.accent(),
+                    Event::ResumeChatAsChat(entry.id.clone()),
+                ));
+            }
             if entry.possibly_running() {
                 actions = actions.push(
                     text("◐ transcript is still growing — may be running in a terminal GitTerm didn't start")
@@ -27410,6 +31916,14 @@ fi
             left: 8.0,
         });
         header = header.push(self.view_git_mode_toggle(tab));
+        // The followed agent worktree went away (TRU-146).
+        if let Some(note) = &tab.worktree_follow.note {
+            header = header.push(
+                text(note)
+                    .size(self.ui_font_small())
+                    .color(self.theme.text_muted()),
+            );
+        }
         if matches!(tab.git_view_mode, GitViewMode::Worktrees) && self.git_source_matches(tab) {
             if let Some(actions) = self.view_git_selection_actions(tab) {
                 header = header.push(actions);
@@ -29849,12 +34363,23 @@ mod tests {
         };
         task.lifecycle = TaskLifecycle::Ready;
 
-        let handoff = task_handoff_prompt(&task);
+        let handoff = task_handoff_prompt(&task, None);
 
         assert!(handoff.contains("task-105: Resume task work"));
         assert!(handoff.contains("Continue the existing implementation safely"));
         assert!(handoff.contains("/worktrees/task-105"));
         assert!(handoff.contains("Inspect git status and the current diff"));
+        assert!(!handoff.contains("Report back:"));
+
+        // A delegated worker's brief keeps all of that and ends with the
+        // Report back section naming its delegation (TRU-142 S6).
+        let worker = task_handoff_prompt(&task, Some("d-42"));
+        assert!(worker.starts_with(&handoff), "{worker}");
+        let section = &worker[handoff.len()..];
+        assert!(section.starts_with("\n\nReport back:\n"), "{section}");
+        assert!(section.contains("GitTerm delegation d-42"));
+        assert!(section.contains("task_update_handoff tool for task task-105"));
+        assert!(section.ends_with("Do not merge or push unless the objective says so."));
     }
 
     #[test]
@@ -29869,6 +34394,43 @@ mod tests {
             HarnessConversationBackend::Pi
         )));
         assert!(!backend_accepts_initial_prompt(None));
+    }
+
+    #[test]
+    fn preassigned_claude_launch_resumes_once_the_session_exists() {
+        let exists = |id: &str| id == "abc";
+        assert_eq!(
+            resume_for_preassigned_claude_launch("claude --session-id abc", exists),
+            Some(("claude --resume abc".to_string(), "abc".to_string()))
+        );
+        assert_eq!(
+            resume_for_preassigned_claude_launch("claude --model opus --session-id abc", exists),
+            Some((
+                "claude --model opus --resume abc".to_string(),
+                "abc".to_string()
+            ))
+        );
+        // The session never got a message: the fresh launch still works.
+        assert_eq!(
+            resume_for_preassigned_claude_launch("claude --session-id new", exists),
+            None
+        );
+        assert_eq!(
+            resume_for_preassigned_claude_launch("claude --resume abc", exists),
+            None
+        );
+        assert_eq!(
+            resume_for_preassigned_claude_launch("codex --session-id abc", exists),
+            None
+        );
+        // An embedded brief is quoted; leave it to the task restore path.
+        assert_eq!(
+            resume_for_preassigned_claude_launch(
+                "claude --session-id abc \"$(cat 'b.md')\"",
+                exists
+            ),
+            None
+        );
     }
 
     #[test]
@@ -29905,6 +34467,86 @@ mod tests {
             Some((0, 1))
         );
         assert_eq!(find_task_session_tab(&workspaces, "missing"), None);
+    }
+
+    #[test]
+    fn handoff_writer_attributes_the_calling_tab() {
+        let mut workspace = Workspace::new(
+            "GitTerm".to_string(),
+            PathBuf::from("/repo"),
+            WorkspaceColor::Blue,
+        );
+        let mut worker = TabState::new(1, PathBuf::from("/worktree"));
+        worker.task_id = Some("task-1".to_string());
+        worker.task_session_id = Some("session-1".to_string());
+        worker.session_uid = "uid-worker".to_string();
+        let mut coordinator = TabState::new(2, PathBuf::from("/repo"));
+        coordinator.session_uid = "uid-coordinator".to_string();
+        workspace.tabs.extend([worker, coordinator]);
+        let workspaces = vec![workspace];
+        let sessions = vec!["session-1".to_string()];
+        let writer = |explicit: Option<&str>, caller: Option<&str>| {
+            handoff_writer(&workspaces, "task-1", &sessions, explicit, caller)
+        };
+
+        // The worker's tab maps to its task session id.
+        assert_eq!(
+            writer(None, Some("uid-worker")),
+            Ok(Some("session-1".to_string()))
+        );
+        // A tab outside the task is recorded by its session_uid.
+        assert_eq!(
+            writer(None, Some("uid-coordinator")),
+            Ok(Some("uid-coordinator".to_string()))
+        );
+        // An explicit id wins and is still validated.
+        assert_eq!(
+            writer(Some(" session-1 "), Some("uid-coordinator")),
+            Ok(Some("session-1".to_string()))
+        );
+        assert!(writer(Some("uid-worker"), None).is_err());
+        assert_eq!(writer(None, None), Ok(None));
+        // The same uid on another task's handoff is not that task's session.
+        assert_eq!(
+            handoff_writer(&workspaces, "task-2", &[], None, Some("uid-worker")),
+            Ok(Some("uid-worker".to_string()))
+        );
+    }
+
+    #[test]
+    fn every_tab_gets_a_distinct_session_uid() {
+        let first = TabState::new(1, PathBuf::from("/repo"));
+        let second = TabState::new(2, PathBuf::from("/repo"));
+        assert!(uuid::Uuid::parse_str(&first.session_uid).is_ok());
+        assert_ne!(first.session_uid, second.session_uid);
+    }
+
+    #[test]
+    fn chat_tab_marker_shows_needs_you_over_running_and_clears_when_idle() {
+        // Idle with nothing pending: no marker, active or not.
+        assert_eq!(chat_tab_marker(false, 0, false), None);
+        assert_eq!(chat_tab_marker(false, 0, true), None);
+        // A running turn shows ▶ whether or not the tab is in front.
+        assert_eq!(
+            chat_tab_marker(true, 0, false),
+            Some(ChatTabMarker::Running)
+        );
+        assert_eq!(chat_tab_marker(true, 0, true), Some(ChatTabMarker::Running));
+        // A pending request outranks the running turn; it pulses only on a
+        // background tab.
+        assert_eq!(
+            chat_tab_marker(true, 1, false),
+            Some(ChatTabMarker::NeedsYou { pulse: true })
+        );
+        assert_eq!(
+            chat_tab_marker(true, 2, true),
+            Some(ChatTabMarker::NeedsYou { pulse: false })
+        );
+        // A request left over without a running turn still needs the human.
+        assert_eq!(
+            chat_tab_marker(false, 1, false),
+            Some(ChatTabMarker::NeedsYou { pulse: true })
+        );
     }
 
     #[test]
@@ -29953,6 +34595,310 @@ mod tests {
         );
         assert_eq!(harness(completed(TurnStatus::Interrupted)), None);
         assert_eq!(harness(HarnessEvent::TextDelta("hi".into())), None);
+    }
+
+    #[cfg(feature = "stt")]
+    #[test]
+    fn held_dictation_joins_like_the_terminal_per_tab() {
+        let mut held = HashMap::new();
+        hold_composer_dictation(&mut held, 7, "Fix the build.");
+        hold_composer_dictation(&mut held, 9, "Other tab");
+        hold_composer_dictation(&mut held, 7, " And add a test.");
+        assert_eq!(
+            held.get(&7).map(String::as_str),
+            Some("Fix the build. And add a test.")
+        );
+        assert_eq!(held.get(&9).map(String::as_str), Some("Other tab"));
+    }
+
+    fn chord(key: Key, modifiers: Modifiers) -> Option<GlobalShortcut> {
+        global_shortcut(&key, modifiers)
+    }
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    #[test]
+    fn global_shortcut_knows_the_app_wide_chords() {
+        let space = Key::Named(key::Named::Space);
+        let escape = Key::Named(key::Named::Escape);
+        assert_eq!(
+            chord(space.clone(), Modifiers::CTRL),
+            Some(GlobalShortcut::Dictation)
+        );
+        assert_eq!(
+            chord(ch("1"), Modifiers::CTRL),
+            Some(GlobalShortcut::SelectWorkspace(1))
+        );
+        assert_eq!(
+            chord(ch("9"), Modifiers::CTRL),
+            Some(GlobalShortcut::SelectWorkspace(9))
+        );
+        assert_eq!(
+            chord(ch("3"), Modifiers::COMMAND),
+            Some(GlobalShortcut::SelectTab(3))
+        );
+        // The key handler has always let Cmd win when Ctrl is also held.
+        assert_eq!(
+            chord(ch("2"), Modifiers::COMMAND | Modifiers::CTRL),
+            Some(GlobalShortcut::SelectTab(2))
+        );
+        for u in ["u", "U"] {
+            assert_eq!(
+                chord(ch(u), Modifiers::COMMAND | Modifiers::SHIFT),
+                Some(GlobalShortcut::UsageView)
+            );
+        }
+        for t in ["t", "T"] {
+            assert_eq!(
+                chord(ch(t), Modifiers::COMMAND),
+                Some(GlobalShortcut::TaskSwitcher)
+            );
+        }
+        assert_eq!(
+            chord(escape.clone(), Modifiers::empty()),
+            Some(GlobalShortcut::Escape)
+        );
+    }
+
+    #[test]
+    fn global_shortcut_leaves_other_chords_alone() {
+        let space = Key::Named(key::Named::Space);
+        let escape = Key::Named(key::Named::Escape);
+        let enter = Key::Named(key::Named::Enter);
+        assert_eq!(chord(space.clone(), Modifiers::empty()), None);
+        assert_eq!(
+            chord(space.clone(), Modifiers::CTRL | Modifiers::SHIFT),
+            None
+        );
+        assert_eq!(chord(space, Modifiers::CTRL | Modifiers::COMMAND), None);
+        assert_eq!(chord(ch("0"), Modifiers::COMMAND), None);
+        assert_eq!(chord(ch("0"), Modifiers::CTRL), None);
+        assert_eq!(chord(ch("1"), Modifiers::empty()), None);
+        assert_eq!(chord(ch("1"), Modifiers::ALT), None);
+        assert_eq!(chord(ch("u"), Modifiers::COMMAND), None);
+        // Cmd+Shift+T is the theme toggle; Ctrl+Cmd+T stays free.
+        assert_eq!(chord(ch("t"), Modifiers::COMMAND | Modifiers::SHIFT), None);
+        assert_eq!(chord(ch("t"), Modifiers::COMMAND | Modifiers::CTRL), None);
+        assert_eq!(chord(ch("w"), Modifiers::COMMAND), None);
+        // Cmd+C / Cmd+V belong to whatever has focus (the terminal copies
+        // and pastes them itself); a chat page's Cmd+V is `forwarded_key`'s.
+        assert_eq!(chord(ch("c"), Modifiers::COMMAND), None);
+        assert_eq!(chord(ch("v"), Modifiers::COMMAND), None);
+        assert_eq!(chord(escape, Modifiers::SHIFT), None);
+        assert_eq!(chord(enter.clone(), Modifiers::empty()), None);
+        assert_eq!(chord(enter.clone(), Modifiers::SHIFT), None);
+        assert_eq!(chord(enter, Modifiers::COMMAND), None);
+    }
+
+    fn hostkey(key: &str, meta: bool, ctrl: bool, shift: bool, alt: bool) -> serde_json::Value {
+        serde_json::json!({
+            "type": "hostkey", "tabId": 4, "key": key, "code": "",
+            "meta": meta, "ctrl": ctrl, "shift": shift, "alt": alt,
+        })
+    }
+
+    #[test]
+    fn hostkey_chord_reads_what_the_page_forwards() {
+        let cases = [
+            (
+                hostkey(" ", false, true, false, false),
+                GlobalShortcut::Dictation,
+            ),
+            (
+                hostkey("4", false, true, false, false),
+                GlobalShortcut::SelectWorkspace(4),
+            ),
+            (
+                hostkey("2", true, false, false, false),
+                GlobalShortcut::SelectTab(2),
+            ),
+            (
+                hostkey("u", true, false, true, false),
+                GlobalShortcut::UsageView,
+            ),
+            (
+                hostkey("U", true, false, true, false),
+                GlobalShortcut::UsageView,
+            ),
+            (
+                hostkey("t", true, false, false, false),
+                GlobalShortcut::TaskSwitcher,
+            ),
+            (
+                hostkey("Escape", false, false, false, false),
+                GlobalShortcut::Escape,
+            ),
+        ];
+        for (value, expected) in cases {
+            let (key, modifiers) = hostkey_chord(&value).expect("chord");
+            assert_eq!(global_shortcut(&key, modifiers), Some(expected), "{value}");
+        }
+        let (key, modifiers) = hostkey_chord(&hostkey(" ", false, true, false, false)).unwrap();
+        assert_eq!(key, Key::Named(key::Named::Space));
+        assert_eq!(modifiers, Modifiers::CTRL);
+        let (key, modifiers) = hostkey_chord(&hostkey("1", true, false, false, false)).unwrap();
+        assert_eq!(key, ch("1"));
+        assert_eq!(modifiers, Modifiers::LOGO);
+    }
+
+    #[test]
+    fn forwarded_key_reads_cmd_v_as_paste_and_passes_the_rest_through() {
+        let forwarded = |value: serde_json::Value| {
+            let (key, modifiers) = hostkey_chord(&value).expect("chord");
+            forwarded_key(&key, modifiers)
+        };
+        // What the page posts for Cmd+V (also with Caps Lock on).
+        assert_eq!(
+            forwarded(hostkey("v", true, false, false, false)),
+            Some(ForwardedKey::Paste)
+        );
+        assert_eq!(
+            forwarded(hostkey("V", true, false, false, false)),
+            Some(ForwardedKey::Paste)
+        );
+        // Only Command alone.
+        for (meta, ctrl, shift, alt) in [
+            (false, false, false, false),
+            (false, true, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, false, false, true),
+        ] {
+            assert_eq!(forwarded(hostkey("v", meta, ctrl, shift, alt)), None);
+        }
+        // The page edits Cmd+C/X/A/Z itself; were they forwarded, the host
+        // would drop them.
+        for k in ["c", "x", "a", "z"] {
+            assert_eq!(forwarded(hostkey(k, true, false, false, false)), None);
+        }
+        // Every global shortcut still means itself.
+        assert_eq!(
+            forwarded(hostkey(" ", false, true, false, false)),
+            Some(ForwardedKey::Global(GlobalShortcut::Dictation))
+        );
+        assert_eq!(
+            forwarded(hostkey("2", true, false, false, false)),
+            Some(ForwardedKey::Global(GlobalShortcut::SelectTab(2)))
+        );
+        assert_eq!(
+            forwarded(hostkey("Escape", false, false, false, false)),
+            Some(ForwardedKey::Global(GlobalShortcut::Escape))
+        );
+    }
+
+    #[test]
+    fn hostkey_chord_rejects_malformed_messages() {
+        assert!(hostkey_chord(&hostkey("Enter", false, false, false, false)).is_err());
+        assert!(hostkey_chord(&hostkey("", true, false, false, false)).is_err());
+        assert!(hostkey_chord(&serde_json::json!({ "key": "1", "meta": true })).is_err());
+        assert!(hostkey_chord(&serde_json::json!({
+            "meta": true, "ctrl": false, "shift": false, "alt": false
+        }))
+        .is_err());
+        // Well formed but not a forwarded chord: the dispatcher drops it.
+        let (key, modifiers) = hostkey_chord(&hostkey("k", true, false, false, false)).unwrap();
+        assert_eq!(forwarded_key(&key, modifiers), None);
+    }
+
+    #[test]
+    fn agent_chat_page_forwards_global_shortcuts() {
+        let html = agent_chat_html();
+        assert!(html.contains("postIpc({ type: 'hostkey', key: e.key, code: e.code"));
+        assert!(html.contains("function pageHasOpenLayer()"));
+        assert!(html.contains("if (cmdOnly && k.toLowerCase() === 'v') return true;"));
+        assert!(html.contains("function editingCommand(e)"));
+        assert!(html.contains("document.execCommand(command);"));
+    }
+
+    #[test]
+    fn agent_chat_page_exposes_composer_insert() {
+        let html = agent_chat_html();
+        assert!(html.contains("window.__insertComposerText = function (text)"));
+    }
+
+    #[test]
+    fn agent_chat_page_sends_while_claude_works() {
+        let html = agent_chat_html();
+        // Claude tabs send mid-turn; a pending request still blocks.
+        assert!(html.contains("submitBtn.disabled = !sendAllowed(busy, pending.size, steerable);"));
+        assert!(html.contains("return pendingCount === 0 && (!isBusy || canSteer);"));
+        assert!(html.contains("steerable = permissionMode != null;"));
+        // Queued markers: withdraw, lifecycle, refused withdraw, exit.
+        assert!(html.contains("postIpc({ type: 'withdraw', id });"));
+        assert!(html.contains("case 'message_lifecycle':"));
+        assert!(html.contains("case 'message_withdraw_refused':"));
+        assert!(html.contains("dropQueued();"));
+    }
+
+    #[test]
+    fn claude_submit_queues_only_while_a_turn_runs() {
+        use tab::{AgentBackend, AgentSessionState};
+        let queues = |backend, running, state: AgentSessionState| {
+            tab::submit_queues(backend, running, &state)
+        };
+        assert!(queues(
+            AgentBackend::Claude,
+            true,
+            AgentSessionState::Streaming
+        ));
+        // No process: the submit spawns one and starts a turn.
+        assert!(!queues(
+            AgentBackend::Claude,
+            false,
+            AgentSessionState::Streaming
+        ));
+        for idle in [
+            AgentSessionState::Idle,
+            AgentSessionState::Stopped,
+            AgentSessionState::Errored("x".into()),
+        ] {
+            assert!(!queues(AgentBackend::Claude, true, idle));
+        }
+        // pi never queues: its composer waits for the turn.
+        assert!(!queues(
+            AgentBackend::Pi,
+            true,
+            AgentSessionState::Streaming
+        ));
+        let session = AgentSession::new(tab::AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        assert!(!session.submit_queues());
+    }
+
+    #[test]
+    fn queued_prompt_echo_carries_id_and_marker() {
+        let prompt = UserPrompt {
+            text: "also this".into(),
+            images: Vec::new(),
+            id: Some("u1".into()),
+        };
+        let payload = tab::AgentEvent::submitted_prompt(&prompt, true)
+            .webview_payload()
+            .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"type": "user_prompt", "text": "also this", "id": "u1", "queued": true})
+        );
+        let payload = tab::AgentEvent::submitted_prompt(&prompt, false)
+            .webview_payload()
+            .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"type": "user_prompt", "text": "also this", "id": "u1"})
+        );
+        // pi's plain echo is unchanged.
+        let payload = tab::AgentEvent::submitted_prompt(&"hi".into(), false)
+            .webview_payload()
+            .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"type": "user_prompt", "text": "hi"})
+        );
     }
 
     #[test]
@@ -30027,11 +34973,457 @@ mod tests {
     }
 
     #[test]
+    fn delegation_results_rank_and_read_like_their_kind_and_clear_on_visit() {
+        use gitterm::tasks::DelegationKind;
+        let ready = AttentionReason::DelegationReady(DelegationKind::Review);
+        let failed = AttentionReason::DelegationFailed(DelegationKind::Consult);
+        assert_eq!(
+            ready.priority(),
+            AttentionReason::CompletedUnread.priority()
+        );
+        assert_eq!(failed.priority(), AttentionReason::AgentFailed.priority());
+        assert_eq!(ready.label(), "Review ready");
+        assert_eq!(
+            AttentionReason::DelegationReady(DelegationKind::Consult).label(),
+            "Consult ready"
+        );
+        assert_eq!(failed.label(), "Consult failed");
+        // A blocked worker needs the human, like an input request.
+        let blocked = AttentionReason::DelegationBlocked(DelegationKind::Implement);
+        assert_eq!(blocked.label(), "Worker blocked");
+        assert_eq!(
+            blocked.priority(),
+            AttentionReason::HumanInputRequired.priority()
+        );
+        assert_eq!(
+            AttentionReason::DelegationReady(DelegationKind::Implement).label(),
+            "Worker done"
+        );
+        let mut worker_parent = TabState::new(2, PathBuf::from("/tmp"));
+        worker_parent.set_attention(blocked);
+        worker_parent.mark_visited();
+        assert!(!worker_parent.needs_attention());
+        let mut tab = TabState::new(1, PathBuf::from("/tmp"));
+        tab.set_attention(ready);
+        tab.mark_visited();
+        assert!(!tab.needs_attention());
+        tab.set_attention(failed);
+        tab.mark_visited();
+        assert!(!tab.needs_attention());
+    }
+
+    #[test]
     fn attention_age_uses_compact_stable_buckets() {
         assert_eq!(format_attention_age(0), "now");
         assert_eq!(format_attention_age(90), "1m");
         assert_eq!(format_attention_age(2 * 60 * 60), "2h");
         assert_eq!(format_attention_age(3 * 24 * 60 * 60), "3d");
+    }
+
+    #[test]
+    fn attention_inbox_rows_hold_still_while_agents_work() {
+        use gitterm::tasks::DelegationKind;
+        let base = Instant::now();
+        let topic = |glyph: &str| format!("{glyph} Fix the inbox");
+
+        // Two Claude tabs that went idle 500ms apart, as restored sessions
+        // do when GitTerm relaunches them together. The older one has the
+        // higher tab id, so a whole-second tie hands the tie-breaker to the
+        // younger one: with seconds as the key their order flipped twice a
+        // second.
+        let mut older = TabState::new(2, PathBuf::from("/tmp/inbox-older"));
+        older.observe_terminal_title(topic("✳"));
+        older.attention = older.attention.map(|attention| TabAttention {
+            since: base,
+            ..attention
+        });
+        let mut younger = TabState::new(1, PathBuf::from("/tmp/inbox-younger"));
+        younger.observe_terminal_title(topic("✳"));
+        younger.attention = younger.attention.map(|attention| TabAttention {
+            since: base + Duration::from_millis(500),
+            ..attention
+        });
+        let older_since = older.attention.map(|attention| attention.since);
+        let younger_since = younger.attention.map(|attention| attention.since);
+
+        // A third tab whose delegated review came back while its Claude
+        // works on: the spinner animates the title every frame and Claude
+        // goes idle (✳) partway through.
+        let mut parent = TabState::new(3, PathBuf::from("/tmp/inbox-parent"));
+        parent.set_attention(AttentionReason::DelegationReady(DelegationKind::Review));
+        let parent_since = parent.attention.map(|attention| attention.since);
+
+        let frames = ["◐", "◑", "◐", "✳", "◑", "◐", "✳", "✳", "◑", "◐"];
+        let mut seen_orders = std::collections::BTreeSet::new();
+        for (frame, glyph) in frames.iter().enumerate() {
+            // Idle tabs re-send their ✳ title (topic renames); the parent
+            // animates.
+            older.observe_terminal_title(topic("✳"));
+            younger.observe_terminal_title(topic("✳"));
+            parent.observe_terminal_title(topic(glyph));
+            assert_eq!(older.attention.map(|a| a.since), older_since);
+            assert_eq!(younger.attention.map(|a| a.since), younger_since);
+            assert_eq!(
+                parent.attention.map(|a| (a.reason, a.since)),
+                parent_since.map(|since| {
+                    (
+                        AttentionReason::DelegationReady(DelegationKind::Review),
+                        since,
+                    )
+                }),
+                "frame {frame} ({glyph}) must not displace or restamp the delegation row"
+            );
+
+            let now = base + Duration::from_millis(1_000 + 100 * frame as u64);
+            let mut items = [&parent, &younger, &older]
+                .into_iter()
+                .filter_map(|tab| AttentionItem::for_tab(tab, 0, now))
+                .collect::<Vec<_>>();
+            sort_attention_items(&mut items);
+            for item in &items {
+                assert_eq!(
+                    item.title, "Fix the inbox",
+                    "frame {frame}: spinner glyph in title"
+                );
+            }
+            seen_orders.insert(
+                items
+                    .iter()
+                    .map(|item| item.target.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            seen_orders.into_iter().collect::<Vec<_>>(),
+            vec![vec![
+                AttentionTarget::Tab(2),
+                AttentionTarget::Tab(1),
+                AttentionTarget::Tab(3),
+            ]],
+            "rows must keep one order across frames"
+        );
+
+        // A working frame on an idle tab is a real state change: it clears.
+        older.observe_terminal_title(topic("◐"));
+        assert!(!older.needs_attention());
+    }
+
+    fn rail_item(target: AttentionTarget, priority: u8, waiting_secs: u64) -> AttentionItem {
+        AttentionItem {
+            target,
+            workspace_idx: Some(0),
+            title: "row".to_string(),
+            priority,
+            icon: "●",
+            label: "label",
+            waiting: Duration::from_secs(waiting_secs),
+        }
+    }
+
+    #[test]
+    fn rail_urgency_is_the_most_urgent_row_then_running() {
+        assert_eq!(workspace_rail_urgency(&[], false), None);
+        assert_eq!(
+            workspace_rail_urgency(&[], true),
+            Some(RailUrgency::Running)
+        );
+        let review = rail_item(AttentionTarget::Tab(1), 3, 10);
+        let failed = rail_item(AttentionTarget::Tab(2), 1, 5);
+        let input = rail_item(AttentionTarget::Task("t".to_string()), 0, 1);
+        let interrupted = rail_item(AttentionTarget::Task("i".to_string()), 2, 1);
+        assert_eq!(
+            workspace_rail_urgency(std::slice::from_ref(&review), true),
+            Some(RailUrgency::Review),
+            "anything waiting outranks a running turn"
+        );
+        assert_eq!(
+            workspace_rail_urgency(&[review.clone(), failed.clone()], false),
+            Some(RailUrgency::Failed)
+        );
+        assert_eq!(
+            workspace_rail_urgency(&[review.clone(), input, failed], true),
+            Some(RailUrgency::NeedsYou)
+        );
+        assert_eq!(
+            workspace_rail_urgency(&[review, interrupted], false),
+            Some(RailUrgency::Interrupted)
+        );
+    }
+
+    #[test]
+    fn rail_click_lands_on_the_most_urgent_longest_waiting_row() {
+        assert_eq!(rail_click_target(&[]), None);
+        let rows = [
+            rail_item(AttentionTarget::Tab(1), 3, 600),
+            rail_item(AttentionTarget::Tab(2), 0, 5),
+            rail_item(AttentionTarget::Tab(3), 0, 90),
+            rail_item(AttentionTarget::Tab(4), 1, 900),
+        ];
+        assert_eq!(rail_click_target(&rows), Some(AttentionTarget::Tab(3)));
+        // Order of the input does not matter.
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        assert_eq!(rail_click_target(&reversed), Some(AttentionTarget::Tab(3)));
+        // A task row can be the target.
+        let task_first = [
+            rail_item(AttentionTarget::Task("t".to_string()), 0, 30),
+            rail_item(AttentionTarget::Tab(9), 3, 3_000),
+        ];
+        assert_eq!(
+            rail_click_target(&task_first),
+            Some(AttentionTarget::Task("t".to_string()))
+        );
+    }
+
+    fn open_row(
+        workspace_idx: usize,
+        tab_idx: usize,
+        attention: Option<(u8, u64)>,
+        running: bool,
+    ) -> OpenTabRow {
+        OpenTabRow {
+            workspace_idx,
+            tab_idx,
+            tab_id: workspace_idx * 100 + tab_idx,
+            attention: attention
+                .map(|(priority, waiting)| (priority, Duration::from_secs(waiting))),
+            running,
+        }
+    }
+
+    #[test]
+    fn open_section_orders_needs_you_then_running_then_idle() {
+        let idle_first = open_row(0, 0, None, false);
+        let running = open_row(0, 1, None, true);
+        let review = open_row(0, 2, Some((3, 900)), false);
+        let input_recent = open_row(1, 0, Some((0, 10)), true);
+        let input_old = open_row(2, 3, Some((0, 600)), false);
+        let failed = open_row(1, 4, Some((1, 5)), false);
+        let idle_later = open_row(2, 0, None, false);
+        let running_later = open_row(2, 1, None, true);
+        let mut rows = vec![
+            idle_later.clone(),
+            running_later.clone(),
+            idle_first.clone(),
+            review.clone(),
+            running.clone(),
+            input_recent.clone(),
+            failed.clone(),
+            input_old.clone(),
+        ];
+        sort_open_tab_rows(&mut rows);
+        assert_eq!(
+            rows,
+            vec![
+                input_old,
+                input_recent,
+                failed,
+                review,
+                running,
+                running_later,
+                idle_first,
+                idle_later,
+            ]
+        );
+    }
+
+    #[test]
+    fn open_section_lists_plain_terminals_only_with_attention() {
+        assert!(open_section_includes(true, false));
+        assert!(open_section_includes(true, true));
+        assert!(open_section_includes(false, true));
+        assert!(!open_section_includes(false, false));
+    }
+
+    fn needs_you_seen(
+        tab_id: usize,
+        needs_you: Option<&'static str>,
+        running: bool,
+        front: bool,
+        requires_work: bool,
+    ) -> NeedsYouObservation {
+        NeedsYouObservation {
+            target: AttentionTarget::Tab(tab_id),
+            needs_you,
+            running,
+            front,
+            requires_work,
+        }
+    }
+
+    #[test]
+    fn needs_you_notifies_once_per_background_transition() {
+        const INPUT: &str = "Input or approval needed";
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut notifier = NeedsYouNotifier::new(start);
+
+        // Raised during the launch grace: restored state, never news —
+        // and still raised afterwards, so it is no transition later either.
+        assert!(notifier
+            .observe(at(1), [needs_you_seen(1, Some(INPUT), true, false, false)])
+            .is_empty());
+        assert!(notifier
+            .observe(
+                at(10),
+                [needs_you_seen(1, Some(INPUT), false, false, false)]
+            )
+            .is_empty());
+
+        // A background chat tab raises a request: one nudge, then quiet
+        // while it stays raised.
+        let nudge = notifier.observe(
+            at(10),
+            [
+                needs_you_seen(1, Some(INPUT), false, false, false),
+                needs_you_seen(2, Some(INPUT), true, false, false),
+            ],
+        );
+        assert_eq!(
+            nudge,
+            vec![NeedsYouNudge {
+                target: AttentionTarget::Tab(2),
+                label: INPUT
+            }]
+        );
+        assert!(notifier
+            .observe(at(11), [needs_you_seen(2, Some(INPUT), true, false, false)])
+            .is_empty());
+
+        // Cleared and raised again within a minute: debounced.
+        notifier.observe(at(12), [needs_you_seen(2, None, true, false, false)]);
+        assert!(notifier
+            .observe(at(20), [needs_you_seen(2, Some(INPUT), true, false, false)])
+            .is_empty());
+
+        // ...but a minute after the last nudge it is news again.
+        notifier.observe(at(30), [needs_you_seen(2, None, true, false, false)]);
+        assert_eq!(
+            notifier
+                .observe(at(71), [needs_you_seen(2, Some(INPUT), true, false, false)])
+                .len(),
+            1
+        );
+
+        // A different reason on the same tab is its own transition.
+        let blocked =
+            AttentionReason::DelegationBlocked(gitterm::tasks::DelegationKind::Implement).label();
+        assert_eq!(
+            notifier
+                .observe(
+                    at(72),
+                    [needs_you_seen(2, Some(blocked), false, false, false)]
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn needs_you_skips_the_front_tab_and_unworked_idle_titles() {
+        const INPUT: &str = "Input or approval needed";
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut notifier = NeedsYouNotifier::new(start);
+
+        // Raised while in front: no nudge, and switching away later is not
+        // a transition.
+        assert!(notifier
+            .observe(at(10), [needs_you_seen(1, Some(INPUT), true, true, false)])
+            .is_empty());
+        assert!(notifier
+            .observe(
+                at(11),
+                [needs_you_seen(1, Some(INPUT), false, false, false)]
+            )
+            .is_empty());
+
+        // A terminal booting to "✳" without ever working: quiet.
+        notifier.observe(at(12), [needs_you_seen(3, None, false, false, true)]);
+        assert!(notifier
+            .observe(at(13), [needs_you_seen(3, Some(INPUT), false, false, true)])
+            .is_empty());
+
+        // Worked ("◐"), then idle ("✳") in the background: news.
+        notifier.observe(at(14), [needs_you_seen(3, None, true, false, true)]);
+        assert_eq!(
+            notifier.observe(at(15), [needs_you_seen(3, Some(INPUT), false, false, true)]),
+            vec![NeedsYouNudge {
+                target: AttentionTarget::Tab(3),
+                label: INPUT
+            }]
+        );
+
+        // The working mark is spent by that transition: going idle again
+        // after the debounce without new work stays quiet.
+        notifier.observe(at(80), [needs_you_seen(3, None, false, false, true)]);
+        assert!(notifier
+            .observe(at(81), [needs_you_seen(3, Some(INPUT), false, false, true)])
+            .is_empty());
+
+        // A task needing input is news without any working signal.
+        let task = NeedsYouObservation {
+            target: AttentionTarget::Task("task-1".to_string()),
+            needs_you: Some("Input or approval needed"),
+            running: false,
+            front: false,
+            requires_work: false,
+        };
+        assert_eq!(notifier.observe(at(90), [task]).len(), 1);
+    }
+
+    #[test]
+    fn notification_script_quotes_its_text() {
+        assert_eq!(
+            needs_you_notification_script("Fix \"the\" inbox", "Worker blocked"),
+            r#"display notification "Worker blocked" with title "Fix \"the\" inbox""#
+        );
+        assert_eq!(applescript_string("a\\b\nc"), r#""a\\b c""#);
+    }
+
+    #[test]
+    fn working_titles_are_running_and_idle_titles_are_not() {
+        assert!(terminal_title_shows_working("◐ Fix the inbox"));
+        assert!(terminal_title_shows_working("◑ Fix the inbox"));
+        assert!(terminal_title_shows_working("✻ Fix the inbox"));
+        assert!(terminal_title_shows_working("⠐ Fix the inbox"));
+        assert!(!terminal_title_shows_working("✳ Fix the inbox"));
+        assert!(!terminal_title_shows_working("* shell"));
+        assert!(!terminal_title_shows_working("zsh"));
+        assert!(!terminal_title_shows_working(""));
+
+        let mut tab = TabState::new(1, PathBuf::from("/tmp/rail-running"));
+        assert!(!tab.is_running());
+        tab.observe_terminal_title("◐ Fix the inbox".to_string());
+        assert!(tab.is_running());
+        tab.observe_terminal_title("✳ Fix the inbox".to_string());
+        assert!(!tab.is_running());
+    }
+
+    #[test]
+    fn title_status_glyphs_strip_to_the_topic() {
+        assert_eq!(
+            strip_title_status_glyphs("✳ Fix the inbox"),
+            "Fix the inbox"
+        );
+        assert_eq!(
+            strip_title_status_glyphs("◑ Fix the inbox"),
+            "Fix the inbox"
+        );
+        assert_eq!(
+            strip_title_status_glyphs("✻ Fix the inbox "),
+            "Fix the inbox"
+        );
+        assert_eq!(
+            strip_title_status_glyphs("⠐ Fix the inbox"),
+            "Fix the inbox"
+        );
+        assert_eq!(strip_title_status_glyphs("* shell"), "shell");
+        assert_eq!(strip_title_status_glyphs("✳"), "");
+        let mut tab = TabState::new(1, PathBuf::from("/tmp/inbox-fallback"));
+        tab.observe_terminal_title("✳ ".to_string());
+        let item = AttentionItem::for_tab(&tab, 0, Instant::now()).expect("✳ raises attention");
+        assert_eq!(item.title, "inbox-fallback");
     }
 
     #[test]
@@ -30948,6 +36340,60 @@ mod tests {
     }
 
     #[test]
+    fn usage_view_open_and_close_keep_the_selection() {
+        let mut state = UsageViewState::default();
+        // Workspace B (1) is showing; the glyph opens the view over it.
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Toggle), 1);
+        assert!(state.open);
+        state.repo = Some((Some(PathBuf::from("/repo/alpha")), "alpha".to_string()));
+        // Esc closes it on the same workspace, app-wide again next time.
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Close), 1);
+        assert_eq!(state, UsageViewState::default());
+        // The glyph again (or Cmd+Shift+U) toggles it open and shut.
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Toggle), 1);
+        assert!(state.open);
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Toggle), 1);
+        assert!(!state.open);
+        // Esc with the view shut changes nothing.
+        assert_eq!(usage_view_step(&mut state, 1, UsageViewInput::Close), 1);
+        assert!(!state.open);
+    }
+
+    #[test]
+    fn a_workspace_click_closes_the_usage_view() {
+        let mut state = UsageViewState::default();
+        usage_view_step(&mut state, 1, UsageViewInput::Toggle);
+        state.repo = Some((None, "(no cwd)".to_string()));
+        // Opened from workspace B (1); clicking A (0) on the rail selects A
+        // and closes the view.
+        assert_eq!(
+            usage_view_step(&mut state, 1, UsageViewInput::SelectWorkspace(0)),
+            0
+        );
+        assert_eq!(state, UsageViewState::default());
+        // Clicking the workspace that was showing just closes it.
+        usage_view_step(&mut state, 1, UsageViewInput::Toggle);
+        assert_eq!(
+            usage_view_step(&mut state, 1, UsageViewInput::SelectWorkspace(1)),
+            1
+        );
+        assert!(!state.open);
+    }
+
+    #[test]
+    fn the_usage_view_hides_every_surface_like_the_attention_view() {
+        // App::visible_webview_surface passes attention || usage open.
+        for active in [ActiveTabSurface::AgentChat(2), ActiveTabSurface::Other] {
+            for viewer in [ViewerWebview::File, ViewerWebview::PlansViewer] {
+                assert_eq!(
+                    visible_webview_surface(viewer, active, true),
+                    VisibleSurface::None
+                );
+            }
+        }
+    }
+
+    #[test]
     fn agent_surface_reveals_live_pages_without_replay() {
         // The page shown last comes back as is.
         assert_eq!(
@@ -31033,5 +36479,88 @@ mod tests {
         );
         tab.close_file_viewer();
         assert!(tab.file_viewer().is_none());
+    }
+
+    fn chat_entry(backend: chats::ChatBackend, dead_cwd: bool) -> chats::ChatIndexEntry {
+        chats::ChatIndexEntry {
+            id: "3f2a".to_string(),
+            backend,
+            path: PathBuf::from("/tmp/3f2a.jsonl"),
+            cwd: PathBuf::from("/tmp/repo/sub"),
+            repo_root: Some(PathBuf::from("/tmp/repo")),
+            is_worktree: false,
+            branch: Some("main".to_string()),
+            title: "a chat".to_string(),
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            size: 1,
+            dead_cwd,
+        }
+    }
+
+    #[test]
+    fn resume_as_chat_is_offered_only_for_local_unowned_claude_chats_with_a_live_cwd() {
+        let claude = chat_entry(chats::ChatBackend::Claude, false);
+        assert!(can_resume_as_chat(&claude, false, false));
+        assert!(!can_resume_as_chat(&claude, true, false), "remote chat");
+        assert!(
+            !can_resume_as_chat(&claude, false, true),
+            "a tab owns it: Go to Session instead"
+        );
+        assert!(
+            !can_resume_as_chat(&chat_entry(chats::ChatBackend::Claude, true), false, false),
+            "dead cwd: only the rescue action"
+        );
+        for backend in [chats::ChatBackend::Codex, chats::ChatBackend::Pi] {
+            assert!(!can_resume_as_chat(
+                &chat_entry(backend, false),
+                false,
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn resumed_chat_session_uses_new_chat_defaults_and_resumes_with_history() {
+        let mut defaults = config::ChatDefaults {
+            default_model: "opus".to_string(),
+            default_effort: Some("high".to_string()),
+            remember_last: false,
+            last: Some(config::ChatSelection {
+                model: "sonnet".to_string(),
+                effort: None,
+            }),
+        };
+        let session = resumed_claude_chat_session(&defaults, "3f2a");
+        let tab::AgentBackendConfig::Claude {
+            model,
+            permission_mode,
+            effort,
+        } = &session.config
+        else {
+            panic!("expected a Claude config, got {:?}", session.config);
+        };
+        assert_eq!(model, "opus");
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(
+            permission_mode.as_deref(),
+            Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE)
+        );
+        // Same path a restored chat tab takes: `show_agent_webview` calls
+        // `start_agent_history_load`, which reads `history_to_load`.
+        assert_eq!(session.history_to_load(), Some("3f2a"));
+        // The first prompt spawns Claude with `--resume=<id>`.
+        let spawn = session
+            .claude_session_config(PathBuf::from("/tmp/repo/sub"), Vec::new())
+            .expect("claude config");
+        assert_eq!(spawn.resume.as_deref(), Some("3f2a"));
+        assert_eq!(spawn.model.as_deref(), Some("opus"));
+
+        // A remembered selection wins, exactly as for "New chat".
+        defaults.remember_last = true;
+        let session = resumed_claude_chat_session(&defaults, "3f2a");
+        assert!(matches!(
+            &session.config,
+            tab::AgentBackendConfig::Claude { model, effort: None, .. } if model == "sonnet"
+        ));
     }
 }

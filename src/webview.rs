@@ -328,6 +328,93 @@ pub fn focus_agent_composer(tab_id: usize) {
     });
 }
 
+/// The script that inserts `text` at the composer caret of an agent chat page
+/// (`window.__insertComposerText`). The text is JSON-encoded, so quotes,
+/// backslashes, newlines and `</script>` arrive as literal characters.
+fn insert_composer_text_script(text: &str) -> String {
+    let literal = serde_json::Value::String(text.to_string());
+    format!("window.__insertComposerText && window.__insertComposerText({literal})")
+}
+
+/// Insert dictated `text` at the caret of agent tab `tab_id`'s composer
+/// (replacing any selection) and give the page keyboard focus. Returns
+/// whether the page existed; the caller holds the text otherwise.
+pub fn insert_agent_composer_text(tab_id: usize, text: &str) -> bool {
+    let script = insert_composer_text_script(text);
+    with_existing_slot(WebviewSurface::Agent(tab_id), |slot| {
+        let Some(webview) = slot.webview.as_ref() else {
+            return false;
+        };
+        if let Err(e) = webview.focus() {
+            eprintln!("[agent-webview] focus failed for tab={tab_id}: {e}");
+        }
+        if let Err(e) = webview.evaluate_script(&script) {
+            eprintln!(
+                "[agent-webview] composer insert failed for tab={tab_id} ({} chars): {e}",
+                text.chars().count()
+            );
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Paste the system pasteboard into agent tab `tab_id`'s page, where its
+/// focus or selection is, as an Edit menu's Paste would: the page forwards
+/// Cmd+V (GitTerm has no Edit menu, so WebKit never gets `paste:` from the
+/// key), and this sends the native `paste:` action to its WKWebView. WebKit
+/// then fires a trusted `paste` event carrying the pasteboard, image files
+/// included, before inserting any text.
+pub fn paste_into_agent_page(tab_id: usize) {
+    let found = with_existing_slot(WebviewSurface::Agent(tab_id), |slot| {
+        let Some(webview) = slot.webview.as_ref() else {
+            return false;
+        };
+        native_paste(webview, tab_id);
+        true
+    });
+    if found != Some(true) {
+        eprintln!("[agent-webview] paste for tab={tab_id} dropped: the tab has no chat page");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_paste(webview: &WebView, _tab_id: usize) {
+    use wry::WebViewExtMacOS;
+    let wk = webview.webview();
+    // SAFETY: `paste:` is the NSResponder action WKWebView implements for
+    // the Edit menu; it takes the sender (nil here) and returns nothing.
+    // Called on the main thread, where the webview lives.
+    unsafe {
+        let _: () = objc2::msg_send![&*wk, paste: std::ptr::null::<objc2::runtime::AnyObject>()];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_paste(_webview: &WebView, tab_id: usize) {
+    // Only macOS pages forward Cmd+V; WebView2 pastes Ctrl+V itself.
+    eprintln!("[agent-webview] paste for tab={tab_id} ignored: native paste is macOS only");
+}
+
+/// Give keyboard focus back to GitTerm's own view, the window view every
+/// webview is a child of. Call when the user clicks a terminal: AppKit does
+/// not move first responder off a WKWebView when the click lands on the
+/// Iced view beside it, so the page that last had focus keeps receiving
+/// keys first. Plain typing still reached the terminal (the page leaves it
+/// alone and AppKit passes it up to the window view), but a chat page takes
+/// Cmd+V for itself (`isHostShortcut`), so pasting into the terminal did
+/// nothing. A no-op when no webview exists.
+pub fn focus_app_view() {
+    let focus_parent =
+        |slot: &mut SurfaceSlot| slot.webview.as_ref().map(|webview| webview.focus_parent());
+    let result = AGENT_PAGES
+        .with(|pages| pages.borrow_mut().values_mut().find_map(focus_parent))
+        .or_else(|| VIEWER_SURFACE.with(|slot| focus_parent(&mut slot.borrow_mut())));
+    if let Some(Err(e)) = result {
+        eprintln!("[webview] giving keyboard focus back to the app view failed: {e}");
+    }
+}
+
 /// Hide every agent page.
 pub fn hide_agent_pages() {
     show_only_agent_page(None);
@@ -353,5 +440,48 @@ pub fn destroy(surface: WebviewSurface) {
                 .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), SurfaceSlot::EMPTY));
             drop(old);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::insert_composer_text_script;
+
+    /// The argument the page receives, decoded as the JS engine would read
+    /// the JSON literal.
+    fn decoded_argument(script: &str) -> String {
+        let prefix = "window.__insertComposerText && window.__insertComposerText(";
+        let literal = script
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(')'))
+            .expect("script shape");
+        serde_json::from_str(literal).expect("argument is a JSON string literal")
+    }
+
+    #[test]
+    fn composer_insert_script_round_trips_awkward_text() {
+        for text in [
+            "plain words",
+            "say \"hi\" and it's fine",
+            "back\\slash \\n not a newline",
+            "two\nlines\r\nand a\ttab",
+            "</script><script>alert(1)</script>",
+            "${template} `tick` ); window.x = 1; (",
+            "caf\u{e9} \u{2028} \u{2029} \u{1f399}",
+        ] {
+            assert_eq!(decoded_argument(&insert_composer_text_script(text)), text);
+        }
+    }
+
+    #[test]
+    fn composer_insert_script_keeps_text_inside_one_string_literal() {
+        let script = insert_composer_text_script("a\") ; evil(); (\"");
+        // Every quote and newline in the text is escaped, so the call has
+        // exactly one argument and nothing runs outside it.
+        assert!(!script.contains('\n'));
+        assert_eq!(
+            script,
+            r#"window.__insertComposerText && window.__insertComposerText("a\") ; evil(); (\"")"#
+        );
     }
 }

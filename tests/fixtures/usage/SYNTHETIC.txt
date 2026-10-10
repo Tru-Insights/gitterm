@@ -1,0 +1,5 @@
+SYNTHETIC fixtures for the Usage panel (TRU-145, src/usage.rs tests).
+
+Hand-written to mirror the field shapes of real Claude Code, Codex and Pi
+transcripts (verified 2026-10-08). No line comes from a real session; the
+cwds point at /nonexistent/synthetic/* so no git command runs in tests.
