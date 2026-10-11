@@ -426,6 +426,20 @@ fn history_timeline(
     timeline
 }
 
+/// `App::log_terminal_failure` for the bulk recreate, which holds the
+/// workspaces mutably and so logs without the per-tab summary.
+fn log_terminal_recreate_failure(cwd: &Path, error: &std::io::Error) {
+    let usage = gitterm::resource_watch::fd_usage()
+        .map(|usage| usage.describe())
+        .unwrap_or_else(|e| format!("usage unknown: {e}"));
+    let line = format!(
+        "FAILED to recreate a terminal in {}: {error}; {usage}",
+        cwd.display()
+    );
+    eprintln!("[resource] {line}");
+    gitterm::resource_watch::append_log(&config::global_config_dir(), &line);
+}
+
 /// Queue dictated `text` for chat tab `tab_id` until its page is built.
 /// Successive dictations join exactly as they do in a terminal, which gets
 /// each transcript verbatim with no separator.
@@ -5733,6 +5747,8 @@ struct App {
     task_ui_error: Option<String>,
     task_worktree_root: PathBuf,
     max_concurrent_local_tasks: usize,
+    /// Open-file usage, logged to `resource.log` on band changes.
+    fd_watch: gitterm::resource_watch::FdWatch,
     selected_task_id: Option<String>,
     task_rail_filter: TaskRailFilter,
     task_rows_seen: HashSet<String>,
@@ -11819,6 +11835,7 @@ impl App {
             task_ui_error: None,
             task_worktree_root: config.task_worktree_root.clone(),
             max_concurrent_local_tasks: config.max_concurrent_local_tasks,
+            fd_watch: gitterm::resource_watch::FdWatch::default(),
             selected_task_id: None,
             task_rail_filter: TaskRailFilter::All,
             task_rows_seen: HashSet::new(),
@@ -12877,6 +12894,55 @@ fi
         bindings
     }
 
+    /// What holds descriptors right now, for `resource.log` lines.
+    fn resource_context(&self) -> String {
+        let tabs = self.workspaces.iter().flat_map(|ws| ws.tabs.iter());
+        let terminals = tabs.clone().filter(|tab| tab.terminal().is_some()).count();
+        let chats = tabs
+            .filter_map(|tab| tab.agent_session())
+            .filter(|session| session.claude.is_some() || session.task_handle.is_some())
+            .count();
+        let bottom = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.bottom_terminals.iter())
+            .filter(|bt| bt.terminal.is_some())
+            .count();
+        let open_workspaces = self.workspaces.len();
+        format!(
+            "{open_workspaces} workspaces, {terminals} tab terminals, {bottom} lower terminals, {chats} running chats"
+        )
+    }
+
+    /// Sample open-file usage (on the tick) and log band changes.
+    fn watch_open_files(&mut self) {
+        match gitterm::resource_watch::fd_usage() {
+            Ok(usage) => {
+                if let Some(line) = self.fd_watch.observe(usage) {
+                    let line = format!("{line}; {}", self.resource_context());
+                    gitterm::resource_watch::append_log(&config::global_config_dir(), &line);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+            Err(error) => eprintln!("[resource] could not read open-file usage: {error}"),
+        }
+    }
+
+    /// Record a terminal that failed to start, with the open-file usage at
+    /// that moment (the usual cause is the open-file ceiling).
+    fn log_terminal_failure(&self, what: &str, cwd: &Path, error: &std::io::Error) {
+        let usage = gitterm::resource_watch::fd_usage()
+            .map(|usage| usage.describe())
+            .unwrap_or_else(|e| format!("usage unknown: {e}"));
+        let line = format!(
+            "FAILED to start {what} in {}: {error}; {usage}; {}",
+            cwd.display(),
+            self.resource_context()
+        );
+        eprintln!("[resource] {line}");
+        gitterm::resource_watch::append_log(&config::global_config_dir(), &line);
+    }
+
     fn create_tab(&mut self, repo_path: PathBuf, startup_command: Option<String>) -> TabState {
         self.create_tab_for_workspace(repo_path, startup_command, None)
     }
@@ -12944,11 +13010,14 @@ fi
             &extra_env_refs,
         );
 
-        if let Ok(mut terminal) = iced_term::Terminal::new(id as u64, settings) {
-            terminal.handle(iced_term::Command::AddBindings(
-                Self::standard_noop_bindings(),
-            ));
-            tab.set_terminal(terminal);
+        match iced_term::Terminal::new(id as u64, settings) {
+            Ok(mut terminal) => {
+                terminal.handle(iced_term::Command::AddBindings(
+                    Self::standard_noop_bindings(),
+                ));
+                tab.set_terminal(terminal);
+            }
+            Err(error) => self.log_terminal_failure("a tab terminal", &repo_path, &error),
         }
 
         tab
@@ -12988,14 +13057,18 @@ fi
             self.terminal_font_size,
             &extra_env_refs,
         );
-        let terminal = iced_term::Terminal::new(id as u64, settings)
-            .ok()
-            .map(|mut t| {
+        let terminal = match iced_term::Terminal::new(id as u64, settings) {
+            Ok(mut t) => {
                 t.handle(iced_term::Command::AddBindings(
                     Self::standard_noop_bindings(),
                 ));
-                t
-            });
+                Some(t)
+            }
+            Err(error) => {
+                self.log_terminal_failure("a lower terminal", &cwd, &error);
+                None
+            }
+        };
         BottomTerminal {
             id,
             terminal,
@@ -14903,6 +14976,7 @@ fi
             }
             Event::Tick => {
                 let mut tasks: Vec<Task<Event>> = Vec::new();
+                self.watch_open_files();
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
@@ -21724,13 +21798,16 @@ fi
                 font_size,
                 &browser_environment_refs,
             );
-            if let Ok(mut terminal) = iced_term::Terminal::new(tab.id as u64, settings) {
-                terminal.handle(iced_term::Command::AddBindings(
-                    Self::standard_noop_bindings(),
-                ));
-                tab.set_terminal(terminal);
-                tab.created_at = Instant::now();
-                recreated_main += 1;
+            match iced_term::Terminal::new(tab.id as u64, settings) {
+                Ok(mut terminal) => {
+                    terminal.handle(iced_term::Command::AddBindings(
+                        Self::standard_noop_bindings(),
+                    ));
+                    tab.set_terminal(terminal);
+                    tab.created_at = Instant::now();
+                    recreated_main += 1;
+                }
+                Err(error) => log_terminal_recreate_failure(&tab.repo_path, &error),
             }
         }
 
@@ -21745,15 +21822,19 @@ fi
                     font_size,
                     &browser_environment_refs,
                 );
-                bt.terminal = iced_term::Terminal::new(bt.id as u64, settings)
-                    .ok()
-                    .map(|mut t| {
+                bt.terminal = match iced_term::Terminal::new(bt.id as u64, settings) {
+                    Ok(mut t) => {
                         t.handle(iced_term::Command::AddBindings(
                             Self::standard_noop_bindings(),
                         ));
                         recreated_bottom += 1;
-                        t
-                    });
+                        Some(t)
+                    }
+                    Err(error) => {
+                        log_terminal_recreate_failure(&bt.cwd, &error);
+                        None
+                    }
+                };
             }
         }
 
