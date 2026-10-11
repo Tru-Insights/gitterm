@@ -1202,22 +1202,10 @@ fn setup_menu_bar() {
         ])
         .unwrap();
 
-    // Edit menu: the predefined items route Cmd+C/V/X/Z/A to the first
-    // responder, which is how WKWebView (agent chat composer) receives
-    // edit actions. Items no responder handles stay disabled, so the iced
-    // view keeps receiving those keys as before.
-    let edit_menu = Submenu::new("Edit", true);
-    edit_menu
-        .append_items(&[
-            &PredefinedMenuItem::undo(None),
-            &PredefinedMenuItem::redo(None),
-            &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::cut(None),
-            &PredefinedMenuItem::copy(None),
-            &PredefinedMenuItem::paste(None),
-            &PredefinedMenuItem::select_all(None),
-        ])
-        .unwrap();
+    // No Edit menu. Its Cut/Copy/Paste key equivalents claim Cmd+C/V
+    // before winit sees them, even with nothing to act on, so terminals
+    // could not copy or paste. The chat page handles those chords itself
+    // (`editingCommand` and the forwarded Cmd+V in agent_chat.html).
 
     // Window menu
     let window_menu = Submenu::new("Window", true);
@@ -1230,7 +1218,7 @@ fn setup_menu_bar() {
         ])
         .unwrap();
 
-    menu.append_items(&[&app_menu, &edit_menu, &view_menu, &window_menu])
+    menu.append_items(&[&app_menu, &view_menu, &window_menu])
         .unwrap();
 
     // Store menu IDs for event handling
@@ -14639,15 +14627,16 @@ fi
                 self.sync_pending_terminal_redraws();
             }
             Event::MainTerminalClicked => {
-                // A webview clicked earlier still holds AppKit focus.
+                // In case a webview still holds AppKit focus (a click on
+                // the Iced view normally moves it already).
                 webview::focus_app_view();
                 if self.bottom_panel_focused {
                     return self.focus_main_terminal();
                 }
             }
             Event::BottomTerminalClicked(idx) => {
-                // Below a chat tab the chat page keeps AppKit focus after
-                // the click and takes Cmd+V for itself; hand focus back.
+                // In case the chat page above still holds AppKit focus,
+                // where it would take Cmd+V for itself.
                 webview::focus_app_view();
                 if !self.bottom_panel_focused {
                     return self.focus_bottom_terminal(idx);

@@ -397,13 +397,11 @@ fn native_paste(_webview: &WebView, tab_id: usize) {
 }
 
 /// Give keyboard focus back to GitTerm's own view, the window view every
-/// webview is a child of. Call when the user clicks a terminal: AppKit does
-/// not move first responder off a WKWebView when the click lands on the
-/// Iced view beside it, so the page that last had focus keeps receiving
-/// keys first. Plain typing still reached the terminal (the page leaves it
-/// alone and AppKit passes it up to the window view), but a chat page takes
-/// Cmd+V for itself (`isHostShortcut`), so pasting into the terminal did
-/// nothing. A no-op when no webview exists.
+/// webview is a child of. Called when the user clicks a terminal, in case a
+/// webview still holds first responder: a chat page takes Cmd+V for itself
+/// (`isHostShortcut`). A click on the Iced view normally moves first
+/// responder there already (seen in focus logging, 2026-10-11). A no-op
+/// when no webview exists.
 pub fn focus_app_view() {
     let focus_parent =
         |slot: &mut SurfaceSlot| slot.webview.as_ref().map(|webview| webview.focus_parent());
