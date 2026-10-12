@@ -21,7 +21,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use super::{
-    HarnessCommand, HarnessEvent, ItemKind, RuntimeDecision, RuntimeRequestKind, TurnStatus,
+    HarnessCommand, HarnessEvent, ItemKind, MessageState, RuntimeDecision, RuntimeRequestKind,
+    TurnStatus, UserPrompt,
 };
 
 /// The tool whose `can_use_tool` request is a question for the user rather
@@ -56,6 +57,19 @@ pub enum HostRequest {
     },
     Interrupt,
     SetPermissionMode(String),
+    /// `set_model`; its success reply carries no payload.
+    SetModel(String),
+    /// `apply_flag_settings {effortLevel}`. Its success reply carries no
+    /// payload and the CLI accepts unknown levels without applying them, so
+    /// the session confirms with a `ConfirmEffort` read afterwards.
+    SetEffort(Option<String>),
+    /// `get_settings`, sent after a successful `SetEffort` to read back what
+    /// the session's flag settings now hold.
+    ConfirmEffort(Option<String>),
+    /// `cancel_async_message {message_uuid}`: withdraw a queued user
+    /// message. The reply is `{cancelled: bool}`; a successful cancel also
+    /// arrives as a `command_lifecycle` `cancelled` frame.
+    WithdrawMessage(String),
 }
 
 /// One thing the parser found in a CLI stdout line.
@@ -111,6 +125,11 @@ pub struct ClaudeFrameParser {
     /// Content block index -> tool_use id, for the current message.
     tool_blocks: HashMap<u64, String>,
     host_requests: HashMap<String, HostRequest>,
+    /// Agent calls whose subagent reported `task_started` and has not
+    /// finished -> whether the subagent has sent text since its last tool
+    /// call. Background Bash commands are tasks too; only subagents'
+    /// completions become `SubagentEvent`s.
+    agent_tasks: HashMap<String, bool>,
 }
 
 impl ClaudeFrameParser {
@@ -132,10 +151,24 @@ impl ClaudeFrameParser {
             return vec![ParsedFrame::Unparsed(line.to_string())];
         };
         let str_at = |p: &str| v.pointer(p).and_then(Value::as_str);
-        // Subagent traffic (Task tool) carries a parent tool_use id. The
-        // chat shows the parent tool call only; its internals are not items
-        // of this turn and their block indexes would collide with ours.
-        let from_subagent = v.get("parent_tool_use_id").is_some_and(|p| !p.is_null());
+        // Subagent traffic (Agent tool) carries the parent's tool_use id.
+        // It is wrapped in `SubagentEvent`s so the chat nests it under the
+        // parent's tool card instead of mixing it into this turn.
+        if let Some(parent) = v.get("parent_tool_use_id").and_then(Value::as_str) {
+            let frames = parse_subagent_frame(parent, &v);
+            if let Some(text_seen) = self.agent_tasks.get_mut(parent) {
+                for frame in &frames {
+                    if let ParsedFrame::Event(HarnessEvent::SubagentEvent { event, .. }) = frame {
+                        match **event {
+                            HarnessEvent::TextDelta(_) => *text_seen = true,
+                            HarnessEvent::ItemStarted { .. } => *text_seen = false,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return frames;
+        }
         match str_at("/type").unwrap_or("") {
             "system" if str_at("/subtype") == Some("init") => {
                 vec![ParsedFrame::Event(HarnessEvent::TurnStarted {
@@ -143,15 +176,70 @@ impl ClaudeFrameParser {
                     model: str_at("/model").map(str::to_string),
                 })]
             }
-            "stream_event" if !from_subagent => self.parse_stream_event(&v["event"]),
+            // Subagent lifecycle; `tool_use_id` is the parent's Agent call.
+            "system" if str_at("/subtype") == Some("task_started") => {
+                match str_at("/tool_use_id") {
+                    Some(parent) if str_at("/task_type") == Some("local_agent") => {
+                        self.agent_tasks.insert(parent.to_string(), false);
+                        vec![subagent_event(
+                            parent,
+                            HarnessEvent::TurnStarted {
+                                session_id: None,
+                                model: None,
+                            },
+                        )]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            "system" if str_at("/subtype") == Some("task_notification") => {
+                let Some(parent) = str_at("/tool_use_id") else {
+                    return Vec::new();
+                };
+                let Some(text_seen) = self.agent_tasks.remove(parent) else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                // A foreground subagent's final message reaches the parent
+                // only as the Agent tool result; the notification's summary
+                // is that message, so it stands in as the subagent's text.
+                match str_at("/summary") {
+                    Some(summary) if !text_seen && !summary.is_empty() => out.push(subagent_event(
+                        parent,
+                        HarnessEvent::TextDelta(summary.to_string()),
+                    )),
+                    _ => {}
+                }
+                out.push(subagent_event(parent, task_completion(&v)));
+                out
+            }
+            "stream_event" => self.parse_stream_event(&v["event"]),
             // Slash-command replies (`/model sonnet`, `/effort high`, ...) are
             // synthetic assistant messages with no stream deltas; surface
             // their text or the turn looks like it produced nothing.
-            "assistant" if !from_subagent && str_at("/message/model") == Some("<synthetic>") => {
+            "assistant" if str_at("/message/model") == Some("<synthetic>") => {
                 parse_synthetic_assistant(&v)
             }
-            "user" if !from_subagent => parse_tool_results(&v),
+            "user" => parse_tool_results(&v),
             "result" => vec![ParsedFrame::Event(parse_result(&v))],
+            // Queue state of a user message sent with a `uuid` (CLI
+            // capability `msg_lifecycle_v1`). Other states are ignored.
+            "command_lifecycle" => {
+                let state = match str_at("/state") {
+                    Some("queued") => MessageState::Queued,
+                    Some("started") => MessageState::Started,
+                    Some("completed") => MessageState::Completed,
+                    Some("cancelled") => MessageState::Cancelled,
+                    _ => return Vec::new(),
+                };
+                match str_at("/command_uuid") {
+                    Some(id) => vec![ParsedFrame::Event(HarnessEvent::MessageLifecycle {
+                        id: id.to_string(),
+                        state,
+                    })],
+                    None => Vec::new(),
+                }
+            }
             "control_request" => parse_control_request(&v),
             "control_response" => self.parse_control_response(&v),
             "control_cancel_request" => match str_at("/request_id") {
@@ -272,7 +360,41 @@ impl ClaudeFrameParser {
                     mode,
                 )));
             }
+            (HostRequest::SetModel(model), Err(e)) => out.push(ParsedFrame::Event(
+                HarnessEvent::Error(format!("Claude rejected model {model:?}: {e}")),
+            )),
+            (HostRequest::SetModel(model), Ok(_)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::ModelChanged(
+                    model.clone(),
+                )));
+            }
+            (HostRequest::SetEffort(effort), Err(e))
+            | (HostRequest::ConfirmEffort(effort), Err(e)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::Error(format!(
+                    "Claude did not change the effort to {}: {e}",
+                    effort.as_deref().unwrap_or("auto")
+                ))))
+            }
+            // The session follows up with `ConfirmEffort`.
+            (HostRequest::SetEffort(_), Ok(_)) => {}
+            (HostRequest::ConfirmEffort(requested), Ok(body)) => {
+                out.push(ParsedFrame::Event(confirm_effort(requested, body)));
+            }
             (HostRequest::Interrupt, Ok(_)) => {}
+            // A cancel that took is reported by its `cancelled` lifecycle.
+            (HostRequest::WithdrawMessage(_), Ok(body)) if body["cancelled"] == true => {}
+            (HostRequest::WithdrawMessage(id), Ok(_)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::MessageWithdrawRefused {
+                    id: id.clone(),
+                    reason: "Claude had already picked it up".into(),
+                }))
+            }
+            (HostRequest::WithdrawMessage(id), Err(e)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::MessageWithdrawRefused {
+                    id: id.clone(),
+                    reason: format!("Claude refused: {e}"),
+                }))
+            }
         }
         out.push(ParsedFrame::HostRequestDone {
             request_id: request_id.to_string(),
@@ -280,6 +402,100 @@ impl ClaudeFrameParser {
             result,
         });
         out
+    }
+}
+
+/// Reads a `get_settings` reply after `apply_flag_settings {effortLevel}`.
+/// The flag-settings source holds the session's pinned level (absent once it
+/// is reset); `applied.effort` is what the model actually runs at.
+fn confirm_effort(requested: &Option<String>, body: &Value) -> HarnessEvent {
+    let pinned = body["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|source| source["source"] == "flagSettings")
+        .and_then(|source| source["settings"]["effortLevel"].as_str())
+        .map(str::to_string);
+    if &pinned != requested {
+        return HarnessEvent::Error(format!(
+            "Claude did not apply effort {}: its session settings hold {}",
+            requested.as_deref().unwrap_or("auto"),
+            pinned.as_deref().unwrap_or("no effort level")
+        ));
+    }
+    HarnessEvent::EffortChanged {
+        effort: pinned,
+        applied: body["applied"]["effort"].as_str().map(str::to_string),
+    }
+}
+
+/// Wraps one normalized event as activity of the subagent whose Agent call
+/// is `parent`.
+fn subagent_event(parent: &str, event: HarnessEvent) -> ParsedFrame {
+    ParsedFrame::Event(HarnessEvent::SubagentEvent {
+        parent_tool_use_id: parent.to_string(),
+        event: Box::new(event),
+    })
+}
+
+/// A frame the subagent produced. The CLI sends subagents' turns as whole
+/// `assistant` messages (one content block each) and `user` tool results;
+/// any subagent `stream_event`s would duplicate those, so they are dropped,
+/// which also keeps their block indexes away from the parent's.
+fn parse_subagent_frame(parent: &str, v: &Value) -> Vec<ParsedFrame> {
+    match v["type"].as_str().unwrap_or("") {
+        "assistant" => v
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|block| {
+                let event = match block["type"].as_str()? {
+                    "text" => HarnessEvent::TextDelta(block["text"].as_str()?.to_string()),
+                    "thinking" => {
+                        HarnessEvent::ThinkingDelta(block["thinking"].as_str()?.to_string())
+                    }
+                    "tool_use" => HarnessEvent::ItemStarted {
+                        id: block["id"].as_str()?.to_string(),
+                        kind: ItemKind::ToolCall {
+                            name: block["name"].as_str().unwrap_or("").to_string(),
+                            input: block.get("input").cloned().unwrap_or(Value::Null),
+                        },
+                    },
+                    _ => return None,
+                };
+                Some(subagent_event(parent, event))
+            })
+            .collect(),
+        "user" => parse_tool_results(v)
+            .into_iter()
+            .map(|frame| match frame {
+                ParsedFrame::Event(event) => subagent_event(parent, event),
+                other => other,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A subagent's `system/task_notification` as the end of its work. For a
+/// background agent this, not the Agent tool result, is when it is done.
+fn task_completion(v: &Value) -> HarnessEvent {
+    let status = match v["status"].as_str().unwrap_or("") {
+        "completed" => TurnStatus::Completed,
+        "failed" | "error" => TurnStatus::Failed(
+            v["summary"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("the subagent failed")
+                .to_string(),
+        ),
+        _ => TurnStatus::Interrupted,
+    };
+    HarnessEvent::TurnCompleted {
+        status,
+        usage: v.get("usage").cloned().unwrap_or(Value::Null),
+        cost_usd: None,
     }
 }
 
@@ -438,14 +654,34 @@ enum ControlResponseBody {
     Error { request_id: String, error: String },
 }
 
-fn user_message_frame(text: &str) -> String {
-    json!({
+/// The stream-json `user` line for one prompt. Without images the content
+/// is a single text block (the shape every fixture records). With images it
+/// is the text block first (left out when the text is empty, since the API
+/// rejects empty text blocks) followed by one `image` block per attachment:
+/// `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`.
+/// A prompt with an `id` carries it as the frame's `uuid`, which turns on
+/// the CLI's `command_lifecycle` reports for it.
+pub fn user_message_frame(prompt: &UserPrompt) -> String {
+    let mut content = Vec::with_capacity(1 + prompt.images.len());
+    if prompt.images.is_empty() || !prompt.text.is_empty() {
+        content.push(json!({"type": "text", "text": prompt.text}));
+    }
+    for image in &prompt.images {
+        content.push(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": image.media_type, "data": image.data},
+        }));
+    }
+    let mut frame = json!({
         "type": "user",
         "session_id": "",
-        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        "message": {"role": "user", "content": content},
         "parent_tool_use_id": null
-    })
-    .to_string()
+    });
+    if let Some(id) = &prompt.id {
+        frame["uuid"] = json!(id);
+    }
+    frame.to_string()
 }
 
 fn control_request_frame(request_id: &str, request: Value) -> String {
@@ -873,6 +1109,9 @@ async fn run_session(
         format!("gitterm_{pid}_{next_id}")
     };
     let mut interrupt_requested = false;
+    // Between `system/init` and `result`. A message sent mid-turn must not
+    // clear an interrupt that turn is still answering.
+    let mut in_turn = false;
 
     // Handshake. Its reply becomes `Ready`.
     let init_id = new_request_id();
@@ -915,7 +1154,12 @@ async fn run_session(
                     match frame {
                         ParsedFrame::Event(ev) => {
                             let ev = match ev {
+                                HarnessEvent::TurnStarted { session_id, model } => {
+                                    in_turn = true;
+                                    HarnessEvent::TurnStarted { session_id, model }
+                                }
                                 HarnessEvent::TurnCompleted { status, usage, cost_usd } => {
+                                    in_turn = false;
                                     let status = match status {
                                         TurnStatus::Failed(_) if interrupt_requested => {
                                             TurnStatus::Interrupted
@@ -961,10 +1205,28 @@ async fn run_session(
                             harness_log(&format!(
                                 "{request:?} ({request_id}) -> {}",
                                 match &result {
+                                    // get_settings carries the user's whole
+                                    // settings (env, tokens); never log it.
+                                    Ok(_) if matches!(request, HostRequest::ConfirmEffort(_)) => {
+                                        "ok (settings not logged)".to_string()
+                                    }
                                     Ok(v) => format!("ok {}", trim_for_log(&v.to_string(), 160)),
                                     Err(e) => format!("error {e}"),
                                 }
                             ));
+                            // An accepted effort change is confirmed by
+                            // reading the session's settings back.
+                            if let (HostRequest::SetEffort(effort), Ok(_)) = (&request, &result) {
+                                let id = new_request_id();
+                                parser.register_host_request(id.clone(), HostRequest::ConfirmEffort(effort.clone()));
+                                if let Err(e) = io
+                                    .write(control_request_frame(&id, json!({"subtype": "get_settings"})))
+                                    .await
+                                {
+                                    harness_log(&e);
+                                    io.emit(HarnessEvent::Error(e));
+                                }
+                            }
                         }
                         ParsedFrame::Unparsed(line) => {
                             harness_log(&format!("non-JSON stdout: {}", trim_for_log(&line, 200)));
@@ -981,10 +1243,27 @@ async fn run_session(
                     continue;
                 };
                 let result = match cmd {
-                    HarnessCommand::SendUserMessage(text) => {
-                        harness_log(&format!("user message ({} chars)", text.len()));
-                        interrupt_requested = false;
-                        io.write(user_message_frame(&text)).await
+                    HarnessCommand::SendUserMessage(prompt) => {
+                        harness_log(&format!(
+                            "user message ({} chars, {} images, id {:?})",
+                            prompt.text.len(),
+                            prompt.images.len(),
+                            prompt.id
+                        ));
+                        if !in_turn {
+                            interrupt_requested = false;
+                        }
+                        io.write(user_message_frame(&prompt)).await
+                    }
+                    HarnessCommand::WithdrawQueuedMessage(message_id) => {
+                        let id = new_request_id();
+                        harness_log(&format!("cancel_async_message {message_id} ({id})"));
+                        parser.register_host_request(id.clone(), HostRequest::WithdrawMessage(message_id.clone()));
+                        io.write(control_request_frame(
+                            &id,
+                            json!({"subtype": "cancel_async_message", "message_uuid": message_id}),
+                        ))
+                        .await
                     }
                     HarnessCommand::Answer { request_id, decision } => {
                         match pending.remove(&request_id) {
@@ -1029,6 +1308,26 @@ async fn run_session(
                         io.write(control_request_frame(
                             &id,
                             json!({"subtype": "set_permission_mode", "mode": mode}),
+                        ))
+                        .await
+                    }
+                    HarnessCommand::SetModel(model) => {
+                        let id = new_request_id();
+                        harness_log(&format!("set_model {model:?} ({id})"));
+                        parser.register_host_request(id.clone(), HostRequest::SetModel(model.clone()));
+                        io.write(control_request_frame(
+                            &id,
+                            json!({"subtype": "set_model", "model": model}),
+                        ))
+                        .await
+                    }
+                    HarnessCommand::SetEffort(effort) => {
+                        let id = new_request_id();
+                        harness_log(&format!("apply_flag_settings effortLevel={effort:?} ({id})"));
+                        parser.register_host_request(id.clone(), HostRequest::SetEffort(effort.clone()));
+                        io.write(control_request_frame(
+                            &id,
+                            json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}),
                         ))
                         .await
                     }
@@ -1115,6 +1414,59 @@ async fn answer_unhandled_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::ImageAttachment;
+
+    #[test]
+    fn text_only_prompt_keeps_the_single_text_block_line() {
+        assert_eq!(
+            user_message_frame(&"hi".into()),
+            r#"{"message":{"content":[{"text":"hi","type":"text"}],"role":"user"},"parent_tool_use_id":null,"session_id":"","type":"user"}"#
+        );
+    }
+
+    #[test]
+    fn image_prompt_puts_text_first_then_base64_image_blocks() {
+        let prompt = UserPrompt {
+            text: "What colour?".into(),
+            images: vec![
+                ImageAttachment {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+                ImageAttachment {
+                    media_type: "image/jpeg".into(),
+                    data: "BBBB".into(),
+                },
+            ],
+            id: None,
+        };
+        let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
+        assert_eq!(
+            v["message"]["content"],
+            json!([
+                {"type": "text", "text": "What colour?"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}},
+            ])
+        );
+        assert_eq!(v["type"], "user");
+    }
+
+    #[test]
+    fn image_only_prompt_leaves_out_the_empty_text_block() {
+        let prompt = UserPrompt {
+            text: String::new(),
+            images: vec![ImageAttachment {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+            id: None,
+        };
+        let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
+        let content = v["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
+    }
 
     fn parse_fixture(parser: &mut ClaudeFrameParser, fixture: &str) -> Vec<ParsedFrame> {
         fixture.lines().flat_map(|l| parser.parse_line(l)).collect()
@@ -1139,8 +1491,57 @@ mod tests {
     const TURN_BASH_DENY: &str = include_str!("../../tests/fixtures/claude/turn_bash_deny.jsonl");
     const TURN_QUESTION: &str = include_str!("../../tests/fixtures/claude/turn_question.jsonl");
     const TURN_INTERRUPT: &str = include_str!("../../tests/fixtures/claude/turn_interrupt.jsonl");
+    // Captured from `claude_harness_smoke --scenario midturn` (TRU-140): a
+    // Bash turn with three messages sent after its first tool call starts
+    // (…b, …c, then …d withdrawn at once via request gitterm_5166_2).
+    // Trimmed to the lifecycle frames, the cancel reply, tool results and
+    // the result.
+    const TURN_MIDTURN_MESSAGES: &str =
+        include_str!("../../tests/fixtures/claude/turn_midturn_messages.jsonl");
     const SET_PERMISSION_MODE_REPLY: &str =
         include_str!("../../tests/fixtures/claude/set_permission_mode_reply.jsonl");
+    // Captured from `claude_harness_smoke --scenario model` (TRU-143):
+    // set_model, apply_flag_settings low, get_settings, apply_flag_settings
+    // null, get_settings. The get_settings replies keep only effortLevel
+    // (the rest is the user's own settings).
+    const MODEL_EFFORT_REPLIES: &str =
+        include_str!("../../tests/fixtures/claude/model_effort_replies.jsonl");
+    // Captured from `claude_harness_smoke --scenario review` (TRU-142):
+    // consecutive deltas on one block merged, signatures and paths redacted.
+    const TURN_SUBAGENT_REVIEW: &str =
+        include_str!("../../tests/fixtures/claude/turn_subagent_review.jsonl");
+    const TURN_SUBAGENT_BACKGROUND: &str =
+        include_str!("../../tests/fixtures/claude/turn_subagent_background.jsonl");
+
+    /// The subagent events for `parent`, unwrapped, plus the number of
+    /// subagent events addressed to any other parent.
+    fn nested(evs: &[HarnessEvent], parent: &str) -> (Vec<HarnessEvent>, usize) {
+        let mut mine = Vec::new();
+        let mut others = 0;
+        for ev in evs {
+            if let HarnessEvent::SubagentEvent {
+                parent_tool_use_id,
+                event,
+            } = ev
+            {
+                if parent_tool_use_id == parent {
+                    mine.push((**event).clone());
+                } else {
+                    others += 1;
+                }
+            }
+        }
+        (mine, others)
+    }
+
+    fn top_level_text(evs: &[HarnessEvent]) -> String {
+        evs.iter()
+            .filter_map(|e| match e {
+                HarnessEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn initialize_reply_becomes_ready() {
@@ -1373,6 +1774,153 @@ mod tests {
     }
 
     #[test]
+    fn foreground_subagent_nests_under_its_agent_call() {
+        let mut p = ClaudeFrameParser::new();
+        let evs = events(&parse_fixture(&mut p, TURN_SUBAGENT_REVIEW));
+        let agent = "toolu_01Y8qfELQtVXDWYpWrA2LVpU";
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemStarted { id, kind: ItemKind::ToolCall { name, .. } }
+                if id == agent && name == "Agent"
+        )));
+        let (sub, others) = nested(&evs, agent);
+        assert_eq!(others, 0, "{evs:?}");
+        let kinds: Vec<&str> = sub
+            .iter()
+            .map(|e| match e {
+                HarnessEvent::TurnStarted { .. } => "started",
+                HarnessEvent::ItemStarted { .. } => "item",
+                HarnessEvent::ItemCompleted { .. } => "result",
+                HarnessEvent::TextDelta(_) => "text",
+                HarnessEvent::TurnCompleted { .. } => "completed",
+                _ => "other",
+            })
+            .collect();
+        // The brief the parent sent (a subagent `user` text frame) is not
+        // an event; task_progress and task_updated add nothing.
+        assert_eq!(kinds, ["started", "item", "result", "text", "completed"]);
+        assert!(matches!(
+            &sub[1],
+            HarnessEvent::ItemStarted { id, kind: ItemKind::ToolCall { name, input } }
+                if id == "toolu_01V55VdwsBegzZmpoUhcm6DG"
+                    && name == "Bash"
+                    && input["command"].as_str().unwrap().contains("git diff HEAD")
+        ));
+        assert!(matches!(
+            &sub[2],
+            HarnessEvent::ItemCompleted { id, output, is_error: false }
+                if id == "toolu_01V55VdwsBegzZmpoUhcm6DG" && output.contains("values[1:]")
+        ));
+        // A foreground subagent's last message only exists as the
+        // notification summary; it becomes the subagent's text.
+        assert!(
+            matches!(&sub[3], HarnessEvent::TextDelta(t) if t.starts_with("Verdict: needs_changes") && t.contains("F1 [P1] calc.py:4"))
+        );
+        assert!(matches!(
+            &sub[4],
+            HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                cost_usd: None,
+                ..
+            }
+        ));
+        // The subagent's text never reaches the parent's reply stream; the
+        // parent relays the report itself.
+        assert!(!top_level_text(&evs).contains("Model: haiku"));
+        assert!(top_level_text(&evs).contains("F1"));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { id, output, is_error: false }
+                if id == agent && output.contains("F1 [P1] calc.py:4")
+        )));
+        assert!(matches!(
+            evs.last(),
+            Some(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn background_subagent_text_is_not_repeated_by_its_summary() {
+        let mut p = ClaudeFrameParser::new();
+        let evs = events(&parse_fixture(&mut p, TURN_SUBAGENT_BACKGROUND));
+        let agent = "toolu_01Dd3gSqnmMHifQuUBFNNzgL";
+        // The Agent call returns at once; the subagent outlives the turn.
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { id, output, .. }
+                if id == agent && output.starts_with("Async agent launched")
+        )));
+        let (sub, others) = nested(&evs, agent);
+        assert_eq!(others, 0);
+        let tools: Vec<&str> = sub
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::ItemStarted {
+                    kind: ItemKind::ToolCall { name, .. },
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools, ["Bash", "Read"]);
+        let texts: Vec<&String> = sub
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::TextDelta(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].starts_with("Verdict: needs_changes"));
+        assert!(sub.contains(&HarnessEvent::ThinkingDelta(String::new())));
+        assert!(matches!(
+            sub.first(),
+            Some(HarnessEvent::TurnStarted { .. })
+        ));
+        assert!(matches!(
+            sub.last(),
+            Some(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+        // Claude starts a follow-up turn on its own when the agent is done.
+        let turns = evs
+            .iter()
+            .filter(|e| matches!(e, HarnessEvent::TurnStarted { .. }))
+            .count();
+        assert_eq!(turns, 2);
+    }
+
+    #[test]
+    fn background_bash_tasks_are_not_subagents() {
+        let mut p = ClaudeFrameParser::new();
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#;
+        let done = r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_bash","status":"completed","summary":"exit 0"}"#;
+        assert!(p.parse_line(started).is_empty());
+        assert!(p.parse_line(done).is_empty());
+        // A subagent that failed reports the summary as the failure.
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_agent","task_type":"local_agent"}"#;
+        let failed = r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_agent","status":"failed","summary":"API error"}"#;
+        p.parse_line(started);
+        let evs = events(&p.parse_line(failed));
+        assert_eq!(
+            evs.last(),
+            Some(&HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "toolu_agent".into(),
+                event: Box::new(HarnessEvent::TurnCompleted {
+                    status: TurnStatus::Failed("API error".into()),
+                    usage: Value::Null,
+                    cost_usd: None,
+                }),
+            })
+        );
+    }
+
+    #[test]
     fn permission_results_match_the_sdk_shape() {
         let input = json!({"command": "touch x"});
         let suggestion = json!({"type": "addRules", "destination": "localSettings",
@@ -1426,6 +1974,186 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn set_model_reply_confirms_the_model() {
+        let mut p = ClaudeFrameParser::new();
+        p.register_host_request(
+            "gitterm_30932_2".into(),
+            HostRequest::SetModel("sonnet".into()),
+        );
+        let line = MODEL_EFFORT_REPLIES.lines().next().unwrap();
+        let frames = p.parse_line(line);
+        assert_eq!(
+            events(&frames),
+            vec![HarnessEvent::ModelChanged("sonnet".into())]
+        );
+        assert!(matches!(
+            frames.last(),
+            Some(ParsedFrame::HostRequestDone {
+                request: HostRequest::SetModel(_),
+                result: Ok(_),
+                ..
+            })
+        ));
+        // An unknown model is the CLI's error, not a confirmation.
+        p.register_host_request("m2".into(), HostRequest::SetModel("nonsense".into()));
+        let frames = p.parse_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"m2","error":"Model 'nonsense' not found","error_code":"catalog_unknown"}}"#,
+        );
+        assert!(
+            matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("not found"))
+        );
+    }
+
+    #[test]
+    fn effort_is_confirmed_by_the_settings_read_back() {
+        let mut p = ClaudeFrameParser::new();
+        let low = Some("low".to_string());
+        p.register_host_request(
+            "gitterm_30932_3".into(),
+            HostRequest::SetEffort(low.clone()),
+        );
+        p.register_host_request(
+            "gitterm_30932_4".into(),
+            HostRequest::ConfirmEffort(low.clone()),
+        );
+        p.register_host_request("gitterm_30932_5".into(), HostRequest::SetEffort(None));
+        p.register_host_request("gitterm_30932_6".into(), HostRequest::ConfirmEffort(None));
+        let frames = parse_fixture(&mut p, MODEL_EFFORT_REPLIES);
+        // The apply_flag_settings replies themselves confirm nothing; the
+        // user's own effortLevel (userSettings) is not mistaken for the pin.
+        assert_eq!(
+            events(&frames),
+            vec![
+                HarnessEvent::EffortChanged {
+                    effort: low.clone(),
+                    applied: low.clone()
+                },
+                HarnessEvent::EffortChanged {
+                    effort: None,
+                    applied: Some("medium".into())
+                },
+            ]
+        );
+        // A level the CLI accepted but did not pin is reported, not shown.
+        p.register_host_request(
+            "c1".into(),
+            HostRequest::ConfirmEffort(Some("bogus".into())),
+        );
+        let frames = p.parse_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"c1","response":{"effective":{},"sources":[{"source":"flagSettings","settings":{}}],"applied":{"effort":"low"}}}}"#,
+        );
+        assert!(
+            matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("bogus"))
+        );
+    }
+
+    #[test]
+    fn prompt_id_rides_as_the_frame_uuid() {
+        let prompt = UserPrompt {
+            text: "hi".into(),
+            images: Vec::new(),
+            id: Some("00000000-0000-4000-8000-00000000000b".into()),
+        };
+        let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
+        assert_eq!(v["uuid"], "00000000-0000-4000-8000-00000000000b");
+        assert_eq!(
+            v["message"]["content"],
+            json!([{"type": "text", "text": "hi"}])
+        );
+        let plain: Value = serde_json::from_str(&user_message_frame(&"hi".into())).unwrap();
+        assert!(plain.get("uuid").is_none());
+    }
+
+    #[test]
+    fn midturn_messages_report_their_queue_state() {
+        use crate::harness::MessageState::*;
+        let mut parser = ClaudeFrameParser::new();
+        parser.register_host_request(
+            "gitterm_5166_2".into(),
+            HostRequest::WithdrawMessage("00000000-0000-4000-8000-00000000000d".into()),
+        );
+        let frames = parse_fixture(&mut parser, TURN_MIDTURN_MESSAGES);
+        let lifecycle: Vec<(char, MessageState)> = events(&frames)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                HarnessEvent::MessageLifecycle { id, state } => {
+                    Some((id.chars().last().unwrap(), state))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lifecycle,
+            [
+                ('b', Queued),
+                ('c', Queued),
+                ('d', Queued),
+                ('d', Cancelled),
+                ('b', Started),
+                ('c', Started),
+                ('b', Completed),
+                ('c', Completed),
+            ]
+        );
+        // The cancel took: its lifecycle says so, the reply adds nothing.
+        assert!(!events(&frames)
+            .iter()
+            .any(|ev| matches!(ev, HarnessEvent::MessageWithdrawRefused { .. })));
+        assert!(frames.iter().any(|f| matches!(
+            f,
+            ParsedFrame::HostRequestDone {
+                request: HostRequest::WithdrawMessage(_),
+                result: Ok(_),
+                ..
+            }
+        )));
+        // Folded into the running turn: one result for all of it.
+        let results = events(&frames)
+            .iter()
+            .filter(|ev| matches!(ev, HarnessEvent::TurnCompleted { .. }))
+            .count();
+        assert_eq!(results, 1);
+    }
+
+    #[test]
+    fn a_withdraw_too_late_or_refused_is_reported() {
+        let mut parser = ClaudeFrameParser::new();
+        parser.register_host_request("w1".into(), HostRequest::WithdrawMessage("m1".into()));
+        parser.register_host_request("w2".into(), HostRequest::WithdrawMessage("m2".into()));
+        let frames = parse_fixture(
+            &mut parser,
+            concat!(
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"w1","response":{"cancelled":false}}}"#,
+                "\n",
+                r#"{"type":"control_response","response":{"subtype":"error","request_id":"w2","error":"Unsupported control request subtype: cancel_async_message"}}"#,
+            ),
+        );
+        assert_eq!(
+            events(&frames),
+            [
+                HarnessEvent::MessageWithdrawRefused {
+                    id: "m1".into(),
+                    reason: "Claude had already picked it up".into()
+                },
+                HarnessEvent::MessageWithdrawRefused {
+                    id: "m2".into(),
+                    reason:
+                        "Claude refused: Unsupported control request subtype: cancel_async_message"
+                            .into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_lifecycle_states_are_ignored() {
+        let mut parser = ClaudeFrameParser::new();
+        assert!(parser
+            .parse_line(r#"{"type":"command_lifecycle","command_uuid":"m1","state":"folded"}"#)
+            .is_empty());
     }
 
     #[test]

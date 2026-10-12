@@ -178,7 +178,7 @@ Two persistent axes plus a switcher — deliberately no third number row
 | `⌘↑` / `esc` on empty canvas | Up to workspace context (General) | new |
 | `⌘0` | Overview of current task | new |
 | `` ⌃` `` | Jump to next thing that needs you (extend to tasks) | shipped, extend |
-| `⌘⇧A` | Attention panel | shipped |
+| `⌘⇧A` | Attention panel | retired (TRU-148): rail dots, Chats → Open, notifications |
 | `⌥⇧1–9` | Launch agent preset (task-aware) | shipped |
 
 ## Vocabulary

@@ -1,0 +1,21 @@
+Provenance of the Jev (TypeSafe System One) fixtures used by src/jev.rs tests.
+
+recorded_choice_noul.json
+  A real System One response, recorded 2026-10-04 by the cree8-video-editor
+  client and kept there as RECORDED in lib/server/typesafe_test.ts. Copied
+  verbatim; it is the only recorded shape here.
+
+rank_batch_1.json, rank_batch_2.json   -- SYNTHETIC
+  Hand-written in the recorded shape (model, answers.<id>.{type, choice,
+  probabilities, confidence}, usage.{input_tokens, output_tokens}) for the
+  chat-ranking question "relevant". No TYPESAFE_API_KEY was available when
+  TRU-141 was written, so these were not captured from the live API. Unlike
+  a live answer they list only a few options' probabilities; the client
+  treats an unlisted option as probability 0. Replace them with a capture
+  from `cargo run --example jev_rank_smoke` once a key is at hand.
+
+rank_request.json   -- SYNTHETIC (golden)
+  The request body src/jev.rs must build for a two-chat ranking call; it
+  pins the wire field names (state, model, questions.<id>.type /
+  instructions / criteria) taken from the reference client and
+  https://docs.typesafe.ai/api.md.

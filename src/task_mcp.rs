@@ -8,13 +8,13 @@ use crate::harness::claude::ClaudeMcpServer;
 use axum::{
     body::Body,
     extract::State,
-    http::{header, Request, StatusCode},
+    http::{header, request::Parts, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     Router,
 };
 use rmcp::{
-    handler::server::wrapper::Parameters,
+    handler::server::{tool::Extension, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
     transport::{
@@ -41,6 +41,9 @@ use uuid::Uuid;
 
 pub const TASK_MCP_TOKEN_ENV: &str = "GITTERM_V5_TASK_MCP_TOKEN";
 pub const TASK_MCP_URL_ENV: &str = "GITTERM_V5_TASK_MCP_URL";
+/// Query parameter on a tab's task MCP URL naming the calling tab's durable
+/// `session_uid`. The bearer token authenticates; this only attributes.
+pub const TASK_MCP_CALLER_QUERY: &str = "caller";
 const TASK_MCP_BASE_PORT: u16 = 25_030;
 const TASK_MCP_PORTS_PER_INSTANCE: u16 = 10;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
@@ -106,8 +109,68 @@ pub struct UpdateTaskHandoffRequest {
     pub next_steps: Vec<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
-    /// GitTerm task-session id writing this handoff, when known.
+    /// GitTerm task-session id writing this handoff, when known. Omit it to
+    /// attribute the handoff to the calling GitTerm tab.
     pub session_id: Option<String>,
+    /// `progress` (the default) records where you are. A worker started by
+    /// delegate_task reports `done` when the objective is met or `blocked`
+    /// when it cannot go on without a human; either wakes the chat that
+    /// delegated the work. Only the worker's own GitTerm tab can report
+    /// done or blocked.
+    pub status: Option<HandoffStatus>,
+}
+
+/// What a `task_update_handoff` says about the work (TRU-142 S6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffStatus {
+    /// Still working; the delegating chat's card shows the summary line.
+    #[default]
+    Progress,
+    /// The objective is met: the delegation completes with this handoff.
+    Done,
+    /// Cannot go on without a human: blockers say why.
+    Blocked,
+}
+
+impl HandoffStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Progress => "progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct DelegateTaskRequest {
+    /// Short task title visible in GitTerm.
+    pub title: String,
+    /// The worker's complete, self-contained objective: what to change,
+    /// constraints, and how to verify. The worker cannot see this chat.
+    pub objective: String,
+    /// Configured GitTerm agent preset that runs the worker, matched
+    /// case-insensitively (see task_list's available_presets). Defaults to
+    /// the Codex preset, else Claude Code.
+    pub preset_name: Option<String>,
+    /// Picks the model from GitTerm's model policy: scoped (routine coding,
+    /// the default), judgment (harder coding) or specialist (review,
+    /// investigation).
+    pub role: Option<crate::workers::WorkerRole>,
+    /// Model for the worker's CLI (`claude --model`, `codex -m`), overriding
+    /// the policy, e.g. sonnet, opus, fable or gpt-6-luna.
+    pub model: Option<String>,
+    /// Optional Linear issue key such as TRU-150.
+    pub issue_key: Option<String>,
+    /// Branch, tag or commit the task worktree starts from. Defaults to
+    /// `develop` when it exists, then `main`, then the current branch.
+    pub base_reference: Option<String>,
+    /// Where the worker should stop. Defaults to implement_until_tests_pass.
+    pub stopping_boundary: Option<TaskStoppingBoundary>,
+    /// Optional GitTerm workspace label for the task. Defaults to the
+    /// repository directory name.
+    pub workspace_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
@@ -116,6 +179,58 @@ pub enum TaskStoppingBoundary {
     PlanOnly,
     ImplementUntilTestsPass,
     PrepareDraftPr,
+}
+
+/// What `review_request` reviews.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewTargetKind {
+    /// Staged, unstaged and untracked changes against HEAD.
+    Uncommitted,
+    /// The merge base with `base_ref` against the working tree, so it
+    /// includes uncommitted changes (Codex `--base`).
+    Base,
+    /// One commit, named by `commit`.
+    Commit,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ReviewDelegationRequest {
+    /// `uncommitted`, `base` (needs `base_ref`) or `commit` (needs `commit`).
+    pub target: ReviewTargetKind,
+    /// Branch or ref to diff against, for target `base`.
+    pub base_ref: Option<String>,
+    /// Commit SHA (7 to 40 hex characters), for target `commit`.
+    pub commit: Option<String>,
+    /// Optional extra instructions for the reviewer.
+    pub focus: Option<String>,
+    /// Only `codex` is supported; omit it for Codex. For a Claude review,
+    /// spawn a review subagent with your own Agent tool instead.
+    pub reviewer: Option<String>,
+    /// Codex model (`codex -m`). Omit it for GitTerm's configured Codex model.
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ConsultDelegationRequest {
+    /// The full question or brief for the consultant: context, what to
+    /// decide, and the answer shape you want. It runs read-only in your
+    /// checkout and cannot see this conversation.
+    pub brief: String,
+    /// Codex model (`codex -m`). Omit it for GitTerm's configured Codex model.
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct GetDelegationRequest {
+    pub delegation_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+pub struct ListDelegationsRequest {
+    /// Only delegations in this state: requested, running, completed,
+    /// blocked, failed, interrupted or cancelled.
+    pub status: Option<String>,
 }
 
 /// A harness-emitted session event crossing the notify bridge, e.g. a
@@ -137,6 +252,15 @@ pub enum TaskControlOperation {
     LaunchSession(LaunchTaskSessionRequest),
     UpdateHandoff(UpdateTaskHandoffRequest),
     SessionEvent(TaskSessionEventRequest),
+    /// Delegation tools (TRU-142). The bridge only receives these with a
+    /// caller: the tool handlers refuse calls without one.
+    RequestReview(ReviewDelegationRequest),
+    RequestConsult(ConsultDelegationRequest),
+    /// Create a task in the caller's repository and launch a worker in it
+    /// (TRU-142 S6).
+    DelegateTask(DelegateTaskRequest),
+    GetDelegation(GetDelegationRequest),
+    ListDelegations(ListDelegationsRequest),
 }
 
 #[derive(Clone)]
@@ -170,7 +294,31 @@ impl TaskControlReply {
 #[derive(Debug, Clone)]
 pub struct TaskControlEnvelope {
     pub operation: TaskControlOperation,
+    /// The calling tab's `session_uid`, read from the `caller` query of the
+    /// MCP URL GitTerm handed that tab. `None` for calls from a URL without
+    /// it (bottom-panel terminals, external clients, the notify route).
+    pub caller: Option<String>,
     pub reply: TaskControlReply,
+}
+
+/// The task MCP URL handed to one tab: the shared endpoint plus
+/// `?caller=<session_uid>`. Without a caller the bare endpoint is returned.
+pub fn caller_endpoint(endpoint: &str, caller: Option<&str>) -> String {
+    match caller.filter(|caller| !caller.is_empty()) {
+        Some(caller) => {
+            let encoded: String = url::form_urlencoded::byte_serialize(caller.as_bytes()).collect();
+            format!("{endpoint}?{TASK_MCP_CALLER_QUERY}={encoded}")
+        }
+        None => endpoint.to_string(),
+    }
+}
+
+/// The caller named by a request URI's `caller` query, if any.
+fn caller_from_query(query: Option<&str>) -> Option<String> {
+    url::form_urlencoded::parse(query?.as_bytes())
+        .find(|(key, _)| key == TASK_MCP_CALLER_QUERY)
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty())
 }
 
 pub struct TaskMcpConnection {
@@ -184,9 +332,15 @@ impl TaskMcpConnection {
         &self.endpoint
     }
 
-    pub fn terminal_environment(&self) -> [(String, String); 2] {
+    /// The task MCP variables for one tab's terminal. The URL carries the
+    /// tab's caller identity; the token is the same for every tab and lives
+    /// only in the environment.
+    pub fn terminal_environment(&self, caller: Option<&str>) -> [(String, String); 2] {
         [
-            (TASK_MCP_URL_ENV.to_string(), self.endpoint.clone()),
+            (
+                TASK_MCP_URL_ENV.to_string(),
+                caller_endpoint(&self.endpoint, caller),
+            ),
             (TASK_MCP_TOKEN_ENV.to_string(), self.token.clone()),
         ]
     }
@@ -198,12 +352,12 @@ impl TaskMcpConnection {
     /// The task server for a natively spawned Claude session (chat tabs):
     /// the same config and pre-approval `configure_claude_command` injects
     /// into terminal launches, with the token carried in the child
-    /// environment.
-    pub fn claude_mcp_server(&self) -> ClaudeMcpServer {
+    /// environment. `caller` is the chat tab's `session_uid`.
+    pub fn claude_mcp_server(&self, caller: Option<&str>) -> ClaudeMcpServer {
         ClaudeMcpServer {
-            config: claude_mcp_config(&self.endpoint),
+            config: claude_mcp_config(&caller_endpoint(&self.endpoint, caller)),
             allowed_tools: vec![CLAUDE_ALLOWED_TOOLS.to_string()],
-            env: self.terminal_environment().into(),
+            env: self.terminal_environment(caller).into(),
         }
     }
 
@@ -371,7 +525,13 @@ async fn notify_session_event(
         session_id: query.session_id,
         event_type,
     };
-    match dispatch_operation(&state.commands, TaskControlOperation::SessionEvent(request)).await {
+    match dispatch_operation(
+        &state.commands,
+        TaskControlOperation::SessionEvent(request),
+        None,
+    )
+    .await
+    {
         Ok(value) => (StatusCode::OK, axum::Json(value)).into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
     }
@@ -380,11 +540,13 @@ async fn notify_session_event(
 async fn dispatch_operation(
     commands: &TaskControlSender,
     operation: TaskControlOperation,
+    caller: Option<String>,
 ) -> Result<Value, String> {
     let (reply, response) = oneshot::channel();
     commands
         .send(TaskControlEnvelope {
             operation,
+            caller,
             reply: TaskControlReply::new(reply),
         })
         .map_err(|_| "GitTerm's task command bridge is unavailable".to_string())?;
@@ -404,9 +566,43 @@ impl TaskMcpTools {
         Self { commands }
     }
 
-    async fn dispatch(&self, operation: TaskControlOperation) -> Result<Value, String> {
-        dispatch_operation(&self.commands, operation).await
+    /// Bridge one operation, attributed to the caller named on the HTTP
+    /// request's URL (rmcp injects the request `Parts` into every call).
+    async fn dispatch(
+        &self,
+        operation: TaskControlOperation,
+        parts: &Parts,
+    ) -> Result<Value, String> {
+        dispatch_operation(
+            &self.commands,
+            operation,
+            caller_from_query(parts.uri.query()),
+        )
+        .await
     }
+
+    /// Like `dispatch`, for tools that act on behalf of the calling tab:
+    /// a call without a caller is refused before it reaches GitTerm.
+    async fn dispatch_for_caller(
+        &self,
+        tool: &str,
+        operation: TaskControlOperation,
+        parts: &Parts,
+    ) -> CallToolResult {
+        let Some(caller) = caller_from_query(parts.uri.query()) else {
+            return tool_error(missing_caller_error(tool));
+        };
+        task_result(dispatch_operation(&self.commands, operation, Some(caller)).await)
+    }
+}
+
+/// Why a delegation tool refused a call that named no calling tab.
+pub fn missing_caller_error(tool: &str) -> String {
+    format!(
+        "{tool} needs the calling GitTerm tab's identity, and this call has none. Delegations \
+         report back to the tab that asked, so call it through the task MCP URL GitTerm gave \
+         that tab (it ends in ?{TASK_MCP_CALLER_QUERY}=<session id>)."
+    )
 }
 
 #[tool_router]
@@ -420,8 +616,15 @@ impl TaskMcpTools {
             open_world_hint = false
         )
     )]
-    async fn task_list(&self, Parameters(request): Parameters<ListTasksRequest>) -> CallToolResult {
-        task_result(self.dispatch(TaskControlOperation::List(request)).await)
+    async fn task_list(
+        &self,
+        Parameters(request): Parameters<ListTasksRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        task_result(
+            self.dispatch(TaskControlOperation::List(request), &parts)
+                .await,
+        )
     }
 
     #[tool(
@@ -433,8 +636,15 @@ impl TaskMcpTools {
             open_world_hint = false
         )
     )]
-    async fn task_get(&self, Parameters(request): Parameters<GetTaskRequest>) -> CallToolResult {
-        task_result(self.dispatch(TaskControlOperation::Get(request)).await)
+    async fn task_get(
+        &self,
+        Parameters(request): Parameters<GetTaskRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        task_result(
+            self.dispatch(TaskControlOperation::Get(request), &parts)
+                .await,
+        )
     }
 
     #[tool(
@@ -449,8 +659,12 @@ impl TaskMcpTools {
     async fn task_create(
         &self,
         Parameters(request): Parameters<CreateTaskRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
-        task_result(self.dispatch(TaskControlOperation::Create(request)).await)
+        task_result(
+            self.dispatch(TaskControlOperation::Create(request), &parts)
+                .await,
+        )
     }
 
     #[tool(
@@ -465,6 +679,7 @@ impl TaskMcpTools {
     async fn task_create_batch(
         &self,
         Parameters(request): Parameters<CreateTaskBatchRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         if request.tasks.is_empty() {
             return tool_error("task_create_batch requires at least one task");
@@ -472,7 +687,10 @@ impl TaskMcpTools {
         let mut results = Vec::with_capacity(request.tasks.len());
         for task in request.tasks {
             let title = task.title.clone();
-            match self.dispatch(TaskControlOperation::Create(task)).await {
+            match self
+                .dispatch(TaskControlOperation::Create(task), &parts)
+                .await
+            {
                 Ok(value) => results.push(serde_json::json!({
                     "title": title,
                     "ok": true,
@@ -500,15 +718,16 @@ impl TaskMcpTools {
     async fn task_launch_session(
         &self,
         Parameters(request): Parameters<LaunchTaskSessionRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         task_result(
-            self.dispatch(TaskControlOperation::LaunchSession(request))
+            self.dispatch(TaskControlOperation::LaunchSession(request), &parts)
                 .await,
         )
     }
 
     #[tool(
-        description = "Persist a concise task handoff for the coordinator or a later harness. Record current state, durable decisions, next steps, and blockers; do not copy a full transcript.",
+        description = "Persist a concise task handoff for the coordinator or a later harness. Record current state, durable decisions, next steps, and blockers; do not copy a full transcript. A worker started by delegate_task sets status: progress as it goes, then done or blocked when it stops; done and blocked wake the chat that delegated the work.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -519,11 +738,122 @@ impl TaskMcpTools {
     async fn task_update_handoff(
         &self,
         Parameters(request): Parameters<UpdateTaskHandoffRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         task_result(
-            self.dispatch(TaskControlOperation::UpdateHandoff(request))
+            self.dispatch(TaskControlOperation::UpdateHandoff(request), &parts)
                 .await,
         )
+    }
+
+    #[tool(
+        description = "Ask Codex to review code in your GitTerm tab's checkout, in the background. Returns {delegation_id} at once; the review takes a minute or more. Do not wait or poll for it: end your turn. The findings appear as a card in the requesting chat tab, and the human sends the ones they want back to you. Read the full result any time with delegation_get. Targets: uncommitted, base (with base_ref; includes uncommitted changes) or commit (with commit). Only reviewer \"codex\" is supported; for a Claude review, spawn a review subagent with your own Agent tool.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn review_request(
+        &self,
+        Parameters(request): Parameters<ReviewDelegationRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        self.dispatch_for_caller(
+            "review_request",
+            TaskControlOperation::RequestReview(request),
+            &parts,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Ask Codex for advice (brainstorming, architecture, investigation) on a self-contained brief. It runs read-only in your GitTerm tab's checkout, in the background, and cannot see this conversation. Returns {delegation_id} at once; do not wait or poll for it. The answer appears as a card in the requesting chat tab; read it with delegation_get.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn consult_request(
+        &self,
+        Parameters(request): Parameters<ConsultDelegationRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        self.dispatch_for_caller(
+            "consult_request",
+            TaskControlOperation::RequestConsult(request),
+            &parts,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Hand an implementation task to a worker agent in the background. GitTerm creates a task with its own git worktree and branch from your GitTerm tab's repository, and launches the worker (a configured preset: Codex by default, or Claude Code) in a background tab with the objective as its brief. Returns {delegation_id, task_id, task_session_id, worktree_path, branch} once the worktree exists; do not wait or poll after that: end your turn. The worker records progress and reports done or blocked with task_update_handoff; the report appears as a card in the requesting chat tab, and delegation_get reads it. role (scoped, judgment, specialist) picks the model from GitTerm's policy; model overrides it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn delegate_task(
+        &self,
+        Parameters(request): Parameters<DelegateTaskRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        self.dispatch_for_caller(
+            "delegate_task",
+            TaskControlOperation::DelegateTask(request),
+            &parts,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Read one delegation (a Codex review or consult, or a worker) with its status and, once completed, its result: review findings with ids F1, F2, ..., severity, file and lines, the consult's answer, or the worker's handoff.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn delegation_get(
+        &self,
+        Parameters(request): Parameters<GetDelegationRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        self.dispatch_for_caller(
+            "delegation_get",
+            TaskControlOperation::GetDelegation(request),
+            &parts,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List the delegations your GitTerm tab requested, newest first, optionally only those in one status (requested, running, completed, blocked, failed, interrupted, cancelled).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn delegation_list(
+        &self,
+        Parameters(request): Parameters<ListDelegationsRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        self.dispatch_for_caller(
+            "delegation_list",
+            TaskControlOperation::ListDelegations(request),
+            &parts,
+        )
+        .await
     }
 }
 
@@ -536,7 +866,7 @@ impl ServerHandler for TaskMcpTools {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "These tools control GitTerm's durable tasks. A task is an isolated job with its own git worktree; a task session is one visible harness or terminal inside that task. Use task_create_batch for an approved set of independent issues, then task_launch_session for each worker. Task creation and session launch are distinct: launching an agent preset opens the harness with the stored objective and latest handoff delivered as its initial prompt; a plain terminal session receives nothing. Before stopping or handing work to another harness, use task_update_handoff to record a concise durable summary, decisions, next steps, and blockers. Never edit GitTerm's tasks.json or worktree registry directly.",
+                "These tools control GitTerm's durable tasks. A task is an isolated job with its own git worktree; a task session is one visible harness or terminal inside that task. Use task_create_batch for an approved set of independent issues, then task_launch_session for each worker. Task creation and session launch are distinct: launching an agent preset opens the harness with the stored objective and latest handoff delivered as its initial prompt; a plain terminal session receives nothing. Before stopping or handing work to another harness, use task_update_handoff to record a concise durable summary, decisions, next steps, and blockers. Never edit GitTerm's tasks.json or worktree registry directly. For a second opinion from Codex, review_request (code review) and consult_request (advice) run in the background and return a delegation id at once; do not wait for them, the result reaches the requesting chat tab and delegation_get reads it. To hand implementation work to a worker agent, delegate_task creates the task and launches the worker in one call; the worker reports done or blocked with task_update_handoff and the requesting chat tab is told.",
             )
     }
 }
@@ -571,7 +901,15 @@ pub fn configure_codex_command(command: &str, endpoint: &str) -> String {
     let mut configured = executable.to_string();
     for value in codex_config_overrides(endpoint) {
         configured.push_str(" --config ");
-        configured.push_str(&value);
+        if value.contains(['?', '&', '*', '[']) {
+            // A per-tab URL carries `?caller=…`; unquoted, zsh treats `?`
+            // as a glob and aborts the launch with "no matches found".
+            configured.push('\'');
+            configured.push_str(&value);
+            configured.push('\'');
+        } else {
+            configured.push_str(&value);
+        }
     }
     configured.push_str(rest);
     configured
@@ -732,8 +1070,9 @@ mod tests {
             .unwrap();
         assert!((TASK_MCP_BASE_PORT..26_030).contains(&port));
         assert!(!(14_030..15_030).contains(&port));
-        let environment = connection.terminal_environment();
+        let environment = connection.terminal_environment(None);
         assert_eq!(environment[0].0, TASK_MCP_URL_ENV);
+        assert_eq!(environment[0].1, connection.endpoint());
         assert_eq!(environment[1].0, TASK_MCP_TOKEN_ENV);
         assert_eq!(environment[1].1.len(), 64);
         assert!(!connection
@@ -743,7 +1082,7 @@ mod tests {
 
         // Chat tabs get the terminal launch's config and pre-approvals, with
         // the token only in the child environment.
-        let server = connection.claude_mcp_server();
+        let server = connection.claude_mcp_server(None);
         let config = server.config.to_string();
         assert!(config.contains("\"gitterm_tasks\""));
         assert!(!config.contains(&environment[1].1));
@@ -759,8 +1098,8 @@ mod tests {
     #[test]
     fn tool_surface_separates_read_and_write_operations() {
         let routes = TaskMcpTools::tool_router();
-        assert_eq!(routes.list_all().len(), 6);
-        for name in ["task_list", "task_get"] {
+        assert_eq!(routes.list_all().len(), 11);
+        for name in ["task_list", "task_get", "delegation_get", "delegation_list"] {
             assert_eq!(
                 routes
                     .get(name)
@@ -776,6 +1115,9 @@ mod tests {
             "task_create_batch",
             "task_launch_session",
             "task_update_handoff",
+            "review_request",
+            "consult_request",
+            "delegate_task",
         ] {
             assert_eq!(
                 routes
@@ -833,6 +1175,75 @@ mod tests {
                 claude_mcp_config(endpoint)
             )
         );
+    }
+
+    #[test]
+    fn every_injection_path_carries_the_caller_and_keeps_the_token_in_the_environment() {
+        let (commands, _requests) = mpsc::unbounded_channel();
+        let (connection, _server) = prepare("caller-injection-test", commands).unwrap();
+        let caller = "7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90";
+        let expected_url = format!("{}?caller={caller}", connection.endpoint());
+        let token = connection.token.clone();
+
+        // Terminal tabs: the per-tab environment.
+        let environment = connection.terminal_environment(Some(caller));
+        assert_eq!(
+            environment[0],
+            (TASK_MCP_URL_ENV.to_string(), expected_url.clone())
+        );
+        assert_eq!(
+            environment[1],
+            (TASK_MCP_TOKEN_ENV.to_string(), token.clone())
+        );
+
+        // Claude and Codex terminal launches read the URL from that
+        // environment (`build_terminal_settings`).
+        let claude = configure_task_command("claude", &environment[0].1);
+        assert!(
+            claude.contains(&format!("\"url\":\"{expected_url}\"")),
+            "{claude}"
+        );
+        assert!(!claude.contains(&token));
+        let codex = configure_task_command("codex resume --last", &environment[0].1);
+        // Quoted: zsh would glob the bare `?` and abort the launch.
+        assert!(
+            codex.contains(&format!(
+                " --config 'mcp_servers.gitterm_tasks.url={expected_url}' "
+            )),
+            "{codex}"
+        );
+        assert!(codex.ends_with(" resume --last"), "{codex}");
+        assert!(!codex.contains(&token));
+
+        // Native chat tabs: the spawned Claude's MCP config.
+        let server = connection.claude_mcp_server(Some(caller));
+        assert_eq!(
+            server.config["mcpServers"]["gitterm_tasks"]["url"],
+            Value::String(expected_url.clone())
+        );
+        assert!(!server.config.to_string().contains(&token));
+        assert_eq!(server.env, environment.to_vec());
+
+        // No caller: the bare endpoint, unchanged launch shapes.
+        assert_eq!(
+            caller_endpoint(connection.endpoint(), None),
+            connection.endpoint()
+        );
+        assert_eq!(
+            caller_endpoint(connection.endpoint(), Some("")),
+            connection.endpoint()
+        );
+        assert!(!configure_codex_command("codex", connection.endpoint()).contains('\''));
+        assert_eq!(
+            caller_from_query(Some("caller=abc")),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            caller_from_query(Some("other=1&caller=a%20b")),
+            Some("a b".to_string())
+        );
+        assert_eq!(caller_from_query(Some("caller=")), None);
+        assert_eq!(caller_from_query(None), None);
     }
 
     #[test]
@@ -962,6 +1373,7 @@ mod tests {
             let envelope = requests.recv().await.expect("missing bridged request");
             assert!(matches!(envelope.operation, TaskControlOperation::List(_)));
             envelope.reply.send(Ok(serde_json::json!({ "tasks": [] })));
+            envelope.caller
         });
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(endpoint).auth_header(token),
@@ -971,7 +1383,7 @@ mod tests {
             .expect("authorized MCP initialization timed out")
             .expect("authorized MCP initialization failed");
         let tools = client.list_tools(Default::default()).await.unwrap();
-        assert_eq!(tools.tools.len(), 6);
+        assert_eq!(tools.tools.len(), 11);
         let result = client
             .call_tool(
                 rmcp::model::CallToolRequestParams::new("task_list").with_arguments(
@@ -984,7 +1396,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error.unwrap_or(false));
-        responder.await.unwrap();
+        assert_eq!(responder.await.unwrap(), None);
         client.cancel().await.unwrap();
 
         drop(connection);
@@ -993,5 +1405,640 @@ mod tests {
             .expect("task MCP server did not shut down")
             .expect("task MCP task panicked")
             .expect("task MCP server returned an error");
+    }
+
+    #[tokio::test]
+    async fn caller_query_reaches_the_bridged_envelope() {
+        let (commands, mut requests) = mpsc::unbounded_channel();
+        let (connection, server) = prepare("caller-test", commands).unwrap();
+        let endpoint = caller_endpoint(connection.endpoint(), Some("abc"));
+        let token = connection.token.clone();
+        let server_task = tokio::spawn(server.run());
+
+        let responder = tokio::spawn(async move {
+            let mut callers = Vec::new();
+            for _ in 0..2 {
+                let envelope = requests.recv().await.expect("missing bridged request");
+                let operation = match &envelope.operation {
+                    TaskControlOperation::List(_) => "list",
+                    TaskControlOperation::UpdateHandoff(_) => "handoff",
+                    other => panic!("unexpected bridged operation: {other:?}"),
+                };
+                callers.push((operation, envelope.caller.clone()));
+                envelope.reply.send(Ok(serde_json::json!({ "tasks": [] })));
+            }
+            callers
+        });
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(endpoint).auth_header(token),
+        );
+        let client = tokio::time::timeout(Duration::from_secs(5), ().serve(transport))
+            .await
+            .expect("MCP initialization timed out")
+            .expect("MCP initialization failed");
+        let list = client
+            .call_tool(rmcp::model::CallToolRequestParams::new("task_list"))
+            .await
+            .unwrap();
+        assert!(!list.is_error.unwrap_or(false));
+        let handoff = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("task_update_handoff").with_arguments(
+                    serde_json::Map::from_iter([
+                        ("task_id".to_string(), Value::from("task-1")),
+                        ("summary".to_string(), Value::from("done")),
+                    ]),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(!handoff.is_error.unwrap_or(false));
+        assert_eq!(
+            responder.await.unwrap(),
+            vec![
+                ("list", Some("abc".to_string())),
+                ("handoff", Some("abc".to_string())),
+            ]
+        );
+        client.cancel().await.unwrap();
+
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("task MCP server did not shut down")
+            .expect("task MCP task panicked")
+            .expect("task MCP server returned an error");
+    }
+
+    fn call(name: &str, arguments: Value) -> rmcp::model::CallToolRequestParams {
+        let Value::Object(arguments) = arguments else {
+            panic!("arguments must be an object");
+        };
+        rmcp::model::CallToolRequestParams::new(name.to_string()).with_arguments(arguments)
+    }
+
+    fn structured(result: &CallToolResult) -> Value {
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "tool failed: {:?}",
+            result.content
+        );
+        result
+            .structured_content
+            .clone()
+            .expect("structured result")
+    }
+
+    fn error_text(result: &CallToolResult) -> String {
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected an error: {result:?}"
+        );
+        result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A fake GitTerm bridge for the delegation tools: a real task store in a
+    /// temporary directory and the same pure rules the app uses, but no
+    /// Codex runner, so a request stays `requested`.
+    fn spawn_delegation_bridge(
+        mut requests: mpsc::UnboundedReceiver<TaskControlEnvelope>,
+        store_dir: PathBuf,
+        bridged: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        use crate::delegations::{self, CallerTab};
+        use crate::tasks::{Delegation, TaskStore};
+        tokio::spawn(async move {
+            let mut store = TaskStore::load(TaskStore::path_for_config_root(&store_dir)).unwrap();
+            let mut clock = 0;
+            while let Some(envelope) = requests.recv().await {
+                let caller = envelope.caller.clone();
+                let tab = CallerTab {
+                    session_uid: caller.clone().unwrap_or_default(),
+                    chat_session_id: None,
+                    workspace: "scratch".to_string(),
+                    cwd: store_dir.clone(),
+                    remote: false,
+                };
+                clock += 1;
+                let now = format!("2026-10-08T10:00:{clock:02}Z");
+                let (name, result) = match envelope.operation {
+                    TaskControlOperation::RequestReview(request) => (
+                        "review_request",
+                        delegations::review_delegation(&request, &tab, None, None).and_then(
+                            |new| {
+                                let delegation = Delegation::new_requested(new, now);
+                                let id = delegation.delegation_id.clone();
+                                store
+                                    .insert_delegation(delegation)
+                                    .map_err(|error| error.to_string())?;
+                                Ok(serde_json::json!({ "delegation_id": id }))
+                            },
+                        ),
+                    ),
+                    TaskControlOperation::RequestConsult(request) => (
+                        "consult_request",
+                        delegations::consult_delegation(&request, &tab, None, None).and_then(
+                            |new| {
+                                let delegation = Delegation::new_requested(new, now);
+                                let id = delegation.delegation_id.clone();
+                                store
+                                    .insert_delegation(delegation)
+                                    .map_err(|error| error.to_string())?;
+                                Ok(serde_json::json!({ "delegation_id": id }))
+                            },
+                        ),
+                    ),
+                    TaskControlOperation::GetDelegation(request) => (
+                        "delegation_get",
+                        store
+                            .delegation(&request.delegation_id)
+                            .ok_or_else(|| {
+                                format!("delegation {} does not exist", request.delegation_id)
+                            })
+                            .and_then(|delegation| {
+                                delegations::delegation_record(delegation, &store_dir)
+                            }),
+                    ),
+                    TaskControlOperation::ListDelegations(request) => (
+                        "delegation_list",
+                        delegations::delegation_list(
+                            &store.delegations_for_parent(&tab.session_uid),
+                            request.status.as_deref(),
+                        ),
+                    ),
+                    other => panic!("unexpected bridged operation: {other:?}"),
+                };
+                bridged.lock().unwrap().push((name.to_string(), caller));
+                envelope.reply.send(result);
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn delegation_tools_need_a_caller_return_ids_at_once_and_list_newest_first() {
+        let (commands, requests) = mpsc::unbounded_channel();
+        let (connection, server) = prepare("delegation-test", commands).unwrap();
+        let token = connection.token.clone();
+        let server_task = tokio::spawn(server.run());
+        let store_dir = tempfile::tempdir().unwrap();
+        let bridged = Arc::new(Mutex::new(Vec::new()));
+        let bridge =
+            spawn_delegation_bridge(requests, store_dir.path().to_path_buf(), bridged.clone());
+
+        // Without a caller every delegation tool is refused before the bridge.
+        let anonymous = tokio::time::timeout(
+            Duration::from_secs(5),
+            ().serve(StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(connection.endpoint().to_string())
+                    .auth_header(token.clone()),
+            )),
+        )
+        .await
+        .expect("MCP initialization timed out")
+        .expect("MCP initialization failed");
+        for (name, arguments) in [
+            (
+                "review_request",
+                serde_json::json!({ "target": "uncommitted" }),
+            ),
+            (
+                "consult_request",
+                serde_json::json!({ "brief": "Which way?" }),
+            ),
+            (
+                "delegation_get",
+                serde_json::json!({ "delegation_id": "x" }),
+            ),
+            ("delegation_list", serde_json::json!({})),
+        ] {
+            let result = anonymous.call_tool(call(name, arguments)).await.unwrap();
+            let text = error_text(&result);
+            assert!(
+                text.contains(&format!("{name} needs the calling GitTerm tab's identity")),
+                "{text}"
+            );
+            assert!(text.contains("?caller="), "{text}");
+        }
+        assert!(bridged.lock().unwrap().is_empty());
+        anonymous.cancel().await.unwrap();
+
+        let client = tokio::time::timeout(
+            Duration::from_secs(5),
+            ().serve(StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(caller_endpoint(
+                    connection.endpoint(),
+                    Some("tab-a"),
+                ))
+                .auth_header(token),
+            )),
+        )
+        .await
+        .expect("MCP initialization timed out")
+        .expect("MCP initialization failed");
+
+        // The id comes back without waiting for any review.
+        let started = std::time::Instant::now();
+        let first = structured(
+            &client
+                .call_tool(call(
+                    "review_request",
+                    serde_json::json!({ "target": "base", "base_ref": "v5", "focus": "webview lifecycle" }),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let first_id = first["delegation_id"].as_str().unwrap().to_string();
+        let second = structured(
+            &client
+                .call_tool(call(
+                    "consult_request",
+                    serde_json::json!({ "brief": "Split main.rs?" }),
+                ))
+                .await
+                .unwrap(),
+        );
+        let second_id = second["delegation_id"].as_str().unwrap().to_string();
+        assert_ne!(first_id, second_id);
+
+        // Request validation errors come back as tool errors.
+        let bad = client
+            .call_tool(call(
+                "review_request",
+                serde_json::json!({ "target": "commit" }),
+            ))
+            .await
+            .unwrap();
+        assert!(error_text(&bad).contains("needs commit"));
+
+        let record = structured(
+            &client
+                .call_tool(call(
+                    "delegation_get",
+                    serde_json::json!({ "delegation_id": first_id }),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(record["kind"], "review");
+        assert_eq!(record["status"]["state"], "requested");
+        assert_eq!(record["parent"]["session_uid"], "tab-a");
+        assert_eq!(record["target"]["mode"]["reference"], "v5");
+        assert!(record["log_path"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("delegations/{first_id}.jsonl")));
+
+        let list = structured(
+            &client
+                .call_tool(call("delegation_list", serde_json::json!({})))
+                .await
+                .unwrap(),
+        );
+        let ids: Vec<&str> = list["delegations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["delegation_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [second_id.as_str(), first_id.as_str()]);
+        let requested = structured(
+            &client
+                .call_tool(call(
+                    "delegation_list",
+                    serde_json::json!({ "status": "requested" }),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(requested["delegations"].as_array().unwrap().len(), 2);
+        let none = structured(
+            &client
+                .call_tool(call(
+                    "delegation_list",
+                    serde_json::json!({ "status": "completed" }),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(none["delegations"].as_array().unwrap().is_empty());
+
+        assert!(bridged
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, caller)| caller.as_deref() == Some("tab-a")));
+        client.cancel().await.unwrap();
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("task MCP server did not shut down")
+            .expect("task MCP task panicked")
+            .expect("task MCP server returned an error");
+        bridge.abort();
+    }
+
+    /// A fake GitTerm bridge for `delegate_task` and worker reports: a real
+    /// task store, the same pure rules as the app, a task created in place
+    /// of a git worktree and a simulated launch (no terminal) whose session
+    /// is hosted by the tab `worker_caller`.
+    fn spawn_worker_bridge(
+        mut requests: mpsc::UnboundedReceiver<TaskControlEnvelope>,
+        store_dir: PathBuf,
+        worker_caller: &'static str,
+        bridged: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        use crate::delegations::{self, CallerTab};
+        use crate::tasks::{Delegation, TaskHandoff, TaskSessionRecord, TaskStore};
+        use crate::workers::{resolve_worker, ModelPolicy, PresetRef};
+        tokio::spawn(async move {
+            let mut store = TaskStore::load(TaskStore::path_for_config_root(&store_dir)).unwrap();
+            // caller session_uid -> (task id, task session id) it hosts.
+            let mut hosted: std::collections::HashMap<String, (String, String)> =
+                Default::default();
+            let presets = [
+                PresetRef {
+                    name: "Claude Code",
+                    command: "claude",
+                },
+                PresetRef {
+                    name: "Codex",
+                    command: "codex",
+                },
+            ];
+            while let Some(envelope) = requests.recv().await {
+                let caller = envelope.caller.clone();
+                let now = chrono::Utc::now().to_rfc3339();
+                let (name, result) = match envelope.operation {
+                    TaskControlOperation::DelegateTask(request) => (
+                        "delegate_task",
+                        (|| {
+                            let tab = CallerTab {
+                                session_uid: caller.clone().ok_or("no caller")?,
+                                chat_session_id: None,
+                                workspace: "scratch".to_string(),
+                                cwd: store_dir.clone(),
+                                remote: false,
+                            };
+                            let choice = resolve_worker(
+                                &presets,
+                                request.preset_name.as_deref(),
+                                request.role,
+                                request.model.as_deref(),
+                                &ModelPolicy::default(),
+                            )?;
+                            let task_id = format!("task-{}", store.tasks().len() + 1);
+                            let mut task =
+                                delegations::test_task(&task_id, &store_dir.join("worktree"));
+                            task.title = request.title.clone();
+                            task.objective = request.objective.clone();
+                            store.insert(task).map_err(|error| error.to_string())?;
+                            let delegation = Delegation::new_requested(
+                                delegations::worker_delegation(
+                                    &tab,
+                                    &task_id,
+                                    &request.title,
+                                    &request.objective,
+                                    &choice,
+                                )?,
+                                now.clone(),
+                            );
+                            let id = delegation.delegation_id.clone();
+                            store
+                                .insert_delegation(delegation)
+                                .map_err(|error| error.to_string())?;
+                            let session_id = format!("{task_id}-session");
+                            store
+                                .upsert_session(
+                                    &task_id,
+                                    TaskSessionRecord {
+                                        task_session_id: session_id.clone(),
+                                        label: choice.preset_name.clone(),
+                                        harness: None,
+                                        conversation: None,
+                                        objective_delivery:
+                                            crate::tasks::ObjectiveDeliveryState::Delivered,
+                                        created_at: now.clone(),
+                                        updated_at: now.clone(),
+                                    },
+                                    &now,
+                                )
+                                .map_err(|error| error.to_string())?;
+                            store
+                                .attach_worker_session(&id, &session_id, None, &now)
+                                .map_err(|error| error.to_string())?;
+                            hosted.insert(
+                                worker_caller.to_string(),
+                                (task_id.clone(), session_id.clone()),
+                            );
+                            Ok(serde_json::json!({
+                                "delegation_id": id,
+                                "task_id": task_id,
+                                "task_session_id": session_id,
+                                "worktree_path": store_dir.join("worktree"),
+                                "branch": "tracey/tru-150-excalidraw-export",
+                                "preset_name": choice.preset_name,
+                                "model": choice.model,
+                            }))
+                        })(),
+                    ),
+                    TaskControlOperation::UpdateHandoff(request) => ("task_update_handoff", {
+                        let hosted_session = caller
+                            .as_deref()
+                            .and_then(|caller| hosted.get(caller))
+                            .filter(|(task, _)| *task == request.task_id)
+                            .map(|(_, session)| session.clone());
+                        delegations::record_handoff(
+                            &mut store,
+                            &request.task_id,
+                            TaskHandoff {
+                                summary: request.summary.clone(),
+                                decisions: request.decisions.clone(),
+                                next_steps: request.next_steps.clone(),
+                                blockers: request.blockers.clone(),
+                                updated_by_session_id: hosted_session.clone(),
+                                updated_at: now.clone(),
+                            },
+                            request.status.unwrap_or_default(),
+                            hosted_session.as_deref(),
+                            &now,
+                        )
+                        .map(|delegation| serde_json::json!({ "delegation_id": delegation }))
+                    }),
+                    TaskControlOperation::GetDelegation(request) => (
+                        "delegation_get",
+                        store
+                            .delegation(&request.delegation_id)
+                            .ok_or_else(|| "missing".to_string())
+                            .and_then(|delegation| {
+                                delegations::delegation_record(delegation, &store_dir)
+                            }),
+                    ),
+                    other => panic!("unexpected bridged operation: {other:?}"),
+                };
+                bridged.lock().unwrap().push((name.to_string(), caller));
+                envelope.reply.send(result.map_err(|error: String| error));
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_delegated_worker_reports_done_to_the_parent_delegation() {
+        let (commands, requests) = mpsc::unbounded_channel();
+        let (connection, server) = prepare("worker-test", commands).unwrap();
+        let token = connection.token.clone();
+        let server_task = tokio::spawn(server.run());
+        let store_dir = tempfile::tempdir().unwrap();
+        let bridged = Arc::new(Mutex::new(Vec::new()));
+        let bridge = spawn_worker_bridge(
+            requests,
+            store_dir.path().to_path_buf(),
+            "worker-tab",
+            bridged.clone(),
+        );
+        let client_for = |caller: Option<&str>| {
+            let uri = caller_endpoint(connection.endpoint(), caller);
+            let token = token.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ().serve(StreamableHttpClientTransport::from_config(
+                        StreamableHttpClientTransportConfig::with_uri(uri).auth_header(token),
+                    )),
+                )
+                .await
+                .expect("MCP initialization timed out")
+                .expect("MCP initialization failed")
+            }
+        };
+
+        // No caller: refused before the bridge.
+        let anonymous = client_for(None).await;
+        let refused = anonymous
+            .call_tool(call(
+                "delegate_task",
+                serde_json::json!({ "title": "x", "objective": "y" }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            error_text(&refused).contains("delegate_task needs the calling GitTerm tab's identity")
+        );
+        anonymous.cancel().await.unwrap();
+        assert!(bridged.lock().unwrap().is_empty());
+
+        let parent = client_for(Some("tab-a")).await;
+        let delegated = structured(
+            &parent
+                .call_tool(call(
+                    "delegate_task",
+                    serde_json::json!({
+                        "title": "Fix the Excalidraw export",
+                        "objective": "Keep embedded images; stop when tests pass.",
+                        "issue_key": "TRU-150",
+                        "stopping_boundary": "implement_until_tests_pass",
+                        "role": "judgment",
+                    }),
+                ))
+                .await
+                .unwrap(),
+        );
+        let delegation_id = delegated["delegation_id"].as_str().unwrap().to_string();
+        let task_id = delegated["task_id"].as_str().unwrap().to_string();
+        assert_eq!(delegated["preset_name"], "Codex");
+        assert_eq!(delegated["model"], "gpt-6.1-sol");
+        assert!(delegated["task_session_id"].as_str().is_some());
+
+        // The parent cannot report done on the worker's behalf.
+        let not_worker = parent
+            .call_tool(call(
+                "task_update_handoff",
+                serde_json::json!({ "task_id": task_id, "summary": "done?", "status": "done" }),
+            ))
+            .await
+            .unwrap();
+        assert!(error_text(&not_worker).contains("only the worker's own GitTerm tab"));
+
+        let worker = client_for(Some("worker-tab")).await;
+        let progress = structured(
+            &worker
+                .call_tool(call(
+                    "task_update_handoff",
+                    serde_json::json!({ "task_id": task_id, "summary": "Wrote the failing test" }),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert!(progress["delegation_id"].is_null());
+        let done = structured(
+            &worker
+                .call_tool(call(
+                    "task_update_handoff",
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "summary": "Export keeps images; cargo test passes",
+                        "decisions": ["Embed as data URLs"],
+                        "next_steps": ["Review the branch"],
+                        "status": "done",
+                    }),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(done["delegation_id"], delegation_id.as_str());
+        worker.cancel().await.unwrap();
+
+        let record = structured(
+            &parent
+                .call_tool(call(
+                    "delegation_get",
+                    serde_json::json!({ "delegation_id": delegation_id }),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(record["kind"], "implement");
+        assert_eq!(record["status"]["state"], "completed");
+        assert_eq!(record["parent"]["session_uid"], "tab-a");
+        assert_eq!(record["child"]["runner"], "task_session");
+        assert_eq!(record["child"]["role"], "judgment");
+        let handoff = &record["result"]["handoff"];
+        assert_eq!(handoff["summary"], "Export keeps images; cargo test passes");
+        assert_eq!(handoff["decisions"][0], "Embed as data URLs");
+        parent.cancel().await.unwrap();
+
+        let calls = bridged.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("delegate_task".to_string(), Some("tab-a".to_string())),
+                ("task_update_handoff".to_string(), Some("tab-a".to_string())),
+                (
+                    "task_update_handoff".to_string(),
+                    Some("worker-tab".to_string())
+                ),
+                (
+                    "task_update_handoff".to_string(),
+                    Some("worker-tab".to_string())
+                ),
+                ("delegation_get".to_string(), Some("tab-a".to_string())),
+            ]
+        );
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("task MCP server did not shut down")
+            .expect("task MCP task panicked")
+            .expect("task MCP server returned an error");
+        bridge.abort();
     }
 }

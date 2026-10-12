@@ -161,6 +161,29 @@ mod tests {
     }
 
     #[test]
+    fn workspace_tab_session_uid_is_optional_and_round_trips() {
+        let existing: WorkspaceTabConfig =
+            serde_json::from_value(serde_json::json!({ "dir": "/repo" })).unwrap();
+        assert_eq!(existing.session_uid, None);
+        assert!(serde_json::to_value(&existing)
+            .unwrap()
+            .get("session_uid")
+            .is_none());
+
+        let tab: WorkspaceTabConfig = serde_json::from_value(serde_json::json!({
+            "dir": "/repo",
+            "session_uid": "7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90"
+        }))
+        .unwrap();
+        let encoded = serde_json::to_string(&tab).unwrap();
+        let decoded: WorkspaceTabConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.session_uid.as_deref(),
+            Some("7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90")
+        );
+    }
+
+    #[test]
     fn test_resolve_config_dir_override_unset() {
         assert_eq!(resolve_config_dir_override(None), None);
     }
@@ -181,6 +204,125 @@ mod tests {
             resolve_config_dir_override(Some("/tmp/gitterm-dev".into())),
             Some(PathBuf::from("/tmp/gitterm-dev"))
         );
+    }
+
+    #[test]
+    fn review_defaults_to_an_opus_claude_subagent_and_old_configs_load() {
+        let mut serialized = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(
+            serialized["review"],
+            serde_json::json!({
+                "default_reviewer": "claude-subagent",
+                "subagent_model": "opus",
+                "max_concurrent_reviews": 2
+            })
+        );
+        serialized.as_object_mut().unwrap().remove("review");
+        let existing: Config = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(existing.review, ReviewConfig::default());
+
+        serialized["review"] = serde_json::json!({"default_reviewer": "codex"});
+        let codex: Config = serde_json::from_value(serialized).unwrap();
+        assert_eq!(codex.review.default_reviewer, ReviewerKind::Codex);
+        assert_eq!(codex.review.subagent_model, "opus");
+        assert_eq!(codex.review.codex_model, None);
+        assert_eq!(codex.review.max_concurrent_reviews, 2);
+    }
+
+    #[test]
+    fn the_worker_model_policy_is_seeded_and_old_configs_load() {
+        let mut serialized = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(
+            serialized["policy"],
+            serde_json::json!({
+                "claude": {"coordinator": "opus", "scoped": "sonnet", "judgment": "opus", "specialist": "fable"},
+                "codex": {"coordinator": "gpt-6.1-sol", "scoped": "gpt-6-luna", "judgment": "gpt-6.1-sol", "specialist": "gpt-6-astra"}
+            })
+        );
+        serialized.as_object_mut().unwrap().remove("policy");
+        let existing: Config = serde_json::from_value(serialized).unwrap();
+        assert_eq!(existing.policy, gitterm::workers::ModelPolicy::default());
+    }
+
+    #[test]
+    fn usage_price_overrides_load_and_survive_a_save() {
+        // An older config without `usage` has no overrides.
+        let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(config.usage, gitterm::usage::UsageConfig::default());
+        let config: Config = serde_json::from_str(
+            r#"{"theme":"dark","usage":{"pricing":{
+                "gpt-6-astra":{"input":1.0,"output":8.0,"cache_read":0.1,"cache_write":0.0},
+                "claude-haiku-5-5":null}}}"#,
+        )
+        .unwrap();
+        let astra = config.usage.pricing["gpt-6-astra"].unwrap();
+        assert_eq!((astra.input, astra.output), (1.0, 8.0));
+        assert_eq!(config.usage.pricing["claude-haiku-5-5"], None);
+        let saved: Config = serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(saved.usage, config.usage);
+    }
+
+    #[test]
+    fn needs_you_notifications_default_on_and_can_be_switched_off() {
+        // An older config without `notifications` notifies.
+        let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(config.notifications.needs_you);
+        let config: Config =
+            serde_json::from_str(r#"{"theme":"dark","notifications":{}}"#).unwrap();
+        assert!(config.notifications.needs_you);
+        let config: Config =
+            serde_json::from_str(r#"{"theme":"dark","notifications":{"needs_you":false}}"#)
+                .unwrap();
+        assert!(!config.notifications.needs_you);
+        assert!(Config::default().notifications.needs_you);
+    }
+
+    #[test]
+    fn new_chats_use_the_defaults_until_something_is_picked() {
+        // An older config without `chat` gets the defaults.
+        let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(config.chat, ChatDefaults::default());
+        let mut chat = ChatDefaults {
+            default_effort: Some("high".into()),
+            ..ChatDefaults::default()
+        };
+        assert_eq!(
+            chat.new_chat_selection(),
+            ChatSelection {
+                model: "opus".into(),
+                effort: Some("high".into())
+            }
+        );
+        // Picking a model keeps the effort a new chat would have had.
+        chat.remember_model("sonnet");
+        assert_eq!(
+            chat.new_chat_selection(),
+            ChatSelection {
+                model: "sonnet".into(),
+                effort: Some("high".into())
+            }
+        );
+        chat.remember_effort(None);
+        assert_eq!(
+            chat.new_chat_selection(),
+            ChatSelection {
+                model: "sonnet".into(),
+                effort: None
+            }
+        );
+        // With remembering off, the configured defaults win again.
+        chat.remember_last = false;
+        assert_eq!(
+            chat.new_chat_selection(),
+            ChatSelection {
+                model: "opus".into(),
+                effort: Some("high".into())
+            }
+        );
+        let json = serde_json::to_value(&chat).unwrap();
+        assert_eq!(json["last"]["model"], "sonnet");
+        let back: ChatDefaults = serde_json::from_value(json).unwrap();
+        assert_eq!(back, chat);
     }
 
     #[test]
@@ -370,6 +512,191 @@ pub struct Config {
     /// would strand every dispatch.
     #[serde(default = "default_max_concurrent_local_tasks")]
     pub max_concurrent_local_tasks: usize,
+    /// Defaults for the chat tab's Review… button (TRU-142).
+    #[serde(default)]
+    pub review: ReviewConfig,
+    /// Model and effort for new chats, and the last selection (TRU-143).
+    #[serde(default)]
+    pub chat: ChatDefaults,
+    /// Which model each worker role runs on, per provider, for
+    /// `delegate_task` (TRU-142 S6, TRU-144). Seeded with the routing table;
+    /// see `gitterm::workers::ModelPolicy`.
+    #[serde(default)]
+    pub policy: gitterm::workers::ModelPolicy,
+    /// Usage panel settings: per-model price overrides (TRU-145); see
+    /// `gitterm::usage::UsageConfig`.
+    #[serde(default)]
+    pub usage: gitterm::usage::UsageConfig,
+    /// macOS notifications (TRU-148).
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+}
+
+/// Which macOS notifications GitTerm posts (TRU-148). Edit the
+/// `notifications` object in `config.json`:
+///
+/// ```json
+/// "notifications": { "needs_you": true }
+/// ```
+///
+/// `needs_you`: notify when a tab that is not in front starts waiting on the
+/// human (an input or approval request, a blocked worker, a task needing
+/// input).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    #[serde(default = "default_true")]
+    pub needs_you: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self { needs_you: true }
+    }
+}
+
+fn default_chat_model() -> String {
+    "opus".to_string()
+}
+
+/// What a new chat tab starts with (TRU-143). The app has no settings
+/// panel; edit the `chat` object in `config.json`:
+///
+/// ```json
+/// "chat": { "default_model": "opus", "default_effort": "high", "remember_last": true }
+/// ```
+///
+/// `default_model` is a Claude model alias (`default` leaves the choice to
+/// the user's Claude settings); `default_effort` is one of the CLI's effort
+/// levels (`low`, `medium`, `high`, `xhigh`, `max`), or absent for the
+/// model's own default. With `remember_last`, a new chat starts with the
+/// model and effort last picked on any chat (`last`, written by the app)
+/// instead of the defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatDefaults {
+    #[serde(default = "default_chat_model")]
+    pub default_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    #[serde(default = "default_true")]
+    pub remember_last: bool,
+    /// The model and effort last picked on any chat. One global selection,
+    /// not per workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<ChatSelection>,
+}
+
+/// A chat's model and effort (`effort: None` is the model's default).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSelection {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl Default for ChatDefaults {
+    fn default() -> Self {
+        Self {
+            default_model: default_chat_model(),
+            default_effort: None,
+            remember_last: true,
+            last: None,
+        }
+    }
+}
+
+impl ChatDefaults {
+    /// The configured defaults, ignoring any remembered selection.
+    fn defaults(&self) -> ChatSelection {
+        ChatSelection {
+            model: self.default_model.clone(),
+            effort: self.default_effort.clone(),
+        }
+    }
+
+    /// What a new chat starts with: the last selection when remembering is
+    /// on and one exists, else the configured defaults.
+    pub fn new_chat_selection(&self) -> ChatSelection {
+        match &self.last {
+            Some(last) if self.remember_last => last.clone(),
+            _ => self.defaults(),
+        }
+    }
+
+    /// Record a model picked on a chat; the effort stays as the next new
+    /// chat would have it.
+    pub fn remember_model(&mut self, model: &str) {
+        let mut selection = self.new_chat_selection();
+        selection.model = model.to_string();
+        self.last = Some(selection);
+    }
+
+    /// Record an effort picked on a chat.
+    pub fn remember_effort(&mut self, effort: Option<&str>) {
+        let mut selection = self.new_chat_selection();
+        selection.effort = effort.map(str::to_string);
+        self.last = Some(selection);
+    }
+}
+
+/// Who reviews code when the chat tab's Review… button is pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewerKind {
+    /// A subagent spawned by the chat's own Claude through its Agent tool.
+    #[default]
+    ClaudeSubagent,
+    /// An independent `codex exec review` run owned by GitTerm (TRU-142).
+    Codex,
+}
+
+impl ReviewerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeSubagent => "claude-subagent",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+fn default_review_subagent_model() -> String {
+    "opus".to_string()
+}
+
+/// Concurrent Codex runs (reviews and consults) before new requests queue
+/// (TRU-142 decision D7).
+pub const DEFAULT_MAX_CONCURRENT_REVIEWS: usize = 2;
+
+fn default_max_concurrent_reviews() -> usize {
+    DEFAULT_MAX_CONCURRENT_REVIEWS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    #[serde(default)]
+    pub default_reviewer: ReviewerKind,
+    /// The Agent tool `model` a Claude-subagent review runs on.
+    #[serde(default = "default_review_subagent_model")]
+    pub subagent_model: String,
+    /// `codex -m <model>` for Codex reviews and consults; `None` keeps
+    /// Codex's configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
+    /// Codex runs (reviews and consults) that may run at once; further
+    /// requests wait as `requested` and start when a slot frees. Zero is
+    /// treated as 1.
+    #[serde(default = "default_max_concurrent_reviews")]
+    pub max_concurrent_reviews: usize,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            default_reviewer: ReviewerKind::default(),
+            subagent_model: default_review_subagent_model(),
+            codex_model: None,
+            max_concurrent_reviews: default_max_concurrent_reviews(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +804,11 @@ impl Default for Config {
             quick_commands: Vec::new(),
             task_worktree_root: default_task_worktree_root(),
             max_concurrent_local_tasks: default_max_concurrent_local_tasks(),
+            review: ReviewConfig::default(),
+            chat: ChatDefaults::default(),
+            policy: gitterm::workers::ModelPolicy::default(),
+            usage: gitterm::usage::UsageConfig::default(),
+            notifications: NotificationsConfig::default(),
         }
     }
 }
@@ -652,6 +984,12 @@ pub struct WorkspaceTabConfig {
     /// share one task id; this id distinguishes their sessions across restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_session_id: Option<String>,
+    /// Durable caller identity of this tab (uuid v4). Every tab carries one
+    /// on its task MCP URL (`?caller=<uid>`) so the task server can tell
+    /// which tab made a call. Older files predate it; a missing value is
+    /// generated when the tab is restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_uid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

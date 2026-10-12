@@ -1,0 +1,1 @@
+The only change expands the module docstring in stats.py. It does not alter behavior or introduce any actionable issues.
