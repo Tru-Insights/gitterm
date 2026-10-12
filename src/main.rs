@@ -418,7 +418,19 @@ fn history_timeline(
                 gitterm::delegations::anchor_payload(&id),
             ));
         }
-        timeline.push(tab::AgentEvent::from(timed.entry));
+        let at_ms = timed
+            .at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.timestamp_millis());
+        let event = tab::AgentEvent::from(timed.entry);
+        let started = tab::subagent_started(&event).map(str::to_string);
+        timeline.push(event);
+        if let (Some(parent), Some(at_ms)) = (started, at_ms) {
+            timeline.push(tab::AgentEvent::Other(tab::subagent_started_at(
+                &parent, at_ms,
+            )));
+        }
     }
     timeline.extend(
         anchors.map(|(_, id)| tab::AgentEvent::Other(gitterm::delegations::anchor_payload(&id))),
@@ -34981,6 +34993,29 @@ mod tests {
         for js in AGENT_CHAT_VENDOR_JS {
             assert!(!js.contains("</script"));
         }
+    }
+
+    #[test]
+    fn agent_session_record_stamps_subagent_starts() {
+        let mut session = AgentSession::new(tab::AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        session.record(tab::AgentEvent::Harness(HarnessEvent::SubagentEvent {
+            parent_tool_use_id: "toolu_a".into(),
+            event: Box::new(HarnessEvent::TurnStarted {
+                session_id: None,
+                model: None,
+            }),
+        }));
+        assert_eq!(session.conversation.len(), 2);
+        let tab::AgentEvent::Other(marker) = &session.conversation[1] else {
+            panic!("no start marker: {:?}", session.conversation[1]);
+        };
+        assert_eq!(marker["kind"], "subagent_started_at");
+        assert_eq!(marker["id"], "toolu_a");
+        assert!(marker["at_ms"].as_i64().unwrap() > 1_700_000_000_000);
     }
 
     #[test]

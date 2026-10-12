@@ -17,10 +17,10 @@ mod agent;
 pub(crate) use agent::submit_queues;
 #[allow(unused_imports)]
 pub(crate) use agent::{
-    checkout_choices, checkout_label, spawn_agent_task, AgentBackend, AgentBackendConfig,
-    AgentEvent, AgentInput, AgentSession, AgentSessionState, AgentTaskHandle, CheckoutChoice,
-    HistoryLoad, TaskWorktreeInfo, CLAUDE_EFFORT_LEVELS, CLAUDE_PERMISSION_MODES,
-    DEFAULT_CLAUDE_PERMISSION_MODE,
+    checkout_choices, checkout_label, spawn_agent_task, subagent_started, subagent_started_at,
+    AgentBackend, AgentBackendConfig, AgentEvent, AgentInput, AgentSession, AgentSessionState,
+    AgentTaskHandle, CheckoutChoice, HistoryLoad, TaskWorktreeInfo, CLAUDE_EFFORT_LEVELS,
+    CLAUDE_PERMISSION_MODES, DEFAULT_CLAUDE_PERMISSION_MODE,
 };
 
 use std::path::PathBuf;

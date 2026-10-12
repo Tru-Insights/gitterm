@@ -196,6 +196,25 @@ impl From<TranscriptEntry> for AgentEvent {
     }
 }
 
+/// The Agent call whose subagent `ev` starts, if it is a subagent start.
+pub(crate) fn subagent_started(ev: &AgentEvent) -> Option<&str> {
+    match ev {
+        AgentEvent::Harness(HarnessEvent::SubagentEvent {
+            parent_tool_use_id,
+            event,
+        }) if matches!(**event, HarnessEvent::TurnStarted { .. }) => {
+            Some(parent_tool_use_id.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// The timeline marker for when Agent call `parent`'s subagent started
+/// (Unix ms). The chat page uses it when the start was not seen live.
+pub(crate) fn subagent_started_at(parent: &str, at_ms: i64) -> serde_json::Value {
+    serde_json::json!({ "kind": "subagent_started_at", "id": parent, "at_ms": at_ms })
+}
+
 /// Whether a resumed session's earlier timeline has been read back from
 /// its transcript (Claude backend; TRU-140).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,7 +274,9 @@ impl AgentSession {
     }
 
     /// Append an event to the conversation buffer, merging consecutive
-    /// streaming fragments so tab switches replay a compact buffer.
+    /// streaming fragments so tab switches replay a compact buffer. A
+    /// subagent's start is followed by when it started, so a rebuilt page
+    /// still knows its elapsed time and where it falls in the roster.
     pub(crate) fn record(&mut self, ev: AgentEvent) {
         if let (Some(AgentEvent::Harness(last)), AgentEvent::Harness(next)) =
             (self.conversation.last_mut(), &ev)
@@ -264,7 +285,16 @@ impl AgentSession {
                 return;
             }
         }
+        let started = subagent_started(&ev).map(str::to_string);
         self.conversation.push(ev);
+        if let Some(parent) = started {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            self.conversation
+                .push(AgentEvent::Other(subagent_started_at(&parent, now_ms)));
+        }
     }
 
     /// The Claude process settings for this tab. `model` "default" (or

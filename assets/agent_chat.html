@@ -614,6 +614,7 @@
   let steerable = false;      // the harness takes messages mid-turn (Claude)
   const queued = new Map();   // message id -> {msg, tag, x}: sent mid-turn, not yet picked up
   let replaying = false;      // __replay is feeding the buffer
+  let rosterSeq = 0;          // roster: creation order of subagents and cards
   let follow = true;          // live-follow: stick to the bottom
   let segment = null;         // current assistant text segment
   let thinking = null;        // current thinking block
@@ -885,8 +886,10 @@
       toolsEl: null, textEl: null,
       state: 'running', tracked: false, waiting: false,
       tools: [], text: '', model: null,
-      // Roster: elapsed is only known for subagents seen live.
-      startMs: replaying ? null : Date.now(), endMs: null, tokens: null, fromReplay: replaying,
+      // Roster: a replay learns the start from a subagent_started_at
+      // marker and the duration from the completion's usage.
+      startMs: replaying ? null : Date.now(), endMs: null, durationMs: null, tokens: null,
+      fromReplay: replaying, seq: ++rosterSeq,
     };
     subagents.push(sub);
     const body = d.appendChild(el('div', 'sa-body'));
@@ -915,8 +918,16 @@
     sub.details.className = 'subagent ' + sub.state;
     sub.latestEl.textContent = lastLine(sub.text);
     sub.latestEl.style.display = sub.text ? '' : 'none';
-    if (sub.state !== 'running' && sub.startMs != null && sub.endMs == null) sub.endMs = Date.now();
+    if (!replaying && sub.state !== 'running' && sub.startMs != null && sub.endMs == null) sub.endMs = Date.now();
     if (!replaying) renderRoster();
+  }
+  // When a subagent started (Unix ms), recorded by GitTerm; only fills in a
+  // start the page did not see live.
+  function subagentStartedAt(id, atMs) {
+    const item = items.get(id);
+    if (!item || typeof atMs !== 'number') return;
+    const sub = ensureSubagent(item);
+    if (sub.startMs == null) sub.startMs = atMs;
   }
   function subagentEvent(parentId, ev) {
     const rootId = items.has(parentId) ? parentId : subTools.get(parentId);
@@ -936,6 +947,7 @@
         const usage = (d && d.usage) || {};
         const tokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : (typeof usage.total_tokens === 'number' ? usage.total_tokens : null);
         if (tokens != null) sub.tokens = tokens;
+        if (typeof usage.duration_ms === 'number') sub.durationMs = usage.duration_ms;
         if (st === 'failed' && d.status.message) sub.text += (sub.text ? '\n' : '') + d.status.message;
         break;
       }
@@ -1726,7 +1738,7 @@
       whatEl: summary.appendChild(el('span', 'dlg-what')),
       stateEl: summary.appendChild(el('span', 'dlg-state', 'requested')),
       body: root.appendChild(el('div', 'dlg-body')),
-      wasDismissed: false,
+      wasDismissed: false, seq: ++rosterSeq,
     };
     cards.set(id, card);
     append(root);
@@ -1989,7 +2001,11 @@
       ? (sub.waiting ? 'waiting for approval' : (last ? (last.desc || last.name) : (lastLine(sub.text) || 'starting')))
       : (sub.state === 'done' ? 'done' : sub.state);
     const parts = [];
-    if (sub.startMs != null) parts.push(fmtDur((sub.endMs != null ? sub.endMs : Date.now()) - sub.startMs));
+    let dur = null;
+    if (sub.state === 'running') { if (sub.startMs != null) dur = Date.now() - sub.startMs; }
+    else if (sub.durationMs != null) dur = sub.durationMs;
+    else if (sub.startMs != null && sub.endMs != null) dur = sub.endMs - sub.startMs;
+    if (dur != null) parts.push(fmtDur(dur));
     if (sub.tokens != null) parts.push('↓ ' + sub.tokens + ' tokens');
     return {
       key: 'sub:' + sub.item.card.dataset.toolId,
@@ -2000,6 +2016,7 @@
       target: sub.item.card,
       details: sub.details,
       live: sub.state === 'running',
+      time: sub.startMs, seq: sub.seq,
     };
   }
   function workerRow(card) {
@@ -2023,7 +2040,7 @@
       key: 'dlg:' + d.delegation_id,
       cls: ws === 'waiting' || ws === 'blocked' ? 'waiting' : ws === 'queued' || ws === 'starting' ? 'queued' : live ? 'running' : ws === 'done' ? 'done' : 'failed',
       name: 'Worker · ' + (w.preset || 'agent') + ' · ' + (w.model || childModel(d)),
-      what, meta, target: card.root, live,
+      what, meta, target: card.root, live, time: created, seq: card.seq,
     };
   }
   function delegationRow(card) {
@@ -2044,7 +2061,7 @@
       key: 'dlg:' + d.delegation_id,
       cls: live ? (st === 'requested' ? 'queued' : 'running') : st === 'completed' ? 'done' : 'failed',
       name: kindLabel(d) + ' · ' + childModel(d),
-      what, meta, target: card.root, live,
+      what, meta, target: card.root, live, time: created, seq: card.seq,
     };
   }
   // Finished subagents read back after a restart: the latest few stay so
@@ -2063,11 +2080,15 @@
       if (!d || d.dismissed_at || d.delivered_at) continue;
       rows.push(delegationRow(card));
     }
-    // Running rows first, so work in progress is in view above the
-    // finished rows in the short roster (the sort is stable).
+    // Running rows first, then newest first: by start time, or by when
+    // the row appeared when a start is unknown.
+    const newest = (a, b) => {
+      if (a.time != null && b.time != null && a.time !== b.time) return b.time - a.time;
+      return b.seq - a.seq;
+    };
     return rows
       .filter((row) => !rosterHidden.has(row.key))
-      .sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0));
+      .sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0) || newest(a, b));
   }
   // Row elements by key, updated in place. The roster re-renders every
   // second while anything runs and on every subagent event; rebuilding the
@@ -2512,6 +2533,7 @@
     try {
       if (event.kind === 'harness') { harnessEvent(event.event); return; }
       if (event.kind === 'delegation_anchor') { delegationAnchor(event.delegation_id); return; }
+      if (event.kind === 'subagent_started_at') { subagentStartedAt(event.id, event.at_ms); return; }
       if (event.kind === 'delegation') { delegationEvent(event); return; }
       if (event.type === 'user_prompt') {
         endSegment(); endThinking();

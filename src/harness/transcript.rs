@@ -10,10 +10,18 @@
 //! Only `user` and `assistant` lines matter. Everything else the CLI writes
 //! (`mode`, `file-history-*`, `cost-state`, hook summaries, sidechains) is
 //! bookkeeping and is skipped.
+//!
+//! Subagents get the lifecycle the live stream gives them: a
+//! `SubagentEvent` start after each Agent call, and an end with the
+//! subagent's tokens, tool uses and duration. A foreground subagent ends at
+//! its Agent result; a background one (result status `async_launched`) ends
+//! at the `<task-notification>` the CLI later injects, or, when the file
+//! ends first, as stopped (its process is gone).
 
+use std::collections::HashSet;
 use std::path::Path;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{HarnessEvent, ItemKind, TurnStatus};
 
@@ -64,6 +72,10 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
     // the transcript has no turn markers, so a new user prompt (or the end
     // of the file) closes the turn.
     let mut turn_open = false;
+    // Agent calls seen, and the background ones still awaiting their
+    // completion notice.
+    let mut agent_calls: HashSet<String> = HashSet::new();
+    let mut background: Vec<String> = Vec::new();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -77,8 +89,29 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
             entry,
         };
         match v["type"].as_str() {
+            // A notice that arrived mid-turn is recorded as a queued
+            // command attachment rather than a user message.
+            Some("attachment") if v["attachment"]["type"] == "queued_command" => {
+                if let Some(end) = notice_end(&mut background, &v["attachment"]["prompt"]) {
+                    out.push(timed(end));
+                }
+            }
             Some("user") => {
+                if task_notification(&v["message"]["content"]).is_some() {
+                    if let Some(end) = notice_end(&mut background, &v["message"]["content"]) {
+                        out.push(timed(end));
+                    }
+                    continue;
+                }
                 for entry in user_entries(&v["message"]["content"]) {
+                    let agent_result = match &entry {
+                        TranscriptEntry::Harness(HarnessEvent::ItemCompleted {
+                            id,
+                            is_error,
+                            ..
+                        }) if agent_calls.contains(id) => Some((id.clone(), *is_error)),
+                        _ => None,
+                    };
                     match &entry {
                         TranscriptEntry::UserPrompt(_) => {
                             if turn_open {
@@ -89,6 +122,16 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
                         TranscriptEntry::Harness(_) => turn_open = true,
                     }
                     out.push(timed(entry));
+                    let Some((id, is_error)) = agent_result else {
+                        continue;
+                    };
+                    let result = &v["toolUseResult"];
+                    if !is_error && result["status"] == "async_launched" {
+                        background.push(id);
+                    } else {
+                        let end = foreground_end(result, is_error);
+                        out.push(timed(TranscriptEntry::Harness(subagent(&id, end))));
+                    }
                 }
             }
             Some("assistant") => {
@@ -96,14 +139,40 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
                 if !events.is_empty() {
                     turn_open = true;
                 }
-                out.extend(
-                    events
-                        .into_iter()
-                        .map(|event| timed(TranscriptEntry::Harness(event))),
-                );
+                for event in events {
+                    let started_agent = match &event {
+                        HarnessEvent::ItemStarted {
+                            id,
+                            kind: ItemKind::ToolCall { name, .. },
+                        } if is_agent_tool(name) => Some(id.clone()),
+                        _ => None,
+                    };
+                    out.push(timed(TranscriptEntry::Harness(event)));
+                    if let Some(id) = started_agent {
+                        let start = HarnessEvent::TurnStarted {
+                            session_id: None,
+                            model: None,
+                        };
+                        out.push(timed(TranscriptEntry::Harness(subagent(&id, start))));
+                        agent_calls.insert(id);
+                    }
+                }
             }
             _ => {}
         }
+    }
+    // Background subagents with no notice: the process that ran them is
+    // gone, so they stopped.
+    for parent in background {
+        let end = HarnessEvent::TurnCompleted {
+            status: TurnStatus::Interrupted,
+            usage: Value::Null,
+            cost_usd: None,
+        };
+        out.push(TimedEntry {
+            at: None,
+            entry: TranscriptEntry::Harness(subagent(&parent, end)),
+        });
     }
     if turn_open {
         out.push(TimedEntry {
@@ -112,6 +181,98 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
         });
     }
     out
+}
+
+/// The subagent end a `<task-notification>` reports, when it is for a
+/// background subagent still awaiting one (each is taken once).
+fn notice_end(background: &mut Vec<String>, content: &Value) -> Option<TranscriptEntry> {
+    let (parent, end) = task_notification(content)?;
+    let pos = background.iter().position(|id| *id == parent)?;
+    background.remove(pos);
+    Some(TranscriptEntry::Harness(subagent(&parent, end)))
+}
+
+/// Claude's subagent tool (`Task` in older CLIs).
+pub fn is_agent_tool(name: &str) -> bool {
+    matches!(name, "Agent" | "Task")
+}
+
+fn subagent(parent: &str, event: HarnessEvent) -> HarnessEvent {
+    HarnessEvent::SubagentEvent {
+        parent_tool_use_id: parent.to_string(),
+        event: Box::new(event),
+    }
+}
+
+/// The usage shape the live `task_notification` carries.
+fn subagent_usage(tokens: Option<u64>, tool_uses: Option<u64>, duration_ms: Option<u64>) -> Value {
+    if tokens.is_none() && tool_uses.is_none() && duration_ms.is_none() {
+        return Value::Null;
+    }
+    json!({ "total_tokens": tokens, "tool_uses": tool_uses, "duration_ms": duration_ms })
+}
+
+/// A foreground subagent's end, from its Agent result's `toolUseResult`.
+fn foreground_end(result: &Value, is_error: bool) -> HarnessEvent {
+    HarnessEvent::TurnCompleted {
+        status: if is_error {
+            TurnStatus::Failed("the subagent failed".to_string())
+        } else {
+            TurnStatus::Completed
+        },
+        usage: subagent_usage(
+            result["totalTokens"].as_u64(),
+            result["totalToolUseCount"].as_u64(),
+            result["totalDurationMs"].as_u64(),
+        ),
+        cost_usd: None,
+    }
+}
+
+/// A `<task-notification>` user message as (Agent call id, the subagent's
+/// end). `None` for any other message.
+fn task_notification(content: &Value) -> Option<(String, HarnessEvent)> {
+    let text = content.as_str()?.trim_start();
+    if !text.starts_with("<task-notification>") {
+        return None;
+    }
+    // The tags before <summary> are the CLI's own; the usage block comes
+    // last, after the free-text result.
+    let parent = tag(text, "tool-use-id")?;
+    let status = match tag(text, "status").unwrap_or_default().as_str() {
+        "completed" => TurnStatus::Completed,
+        "failed" | "error" => TurnStatus::Failed(
+            tag(text, "summary")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "the subagent failed".to_string()),
+        ),
+        _ => TurnStatus::Interrupted,
+    };
+    let usage = text
+        .rfind("<usage>")
+        .map(|start| &text[start..])
+        .map(|block| {
+            let num = |name| tag(block, name).and_then(|n| n.trim().parse::<u64>().ok());
+            subagent_usage(num("subagent_tokens"), num("tool_uses"), num("duration_ms"))
+        })
+        .unwrap_or(Value::Null);
+    Some((
+        parent,
+        HarnessEvent::TurnCompleted {
+            status,
+            usage,
+            cost_usd: None,
+        },
+    ))
+}
+
+/// The text of the first `<name>…</name>` in `text`.
+fn tag(text: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim().to_string())
 }
 
 fn turn_completed() -> HarnessEvent {
@@ -382,5 +543,88 @@ mod tests {
     #[test]
     fn empty_transcript_yields_nothing() {
         assert!(parse_claude_transcript("").is_empty());
+    }
+
+    fn agent_call(id: &str) -> String {
+        assistant(json!([{"type":"tool_use","id":id,"name":"Agent","input":{"description":"d"}}]))
+    }
+
+    fn agent_result(id: &str, result: Value) -> String {
+        line(json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":id,"content":"ok","is_error":false}]},
+            "toolUseResult": result}))
+    }
+
+    fn sub_events(entries: &[TranscriptEntry]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Harness(HarnessEvent::SubagentEvent {
+                    parent_tool_use_id,
+                    event,
+                }) => Some((
+                    parent_tool_use_id.clone(),
+                    match &**event {
+                        HarnessEvent::TurnStarted { .. } => "start".to_string(),
+                        HarnessEvent::TurnCompleted { status, usage, .. } => {
+                            format!("{status:?} {usage}")
+                        }
+                        other => format!("{other:?}"),
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn subagents_start_and_end_with_their_usage() {
+        let notice = "<task-notification>\n<task-id>t</task-id>\n<tool-use-id>bg</tool-use-id>\n<status>completed</status>\n<summary>s</summary>\n<result>a <usage> word</result>\n<usage><subagent_tokens>2000</subagent_tokens><tool_uses>7</tool_uses><duration_ms>9000</duration_ms></usage>\n</task-notification>";
+        let text = [
+            user_text("go"),
+            agent_call("fg"),
+            agent_result(
+                "fg",
+                json!({"status":"completed","totalTokens":500,"totalToolUseCount":3,"totalDurationMs":4000}),
+            ),
+            agent_call("bg"),
+            agent_result("bg", json!({"status":"async_launched"})),
+            agent_call("lost"),
+            agent_result("lost", json!({"status":"async_launched"})),
+            agent_call("mid"),
+            agent_result("mid", json!({"status":"async_launched"})),
+            user_text(notice),
+            line(json!({"type":"attachment","isSidechain":false,"attachment":{
+                "type":"queued_command","commandMode":"task-notification",
+                "prompt": notice.replace("<tool-use-id>bg<", "<tool-use-id>mid<")}})),
+        ]
+        .join("\n");
+        let entries = parse_claude_transcript(&text);
+        assert_eq!(
+            sub_events(&entries),
+            vec![
+                ("fg".into(), "start".into()),
+                (
+                    "fg".into(),
+                    r#"Completed {"duration_ms":4000,"tool_uses":3,"total_tokens":500}"#.into()
+                ),
+                ("bg".into(), "start".into()),
+                ("lost".into(), "start".into()),
+                ("mid".into(), "start".into()),
+                (
+                    "bg".into(),
+                    r#"Completed {"duration_ms":9000,"tool_uses":7,"total_tokens":2000}"#.into()
+                ),
+                (
+                    "mid".into(),
+                    r#"Completed {"duration_ms":9000,"tool_uses":7,"total_tokens":2000}"#.into()
+                ),
+                ("lost".into(), "Interrupted null".into()),
+            ]
+        );
+        // The notice is not shown as something the human typed.
+        assert!(!entries.iter().any(
+            |e| matches!(e, TranscriptEntry::UserPrompt(t) if t.contains("task-notification"))
+        ));
     }
 }
