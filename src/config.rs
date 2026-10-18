@@ -562,7 +562,8 @@ fn default_chat_model() -> String {
 /// panel; edit the `chat` object in `config.json`:
 ///
 /// ```json
-/// "chat": { "default_model": "opus", "default_effort": "high", "remember_last": true }
+/// "chat": { "default_model": "opus", "default_effort": "high", "remember_last": true,
+///           "claude_in_chrome": true }
 /// ```
 ///
 /// `default_model` is a Claude model alias (`default` leaves the choice to
@@ -570,7 +571,11 @@ fn default_chat_model() -> String {
 /// levels (`low`, `medium`, `high`, `xhigh`, `max`), or absent for the
 /// model's own default. With `remember_last`, a new chat starts with the
 /// model and effort last picked on any chat (`last`, written by the app)
-/// instead of the defaults.
+/// instead of the defaults. `claude_in_chrome` starts chats with Claude in
+/// Chrome (the CLI's `--chrome`), which drives the user's own Chrome through
+/// the extension; headless Claude ignores the CLI's own "on by default"
+/// setting, so GitTerm passes the flag. Chats also keep GitTerm's browser,
+/// a separate Chrome profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatDefaults {
     #[serde(default = "default_chat_model")]
@@ -583,6 +588,8 @@ pub struct ChatDefaults {
     /// not per workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<ChatSelection>,
+    #[serde(default = "default_true")]
+    pub claude_in_chrome: bool,
 }
 
 /// A chat's model and effort (`effort: None` is the model's default).
@@ -600,6 +607,7 @@ impl Default for ChatDefaults {
             default_effort: None,
             remember_last: true,
             last: None,
+            claude_in_chrome: true,
         }
     }
 }

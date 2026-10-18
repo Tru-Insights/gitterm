@@ -299,11 +299,13 @@ impl AgentSession {
 
     /// The Claude process settings for this tab. `model` "default" (or
     /// empty) leaves the model to the user's Claude settings. `mcp_servers`
-    /// are the GitTerm MCP servers the app attaches (task and browser).
+    /// are the GitTerm MCP servers the app attaches (task and browser);
+    /// `chrome` attaches Claude in Chrome (`chat.claude_in_chrome`).
     pub(crate) fn claude_session_config(
         &self,
         cwd: PathBuf,
         mcp_servers: Vec<ClaudeMcpServer>,
+        chrome: bool,
     ) -> Option<ClaudeSessionConfig> {
         let AgentBackendConfig::Claude {
             model,
@@ -324,6 +326,7 @@ impl AgentSession {
             resume: self.session_id.clone(),
             wire_log_dir: std::env::var_os(CLAUDE_WIRE_LOG_ENV).map(PathBuf::from),
             mcp_servers,
+            chrome,
         })
     }
 

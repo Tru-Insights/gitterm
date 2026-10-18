@@ -15560,6 +15560,7 @@ fi
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
+                let claude_in_chrome = self.chat_config.claude_in_chrome;
                 // Find the tab. If it's an Agent tab, ensure a subprocess
                 // manager is spawned (lazy on first prompt) and forward the
                 // prompt. The first spawn returns a Task that bridges the
@@ -15628,6 +15629,7 @@ fi
                                 let Some(config) = session.claude_session_config(
                                     repo_path,
                                     std::mem::take(&mut claude_mcp_servers),
+                                    claude_in_chrome,
                                 ) else {
                                     return Task::none();
                                 };
@@ -35060,7 +35062,7 @@ mod tests {
             ]
         );
         let config = session
-            .claude_session_config(PathBuf::from("/tmp"), Vec::new())
+            .claude_session_config(PathBuf::from("/tmp"), Vec::new(), false)
             .expect("claude config");
         assert_eq!(config.model, None, "\"default\" defers to Claude settings");
         assert_eq!(config.permission_mode, "default");
@@ -36634,6 +36636,7 @@ mod tests {
                 model: "sonnet".to_string(),
                 effort: None,
             }),
+            claude_in_chrome: true,
         };
         let session = resumed_claude_chat_session(&defaults, "3f2a");
         let tab::AgentBackendConfig::Claude {
@@ -36655,7 +36658,7 @@ mod tests {
         assert_eq!(session.history_to_load(), Some("3f2a"));
         // The first prompt spawns Claude with `--resume=<id>`.
         let spawn = session
-            .claude_session_config(PathBuf::from("/tmp/repo/sub"), Vec::new())
+            .claude_session_config(PathBuf::from("/tmp/repo/sub"), Vec::new(), false)
             .expect("claude config");
         assert_eq!(spawn.resume.as_deref(), Some("3f2a"));
         assert_eq!(spawn.model.as_deref(), Some("opus"));

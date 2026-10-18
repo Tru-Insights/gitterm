@@ -196,6 +196,7 @@ async fn main() {
         resume: None,
         wire_log_dir: Some(workdir.with_extension("wire")),
         mcp_servers: Vec::new(),
+        chrome: false,
     });
     let mut failures = Vec::new();
     let mut check = |name: &str, ok: bool, detail: String| {
@@ -932,6 +933,7 @@ async fn review_scenario(workdir: &Path) {
         resume: None,
         wire_log_dir: Some(workdir.join("review-wire")),
         mcp_servers: Vec::new(),
+        chrome: false,
     });
     let mut failures = Vec::new();
     let mut check = |name: &str, ok: bool, detail: String| {

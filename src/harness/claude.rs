@@ -790,6 +790,9 @@ pub struct ClaudeSessionConfig {
     pub wire_log_dir: Option<PathBuf>,
     /// GitTerm MCP servers to attach (task and browser controls).
     pub mcp_servers: Vec<ClaudeMcpServer>,
+    /// Attach Claude in Chrome (`--chrome`). Headless Claude does not
+    /// apply the CLI's own default for it.
+    pub chrome: bool,
 }
 
 impl ClaudeSessionConfig {
@@ -807,6 +810,9 @@ impl ClaudeSessionConfig {
         .iter()
         .map(|s| s.to_string())
         .collect();
+        if self.chrome {
+            args.push("--chrome".into());
+        }
         if let Some(model) = &self.model {
             args.push("--model".into());
             args.push(model.clone());
@@ -2195,8 +2201,16 @@ mod tests {
             resume: Some("sid".into()),
             wire_log_dir: None,
             mcp_servers: Vec::new(),
+            chrome: true,
         };
         let args = cfg.args().join(" ");
+        assert!(args.contains("--chrome"));
+        assert!(!ClaudeSessionConfig {
+            chrome: false,
+            ..cfg.clone()
+        }
+        .args()
+        .contains(&"--chrome".to_string()));
         assert!(args.contains("--permission-prompt-tool stdio"));
         assert!(args.contains("--input-format stream-json"));
         assert!(args.contains("--include-partial-messages"));
@@ -2234,6 +2248,7 @@ mod tests {
             resume: Some("sid".into()),
             wire_log_dir: None,
             mcp_servers,
+            chrome: false,
         }
     }
 
