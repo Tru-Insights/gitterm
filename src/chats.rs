@@ -22,6 +22,10 @@ const HEAD_SCAN_BYTES: u64 = 256 * 1024;
 const HEAD_SCAN_LINES: usize = 60;
 /// Bytes read from the end of a transcript for the preview tail.
 const TAIL_READ_BYTES: u64 = 128 * 1024;
+/// Bytes read from the end of a transcript for Claude's own title. The
+/// CLI rewrites its `ai-title` line through the session, so the end of a
+/// file nearly always holds the current one.
+const TITLE_TAIL_BYTES: u64 = 64 * 1024;
 /// Messages shown in the preview tail.
 const PREVIEW_MESSAGES: usize = 8;
 /// Truncation length for titles derived from the first user message.
@@ -354,6 +358,22 @@ fn scan_head(path: &Path) -> std::io::Result<HeadScan> {
     Ok(out)
 }
 
+/// The latest title Claude generated for a session (`{"type":"ai-title",
+/// "aiTitle":…}` lines), if `lines` hold one.
+fn claude_ai_title(lines: &[String]) -> Option<String> {
+    lines.iter().rev().find_map(|line| {
+        if !line.contains("\"ai-title\"") {
+            return None;
+        }
+        let value: Value = serde_json::from_str(line).ok()?;
+        if value.get("type")?.as_str()? != "ai-title" {
+            return None;
+        }
+        let title = value.get("aiTitle")?.as_str()?.trim();
+        (!title.is_empty()).then(|| title.to_string())
+    })
+}
+
 /// Complete JSONL lines from the last `TAIL_READ_BYTES` of the file.
 fn read_tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
     read_tail_lines_bounded(path, TAIL_READ_BYTES)
@@ -388,7 +408,13 @@ fn index_transcript(path: &Path, backend: ChatBackend) -> Option<ChatIndexEntry>
     if head.headless {
         return None;
     }
-    let title = head.title?;
+    // A session with no real user message is an empty shell, even if
+    // Claude titled it.
+    let first_message_title = head.title?;
+    let title = read_tail_lines_bounded(path, TITLE_TAIL_BYTES)
+        .ok()
+        .and_then(|lines| claude_ai_title(&lines))
+        .unwrap_or(first_message_title);
     let cwd = head.cwd?;
     let id = path.file_stem()?.to_string_lossy().to_string();
     let dead_cwd = !cwd.exists();
@@ -862,6 +888,24 @@ mod tests {
             "message": {"role": "user", "content": text}
         })
         .to_string()
+    }
+
+    #[test]
+    fn index_prefers_claudes_latest_generated_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = user_line("/tmp/x", "main", "it is just coming to my attention");
+        let path = write_transcript(
+            dir.path(),
+            "abc-456.jsonl",
+            &[
+                real.as_str(),
+                r#"{"type":"ai-title","aiTitle":"First guess","sessionId":"abc-456"}"#,
+                r#"{"type":"assistant","message":{"role":"assistant","content":"ok"}}"#,
+                r#"{"type":"ai-title","aiTitle":"Org snapshot billing period regression","sessionId":"abc-456"}"#,
+            ],
+        );
+        let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
+        assert_eq!(entry.title, "Org snapshot billing period regression");
     }
 
     #[test]

@@ -7615,6 +7615,43 @@ impl App {
         })
     }
 
+    /// Display name of a machine in the Chats panel (None = this Mac).
+    fn chat_machine_name(&self, remote_id: Option<&str>) -> String {
+        match remote_id {
+            None => "This Mac".to_string(),
+            Some(remote_id) => self
+                .remote_agent_defs
+                .iter()
+                .find(|agent| agent.id == remote_id)
+                .map(|agent| agent.name.clone())
+                .unwrap_or_else(|| remote_id.to_string()),
+        }
+    }
+
+    /// Index status of a remote machine's chats: text and colour. Empty
+    /// for this Mac, whose index is always local.
+    fn chat_machine_status(&self, remote_id: Option<&str>) -> (String, iced::Color) {
+        let theme = &self.theme;
+        let Some(remote_id) = remote_id else {
+            return (String::new(), theme.text_muted());
+        };
+        match self.remote_chat_indexes.get(remote_id) {
+            Some(state) if state.loading => ("⟳ syncing".to_string(), theme.yellow()),
+            Some(state) if state.error.is_some() => {
+                if state.entries.is_empty() {
+                    ("○ unreachable".to_string(), theme.text_muted())
+                } else {
+                    (
+                        "○ unreachable · cached index".to_string(),
+                        theme.text_muted(),
+                    )
+                }
+            }
+            Some(_) => ("● connected".to_string(), theme.green()),
+            None => ("○ not yet synced".to_string(), theme.text_muted()),
+        }
+    }
+
     fn request_remote_chat_index(
         remote_id: String,
         client: RemoteAgentClientConfig,
@@ -29144,7 +29181,7 @@ fi
                 selection: input_selection,
             });
 
-        let scope_button = |label: &'static str, scope: chats::ChatScope| {
+        let scope_button = |label: String, scope: chats::ChatScope| {
             let active = self.chat_scope == scope;
             let bg = if active {
                 Some(theme.surface0().into())
@@ -29169,9 +29206,12 @@ fi
                 .on_press(Event::ChatsScopeChanged(scope))
         };
         let scope_row = row![
-            scope_button("This workspace", chats::ChatScope::Workspace),
-            scope_button("This machine", chats::ChatScope::Machine),
-            scope_button("Everywhere", chats::ChatScope::Everywhere),
+            scope_button("This workspace".into(), chats::ChatScope::Workspace),
+            scope_button(
+                self.chat_machine_name(self.active_machine_remote_id()),
+                chats::ChatScope::Machine,
+            ),
+            scope_button("Everywhere".into(), chats::ChatScope::Everywhere),
         ]
         .spacing(2);
 
@@ -29293,6 +29333,23 @@ fi
         if let Some(open_section) = self.view_chats_open_section() {
             list = list.push(open_section);
         }
+        if !everywhere {
+            // Which machine's conversations these are: the inner scopes
+            // follow the active workspace's machine.
+            let (status_text, status_color) = self.chat_machine_status(active_remote_id.as_deref());
+            let mut line = Row::new().spacing(8).align_y(iced::Alignment::Center).push(
+                text(
+                    self.chat_machine_name(active_remote_id.as_deref())
+                        .to_uppercase(),
+                )
+                .size(10)
+                .color(theme.text_secondary()),
+            );
+            if !status_text.is_empty() {
+                line = line.push(text(status_text).size(10).color(status_color));
+            }
+            list = list.push(line.padding([6, 2]));
+        }
         if self.chat_index_loading && self.chat_index.is_empty() {
             list = list.push(
                 text("indexing conversations…")
@@ -29333,36 +29390,9 @@ fi
                 || !self.chat_query.is_empty()
                 || self.chat_expanded_machines.contains(&machine_key);
             if everywhere {
-                let (label, status_text, status_color) = match section_remote_id.as_deref() {
-                    None => ("this mac".to_string(), String::new(), theme.text_muted()),
-                    Some(remote_id) => {
-                        let name = self
-                            .remote_agent_defs
-                            .iter()
-                            .find(|agent| agent.id == remote_id)
-                            .map(|agent| agent.name.clone())
-                            .unwrap_or_else(|| remote_id.to_string());
-                        let state = self.remote_chat_indexes.get(remote_id);
-                        let (status, color) = match state {
-                            Some(state) if state.loading => {
-                                ("⟳ syncing".to_string(), theme.yellow())
-                            }
-                            Some(state) if state.error.is_some() => {
-                                if state.entries.is_empty() {
-                                    ("○ unreachable".to_string(), theme.text_muted())
-                                } else {
-                                    (
-                                        "○ unreachable · cached index".to_string(),
-                                        theme.text_muted(),
-                                    )
-                                }
-                            }
-                            Some(_) => ("● connected".to_string(), theme.green()),
-                            None => ("○ not yet synced".to_string(), theme.text_muted()),
-                        };
-                        (name, status, color)
-                    }
-                };
+                let label = self.chat_machine_name(section_remote_id.as_deref());
+                let (status_text, status_color) =
+                    self.chat_machine_status(section_remote_id.as_deref());
                 let chevron = if section_expanded { "▾" } else { "▸" };
                 let mut header = Row::new()
                     .spacing(8)
@@ -29474,6 +29504,13 @@ fi
                     if entry.is_worktree {
                         meta =
                             meta.push(text("worktree").size(font_small - 1.0).color(theme.mauve()));
+                    }
+                    if let Some(remote_id) = section_remote_id.as_deref() {
+                        meta = meta.push(
+                            text(format!("@ {}", self.chat_machine_name(Some(remote_id))))
+                                .size(font_small - 1.0)
+                                .color(theme.blue()),
+                        );
                     }
                     if entry.dead_cwd {
                         meta =
