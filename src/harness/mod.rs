@@ -275,7 +275,7 @@ pub fn validate_images(images: &[ImageAttachment]) -> Result<(), String> {
 /// into it. `id`, when set, is sent as the message's `uuid`; Claude then
 /// reports the message's queue state (`MessageLifecycle`) under it and it
 /// can be withdrawn while still queued.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UserPrompt {
     pub text: String,
     pub images: Vec<ImageAttachment>,
@@ -298,8 +298,10 @@ impl From<&str> for UserPrompt {
     }
 }
 
-/// Commands the UI sends into a harness session.
-#[derive(Debug, Clone, PartialEq)]
+/// Commands the UI sends into a harness session. Serializable so a remote
+/// chat can carry them to the agent machine (TRU-152).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum HarnessCommand {
     /// Claude accepts a message at any time: one sent mid-turn is queued
     /// by the CLI and reaches the running turn at its next tool boundary,
@@ -428,6 +430,154 @@ mod tests {
         assert_eq!(one.decoded_len(), 1);
         assert!(format!("{one:?}").contains("bytes: 1"));
         assert!(!format!("{one:?}").contains("QQ=="));
+    }
+
+    #[test]
+    fn commands_round_trip_through_json_for_remote_chats() {
+        let commands = vec![
+            HarnessCommand::SendUserMessage(UserPrompt {
+                text: "hi".into(),
+                images: vec![ImageAttachment {
+                    media_type: "image/png".into(),
+                    data: "QQ==".into(),
+                }],
+                id: Some("u1".into()),
+            }),
+            HarnessCommand::WithdrawQueuedMessage("u1".into()),
+            HarnessCommand::Answer {
+                request_id: "r1".into(),
+                decision: RuntimeDecision::Allow {
+                    updated_input: Some(json!({"command": "ls"})),
+                    remember: Some(json!({"type": "addRules"})),
+                },
+            },
+            HarnessCommand::Answer {
+                request_id: "r2".into(),
+                decision: RuntimeDecision::AnswerQuestion {
+                    answers: BTreeMap::from([("Red?".to_string(), "Blue".to_string())]),
+                },
+            },
+            HarnessCommand::Interrupt,
+            HarnessCommand::SetPermissionMode("plan".into()),
+            HarnessCommand::SetModel("sonnet".into()),
+            HarnessCommand::SetEffort(None),
+            HarnessCommand::SetEffort(Some("high".into())),
+            HarnessCommand::Shutdown,
+        ];
+        for command in commands {
+            let json = serde_json::to_string(&command).unwrap();
+            let back: HarnessCommand = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, command, "{json}");
+        }
+        assert_eq!(
+            serde_json::to_value(HarnessCommand::Interrupt).unwrap(),
+            json!({"type": "interrupt"})
+        );
+        // The base64 payload rides the wire but never a Debug line.
+        let prompt = HarnessCommand::SendUserMessage(UserPrompt {
+            text: String::new(),
+            images: vec![ImageAttachment {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            }],
+            id: None,
+        });
+        assert!(serde_json::to_string(&prompt).unwrap().contains("QUJD"));
+        assert!(!format!("{prompt:?}").contains("QUJD"));
+    }
+
+    #[test]
+    fn events_round_trip_through_json_for_remote_chats() {
+        let events = vec![
+            HarnessEvent::Ready {
+                session_id: Some("s".into()),
+                permission_mode: Some("default".into()),
+                models: vec![json!({"value": "haiku"})],
+            },
+            HarnessEvent::TurnStarted {
+                session_id: None,
+                model: Some("haiku".into()),
+            },
+            HarnessEvent::TextDelta("hi".into()),
+            HarnessEvent::ThinkingDelta(String::new()),
+            HarnessEvent::ItemStarted {
+                id: "t1".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Bash".into(),
+                    input: json!({"command": "ls"}),
+                },
+            },
+            HarnessEvent::ItemInputDelta {
+                id: "t1".into(),
+                partial_json: "{\"a".into(),
+            },
+            HarnessEvent::ItemCompleted {
+                id: "t1".into(),
+                output: "ok".into(),
+                is_error: false,
+            },
+            HarnessEvent::RuntimeRequest {
+                request_id: "r1".into(),
+                tool_use_id: "t1".into(),
+                kind: RuntimeRequestKind::Permission {
+                    tool_name: "Bash".into(),
+                    input: json!({}),
+                    suggestions: vec![json!({"type": "setMode"})],
+                    decision_reason: None,
+                },
+            },
+            HarnessEvent::RuntimeRequest {
+                request_id: "r2".into(),
+                tool_use_id: "t2".into(),
+                kind: RuntimeRequestKind::Question {
+                    questions: json!([{"question": "Red?"}]),
+                },
+            },
+            HarnessEvent::RuntimeRequestResolved {
+                request_id: "r1".into(),
+            },
+            HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                usage: json!({"input_tokens": 4}),
+                cost_usd: Some(0.00378657),
+            },
+            HarnessEvent::TurnCompleted {
+                status: TurnStatus::Interrupted,
+                usage: Value::Null,
+                cost_usd: None,
+            },
+            HarnessEvent::TurnCompleted {
+                status: TurnStatus::Failed("boom".into()),
+                usage: json!({}),
+                cost_usd: None,
+            },
+            HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "a1".into(),
+                event: Box::new(HarnessEvent::TextDelta("sub".into())),
+            },
+            HarnessEvent::MessageLifecycle {
+                id: "u1".into(),
+                state: MessageState::Cancelled,
+            },
+            HarnessEvent::MessageWithdrawRefused {
+                id: "u1".into(),
+                reason: "late".into(),
+            },
+            HarnessEvent::PermissionModeChanged("plan".into()),
+            HarnessEvent::ModelChanged("sonnet".into()),
+            HarnessEvent::EffortChanged {
+                effort: Some("low".into()),
+                applied: None,
+            },
+            HarnessEvent::Error("bad".into()),
+            HarnessEvent::ProcessExited { code: Some(0) },
+            HarnessEvent::ProcessExited { code: None },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            let back: HarnessEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, event, "{json}");
+        }
     }
 
     #[test]

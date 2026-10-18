@@ -24,6 +24,7 @@ use super::{
     HarnessCommand, HarnessEvent, ItemKind, MessageState, RuntimeDecision, RuntimeRequestKind,
     TurnStatus, UserPrompt,
 };
+use crate::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig};
 
 /// The tool whose `can_use_tool` request is a question for the user rather
 /// than a permission prompt.
@@ -925,6 +926,212 @@ impl ClaudeSession {
 impl Drop for ClaudeSession {
     fn drop(&mut self) {
         let _ = self.commands.send(HarnessCommand::Shutdown);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote session (TRU-152)
+// ---------------------------------------------------------------------------
+
+/// The first message of a remote chat stream: the session config minus
+/// what cannot cross machines. MCP servers point at this Mac's GitTerm and
+/// the wire log is a local directory, so neither travels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteClaudeChatStart {
+    /// A directory on the agent's machine.
+    pub cwd: String,
+    pub model: Option<String>,
+    pub permission_mode: String,
+    pub effort: Option<String>,
+    pub resume: Option<String>,
+    pub chrome: bool,
+}
+
+impl RemoteClaudeChatStart {
+    /// The remote start for a desktop config. A config carrying MCP servers
+    /// is refused rather than started without them.
+    pub fn from_config(config: &ClaudeSessionConfig) -> Result<Self, String> {
+        if !config.mcp_servers.is_empty() {
+            return Err(format!(
+                "{} MCP server(s) cannot be attached to a chat on a remote machine",
+                config.mcp_servers.len()
+            ));
+        }
+        if let Some(dir) = &config.wire_log_dir {
+            remote_log(&format!(
+                "wire log {} is local-only; a remote chat does not keep one",
+                dir.display()
+            ));
+        }
+        Ok(Self {
+            cwd: config.cwd.to_string_lossy().into_owned(),
+            model: config.model.clone(),
+            permission_mode: config.permission_mode.clone(),
+            effort: config.effort.clone(),
+            resume: config.resume.clone(),
+            chrome: config.chrome,
+        })
+    }
+
+    /// The agent side's session config, run in `cwd` (the validated,
+    /// canonical form of `self.cwd`).
+    pub fn into_config(self, cwd: PathBuf) -> ClaudeSessionConfig {
+        ClaudeSessionConfig {
+            cwd,
+            model: self.model,
+            permission_mode: self.permission_mode,
+            effort: self.effort,
+            resume: self.resume,
+            wire_log_dir: None,
+            mcp_servers: Vec::new(),
+            chrome: self.chrome,
+        }
+    }
+}
+
+impl ClaudeSession {
+    /// Start `claude` on a remote machine through its GitTerm agent's
+    /// `ClaudeChat` stream. Same handle as `spawn`: commands go out over the
+    /// stream, events come back on the channel, and dropping the handle
+    /// shuts the remote process down. A failure to connect, a lost
+    /// connection or a stream that ends early arrives as `Error` followed
+    /// by `ProcessExited { code: None }`.
+    pub fn spawn_remote(
+        client: RemoteAgentClientConfig,
+        config: ClaudeSessionConfig,
+    ) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("claude-remote-session".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ev_tx.send(HarnessEvent::Error(format!(
+                            "could not start the remote Claude session runtime: {e}"
+                        )));
+                        let _ = ev_tx.send(HarnessEvent::ProcessExited { code: None });
+                        return;
+                    }
+                };
+                rt.block_on(run_remote_session(client, config, cmd_rx, ev_tx));
+            });
+        if let Err(e) = spawn_result {
+            remote_log(&format!("could not spawn remote session thread: {e}"));
+        }
+        (Self { commands: cmd_tx }, ev_rx)
+    }
+}
+
+fn remote_log(msg: &str) {
+    eprintln!("[remote-chat] {msg}");
+}
+
+/// Relay one remote chat: commands out as JSON, events back from JSON,
+/// until the agent ends the stream or the connection drops.
+async fn run_remote_session(
+    client: RemoteAgentClientConfig,
+    config: ClaudeSessionConfig,
+    mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
+    events: mpsc::UnboundedSender<HarnessEvent>,
+) {
+    use tokio_stream::StreamExt as _;
+
+    let remote = format!("{} ({})", client.name, client.endpoint);
+    let fail = |msg: String| {
+        remote_log(&msg);
+        let _ = events.send(HarnessEvent::Error(msg));
+        let _ = events.send(HarnessEvent::ProcessExited { code: None });
+    };
+    let start = match RemoteClaudeChatStart::from_config(&config) {
+        Ok(start) => start,
+        Err(e) => return fail(format!("could not start Claude on {remote}: {e}")),
+    };
+    let start_json = match serde_json::to_string(&start) {
+        Ok(json) => json,
+        Err(e) => return fail(format!("could not encode the start for {remote}: {e}")),
+    };
+    remote_log(&format!(
+        "start on {remote}: cwd {} model {:?} mode {} resume {:?}",
+        start.cwd, start.model, start.permission_mode, start.resume
+    ));
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+    let mut stream = match RemoteAgentBackend::new(client)
+        .claude_chat(start_json, out_rx)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => return fail(format!("could not start Claude on {remote}: {e}")),
+    };
+
+    let mut out_tx = Some(out_tx);
+    let mut exited = false;
+    loop {
+        tokio::select! {
+            cmd = commands.recv(), if out_tx.is_some() => {
+                let Some(cmd) = cmd else {
+                    // Handle dropped: closing our half ends the stream, and
+                    // the agent shuts its process down.
+                    out_tx = None;
+                    continue;
+                };
+                let sent = match serde_json::to_string(&cmd) {
+                    Ok(json) => out_tx.as_ref().is_some_and(|tx| tx.send(json).is_ok()),
+                    Err(e) => {
+                        let msg = format!("could not encode {cmd:?} for {remote}: {e}");
+                        remote_log(&msg);
+                        let _ = events.send(HarnessEvent::Error(msg));
+                        continue;
+                    }
+                };
+                if !sent {
+                    let msg = format!("the chat stream to {remote} is closed; {cmd:?} was not sent");
+                    remote_log(&msg);
+                    let _ = events.send(HarnessEvent::Error(msg));
+                }
+            }
+            item = stream.next() => match item {
+                Some(Ok(json)) => match serde_json::from_str::<HarnessEvent>(&json) {
+                    Ok(ev) => {
+                        exited |= matches!(ev, HarnessEvent::ProcessExited { .. });
+                        if events.send(ev).is_err() {
+                            // The tab is gone; dropping the stream cancels
+                            // the call and the agent stops its process.
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "undecodable event from {remote}: {e}: {}",
+                            trim_for_log(&json, 200)
+                        );
+                        remote_log(&msg);
+                        let _ = events.send(HarnessEvent::Error(msg));
+                    }
+                },
+                Some(Err(e)) => {
+                    let msg = format!("lost the connection to {remote}: {e}");
+                    remote_log(&msg);
+                    let _ = events.send(HarnessEvent::Error(msg));
+                    break;
+                }
+                None => {
+                    if !exited {
+                        let msg = format!("{remote} ended the chat stream before Claude exited");
+                        remote_log(&msg);
+                        let _ = events.send(HarnessEvent::Error(msg));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if !exited {
+        let _ = events.send(HarnessEvent::ProcessExited { code: None });
     }
 }
 
@@ -2250,6 +2457,41 @@ mod tests {
             mcp_servers,
             chrome: false,
         }
+    }
+
+    #[test]
+    fn remote_start_carries_the_config_and_round_trips() {
+        let mut config = config_with(Vec::new());
+        config.model = Some("haiku".into());
+        config.effort = Some("low".into());
+        config.chrome = true;
+        config.wire_log_dir = Some(PathBuf::from("/tmp/wire"));
+        let start = RemoteClaudeChatStart::from_config(&config).unwrap();
+        assert_eq!(
+            serde_json::to_value(&start).unwrap(),
+            json!({"cwd": "/tmp", "model": "haiku", "permission_mode": "default",
+                   "effort": "low", "resume": "sid", "chrome": true})
+        );
+        let back: RemoteClaudeChatStart =
+            serde_json::from_str(&serde_json::to_string(&start).unwrap()).unwrap();
+        assert_eq!(back, start);
+        // The agent side never gets a wire log or MCP servers.
+        let agent = back.into_config(PathBuf::from("/private/tmp"));
+        assert_eq!(agent.cwd, PathBuf::from("/private/tmp"));
+        assert_eq!(agent.wire_log_dir, None);
+        assert!(agent.mcp_servers.is_empty());
+        assert_eq!(agent.args(), {
+            let mut local = config.clone();
+            local.wire_log_dir = None;
+            local.args()
+        });
+    }
+
+    #[test]
+    fn remote_start_refuses_mcp_servers() {
+        let config = config_with(vec![mcp_server("gitterm-tasks", "TOKEN", &[])]);
+        let err = RemoteClaudeChatStart::from_config(&config).unwrap_err();
+        assert!(err.contains("remote machine"), "{err}");
     }
 
     fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {

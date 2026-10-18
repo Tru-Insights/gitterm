@@ -13,10 +13,17 @@ use super::protocol::v5::HandshakeRequest;
 use super::protocol::v5::ListDirRequest;
 use super::protocol::v5::ReadFileRequest;
 use super::protocol::v5::{
-    terminal_input, AttachRequest, ChatEntry, ChatPreviewRequest, EnvVar, ListChatsRequest,
+    claude_chat_client_message, terminal_input, AttachRequest, ChatEntry, ChatPreviewRequest,
+    ClaudeChatClientMessage, ClaudeChatHistoryRequest, EnvVar, ListChatsRequest,
     ListSessionsRequest, Resize, StartSessionRequest, StopSessionRequest, TerminalInput,
 };
 use super::server::PROTOCOL_VERSION;
+
+/// The agent's side of a remote Claude chat: one harness event as JSON
+/// per item, in order (TRU-152).
+pub type ClaudeChatEventStream = std::pin::Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<String, RemoteAgentClientError>> + Send>,
+>;
 
 #[derive(Debug, Clone)]
 pub struct RemoteAgentClientConfig {
@@ -486,28 +493,7 @@ impl RemoteAgentBackend {
         use tokio_stream::StreamExt;
 
         let token = resolve_token_ref(&self.config.token_ref)?;
-        // No per-request timeout: this stream is long-lived by design.
-        let endpoint = Endpoint::from_shared(self.config.endpoint.clone())
-            .map_err(|err| {
-                RemoteAgentClientError::new(format!(
-                    "invalid endpoint {}: {err}",
-                    self.config.endpoint
-                ))
-            })?
-            .connect_timeout(Duration::from_secs(5));
-        let endpoint = if self.config.endpoint.starts_with("https://") {
-            endpoint
-                .tls_config(ClientTlsConfig::new().with_enabled_roots())
-                .map_err(|err| RemoteAgentClientError::new(format!("invalid TLS config: {err}")))?
-        } else {
-            endpoint
-        };
-        let channel = endpoint.connect().await.map_err(|err| {
-            RemoteAgentClientError::new(format!(
-                "could not connect to {}: {err:?}",
-                self.config.endpoint
-            ))
-        })?;
+        let channel = connect_long_lived_channel(&self.config.endpoint).await?;
 
         let (input_tx, input_rx) = tokio::sync::mpsc::channel::<TerminalSend>(64);
         let attach = TerminalInput {
@@ -556,6 +542,74 @@ impl RemoteAgentBackend {
         });
 
         Ok((input_tx, Box::pin(output)))
+    }
+
+    /// Open a native Claude chat on the agent (TRU-152): `start_json` is
+    /// the first message, each string from `commands_json` one command
+    /// after it. Returns the agent's events as JSON, in order. Closing
+    /// `commands_json` ends the stream, and the agent stops its process.
+    /// The connection has no request timeout; it lives as long as the chat.
+    pub async fn claude_chat(
+        &self,
+        start_json: String,
+        commands_json: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Result<ClaudeChatEventStream, RemoteAgentClientError> {
+        use tokio_stream::StreamExt;
+
+        let channel = connect_long_lived_channel(&self.config.endpoint).await?;
+        let start = ClaudeChatClientMessage {
+            message: Some(claude_chat_client_message::Message::StartJson(start_json)),
+        };
+        let outbound = tokio_stream::once(start).chain(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(commands_json).map(|json| {
+                ClaudeChatClientMessage {
+                    message: Some(claude_chat_client_message::Message::CommandJson(json)),
+                }
+            }),
+        );
+        let mut request = Request::new(outbound);
+        self.authorize(&mut request)?;
+        let stream = GitTermAgentClient::new(channel)
+            .claude_chat(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("claude_chat failed: {err:?}")))?
+            .into_inner();
+        Ok(Box::pin(stream.map(|item| {
+            item.map(|message| message.event_json)
+                .map_err(|err| RemoteAgentClientError::new(format!("claude_chat stream: {err:?}")))
+        })))
+    }
+
+    /// A Claude session's timeline from its transcript on the agent's
+    /// machine. `None` when the agent has no transcript for the id.
+    pub async fn claude_chat_history(
+        &self,
+        session_id: String,
+    ) -> Result<Option<Vec<crate::harness::transcript::TimedEntry>>, RemoteAgentClientError> {
+        let mut request = Request::new(ClaudeChatHistoryRequest {
+            session_id: session_id.clone(),
+        });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = match GitTermAgentClient::new(channel)
+            .claude_chat_history(request)
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(RemoteAgentClientError::new(format!(
+                    "claude_chat_history failed: {err:?}"
+                )))
+            }
+        };
+        serde_json::from_str(&response.timeline_json)
+            .map(Some)
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!(
+                    "claude_chat_history for {session_id}: undecodable timeline: {err}"
+                ))
+            })
     }
 
     fn authorize<T>(&self, request: &mut Request<T>) -> Result<(), RemoteAgentClientError> {
@@ -614,6 +668,24 @@ async fn connect_channel(endpoint: &str) -> Result<Channel, RemoteAgentClientErr
             })?;
     }
 
+    builder.connect().await.map_err(|err| {
+        RemoteAgentClientError::new(format!("could not connect to {endpoint}: {err:?}"))
+    })
+}
+
+/// A channel for a stream that lives as long as its session or chat: a
+/// connect timeout but no per-request timeout.
+async fn connect_long_lived_channel(endpoint: &str) -> Result<Channel, RemoteAgentClientError> {
+    let builder = Endpoint::from_shared(endpoint.to_string())
+        .map_err(|err| RemoteAgentClientError::new(format!("invalid endpoint {endpoint}: {err}")))?
+        .connect_timeout(Duration::from_secs(5));
+    let builder = if endpoint.starts_with("https://") {
+        builder
+            .tls_config(ClientTlsConfig::new().with_enabled_roots())
+            .map_err(|err| RemoteAgentClientError::new(format!("invalid TLS config: {err}")))?
+    } else {
+        builder
+    };
     builder.connect().await.map_err(|err| {
         RemoteAgentClientError::new(format!("could not connect to {endpoint}: {err:?}"))
     })

@@ -9,14 +9,17 @@ use tonic::{Request, Response, Status};
 
 use super::protocol::v5::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
 use super::protocol::v5::{
-    terminal_input, terminal_output, ChatEntry, ChatPreviewMessage, ChatPreviewRequest,
-    ChatPreviewResponse, DirEntry, GitDiffRequest, GitDiffResponse, GitStatusRequest,
-    GitStatusResponse, HandshakeRequest, HandshakeResponse, ListChatsRequest, ListChatsResponse,
-    ListDirRequest, ListDirResponse, ListSessionsRequest, ListSessionsResponse, ReadFileChunk,
-    ReadFileRequest, Session, SessionExited, StartSessionRequest, StopSessionRequest,
-    StopSessionResponse, TerminalInput, TerminalOutput,
+    claude_chat_client_message, terminal_input, terminal_output, ChatEntry, ChatPreviewMessage,
+    ChatPreviewRequest, ChatPreviewResponse, ClaudeChatClientMessage, ClaudeChatHistoryRequest,
+    ClaudeChatHistoryResponse, ClaudeChatServerMessage, DirEntry, GitDiffRequest, GitDiffResponse,
+    GitStatusRequest, GitStatusResponse, HandshakeRequest, HandshakeResponse, ListChatsRequest,
+    ListChatsResponse, ListDirRequest, ListDirResponse, ListSessionsRequest, ListSessionsResponse,
+    ReadFileChunk, ReadFileRequest, Session, SessionExited, StartSessionRequest,
+    StopSessionRequest, StopSessionResponse, TerminalInput, TerminalOutput,
 };
 use super::sessions::{SessionManager, SessionOutput};
+use crate::harness::claude::{ClaudeSession, ClaudeSessionConfig, RemoteClaudeChatStart};
+use crate::harness::{HarnessCommand, HarnessEvent};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -82,6 +85,7 @@ impl GitTermAgent for GitTermAgentService {
                 "git_diff".to_string(),
                 "sessions".to_string(),
                 "chats".to_string(),
+                "claude_chat".to_string(),
             ],
             home_dir,
         }))
@@ -447,6 +451,217 @@ impl GitTermAgent for GitTermAgentService {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type ClaudeChatStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ClaudeChatServerMessage, Status>>;
+
+    async fn claude_chat(
+        &self,
+        request: Request<tonic::Streaming<ClaudeChatClientMessage>>,
+    ) -> Result<Response<Self::ClaudeChatStream>, Status> {
+        let mut input = request.into_inner();
+        let config = claude_chat_config(input.message().await?)?;
+        eprintln!(
+            "[agent] claude_chat: starting claude in {} (model {:?}, mode {}, resume {:?})",
+            config.cwd.display(),
+            config.model,
+            config.permission_mode,
+            config.resume
+        );
+        let (session, events) = ClaudeSession::spawn(config);
+
+        // Commands are read on their own task so the relay selects over
+        // two channels rather than over the gRPC stream.
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<ClaudeChatInput>();
+        tokio::spawn(async move {
+            loop {
+                let next = match input.message().await {
+                    Ok(Some(message)) => ClaudeChatInput::Message(message),
+                    Ok(None) => ClaudeChatInput::Closed(None),
+                    Err(status) => ClaudeChatInput::Closed(Some(status.to_string())),
+                };
+                let closed = matches!(next, ClaudeChatInput::Closed(_));
+                if input_tx.send(next).is_err() || closed {
+                    break;
+                }
+            }
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(relay_claude_chat(session, events, input_rx, tx));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn claude_chat_history(
+        &self,
+        request: Request<ClaudeChatHistoryRequest>,
+    ) -> Result<Response<ClaudeChatHistoryResponse>, Status> {
+        let session_id = request.into_inner().session_id;
+        validate_claude_session_id(&session_id)?;
+        let timeline_json = tokio::task::spawn_blocking(move || claude_history_json(&session_id))
+            .await
+            .map_err(|err| Status::internal(format!("chat history task failed: {err}")))??;
+        Ok(Response::new(ClaudeChatHistoryResponse { timeline_json }))
+    }
+}
+
+/// A Claude session's timeline as JSON, read from its transcript on this
+/// machine. Blocking.
+#[allow(clippy::result_large_err)]
+fn claude_history_json(session_id: &str) -> Result<String, Status> {
+    let path = crate::chats::claude_session_path(session_id).ok_or_else(|| {
+        Status::not_found(format!("no transcript for Claude session {session_id}"))
+    })?;
+    let entries = crate::harness::transcript::load_claude_history(&path).map_err(|err| {
+        Status::internal(format!(
+            "could not read transcript {}: {err}",
+            path.display()
+        ))
+    })?;
+    serde_json::to_string(&entries).map_err(|err| {
+        Status::internal(format!(
+            "could not encode the timeline of {session_id}: {err}"
+        ))
+    })
+}
+
+/// What the command reader hands the relay: a client message, or the end
+/// of the client's stream (with its error, when it failed).
+enum ClaudeChatInput {
+    Message(ClaudeChatClientMessage),
+    Closed(Option<String>),
+}
+
+/// The session config a `ClaudeChat` stream's first message carries: a
+/// start message whose JSON decodes, with a non-empty permission mode, a
+/// well-formed resume id, and a cwd that is an existing absolute directory
+/// on this machine.
+#[allow(clippy::result_large_err)]
+fn claude_chat_config(
+    first: Option<ClaudeChatClientMessage>,
+) -> Result<ClaudeSessionConfig, Status> {
+    let first = first
+        .ok_or_else(|| Status::invalid_argument("input stream closed before the start message"))?;
+    let Some(claude_chat_client_message::Message::StartJson(json)) = first.message else {
+        return Err(Status::invalid_argument(
+            "first message must be a start message",
+        ));
+    };
+    let start: RemoteClaudeChatStart = serde_json::from_str(&json)
+        .map_err(|err| Status::invalid_argument(format!("invalid start message: {err}")))?;
+    if start.permission_mode.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "permission_mode must not be empty",
+        ));
+    }
+    if let Some(resume) = &start.resume {
+        validate_claude_session_id(resume)?;
+    }
+    let cwd = canonical_dir(&start.cwd, "cwd")?;
+    Ok(start.into_config(cwd))
+}
+
+/// A Claude session id names a transcript file; refuse anything that could
+/// step outside the projects directory.
+#[allow(clippy::result_large_err)]
+fn validate_claude_session_id(session_id: &str) -> Result<(), Status> {
+    let valid = !session_id.is_empty()
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!(
+            "invalid Claude session id {session_id:?}"
+        )))
+    }
+}
+
+async fn send_chat_event(
+    tx: &tokio::sync::mpsc::Sender<Result<ClaudeChatServerMessage, Status>>,
+    event: &HarnessEvent,
+) -> Result<(), ()> {
+    let message = match serde_json::to_string(event) {
+        Ok(event_json) => Ok(ClaudeChatServerMessage { event_json }),
+        Err(err) => {
+            eprintln!("[agent] claude_chat: could not encode {event:?}: {err}");
+            Err(Status::internal(format!(
+                "could not encode an event: {err}"
+            )))
+        }
+    };
+    tx.send(message).await.map_err(|_| ())
+}
+
+/// Relay one chat between its stream and its Claude session until the
+/// session's events end. The client closing its half, or going away,
+/// drops the session, which shuts the process down; its exit still
+/// reaches a client whose receiving half is open.
+async fn relay_claude_chat(
+    session: ClaudeSession,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>,
+    mut input: tokio::sync::mpsc::UnboundedReceiver<ClaudeChatInput>,
+    tx: tokio::sync::mpsc::Sender<Result<ClaudeChatServerMessage, Status>>,
+) {
+    let mut session = Some(session);
+    loop {
+        tokio::select! {
+            next = input.recv(), if session.is_some() => {
+                let message = match next {
+                    Some(ClaudeChatInput::Message(message)) => message,
+                    Some(ClaudeChatInput::Closed(error)) => {
+                        match error {
+                            Some(error) => eprintln!(
+                                "[agent] claude_chat: client stream failed ({error}); stopping claude"
+                            ),
+                            None => eprintln!(
+                                "[agent] claude_chat: client closed the stream; stopping claude"
+                            ),
+                        }
+                        session = None;
+                        continue;
+                    }
+                    None => {
+                        eprintln!("[agent] claude_chat: command reader ended; stopping claude");
+                        session = None;
+                        continue;
+                    }
+                };
+                let error = match message.message {
+                    Some(claude_chat_client_message::Message::CommandJson(json)) => {
+                        match serde_json::from_str::<HarnessCommand>(&json) {
+                            Ok(command) => session
+                                .as_ref()
+                                .and_then(|session| session.send(command).err()),
+                            Err(err) => Some(format!("the agent could not decode a command: {err}")),
+                        }
+                    }
+                    Some(claude_chat_client_message::Message::StartJson(_)) => {
+                        Some("the chat has already started; a second start was ignored".to_string())
+                    }
+                    None => Some("an empty chat message was ignored".to_string()),
+                };
+                if let Some(error) = error {
+                    eprintln!("[agent] claude_chat: {error}");
+                    if send_chat_event(&tx, &HarnessEvent::Error(error)).await.is_err() {
+                        eprintln!("[agent] claude_chat: client went away; stopping claude");
+                        break;
+                    }
+                }
+            }
+            event = events.recv() => {
+                let Some(event) = event else { break };
+                if send_chat_event(&tx, &event).await.is_err() {
+                    eprintln!("[agent] claude_chat: client went away; stopping claude");
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -1009,6 +1224,195 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    fn start_message(json: serde_json::Value) -> Option<ClaudeChatClientMessage> {
+        Some(ClaudeChatClientMessage {
+            message: Some(claude_chat_client_message::Message::StartJson(
+                json.to_string(),
+            )),
+        })
+    }
+
+    fn start_json(cwd: &str) -> serde_json::Value {
+        serde_json::json!({"cwd": cwd, "model": "haiku", "permission_mode": "default",
+                           "effort": null, "resume": null, "chrome": false})
+    }
+
+    #[test]
+    fn claude_chat_start_must_come_first_and_decode() {
+        let code = |first| claude_chat_config(first).unwrap_err().code();
+        assert_eq!(code(None), tonic::Code::InvalidArgument);
+        assert_eq!(
+            code(Some(ClaudeChatClientMessage {
+                message: Some(claude_chat_client_message::Message::CommandJson(
+                    r#"{"type":"interrupt"}"#.into()
+                )),
+            })),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            code(Some(ClaudeChatClientMessage { message: None })),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            code(start_message(serde_json::json!({"cwd": "/tmp"}))),
+            tonic::Code::InvalidArgument,
+            "a start missing fields does not decode"
+        );
+    }
+
+    #[test]
+    fn claude_chat_start_validates_its_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let code = |json| claude_chat_config(start_message(json)).unwrap_err().code();
+
+        let mut empty_mode = start_json(&cwd);
+        empty_mode["permission_mode"] = " ".into();
+        assert_eq!(code(empty_mode), tonic::Code::InvalidArgument);
+
+        let mut traversal = start_json(&cwd);
+        traversal["resume"] = "../../etc/passwd".into();
+        assert_eq!(code(traversal), tonic::Code::InvalidArgument);
+
+        assert_eq!(
+            code(start_json("relative/dir")),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            code(start_json("/definitely/not/a/real/dir")),
+            tonic::Code::NotFound
+        );
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(
+            code(start_json(&file.to_string_lossy())),
+            tonic::Code::InvalidArgument
+        );
+
+        let mut ok = start_json(&cwd);
+        ok["resume"] = "67838915-705b-4a13-af63-4d08a1d7da10".into();
+        ok["chrome"] = true.into();
+        let config = claude_chat_config(start_message(ok)).unwrap();
+        assert_eq!(config.cwd, dir.path().canonicalize().unwrap());
+        assert_eq!(config.model.as_deref(), Some("haiku"));
+        assert_eq!(
+            config.resume.as_deref(),
+            Some("67838915-705b-4a13-af63-4d08a1d7da10")
+        );
+        assert!(config.chrome);
+        assert!(config.mcp_servers.is_empty());
+        assert!(config.wire_log_dir.is_none());
+    }
+
+    #[test]
+    fn claude_session_ids_are_plain_names() {
+        assert!(validate_claude_session_id("67838915-705b-4a13-af63-4d08a1d7da10").is_ok());
+        assert!(validate_claude_session_id("agent_a1").is_ok());
+        for bad in ["", "../x", "a/b", "a b", "a.jsonl", "a\\b"] {
+            assert!(validate_claude_session_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_advertises_claude_chat() {
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let response = service
+            .handshake(Request::new(HandshakeRequest {
+                client_name: "test-client".to_string(),
+                client_version: "0.0.0".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.capabilities.contains(&"claude_chat".to_string()));
+        assert_eq!(response.protocol_version, 1);
+    }
+
+    #[tokio::test]
+    async fn claude_chat_history_rejects_bad_ids_and_misses() {
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let status = service
+            .claude_chat_history(Request::new(ClaudeChatHistoryRequest {
+                session_id: "../../secrets".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        let status = service
+            .claude_chat_history(Request::new(ClaudeChatHistoryRequest {
+                session_id: uuid::Uuid::new_v4().to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn claude_chat_rpcs_require_the_bearer_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected_token = Arc::new("secret".to_string());
+        let authenticated_service = GitTermAgentServer::with_interceptor(
+            GitTermAgentService::new("test-agent".to_string()),
+            move |request: Request<()>| {
+                if is_authorized_metadata(request.metadata(), expected_token.as_str()) {
+                    Ok(request)
+                } else {
+                    Err(Status::unauthenticated("missing or invalid bearer token"))
+                }
+            },
+        );
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(authenticated_service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = GitTermAgentClient::new(channel);
+
+        let status = client
+            .claude_chat_history(Request::new(ClaudeChatHistoryRequest {
+                session_id: "abc".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+        let start = ClaudeChatClientMessage {
+            message: Some(claude_chat_client_message::Message::StartJson(
+                start_json("/tmp").to_string(),
+            )),
+        };
+        let status = client
+            .claude_chat(Request::new(tokio_stream::once(start)))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+        // Authorized, a bad start is refused before any process starts.
+        let bad = ClaudeChatClientMessage {
+            message: Some(claude_chat_client_message::Message::CommandJson(
+                r#"{"type":"interrupt"}"#.to_string(),
+            )),
+        };
+        let mut request = Request::new(tokio_stream::once(bad));
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer secret".parse().unwrap());
+        let status = client.claude_chat(request).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+        server.abort();
     }
 
     #[allow(clippy::result_large_err)]

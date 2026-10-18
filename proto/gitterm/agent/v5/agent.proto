@@ -16,6 +16,11 @@ service GitTermAgent {
   // stores (claude/codex/pi) with the same code the desktop uses locally.
   rpc ListChats(ListChatsRequest) returns (ListChatsResponse);
   rpc ChatPreview(ChatPreviewRequest) returns (ChatPreviewResponse);
+  // Native Claude chat (TRU-152), capability "claude_chat": one `claude`
+  // process on the agent per stream, alive as long as the stream is.
+  rpc ClaudeChat(stream ClaudeChatClientMessage) returns (stream ClaudeChatServerMessage);
+  // A Claude session's transcript, parsed into the chat timeline.
+  rpc ClaudeChatHistory(ClaudeChatHistoryRequest) returns (ClaudeChatHistoryResponse);
 }
 
 message HandshakeRequest {
@@ -246,4 +251,29 @@ message ChatPreviewMessage {
 message ChatPreviewResponse {
   repeated ChatPreviewMessage messages = 1;
   optional uint64 message_count = 2;
+}
+
+message ClaudeChatClientMessage {
+  oneof message {
+    // First message only: the session config as JSON (cwd, model,
+    // permission_mode, effort, resume, chrome).
+    string start_json = 1;
+    // Every later message: one harness command as JSON.
+    string command_json = 2;
+  }
+}
+
+message ClaudeChatServerMessage {
+  // One harness event as JSON.
+  string event_json = 1;
+}
+
+message ClaudeChatHistoryRequest {
+  string session_id = 1;
+}
+
+message ClaudeChatHistoryResponse {
+  // The transcript's timeline entries as a JSON array. A session with no
+  // transcript on the agent's machine is NOT_FOUND instead.
+  string timeline_json = 1;
 }

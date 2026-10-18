@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{HarnessEvent, ItemKind, TurnStatus};
@@ -30,8 +31,10 @@ use super::{HarnessEvent, ItemKind, TurnStatus};
 /// (long sessions have thousands of tool results).
 pub const MAX_RESULT_CHARS: usize = 20_000;
 
-/// One timeline entry recovered from a transcript.
-#[derive(Debug, Clone, PartialEq)]
+/// One timeline entry recovered from a transcript. Serializable so an
+/// agent can return a remote session's history (TRU-152).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum TranscriptEntry {
     /// Something the human typed (or a compaction summary standing in for
     /// the earlier conversation).
@@ -42,7 +45,7 @@ pub enum TranscriptEntry {
 /// A timeline entry and when its transcript line was written (the line's
 /// RFC 3339 `timestamp`, when it has one). The time places delegation
 /// cards, which are not in the transcript, back where they were (TRU-142).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimedEntry {
     pub at: Option<String>,
     pub entry: TranscriptEntry,
@@ -426,6 +429,30 @@ mod tests {
         line(
             json!({"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":blocks}}),
         )
+    }
+
+    #[test]
+    fn timed_entries_round_trip_through_json_for_remote_history() {
+        let lines = [
+            line(
+                json!({"type":"user","timestamp":"2026-10-18T10:00:00Z","message":{"role":"user","content":"list the files"}}),
+            ),
+            assistant(
+                json!([{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]),
+            ),
+            assistant(json!([{"type":"text","text":"Two files."}])),
+        ];
+        let entries = parse_claude_transcript_timed(&lines.join("\n"));
+        assert!(entries.len() >= 3, "{entries:?}");
+        assert_eq!(entries[0].at.as_deref(), Some("2026-10-18T10:00:00Z"));
+        let json = serde_json::to_string(&entries).unwrap();
+        let back: Vec<TimedEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entries);
+        assert_eq!(
+            serde_json::to_value(&entries[0]).unwrap(),
+            json!({"at": "2026-10-18T10:00:00Z",
+                   "entry": {"type": "user_prompt", "data": "list the files"}})
+        );
     }
 
     #[test]
