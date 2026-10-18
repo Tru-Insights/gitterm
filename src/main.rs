@@ -10076,14 +10076,25 @@ impl App {
         let contains = |dir: &Path| {
             cwd.starts_with(dir) || repo_root.is_some_and(|root| root.starts_with(dir))
         };
-        if let Some(idx) = self.workspaces.iter().position(|ws| match &ws.location {
-            WorkspaceLocation::RemoteAgent {
-                remote_id: rid,
-                root,
-                ..
-            } => rid == remote_id && contains(Path::new(root)),
-            _ => false,
-        }) {
+        // The deepest root wins, so a broad workspace (say one rooted at
+        // "/") doesn't swallow chats whose repo has its own workspace.
+        if let Some(idx) = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, ws)| match &ws.location {
+                WorkspaceLocation::RemoteAgent {
+                    remote_id: rid,
+                    root,
+                    ..
+                } if rid == remote_id && contains(Path::new(root)) => {
+                    Some((idx, Path::new(root).components().count()))
+                }
+                _ => None,
+            })
+            .max_by_key(|(_, depth)| *depth)
+            .map(|(idx, _)| idx)
+        {
             return idx;
         }
         let closed_idx = self.closed_workspace_configs.iter().position(|cfg| {
@@ -10898,7 +10909,18 @@ impl App {
             .active_workspace()
             .filter(|ws| holds(ws))
             .map(|_| self.active_workspace_idx)
-            .or_else(|| self.workspaces.iter().position(holds));
+            .or_else(|| {
+                // Deepest root first, as for chats.
+                self.workspaces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ws)| holds(ws))
+                    .max_by_key(|(_, ws)| {
+                        remote_agent_root(&ws.location)
+                            .map_or(0, |root| Path::new(root).components().count())
+                    })
+                    .map(|(idx, _)| idx)
+            });
         let mut tasks = Vec::new();
         match existing {
             Some(ws_idx) => {
