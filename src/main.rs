@@ -3805,7 +3805,7 @@ struct TabState {
     agent_sidebar: AgentActivityState,
     // Chat selected in the Chats sidebar; the main pane shows its preview
     // while the Chats mode is active.
-    selected_chat_id: Option<String>,
+    selected_chat: Option<chats::ChatRef>,
     // Harness conversation this tab owns (claude session uuid). Set by the
     // Chats resume flow and by picker launches with a pre-assigned id;
     // persisted so the registry rule survives restarts.
@@ -3880,7 +3880,7 @@ impl TabState {
             files: FilesState::at(SourcePath::Local(current_dir.clone())),
             current_dir,
             search: SearchState::default(),
-            selected_chat_id: None,
+            selected_chat: None,
             chat_session_id: None,
             task_id: None,
             task_session_id: None,
@@ -4040,7 +4040,7 @@ impl TabState {
     /// Path of the file currently shown in the file viewer overlay, if any.
     /// A conversation picked in the Chats panel is being previewed.
     fn chat_preview_open(&self) -> bool {
-        self.sidebar_mode == SidebarMode::Chats && self.selected_chat_id.is_some()
+        self.sidebar_mode == SidebarMode::Chats && self.selected_chat.is_some()
     }
 
     fn viewing_file_path(&self) -> Option<&Path> {
@@ -5597,21 +5597,21 @@ pub enum Event {
     ShowMachineChats(String),
     /// Force a reconnect attempt to a remote agent.
     MachineReconnect(String),
-    SelectChat(String),
+    SelectChat(chats::ChatRef),
     CloseChatPreview,
-    ChatPreviewLoaded(String, chats::ChatPreview),
+    ChatPreviewLoaded(chats::ChatRef, chats::ChatPreview),
     /// Resume a conversation as a new tab in its recorded cwd (registry
     /// rule: focuses the existing tab instead if one owns the session).
-    ResumeChatAsTab(String),
+    ResumeChatAsTab(chats::ChatRef),
     /// Resume a local Claude conversation in a native chat tab (an Agent
     /// tab) in its recorded cwd; same registry rule as `ResumeChatAsTab`.
-    ResumeChatAsChat(String),
+    ResumeChatAsChat(chats::ChatRef),
     /// Dead-cwd rescue: recreate the recorded directory, then resume.
     /// (`claude --resume` is cwd-scoped — verified 2026-07-04 — so the
     /// session can only be found from its original directory.)
-    ResumeChatRecreateDir(String),
+    ResumeChatRecreateDir(chats::ChatRef),
     /// Focus the live tab owning a conversation, jumping workspaces.
-    FocusChatTab(String),
+    FocusChatTab(chats::ChatRef),
     RefreshRemoteSessions,
     RemoteSessionsLoaded(RemoteSessionsSnapshot),
     RemoteAgentConnect(String),
@@ -5906,7 +5906,7 @@ struct App {
     remote_chat_indexes: HashMap<String, RemoteChatState>,
     /// Preview tail for the most recently selected chat, keyed by session
     /// id so a stale load never renders under the wrong chat.
-    chat_preview: Option<(String, chats::ChatPreview)>,
+    chat_preview: Option<(chats::ChatRef, chats::ChatPreview)>,
     /// Jev client for relevance ordering (TRU-141); None without
     /// TYPESAFE_API_KEY, and then the panel offers no toggle.
     jev_client: Option<gitterm::jev::JevClient>,
@@ -7383,7 +7383,15 @@ impl App {
     /// A chat entry by session id, searching the local index first and
     /// then every remote machine's cache. The first element is the
     /// owning remote id (None = this machine).
-    fn find_chat_entry(&self, id: &str) -> Option<(Option<&str>, &chats::ChatIndexEntry)> {
+    fn find_chat_entry(&self, chat: &chats::ChatRef) -> Option<&chats::ChatIndexEntry> {
+        self.chat_entries_for_machine(chat.remote_id.as_deref())
+            .iter()
+            .find(|entry| entry.id == chat.id)
+    }
+
+    /// A conversation by id on whichever machine indexes it, this Mac
+    /// first. Only for callers that hold a bare id (task records).
+    fn find_chat_entry_any(&self, id: &str) -> Option<(Option<&str>, &chats::ChatIndexEntry)> {
         if let Some(entry) = self.chat_index.iter().find(|entry| entry.id == id) {
             return Some((None, entry));
         }
@@ -7700,13 +7708,19 @@ impl App {
 
     /// The open tab owning a conversation, as (workspace idx, tab idx).
     /// Backbone of the registry rule: one conversation ⇒ at most one tab.
-    fn find_chat_tab(&self, session_id: &str) -> Option<(usize, usize)> {
-        self.workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
-            ws.tabs
-                .iter()
-                .position(|tab| tab.chat_session_id.as_deref() == Some(session_id))
-                .map(|tab_idx| (ws_idx, tab_idx))
-        })
+    /// The tab owning a conversation, looked for only in workspaces on the
+    /// conversation's machine.
+    fn find_chat_tab(&self, chat: &chats::ChatRef) -> Option<(usize, usize)> {
+        self.workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, ws)| self.remote_agent_id_for_workspace(ws) == chat.remote_id.as_deref())
+            .find_map(|(ws_idx, ws)| {
+                ws.tabs
+                    .iter()
+                    .position(|tab| tab.chat_session_id.as_deref() == Some(chat.id.as_str()))
+                    .map(|tab_idx| (ws_idx, tab_idx))
+            })
     }
 
     /// The checkout chip's state for a Claude chat tab (TRU-143): its label
@@ -8836,7 +8850,7 @@ impl App {
         // The task record alone is enough to resume; the Chats index is
         // consulted only when it happens to be loaded, to catch a
         // conversation that lives on a remote machine or moved directory.
-        if let Some((remote_id, entry)) = self.find_chat_entry(chat_id) {
+        if let Some((remote_id, entry)) = self.find_chat_entry_any(chat_id) {
             if remote_id.is_some() {
                 self.task_ui_error = Some(
                     "Remote task conversation resume requires the remote-executor slice"
@@ -8869,7 +8883,8 @@ impl App {
         }
         let backend_label = conversation_backend_label(conversation.backend);
 
-        if let Some((workspace_idx, tab_idx)) = self.find_chat_tab(chat_id) {
+        if let Some((workspace_idx, tab_idx)) = self.find_chat_tab(&chats::ChatRef::local(chat_id))
+        {
             if self.workspaces[workspace_idx].tabs[tab_idx]
                 .task_id
                 .as_deref()
@@ -10025,16 +10040,16 @@ impl App {
         self.active_workspace_idx
     }
 
-    fn resume_chat_as_tab(&mut self, id: String, recreate_dir: bool) -> Task<Event> {
-        if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
+    fn resume_chat_as_tab(&mut self, chat: chats::ChatRef, recreate_dir: bool) -> Task<Event> {
+        if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
-        if let Some((Some(remote_id), _)) = self.find_chat_entry(&id) {
-            let remote_id = remote_id.to_string();
-            return self.resume_remote_chat(id, remote_id);
+        if let Some(remote_id) = chat.remote_id.clone() {
+            return self.resume_remote_chat(chat.id, remote_id);
         }
+        let id = chat.id;
         let Some(entry) = self.chat_index.iter().find(|entry| entry.id == id) else {
-            eprintln!("[chats] cannot resume {id}: not in any machine's index");
+            eprintln!("[chats] cannot resume {id}: not in this Mac's index");
             return Task::none();
         };
         let cwd = entry.cwd.clone();
@@ -10087,12 +10102,14 @@ impl App {
     /// process spawns in the tab's `repo_path`), and carries the session id,
     /// so showing it reads the transcript back (`start_agent_history_load`)
     /// and its first prompt spawns Claude with `--resume`.
-    fn resume_chat_as_chat_tab(&mut self, id: String) -> Task<Event> {
-        if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
+    fn resume_chat_as_chat_tab(&mut self, chat: chats::ChatRef) -> Task<Event> {
+        if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
-        let Some((remote_id, entry)) = self.find_chat_entry(&id) else {
-            eprintln!("[chats] cannot resume {id} as a chat: not in any machine's index");
+        let remote_id = chat.remote_id.as_deref();
+        let id = chat.id.clone();
+        let Some(entry) = self.find_chat_entry(&chat) else {
+            eprintln!("[chats] cannot resume {id} as a chat: not in {remote_id:?}'s index");
             return Task::none();
         };
         if !can_resume_as_chat(entry, remote_id.is_some(), false) {
@@ -10147,7 +10164,8 @@ impl App {
     /// an open workspace bound to that remote — reopening closed
     /// workspaces is slice 5.
     fn resume_remote_chat(&mut self, id: String, remote_id: String) -> Task<Event> {
-        let Some((_, entry)) = self.find_chat_entry(&id) else {
+        let Some(entry) = self.find_chat_entry(&chats::ChatRef::new(Some(&remote_id), &id)) else {
+            eprintln!("[chats] cannot resume {id}: not in {remote_id}'s index");
             return Task::none();
         };
         if entry.dead_cwd {
@@ -10250,7 +10268,11 @@ impl App {
         Self::request_chat_index()
     }
 
-    fn request_chat_preview(id: String, path: PathBuf, backend: chats::ChatBackend) -> Task<Event> {
+    fn request_chat_preview(
+        chat: chats::ChatRef,
+        path: PathBuf,
+        backend: chats::ChatBackend,
+    ) -> Task<Event> {
         Task::perform(
             async move {
                 let preview =
@@ -10263,14 +10285,14 @@ impl App {
                             chats::ChatPreview::default()
                         }
                     };
-                (id, preview)
+                (chat, preview)
             },
-            |(id, preview)| Event::ChatPreviewLoaded(id, preview),
+            |(chat, preview)| Event::ChatPreviewLoaded(chat, preview),
         )
     }
 
     fn request_remote_chat_preview(
-        id: String,
+        chat: chats::ChatRef,
         path: PathBuf,
         backend: chats::ChatBackend,
         client: RemoteAgentClientConfig,
@@ -10287,9 +10309,9 @@ impl App {
                         chats::ChatPreview::default()
                     }
                 };
-                (id, preview)
+                (chat, preview)
             },
-            |(id, preview)| Event::ChatPreviewLoaded(id, preview),
+            |(chat, preview)| Event::ChatPreviewLoaded(chat, preview),
         )
     }
 
@@ -17548,7 +17570,7 @@ fi
                     }
 
                     // Escape closes the chat preview in Chats mode
-                    if tab.sidebar_mode == SidebarMode::Chats && tab.selected_chat_id.is_some() {
+                    if tab.sidebar_mode == SidebarMode::Chats && tab.selected_chat.is_some() {
                         if let Key::Named(key::Named::Escape) = key.as_ref() {
                             return Task::done(Event::CloseChatPreview);
                         }
@@ -19740,31 +19762,31 @@ fi
                     }
                 }
             }
-            Event::SelectChat(id) => {
-                let task = self.select_chat(id);
+            Event::SelectChat(chat) => {
+                let task = self.select_chat(chat);
                 self.settle_agent_surface();
                 return task;
             }
             Event::CloseChatPreview => {
                 if let Some(tab) = self.active_tab_mut() {
-                    tab.selected_chat_id = None;
+                    tab.selected_chat = None;
                 }
                 self.settle_agent_surface();
             }
-            Event::ChatPreviewLoaded(id, preview) => {
-                self.chat_preview = Some((id, preview));
+            Event::ChatPreviewLoaded(chat, preview) => {
+                self.chat_preview = Some((chat, preview));
             }
-            Event::ResumeChatAsTab(id) => {
-                return self.resume_chat_as_tab(id, false);
+            Event::ResumeChatAsTab(chat) => {
+                return self.resume_chat_as_tab(chat, false);
             }
-            Event::ResumeChatRecreateDir(id) => {
-                return self.resume_chat_as_tab(id, true);
+            Event::ResumeChatRecreateDir(chat) => {
+                return self.resume_chat_as_tab(chat, true);
             }
-            Event::ResumeChatAsChat(id) => {
-                return self.resume_chat_as_chat_tab(id);
+            Event::ResumeChatAsChat(chat) => {
+                return self.resume_chat_as_chat_tab(chat);
             }
-            Event::FocusChatTab(id) => {
-                if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&id) {
+            Event::FocusChatTab(chat) => {
+                if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
                     return self.focus_workspace_tab(ws_idx, tab_idx);
                 }
             }
@@ -21735,36 +21757,35 @@ fi
     /// Toggle the Chats-panel selection and fetch the preview for a newly
     /// selected conversation. Callers settle the agent surface afterwards:
     /// on a chat tab the preview covers the page.
-    fn select_chat(&mut self, id: String) -> Task<Event> {
+    fn select_chat(&mut self, chat: chats::ChatRef) -> Task<Event> {
         let already_selected = self
             .active_tab()
-            .is_some_and(|tab| tab.selected_chat_id.as_deref() == Some(id.as_str()));
+            .is_some_and(|tab| tab.selected_chat.as_ref() == Some(&chat));
         if already_selected {
             if let Some(tab) = self.active_tab_mut() {
-                tab.selected_chat_id = None;
+                tab.selected_chat = None;
             }
             return Task::none();
         }
-        let source = self.find_chat_entry(&id).map(|(remote_id, entry)| {
-            (
-                remote_id.map(str::to_string),
-                entry.path.clone(),
-                entry.backend,
-            )
-        });
+        let source = self
+            .find_chat_entry(&chat)
+            .map(|entry| (entry.path.clone(), entry.backend));
         if let Some(tab) = self.active_tab_mut() {
-            tab.selected_chat_id = Some(id.clone());
+            tab.selected_chat = Some(chat.clone());
         }
-        if let Some((remote_id, path, backend)) = source {
-            return match remote_id {
-                None => Self::request_chat_preview(id, path, backend),
+        if let Some((path, backend)) = source {
+            return match chat.remote_id.clone() {
+                None => Self::request_chat_preview(chat, path, backend),
                 Some(remote_id) => {
                     let Some(agent) = self.fresh_remote_agent_config(&remote_id) else {
-                        eprintln!("[chats] no config for remote {remote_id}; cannot preview {id}");
+                        eprintln!(
+                            "[chats] no config for remote {remote_id}; cannot preview {}",
+                            chat.id
+                        );
                         return Task::none();
                     };
                     Self::request_remote_chat_preview(
-                        id,
+                        chat,
                         path,
                         backend,
                         remote_agent_client_config(agent),
@@ -27190,7 +27211,9 @@ fi
                 continue;
             };
             resumable_count += 1;
-            let open = self.find_chat_tab(&conversation.session_id).is_some();
+            let open = self
+                .find_chat_tab(&chats::ChatRef::local(&conversation.session_id))
+                .is_some();
             let backend = conversation_backend_label(conversation.backend);
             let (badge_glyph, badge_color) = self.backend_badge(conversation.backend);
             let short_id = conversation.session_id.chars().take(8).collect::<String>();
@@ -29102,8 +29125,11 @@ fi
                 _ => tab
                     .chat_session_id
                     .as_deref()
-                    .and_then(|id| self.find_chat_entry(id))
-                    .map(|(_, entry)| entry.title.clone()),
+                    .and_then(|id| {
+                        let machine = self.remote_agent_id_for_workspace(workspace);
+                        self.find_chat_entry(&chats::ChatRef::new(machine, id))
+                    })
+                    .map(|entry| entry.title.clone()),
             };
             let about = about
                 .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -29367,13 +29393,14 @@ fi
 
         // Conversations open in a tab, with the workspace that holds them:
         // the "open" marker doubles as a jump to that tab.
-        let live_in: HashMap<&str, &str> = self
+        let live_in: HashMap<(Option<&str>, &str), &str> = self
             .workspaces
             .iter()
             .flat_map(|ws| {
-                ws.tabs
-                    .iter()
-                    .filter_map(move |t| Some((t.chat_session_id.as_deref()?, ws.name.as_str())))
+                let machine = self.remote_agent_id_for_workspace(ws);
+                ws.tabs.iter().filter_map(move |t| {
+                    Some(((machine, t.chat_session_id.as_deref()?), ws.name.as_str()))
+                })
             })
             .collect();
         let selected_bg = theme.surface0();
@@ -29470,7 +29497,8 @@ fi
                     .padding([6, 2]),
                 );
                 for entry in entries {
-                    let is_selected = tab.selected_chat_id.as_deref() == Some(entry.id.as_str());
+                    let chat_ref = chats::ChatRef::new(section_remote_id.as_deref(), &entry.id);
+                    let is_selected = tab.selected_chat.as_ref() == Some(&chat_ref);
                     let mut meta = Row::new().spacing(8).push(
                         text(chats::format_age(entry.mtime))
                             .size(font_small - 1.0)
@@ -29483,7 +29511,9 @@ fi
                                 .color(theme.text_secondary()),
                         );
                     }
-                    if let Some(ws_name) = live_in.get(entry.id.as_str()) {
+                    if let Some(ws_name) =
+                        live_in.get(&(section_remote_id.as_deref(), entry.id.as_str()))
+                    {
                         meta = meta.push(
                             button(
                                 text(format!("● open in {ws_name}"))
@@ -29492,7 +29522,7 @@ fi
                             )
                             .style(button::text)
                             .padding(0)
-                            .on_press(Event::FocusChatTab(entry.id.clone())),
+                            .on_press(Event::FocusChatTab(chat_ref.clone())),
                         );
                     } else if entry.possibly_running() {
                         meta = meta.push(
@@ -29532,7 +29562,7 @@ fi
                     let mut btn = button(content)
                         .padding([6, 8])
                         .width(Length::Fill)
-                        .on_press(Event::SelectChat(entry.id.clone()));
+                        .on_press(Event::SelectChat(chat_ref));
                     btn = if is_selected {
                         btn.style(move |_theme, _status| button::Style {
                             background: Some(selected_bg.into()),
@@ -29694,7 +29724,7 @@ fi
         let font = self.ui_font();
         let font_small = self.ui_font_small();
 
-        let Some(selected_id) = tab.selected_chat_id.as_deref() else {
+        let Some(selected) = tab.selected_chat.as_ref() else {
             return container(
                 text("select a conversation to preview it")
                     .size(font)
@@ -29704,8 +29734,8 @@ fi
             .center_y(Length::Fill)
             .into();
         };
-        let found = self.find_chat_entry(selected_id);
-        let Some((entry_remote_id, entry)) = found else {
+        let entry_remote_id = selected.remote_id.as_deref();
+        let Some(entry) = self.find_chat_entry(selected) else {
             return container(
                 text("conversation no longer in the index")
                     .size(font)
@@ -29720,7 +29750,7 @@ fi
         let preview = self
             .chat_preview
             .as_ref()
-            .filter(|(id, _)| *id == entry.id)
+            .filter(|(chat, _)| chat == selected)
             .map(|(_, preview)| preview);
 
         let machine_name = entry_remote_id.map(|remote_id| {
@@ -29793,7 +29823,7 @@ fi
         // Primary action per the registry rule: a live tab wins, then
         // dead-cwd rescue, then plain resume (with a possibly-running
         // warning when the transcript is still growing).
-        let is_live = self.find_chat_tab(&entry.id).is_some();
+        let is_live = self.find_chat_tab(selected).is_some();
         let is_remote = entry_remote_id.is_some();
         let action_button = |label: &'static str, color: iced::Color, event: Event| {
             button(text(label).size(font_small).color(color))
@@ -29815,7 +29845,7 @@ fi
                 .push(action_button(
                     "Go to Session",
                     theme.green(),
-                    Event::FocusChatTab(entry.id.clone()),
+                    Event::FocusChatTab(selected.clone()),
                 ))
                 .push(
                     text("already open in a session — one process per conversation")
@@ -29842,7 +29872,7 @@ fi
                 .push(action_button(
                     "Recreate directory & resume",
                     theme.yellow(),
-                    Event::ResumeChatRecreateDir(entry.id.clone()),
+                    Event::ResumeChatRecreateDir(selected.clone()),
                 ))
                 .push(
                     text("the recorded directory was deleted; resume only works from it")
@@ -29853,13 +29883,13 @@ fi
             actions = actions.push(action_button(
                 "Resume as Session",
                 theme.accent(),
-                Event::ResumeChatAsTab(entry.id.clone()),
+                Event::ResumeChatAsTab(selected.clone()),
             ));
             if can_resume_as_chat(entry, is_remote, is_live) {
                 actions = actions.push(action_button(
                     "Resume as Chat",
                     theme.accent(),
-                    Event::ResumeChatAsChat(entry.id.clone()),
+                    Event::ResumeChatAsChat(selected.clone()),
                 ));
             }
             if entry.possibly_running() {

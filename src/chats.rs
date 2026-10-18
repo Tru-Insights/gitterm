@@ -77,6 +77,28 @@ impl ChatBackend {
     }
 }
 
+/// One conversation on one machine (`remote_id` None = this Mac). A
+/// conversation moved to another machine keeps its session id, so the id
+/// alone can name two transcripts; every lookup goes through both.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChatRef {
+    pub remote_id: Option<String>,
+    pub id: String,
+}
+
+impl ChatRef {
+    pub fn new(remote_id: Option<&str>, id: &str) -> Self {
+        Self {
+            remote_id: remote_id.map(str::to_string),
+            id: id.to_string(),
+        }
+    }
+
+    pub fn local(id: &str) -> Self {
+        Self::new(None, id)
+    }
+}
+
 /// The three scope rings of the Chats panel. With only the local machine
 /// indexed (slice 1), Machine and Everywhere show the same set; they
 /// diverge when remote machines land (slice 4).
