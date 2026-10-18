@@ -29,6 +29,9 @@ message HandshakeResponse {
   string agent_version = 2;
   uint32 protocol_version = 3;
   repeated string capabilities = 4;
+  // The agent user's $HOME, so pickers can start there. Empty from agents
+  // that predate it.
+  string home_dir = 5;
 }
 
 message ListDirRequest {
@@ -49,6 +52,9 @@ message DirEntry {
   string name = 1;
   string path = 2;
   bool is_dir = 3;
+  // Directory contains a `.git` entry (file or dir). False from agents
+  // that predate it.
+  bool is_git_repo = 4;
 }
 
 message ReadFileRequest {

@@ -34,6 +34,8 @@ pub struct RemoteAgentHandshake {
     pub agent_version: String,
     pub protocol_version: u32,
     pub capabilities: Vec<String>,
+    /// Agent user's $HOME; empty from agents that predate the field.
+    pub home_dir: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +52,8 @@ pub struct RemoteAgentDirEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    /// False from agents that predate the field.
+    pub is_git_repo: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +167,7 @@ impl RemoteAgentBackend {
             agent_version: response.agent_version,
             protocol_version: response.protocol_version,
             capabilities: response.capabilities,
+            home_dir: response.home_dir,
         })
     }
 
@@ -207,6 +212,7 @@ impl RemoteAgentBackend {
                     name: entry.name,
                     path: entry.path,
                     is_dir: entry.is_dir,
+                    is_git_repo: entry.is_git_repo,
                 })
                 .collect(),
         })

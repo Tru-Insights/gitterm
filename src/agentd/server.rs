@@ -60,6 +60,16 @@ impl GitTermAgent for GitTermAgentService {
             )));
         }
 
+        // Optional by contract: an empty home_dir makes the desktop picker
+        // start at "/", so log instead of failing the handshake.
+        let home_dir = match dirs::home_dir() {
+            Some(home) => home.to_string_lossy().to_string(),
+            None => {
+                eprintln!("[agent] handshake: home directory unavailable; sending empty home_dir");
+                String::new()
+            }
+        };
+
         Ok(Response::new(HandshakeResponse {
             agent_name: self.agent_name.clone(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -73,6 +83,7 @@ impl GitTermAgent for GitTermAgentService {
                 "sessions".to_string(),
                 "chats".to_string(),
             ],
+            home_dir,
         }))
     }
 
@@ -594,10 +605,14 @@ fn list_dir_response(request: ListDirRequest) -> Result<ListDirResponse, Status>
                 entry.path().display()
             ))
         })?;
+        let is_dir = file_type.is_dir();
+        let path = entry.path();
         let item = DirEntry {
             name,
-            path: entry.path().to_string_lossy().to_string(),
-            is_dir: file_type.is_dir(),
+            // A `.git` file (worktree/submodule) counts as well as a dir.
+            is_git_repo: is_dir && path.join(".git").exists(),
+            path: path.to_string_lossy().to_string(),
+            is_dir,
         };
         if item.is_dir {
             dirs.push(item);
@@ -736,6 +751,10 @@ mod tests {
         assert_eq!(response.agent_name, "test-agent");
         assert_eq!(response.protocol_version, PROTOCOL_VERSION);
         assert!(response.capabilities.contains(&"handshake".to_string()));
+        assert_eq!(
+            response.home_dir,
+            dirs::home_dir().unwrap().to_string_lossy().to_string()
+        );
     }
 
     #[tokio::test]
@@ -788,6 +807,48 @@ mod tests {
                 ("z-dir".to_string(), true),
                 ("a.txt".to_string(), false),
                 ("b.txt".to_string(), false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_dir_marks_git_repos() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("repo").join(".git")).unwrap();
+        // Linked worktrees and submodules carry a `.git` file, not a dir.
+        std::fs::create_dir(root.path().join("worktree")).unwrap();
+        std::fs::write(
+            root.path().join("worktree").join(".git"),
+            "gitdir: /elsewhere",
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join("plain")).unwrap();
+        std::fs::write(root.path().join("file.txt"), "f").unwrap();
+
+        let service = GitTermAgentService::new("test-agent".to_string());
+        let response = service
+            .list_dir(Request::new(ListDirRequest {
+                workspace_id: "workspace".to_string(),
+                root: root.path().to_string_lossy().to_string(),
+                current_dir: root.path().to_string_lossy().to_string(),
+                show_hidden: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let marks: Vec<(String, bool)> = response
+            .entries
+            .into_iter()
+            .map(|entry| (entry.name, entry.is_git_repo))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                ("plain".to_string(), false),
+                ("repo".to_string(), true),
+                ("worktree".to_string(), true),
+                ("file.txt".to_string(), false),
             ]
         );
     }

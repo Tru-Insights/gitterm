@@ -5380,16 +5380,23 @@ pub enum Event {
     WorkspaceCreate,
     WorkspaceCreateLocal,
     WorkspaceCreated(Option<PathBuf>),
-    WorkspaceSourcePickerCancel,
     RemoteWorkspaceBrowse(String),
-    RemotePickerNavigate(SourcePath),
-    RemotePickerUp,
-    RemotePickerLoaded {
+    // In-app folder picker (TRU-149)
+    FolderPickerMachine(Option<String>),
+    FolderPickerNavigate(SourcePath),
+    FolderPickerUp,
+    FolderPickerLoaded {
         seq: u64,
         listing: SourceDirListing,
+        /// A typed-path check rather than plain navigation.
+        typed: bool,
     },
-    RemotePickerConfirm,
-    RemotePickerCancel,
+    FolderPickerPathChanged(String),
+    FolderPickerPathSubmit,
+    FolderPickerConfirm,
+    FolderPickerCancel,
+    FolderPickerNativeDialog,
+    FolderPickerNativeChosen(FolderPickerPurpose, Option<PathBuf>),
     RemoteConnectOpen,
     RemoteConnectClose,
     RemoteConnectNameChanged(String),
@@ -5863,9 +5870,11 @@ struct App {
     // True only when the picker was opened by "+ Continue" and the task's
     // handoff brief was actually written to the clipboard.
     task_handoff_copied: bool,
-    // "New workspace" source chooser + remote directory picker (Phase 8)
-    workspace_source_picker_visible: bool,
-    remote_workspace_picker: Option<RemoteWorkspacePicker>,
+    // In-app folder picker for every machine (TRU-149)
+    folder_picker: Option<FolderPicker>,
+    /// Folder last chosen in the picker per machine (None = this Mac),
+    /// this session only; where the picker opens next time.
+    folder_picker_last_dirs: HashMap<Option<String>, String>,
     // "Connect remote host" form (in-app editor for remote-agents.json)
     remote_connect_form: Option<RemoteConnectForm>,
     // Configured agent presets
@@ -6012,7 +6021,8 @@ enum VisibleSurface {
 }
 
 /// Pick the visible webview surface: at most one, Viewer over Agent, nothing
-/// while the Usage view covers the content area (`overlay_open`).
+/// while the Usage view or the folder picker covers the content area
+/// (`overlay_open`).
 fn visible_webview_surface(
     viewer: ViewerWebview,
     active: ActiveTabSurface,
@@ -6494,14 +6504,114 @@ fn remote_agent_root(location: &WorkspaceLocation) -> Option<&str> {
     }
 }
 
-/// In-app directory browser for choosing a new remote workspace root.
-/// Reuses FilesState so listing/navigation behaves exactly like the Files
-/// sidebar, fed by the same source.
+/// Why the folder picker is open; decides what "Use this folder" does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderPickerPurpose {
+    /// New workspace ("+", machine menus): create a workspace rooted at
+    /// the folder on the chosen machine.
+    NewWorkspace,
+    /// Open Folder (Cmd+O, Option+Shift+T, the empty-state button): add a
+    /// tab for the folder, in a workspace on the chosen machine.
+    OpenFolder,
+}
+
+/// The in-app folder picker (TRU-149), one for every machine. Listings
+/// come through `WorkspaceSource` + `FilesState` exactly like the Files
+/// sidebar, from a source rooted at the filesystem root so any directory
+/// can be chosen.
 #[derive(Debug, Clone)]
-struct RemoteWorkspacePicker {
-    remote_id: String,
-    remote_name: String,
+struct FolderPicker {
+    purpose: FolderPickerPurpose,
+    /// Machine being browsed (None = this Mac).
+    remote_id: Option<String>,
     files: FilesState,
+    /// Path field contents: follows navigation, editable to jump.
+    path_input: String,
+    /// Inline error for a typed path that is not a directory.
+    path_error: Option<String>,
+    /// Sequence of typed-path checks; any navigation supersedes a pending
+    /// one so a slow answer can't jump the picker.
+    typed_seq: u64,
+    /// Opened at "/" because the remote's home was not known yet: the
+    /// handshake that reports it moves the picker there, unless the user
+    /// navigated meanwhile.
+    awaiting_home: bool,
+}
+
+/// Where the folder picker opens on a machine: the folder last chosen
+/// there this session, else the machine's home, else "/".
+fn folder_picker_start_dir(last_chosen: Option<&str>, home: Option<&str>) -> String {
+    [last_chosen, home]
+        .into_iter()
+        .flatten()
+        .find(|dir| !dir.is_empty())
+        .unwrap_or("/")
+        .to_string()
+}
+
+/// The picker's "Recent" list for one machine: distinct repo roots from
+/// its chat index, most recent first, then its open workspaces' dirs; at
+/// most `max`. Chats whose directory is gone are skipped.
+fn folder_picker_recents(
+    entries: &[chats::ChatIndexEntry],
+    open_dirs: &[PathBuf],
+    max: usize,
+) -> Vec<PathBuf> {
+    let mut live: Vec<&chats::ChatIndexEntry> =
+        entries.iter().filter(|entry| !entry.dead_cwd).collect();
+    live.sort_by_key(|entry| std::cmp::Reverse(entry.mtime));
+    let mut recents: Vec<PathBuf> = Vec::new();
+    let candidates = live
+        .iter()
+        .map(|entry| entry.group_root())
+        .chain(open_dirs.iter().map(PathBuf::as_path));
+    for dir in candidates {
+        if recents.len() >= max {
+            break;
+        }
+        if !recents.iter().any(|seen| seen == dir) {
+            recents.push(dir.to_path_buf());
+        }
+    }
+    recents
+}
+
+/// Resolve the picker's path field: trimmed, a leading "~" expanded to
+/// the machine's `home`, and absolute. The error is shown inline.
+fn folder_picker_typed_path(input: &str, home: Option<&str>) -> Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("Type a folder path".to_string());
+    }
+    let resolved = if input == "~" || input.starts_with("~/") {
+        let Some(home) = home.filter(|home| !home.is_empty()) else {
+            return Err(
+                "This machine's home folder is not known; type an absolute path".to_string(),
+            );
+        };
+        format!("{}{}", home.trim_end_matches('/'), &input[1..])
+    } else {
+        input.to_string()
+    };
+    if !(resolved.starts_with('/') || Path::new(&resolved).is_absolute()) {
+        return Err(format!("{resolved} is not an absolute path"));
+    }
+    Ok(resolved)
+}
+
+/// A picker path for display, with the machine's home shown as "~".
+fn folder_picker_tilde(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home
+        .map(|home| home.trim_end_matches('/'))
+        .filter(|home| !home.is_empty())
+    else {
+        return path.to_string();
+    };
+    match path.strip_prefix(home) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
 }
 
 /// "Connect remote host" form — the in-app editor for adding an entry to
@@ -10455,12 +10565,371 @@ impl App {
         source: WorkspaceSource,
         dir: SourcePath,
         seq: u64,
+        typed: bool,
         show_hidden: bool,
     ) -> Task<Event> {
         Task::perform(
             async move { source.list_dir(0, dir, show_hidden).await },
-            move |listing| Event::RemotePickerLoaded { seq, listing },
+            move |listing| Event::FolderPickerLoaded {
+                seq,
+                listing,
+                typed,
+            },
         )
+    }
+
+    /// A folder-picker path token for a machine (None = this Mac).
+    fn folder_picker_path(remote_id: Option<&str>, dir: String) -> SourcePath {
+        match remote_id {
+            None => SourcePath::Local(PathBuf::from(dir)),
+            Some(_) => SourcePath::Remote(dir),
+        }
+    }
+
+    /// Source the folder picker lists `dir` through: locally a source
+    /// rooted at the filesystem root holding `dir`, remotely the agent's
+    /// whole filesystem (`picker_source`).
+    fn folder_picker_source(
+        &self,
+        remote_id: Option<&str>,
+        dir: &SourcePath,
+    ) -> Result<WorkspaceSource, String> {
+        match (remote_id, dir) {
+            (None, SourcePath::Local(path)) => Ok(WorkspaceSource::Local {
+                root: path.ancestors().last().unwrap_or(path).to_path_buf(),
+            }),
+            (Some(remote_id), SourcePath::Remote(_)) => self
+                .remote_agent_config_by_id(remote_id)
+                .cloned()
+                .map(Self::picker_source)
+                .ok_or_else(|| {
+                    format!("Remote \"{remote_id}\" is not configured in remote-agents.json")
+                }),
+            (remote_id, dir) => Err(format!(
+                "internal error: path {} does not belong to machine {remote_id:?}",
+                dir.display()
+            )),
+        }
+    }
+
+    /// A machine's home folder for the picker: this Mac's, or the one a
+    /// remote reported in its handshake (empty from older agents).
+    fn folder_picker_home(&self, remote_id: Option<&str>) -> Option<String> {
+        match remote_id {
+            None => dirs::home_dir().map(|home| home.to_string_lossy().to_string()),
+            Some(remote_id) => match self
+                .remote_agent_connections
+                .get(remote_id)
+                .map(|connection| &connection.status)
+            {
+                Some(RemoteAgentConnectionStatus::Connected(handshake))
+                    if !handshake.home_dir.is_empty() =>
+                {
+                    Some(handshake.home_dir.clone())
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// The picker's Recent folders on one machine.
+    fn folder_picker_recent_dirs(&self, remote_id: Option<&str>) -> Vec<PathBuf> {
+        const MAX_RECENT_FOLDERS: usize = 8;
+        let open_dirs: Vec<PathBuf> = self
+            .workspaces
+            .iter()
+            .filter_map(|ws| match (&ws.location, remote_id) {
+                (WorkspaceLocation::Local { .. }, None) => Some(ws.dir.clone()),
+                (
+                    WorkspaceLocation::RemoteAgent {
+                        remote_id: rid,
+                        root,
+                        ..
+                    },
+                    Some(id),
+                ) if rid == id => Some(PathBuf::from(root)),
+                _ => None,
+            })
+            .collect();
+        folder_picker_recents(
+            self.chat_entries_for_machine(remote_id),
+            &open_dirs,
+            MAX_RECENT_FOLDERS,
+        )
+    }
+
+    /// Open the folder picker on `remote_id`'s machine (None = this Mac).
+    /// Hides the webview surfaces, which would otherwise cover it, and
+    /// refreshes stale chat indexes so the Recent list fills in.
+    fn open_folder_picker(
+        &mut self,
+        purpose: FolderPickerPurpose,
+        remote_id: Option<String>,
+    ) -> Task<Event> {
+        self.machine_menu = None;
+        self.folder_picker = Some(FolderPicker {
+            purpose,
+            remote_id: None,
+            files: FilesState::at(SourcePath::Local(PathBuf::from("/"))),
+            path_input: String::new(),
+            path_error: None,
+            typed_seq: 0,
+            awaiting_home: false,
+        });
+        let select = self.folder_picker_select_machine(remote_id);
+        let surfaces = self.apply_webview_surfaces();
+        let chats = self.refresh_chat_index_if_stale();
+        Task::batch([select, surfaces, chats])
+    }
+
+    fn close_folder_picker(&mut self) -> Task<Event> {
+        if self.folder_picker.take().is_none() {
+            return Task::none();
+        }
+        self.apply_webview_surfaces()
+    }
+
+    /// Point the open picker at a machine and list its start directory.
+    fn folder_picker_select_machine(&mut self, remote_id: Option<String>) -> Task<Event> {
+        if self.folder_picker.is_none() {
+            return Task::none();
+        }
+        let last = self.folder_picker_last_dirs.get(&remote_id).cloned();
+        let home = self.folder_picker_home(remote_id.as_deref());
+        let start = folder_picker_start_dir(last.as_deref(), home.as_deref());
+        let connect = match remote_id.as_deref() {
+            Some(id) => self.ensure_remote_agent_connection(id, false),
+            None => Task::none(),
+        };
+        // Still connecting (or just kicked off above): the handshake that
+        // lands next carries the home folder.
+        let awaiting_home = last.is_none()
+            && home.is_none()
+            && remote_id.as_deref().is_some_and(|id| {
+                matches!(
+                    self.remote_agent_connections
+                        .get(id)
+                        .map(|connection| &connection.status),
+                    Some(RemoteAgentConnectionStatus::Connecting)
+                )
+            });
+        let dir = Self::folder_picker_path(remote_id.as_deref(), start.clone());
+        if let Some(picker) = self.folder_picker.as_mut() {
+            picker.remote_id = remote_id;
+            // Keep `files` (and its seq) so a listing still in flight for
+            // the previous machine is dropped, not applied here.
+            picker.files.entries.clear();
+            picker.files.parent = None;
+            picker.path_input = start;
+            picker.path_error = None;
+            picker.awaiting_home = awaiting_home;
+        }
+        Task::batch([connect, self.folder_picker_list(dir, false)])
+    }
+
+    /// List `dir` for the picker. Plain navigation moves the picker now;
+    /// a typed path is only checked, and moves it once it lists cleanly.
+    fn folder_picker_list(&mut self, dir: SourcePath, typed: bool) -> Task<Event> {
+        let Some(remote_id) = self
+            .folder_picker
+            .as_ref()
+            .map(|picker| picker.remote_id.clone())
+        else {
+            return Task::none();
+        };
+        let source = self.folder_picker_source(remote_id.as_deref(), &dir);
+        let show_hidden = self.show_hidden;
+        let Some(picker) = self.folder_picker.as_mut() else {
+            return Task::none();
+        };
+        picker.typed_seq = picker.typed_seq.wrapping_add(1);
+        let seq = if typed {
+            picker.typed_seq
+        } else {
+            picker.files.begin_request(dir.clone())
+        };
+        match source {
+            Ok(source) => Self::request_picker_listing(source, dir, seq, typed, show_hidden),
+            Err(error) => {
+                eprintln!("[picker] cannot list {}: {error}", dir.display());
+                if typed {
+                    picker.path_error = Some(error);
+                } else {
+                    picker.files.loading = false;
+                    picker.files.error = Some(error);
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// A remote handshake landed: move a picker still waiting for that
+    /// machine's home folder there.
+    fn folder_picker_home_arrived(&mut self, remote_id: &str) -> Task<Event> {
+        let waiting = self.folder_picker.as_ref().is_some_and(|picker| {
+            picker.awaiting_home && picker.remote_id.as_deref() == Some(remote_id)
+        });
+        if !waiting {
+            return Task::none();
+        }
+        let home = self.folder_picker_home(Some(remote_id));
+        if let Some(picker) = self.folder_picker.as_mut() {
+            picker.awaiting_home = false;
+        }
+        match home {
+            Some(home) => self.folder_picker_list(SourcePath::Remote(home), false),
+            None => Task::none(),
+        }
+    }
+
+    /// "Use this folder" (or the macOS dialog's answer), with the picker
+    /// already closed: remember the folder for this machine, create a
+    /// workspace or add a tab, then present the surfaces of whatever tab
+    /// is now active (the picker kept them hidden).
+    fn confirm_folder_picker(
+        &mut self,
+        purpose: FolderPickerPurpose,
+        remote_id: Option<String>,
+        dir: String,
+    ) -> Task<Event> {
+        self.folder_picker_last_dirs
+            .insert(remote_id.clone(), dir.clone());
+        let opened = match (purpose, remote_id) {
+            (FolderPickerPurpose::NewWorkspace, None) => {
+                self.update(Event::WorkspaceCreated(Some(PathBuf::from(dir))))
+            }
+            (FolderPickerPurpose::NewWorkspace, Some(remote_id)) => {
+                self.create_remote_workspace_at(&remote_id, dir)
+            }
+            (FolderPickerPurpose::OpenFolder, None) => {
+                self.open_local_folder_tab(PathBuf::from(dir))
+            }
+            (FolderPickerPurpose::OpenFolder, Some(remote_id)) => {
+                self.open_remote_folder_tab(&remote_id, dir)
+            }
+        };
+        Task::batch([opened, self.present_active_tab_surfaces()])
+    }
+
+    /// New remote workspace rooted at `root`, named "<remote>:<dir>", with
+    /// a remote browser tab; becomes the active workspace.
+    fn create_remote_workspace_at(&mut self, remote_id: &str, root: String) -> Task<Event> {
+        let Some(remote_name) = self
+            .remote_agent_config_by_id(remote_id)
+            .map(|agent| agent.name.clone())
+        else {
+            eprintln!(
+                "[picker] cannot create a workspace at {root}: remote {remote_id} is no longer configured"
+            );
+            return Task::none();
+        };
+        let name = root
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or("remote")
+            .to_string();
+        let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
+        let mut workspace = Workspace::new(
+            format!("{remote_name}:{name}"),
+            PathBuf::from(&root),
+            WorkspaceColor::next_available(&used_colors),
+        );
+        workspace.location = WorkspaceLocation::RemoteAgent {
+            remote_id: remote_id.to_string(),
+            workspace_id: root.clone(),
+            root: root.clone(),
+        };
+        self.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
+        workspace.active_tab = 0;
+        self.workspaces.push(workspace);
+        self.active_workspace_idx = self.workspaces.len() - 1;
+        self.normalize_workspace_order();
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.sync_plans_dir();
+        self.snap_slide_to_active_workspace();
+        Task::batch([
+            self.ensure_active_remote_agent_connection(true),
+            self.refresh_files_for_active_tab(),
+        ])
+    }
+
+    /// Open Folder on this Mac: a tab in the active workspace when that is
+    /// local (the `FolderSelected` flow), otherwise in the local workspace
+    /// holding the folder, reopened or created as chats do.
+    fn open_local_folder_tab(&mut self, path: PathBuf) -> Task<Event> {
+        let active_is_local = self
+            .active_workspace()
+            .is_some_and(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }));
+        if active_is_local {
+            return self.update(Event::FolderSelected(Some(path)));
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let mut tasks = Vec::new();
+        let ws_idx = self.ensure_local_workspace_for_chat(&path, None, &name);
+        if ws_idx != self.active_workspace_idx {
+            tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
+        }
+        tasks.push(self.update(Event::FolderSelected(Some(path))));
+        Task::batch(tasks)
+    }
+
+    /// Open Folder on a remote: a browser tab at `dir` in the active
+    /// workspace when it is on that machine and holds `dir`, else in that
+    /// machine's workspace holding it, else in one reopened or created
+    /// for it. A remote tab can't browse outside its workspace root, so
+    /// "same machine" alone isn't enough to reuse the active workspace.
+    fn open_remote_folder_tab(&mut self, remote_id: &str, dir: String) -> Task<Event> {
+        let folder = PathBuf::from(&dir);
+        let holds = |ws: &Workspace| match &ws.location {
+            WorkspaceLocation::RemoteAgent {
+                remote_id: rid,
+                root,
+                ..
+            } => rid == remote_id && folder.starts_with(root),
+            _ => false,
+        };
+        let existing = self
+            .active_workspace()
+            .filter(|ws| holds(ws))
+            .map(|_| self.active_workspace_idx)
+            .or_else(|| self.workspaces.iter().position(holds));
+        let mut tasks = Vec::new();
+        match existing {
+            Some(ws_idx) => {
+                if ws_idx != self.active_workspace_idx {
+                    tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
+                }
+                let ws = &self.workspaces[ws_idx];
+                let Some(root) = remote_agent_root(&ws.location).map(str::to_string) else {
+                    return Task::batch(tasks);
+                };
+                let name = ws.name.clone();
+                let tab = self.new_remote_agent_tab(&name, root, Some(dir));
+                let workspace = &mut self.workspaces[ws_idx];
+                workspace.tabs.push(tab);
+                workspace.active_tab = workspace.tabs.len() - 1;
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
+            }
+            None => {
+                self.ensure_remote_workspace_for_chat(remote_id, &folder, None);
+                // A reopened closed workspace's tab browses its root;
+                // point it at the chosen folder.
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.files = FilesState::at(SourcePath::Remote(dir));
+                }
+            }
+        }
+        tasks.push(self.ensure_active_remote_agent_connection(false));
+        tasks.push(self.refresh_files_for_active_tab());
+        tasks.push(self.scroll_to_active_tab());
+        Task::batch(tasks)
     }
 
     /// Run one directory listing against a source and deliver it as a
@@ -11975,8 +12444,8 @@ impl App {
             tab_picker_visible: false,
             tab_picker_cli_open: false,
             task_handoff_copied: false,
-            workspace_source_picker_visible: false,
-            remote_workspace_picker: None,
+            folder_picker: None,
+            folder_picker_last_dirs: HashMap::new(),
             remote_connect_form: None,
             agent_presets: config.agent_presets.clone(),
             quick_commands: config.quick_commands.clone(),
@@ -12584,10 +13053,23 @@ impl App {
         root: String,
         browse_dir: Option<String>,
     ) {
+        let tab = self.new_remote_agent_tab(&workspace.name, root, browse_dir);
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+    }
+
+    /// A remote browser tab for a workspace rooted at `root`, browsing
+    /// `browse_dir` (default the root).
+    fn new_remote_agent_tab(
+        &mut self,
+        workspace_name: &str,
+        root: String,
+        browse_dir: Option<String>,
+    ) -> TabState {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let mut tab = TabState::new(id, PathBuf::from(&root));
-        tab.repo_name = workspace.name.clone();
+        tab.repo_name = workspace_name.to_string();
         tab.branch_name = "remote".to_string();
         tab.sidebar_mode = SidebarMode::Files;
         tab.is_git_repo = false;
@@ -12596,8 +13078,7 @@ impl App {
         tab.files = FilesState::at(SourcePath::Remote(
             browse_dir.unwrap_or_else(|| root.clone()),
         ));
-        workspace.tabs.push(tab);
-        workspace.active_tab = workspace.tabs.len() - 1;
+        tab
     }
 
     /// Open a new session tab through the active workspace's source: local
@@ -17148,16 +17629,8 @@ fi
                 }
             }
             Event::OpenFolder => {
-                return Task::perform(
-                    async {
-                        let folder = rfd::AsyncFileDialog::new()
-                            .set_title("Select Folder")
-                            .pick_folder()
-                            .await;
-                        folder.map(|f| f.path().to_path_buf())
-                    },
-                    Event::FolderSelected,
-                );
+                let machine = self.active_machine_remote_id().map(str::to_string);
+                return self.open_folder_picker(FolderPickerPurpose::OpenFolder, machine);
             }
             Event::FolderSelected(Some(path)) => {
                 // Allow any folder, not just git repos
@@ -17384,6 +17857,13 @@ fi
                 {
                     self.remote_connect_form = None;
                     return Task::none();
+                }
+
+                // Folder picker: Escape closes
+                if self.folder_picker.is_some()
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    return self.close_folder_picker();
                 }
 
                 // Machine menu: Escape closes
@@ -19020,6 +19500,7 @@ fi
                         .and_then(|connection| connection.last_connected),
                 };
 
+                let remote_id = snapshot.remote_id.clone();
                 self.remote_agent_connections.insert(
                     snapshot.remote_id,
                     RemoteAgentConnection {
@@ -19030,9 +19511,8 @@ fi
                         last_connected,
                     },
                 );
-                if let Some(refresh) = pending_refresh {
-                    return refresh;
-                }
+                let picker_task = self.folder_picker_home_arrived(&remote_id);
+                return Task::batch([pending_refresh.unwrap_or_else(Task::none), picker_task]);
             }
             Event::AttachRemoteSession(session_name) => {
                 return self.open_remote_session_tab(&session_name);
@@ -20640,29 +21120,18 @@ fi
                 }
             }
             Event::WorkspaceCreate => {
-                // Always show the source chooser: it is also the entry
-                // point for connecting a new remote host.
-                self.workspace_source_picker_visible = true;
+                // The picker's machine selector (with its "connect a
+                // machine" entry) replaces the old source chooser.
+                let machine = self.active_machine_remote_id().map(str::to_string);
+                return self.open_folder_picker(FolderPickerPurpose::NewWorkspace, machine);
             }
             Event::WorkspaceCreateLocal => {
-                self.machine_menu = None;
-                self.workspace_source_picker_visible = false;
-                return Task::perform(
-                    async {
-                        let folder = rfd::AsyncFileDialog::new()
-                            .set_title("Select Workspace Folder")
-                            .pick_folder()
-                            .await;
-                        folder.map(|f| f.path().to_path_buf())
-                    },
-                    Event::WorkspaceCreated,
-                );
-            }
-            Event::WorkspaceSourcePickerCancel => {
-                self.workspace_source_picker_visible = false;
+                return self.open_folder_picker(FolderPickerPurpose::NewWorkspace, None);
             }
             Event::RemoteConnectOpen => {
-                self.workspace_source_picker_visible = false;
+                // Opened from the folder picker's machine selector, the
+                // picker stays underneath: a machine saved here shows up
+                // in its selector when the form closes.
                 self.remote_connect_form = Some(RemoteConnectForm::default());
             }
             Event::RemoteConnectClose => {
@@ -20687,98 +21156,131 @@ fi
                 return self.submit_remote_connect_form();
             }
             Event::RemoteWorkspaceBrowse(remote_id) => {
-                self.machine_menu = None;
-                self.workspace_source_picker_visible = false;
-                let Some(agent) = self.remote_agent_config_by_id(&remote_id).cloned() else {
-                    return Task::none();
-                };
-                let start = SourcePath::Remote("/".to_string());
-                let mut files = FilesState::at(start.clone());
-                let seq = files.begin_request(start.clone());
-                self.remote_workspace_picker = Some(RemoteWorkspacePicker {
-                    remote_id: agent.id.clone(),
-                    remote_name: agent.name.clone(),
-                    files,
-                });
-                let source = Self::picker_source(agent);
-                return Self::request_picker_listing(source, start, seq, self.show_hidden);
+                return self.open_folder_picker(FolderPickerPurpose::NewWorkspace, Some(remote_id));
             }
-            Event::RemotePickerNavigate(dir) => {
-                let Some(picker) = self.remote_workspace_picker.as_mut() else {
-                    return Task::none();
-                };
-                let seq = picker.files.begin_request(dir.clone());
-                let remote_id = picker.remote_id.clone();
-                let Some(agent) = self.remote_agent_config_by_id(&remote_id).cloned() else {
-                    return Task::none();
-                };
-                return Self::request_picker_listing(
-                    Self::picker_source(agent),
-                    dir,
-                    seq,
-                    self.show_hidden,
-                );
+            Event::FolderPickerMachine(remote_id) => {
+                return self.folder_picker_select_machine(remote_id);
             }
-            Event::RemotePickerUp => {
+            Event::FolderPickerNavigate(dir) => {
+                if let Some(picker) = self.folder_picker.as_mut() {
+                    picker.awaiting_home = false;
+                    picker.path_error = None;
+                }
+                return self.folder_picker_list(dir, false);
+            }
+            Event::FolderPickerUp => {
                 let parent = self
-                    .remote_workspace_picker
+                    .folder_picker
                     .as_ref()
                     .and_then(|picker| picker.files.parent.clone());
                 if let Some(parent) = parent {
-                    return Task::done(Event::RemotePickerNavigate(parent));
+                    return Task::done(Event::FolderPickerNavigate(parent));
                 }
             }
-            Event::RemotePickerLoaded { seq, listing } => {
-                if let Some(picker) = self.remote_workspace_picker.as_mut() {
-                    picker.files.apply(seq, listing);
-                }
-            }
-            Event::RemotePickerCancel => {
-                self.remote_workspace_picker = None;
-            }
-            Event::RemotePickerConfirm => {
-                let Some(picker) = self.remote_workspace_picker.take() else {
+            Event::FolderPickerLoaded {
+                seq,
+                listing,
+                typed,
+            } => {
+                let Some(picker) = self.folder_picker.as_mut() else {
                     return Task::none();
                 };
-                let root = picker.files.dir.display();
-                let name = root
-                    .trim_end_matches('/')
-                    .rsplit('/')
-                    .next()
-                    .filter(|segment| !segment.is_empty())
-                    .unwrap_or("remote")
-                    .to_string();
-                let used_colors: Vec<WorkspaceColor> =
-                    self.workspaces.iter().map(|ws| ws.color).collect();
-                let mut workspace = Workspace::new(
-                    format!("{}:{}", picker.remote_name, name),
-                    PathBuf::from(&root),
-                    WorkspaceColor::next_available(&used_colors),
-                );
-                workspace.location = WorkspaceLocation::RemoteAgent {
-                    remote_id: picker.remote_id.clone(),
-                    workspace_id: root.clone(),
-                    root: root.clone(),
-                };
-                self.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
-                workspace.active_tab = 0;
-                self.workspaces.push(workspace);
-                self.active_workspace_idx = self.workspaces.len() - 1;
-                self.normalize_workspace_order();
-                self.mark_workspaces_dirty();
-                self.mark_log_server_dirty();
-                self.sync_plans_dir();
-                let viewport_width = self.content_viewport_width();
-                let new_target = self.active_workspace_idx as f32 * viewport_width;
-                self.slide_offset = new_target;
-                self.slide_target = new_target;
-                self.slide_animating = false;
-                self.slide_start_time = None;
-                return Task::batch([
-                    self.ensure_active_remote_agent_connection(true),
-                    self.refresh_files_for_active_tab(),
-                ]);
+                if let Some(error) = &listing.error {
+                    eprintln!(
+                        "[picker] listing {} on {:?} failed: {error}",
+                        listing.current_dir.display(),
+                        picker.remote_id
+                    );
+                }
+                if typed {
+                    if seq != picker.typed_seq {
+                        return Task::none();
+                    }
+                    // Only a listable directory moves the picker; anything
+                    // else stays an inline error under the path field.
+                    if let Some(error) = listing.error {
+                        picker.path_error = Some(error);
+                        return Task::none();
+                    }
+                    let applied = picker.files.begin_request(listing.current_dir.clone());
+                    picker.files.apply(applied, listing);
+                    picker.path_input = picker.files.dir.display();
+                    picker.path_error = None;
+                } else if seq == picker.files.seq {
+                    picker.files.apply(seq, listing);
+                    picker.path_input = picker.files.dir.display();
+                }
             }
+            Event::FolderPickerPathChanged(value) => {
+                if let Some(picker) = self.folder_picker.as_mut() {
+                    picker.path_input = value;
+                    picker.path_error = None;
+                }
+            }
+            Event::FolderPickerPathSubmit => {
+                let Some(picker) = self.folder_picker.as_ref() else {
+                    return Task::none();
+                };
+                let remote_id = picker.remote_id.clone();
+                let input = picker.path_input.clone();
+                let home = self.folder_picker_home(remote_id.as_deref());
+                match folder_picker_typed_path(&input, home.as_deref()) {
+                    Ok(path) => {
+                        if let Some(picker) = self.folder_picker.as_mut() {
+                            picker.awaiting_home = false;
+                        }
+                        let dir = Self::folder_picker_path(remote_id.as_deref(), path);
+                        return self.folder_picker_list(dir, true);
+                    }
+                    Err(error) => {
+                        if let Some(picker) = self.folder_picker.as_mut() {
+                            picker.path_error = Some(error);
+                        }
+                    }
+                }
+            }
+            Event::FolderPickerConfirm => {
+                let Some(picker) = self.folder_picker.as_ref() else {
+                    return Task::none();
+                };
+                if picker.files.loading || picker.files.error.is_some() {
+                    return Task::none();
+                }
+                let purpose = picker.purpose;
+                let remote_id = picker.remote_id.clone();
+                let dir = picker.files.dir.display();
+                self.folder_picker = None;
+                return self.confirm_folder_picker(purpose, remote_id, dir);
+            }
+            Event::FolderPickerCancel => {
+                return self.close_folder_picker();
+            }
+            Event::FolderPickerNativeDialog => {
+                let Some(purpose) = self.folder_picker.as_ref().map(|picker| picker.purpose) else {
+                    return Task::none();
+                };
+                let close = self.close_folder_picker();
+                let title = match purpose {
+                    FolderPickerPurpose::NewWorkspace => "Select Workspace Folder",
+                    FolderPickerPurpose::OpenFolder => "Select Folder",
+                };
+                let dialog = Task::perform(
+                    async move {
+                        let folder = rfd::AsyncFileDialog::new()
+                            .set_title(title)
+                            .pick_folder()
+                            .await;
+                        folder.map(|f| f.path().to_path_buf())
+                    },
+                    move |folder| Event::FolderPickerNativeChosen(purpose, folder),
+                );
+                return Task::batch([close, dialog]);
+            }
+            Event::FolderPickerNativeChosen(purpose, Some(path)) => {
+                let dir = path.to_string_lossy().to_string();
+                return self.confirm_folder_picker(purpose, None, dir);
+            }
+            Event::FolderPickerNativeChosen(_, None) => {}
             Event::WorkspaceCreated(Some(path)) => {
                 let dir_str = path.to_string_lossy().to_string();
 
@@ -21153,11 +21655,18 @@ fi
         }
     }
 
+    /// Something Iced draws covers the content area, so the native
+    /// webviews (which would sit on top of it) stay hidden: the Usage view
+    /// or the folder picker.
+    fn webview_overlay_open(&self) -> bool {
+        self.usage_view.open || self.folder_picker.is_some()
+    }
+
     fn visible_webview_surface(&self) -> VisibleSurface {
         visible_webview_surface(
             self.viewer_webview,
             self.active_tab_surface(),
-            self.usage_view.open,
+            self.webview_overlay_open(),
         )
     }
 
@@ -21385,9 +21894,9 @@ fi
     fn reveal_agent_page(&mut self, tab_id: usize) {
         let (x, y, width, height) = self.calculate_webview_bounds();
         webview::update_bounds(WebviewSurface::Agent(tab_id), x, y, width, height);
-        if self.usage_view.open {
-            // Something landed behind the Usage view; closing it shows the
-            // page (apply_webview_surfaces).
+        if self.webview_overlay_open() {
+            // Something landed behind the Usage view or folder picker;
+            // closing it shows the page (apply_webview_surfaces).
             webview::hide_agent_pages();
         } else {
             webview::show_only_agent_page(Some(tab_id));
@@ -21547,8 +22056,8 @@ fi
                 bounds.3,
             );
             webview::update_content(WebviewSurface::Viewer, &html);
-            // Kept hidden behind the Usage view until it closes.
-            webview::set_visible(WebviewSurface::Viewer, !self.usage_view.open);
+            // Kept hidden behind the Usage view / folder picker until it closes.
+            webview::set_visible(WebviewSurface::Viewer, !self.webview_overlay_open());
             return Task::none();
         }
 
@@ -22069,108 +22578,16 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
-        } else if self.remote_workspace_picker.is_some() {
+        } else if self.folder_picker.is_some() {
             Stack::new()
                 .push(main_view)
-                .push(self.view_remote_workspace_picker())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else if self.workspace_source_picker_visible {
-            Stack::new()
-                .push(main_view)
-                .push(self.view_workspace_source_picker())
+                .push(self.view_folder_picker())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
         } else {
             main_view
         }
-    }
-
-    /// "New workspace" source chooser: local folder or one of the
-    /// configured remote agents.
-    fn view_workspace_source_picker(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let bg = theme.bg_surface();
-        let border_color = theme.border();
-        let text_primary = theme.text_primary();
-        let text_secondary = theme.text_secondary();
-        let hover_bg = theme.surface0();
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-
-        let mut items = Column::new().spacing(4).width(Length::Fixed(320.0));
-        items = items.push(text("New workspace").size(font).color(text_primary));
-        let entry = |label: String, desc: String, event: Event| {
-            button(
-                column![
-                    text(label).size(font).color(text_primary),
-                    text(desc).size(font_small).color(text_secondary),
-                ]
-                .spacing(2),
-            )
-            .style(move |_theme, status| button::Style {
-                background: matches!(status, button::Status::Hovered).then_some(hover_bg.into()),
-                text_color: text_primary,
-                ..Default::default()
-            })
-            .padding([8, 10])
-            .width(Length::Fill)
-            .on_press(event)
-        };
-        items = items.push(entry(
-            "Local Folder…".to_string(),
-            "Choose a folder on this Mac".to_string(),
-            Event::WorkspaceCreateLocal,
-        ));
-        for agent in &self.remote_agent_defs {
-            items = items.push(entry(
-                format!("On {}…", agent.name),
-                agent.endpoint.clone(),
-                Event::RemoteWorkspaceBrowse(agent.id.clone()),
-            ));
-        }
-        items = items.push(entry(
-            "Connect Remote Host…".to_string(),
-            "Add a gitterm-v5-agent endpoint".to_string(),
-            Event::RemoteConnectOpen,
-        ));
-
-        let menu = container(items)
-            .style(move |_| container::Style {
-                background: Some(bg.into()),
-                border: iced::Border {
-                    color: border_color,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                shadow: iced::Shadow {
-                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.3),
-                    offset: iced::Vector::new(0.0, 2.0),
-                    blur_radius: 8.0,
-                },
-                ..Default::default()
-            })
-            .padding(12);
-
-        let backdrop = iced::widget::mouse_area(
-            container(iced::widget::Space::new())
-                .width(Length::Fill)
-                .height(Length::Fill),
-        )
-        .on_press(Event::WorkspaceSourcePickerCancel);
-
-        Stack::new()
-            .push(backdrop)
-            .push(
-                container(menu)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill),
-            )
-            .into()
     }
 
     /// "Connect Remote Host" form: writes an entry into remote-agents.json
@@ -22375,92 +22792,215 @@ fi
         .into()
     }
 
-    /// Remote directory browser for picking a new workspace root — fed by
-    /// the same source listings as the Files sidebar.
-    fn view_remote_workspace_picker(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+    /// The in-app folder picker (TRU-149): machine selector, path field,
+    /// Recent folders and a folder listing, the same for this Mac and for
+    /// remote agents. Listings come from the same sources as the Files
+    /// sidebar.
+    fn view_folder_picker(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let bg = theme.bg_surface();
+        let bg_base = theme.bg_base();
         let border_color = theme.border();
         let text_primary = theme.text_primary();
         let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
         let hover_bg = theme.surface0();
+        let accent = theme.accent();
+        let danger = theme.danger();
         let font = self.ui_font();
         let font_small = self.ui_font_small();
 
-        let Some(picker) = &self.remote_workspace_picker else {
+        let Some(picker) = &self.folder_picker else {
             return container(iced::widget::Space::new()).into();
         };
+        let machine = picker.remote_id.as_deref();
+        let home = self.folder_picker_home(machine);
 
-        let mut body = Column::new().spacing(6).width(Length::Fixed(440.0));
-        body = body.push(
-            text(format!("Choose a folder on {}", picker.remote_name))
-                .size(font)
-                .color(text_primary),
-        );
-        body = body.push(
-            text(picker.files.display_dir.clone())
-                .size(font_small)
-                .color(theme.accent()),
-        );
-        if let Some(error) = &picker.files.error {
-            body = body.push(text(error).size(font_small).color(theme.danger()));
-        }
-        if picker.files.loading {
-            body = body.push(text("Loading…").size(font_small).color(text_secondary));
-        }
+        let title = match picker.purpose {
+            FolderPickerPurpose::NewWorkspace => "New workspace",
+            FolderPickerPurpose::OpenFolder => "Open folder",
+        };
+        let mut body = Column::new().spacing(8).width(Length::Fixed(520.0));
+        body = body.push(text(title).size(font).color(text_primary));
 
-        let mut list = Column::new().spacing(1);
-        if picker.files.parent.is_some() {
-            list = list.push(
-                button(text(".. (parent)").size(font_small).color(text_secondary))
-                    .style(move |_theme, status| button::Style {
-                        background: matches!(status, button::Status::Hovered)
-                            .then_some(hover_bg.into()),
-                        text_color: text_secondary,
-                        ..Default::default()
-                    })
-                    .padding([4, 8])
-                    .width(Length::Fill)
-                    .on_press(Event::RemotePickerUp),
+        // Machine selector: this Mac, each configured agent, and the entry
+        // that adds a machine (the connect form opens over the picker).
+        let pill = |label: String, selected: bool, event: Event| {
+            button(text(label).size(font_small).color(if selected {
+                accent
+            } else {
+                text_secondary
+            }))
+            .style(move |_theme, status| button::Style {
+                background: (selected || matches!(status, button::Status::Hovered))
+                    .then_some(hover_bg.into()),
+                border: iced::Border {
+                    color: if selected { accent } else { border_color },
+                    width: 1.0,
+                    radius: 12.0.into(),
+                },
+                ..Default::default()
+            })
+            .padding([3, 10])
+            .on_press(event)
+        };
+        let mut machines = Row::new().spacing(6);
+        machines = machines.push(pill(
+            self.chat_machine_name(None),
+            machine.is_none(),
+            Event::FolderPickerMachine(None),
+        ));
+        for agent in &self.remote_agent_defs {
+            machines = machines.push(pill(
+                agent.name.clone(),
+                machine == Some(agent.id.as_str()),
+                Event::FolderPickerMachine(Some(agent.id.clone())),
+            ));
+        }
+        machines = machines.push(pill(
+            "Connect a machine…".to_string(),
+            false,
+            Event::RemoteConnectOpen,
+        ));
+        body = body.push(machines.wrap().vertical_spacing(6));
+
+        let path_field = text_input("/path/to/folder or ~/folder", &picker.path_input)
+            .on_input(Event::FolderPickerPathChanged)
+            .on_submit(Event::FolderPickerPathSubmit)
+            .size(font_small)
+            .padding([6, 8])
+            .style(
+                move |_theme: &Theme, _status: text_input::Status| text_input::Style {
+                    background: bg_base.into(),
+                    border: iced::Border {
+                        width: 1.0,
+                        color: border_color,
+                        radius: 3.0.into(),
+                    },
+                    icon: iced::Color::TRANSPARENT,
+                    placeholder: text_muted,
+                    value: text_primary,
+                    selection: accent,
+                },
             );
+        body = body.push(path_field);
+        if let Some(error) = &picker.path_error {
+            body = body.push(text(error.clone()).size(font_small).color(danger));
         }
-        for dir_entry in picker.files.entries.iter().filter(|entry| entry.is_dir) {
-            list = list.push(
-                button(
-                    text(format!("📁 {}", dir_entry.name))
-                        .size(font_small)
-                        .color(text_primary),
-                )
+
+        let row_button = |content: Element<'static, Event, Theme, iced::Renderer>, event: Event| {
+            button(content)
                 .style(move |_theme, status| button::Style {
                     background: matches!(status, button::Status::Hovered)
                         .then_some(hover_bg.into()),
                     text_color: text_primary,
                     ..Default::default()
                 })
-                .padding([4, 8])
+                .padding([3, 8])
                 .width(Length::Fill)
-                .on_press(Event::RemotePickerNavigate(dir_entry.path.clone())),
+                .on_press(event)
+        };
+
+        let recents = self.folder_picker_recent_dirs(machine);
+        body = body.push(text("Recent").size(font_small).color(text_secondary));
+        if recents.is_empty() {
+            body = body.push(
+                text("No recent folders on this machine yet")
+                    .size(font_small)
+                    .color(text_muted),
             );
+        } else {
+            let mut recent_list = Column::new().spacing(1);
+            for dir in recents {
+                let full = dir.to_string_lossy().to_string();
+                let name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| full.clone());
+                let shown = folder_picker_tilde(&full, home.as_deref());
+                recent_list = recent_list.push(row_button(
+                    row![
+                        text(name).size(font_small).color(text_primary),
+                        text(shown).size(font_small).color(text_muted),
+                    ]
+                    .spacing(8)
+                    .into(),
+                    Event::FolderPickerNavigate(Self::folder_picker_path(machine, full)),
+                ));
+            }
+            body = body.push(recent_list);
+        }
+
+        let header = if picker.files.loading {
+            text("Loading…").size(font_small).color(text_secondary)
+        } else {
+            text(folder_picker_tilde(
+                &picker.files.dir.display(),
+                home.as_deref(),
+            ))
+            .size(font_small)
+            .color(accent)
+        };
+        body = body.push(header);
+        if let Some(error) = &picker.files.error {
+            body = body.push(text(error.clone()).size(font_small).color(danger));
+        }
+
+        let mut list = Column::new().spacing(1);
+        if picker.files.parent.is_some() {
+            list = list.push(row_button(
+                text(".. (parent)")
+                    .size(font_small)
+                    .color(text_secondary)
+                    .into(),
+                Event::FolderPickerUp,
+            ));
+        }
+        for dir_entry in picker.files.entries.iter().filter(|entry| entry.is_dir) {
+            let mut line = Row::new().spacing(8).align_y(iced::Alignment::Center).push(
+                text(format!("📁 {}", dir_entry.name))
+                    .size(font_small)
+                    .color(text_primary),
+            );
+            if dir_entry.is_git_repo {
+                line = line.push(text("git").size(font_small).color(accent));
+            }
+            list = list.push(row_button(
+                line.into(),
+                Event::FolderPickerNavigate(dir_entry.path.clone()),
+            ));
         }
         body = body.push(
             scrollable(list)
-                .height(Length::Fixed(320.0))
+                .height(Length::Fixed(240.0))
                 .width(Length::Fill),
         );
 
-        body = body.push(
-            row![
-                button(text("Use this folder").size(font_small))
-                    .style(button::primary)
+        let can_confirm = !picker.files.loading && picker.files.error.is_none();
+        let mut actions = Row::new().spacing(8).align_y(iced::Alignment::Center);
+        if machine.is_none() {
+            actions = actions.push(
+                button(text("Use macOS dialog…").size(font_small))
+                    .style(button::text)
                     .padding([6, 12])
-                    .on_press(Event::RemotePickerConfirm),
+                    .on_press(Event::FolderPickerNativeDialog),
+            );
+        }
+        actions = actions
+            .push(iced::widget::Space::new().width(Length::Fill))
+            .push(
                 button(text("Cancel").size(font_small))
                     .style(button::text)
                     .padding([6, 12])
-                    .on_press(Event::RemotePickerCancel),
-            ]
-            .spacing(8),
-        );
+                    .on_press(Event::FolderPickerCancel),
+            )
+            .push(
+                button(text("Use this folder").size(font_small))
+                    .style(button::primary)
+                    .padding([6, 12])
+                    .on_press_maybe(can_confirm.then_some(Event::FolderPickerConfirm)),
+            );
+        body = body.push(actions);
 
         let panel = container(body)
             .style(move |_| container::Style {
@@ -22484,7 +23024,7 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill),
         )
-        .on_press(Event::RemotePickerCancel);
+        .on_press(Event::FolderPickerCancel);
 
         Stack::new()
             .push(backdrop)
@@ -23482,8 +24022,8 @@ fi
             .into()
     }
 
-    /// Machine-scoped "+": local opens the folder picker, remotes open
-    /// their directory browser. Legacy ssh groups get none.
+    /// Machine-scoped "+": opens the folder picker on that machine (local
+    /// or remote agent). Legacy ssh groups get none.
     fn machine_group_plus(&self, key: &str) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
         let event = match key.split_once(':') {
             None => Event::WorkspaceCreateLocal,
@@ -36669,6 +37209,95 @@ mod tests {
             size: 1,
             dead_cwd,
         }
+    }
+
+    /// A chat in `cwd` (repo root `root`, if any) last touched `secs`
+    /// after the epoch.
+    fn recent_chat(cwd: &str, root: Option<&str>, secs: u64) -> chats::ChatIndexEntry {
+        chats::ChatIndexEntry {
+            cwd: PathBuf::from(cwd),
+            repo_root: root.map(PathBuf::from),
+            mtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            ..chat_entry(chats::ChatBackend::Claude, false)
+        }
+    }
+
+    #[test]
+    fn folder_picker_recents_are_distinct_repo_roots_newest_first_then_open_workspaces() {
+        let entries = vec![
+            recent_chat("/w/old/sub", Some("/w/old"), 10),
+            recent_chat("/w/new", Some("/w/new"), 30),
+            // A worktree chat collapses into its main repo.
+            recent_chat("/w/new-wt", Some("/w/new"), 20),
+            // Not a repo: grouped by its cwd.
+            recent_chat("/w/scratch", None, 25),
+            chats::ChatIndexEntry {
+                dead_cwd: true,
+                ..recent_chat("/w/gone", None, 40)
+            },
+        ];
+        let open = vec![PathBuf::from("/w/old"), PathBuf::from("/w/open")];
+        let recents = folder_picker_recents(&entries, &open, 8);
+        assert_eq!(
+            recents,
+            ["/w/new", "/w/scratch", "/w/old", "/w/open"]
+                .map(PathBuf::from)
+                .to_vec()
+        );
+        assert_eq!(
+            folder_picker_recents(&entries, &open, 2),
+            ["/w/new", "/w/scratch"].map(PathBuf::from).to_vec()
+        );
+        assert_eq!(
+            folder_picker_recents(&[], &open, 8),
+            open,
+            "an unloaded chat index still lists open workspaces"
+        );
+    }
+
+    #[test]
+    fn folder_picker_starts_at_last_choice_then_home_then_root() {
+        assert_eq!(
+            folder_picker_start_dir(Some("/w/repo"), Some("/Users/t")),
+            "/w/repo"
+        );
+        assert_eq!(folder_picker_start_dir(None, Some("/Users/t")), "/Users/t");
+        // An older agent reports an empty home.
+        assert_eq!(folder_picker_start_dir(None, Some("")), "/");
+        assert_eq!(folder_picker_start_dir(None, None), "/");
+    }
+
+    #[test]
+    fn folder_picker_typed_path_expands_home_and_requires_absolute() {
+        let home = Some("/home/u");
+        assert_eq!(
+            folder_picker_typed_path("  /srv/app ", home),
+            Ok("/srv/app".to_string())
+        );
+        assert_eq!(
+            folder_picker_typed_path("~", home),
+            Ok("/home/u".to_string())
+        );
+        assert_eq!(
+            folder_picker_typed_path("~/code/x", Some("/home/u/")),
+            Ok("/home/u/code/x".to_string())
+        );
+        assert!(folder_picker_typed_path("~/code", None).is_err());
+        assert!(folder_picker_typed_path("~/code", Some("")).is_err());
+        assert!(folder_picker_typed_path("code/x", home).is_err());
+        assert!(folder_picker_typed_path("   ", home).is_err());
+        // "~user" is not expanded (and so not absolute).
+        assert!(folder_picker_typed_path("~other/x", home).is_err());
+    }
+
+    #[test]
+    fn folder_picker_tilde_shortens_home_only_on_a_boundary() {
+        let home = Some("/home/u");
+        assert_eq!(folder_picker_tilde("/home/u", home), "~");
+        assert_eq!(folder_picker_tilde("/home/u/code", home), "~/code");
+        assert_eq!(folder_picker_tilde("/home/user2", home), "/home/user2");
+        assert_eq!(folder_picker_tilde("/srv", home), "/srv");
+        assert_eq!(folder_picker_tilde("/home/u/code", None), "/home/u/code");
     }
 
     #[test]
