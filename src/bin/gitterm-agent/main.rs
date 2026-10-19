@@ -86,6 +86,7 @@ fn parse_serve_config(
     }
 
     Ok(AgentServerConfig {
+        claude_chat_limits: Default::default(),
         bind_addr: bind_addr.parse::<SocketAddr>()?,
         auth_token,
         agent_name,

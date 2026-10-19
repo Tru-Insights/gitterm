@@ -7,44 +7,69 @@ use tonic::metadata::MetadataMap;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use super::claude_chats::{
+    ChatActivity, ChatAttachment, ChatInfo, ChatLimits, ClaudeChatRegistry, Gap, SeqEvent,
+};
 use super::protocol::v5::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
 use super::protocol::v5::{
     claude_chat_client_message, terminal_input, terminal_output, ChatEntry, ChatPreviewMessage,
     ChatPreviewRequest, ChatPreviewResponse, ClaudeChatClientMessage, ClaudeChatHistoryRequest,
-    ClaudeChatHistoryResponse, ClaudeChatServerMessage, DirEntry, GitDiffRequest, GitDiffResponse,
-    GitStatusRequest, GitStatusResponse, HandshakeRequest, HandshakeResponse, ListChatsRequest,
-    ListChatsResponse, ListDirRequest, ListDirResponse, ListSessionsRequest, ListSessionsResponse,
-    ReadFileChunk, ReadFileRequest, Session, SessionExited, StartSessionRequest,
-    StopSessionRequest, StopSessionResponse, TerminalInput, TerminalOutput,
+    ClaudeChatHistoryResponse, ClaudeChatInfo, ClaudeChatOpened, ClaudeChatServerMessage,
+    ClaudeChatState, DirEntry, GitDiffRequest, GitDiffResponse, GitStatusRequest,
+    GitStatusResponse, HandshakeRequest, HandshakeResponse, ListChatsRequest, ListChatsResponse,
+    ListClaudeChatsRequest, ListClaudeChatsResponse, ListDirRequest, ListDirResponse,
+    ListSessionsRequest, ListSessionsResponse, ReadFileChunk, ReadFileRequest, Session,
+    SessionExited, StartSessionRequest, StopSessionRequest, StopSessionResponse, TerminalInput,
+    TerminalOutput,
 };
 use super::sessions::{SessionManager, SessionOutput};
-use crate::harness::claude::{ClaudeSession, ClaudeSessionConfig, RemoteClaudeChatStart};
+use crate::harness::claude::{ClaudeSessionConfig, RemoteClaudeChatStart};
 use crate::harness::{HarnessCommand, HarnessEvent};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Handshake capability of an agent that owns its Claude chats (TRU-152):
+/// streams attach and detach, events carry a seq, `ListClaudeChats`.
+pub const CLAUDE_CHAT_PERSISTENT_CAPABILITY: &str = "claude_chat_persistent";
+
 /// Hard ceiling for one ReadFile stream; requests may ask for less.
 const READ_FILE_DEFAULT_MAX_BYTES: u64 = 2_000_000;
 const READ_FILE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// How often idle Claude chats are looked for.
+const CLAUDE_CHAT_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// HTTP/2 pings, so a client that vanished without closing its connection
+/// (a laptop lid, a dropped network) is detached rather than counted as
+/// attached forever.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 pub struct AgentServerConfig {
     pub bind_addr: SocketAddr,
     pub auth_token: String,
     pub agent_name: String,
+    /// Replay buffer bounds and idle timeout of agent-owned Claude chats.
+    pub claude_chat_limits: ChatLimits,
 }
 
 #[derive(Clone)]
 pub struct GitTermAgentService {
     agent_name: String,
     sessions: Arc<SessionManager>,
+    claude_chats: Arc<ClaudeChatRegistry>,
 }
 
 impl GitTermAgentService {
     pub fn new(agent_name: String) -> Self {
+        Self::with_claude_chat_limits(agent_name, ChatLimits::default())
+    }
+
+    pub fn with_claude_chat_limits(agent_name: String, limits: ChatLimits) -> Self {
         Self {
             agent_name,
             sessions: Arc::new(SessionManager::default()),
+            claude_chats: ClaudeChatRegistry::new(limits),
         }
     }
 }
@@ -86,6 +111,7 @@ impl GitTermAgent for GitTermAgentService {
                 "sessions".to_string(),
                 "chats".to_string(),
                 "claude_chat".to_string(),
+                CLAUDE_CHAT_PERSISTENT_CAPABILITY.to_string(),
             ],
             home_dir,
         }))
@@ -461,15 +487,25 @@ impl GitTermAgent for GitTermAgentService {
         request: Request<tonic::Streaming<ClaudeChatClientMessage>>,
     ) -> Result<Response<Self::ClaudeChatStream>, Status> {
         let mut input = request.into_inner();
-        let config = claude_chat_config(input.message().await?)?;
-        eprintln!(
-            "[agent] claude_chat: starting claude in {} (model {:?}, mode {}, resume {:?})",
-            config.cwd.display(),
-            config.model,
-            config.permission_mode,
-            config.resume
-        );
-        let (session, events) = ClaudeSession::spawn(config);
+        let (attachment, sequenced) = match claude_chat_opening(input.message().await?)? {
+            ChatOpening::Start(config) => (self.claude_chats.start_or_attach(config, None), false),
+            ChatOpening::StartOrAttach { config, after_seq } => {
+                (self.claude_chats.start_or_attach(config, after_seq), true)
+            }
+            ChatOpening::Attach { chat_id, after_seq } => {
+                let attachment =
+                    self.claude_chats
+                        .attach(&chat_id, after_seq)
+                        .ok_or_else(|| {
+                            eprintln!("[agent] claude_chat: attach to {chat_id}: not running");
+                            Status::not_found(format!("no running Claude chat {chat_id}"))
+                        })?;
+                eprintln!(
+                    "[agent] claude_chat {chat_id}: a client reattached after seq {after_seq:?}"
+                );
+                (attachment, true)
+            }
+        };
 
         // Commands are read on their own task so the relay selects over
         // two channels rather than over the gRPC stream.
@@ -489,10 +525,23 @@ impl GitTermAgent for GitTermAgentService {
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel(256);
-        tokio::spawn(relay_claude_chat(session, events, input_rx, tx));
+        tokio::spawn(relay_claude_chat(attachment, sequenced, input_rx, tx));
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    async fn list_claude_chats(
+        &self,
+        _request: Request<ListClaudeChatsRequest>,
+    ) -> Result<Response<ListClaudeChatsResponse>, Status> {
+        let chats = self
+            .claude_chats
+            .list()
+            .into_iter()
+            .map(proto_claude_chat)
+            .collect();
+        Ok(Response::new(ListClaudeChatsResponse { chats }))
     }
 
     #[allow(clippy::result_large_err)]
@@ -536,22 +585,66 @@ enum ClaudeChatInput {
     Closed(Option<String>),
 }
 
-/// The session config a `ClaudeChat` stream's first message carries: a
-/// start message whose JSON decodes, with a non-empty permission mode, a
-/// well-formed resume id, and a cwd that is an existing absolute directory
-/// on this machine.
+/// What a `ClaudeChat` stream's first message asks for.
+#[derive(Debug)]
+enum ChatOpening {
+    /// A plain `start_json` (clients from before "claude_chat_persistent"):
+    /// start, or attach by resume id; no `opened` message.
+    Start(ClaudeSessionConfig),
+    /// An `attach` without a chat id: the same, answered with `opened`.
+    StartOrAttach {
+        config: ClaudeSessionConfig,
+        after_seq: Option<u64>,
+    },
+    /// An `attach` to a chat by id, answered with `opened`.
+    Attach {
+        chat_id: String,
+        after_seq: Option<u64>,
+    },
+}
+
+/// Decode a `ClaudeChat` stream's first message: a start, or an attach
+/// carrying a chat id or a start.
 #[allow(clippy::result_large_err)]
-fn claude_chat_config(
-    first: Option<ClaudeChatClientMessage>,
-) -> Result<ClaudeSessionConfig, Status> {
+fn claude_chat_opening(first: Option<ClaudeChatClientMessage>) -> Result<ChatOpening, Status> {
     let first = first
         .ok_or_else(|| Status::invalid_argument("input stream closed before the start message"))?;
-    let Some(claude_chat_client_message::Message::StartJson(json)) = first.message else {
-        return Err(Status::invalid_argument(
-            "first message must be a start message",
-        ));
-    };
-    let start: RemoteClaudeChatStart = serde_json::from_str(&json)
+    match first.message {
+        Some(claude_chat_client_message::Message::StartJson(json)) => {
+            Ok(ChatOpening::Start(claude_chat_start_config(&json)?))
+        }
+        Some(claude_chat_client_message::Message::Attach(attach)) => {
+            if !attach.chat_id.is_empty() {
+                // Chat ids are agent-assigned uuids; anything else names no chat.
+                validate_claude_session_id(&attach.chat_id)
+                    .map_err(|_| Status::invalid_argument("invalid chat id"))?;
+                return Ok(ChatOpening::Attach {
+                    chat_id: attach.chat_id,
+                    after_seq: attach.after_seq,
+                });
+            }
+            if attach.start_json.is_empty() {
+                return Err(Status::invalid_argument(
+                    "an attach needs a chat_id or a start_json",
+                ));
+            }
+            Ok(ChatOpening::StartOrAttach {
+                config: claude_chat_start_config(&attach.start_json)?,
+                after_seq: attach.after_seq,
+            })
+        }
+        Some(claude_chat_client_message::Message::CommandJson(_)) | None => Err(
+            Status::invalid_argument("first message must be a start message"),
+        ),
+    }
+}
+
+/// The session config a start carries: JSON that decodes, with a non-empty
+/// permission mode, a well-formed resume id, and a cwd that is an existing
+/// absolute directory on this machine.
+#[allow(clippy::result_large_err)]
+fn claude_chat_start_config(json: &str) -> Result<ClaudeSessionConfig, Status> {
+    let start: RemoteClaudeChatStart = serde_json::from_str(json)
         .map_err(|err| Status::invalid_argument(format!("invalid start message: {err}")))?;
     if start.permission_mode.trim().is_empty() {
         return Err(Status::invalid_argument(
@@ -582,12 +675,25 @@ fn validate_claude_session_id(session_id: &str) -> Result<(), Status> {
     }
 }
 
-async fn send_chat_event(
-    tx: &tokio::sync::mpsc::Sender<Result<ClaudeChatServerMessage, Status>>,
-    event: &HarnessEvent,
-) -> Result<(), ()> {
+type ChatTx = tokio::sync::mpsc::Sender<Result<ClaudeChatServerMessage, Status>>;
+
+/// A relayed event as this stream sends it.
+fn chat_event_message(event: &SeqEvent, redelivered: bool) -> ClaudeChatServerMessage {
+    ClaudeChatServerMessage {
+        event_json: event.json.to_string(),
+        seq: event.seq,
+        opened: None,
+        redelivered,
+    }
+}
+
+/// An event for this stream only (seq 0), such as a refused command.
+async fn send_stream_notice(tx: &ChatTx, event: &HarnessEvent) -> Result<(), ()> {
     let message = match serde_json::to_string(event) {
-        Ok(event_json) => Ok(ClaudeChatServerMessage { event_json }),
+        Ok(event_json) => Ok(ClaudeChatServerMessage {
+            event_json,
+            ..Default::default()
+        }),
         Err(err) => {
             eprintln!("[agent] claude_chat: could not encode {event:?}: {err}");
             Err(Status::internal(format!(
@@ -598,70 +704,154 @@ async fn send_chat_event(
     tx.send(message).await.map_err(|_| ())
 }
 
-/// Relay one chat between its stream and its Claude session until the
-/// session's events end. The client closing its half, or going away,
-/// drops the session, which shuts the process down; its exit still
-/// reaches a client whose receiving half is open.
+/// Send live events after `position`, advancing it. `Ok(true)` once the
+/// chat's exit has been sent; `Err` when the client went away.
+async fn send_live(
+    tx: &ChatTx,
+    events: impl IntoIterator<Item = SeqEvent>,
+    position: &mut u64,
+) -> Result<bool, ()> {
+    for event in events {
+        if event.seq <= *position {
+            continue;
+        }
+        *position = event.seq;
+        tx.send(Ok(chat_event_message(&event, false)))
+            .await
+            .map_err(|_| ())?;
+        if event.exited {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Relay one stream's attachment to a chat: `opened` (for an `attach`
+/// stream), the redelivered standing events, the replay, then live events
+/// and the client's commands, until the chat exits or the client goes.
+/// Ending the stream, from either side, only detaches; the chat runs on.
 async fn relay_claude_chat(
-    session: ClaudeSession,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>,
+    mut attachment: ChatAttachment,
+    sequenced: bool,
     mut input: tokio::sync::mpsc::UnboundedReceiver<ClaudeChatInput>,
-    tx: tokio::sync::mpsc::Sender<Result<ClaudeChatServerMessage, Status>>,
+    tx: ChatTx,
 ) {
-    let mut session = Some(session);
+    let chat_id = attachment.opened.chat_id.clone();
+    let gone = |why: &str| eprintln!("[agent] claude_chat {chat_id}: {why}; detaching");
+    if sequenced {
+        let opened = &attachment.opened;
+        let message = ClaudeChatServerMessage {
+            opened: Some(ClaudeChatOpened {
+                chat_id: opened.chat_id.clone(),
+                attached: opened.attached,
+                claude_session_id: opened.claude_session_id.clone().unwrap_or_default(),
+                head_seq: opened.head_seq,
+                gap: opened.gap,
+            }),
+            ..Default::default()
+        };
+        if tx.send(Ok(message)).await.is_err() {
+            return gone("client went away before it was opened");
+        }
+    }
+    for event in std::mem::take(&mut attachment.redelivered) {
+        if tx.send(Ok(chat_event_message(&event, true))).await.is_err() {
+            return gone("client went away during redelivery");
+        }
+    }
+    let mut position = 0;
+    match send_live(&tx, std::mem::take(&mut attachment.replay), &mut position).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(()) => return gone("client went away during replay"),
+    }
+    position = attachment.position;
+
     loop {
         tokio::select! {
-            next = input.recv(), if session.is_some() => {
+            next = input.recv() => {
                 let message = match next {
                     Some(ClaudeChatInput::Message(message)) => message,
-                    Some(ClaudeChatInput::Closed(error)) => {
-                        match error {
-                            Some(error) => eprintln!(
-                                "[agent] claude_chat: client stream failed ({error}); stopping claude"
-                            ),
-                            None => eprintln!(
-                                "[agent] claude_chat: client closed the stream; stopping claude"
-                            ),
-                        }
-                        session = None;
-                        continue;
+                    Some(ClaudeChatInput::Closed(Some(error))) => {
+                        return gone(&format!("client stream failed ({error})"));
                     }
-                    None => {
-                        eprintln!("[agent] claude_chat: command reader ended; stopping claude");
-                        session = None;
-                        continue;
+                    Some(ClaudeChatInput::Closed(None)) => {
+                        return gone("client closed the stream");
                     }
+                    None => return gone("command reader ended"),
                 };
                 let error = match message.message {
                     Some(claude_chat_client_message::Message::CommandJson(json)) => {
                         match serde_json::from_str::<HarnessCommand>(&json) {
-                            Ok(command) => session
-                                .as_ref()
-                                .and_then(|session| session.send(command).err()),
+                            Ok(command) => attachment.chat.send(command).err(),
                             Err(err) => Some(format!("the agent could not decode a command: {err}")),
                         }
                     }
-                    Some(claude_chat_client_message::Message::StartJson(_)) => {
+                    Some(claude_chat_client_message::Message::StartJson(_))
+                    | Some(claude_chat_client_message::Message::Attach(_)) => {
                         Some("the chat has already started; a second start was ignored".to_string())
                     }
                     None => Some("an empty chat message was ignored".to_string()),
                 };
                 if let Some(error) = error {
-                    eprintln!("[agent] claude_chat: {error}");
-                    if send_chat_event(&tx, &HarnessEvent::Error(error)).await.is_err() {
-                        eprintln!("[agent] claude_chat: client went away; stopping claude");
-                        break;
+                    eprintln!("[agent] claude_chat {chat_id}: {error}");
+                    if send_stream_notice(&tx, &HarnessEvent::Error(error)).await.is_err() {
+                        return gone("client went away");
                     }
                 }
             }
-            event = events.recv() => {
-                let Some(event) = event else { break };
-                if send_chat_event(&tx, &event).await.is_err() {
-                    eprintln!("[agent] claude_chat: client went away; stopping claude");
-                    break;
+            _ = tx.closed() => return gone("client went away"),
+            live = attachment.live.recv() => {
+                let events = match live {
+                    Ok(event) => vec![event],
+                    // The stream fell behind the fan-out: catch up from
+                    // the buffer, or end it so the client reattaches and
+                    // learns of the gap.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        match attachment.chat.events_after(position) {
+                            Ok(events) => events,
+                            Err(Gap) => {
+                                eprintln!(
+                                    "[agent] claude_chat {chat_id}: a client fell {skipped} events behind, past the buffer; ending its stream"
+                                );
+                                let _ = tx
+                                    .send(Err(Status::data_loss(
+                                        "fell behind the chat's event buffer; attach again",
+                                    )))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                };
+                match send_live(&tx, events, &mut position).await {
+                    Ok(true) => {
+                        eprintln!("[agent] claude_chat {chat_id}: claude exited; ending the stream");
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(()) => return gone("client went away"),
                 }
             }
         }
+    }
+}
+
+fn proto_claude_chat(info: ChatInfo) -> ClaudeChatInfo {
+    let state = match info.activity {
+        ChatActivity::Idle => ClaudeChatState::Idle,
+        ChatActivity::TurnRunning => ClaudeChatState::TurnRunning,
+        ChatActivity::AwaitingInput => ClaudeChatState::AwaitingInput,
+    };
+    ClaudeChatInfo {
+        chat_id: info.chat_id,
+        claude_session_id: info.claude_session_id.unwrap_or_default(),
+        cwd: info.cwd,
+        state: state as i32,
+        created_unix_secs: info.created_unix_secs,
+        last_activity_unix_secs: info.last_activity_unix_secs,
+        attached_clients: info.attached_clients,
     }
 }
 
@@ -873,7 +1063,16 @@ pub async fn serve(config: AgentServerConfig) -> Result<(), Box<dyn Error + Send
     }
 
     let expected_token = Arc::new(config.auth_token.clone());
-    let service = GitTermAgentService::new(config.agent_name);
+    let service =
+        GitTermAgentService::with_claude_chat_limits(config.agent_name, config.claude_chat_limits);
+    let claude_chats = service.claude_chats.clone();
+    let reaper = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(CLAUDE_CHAT_REAP_INTERVAL);
+        loop {
+            tick.tick().await;
+            claude_chats.reap_idle();
+        }
+    });
     let authenticated_service =
         GitTermAgentServer::with_interceptor(service, move |request: Request<()>| {
             if is_authorized_metadata(request.metadata(), expected_token.as_str()) {
@@ -883,10 +1082,14 @@ pub async fn serve(config: AgentServerConfig) -> Result<(), Box<dyn Error + Send
             }
         });
 
-    Server::builder()
+    let served = Server::builder()
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .add_service(authenticated_service)
         .serve(config.bind_addr)
-        .await?;
+        .await;
+    reaper.abort();
+    served?;
 
     Ok(())
 }
@@ -1239,6 +1442,291 @@ mod tests {
                            "effort": null, "resume": null, "chrome": false})
     }
 
+    /// The config of a plain `start_json` opening.
+    #[allow(clippy::result_large_err)]
+    fn claude_chat_config(
+        first: Option<ClaudeChatClientMessage>,
+    ) -> Result<ClaudeSessionConfig, Status> {
+        match claude_chat_opening(first)? {
+            ChatOpening::Start(config) => Ok(config),
+            other => panic!("not a plain start: {other:?}"),
+        }
+    }
+
+    fn attach_message(
+        chat_id: &str,
+        after_seq: Option<u64>,
+        start: &str,
+    ) -> ClaudeChatClientMessage {
+        ClaudeChatClientMessage {
+            message: Some(claude_chat_client_message::Message::Attach(
+                super::super::protocol::v5::ClaudeChatAttach {
+                    chat_id: chat_id.to_string(),
+                    after_seq,
+                    start_json: start.to_string(),
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn claude_chat_attach_openings_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = start_json(&dir.path().to_string_lossy()).to_string();
+        assert!(matches!(
+            claude_chat_opening(Some(attach_message("0b6c-chat_1", Some(7), ""))).unwrap(),
+            ChatOpening::Attach { chat_id, after_seq: Some(7) } if chat_id == "0b6c-chat_1"
+        ));
+        assert!(matches!(
+            claude_chat_opening(Some(attach_message("", None, &start))).unwrap(),
+            ChatOpening::StartOrAttach {
+                after_seq: None,
+                ..
+            }
+        ));
+        let code = |message| claude_chat_opening(Some(message)).unwrap_err().code();
+        assert_eq!(
+            code(attach_message("", Some(1), "")),
+            tonic::Code::InvalidArgument,
+            "neither a chat id nor a start"
+        );
+        assert_eq!(
+            code(attach_message("../chat", None, "")),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            code(attach_message("", None, r#"{"cwd": "/tmp"}"#)),
+            tonic::Code::InvalidArgument,
+            "the start is validated like a plain one"
+        );
+    }
+
+    /// A chat process the test drives (see `claude_chats` for the same
+    /// fake at the registry level).
+    struct FakeChatProcess(tokio::sync::mpsc::UnboundedSender<HarnessCommand>);
+
+    impl super::super::claude_chats::ChatProcess for FakeChatProcess {
+        fn send(&self, command: HarnessCommand) -> Result<(), String> {
+            self.0.send(command).map_err(|_| "fake gone".to_string())
+        }
+    }
+
+    type FakeChat = (
+        tokio::sync::mpsc::UnboundedSender<HarnessEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<HarnessCommand>,
+    );
+
+    /// A served agent whose Claude chats are fakes, and a client for it.
+    async fn fake_chat_agent() -> (
+        GitTermAgentClient<tonic::transport::Channel>,
+        Arc<ClaudeChatRegistry>,
+        Arc<std::sync::Mutex<Vec<FakeChat>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let spawned: Arc<std::sync::Mutex<Vec<FakeChat>>> = Arc::default();
+        let registry = {
+            let spawned = spawned.clone();
+            ClaudeChatRegistry::with_parts(
+                ChatLimits::default(),
+                Arc::new(move |_config| {
+                    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+                    spawned.lock().unwrap().push((event_tx, command_rx));
+                    (
+                        Box::new(FakeChatProcess(command_tx))
+                            as Box<dyn super::super::claude_chats::ChatProcess>,
+                        event_rx,
+                    )
+                }),
+                Arc::new(std::time::SystemTime::now),
+            )
+        };
+        let service = GitTermAgentService {
+            agent_name: "test-agent".to_string(),
+            sessions: Arc::new(SessionManager::default()),
+            claude_chats: registry.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(GitTermAgentServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        (GitTermAgentClient::new(channel), registry, spawned, server)
+    }
+
+    async fn open_chat(
+        client: &mut GitTermAgentClient<tonic::transport::Channel>,
+        first: ClaudeChatClientMessage,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::UnboundedSender<ClaudeChatClientMessage>,
+            tonic::Streaming<ClaudeChatServerMessage>,
+        ),
+        Status,
+    > {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(first).unwrap();
+        let stream = client
+            .claude_chat(Request::new(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            ))
+            .await?
+            .into_inner();
+        Ok((tx, stream))
+    }
+
+    async fn next_message(
+        stream: &mut tonic::Streaming<ClaudeChatServerMessage>,
+    ) -> ClaudeChatServerMessage {
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+            .await
+            .expect("timed out waiting for a chat message")
+            .expect("stream failed")
+            .expect("stream ended")
+    }
+
+    async fn wait_for_attached(registry: &ClaudeChatRegistry, attached: u32) {
+        for _ in 0..400 {
+            if registry.list().first().map(|chat| chat.attached_clients) == Some(attached) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "attached clients never reached {attached}: {:?}",
+            registry.list()
+        );
+    }
+
+    fn event_of(message: &ClaudeChatServerMessage) -> HarnessEvent {
+        serde_json::from_str(&message.event_json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_detaches_and_a_reattach_gets_the_open_request() {
+        let (mut client, registry, spawned, server) = fake_chat_agent().await;
+        let dir = tempfile::tempdir().unwrap();
+        let start = start_json(&dir.path().to_string_lossy()).to_string();
+
+        let (commands, mut stream) = open_chat(&mut client, attach_message("", None, &start))
+            .await
+            .unwrap();
+        let opened = next_message(&mut stream)
+            .await
+            .opened
+            .expect("opened first");
+        assert!(!opened.attached && !opened.gap);
+        assert_eq!(opened.head_seq, 0);
+        let events = spawned.lock().unwrap()[0].0.clone();
+        events
+            .send(HarnessEvent::TurnStarted {
+                session_id: Some("s1".into()),
+                model: None,
+            })
+            .unwrap();
+        events
+            .send(HarnessEvent::RuntimeRequest {
+                request_id: "r1".into(),
+                tool_use_id: "t1".into(),
+                kind: crate::harness::RuntimeRequestKind::Question {
+                    questions: serde_json::json!([]),
+                },
+            })
+            .unwrap();
+        let first = next_message(&mut stream).await;
+        let second = next_message(&mut stream).await;
+        assert_eq!((first.seq, second.seq), (1, 2));
+        assert!(matches!(
+            event_of(&second),
+            HarnessEvent::RuntimeRequest { .. }
+        ));
+
+        // The client goes away without answering: only a detach.
+        drop(commands);
+        drop(stream);
+        wait_for_attached(&registry, 0).await;
+        assert!(
+            spawned.lock().unwrap()[0].1.try_recv().is_err(),
+            "no shutdown"
+        );
+        let listed = client
+            .list_claude_chats(Request::new(ListClaudeChatsRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .chats;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].chat_id, opened.chat_id);
+        assert_eq!(listed[0].claude_session_id, "s1");
+        assert_eq!(listed[0].state, ClaudeChatState::AwaitingInput as i32);
+
+        // Back after seq 2: the open request is redelivered.
+        let (commands, mut stream) =
+            open_chat(&mut client, attach_message(&opened.chat_id, Some(2), ""))
+                .await
+                .unwrap();
+        let reopened = next_message(&mut stream)
+            .await
+            .opened
+            .expect("opened first");
+        assert!(reopened.attached && !reopened.gap);
+        assert_eq!(reopened.head_seq, 2);
+        let turn = next_message(&mut stream).await;
+        let request = next_message(&mut stream).await;
+        assert!(turn.redelivered && request.redelivered);
+        assert!(matches!(
+            event_of(&request),
+            HarnessEvent::RuntimeRequest { request_id, .. } if request_id == "r1"
+        ));
+
+        // An explicit Shutdown stops it; the exit ends the stream.
+        commands
+            .send(ClaudeChatClientMessage {
+                message: Some(claude_chat_client_message::Message::CommandJson(
+                    serde_json::to_string(&HarnessCommand::Shutdown).unwrap(),
+                )),
+            })
+            .unwrap();
+        for _ in 0..400 {
+            if let Ok(command) = spawned.lock().unwrap()[0].1.try_recv() {
+                assert_eq!(command, HarnessCommand::Shutdown);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        events
+            .send(HarnessEvent::ProcessExited { code: Some(0) })
+            .unwrap();
+        let exit = next_message(&mut stream).await;
+        assert_eq!(exit.seq, 3);
+        assert!(matches!(
+            event_of(&exit),
+            HarnessEvent::ProcessExited { .. }
+        ));
+        assert!(stream.message().await.unwrap().is_none(), "stream ends");
+        for _ in 0..400 {
+            if registry.list().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(registry.list().is_empty());
+        match open_chat(&mut client, attach_message(&opened.chat_id, Some(3), "")).await {
+            Ok(_) => panic!("attach to a stopped chat succeeded"),
+            Err(status) => assert_eq!(status.code(), tonic::Code::NotFound),
+        }
+        server.abort();
+    }
+
     #[test]
     fn claude_chat_start_must_come_first_and_decode() {
         let code = |first| claude_chat_config(first).unwrap_err().code();
@@ -1328,6 +1816,9 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(response.capabilities.contains(&"claude_chat".to_string()));
+        assert!(response
+            .capabilities
+            .contains(&"claude_chat_persistent".to_string()));
         assert_eq!(response.protocol_version, 1);
     }
 

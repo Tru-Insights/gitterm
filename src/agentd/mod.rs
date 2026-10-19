@@ -1,3 +1,4 @@
+pub mod claude_chats;
 pub mod client;
 pub mod config;
 pub mod git;

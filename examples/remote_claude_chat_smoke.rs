@@ -79,6 +79,7 @@ async fn main() {
         bind_addr: addr,
         auth_token: token,
         agent_name: "remote-chat-smoke".into(),
+        claude_chat_limits: Default::default(),
     }));
     let client = RemoteAgentClientConfig {
         remote_id: "smoke".into(),
