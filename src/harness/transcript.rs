@@ -18,7 +18,7 @@
 //! at the `<task-notification>` the CLI later injects, or, when the file
 //! ends first, as stopped (its process is gone).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,12 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
     // completion notice.
     let mut agent_calls: HashSet<String> = HashSet::new();
     let mut background: Vec<String> = Vec::new();
+    // Every tool call started so far, and results that arrived before
+    // their call: Claude occasionally writes a result line ahead of the
+    // assistant line holding its tool_use. Such a result is replayed right
+    // after its call starts, so the card and any subagent still close.
+    let mut started_tools: HashSet<String> = HashSet::new();
+    let mut early_results: HashMap<String, (TranscriptEntry, Value)> = HashMap::new();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -107,6 +113,13 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
                     continue;
                 }
                 for entry in user_entries(&v["message"]["content"]) {
+                    if let TranscriptEntry::Harness(HarnessEvent::ItemCompleted { id, .. }) = &entry
+                    {
+                        if !started_tools.contains(id) {
+                            early_results
+                                .insert(id.clone(), (entry.clone(), v["toolUseResult"].clone()));
+                        }
+                    }
                     let agent_result = match &entry {
                         TranscriptEntry::Harness(HarnessEvent::ItemCompleted {
                             id,
@@ -128,12 +141,10 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
                     let Some((id, is_error)) = agent_result else {
                         continue;
                     };
-                    let result = &v["toolUseResult"];
-                    if !is_error && result["status"] == "async_launched" {
-                        background.push(id);
-                    } else {
-                        let end = foreground_end(result, is_error);
-                        out.push(timed(TranscriptEntry::Harness(subagent(&id, end))));
+                    if let Some(end) =
+                        agent_result_end(&mut background, id, is_error, &v["toolUseResult"])
+                    {
+                        out.push(timed(end));
                     }
                 }
             }
@@ -143,21 +154,42 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
                     turn_open = true;
                 }
                 for event in events {
-                    let started_agent = match &event {
+                    let started_tool = match &event {
                         HarnessEvent::ItemStarted {
                             id,
                             kind: ItemKind::ToolCall { name, .. },
-                        } if is_agent_tool(name) => Some(id.clone()),
+                        } => Some((id.clone(), is_agent_tool(name))),
                         _ => None,
                     };
                     out.push(timed(TranscriptEntry::Harness(event)));
-                    if let Some(id) = started_agent {
+                    let Some((id, is_agent)) = started_tool else {
+                        continue;
+                    };
+                    started_tools.insert(id.clone());
+                    if is_agent {
                         let start = HarnessEvent::TurnStarted {
                             session_id: None,
                             model: None,
                         };
                         out.push(timed(TranscriptEntry::Harness(subagent(&id, start))));
-                        agent_calls.insert(id);
+                        agent_calls.insert(id.clone());
+                    }
+                    if let Some((completed, result)) = early_results.remove(&id) {
+                        let is_error = matches!(
+                            &completed,
+                            TranscriptEntry::Harness(HarnessEvent::ItemCompleted {
+                                is_error: true,
+                                ..
+                            })
+                        );
+                        out.push(timed(completed));
+                        if is_agent {
+                            if let Some(end) =
+                                agent_result_end(&mut background, id, is_error, &result)
+                            {
+                                out.push(timed(end));
+                            }
+                        }
                     }
                 }
             }
@@ -184,6 +216,22 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
         });
     }
     out
+}
+
+/// What an Agent call's result means for its subagent: a background launch
+/// waits for its completion notice (`None`); anything else ends it now.
+fn agent_result_end(
+    background: &mut Vec<String>,
+    id: String,
+    is_error: bool,
+    result: &Value,
+) -> Option<TranscriptEntry> {
+    if !is_error && result["status"] == "async_launched" {
+        background.push(id);
+        return None;
+    }
+    let end = foreground_end(result, is_error);
+    Some(TranscriptEntry::Harness(subagent(&id, end)))
 }
 
 /// The subagent end a `<task-notification>` reports, when it is for a
@@ -653,5 +701,42 @@ mod tests {
         assert!(!entries.iter().any(
             |e| matches!(e, TranscriptEntry::UserPrompt(t) if t.contains("task-notification"))
         ));
+    }
+
+    #[test]
+    fn a_result_written_before_its_call_still_closes_the_subagent() {
+        // Seen in a real transcript: the async_launched result line comes
+        // ahead of the assistant line that holds the Agent tool_use.
+        let notice = "<task-notification>\n<task-id>t</task-id>\n<tool-use-id>early</tool-use-id>\n<status>completed</status>\n<summary>s</summary>\n<usage><subagent_tokens>10</subagent_tokens><tool_uses>1</tool_uses><duration_ms>20</duration_ms></usage>\n</task-notification>";
+        let text = [
+            user_text("go"),
+            agent_result("early", json!({"status":"async_launched"})),
+            agent_call("early"),
+            line(
+                json!({"type":"attachment","isSidechain":false,"attachment":{
+                "type":"queued_command","commandMode":"task-notification",
+                "prompt": notice}}),
+            ),
+        ]
+        .join("\n");
+        let entries = parse_claude_transcript(&text);
+        assert_eq!(
+            sub_events(&entries),
+            vec![
+                ("early".into(), "start".into()),
+                (
+                    "early".into(),
+                    r#"Completed {"duration_ms":20,"tool_uses":1,"total_tokens":10}"#.into()
+                ),
+            ]
+        );
+        // The tool card completes after it starts, not only before.
+        let started = entries.iter().position(|e| {
+            matches!(e, TranscriptEntry::Harness(HarnessEvent::ItemStarted { id, .. }) if id == "early")
+        });
+        let completed_after = entries.iter().rposition(|e| {
+            matches!(e, TranscriptEntry::Harness(HarnessEvent::ItemCompleted { id, .. }) if id == "early")
+        });
+        assert!(started.unwrap() < completed_after.unwrap());
     }
 }
