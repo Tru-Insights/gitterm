@@ -3363,12 +3363,32 @@ fn conversation_backend_glyph(backend: HarnessConversationBackend) -> &'static s
     }
 }
 
-/// Whether the Chats panel offers "Resume as Chat" for an entry: a local
-/// Claude conversation whose recorded directory still exists and that no tab
-/// owns yet (an owned one shows "Go to Session"). Codex and pi chats, remote
-/// chats and dead-cwd chats keep only their existing action.
-fn can_resume_as_chat(entry: &chats::ChatIndexEntry, is_remote: bool, is_live: bool) -> bool {
-    entry.backend == chats::ChatBackend::Claude && !is_remote && !is_live && !entry.dead_cwd
+/// The handshake capability of an agent that runs native Claude chats
+/// (`ClaudeChat` / `ClaudeChatHistory`, TRU-152).
+const CLAUDE_CHAT_CAPABILITY: &str = "claude_chat";
+
+/// Which machine a Chats-panel entry is on, for "Resume as Chat".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatMachine {
+    Local,
+    /// `claude_chat`: the remote's agent is reachable and advertises it.
+    Remote {
+        claude_chat: bool,
+    },
+}
+
+/// Whether the Chats panel offers "Resume as Chat" for an entry: a Claude
+/// conversation whose recorded directory still exists and that no tab owns
+/// yet (an owned one shows "Go to Session"), on this Mac or on a remote
+/// whose agent runs native Claude chats. Codex and pi chats, chats on
+/// older or unreachable agents and dead-cwd chats keep only their
+/// existing action.
+fn can_resume_as_chat(entry: &chats::ChatIndexEntry, machine: ChatMachine, is_live: bool) -> bool {
+    let machine_ok = match machine {
+        ChatMachine::Local => true,
+        ChatMachine::Remote { claude_chat } => claude_chat,
+    };
+    entry.backend == chats::ChatBackend::Claude && machine_ok && !is_live && !entry.dead_cwd
 }
 
 /// The config a new Claude chat tab starts with: the remembered or configured
@@ -5506,6 +5526,9 @@ pub enum Event {
     /// A resumed Claude chat tab's earlier timeline, read back from its
     /// transcript (TRU-140). Empty when the transcript is missing.
     AgentHistoryLoaded(usize, Vec<tab::AgentEvent>),
+    /// A remote chat's transcript could not be fetched (TRU-152); the
+    /// message is shown in the chat.
+    AgentHistoryUnavailable(usize, String),
     /// The Agent surface finished building this tab's page. The tab's
     /// buffer is replayed now, from live state, so events that arrived while
     /// the page was under construction (transcript read-back, a fast first
@@ -7833,6 +7856,38 @@ impl App {
             })
     }
 
+    /// The remote a tab runs on (TRU-152): its workspace's remote id when
+    /// the workspace is on a remote agent. A Claude chat tab there runs
+    /// `claude` on that machine. `None` for tabs on this Mac.
+    fn tab_remote_id(&self, tab_id: usize) -> Option<String> {
+        self.workspaces
+            .iter()
+            .find(|ws| ws.tabs.iter().any(|tab| tab.id == tab_id))
+            .and_then(|ws| self.remote_agent_id_for_workspace(ws))
+            .map(str::to_string)
+    }
+
+    /// Whether a remote's agent is connected and advertises native Claude
+    /// chats. Agents that predate TRU-152 (or have not answered a
+    /// handshake yet) do not.
+    fn remote_runs_claude_chat(&self, remote_id: &str) -> bool {
+        matches!(
+            self.remote_agent_connections.get(remote_id).map(|connection| &connection.status),
+            Some(RemoteAgentConnectionStatus::Connected(handshake))
+                if handshake.capabilities.iter().any(|c| c == CLAUDE_CHAT_CAPABILITY)
+        )
+    }
+
+    /// The client for a remote chat tab's machine, from the freshest
+    /// config. The error names what is missing, for the chat to show.
+    fn remote_chat_client(&self, remote_id: &str) -> Result<RemoteAgentClientConfig, String> {
+        self.fresh_remote_agent_config(remote_id)
+            .map(remote_agent_client_config)
+            .ok_or_else(|| {
+                format!("No remote agent named {remote_id} is configured in remote-agents.json.")
+            })
+    }
+
     /// The checkout chip's state for a Claude chat tab (TRU-143): its label
     /// and directory, the choices offered before the first message, and
     /// whether it is locked and why. `None` when the tab is not a Claude chat.
@@ -7844,6 +7899,22 @@ impl App {
         let session = tab.agent_session()?;
         if session.backend() != tab::AgentBackend::Claude {
             return None;
+        }
+        // A remote chat runs in its workspace's directory on that machine;
+        // task worktrees are local-only, so there is nothing to pick, and
+        // the paths cannot be compared on this Mac's filesystem.
+        if let Some(remote_id) = self.remote_agent_id_for_workspace(ws) {
+            let same = |a: &Path, b: &Path| a == b;
+            return Some(serde_json::json!({
+                "label": tab::checkout_label(&tab.repo_path, None, &ws.dir, same),
+                "path": tab.repo_path,
+                "locked": true,
+                "reason": format!(
+                    "This chat runs on {} in the workspace's directory",
+                    self.chat_machine_name(Some(remote_id))
+                ),
+                "choices": Vec::<tab::CheckoutChoice>::new(),
+            }));
         }
         let task_worktree = tab
             .task_id
@@ -10229,13 +10300,19 @@ impl App {
         }
         let remote_id = chat.remote_id.as_deref();
         let id = chat.id.clone();
+        let machine = match remote_id {
+            None => ChatMachine::Local,
+            Some(remote_id) => ChatMachine::Remote {
+                claude_chat: self.remote_runs_claude_chat(remote_id),
+            },
+        };
         let Some(entry) = self.find_chat_entry(&chat) else {
             eprintln!("[chats] cannot resume {id} as a chat: not in {remote_id:?}'s index");
             return Task::none();
         };
-        if !can_resume_as_chat(entry, remote_id.is_some(), false) {
+        if !can_resume_as_chat(entry, machine, false) {
             eprintln!(
-                "[chats] cannot resume {id} as a chat: only a local Claude chat whose directory exists can be (backend {}, remote {:?}, dead cwd {})",
+                "[chats] cannot resume {id} as a chat: only a Claude chat whose directory exists, on this Mac or on an agent that runs Claude chats, can be (backend {}, machine {machine:?}, remote {:?}, dead cwd {})",
                 entry.backend.label(),
                 remote_id,
                 entry.dead_cwd
@@ -10245,6 +10322,9 @@ impl App {
         let cwd = entry.cwd.clone();
         let repo_root = entry.repo_root.clone();
         let repo_name = entry.group_name();
+        if let Some(remote_id) = chat.remote_id.clone() {
+            return self.resume_remote_chat_as_chat_tab(id, remote_id, cwd, repo_root);
+        }
         if !cwd.exists() {
             eprintln!(
                 "[chats] not resuming {id} as a chat: recorded cwd {} is gone (use the rescue action)",
@@ -10277,6 +10357,55 @@ impl App {
         // Builds the chat page: history read-back, replay, composer focus.
         tasks.push(self.present_active_tab_surfaces());
         Task::batch(tasks)
+    }
+
+    /// "Resume as Chat" for a Claude conversation on a remote machine
+    /// (TRU-152): a chat tab in that repo's remote workspace, running in
+    /// the conversation's recorded cwd there and carrying its session id,
+    /// so showing it reads the transcript back over `ClaudeChatHistory` and
+    /// its first prompt resumes the session on that machine.
+    fn resume_remote_chat_as_chat_tab(
+        &mut self,
+        id: String,
+        remote_id: String,
+        cwd: PathBuf,
+        repo_root: Option<PathBuf>,
+    ) -> Task<Event> {
+        let ws_idx = self.ensure_remote_workspace_for_chat(&remote_id, &cwd, repo_root.as_deref());
+        let mut tasks = Vec::new();
+        if ws_idx != self.active_workspace_idx {
+            tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
+        }
+        let mut tab = self.new_remote_claude_chat_tab(
+            &cwd.to_string_lossy(),
+            resumed_claude_chat_session(&self.chat_config, &id),
+        );
+        let tab_id = tab.id;
+        tab.chat_session_id = Some(id.clone());
+        tab.git_status_loading = true;
+        let repo_path = tab.repo_path.clone();
+        let workspace = &mut self.workspaces[ws_idx];
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+        eprintln!("[agent] opened Claude chat tab id={tab_id} resuming {id} on {remote_id}");
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
+        tasks.push(self.scroll_to_active_tab());
+        tasks.push(self.present_active_tab_surfaces());
+        Task::batch(tasks)
+    }
+
+    /// A Claude chat tab for a remote-agent workspace (TRU-152): `claude`
+    /// runs in `dir` on that machine, and the tab's Files panel browses the
+    /// remote, never this Mac's filesystem.
+    fn new_remote_claude_chat_tab(&mut self, dir: &str, session: AgentSession) -> TabState {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let mut tab = TabState::new(id, PathBuf::from(dir));
+        tab.kind = TabKind::Agent(session);
+        tab.files = FilesState::at(SourcePath::Remote(dir.to_string()));
+        tab
     }
 
     /// Resume a chat that lives on a remote machine: start an agentd
@@ -12089,7 +12218,9 @@ impl App {
             .task_store
             .as_ref()
             .is_some_and(|store| !store.delegations_for_parent(&tab.session_uid).is_empty());
-        if !has_cards {
+        // The HEAD check runs git on this Mac; a remote tab has no
+        // delegation cards (remote delegations are refused) anyway.
+        if !has_cards || self.tab_remote_id(tab_id).is_some() {
             return Task::none();
         }
         let cwd = tab.repo_path.clone();
@@ -12669,6 +12800,31 @@ impl App {
                                     tab_config.startup_command.clone(),
                                     restored_session_uid,
                                 );
+                                continue;
+                            }
+                            // A native Claude chat tab (TRU-152) comes back
+                            // as a remote chat in its recorded directory,
+                            // resuming its conversation on the next prompt.
+                            if let (
+                                Some("agent"),
+                                Some(agent_config @ AgentBackendConfig::Claude { .. }),
+                            ) = (
+                                tab_config.tab_kind.as_deref(),
+                                tab_config.agent_config.as_ref(),
+                            ) {
+                                let dir = tab_config
+                                    .repo_dir
+                                    .clone()
+                                    .unwrap_or_else(|| root.to_string());
+                                let mut session = AgentSession::new(agent_config.clone());
+                                session.session_id = tab_config.chat_session_id.clone();
+                                let mut tab = app.new_remote_claude_chat_tab(&dir, session);
+                                tab.chat_session_id = tab_config.chat_session_id.clone();
+                                if let Some(uid) = restored_session_uid {
+                                    tab.session_uid = uid;
+                                }
+                                workspace.tabs.push(tab);
+                                workspace.active_tab = workspace.tabs.len() - 1;
                                 continue;
                             }
                             if remote_agent_files_tab_added {
@@ -16144,24 +16300,37 @@ fi
                 let mut harness_bridge: Option<tokio::sync::mpsc::UnboundedReceiver<HarnessEvent>> =
                     None;
                 let mut claude_spawned = false;
-                // A native Claude spawn gets the same GitTerm MCP servers a
-                // terminal-launched `claude` does.
+                // A chat tab in a remote-agent workspace runs `claude` on
+                // that machine (TRU-152). Resolved before the tab is
+                // borrowed; only consulted when a process is spawned.
+                let mut remote_chat: Option<(String, Result<RemoteAgentClientConfig, String>)> =
+                    self.tab_remote_id(tab_id).map(|remote_id| {
+                        let client = self.remote_chat_client(&remote_id);
+                        (remote_id, client)
+                    });
+                // A native Claude spawn on this Mac gets the same GitTerm MCP
+                // servers a terminal-launched `claude` does. They point at
+                // this Mac, so a remote chat gets none.
                 let caller = self
                     .workspaces
                     .iter()
                     .flat_map(|ws| ws.tabs.iter())
                     .find(|t| t.id == tab_id)
                     .map(|t| t.session_uid.clone());
-                let mut claude_mcp_servers: Vec<gitterm::harness::claude::ClaudeMcpServer> = self
-                    .task_mcp
-                    .iter()
-                    .map(|connection| connection.claude_mcp_server(caller.as_deref()))
-                    .chain(
-                        self.browser_mcp
+                let mut claude_mcp_servers: Vec<gitterm::harness::claude::ClaudeMcpServer> =
+                    if remote_chat.is_some() {
+                        Vec::new()
+                    } else {
+                        self.task_mcp
                             .iter()
-                            .map(BrowserMcpConnection::claude_mcp_server),
-                    )
-                    .collect();
+                            .map(|connection| connection.claude_mcp_server(caller.as_deref()))
+                            .chain(
+                                self.browser_mcp
+                                    .iter()
+                                    .map(BrowserMcpConnection::claude_mcp_server),
+                            )
+                            .collect()
+                    };
                 'outer_submit: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id != tab_id {
@@ -16178,9 +16347,14 @@ fi
                             // Native Claude: one long-lived process per tab,
                             // spawned on first prompt (or after it exited).
                             if session.claude.is_none() {
-                                if let Some(id) = session.session_id.clone() {
+                                if let (Some(id), None) =
+                                    (session.session_id.clone(), remote_chat.as_ref())
+                                {
                                     // Resuming a session whose transcript
                                     // is gone fails at launch; start fresh.
+                                    // A remote transcript is not on this
+                                    // Mac: a missing one fails visibly on
+                                    // the remote instead.
                                     if !chats::claude_session_exists(&id) {
                                         eprintln!(
                                             "[agent] Claude session {id} has no transcript; starting a new session"
@@ -16195,8 +16369,25 @@ fi
                                 ) else {
                                     return Task::none();
                                 };
-                                let (claude, rx) =
-                                    gitterm::harness::claude::ClaudeSession::spawn(config);
+                                let (claude, rx) = match remote_chat.take() {
+                                    None => gitterm::harness::claude::ClaudeSession::spawn(config),
+                                    Some((remote_id, Ok(client))) => {
+                                        eprintln!(
+                                            "[remote-chat] tab {tab_id}: starting Claude on {remote_id} in {}",
+                                            config.cwd.display()
+                                        );
+                                        gitterm::harness::claude::ClaudeSession::spawn_remote(
+                                            client, config,
+                                        )
+                                    }
+                                    Some((remote_id, Err(error))) => {
+                                        eprintln!(
+                                            "[remote-chat] tab {tab_id}: cannot start Claude on {remote_id}: {error}"
+                                        );
+                                        agent_webview_note(tab_id, &format!("Not sent: {error}"));
+                                        return Task::none();
+                                    }
+                                };
                                 session.claude = Some(claude);
                                 harness_bridge = Some(rx);
                                 claude_spawned = true;
@@ -16570,6 +16761,21 @@ fi
                     eprintln!("AgentReviewContextRequested: no tab {tab_id}");
                     return Task::none();
                 };
+                // The context reads the checkout's git state on this Mac;
+                // a remote chat's checkout is on its machine (TRU-152).
+                if let Some(remote_id) = self.tab_remote_id(tab_id) {
+                    let error = format!(
+                        "Review… reads the checkout on this Mac; this chat runs on {}.",
+                        self.chat_machine_name(Some(&remote_id))
+                    );
+                    return Task::done(Event::AgentReviewContextLoaded(
+                        tab_id,
+                        gitterm::review::ReviewContext {
+                            error: Some(error),
+                            ..Default::default()
+                        },
+                    ));
+                }
                 let repo_path = tab.repo_path.clone();
                 // A task tab reviews against the base its task was cut from.
                 let task_base = tab
@@ -16826,6 +17032,16 @@ fi
                 };
             }
             Event::DelegationOpenFile(tab_id, path) => {
+                // Delegations run on this Mac; a remote tab never has one,
+                // and its paths are not files here (TRU-152).
+                if self.tab_remote_id(tab_id).is_some() {
+                    eprintln!(
+                        "[delegation] open_file {} from remote tab {tab_id} refused",
+                        path.display()
+                    );
+                    agent_webview_note(tab_id, "Files of a remote chat cannot open from here.");
+                    return Task::none();
+                }
                 let Some(repo_path) = self
                     .active_tab()
                     .filter(|tab| tab.id == tab_id)
@@ -16851,6 +17067,24 @@ fi
             Event::NewClaudeChatTab => {
                 self.tab_picker_visible = false;
                 let config = new_claude_chat_config(&self.chat_config);
+                // In a remote-agent workspace the chat runs on that machine,
+                // in the workspace's root (TRU-152).
+                let remote_root = self
+                    .active_workspace()
+                    .and_then(|ws| remote_agent_root(&ws.location))
+                    .map(str::to_string);
+                if let Some(root) = remote_root {
+                    let tab = self.new_remote_claude_chat_tab(&root, AgentSession::new(config));
+                    let id = tab.id;
+                    if let Some(ws) = self.active_workspace_mut() {
+                        ws.tabs.push(tab);
+                        ws.active_tab = ws.tabs.len() - 1;
+                    }
+                    eprintln!("[agent] opened remote Claude chat tab id={id} in {root}");
+                    self.mark_workspaces_dirty();
+                    let scroll_task = self.scroll_to_active_tab();
+                    return Task::batch([scroll_task, self.present_active_tab_surfaces()]);
+                }
                 let (repo_path, current_dir) = match self.active_workspace() {
                     Some(ws) => {
                         let cd = ws
@@ -16951,6 +17185,25 @@ fi
                     webview::insert_agent_composer_text(tab_id, &text);
                 }
                 return self.refresh_delegation_head(tab_id);
+            }
+            Event::AgentHistoryUnavailable(tab_id, error) => {
+                eprintln!("[remote-chat] tab {tab_id}: {error}");
+                if let Some(session) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session_mut())
+                {
+                    // Not retried on every show; the next turn still runs.
+                    // Recorded, so a page still being built (or rebuilt
+                    // later) shows it too.
+                    session.history = tab::HistoryLoad::Loaded;
+                    let ev = tab::AgentEvent::Harness(HarnessEvent::Error(error));
+                    push_agent_event_to_webview(tab_id, &ev);
+                    session.record(ev);
+                }
+                return Task::none();
             }
             Event::AgentHistoryLoaded(tab_id, history) => {
                 let Some(session) = self
@@ -20257,6 +20510,10 @@ fi
                     Ok(entries) => {
                         state.entries = entries;
                         state.error = None;
+                        // "Resume as Chat" needs the agent's capabilities;
+                        // a remote whose workspace was never opened has not
+                        // been handshaken yet (no-op when it has).
+                        return self.ensure_remote_agent_connection(&remote_id, false);
                     }
                     Err(err) => {
                         eprintln!("[chats] remote index fetch for {remote_id} failed: {err}");
@@ -22334,6 +22591,9 @@ fi
         // The tab's delegation cards are not in the transcript; they are
         // anchored back where they were requested (TRU-142).
         let delegations = self.delegation_times_for_tab(tab_id);
+        // A remote chat's transcript is on its machine (TRU-152).
+        let remote_id = self.tab_remote_id(tab_id);
+        let remote_client = remote_id.as_deref().map(|id| self.remote_chat_client(id));
         let Some(session) = self
             .workspaces
             .iter_mut()
@@ -22347,6 +22607,34 @@ fi
             return Task::none();
         };
         session.history = tab::HistoryLoad::Loading;
+        if let (Some(remote_id), Some(client)) = (remote_id, remote_client) {
+            return Task::perform(
+                async move {
+                    let client = client?;
+                    match RemoteAgentBackend::new(client)
+                        .claude_chat_history(session_id.clone())
+                        .await
+                    {
+                        Ok(Some(entries)) => Ok(history_timeline(entries, &delegations)),
+                        Ok(None) => {
+                            // Same as a local session with no transcript:
+                            // nothing to show yet.
+                            eprintln!(
+                                "[remote-chat] Claude session {session_id} has no transcript on {remote_id} to read back"
+                            );
+                            Ok(Vec::new())
+                        }
+                        Err(error) => Err(format!(
+                            "Could not read this conversation back from {remote_id}: {error}"
+                        )),
+                    }
+                },
+                move |result| match result {
+                    Ok(events) => Event::AgentHistoryLoaded(tab_id, events),
+                    Err(error) => Event::AgentHistoryUnavailable(tab_id, error),
+                },
+            );
+        }
         Task::perform(
             async move {
                 let id = session_id.clone();
@@ -30447,7 +30735,15 @@ fi
                 theme.accent(),
                 Event::ResumeChatAsTab(selected.clone()),
             ));
-            if can_resume_as_chat(entry, is_remote, is_live) {
+            // Unreachable machines were handled above; a remote also needs
+            // an agent that runs native Claude chats.
+            let machine = match entry_remote_id {
+                None => ChatMachine::Local,
+                Some(remote_id) => ChatMachine::Remote {
+                    claude_chat: self.remote_runs_claude_chat(remote_id),
+                },
+            };
+            if can_resume_as_chat(entry, machine, is_live) {
                 actions = actions.push(action_button(
                     "Resume as Chat",
                     theme.accent(),
@@ -37323,24 +37619,40 @@ mod tests {
     }
 
     #[test]
-    fn resume_as_chat_is_offered_only_for_local_unowned_claude_chats_with_a_live_cwd() {
+    fn resume_as_chat_is_offered_only_for_unowned_claude_chats_with_a_live_cwd() {
+        let local = ChatMachine::Local;
+        let remote_chat = ChatMachine::Remote { claude_chat: true };
+        let old_remote = ChatMachine::Remote { claude_chat: false };
         let claude = chat_entry(chats::ChatBackend::Claude, false);
-        assert!(can_resume_as_chat(&claude, false, false));
-        assert!(!can_resume_as_chat(&claude, true, false), "remote chat");
+        assert!(can_resume_as_chat(&claude, local, false));
         assert!(
-            !can_resume_as_chat(&claude, false, true),
-            "a tab owns it: Go to Session instead"
+            can_resume_as_chat(&claude, remote_chat, false),
+            "remote chat on an agent that runs Claude chats"
         );
         assert!(
-            !can_resume_as_chat(&chat_entry(chats::ChatBackend::Claude, true), false, false),
-            "dead cwd: only the rescue action"
+            !can_resume_as_chat(&claude, old_remote, false),
+            "older or unreachable agent: Resume as Session only"
         );
-        for backend in [chats::ChatBackend::Codex, chats::ChatBackend::Pi] {
-            assert!(!can_resume_as_chat(
-                &chat_entry(backend, false),
-                false,
-                false
-            ));
+        for machine in [local, remote_chat] {
+            assert!(
+                !can_resume_as_chat(&claude, machine, true),
+                "a tab owns it: Go to Session instead"
+            );
+            assert!(
+                !can_resume_as_chat(
+                    &chat_entry(chats::ChatBackend::Claude, true),
+                    machine,
+                    false
+                ),
+                "dead cwd: only the rescue action"
+            );
+            for backend in [chats::ChatBackend::Codex, chats::ChatBackend::Pi] {
+                assert!(!can_resume_as_chat(
+                    &chat_entry(backend, false),
+                    machine,
+                    false
+                ));
+            }
         }
     }
 
