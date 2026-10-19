@@ -239,12 +239,18 @@ pub(crate) struct AgentSession {
     pub(crate) task_handle: Option<AgentTaskHandle>,
     /// Long-lived native Claude process (Claude backend only). Lazy like
     /// `task_handle`; dropped (and respawned with `--resume`) when the
-    /// process exits. Dropping it shuts the process down.
+    /// process exits. Dropping a local one shuts the process down; dropping
+    /// a remote one detaches and leaves the chat running on its machine
+    /// (closing the tab sends `Shutdown` first, TRU-152).
     pub(crate) claude: Option<ClaudeSession>,
     /// Runtime requests (permission prompts, questions) awaiting the human.
     pub(crate) pending_requests: Vec<String>,
     /// Transcript read-back for a session restored from `workspaces.json`.
     pub(crate) history: HistoryLoad,
+    /// A remote chat's "reconnecting" notice while its connection is down
+    /// (TRU-152). Not in the conversation, so a page rebuilt meanwhile is
+    /// given it again.
+    pub(crate) remote_disconnected: Option<AgentEvent>,
 }
 
 impl AgentSession {
@@ -260,6 +266,7 @@ impl AgentSession {
             claude: None,
             pending_requests: Vec::new(),
             history: HistoryLoad::NotLoaded,
+            remote_disconnected: None,
         }
     }
 

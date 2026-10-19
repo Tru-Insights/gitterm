@@ -197,17 +197,23 @@ async fn main() {
         cwd.join(PROBE_FILE).display().to_string(),
     );
 
-    // Dropping the handle stops the agent's process; its exit comes back.
-    drop(session);
+    // The agent owns the chat (TRU-152): dropping the handle only
+    // detaches, so stop it explicitly, as closing the tab does. Its exit
+    // comes back.
+    if let Err(e) = session.send(HarnessCommand::Shutdown) {
+        check!("shutdown stops the remote process", false, e);
+    }
     let mut exited = None;
     while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(20), events.recv()).await {
         show(&ev);
         if let HarnessEvent::ProcessExited { code } = ev {
             exited = Some(code);
+            break;
         }
     }
+    drop(session);
     check!(
-        "drop shuts the remote process down",
+        "shutdown stops the remote process",
         exited.is_some(),
         format!("exit={exited:?}"),
     );

@@ -41,7 +41,10 @@ mod events;
 mod tab;
 mod theme;
 
-use gitterm::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake};
+use gitterm::agentd::client::{
+    RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake, RunningClaudeChat,
+    RunningClaudeChatState,
+};
 use gitterm::browser_control::{
     BrowserCaptureMode, BrowserControlService, BrowserEvidence, BrowserLaunchOptions, BrowserState,
     BrowserStatus, BrowserTelemetrySnapshot,
@@ -5529,6 +5532,8 @@ pub enum Event {
     /// A remote chat's transcript could not be fetched (TRU-152); the
     /// message is shown in the chat.
     AgentHistoryUnavailable(usize, String),
+    /// The Claude chats a remote's agent is running (TRU-152).
+    RemoteRunningChatsLoaded(String, Result<Vec<RunningClaudeChat>, String>),
     /// The Agent surface finished building this tab's page. The tab's
     /// buffer is replayed now, from live state, so events that arrived while
     /// the page was under construction (transcript read-back, a fast first
@@ -5936,6 +5941,11 @@ struct App {
     /// Kept when a machine becomes unreachable so Everywhere still shows
     /// its (stale) chats.
     remote_chat_indexes: HashMap<String, RemoteChatState>,
+    /// The Claude chats each remote's agent is running (TRU-152), from
+    /// `ListClaudeChats`, keyed by remote id. Only agents that own their
+    /// chats are asked. Kept when a fetch fails, so a running chat is never
+    /// offered a second process on a stale "not running".
+    remote_running_chats: HashMap<String, Vec<RunningClaudeChat>>,
     /// Preview tail for the most recently selected chat, keyed by session
     /// id so a stale load never renders under the wrong chat.
     chat_preview: Option<(chats::ChatRef, chats::ChatPreview)>,
@@ -7876,6 +7886,226 @@ impl App {
             Some(RemoteAgentConnectionStatus::Connected(handshake))
                 if handshake.capabilities.iter().any(|c| c == CLAUDE_CHAT_CAPABILITY)
         )
+    }
+
+    /// Whether a remote's agent owns its Claude chats (TRU-152): they
+    /// outlive the connection, and `ListClaudeChats` says which are running.
+    fn remote_owns_claude_chats(&self, remote_id: &str) -> bool {
+        matches!(
+            self.remote_agent_connections.get(remote_id).map(|connection| &connection.status),
+            Some(RemoteAgentConnectionStatus::Connected(handshake))
+                if handshake.capabilities.iter().any(|c| {
+                    c == gitterm::agentd::server::CLAUDE_CHAT_PERSISTENT_CAPABILITY
+                })
+        )
+    }
+
+    /// The chat a remote's agent is running for a Claude conversation, as
+    /// last listed.
+    fn running_remote_chat(&self, remote_id: &str, session_id: &str) -> Option<&RunningClaudeChat> {
+        self.remote_running_chats
+            .get(remote_id)?
+            .iter()
+            .find(|chat| chat.claude_session_id == session_id)
+    }
+
+    /// Ask a remote's agent which Claude chats it is running. A no-op for
+    /// agents that do not own their chats.
+    fn request_remote_running_chats(&self, remote_id: &str) -> Task<Event> {
+        if !self.remote_owns_claude_chats(remote_id) {
+            return Task::none();
+        }
+        let client = match self.remote_chat_client(remote_id) {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("[remote-chat] cannot list running chats on {remote_id}: {error}");
+                return Task::none();
+            }
+        };
+        let remote_id = remote_id.to_string();
+        Task::perform(
+            async move {
+                RemoteAgentBackend::new(client)
+                    .list_claude_chats()
+                    .await
+                    .map_err(|err| err.to_string())
+            },
+            move |result| Event::RemoteRunningChatsLoaded(remote_id, result),
+        )
+    }
+
+    /// Attach every chat tab of a remote whose conversation is running
+    /// there and that has no handle yet (a tab restored at launch, or one
+    /// just opened from the Chats panel), so pending prompts and a running
+    /// turn show without waiting for the next message, and no second
+    /// `claude` is ever started for it.
+    fn attach_running_remote_chat_tabs(&mut self, remote_id: &str) -> Task<Event> {
+        let Some(running) = self.remote_running_chats.get(remote_id) else {
+            return Task::none();
+        };
+        // Claude session id -> chat id.
+        let running: HashMap<&str, &str> = running
+            .iter()
+            .filter(|chat| !chat.claude_session_id.is_empty())
+            .map(|chat| (chat.claude_session_id.as_str(), chat.chat_id.as_str()))
+            .collect();
+        let to_attach: Vec<(usize, String)> = self
+            .workspaces
+            .iter()
+            .filter(|ws| self.remote_agent_id_for_workspace(ws) == Some(remote_id))
+            .flat_map(|ws| ws.tabs.iter())
+            .filter_map(|tab| {
+                let session = tab.agent_session()?;
+                if session.backend() != tab::AgentBackend::Claude || session.claude.is_some() {
+                    return None;
+                }
+                let chat_id = running.get(session.session_id.as_deref()?)?;
+                Some((tab.id, chat_id.to_string()))
+            })
+            .collect();
+        let tasks: Vec<Task<Event>> = to_attach
+            .into_iter()
+            .map(|(tab_id, chat_id)| self.attach_remote_chat_tab(tab_id, chat_id))
+            .collect();
+        Task::batch(tasks)
+    }
+
+    /// Give a remote chat tab a handle on chat `chat_id`, listed running on
+    /// its machine, now. It only attaches (never starts a process). The
+    /// transcript is read first so redelivered state (a pending prompt, a
+    /// running turn) lands after it.
+    fn attach_remote_chat_tab(&mut self, tab_id: usize, chat_id: String) -> Task<Event> {
+        let Some(remote_id) = self.tab_remote_id(tab_id) else {
+            return Task::none();
+        };
+        let client = match self.remote_chat_client(&remote_id) {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("[remote-chat] tab {tab_id}: cannot attach on {remote_id}: {error}");
+                return Task::none();
+            }
+        };
+        let chrome = self.chat_config.claude_in_chrome;
+        let history = self.start_agent_history_load(tab_id);
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|t| t.id == tab_id)
+        else {
+            return history;
+        };
+        let repo_path = tab.repo_path.clone();
+        let Some(session) = tab.agent_session_mut() else {
+            return history;
+        };
+        if session.claude.is_some() {
+            return history;
+        }
+        let Some(config) = session.claude_session_config(repo_path, Vec::new(), chrome) else {
+            return history;
+        };
+        eprintln!(
+            "[remote-chat] tab {tab_id}: attaching to chat {chat_id} (session {:?}) running on {remote_id}",
+            config.resume
+        );
+        let (claude, rx) =
+            gitterm::harness::claude::ClaudeSession::attach_remote(client, config, chat_id);
+        session.claude = Some(claude);
+        let bridge = Task::run(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            move |ev| Event::AgentEventReceived(tab_id, tab::AgentEvent::Harness(ev)),
+        );
+        Task::batch([history, bridge])
+    }
+
+    /// Closing a remote Claude chat tab stops its chat on that machine
+    /// (TRU-152). Dropping the handle alone only detaches, which is what
+    /// quitting GitTerm or losing the network does.
+    fn stop_remote_chat_for_closing_tab(&mut self, tab_id: usize) {
+        let Some(remote_id) = self.tab_remote_id(tab_id) else {
+            return;
+        };
+        let Some(session) = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.agent_session())
+        else {
+            return;
+        };
+        let session_id = session.session_id.clone();
+        if let Some(claude) = session.claude.as_ref() {
+            eprintln!("[remote-chat] tab {tab_id}: closing; stopping its chat on {remote_id}");
+            if let Err(e) = claude.send(HarnessCommand::Shutdown) {
+                eprintln!("[remote-chat] tab {tab_id}: could not ask {remote_id} to stop it: {e}");
+            }
+        }
+        // Not running any more as far as the Chats panel is concerned.
+        if let (Some(id), Some(chats)) = (session_id, self.remote_running_chats.get_mut(&remote_id))
+        {
+            chats.retain(|chat| chat.claude_session_id != id);
+        }
+    }
+
+    /// A remote chat tab's connection to its machine went down or came
+    /// back (TRU-152). Shown in the page, never recorded. A reattach that
+    /// missed events reloads the timeline from the transcript, the way a
+    /// restored tab reads it.
+    fn remote_chat_link_changed(&mut self, tab_id: usize, link: HarnessEvent) -> Task<Event> {
+        let Some(session) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.agent_session_mut())
+        else {
+            eprintln!("[remote-chat] tab {tab_id}: connection change for a closed tab: {link:?}");
+            return Task::none();
+        };
+        let ev = tab::AgentEvent::Harness(link.clone());
+        push_agent_event_to_webview(tab_id, &ev);
+        match link {
+            HarnessEvent::RemoteDisconnected { machine, error } => {
+                eprintln!("[remote-chat] tab {tab_id}: lost {machine} ({error}); reconnecting");
+                session.remote_disconnected = Some(ev);
+                Task::none()
+            }
+            HarnessEvent::RemoteReconnected {
+                machine,
+                history_gap,
+            } => {
+                session.remote_disconnected = None;
+                if !history_gap {
+                    eprintln!("[remote-chat] tab {tab_id}: reattached to {machine}");
+                    return Task::none();
+                }
+                if session.session_id.is_none() {
+                    eprintln!(
+                        "[remote-chat] tab {tab_id}: reattached to {machine} past its event buffer, with no session id to reload; continuing from live events"
+                    );
+                    return Task::none();
+                }
+                eprintln!(
+                    "[remote-chat] tab {tab_id}: reattached to {machine} past its event buffer; reloading the conversation"
+                );
+                // The transcript replaces everything; what is still in force
+                // (a running turn, open prompts) is redelivered after this.
+                session.conversation.clear();
+                session.pending_requests.clear();
+                session.state = tab::AgentSessionState::Idle;
+                session.history = tab::HistoryLoad::NotLoaded;
+                if webview::is_active(WebviewSurface::Agent(tab_id)) {
+                    reset_agent_webview(tab_id);
+                }
+                self.start_agent_history_load(tab_id)
+            }
+            other => {
+                eprintln!("[remote-chat] tab {tab_id}: not a connection change: {other:?}");
+                Task::none()
+            }
+        }
     }
 
     /// The client for a remote chat tab's machine, from the freshest
@@ -10237,6 +10467,15 @@ impl App {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
         if let Some(remote_id) = chat.remote_id.clone() {
+            // A second `claude --resume` next to the running chat would
+            // fork the conversation; join the running one (TRU-152).
+            if self.running_remote_chat(&remote_id, &chat.id).is_some() {
+                eprintln!(
+                    "[chats] {} is running on {remote_id}; opening its chat instead of a second process",
+                    chat.id
+                );
+                return self.resume_chat_as_chat_tab(chat);
+            }
             return self.resume_remote_chat(chat.id, remote_id);
         }
         let id = chat.id;
@@ -10393,6 +10632,13 @@ impl App {
         tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
         tasks.push(self.scroll_to_active_tab());
         tasks.push(self.present_active_tab_surfaces());
+        // "Open Chat" on a conversation running there: attach now (TRU-152).
+        if let Some(chat_id) = self
+            .running_remote_chat(&remote_id, &id)
+            .map(|chat| chat.chat_id.clone())
+        {
+            tasks.push(self.attach_remote_chat_tab(tab_id, chat_id));
+        }
         Task::batch(tasks)
     }
 
@@ -12651,6 +12897,7 @@ impl App {
             collapsed_machine_groups: std::collections::HashSet::new(),
             machine_menu: None,
             remote_chat_indexes: HashMap::new(),
+            remote_running_chats: HashMap::new(),
             chat_preview: None,
             jev_client: gitterm::jev::JevClient::from_env(),
             chat_rank: chat_rank::ChatRankState::default(),
@@ -16028,6 +16275,13 @@ fi
                         return self.close_task_tab(prompt);
                     }
                 }
+                let closing = self
+                    .active_workspace()
+                    .filter(|ws| idx < ws.tabs.len() && ws.tabs.len() > 1)
+                    .map(|ws| ws.tabs[idx].id);
+                if let Some(tab_id) = closing {
+                    self.stop_remote_chat_for_closing_tab(tab_id);
+                }
                 if let Some(ws) = self.active_workspace_mut() {
                     if idx < ws.tabs.len() && ws.tabs.len() > 1 {
                         ws.tabs.remove(idx);
@@ -17175,6 +17429,9 @@ fi
                 );
                 let cards = self.delegation_cards_for_tab(tab_id);
                 replay_agent_conversation_in_webview(tab_id, &session.conversation, cards);
+                if let Some(notice) = &session.remote_disconnected {
+                    push_agent_event_to_webview(tab_id, notice);
+                }
                 webview::focus_agent_composer(tab_id);
                 if let Some(text) = self.dictation_held.remove(&tab_id) {
                     eprintln!(
@@ -17231,12 +17488,25 @@ fi
                 // it is done (`AgentWebviewCreated`).
                 if webview::is_active(WebviewSurface::Agent(tab_id)) {
                     let conversation = session.conversation.clone();
+                    let notice = session.remote_disconnected.clone();
                     let cards = self.delegation_cards_for_tab(tab_id);
                     reset_agent_webview(tab_id);
                     replay_agent_conversation_in_webview(tab_id, &conversation, cards);
+                    if let Some(notice) = &notice {
+                        push_agent_event_to_webview(tab_id, notice);
+                    }
                     return self.refresh_delegation_head(tab_id);
                 }
                 return Task::none();
+            }
+            Event::AgentEventReceived(
+                tab_id,
+                tab::AgentEvent::Harness(
+                    link @ (HarnessEvent::RemoteDisconnected { .. }
+                    | HarnessEvent::RemoteReconnected { .. }),
+                ),
+            ) => {
+                return self.remote_chat_link_changed(tab_id, link);
             }
             Event::AgentEventReceived(tab_id, ev) => {
                 // Append to the conversation buffer and push the event live
@@ -19787,7 +20057,13 @@ fi
                     },
                 );
                 let picker_task = self.folder_picker_home_arrived(&remote_id);
-                return Task::batch([pending_refresh.unwrap_or_else(Task::none), picker_task]);
+                // Its running chats: restored chat tabs reattach to theirs.
+                let running_task = self.request_remote_running_chats(&remote_id);
+                return Task::batch([
+                    pending_refresh.unwrap_or_else(Task::none),
+                    picker_task,
+                    running_task,
+                ]);
             }
             Event::AttachRemoteSession(session_name) => {
                 return self.open_remote_session_tab(&session_name);
@@ -20512,8 +20788,12 @@ fi
                         state.error = None;
                         // "Resume as Chat" needs the agent's capabilities;
                         // a remote whose workspace was never opened has not
-                        // been handshaken yet (no-op when it has).
-                        return self.ensure_remote_agent_connection(&remote_id, false);
+                        // been handshaken yet (no-op when it has). Which of
+                        // its chats are running refreshes with the index.
+                        return Task::batch([
+                            self.ensure_remote_agent_connection(&remote_id, false),
+                            self.request_remote_running_chats(&remote_id),
+                        ]);
                     }
                     Err(err) => {
                         eprintln!("[chats] remote index fetch for {remote_id} failed: {err}");
@@ -20521,6 +20801,21 @@ fi
                     }
                 }
             }
+            Event::RemoteRunningChatsLoaded(remote_id, result) => match result {
+                Ok(chats) => {
+                    eprintln!(
+                        "[remote-chat] {remote_id} is running {} Claude chat(s)",
+                        chats.len()
+                    );
+                    self.remote_running_chats.insert(remote_id.clone(), chats);
+                    return self.attach_running_remote_chat_tabs(&remote_id);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[remote-chat] could not list the running chats on {remote_id} (keeping the last list): {err}"
+                    );
+                }
+            },
             Event::SelectChat(chat) => {
                 let task = self.select_chat(chat);
                 self.settle_agent_surface();
@@ -21366,6 +21661,12 @@ fi
                         remote_session,
                         active: false,
                     });
+                    // Its tabs are discarded, so its remote chats stop too.
+                    let tab_ids: Vec<usize> =
+                        self.workspaces[idx].tabs.iter().map(|tab| tab.id).collect();
+                    for tab_id in tab_ids {
+                        self.stop_remote_chat_for_closing_tab(tab_id);
+                    }
                     // Kill console process before removing workspace
                     self.workspaces[idx].console.kill_process();
                     self.workspaces.remove(idx);
@@ -30711,6 +31012,30 @@ fi
                 .size(font_small - 1.0)
                 .color(theme.text_secondary()),
             );
+        } else if let Some(running) =
+            entry_remote_id.and_then(|remote_id| self.running_remote_chat(remote_id, &entry.id))
+        {
+            // Its chat is running on that machine (TRU-152): the only
+            // action joins it; nothing here can start a second process.
+            let doing = match running.state {
+                RunningClaudeChatState::Idle => "idle",
+                RunningClaudeChatState::TurnRunning => "working",
+                RunningClaudeChatState::AwaitingInput => "waiting for you",
+            };
+            actions = actions
+                .push(action_button(
+                    "Open Chat",
+                    theme.green(),
+                    Event::ResumeChatAsChat(selected.clone()),
+                ))
+                .push(
+                    text(format!(
+                        "● running on {} · {doing}",
+                        machine_name.as_deref().unwrap_or("the remote")
+                    ))
+                    .size(font_small - 1.0)
+                    .color(theme.green()),
+                );
         } else if cwd_gone && is_remote {
             actions = actions.push(
                 text("the recorded directory is gone on the remote machine")

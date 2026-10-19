@@ -178,6 +178,20 @@ pub enum HarnessEvent {
     ProcessExited {
         code: Option<i32>,
     },
+    /// A remote chat lost its connection to the machine it runs on and is
+    /// reconnecting (TRU-152). The chat keeps running there. Raised by the
+    /// desktop's remote handle, never by a harness.
+    RemoteDisconnected {
+        machine: String,
+        error: String,
+    },
+    /// The remote chat is attached again. `history_gap`: events were missed
+    /// beyond what the agent buffers, so the timeline is reloaded from the
+    /// transcript.
+    RemoteReconnected {
+        machine: String,
+        history_gap: bool,
+    },
 }
 
 /// The human's answer to a `RuntimeRequest`.
@@ -572,6 +586,14 @@ mod tests {
             HarnessEvent::Error("bad".into()),
             HarnessEvent::ProcessExited { code: Some(0) },
             HarnessEvent::ProcessExited { code: None },
+            HarnessEvent::RemoteDisconnected {
+                machine: "mini".into(),
+                error: "connection reset".into(),
+            },
+            HarnessEvent::RemoteReconnected {
+                machine: "mini".into(),
+                history_gap: true,
+            },
         ];
         for event in events {
             let json = serde_json::to_string(&event).unwrap();

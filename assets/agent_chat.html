@@ -2401,6 +2401,8 @@
 
   // ---- harness events ----------------------------------------------------
   function note(text, cls) { append(el('div', 'note' + (cls ? ' ' + cls : ''), text)); }
+  // The "reconnecting" notice of a remote chat, while it shows.
+  let linkNote = null;
   function errorBlock(text) { endSegment(); append(el('div', 'error-block', text)); }
 
   function harnessEvent(ev) {
@@ -2480,7 +2482,24 @@
         clearPendingChips();
         errorBlock(d);
         break;
+      case 'remote_disconnected':
+        // Not fatal: the chat keeps running on its machine and the app
+        // reattaches on its own (TRU-152).
+        endSegment(); endThinking();
+        if (!linkNote || !linkNote.isConnected) {
+          linkNote = el('div', 'note warn');
+          append(linkNote);
+        }
+        linkNote.textContent = 'Reconnecting to ' + d.machine + '… the chat keeps running there.';
+        linkNote.title = d.error || '';
+        break;
+      case 'remote_reconnected':
+        if (linkNote) { linkNote.remove(); linkNote = null; }
+        note(d.history_gap ? 'Reconnected to ' + d.machine + ' · reloading the conversation'
+                           : 'Reconnected to ' + d.machine);
+        break;
       case 'process_exited':
+        if (linkNote) { linkNote.remove(); linkNote = null; }
         endSegment(); endThinking();
         clearPending();
         clearPendingMode();

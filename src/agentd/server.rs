@@ -1612,6 +1612,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_plain_start_from_an_older_client_gets_bare_events_and_only_detaches() {
+        let (mut client, registry, spawned, server) = fake_chat_agent().await;
+        let dir = tempfile::tempdir().unwrap();
+        let start = start_message(start_json(&dir.path().to_string_lossy())).unwrap();
+        let (commands, mut stream) = open_chat(&mut client, start).await.unwrap();
+        // The process starts before the stream is answered.
+        let events = spawned.lock().unwrap()[0].0.clone();
+        events.send(HarnessEvent::TextDelta("hi".into())).unwrap();
+        // No `opened`: the first message is the event, as before.
+        let first = next_message(&mut stream).await;
+        assert!(first.opened.is_none());
+        assert_eq!(event_of(&first), HarnessEvent::TextDelta("hi".into()));
+        // Closing the stream no longer stops the process.
+        drop(commands);
+        drop(stream);
+        wait_for_attached(&registry, 0).await;
+        assert!(
+            spawned.lock().unwrap()[0].1.try_recv().is_err(),
+            "no shutdown"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn a_dropped_stream_detaches_and_a_reattach_gets_the_open_request() {
         let (mut client, registry, spawned, server) = fake_chat_agent().await;
         let dir = tempfile::tempdir().unwrap();

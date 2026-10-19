@@ -24,7 +24,9 @@ use super::{
     HarnessCommand, HarnessEvent, ItemKind, MessageState, RuntimeDecision, RuntimeRequestKind,
     TurnStatus, UserPrompt,
 };
-use crate::agentd::client::{RemoteAgentBackend, RemoteAgentClientConfig};
+use crate::agentd::client::{
+    ClaudeChatFrame, ClaudeChatOpen, ClaudeChatOpened, RemoteAgentBackend, RemoteAgentClientConfig,
+};
 
 /// The tool whose `can_use_tool` request is a question for the user rather
 /// than a permission prompt.
@@ -881,9 +883,12 @@ pub fn resolve_claude_program() -> Result<PathBuf, String> {
         })
 }
 
-/// Handle to a running Claude session. Dropping it shuts the process down.
+/// Handle to a running Claude session. Dropping a local one shuts the
+/// process down; dropping a remote one on an agent that owns its chats
+/// only detaches (send `Shutdown` first to stop it).
 pub struct ClaudeSession {
     commands: mpsc::UnboundedSender<HarnessCommand>,
+    shutdown_on_drop: bool,
 }
 
 impl ClaudeSession {
@@ -913,7 +918,13 @@ impl ClaudeSession {
         if let Err(e) = spawn_result {
             eprintln!("[claude-harness] could not spawn session thread: {e}");
         }
-        (Self { commands: cmd_tx }, ev_rx)
+        (
+            Self {
+                commands: cmd_tx,
+                shutdown_on_drop: true,
+            },
+            ev_rx,
+        )
     }
 
     pub fn send(&self, command: HarnessCommand) -> Result<(), String> {
@@ -925,7 +936,9 @@ impl ClaudeSession {
 
 impl Drop for ClaudeSession {
     fn drop(&mut self) {
-        let _ = self.commands.send(HarnessCommand::Shutdown);
+        if self.shutdown_on_drop {
+            let _ = self.commands.send(HarnessCommand::Shutdown);
+        }
     }
 }
 
@@ -991,14 +1004,47 @@ impl RemoteClaudeChatStart {
 
 impl ClaudeSession {
     /// Start `claude` on a remote machine through its GitTerm agent's
-    /// `ClaudeChat` stream. Same handle as `spawn`: commands go out over the
-    /// stream, events come back on the channel, and dropping the handle
-    /// shuts the remote process down. A failure to connect, a lost
-    /// connection or a stream that ends early arrives as `Error` followed
-    /// by `ProcessExited { code: None }`.
+    /// `ClaudeChat` stream, or attach to the chat already running there
+    /// for `config.resume`. Same handle as `spawn`: commands go out over
+    /// the stream and events come back on the channel.
+    ///
+    /// On an agent that owns its chats ("claude_chat_persistent") the chat
+    /// outlives the connection: a lost connection is retried with backoff
+    /// (capped at 30 s) for as long as the handle lives, resuming after the
+    /// last event seen, and shows as `RemoteDisconnected` then
+    /// `RemoteReconnected` (with `history_gap` when events were missed).
+    /// Dropping the handle detaches and leaves the chat running; send
+    /// `Shutdown` first to stop it.
+    ///
+    /// On an older agent the process lives as long as the stream: dropping
+    /// the handle stops it, and a lost connection arrives as `Error`
+    /// followed by `ProcessExited { code: None }`. Either way, failing to
+    /// reach the agent at all does too.
     pub fn spawn_remote(
         client: RemoteAgentClientConfig,
         config: ClaudeSessionConfig,
+    ) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
+        Self::remote(client, config, None)
+    }
+
+    /// Attach to chat `chat_id`, which `ListClaudeChats` reported running
+    /// on an agent that owns its chats, without replay (the tab reads the
+    /// transcript). Never starts a process: a chat that has stopped since
+    /// arrives as `Error` then `ProcessExited { code: None }`, and the next
+    /// message starts one as usual. `config` is the tab's own, for the
+    /// start that follows such an exit. Otherwise as `spawn_remote`.
+    pub fn attach_remote(
+        client: RemoteAgentClientConfig,
+        config: ClaudeSessionConfig,
+        chat_id: String,
+    ) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
+        Self::remote(client, config, Some(chat_id))
+    }
+
+    fn remote(
+        client: RemoteAgentClientConfig,
+        config: ClaudeSessionConfig,
+        chat_id: Option<String>,
     ) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
@@ -1018,12 +1064,20 @@ impl ClaudeSession {
                         return;
                     }
                 };
-                rt.block_on(run_remote_session(client, config, cmd_rx, ev_tx));
+                rt.block_on(run_remote_session(client, config, chat_id, cmd_rx, ev_tx));
             });
         if let Err(e) = spawn_result {
             remote_log(&format!("could not spawn remote session thread: {e}"));
         }
-        (Self { commands: cmd_tx }, ev_rx)
+        // An older agent stops the process when the stream closes, which
+        // dropping the handle does; a newer one keeps it running.
+        (
+            Self {
+                commands: cmd_tx,
+                shutdown_on_drop: false,
+            },
+            ev_rx,
+        )
     }
 }
 
@@ -1031,16 +1085,23 @@ fn remote_log(msg: &str) {
     eprintln!("[remote-chat] {msg}");
 }
 
-/// Relay one remote chat: commands out as JSON, events back from JSON,
-/// until the agent ends the stream or the connection drops.
+/// First wait before reconnecting a remote chat; doubles per failure.
+const RECONNECT_FIRST_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+/// How long a dropped handle keeps reconnecting to deliver a `Shutdown`
+/// the connection lost.
+const SHUTDOWN_DELIVERY_WINDOW: Duration = Duration::from_secs(15);
+
+/// Relay one remote chat: commands out as JSON, events back from JSON.
+/// Picks the agent's protocol from its handshake. `chat_id`: attach to
+/// that running chat instead of starting (or attaching by resume id).
 async fn run_remote_session(
     client: RemoteAgentClientConfig,
     config: ClaudeSessionConfig,
-    mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
+    chat_id: Option<String>,
+    commands: mpsc::UnboundedReceiver<HarnessCommand>,
     events: mpsc::UnboundedSender<HarnessEvent>,
 ) {
-    use tokio_stream::StreamExt as _;
-
     let remote = format!("{} ({})", client.name, client.endpoint);
     let fail = |msg: String| {
         remote_log(&msg);
@@ -1059,11 +1120,442 @@ async fn run_remote_session(
         "start on {remote}: cwd {} model {:?} mode {} resume {:?}",
         start.cwd, start.model, start.permission_mode, start.resume
     ));
+    let machine = client.name.clone();
+    let backend = RemoteAgentBackend::new(client);
+    let persistent = match backend.handshake().await {
+        Ok(handshake) => handshake
+            .capabilities
+            .iter()
+            .any(|c| c == crate::agentd::server::CLAUDE_CHAT_PERSISTENT_CAPABILITY),
+        Err(e) => return fail(format!("could not reach {remote}: {e}")),
+    };
+    if persistent {
+        RemoteChatLink {
+            backend,
+            machine,
+            remote,
+            start_json,
+            commands,
+            events,
+            chat_id,
+            attached_once: false,
+            last_seq: 0,
+            replay_only: false,
+            open_requests: std::collections::HashSet::new(),
+            queued: VecDeque::new(),
+            handle_dropped: false,
+            shutdown_requested: false,
+            disconnected: false,
+            backoff: RECONNECT_FIRST_DELAY,
+        }
+        .run()
+        .await;
+    } else if let Some(chat_id) = chat_id {
+        fail(format!(
+            "cannot attach to chat {chat_id}: {remote} predates claude_chat_persistent"
+        ));
+    } else {
+        remote_log(&format!(
+            "{remote} predates claude_chat_persistent; the chat lives as long as this connection"
+        ));
+        run_legacy_remote_session(backend, remote, start_json, commands, events).await;
+    }
+}
+
+/// How one attached stream of a persistent remote chat ended.
+enum StreamEnd {
+    /// The chat's process exited; its exit was forwarded.
+    Exited,
+    /// The handle was dropped and the agent closed the stream: detached.
+    Detached,
+    /// The tab stopped listening.
+    UiGone,
+    /// The connection failed; reconnect.
+    Lost(String),
+}
+
+/// A remote chat on an agent that owns its chats: attach, relay, and on a
+/// lost connection reattach after the last seq seen, for as long as the
+/// handle lives.
+struct RemoteChatLink {
+    backend: RemoteAgentBackend,
+    /// The machine's display name, for the reconnect notice.
+    machine: String,
+    /// Name and endpoint, for logs.
+    remote: String,
+    start_json: String,
+    commands: mpsc::UnboundedReceiver<HarnessCommand>,
+    events: mpsc::UnboundedSender<HarnessEvent>,
+    /// The chat: given when attaching to a listed one, otherwise known
+    /// once the agent has answered the first start.
+    chat_id: Option<String>,
+    /// The agent has answered an attach on this link; later opens resume
+    /// after `last_seq`.
+    attached_once: bool,
+    /// The last sequenced event forwarded to the tab.
+    last_seq: u64,
+    /// The current stream resumed without a gap: the tab already has every
+    /// redelivered event except, possibly, a runtime request.
+    replay_only: bool,
+    /// Runtime requests forwarded and not yet resolved, so a redelivered
+    /// one the tab is already showing is not shown twice.
+    open_requests: std::collections::HashSet<String>,
+    /// Commands not yet handed to a stream (sent while connecting).
+    queued: VecDeque<HarnessCommand>,
+    handle_dropped: bool,
+    shutdown_requested: bool,
+    /// A `RemoteDisconnected` notice is showing.
+    disconnected: bool,
+    backoff: Duration,
+}
+
+impl RemoteChatLink {
+    async fn run(mut self) {
+        let mut shutdown_deadline: Option<tokio::time::Instant> = None;
+        loop {
+            if self.handle_dropped {
+                if !self.shutdown_requested {
+                    remote_log(&format!("{}: handle dropped; detached", self.remote));
+                    return;
+                }
+                // The connection may have taken the Shutdown with it;
+                // sending it again is harmless.
+                if !self.queued.contains(&HarnessCommand::Shutdown) {
+                    self.queued.push_back(HarnessCommand::Shutdown);
+                }
+                let deadline = *shutdown_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + SHUTDOWN_DELIVERY_WINDOW);
+                if tokio::time::Instant::now() >= deadline {
+                    remote_log(&format!(
+                        "{}: could not deliver Shutdown within {}s; the chat keeps running there until its idle stop",
+                        self.remote,
+                        SHUTDOWN_DELIVERY_WINDOW.as_secs()
+                    ));
+                    return;
+                }
+            }
+            let open = match &self.chat_id {
+                None => ClaudeChatOpen::Start {
+                    start_json: self.start_json.clone(),
+                },
+                Some(chat_id) => ClaudeChatOpen::Chat {
+                    chat_id: chat_id.clone(),
+                    after_seq: self.attached_once.then_some(self.last_seq),
+                },
+            };
+            let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+            let error = match self.backend.claude_chat_attach(open, out_rx).await {
+                Ok(stream) => match self.relay(stream, out_tx).await {
+                    StreamEnd::Exited | StreamEnd::Detached | StreamEnd::UiGone => return,
+                    StreamEnd::Lost(error) => error,
+                },
+                Err(e) if e.is_not_found() => {
+                    if self.handle_dropped {
+                        remote_log(&format!("{}: the chat has already stopped", self.remote));
+                        return;
+                    }
+                    let msg = format!(
+                        "The chat on {} is no longer running (stopped there, or its agent restarted): {e}",
+                        self.machine
+                    );
+                    remote_log(&msg);
+                    let _ = self.events.send(HarnessEvent::Error(msg));
+                    let _ = self.events.send(HarnessEvent::ProcessExited { code: None });
+                    return;
+                }
+                Err(e) => {
+                    if !self.attached_once {
+                        let msg = format!("could not start Claude on {}: {e}", self.remote);
+                        remote_log(&msg);
+                        let _ = self.events.send(HarnessEvent::Error(msg));
+                        let _ = self.events.send(HarnessEvent::ProcessExited { code: None });
+                        return;
+                    }
+                    e.to_string()
+                }
+            };
+            if self.handle_dropped && !self.shutdown_requested {
+                remote_log(&format!(
+                    "{}: connection lost ({error}) after the handle was dropped; detached",
+                    self.remote
+                ));
+                return;
+            }
+            remote_log(&format!(
+                "{}: connection lost ({error}); retrying in {}s",
+                self.remote,
+                self.backoff.as_secs()
+            ));
+            if !self.disconnected && !self.handle_dropped {
+                self.disconnected = true;
+                if self
+                    .events
+                    .send(HarnessEvent::RemoteDisconnected {
+                        machine: self.machine.clone(),
+                        error,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if !self.wait_to_retry().await {
+                return;
+            }
+            self.backoff = (self.backoff * 2).min(RECONNECT_MAX_DELAY);
+        }
+    }
+
+    /// Sleep out the backoff, queueing commands meanwhile. `false` when
+    /// the handle was dropped with nothing left to deliver.
+    async fn wait_to_retry(&mut self) -> bool {
+        let wake = tokio::time::Instant::now() + self.backoff;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(wake) => return true,
+                cmd = self.commands.recv(), if !self.handle_dropped => match cmd {
+                    Some(cmd) => {
+                        self.shutdown_requested |= cmd == HarnessCommand::Shutdown;
+                        self.queued.push_back(cmd);
+                    }
+                    None => {
+                        self.handle_dropped = true;
+                        if !self.shutdown_requested {
+                            remote_log(&format!(
+                                "{}: handle dropped while reconnecting; detached",
+                                self.remote
+                            ));
+                            return false;
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// Hand one command to the stream. `false` when the stream is closed.
+    fn send_command(
+        &mut self,
+        out_tx: &mpsc::UnboundedSender<String>,
+        cmd: HarnessCommand,
+    ) -> bool {
+        self.shutdown_requested |= cmd == HarnessCommand::Shutdown;
+        match serde_json::to_string(&cmd) {
+            Ok(json) => {
+                if out_tx.send(json).is_err() {
+                    // Kept for the next stream.
+                    self.queued.push_front(cmd);
+                    return false;
+                }
+                true
+            }
+            Err(e) => {
+                let msg = format!("could not encode {cmd:?} for {}: {e}", self.remote);
+                remote_log(&msg);
+                let _ = self.events.send(HarnessEvent::Error(msg));
+                true
+            }
+        }
+    }
+
+    /// Relay one attached stream until it ends.
+    async fn relay(
+        &mut self,
+        mut stream: crate::agentd::client::ClaudeChatFrameStream,
+        out_tx: mpsc::UnboundedSender<String>,
+    ) -> StreamEnd {
+        use tokio_stream::StreamExt as _;
+
+        let mut out_tx = Some(out_tx);
+        let mut opened = false;
+        let mut exited = false;
+        loop {
+            tokio::select! {
+                cmd = self.commands.recv(), if !self.handle_dropped => match cmd {
+                    Some(cmd) => match out_tx.as_ref().filter(|_| opened) {
+                        Some(tx) => {
+                            let tx = tx.clone();
+                            self.send_command(&tx, cmd);
+                        }
+                        None => {
+                            self.shutdown_requested |= cmd == HarnessCommand::Shutdown;
+                            self.queued.push_back(cmd);
+                        }
+                    },
+                    None => {
+                        // Handle dropped: closing our half detaches (after
+                        // anything queued, such as a Shutdown, goes out).
+                        self.handle_dropped = true;
+                        if opened {
+                            out_tx = None;
+                        }
+                    }
+                },
+                item = stream.next() => match item {
+                    Some(Ok(ClaudeChatFrame::Opened(info))) => {
+                        if opened {
+                            remote_log(&format!("{}: a second opened message was ignored", self.remote));
+                            continue;
+                        }
+                        opened = true;
+                        if !self.on_opened(info) {
+                            return StreamEnd::UiGone;
+                        }
+                        if let Some(tx) = out_tx.clone() {
+                            while let Some(cmd) = self.queued.pop_front() {
+                                if !self.send_command(&tx, cmd) {
+                                    break;
+                                }
+                            }
+                        }
+                        if self.handle_dropped {
+                            out_tx = None;
+                        }
+                    }
+                    Some(Ok(ClaudeChatFrame::Event { json, seq, redelivered })) => {
+                        match self.on_event(&json, seq, redelivered) {
+                            Ok(true) => exited = true,
+                            Ok(false) => {}
+                            Err(()) => return StreamEnd::UiGone,
+                        }
+                    }
+                    Some(Err(e)) => {
+                        if exited {
+                            return StreamEnd::Exited;
+                        }
+                        return StreamEnd::Lost(e.to_string());
+                    }
+                    None => {
+                        if exited {
+                            return StreamEnd::Exited;
+                        }
+                        if self.handle_dropped && opened {
+                            remote_log(&format!("{}: detached", self.remote));
+                            return StreamEnd::Detached;
+                        }
+                        return StreamEnd::Lost(format!("{} ended the chat stream", self.remote));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take in the agent's answer to an attach. `false` when the tab
+    /// stopped listening.
+    fn on_opened(&mut self, info: ClaudeChatOpened) -> bool {
+        let first = !self.attached_once;
+        self.attached_once = true;
+        remote_log(&format!(
+            "{}: {} chat {} (session {:?}, head seq {}, gap {})",
+            self.remote,
+            match (first, info.attached) {
+                (true, true) => "attached to running",
+                (true, false) => "started",
+                (false, _) => "reattached to",
+            },
+            info.chat_id,
+            info.claude_session_id,
+            info.head_seq,
+            info.gap
+        ));
+        self.chat_id = Some(info.chat_id);
+        self.backoff = RECONNECT_FIRST_DELAY;
+        // From the head on, unless the agent is replaying what we missed.
+        self.replay_only = !first && !info.gap;
+        if !self.replay_only {
+            self.last_seq = info.head_seq;
+            self.open_requests.clear();
+        }
+        if first {
+            return true;
+        }
+        self.disconnected = false;
+        self.events
+            .send(HarnessEvent::RemoteReconnected {
+                machine: self.machine.clone(),
+                history_gap: info.gap,
+            })
+            .is_ok()
+    }
+
+    /// Forward one event to the tab unless it already has it. `Ok(true)`
+    /// for the chat's exit; `Err` when the tab stopped listening.
+    fn on_event(&mut self, json: &str, seq: u64, redelivered: bool) -> Result<bool, ()> {
+        let ev = match serde_json::from_str::<HarnessEvent>(json) {
+            Ok(ev) => ev,
+            Err(e) => {
+                let msg = format!(
+                    "undecodable event from {}: {e}: {}",
+                    self.remote,
+                    trim_for_log(json, 200)
+                );
+                remote_log(&msg);
+                return self
+                    .events
+                    .send(HarnessEvent::Error(msg))
+                    .map(|_| false)
+                    .map_err(|_| ());
+            }
+        };
+        if redelivered {
+            let showing = match &ev {
+                HarnessEvent::RuntimeRequest { request_id, .. } => {
+                    self.open_requests.contains(request_id)
+                }
+                // Ready, mode, model, effort and the turn start are
+                // already on a tab that missed nothing.
+                _ => self.replay_only,
+            };
+            if showing {
+                return Ok(false);
+            }
+        } else if seq != 0 {
+            if seq <= self.last_seq {
+                return Ok(false);
+            }
+            if seq != self.last_seq + 1 {
+                remote_log(&format!(
+                    "{}: event seq {seq} after {}; events in between were not received",
+                    self.remote, self.last_seq
+                ));
+            }
+            self.last_seq = seq;
+        }
+        let exited = matches!(ev, HarnessEvent::ProcessExited { .. });
+        match &ev {
+            HarnessEvent::RuntimeRequest { request_id, .. } => {
+                self.open_requests.insert(request_id.clone());
+            }
+            HarnessEvent::RuntimeRequestResolved { request_id } => {
+                self.open_requests.remove(request_id);
+            }
+            HarnessEvent::TurnCompleted { .. } | HarnessEvent::ProcessExited { .. } => {
+                self.open_requests.clear();
+            }
+            _ => {}
+        }
+        self.events.send(ev).map(|_| exited).map_err(|_| ())
+    }
+}
+
+/// Relay a remote chat on an agent from before "claude_chat_persistent":
+/// the process lives as long as this stream.
+async fn run_legacy_remote_session(
+    backend: RemoteAgentBackend,
+    remote: String,
+    start_json: String,
+    mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
+    events: mpsc::UnboundedSender<HarnessEvent>,
+) {
+    use tokio_stream::StreamExt as _;
+
+    let fail = |msg: String| {
+        remote_log(&msg);
+        let _ = events.send(HarnessEvent::Error(msg));
+        let _ = events.send(HarnessEvent::ProcessExited { code: None });
+    };
     let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
-    let mut stream = match RemoteAgentBackend::new(client)
-        .claude_chat(start_json, out_rx)
-        .await
-    {
+    let mut stream = match backend.claude_chat(start_json, out_rx).await {
         Ok(stream) => stream,
         Err(e) => return fail(format!("could not start Claude on {remote}: {e}")),
     };
@@ -2492,6 +2984,133 @@ mod tests {
         let config = config_with(vec![mcp_server("gitterm-tasks", "TOKEN", &[])]);
         let err = RemoteClaudeChatStart::from_config(&config).unwrap_err();
         assert!(err.contains("remote machine"), "{err}");
+    }
+
+    fn link() -> (RemoteChatLink, mpsc::UnboundedReceiver<HarnessEvent>) {
+        let (_commands_tx, commands) = mpsc::unbounded_channel();
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let link = RemoteChatLink {
+            backend: RemoteAgentBackend::new(RemoteAgentClientConfig {
+                remote_id: "mini".into(),
+                name: "mini".into(),
+                endpoint: "http://127.0.0.1:1".into(),
+                token_ref: "env:UNUSED".into(),
+            }),
+            machine: "mini".into(),
+            remote: "mini (test)".into(),
+            start_json: "{}".into(),
+            commands,
+            events,
+            chat_id: None,
+            attached_once: false,
+            last_seq: 0,
+            replay_only: false,
+            open_requests: std::collections::HashSet::new(),
+            queued: VecDeque::new(),
+            handle_dropped: false,
+            shutdown_requested: false,
+            disconnected: false,
+            backoff: RECONNECT_FIRST_DELAY,
+        };
+        (link, events_rx)
+    }
+
+    fn opened(head_seq: u64, gap: bool) -> ClaudeChatOpened {
+        ClaudeChatOpened {
+            chat_id: "chat-1".into(),
+            attached: true,
+            claude_session_id: "s1".into(),
+            head_seq,
+            gap,
+        }
+    }
+
+    fn wire(ev: &HarnessEvent) -> String {
+        serde_json::to_string(ev).unwrap()
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<HarnessEvent>) -> Vec<HarnessEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[test]
+    fn a_reattached_link_forwards_each_event_once() {
+        let (mut link, mut rx) = link();
+        let ready = HarnessEvent::Ready {
+            session_id: Some("s1".into()),
+            permission_mode: None,
+            models: Vec::new(),
+        };
+        let request = HarnessEvent::RuntimeRequest {
+            request_id: "r1".into(),
+            tool_use_id: "t1".into(),
+            kind: RuntimeRequestKind::Question {
+                questions: json!([]),
+            },
+        };
+        let delta = |s: &str| HarnessEvent::TextDelta(s.into());
+
+        // First attach to a running chat: its standing state comes through.
+        assert!(link.on_opened(opened(5, false)));
+        assert_eq!(link.on_event(&wire(&ready), 1, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&request), 5, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("a")), 6, false), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("a")), 6, false), Ok(false));
+        assert_eq!(
+            drain(&mut rx),
+            vec![ready.clone(), request.clone(), delta("a")]
+        );
+
+        // Back without a gap: the tab has all of it; only the replay shows.
+        assert!(link.on_opened(opened(7, false)));
+        assert_eq!(link.on_event(&wire(&ready), 1, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&request), 5, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("b")), 7, false), Ok(false));
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                HarnessEvent::RemoteReconnected {
+                    machine: "mini".into(),
+                    history_gap: false
+                },
+                delta("b")
+            ]
+        );
+
+        // Back past the buffer: the tab reloads, so the open prompt is
+        // shown again, and only events after the head follow.
+        assert!(link.on_opened(opened(20, true)));
+        assert_eq!(link.on_event(&wire(&request), 5, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("old")), 15, false), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("c")), 21, false), Ok(false));
+        assert_eq!(
+            link.on_event(
+                &wire(&HarnessEvent::ProcessExited { code: Some(0) }),
+                22,
+                false
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                HarnessEvent::RemoteReconnected {
+                    machine: "mini".into(),
+                    history_gap: true
+                },
+                request,
+                delta("c"),
+                HarnessEvent::ProcessExited { code: Some(0) },
+            ]
+        );
+        // A notice for this stream only (seq 0) always reaches the tab.
+        let notice = HarnessEvent::Error("refused".into());
+        assert_eq!(link.on_event(&wire(&notice), 0, false), Ok(false));
+        assert_eq!(drain(&mut rx), vec![notice]);
     }
 
     fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
