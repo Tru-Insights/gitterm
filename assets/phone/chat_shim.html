@@ -1,0 +1,197 @@
+<script>
+// Phone transport for the chat page (TRU-151). The desktop feeds this page
+// from Rust through wry; on a phone the same entry points
+// (__resetConversation / __replay / __appendEvent) are fed from the
+// agent's socket (a running chat) or its history API (a past one).
+// Stage 1 is view only: the host bridge (window.ipc) opens links and
+// drops every action, and the agent refuses anything a viewing socket
+// sends anyway.
+(function () {
+  'use strict';
+  const TOKEN_KEY = 'gitterm.phone.token';
+  const params = new URLSearchParams(location.search);
+  const chatId = params.get('chat') || '';
+  let sessionId = params.get('session') || '';
+  const title = params.get('title') || '';
+
+  // ---- top bar -------------------------------------------------------------
+  const bar = document.createElement('div');
+  bar.id = 'phone-bar';
+  const back = bar.appendChild(document.createElement('a'));
+  back.href = './';
+  back.textContent = '‹ Chats';
+  const titleEl = bar.appendChild(document.createElement('div'));
+  titleEl.id = 'phone-title';
+  titleEl.textContent = title || 'Chat';
+  const stateEl = bar.appendChild(document.createElement('span'));
+  stateEl.id = 'phone-state';
+  document.body.insertBefore(bar, document.body.firstChild);
+  document.title = title || 'Chat';
+  function state(text, cls) {
+    stateEl.textContent = text;
+    stateEl.className = cls || '';
+  }
+
+  // ---- host bridge ---------------------------------------------------------
+  window.ipc = {
+    postMessage(raw) {
+      let message = null;
+      try { message = JSON.parse(raw); } catch (e) { console.error('phone: bad page message', e); return; }
+      if (message.type === 'open_url' && /^https?:/i.test(message.url || '')) {
+        window.open(message.url, '_blank', 'noopener,noreferrer');
+        return;
+      }
+      if (message.type === 'hostkey') return;
+      console.warn('phone: view only; "' + message.type + '" is not sent');
+    },
+  };
+  window.__setTabId(0, null, null);
+
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (!token) {
+    state('Not paired', 'err');
+    window.__appendEvent({ kind: 'harness', event: { type: 'error', data: 'This phone is not paired. Pair it from GitTerm (machine menu → Pair a phone…).' } });
+    return;
+  }
+
+  function showHistory(events) {
+    window.__resetConversation();
+    window.__replay(Array.isArray(events) ? events : []);
+  }
+  function fail(text) {
+    window.__appendEvent({ kind: 'harness', event: { type: 'error', data: text } });
+  }
+
+  // ---- a conversation that is not running -----------------------------------
+  async function loadHistory() {
+    if (!sessionId) {
+      state('Ended', 'warn');
+      fail('This chat is no longer running and has no saved conversation to show.');
+      return;
+    }
+    state('Loading…');
+    try {
+      const response = await fetch('api/history?session=' + encodeURIComponent(sessionId), {
+        headers: { Authorization: 'Bearer ' + token },
+        cache: 'no-store',
+      });
+      let body = null;
+      try { body = await response.json(); } catch (e) { console.error('history: unreadable response', e); }
+      if (response.status === 401) {
+        localStorage.removeItem(TOKEN_KEY);
+        state('Not paired', 'err');
+        fail('This phone is no longer paired. Pair it again from GitTerm.');
+        return;
+      }
+      if (!response.ok || !body) {
+        state('Error', 'err');
+        fail('Could not load this conversation: ' + ((body && body.error) || response.status));
+        return;
+      }
+      showHistory(body.events);
+      state('History');
+    } catch (e) {
+      console.error('history: request failed', e);
+      state('Offline', 'err');
+      fail('Could not reach the agent: ' + e);
+    }
+  }
+
+  // ---- a running chat ---------------------------------------------------------
+  let socket = null;
+  let lastSeq = null;     // the last seq shown; a reconnect resumes after it
+  let finished = false;   // exited / revoked / unpaired: do not reconnect
+  let retry = 0;
+  let retryTimer = null;
+
+  function connect() {
+    if (finished || socket) return;
+    clearTimeout(retryTimer);
+    const url = new URL('api/ws', location.href);
+    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    state(lastSeq == null ? 'Connecting…' : 'Reconnecting…', 'warn');
+    const ws = new WebSocket(url.toString());
+    socket = ws;
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'hello', token, chat_id: chatId, after_seq: lastSeq }));
+    };
+    ws.onmessage = (e) => {
+      let message = null;
+      try { message = JSON.parse(e.data); } catch (err) { console.error('phone: bad socket message', err); return; }
+      onMessage(message);
+    };
+    ws.onclose = () => {
+      if (socket === ws) socket = null;
+      if (finished) return;
+      const delay = Math.min(15000, 1000 * Math.pow(2, retry));
+      retry += 1;
+      state('Reconnecting…', 'warn');
+      retryTimer = setTimeout(connect, delay);
+    };
+    ws.onerror = (e) => console.warn('phone: socket error', e);
+  }
+
+  function onMessage(message) {
+    switch (message.type) {
+      case 'opened':
+        retry = 0;
+        if (message.claude_session_id) sessionId = message.claude_session_id;
+        state('Live', 'live');
+        return;
+      case 'history':
+        showHistory(message.events);
+        return;
+      case 'event':
+        // On a reconnect, redelivered standing events this page already
+        // shows are skipped; seqs never go backwards.
+        if (lastSeq != null && message.seq <= lastSeq) return;
+        window.__appendEvent(message.event);
+        if (!message.redelivered) lastSeq = message.seq;
+        else if (lastSeq == null) lastSeq = 0;
+        return;
+      case 'refused':
+        fail(message.message || 'The agent refused that.');
+        return;
+      case 'gap':
+        // Fell behind the agent's buffer: reattach; the agent sends the
+        // history again.
+        state('Catching up…', 'warn');
+        return;
+      case 'exited':
+        finished = true;
+        state('Ended', 'warn');
+        return;
+      case 'not_running':
+        finished = true;
+        loadHistory();
+        return;
+      case 'revoked':
+      case 'unauthorized':
+        finished = true;
+        localStorage.removeItem(TOKEN_KEY);
+        state('Not paired', 'err');
+        fail(message.type === 'revoked'
+          ? 'This phone was unpaired in GitTerm.'
+          : 'This phone is not paired (or was revoked). Pair it again from GitTerm.');
+        return;
+      case 'error':
+        state('Error', 'err');
+        fail(message.message || 'The agent closed the connection.');
+        return;
+      default:
+        console.warn('phone: unknown socket message', message.type);
+    }
+  }
+
+  // iOS drops sockets of backgrounded pages; reconnect when shown again.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && chatId && !finished && !socket) {
+      retry = 0;
+      connect();
+    }
+  });
+
+  if (chatId) connect();
+  else loadHistory();
+})();
+</script>

@@ -48,6 +48,12 @@ hyper = { version = "0.14", features = ["client", "http1", "tcp"] }
 # feature would pull aws-lc-sys, which needs cmake/NASM on Windows CI).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-native-certs = "0.8"
+# Phone pairing (TRU-151): random codes/tokens and their SHA-256 digests.
+# Already in the tree through rustls, so it adds no crates.
+ring = "0.17"
+# The desktop's "Pair a phone" panel draws the pairing URL as a QR code.
+# No default features: no image crate, just the module matrix.
+qrcode = { version = "0.14", default-features = false }
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 tokio-tungstenite = "0.21"
 url = "2.5"

@@ -14,9 +14,10 @@ use super::protocol::v5::ListDirRequest;
 use super::protocol::v5::ReadFileRequest;
 use super::protocol::v5::{
     claude_chat_client_message, terminal_input, AttachRequest, ChatEntry, ChatPreviewRequest,
-    ClaudeChatAttach, ClaudeChatClientMessage, ClaudeChatHistoryRequest, ClaudeChatState, EnvVar,
-    ListChatsRequest, ListClaudeChatsRequest, ListSessionsRequest, Resize, StartSessionRequest,
-    StopSessionRequest, TerminalInput,
+    ClaudeChatAttach, ClaudeChatClientMessage, ClaudeChatHistoryRequest, ClaudeChatState,
+    CreatePhonePairingRequest, EnvVar, ListChatsRequest, ListClaudeChatsRequest, ListPhonesRequest,
+    ListSessionsRequest, Resize, RevokePhoneRequest, StartSessionRequest, StopSessionRequest,
+    TerminalInput,
 };
 use super::server::PROTOCOL_VERSION;
 
@@ -90,6 +91,27 @@ pub struct RunningClaudeChat {
     pub created_unix_secs: u64,
     pub last_activity_unix_secs: u64,
     pub attached_clients: u32,
+}
+
+/// A one-time phone pairing from `CreatePhonePairing` (TRU-151).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhonePairing {
+    /// Open on the phone; the code is in its fragment.
+    pub pairing_url: String,
+    pub expires_unix_secs: u64,
+    /// The scope the phone gets ("view" in stage 1).
+    pub scope: String,
+}
+
+/// A phone paired with an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedPhoneInfo {
+    pub id: String,
+    pub name: String,
+    pub scope: String,
+    pub created_unix_secs: u64,
+    /// 0: not used since pairing.
+    pub last_seen_unix_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -760,6 +782,74 @@ impl RemoteAgentBackend {
                 })
             })
             .collect()
+    }
+
+    /// A one-time pairing for a phone named `device_name` (capability
+    /// "phone").
+    pub async fn create_phone_pairing(
+        &self,
+        device_name: String,
+        scope: String,
+    ) -> Result<PhonePairing, RemoteAgentClientError> {
+        let mut request = Request::new(CreatePhonePairingRequest { device_name, scope });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .create_phone_pairing(request)
+            .await
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!(
+                    "create_phone_pairing failed: {}",
+                    err.message()
+                ))
+            })?
+            .into_inner();
+        // The code itself is only ever used inside the URL.
+        Ok(PhonePairing {
+            pairing_url: response.pairing_url,
+            expires_unix_secs: response.expires_unix_secs,
+            scope: response.scope,
+        })
+    }
+
+    /// The phones paired with the agent (capability "phone").
+    pub async fn list_phones(&self) -> Result<Vec<PairedPhoneInfo>, RemoteAgentClientError> {
+        let mut request = Request::new(ListPhonesRequest {});
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .list_phones(request)
+            .await
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!("list_phones failed: {}", err.message()))
+            })?
+            .into_inner();
+        Ok(response
+            .phones
+            .into_iter()
+            .map(|phone| PairedPhoneInfo {
+                id: phone.id,
+                name: phone.name,
+                scope: phone.scope,
+                created_unix_secs: phone.created_unix_secs,
+                last_seen_unix_secs: phone.last_seen_unix_secs,
+            })
+            .collect())
+    }
+
+    /// Revoke a paired phone; `false` when the agent had no phone `id`.
+    pub async fn revoke_phone(&self, id: String) -> Result<bool, RemoteAgentClientError> {
+        let mut request = Request::new(RevokePhoneRequest { id });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .revoke_phone(request)
+            .await
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!("revoke_phone failed: {}", err.message()))
+            })?
+            .into_inner();
+        Ok(response.revoked)
     }
 
     /// A Claude session's timeline from its transcript on the agent's

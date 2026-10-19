@@ -27,6 +27,14 @@ service GitTermAgent {
   // The Claude chats the agent is running (capability
   // "claude_chat_persistent").
   rpc ListClaudeChats(ListClaudeChatsRequest) returns (ListClaudeChatsResponse);
+  // Phone access (TRU-151), capability "phone": the agent serves a small
+  // web app on its phone address. A pairing is a one-time code a phone
+  // redeems there for a device token.
+  rpc CreatePhonePairing(CreatePhonePairingRequest) returns (CreatePhonePairingResponse);
+  rpc ListPhones(ListPhonesRequest) returns (ListPhonesResponse);
+  // Forget a paired phone: its token stops working and its open sockets
+  // close at once.
+  rpc RevokePhone(RevokePhoneRequest) returns (RevokePhoneResponse);
 }
 
 message HandshakeRequest {
@@ -354,4 +362,48 @@ message ClaudeChatHistoryResponse {
   // The transcript's timeline entries as a JSON array. A session with no
   // transcript on the agent's machine is NOT_FOUND instead.
   string timeline_json = 1;
+}
+
+message CreatePhonePairingRequest {
+  // Shown in the paired-phones list ("Tracey's iPhone").
+  string device_name = 1;
+  // "view" or "act" (empty: "view"). The agent may grant less than asked;
+  // the response says what the phone will get.
+  string scope = 2;
+}
+
+message CreatePhonePairingResponse {
+  // Single use; expires at expires_unix_secs.
+  string code = 1;
+  // http://<phone host:port>/pair#<code>: the code rides in the fragment,
+  // which browsers never send to a server or proxy.
+  string pairing_url = 2;
+  uint64 expires_unix_secs = 3;
+  // The scope the phone is granted when it pairs.
+  string scope = 4;
+}
+
+message ListPhonesRequest {}
+
+message PairedPhone {
+  string id = 1;
+  string name = 2;
+  // "view" | "act"
+  string scope = 3;
+  uint64 created_unix_secs = 4;
+  // 0: never used since pairing.
+  uint64 last_seen_unix_secs = 5;
+}
+
+message ListPhonesResponse {
+  repeated PairedPhone phones = 1;
+}
+
+message RevokePhoneRequest {
+  string id = 1;
+}
+
+message RevokePhoneResponse {
+  // False when no phone had the id.
+  bool revoked = 1;
 }

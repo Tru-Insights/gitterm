@@ -10,17 +10,20 @@ use tonic::{Request, Response, Status};
 use super::claude_chats::{
     ChatActivity, ChatAttachment, ChatInfo, ChatLimits, ClaudeChatRegistry, Gap, SeqEvent,
 };
+use super::phone_http::{PhoneServerConfig, PhoneState};
+use super::phones::{PhoneRegistry, PhoneScope};
 use super::protocol::v5::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
 use super::protocol::v5::{
     claude_chat_client_message, terminal_input, terminal_output, ChatEntry, ChatPreviewMessage,
     ChatPreviewRequest, ChatPreviewResponse, ClaudeChatClientMessage, ClaudeChatHistoryRequest,
     ClaudeChatHistoryResponse, ClaudeChatInfo, ClaudeChatOpened, ClaudeChatServerMessage,
-    ClaudeChatState, DirEntry, GitDiffRequest, GitDiffResponse, GitStatusRequest,
-    GitStatusResponse, HandshakeRequest, HandshakeResponse, ListChatsRequest, ListChatsResponse,
-    ListClaudeChatsRequest, ListClaudeChatsResponse, ListDirRequest, ListDirResponse,
-    ListSessionsRequest, ListSessionsResponse, ReadFileChunk, ReadFileRequest, Session,
-    SessionExited, StartSessionRequest, StopSessionRequest, StopSessionResponse, TerminalInput,
-    TerminalOutput,
+    ClaudeChatState, CreatePhonePairingRequest, CreatePhonePairingResponse, DirEntry,
+    GitDiffRequest, GitDiffResponse, GitStatusRequest, GitStatusResponse, HandshakeRequest,
+    HandshakeResponse, ListChatsRequest, ListChatsResponse, ListClaudeChatsRequest,
+    ListClaudeChatsResponse, ListDirRequest, ListDirResponse, ListPhonesRequest,
+    ListPhonesResponse, ListSessionsRequest, ListSessionsResponse, PairedPhone, ReadFileChunk,
+    ReadFileRequest, RevokePhoneRequest, RevokePhoneResponse, Session, SessionExited,
+    StartSessionRequest, StopSessionRequest, StopSessionResponse, TerminalInput, TerminalOutput,
 };
 use super::sessions::{SessionManager, SessionOutput};
 use crate::harness::claude::{ClaudeSessionConfig, RemoteClaudeChatStart};
@@ -31,6 +34,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Handshake capability of an agent that owns its Claude chats (TRU-152):
 /// streams attach and detach, events carry a seq, `ListClaudeChats`.
 pub const CLAUDE_CHAT_PERSISTENT_CAPABILITY: &str = "claude_chat_persistent";
+
+/// Handshake capability of an agent serving the phone web app (TRU-151):
+/// `CreatePhonePairing`, `ListPhones`, `RevokePhone`.
+pub const PHONE_CAPABILITY: &str = "phone";
 
 /// Hard ceiling for one ReadFile stream; requests may ask for less.
 const READ_FILE_DEFAULT_MAX_BYTES: u64 = 2_000_000;
@@ -51,6 +58,17 @@ pub struct AgentServerConfig {
     pub agent_name: String,
     /// Replay buffer bounds and idle timeout of agent-owned Claude chats.
     pub claude_chat_limits: ChatLimits,
+    /// The phone web app (TRU-151); `None` leaves it off.
+    pub phone: Option<PhoneServerConfig>,
+}
+
+/// The phone web app as the gRPC service sees it: its paired phones and
+/// the base URL pairing links point at.
+#[derive(Clone)]
+pub struct PhoneAccess {
+    pub phones: Arc<PhoneRegistry>,
+    /// `http://host:port`, no trailing slash.
+    pub base_url: String,
 }
 
 #[derive(Clone)]
@@ -58,6 +76,7 @@ pub struct GitTermAgentService {
     agent_name: String,
     sessions: Arc<SessionManager>,
     claude_chats: Arc<ClaudeChatRegistry>,
+    phone: Option<PhoneAccess>,
 }
 
 impl GitTermAgentService {
@@ -70,7 +89,27 @@ impl GitTermAgentService {
             agent_name,
             sessions: Arc::new(SessionManager::default()),
             claude_chats: ClaudeChatRegistry::new(limits),
+            phone: None,
         }
+    }
+
+    /// The agent's running Claude chats, shared with the phone server.
+    pub fn claude_chats(&self) -> Arc<ClaudeChatRegistry> {
+        self.claude_chats.clone()
+    }
+
+    /// Serve the phone RPCs for this phone web app (and advertise
+    /// `PHONE_CAPABILITY`).
+    pub fn with_phone_access(mut self, phone: PhoneAccess) -> Self {
+        self.phone = Some(phone);
+        self
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn phone_access(&self) -> Result<&PhoneAccess, Status> {
+        self.phone.as_ref().ok_or_else(|| {
+            Status::failed_precondition("phone access is off on this agent (--phone-addr off)")
+        })
     }
 }
 
@@ -98,21 +137,25 @@ impl GitTermAgent for GitTermAgentService {
             }
         };
 
+        let mut capabilities = vec![
+            "handshake".to_string(),
+            "list_dir".to_string(),
+            "read_file".to_string(),
+            "git_status".to_string(),
+            "git_diff".to_string(),
+            "sessions".to_string(),
+            "chats".to_string(),
+            "claude_chat".to_string(),
+            CLAUDE_CHAT_PERSISTENT_CAPABILITY.to_string(),
+        ];
+        if self.phone.is_some() {
+            capabilities.push(PHONE_CAPABILITY.to_string());
+        }
         Ok(Response::new(HandshakeResponse {
             agent_name: self.agent_name.clone(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
-            capabilities: vec![
-                "handshake".to_string(),
-                "list_dir".to_string(),
-                "read_file".to_string(),
-                "git_status".to_string(),
-                "git_diff".to_string(),
-                "sessions".to_string(),
-                "chats".to_string(),
-                "claude_chat".to_string(),
-                CLAUDE_CHAT_PERSISTENT_CAPABILITY.to_string(),
-            ],
+            capabilities,
             home_dir,
         }))
     }
@@ -542,6 +585,81 @@ impl GitTermAgent for GitTermAgentService {
             .map(proto_claude_chat)
             .collect();
         Ok(Response::new(ListClaudeChatsResponse { chats }))
+    }
+
+    async fn create_phone_pairing(
+        &self,
+        request: Request<CreatePhonePairingRequest>,
+    ) -> Result<Response<CreatePhonePairingResponse>, Status> {
+        let phone = self.phone_access()?;
+        let request = request.into_inner();
+        let requested = PhoneScope::parse(&request.scope).map_err(Status::invalid_argument)?;
+        let pairing = phone
+            .phones
+            .create_pairing(&request.device_name, requested)
+            .map_err(|err| {
+                eprintln!("[phone] could not create a pairing: {err}");
+                Status::invalid_argument(err)
+            })?;
+        let expires_unix_secs = pairing
+            .expires
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        eprintln!(
+            "[phone] created a pairing for {:?} ({} scope{}), expiring at {expires_unix_secs}",
+            request.device_name.trim(),
+            pairing.scope.label(),
+            if pairing.scope != requested {
+                format!(", {} was asked", requested.label())
+            } else {
+                String::new()
+            }
+        );
+        Ok(Response::new(CreatePhonePairingResponse {
+            pairing_url: format!("{}/pair#{}", phone.base_url, pairing.code),
+            code: pairing.code,
+            expires_unix_secs,
+            scope: pairing.scope.label().to_string(),
+        }))
+    }
+
+    async fn list_phones(
+        &self,
+        _request: Request<ListPhonesRequest>,
+    ) -> Result<Response<ListPhonesResponse>, Status> {
+        let phone = self.phone_access()?;
+        let phones = phone
+            .phones
+            .list()
+            .into_iter()
+            .map(|phone| PairedPhone {
+                id: phone.id,
+                name: phone.name,
+                scope: phone.scope.label().to_string(),
+                created_unix_secs: phone.created_unix_secs,
+                last_seen_unix_secs: phone.last_seen_unix_secs,
+            })
+            .collect();
+        Ok(Response::new(ListPhonesResponse { phones }))
+    }
+
+    async fn revoke_phone(
+        &self,
+        request: Request<RevokePhoneRequest>,
+    ) -> Result<Response<RevokePhoneResponse>, Status> {
+        let phone = self.phone_access()?;
+        let id = request.into_inner().id;
+        let revoked = phone.phones.revoke(&id).map_err(|err| {
+            eprintln!("[phone] revoking phone {id}: {err}");
+            Status::internal(err)
+        })?;
+        if revoked {
+            eprintln!("[phone] revoked phone {id}");
+        } else {
+            eprintln!("[phone] revoke: no paired phone {id}");
+        }
+        Ok(Response::new(RevokePhoneResponse { revoked }))
     }
 
     #[allow(clippy::result_large_err)]
@@ -1063,8 +1181,21 @@ pub async fn serve(config: AgentServerConfig) -> Result<(), Box<dyn Error + Send
     }
 
     let expected_token = Arc::new(config.auth_token.clone());
-    let service =
-        GitTermAgentService::with_claude_chat_limits(config.agent_name, config.claude_chat_limits);
+    let mut service = GitTermAgentService::with_claude_chat_limits(
+        config.agent_name.clone(),
+        config.claude_chat_limits,
+    );
+    if let Some(phone_config) = &config.phone {
+        match start_phone_server(phone_config, &config.agent_name, service.claude_chats()) {
+            Ok(access) => service = service.with_phone_access(access),
+            Err(err) if phone_config.required => {
+                return Err(format!("phone access: {err}").into());
+            }
+            Err(err) => eprintln!(
+                "[phone] {err}; phone access is off (pass --phone-addr HOST:PORT to choose another address)"
+            ),
+        }
+    }
     let claude_chats = service.claude_chats.clone();
     let reaper = tokio::spawn(async move {
         let mut tick = tokio::time::interval(CLAUDE_CHAT_REAP_INTERVAL);
@@ -1092,6 +1223,31 @@ pub async fn serve(config: AgentServerConfig) -> Result<(), Box<dyn Error + Send
     served?;
 
     Ok(())
+}
+
+/// Load the paired phones and start the phone web app.
+fn start_phone_server(
+    config: &PhoneServerConfig,
+    agent_name: &str,
+    claude_chats: Arc<ClaudeChatRegistry>,
+) -> Result<PhoneAccess, String> {
+    let phones = PhoneRegistry::load(&config.store_dir)?;
+    let state = PhoneState::new(agent_name.to_string(), phones.clone(), claude_chats)?;
+    let addr = super::phone_http::spawn(state, config.bind_addr)?;
+    if addr.ip().is_unspecified() {
+        eprintln!(
+            "[phone] listening on {addr}, a wildcard address: pairing links will name it as is; bind a specific address for links a phone can open"
+        );
+    }
+    eprintln!(
+        "[phone] serving the phone app on http://{addr} ({} paired phone(s), {})",
+        phones.list().len(),
+        phones.path().display()
+    );
+    Ok(PhoneAccess {
+        phones,
+        base_url: format!("http://{addr}"),
+    })
 }
 
 pub fn is_authorized_metadata(metadata: &MetadataMap, expected_token: &str) -> bool {
@@ -1545,6 +1701,7 @@ mod tests {
             agent_name: "test-agent".to_string(),
             sessions: Arc::new(SessionManager::default()),
             claude_chats: registry.clone(),
+            phone: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1844,6 +2001,107 @@ mod tests {
             .capabilities
             .contains(&"claude_chat_persistent".to_string()));
         assert_eq!(response.protocol_version, 1);
+    }
+
+    async fn capabilities_of(service: &GitTermAgentService) -> Vec<String> {
+        service
+            .handshake(Request::new(HandshakeRequest {
+                client_name: "test-client".to_string(),
+                client_version: "0.0.0".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .capabilities
+    }
+
+    #[tokio::test]
+    async fn phone_rpcs_are_off_without_the_phone_app() {
+        let service = GitTermAgentService::new("test-agent".to_string());
+        assert!(!capabilities_of(&service)
+            .await
+            .contains(&PHONE_CAPABILITY.to_string()));
+        let status = service
+            .create_phone_pairing(Request::new(CreatePhonePairingRequest {
+                device_name: "phone".into(),
+                scope: "view".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        let status = service
+            .list_phones(Request::new(ListPhonesRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn phone_rpcs_pair_list_and_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let phones = PhoneRegistry::load(dir.path()).unwrap();
+        let service =
+            GitTermAgentService::new("test-agent".to_string()).with_phone_access(PhoneAccess {
+                phones: phones.clone(),
+                base_url: "http://100.64.0.1:7778".into(),
+            });
+        assert!(capabilities_of(&service)
+            .await
+            .contains(&PHONE_CAPABILITY.to_string()));
+
+        let status = service
+            .create_phone_pairing(Request::new(CreatePhonePairingRequest {
+                device_name: "phone".into(),
+                scope: "admin".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+        // Asking for act still pairs a viewer in stage 1.
+        let pairing = service
+            .create_phone_pairing(Request::new(CreatePhonePairingRequest {
+                device_name: "Tracey's iPhone".into(),
+                scope: "act".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(pairing.scope, "view");
+        assert_eq!(
+            pairing.pairing_url,
+            format!("http://100.64.0.1:7778/pair#{}", pairing.code)
+        );
+        let paired = phones.redeem(&pairing.code).unwrap();
+
+        let listed = service
+            .list_phones(Request::new(ListPhonesRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .phones;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Tracey's iPhone");
+        assert_eq!(listed[0].scope, "view");
+
+        let revoked = service
+            .revoke_phone(Request::new(RevokePhoneRequest {
+                id: listed[0].id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(revoked.revoked);
+        assert!(phones.authenticate(&paired.token).is_none());
+        let again = service
+            .revoke_phone(Request::new(RevokePhoneRequest {
+                id: listed[0].id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!again.revoked);
     }
 
     #[tokio::test]

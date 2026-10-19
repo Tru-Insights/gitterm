@@ -42,14 +42,15 @@ mod tab;
 mod theme;
 
 use gitterm::agentd::client::{
-    RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake, RunningClaudeChat,
-    RunningClaudeChatState,
+    PairedPhoneInfo, PhonePairing, RemoteAgentBackend, RemoteAgentClientConfig,
+    RemoteAgentHandshake, RunningClaudeChat, RunningClaudeChatState,
 };
 use gitterm::browser_control::{
     BrowserCaptureMode, BrowserControlService, BrowserEvidence, BrowserLaunchOptions, BrowserState,
     BrowserStatus, BrowserTelemetrySnapshot,
 };
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
+use gitterm::chat_page::agent_chat_html;
 use gitterm::chats;
 use gitterm::gh_identity::GH_ACCOUNT_ENV_KEY;
 use gitterm::harness::{
@@ -345,26 +346,6 @@ fn browser_telemetry_stream(
         }
     })
     .boxed()
-}
-
-/// Embedded HTML scaffold for the agent chat surface (Step 4 of TRU-29).
-const AGENT_CHAT_HTML: &str = include_str!("../assets/agent_chat.html");
-/// Vendored renderers inlined into the chat page (no network at runtime).
-/// Licenses sit next to them in `assets/vendor/`.
-const AGENT_CHAT_VENDOR_JS: [&str; 2] = [
-    include_str!("../assets/vendor/marked.min.js"),
-    include_str!("../assets/vendor/highlight.min.js"),
-];
-const AGENT_CHAT_VENDOR_SLOT: &str = "/*__VENDOR_JS__*/";
-
-/// The chat page with the vendored scripts inlined into its slot.
-fn agent_chat_html() -> String {
-    debug_assert!(AGENT_CHAT_HTML.contains(AGENT_CHAT_VENDOR_SLOT));
-    AGENT_CHAT_HTML.replacen(
-        AGENT_CHAT_VENDOR_SLOT,
-        &AGENT_CHAT_VENDOR_JS.join("\n;\n"),
-        1,
-    )
 }
 
 /// Push one `AgentEvent` into tab `tab_id`'s chat page via
@@ -5426,6 +5407,18 @@ pub enum Event {
     RemoteConnectEndpointChanged(String),
     RemoteConnectTokenChanged(String),
     RemoteConnectSubmit,
+    /// "Pair a phone…" (TRU-151): open the panel for a remote agent.
+    PhonePanelOpen(String),
+    PhonePanelClose,
+    PhoneDeviceNameChanged(String),
+    PhonePairingCreate,
+    /// remote id, the new pairing or why not.
+    PhonePairingCreated(String, Result<PhonePairing, String>),
+    /// remote id, its paired phones or why not.
+    PhonesLoaded(String, Result<Vec<PairedPhoneInfo>, String>),
+    /// Revoke a paired phone by id.
+    PhoneRevoke(String),
+    PhoneRevoked(String, Result<bool, String>),
     RemoteWorkspaceOpen(String),
     WorkspaceSettingsOpen(usize),
     WorkspaceSettingsClose,
@@ -5905,6 +5898,8 @@ struct App {
     folder_picker_last_dirs: HashMap<Option<String>, String>,
     // "Connect remote host" form (in-app editor for remote-agents.json)
     remote_connect_form: Option<RemoteConnectForm>,
+    /// "Pair a phone" panel for one remote agent (TRU-151).
+    phone_panel: Option<PhonePanel>,
     // Configured agent presets
     agent_presets: Vec<AgentPreset>,
     // Quick commands (app-level, run in bottom terminal)
@@ -6658,6 +6653,69 @@ struct RemoteConnectForm {
     token: String,
     error: Option<String>,
     saved_remote_id: Option<String>,
+}
+
+/// The "Pair a phone" panel (TRU-151) for one remote agent: a pairing QR
+/// code and the phones already paired, with Revoke.
+#[derive(Debug, Clone)]
+struct PhonePanel {
+    remote_id: String,
+    machine_name: String,
+    /// Shown in the paired-phones list.
+    device_name: String,
+    pairing: Option<PhonePairingView>,
+    /// `None` while loading.
+    phones: Option<Vec<PairedPhoneInfo>>,
+    /// A pairing or revoke is in flight.
+    busy: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PhonePairingView {
+    url: String,
+    expires_unix_secs: u64,
+    qr: iced::widget::image::Handle,
+}
+
+/// Pixels per QR module in the pairing panel, and the quiet zone around
+/// the code (modules) that scanners need.
+const PHONE_QR_SCALE: usize = 6;
+const PHONE_QR_QUIET: usize = 4;
+
+/// The pairing URL as a QR image (black on white, quiet zone included).
+fn phone_pairing_qr(url: &str) -> Result<iced::widget::image::Handle, String> {
+    let code = qrcode::QrCode::new(url.as_bytes())
+        .map_err(|err| format!("could not draw the pairing QR code: {err}"))?;
+    let modules = code.width();
+    let side = (modules + 2 * PHONE_QR_QUIET) * PHONE_QR_SCALE;
+    let mut pixels = vec![255u8; side * side * 4];
+    for (index, color) in code.to_colors().iter().enumerate() {
+        if *color != qrcode::Color::Dark {
+            continue;
+        }
+        let (mx, my) = (index % modules, index / modules);
+        for dy in 0..PHONE_QR_SCALE {
+            let y = (my + PHONE_QR_QUIET) * PHONE_QR_SCALE + dy;
+            for dx in 0..PHONE_QR_SCALE {
+                let x = (mx + PHONE_QR_QUIET) * PHONE_QR_SCALE + dx;
+                let at = (y * side + x) * 4;
+                pixels[at..at + 3].fill(0);
+            }
+        }
+    }
+    Ok(iced::widget::image::Handle::from_rgba(
+        side as u32,
+        side as u32,
+        pixels,
+    ))
+}
+
+/// A Unix time as local "HH:MM".
+fn local_clock_time(unix_secs: u64) -> String {
+    chrono::DateTime::from_timestamp(unix_secs as i64, 0)
+        .map(|at| at.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_else(|| unix_secs.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -7886,6 +7944,57 @@ impl App {
             Some(RemoteAgentConnectionStatus::Connected(handshake))
                 if handshake.capabilities.iter().any(|c| c == CLAUDE_CHAT_CAPABILITY)
         )
+    }
+
+    /// Whether a remote's agent serves the phone web app (TRU-151).
+    fn remote_serves_phones(&self, remote_id: &str) -> bool {
+        matches!(
+            self.remote_agent_connections.get(remote_id).map(|connection| &connection.status),
+            Some(RemoteAgentConnectionStatus::Connected(handshake))
+                if handshake.capabilities.iter().any(|c| c == gitterm::agentd::server::PHONE_CAPABILITY)
+        )
+    }
+
+    /// Load the phone panel's paired phones from its agent.
+    fn load_paired_phones(&mut self) -> Task<Event> {
+        let Some(panel) = self.phone_panel.as_ref() else {
+            return Task::none();
+        };
+        let remote_id = panel.remote_id.clone();
+        let client = match self.remote_chat_client(&remote_id) {
+            Ok(client) => client,
+            Err(error) => {
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.error = Some(error);
+                    panel.phones = Some(Vec::new());
+                }
+                return Task::none();
+            }
+        };
+        Task::perform(
+            async move {
+                let result = RemoteAgentBackend::new(client)
+                    .list_phones()
+                    .await
+                    .map_err(|err| err.to_string());
+                (remote_id, result)
+            },
+            |(remote_id, result)| Event::PhonesLoaded(remote_id, result),
+        )
+    }
+
+    /// The phone panel's agent client, or the panel shows why there is none.
+    fn phone_panel_client(&mut self) -> Option<(String, RemoteAgentClientConfig)> {
+        let remote_id = self.phone_panel.as_ref()?.remote_id.clone();
+        match self.remote_chat_client(&remote_id) {
+            Ok(client) => Some((remote_id, client)),
+            Err(error) => {
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.error = Some(error);
+                }
+                None
+            }
+        }
     }
 
     /// Whether a remote's agent owns its Claude chats (TRU-152): they
@@ -12846,6 +12955,7 @@ impl App {
             folder_picker: None,
             folder_picker_last_dirs: HashMap::new(),
             remote_connect_form: None,
+            phone_panel: None,
             agent_presets: config.agent_presets.clone(),
             quick_commands: config.quick_commands.clone(),
             quick_commands_visible: false,
@@ -18396,6 +18506,14 @@ fi
                     return Task::none();
                 }
 
+                // Phone panel: Escape closes
+                if self.phone_panel.is_some()
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    self.phone_panel = None;
+                    return Task::none();
+                }
+
                 // Remote connect form: Escape closes
                 if self.remote_connect_form.is_some()
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
@@ -21735,6 +21853,146 @@ fi
             Event::RemoteConnectSubmit => {
                 return self.submit_remote_connect_form();
             }
+            Event::PhonePanelOpen(remote_id) => {
+                self.machine_menu = None;
+                let machine_name = self
+                    .remote_agent_config_by_id(&remote_id)
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_else(|| remote_id.clone());
+                self.phone_panel = Some(PhonePanel {
+                    remote_id,
+                    machine_name,
+                    device_name: "iPhone".to_string(),
+                    pairing: None,
+                    phones: None,
+                    busy: false,
+                    error: None,
+                });
+                return self.load_paired_phones();
+            }
+            Event::PhonePanelClose => {
+                self.phone_panel = None;
+            }
+            Event::PhoneDeviceNameChanged(value) => {
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.device_name = value;
+                }
+            }
+            Event::PhonePairingCreate => {
+                let Some(panel) = self.phone_panel.as_mut() else {
+                    return Task::none();
+                };
+                if panel.busy {
+                    return Task::none();
+                }
+                let device_name = panel.device_name.trim().to_string();
+                if device_name.is_empty() {
+                    panel.error = Some("Name the phone first.".to_string());
+                    return Task::none();
+                }
+                let Some((remote_id, client)) = self.phone_panel_client() else {
+                    return Task::none();
+                };
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.busy = true;
+                    panel.error = None;
+                }
+                return Task::perform(
+                    async move {
+                        let result = RemoteAgentBackend::new(client)
+                            .create_phone_pairing(device_name, "view".to_string())
+                            .await
+                            .map_err(|err| err.to_string());
+                        (remote_id, result)
+                    },
+                    |(remote_id, result)| Event::PhonePairingCreated(remote_id, result),
+                );
+            }
+            Event::PhonePairingCreated(remote_id, result) => {
+                let Some(panel) = self
+                    .phone_panel
+                    .as_mut()
+                    .filter(|panel| panel.remote_id == remote_id)
+                else {
+                    return Task::none();
+                };
+                panel.busy = false;
+                let view = result.and_then(|pairing| {
+                    phone_pairing_qr(&pairing.pairing_url).map(|qr| PhonePairingView {
+                        url: pairing.pairing_url,
+                        expires_unix_secs: pairing.expires_unix_secs,
+                        qr,
+                    })
+                });
+                match view {
+                    Ok(view) => {
+                        panel.pairing = Some(view);
+                        panel.error = None;
+                    }
+                    Err(error) => {
+                        eprintln!("[phone] pairing on {remote_id} failed: {error}");
+                        panel.error = Some(format!("Could not create a pairing: {error}"));
+                    }
+                }
+            }
+            Event::PhonesLoaded(remote_id, result) => {
+                let Some(panel) = self
+                    .phone_panel
+                    .as_mut()
+                    .filter(|panel| panel.remote_id == remote_id)
+                else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(phones) => panel.phones = Some(phones),
+                    Err(error) => {
+                        eprintln!("[phone] listing phones on {remote_id} failed: {error}");
+                        panel.phones = Some(Vec::new());
+                        panel.error = Some(format!("Could not list paired phones: {error}"));
+                    }
+                }
+            }
+            Event::PhoneRevoke(id) => {
+                let Some((remote_id, client)) = self.phone_panel_client() else {
+                    return Task::none();
+                };
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.busy = true;
+                    panel.error = None;
+                }
+                return Task::perform(
+                    async move {
+                        let result = RemoteAgentBackend::new(client)
+                            .revoke_phone(id)
+                            .await
+                            .map_err(|err| err.to_string());
+                        (remote_id, result)
+                    },
+                    |(remote_id, result)| Event::PhoneRevoked(remote_id, result),
+                );
+            }
+            Event::PhoneRevoked(remote_id, result) => {
+                let Some(panel) = self
+                    .phone_panel
+                    .as_mut()
+                    .filter(|panel| panel.remote_id == remote_id)
+                else {
+                    return Task::none();
+                };
+                panel.busy = false;
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        panel.error =
+                            Some("That phone was no longer paired with the agent.".to_string());
+                    }
+                    Err(error) => {
+                        eprintln!("[phone] revoking a phone on {remote_id} failed: {error}");
+                        panel.error = Some(format!("Could not revoke: {error}"));
+                    }
+                }
+                return self.load_paired_phones();
+            }
             Event::RemoteWorkspaceBrowse(remote_id) => {
                 return self.open_folder_picker(FolderPickerPurpose::NewWorkspace, Some(remote_id));
             }
@@ -23182,6 +23440,13 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        } else if self.phone_panel.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_phone_panel())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else if self.remote_connect_form.is_some() {
             Stack::new()
                 .push(main_view)
@@ -23204,6 +23469,205 @@ fi
     /// "Connect Remote Host" form: writes an entry into remote-agents.json
     /// (token stored under ~/.config/gitterm-v5/tokens/) and shows live
     /// handshake feedback after Connect.
+    /// "Pair a phone" (TRU-151): the pairing QR code and URL, and the
+    /// phones already paired with this agent, each with Revoke.
+    fn view_phone_panel(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let bg_surface = theme.bg_surface();
+        let bg_base = theme.bg_base();
+        let border_color = theme.border();
+        let bg_crust = theme.bg_crust();
+        let hover_bg = theme.surface0();
+        let accent = theme.accent();
+        let danger = theme.danger();
+        let mono = iced::Font::with_name("Menlo");
+
+        let Some(panel) = &self.phone_panel else {
+            return container(iced::widget::Space::new()).into();
+        };
+
+        let outline_button = move |label: &str, color: iced::Color, event: Option<Event>| {
+            button(text(label.to_string()).size(12).color(color).font(mono))
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if matches!(status, button::Status::Hovered) {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    border: iced::Border {
+                        color,
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([4, 12])
+                .on_press_maybe(event)
+        };
+
+        let name_input = text_input("iPhone", &panel.device_name)
+            .on_input(Event::PhoneDeviceNameChanged)
+            .on_submit(Event::PhonePairingCreate)
+            .size(12)
+            .padding([6, 8])
+            .font(mono)
+            .style(
+                move |_theme: &Theme, _status: text_input::Status| text_input::Style {
+                    background: bg_base.into(),
+                    border: iced::Border {
+                        width: 1.0,
+                        color: border_color,
+                        radius: 3.0.into(),
+                    },
+                    icon: iced::Color::TRANSPARENT,
+                    placeholder: text_muted,
+                    value: text_primary,
+                    selection: accent,
+                },
+            );
+        let create_label = if panel.pairing.is_some() {
+            "New code"
+        } else {
+            "Show pairing code"
+        };
+        let name_row = row![
+            column![
+                text("Phone name").size(11).color(text_secondary),
+                name_input
+            ]
+            .spacing(4)
+            .width(Length::Fill),
+            outline_button(
+                create_label,
+                accent,
+                (!panel.busy).then_some(Event::PhonePairingCreate),
+            ),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::End);
+
+        let mut content = column![
+            text(format!("Pair a phone with {}", panel.machine_name))
+                .size(14)
+                .color(text_primary),
+            text(
+                "Scan the code with the phone's camera; the phone must be on the \
+                 same tailnet. It can view this machine's chats, not send to them.",
+            )
+            .size(11)
+            .color(text_muted),
+            name_row,
+        ]
+        .spacing(10)
+        .padding([24, 28]);
+
+        if let Some(pairing) = &panel.pairing {
+            let qr = iced::widget::image(pairing.qr.clone())
+                .filter_method(iced::widget::image::FilterMethod::Nearest)
+                .width(Length::Fixed(240.0))
+                .height(Length::Fixed(240.0));
+            content = content.push(
+                column![
+                    container(qr).center_x(Length::Fill),
+                    text(pairing.url.clone())
+                        .size(11)
+                        .font(mono)
+                        .color(text_secondary),
+                    text(format!(
+                        "Works once · expires at {}",
+                        local_clock_time(pairing.expires_unix_secs)
+                    ))
+                    .size(10)
+                    .color(text_muted),
+                ]
+                .spacing(6),
+            );
+        }
+
+        if let Some(error) = &panel.error {
+            content = content.push(text(error.clone()).size(11).color(danger));
+        }
+
+        content = content.push(text("Paired phones").size(12).color(text_secondary));
+        match &panel.phones {
+            None => content = content.push(text("Loading…").size(11).color(text_muted)),
+            Some(phones) if phones.is_empty() => {
+                content = content.push(text("None yet.").size(11).color(text_muted));
+            }
+            Some(phones) => {
+                for phone in phones {
+                    let seen = if phone.last_seen_unix_secs == 0 {
+                        "never used".to_string()
+                    } else {
+                        format!(
+                            "seen {} ago",
+                            chats::format_age(
+                                std::time::UNIX_EPOCH
+                                    + Duration::from_secs(phone.last_seen_unix_secs)
+                            )
+                        )
+                    };
+                    content = content.push(
+                        row![
+                            column![
+                                text(phone.name.clone()).size(12).color(text_primary),
+                                text(format!("{} · {seen}", phone.scope))
+                                    .size(10)
+                                    .color(text_muted),
+                            ]
+                            .spacing(2)
+                            .width(Length::Fill),
+                            outline_button(
+                                "Revoke",
+                                danger,
+                                (!panel.busy).then(|| Event::PhoneRevoke(phone.id.clone())),
+                            ),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    );
+                }
+            }
+        }
+
+        content = content.push(row![
+            iced::widget::Space::new().width(Length::Fill),
+            outline_button("Close", text_secondary, Some(Event::PhonePanelClose)),
+        ]);
+
+        let card = container(iced::widget::scrollable(content))
+            .max_width(460)
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+
+        let backdrop_color = iced::Color { a: 0.8, ..bg_crust };
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop_color.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
     fn view_remote_connect_form(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let text_primary = theme.text_primary();
@@ -24776,6 +25240,14 @@ fi
                 "Reconnect…".to_string(),
                 Event::MachineReconnect(key.clone()),
             ));
+        }
+        if let Some(("agent", remote_id)) = key.split_once(':') {
+            if self.remote_serves_phones(remote_id) {
+                card_col = card_col.push(item(
+                    "Pair a phone…".to_string(),
+                    Event::PhonePanelOpen(remote_id.to_string()),
+                ));
+            }
         }
 
         let card_bg = theme.bg_surface();
@@ -36236,7 +36708,31 @@ mod tests {
     }
 
     #[test]
+    fn phone_pairing_qr_is_a_square_with_a_quiet_zone() {
+        let url = "http://100.100.151.63:7778/pair#cS3NsQfxyBZlpAh4Vcj1PA";
+        let iced::widget::image::Handle::Rgba {
+            width,
+            height,
+            pixels,
+            ..
+        } = phone_pairing_qr(url).unwrap()
+        else {
+            panic!("not an RGBA image");
+        };
+        assert_eq!(width, height);
+        let side = width as usize;
+        assert_eq!(pixels.len(), side * side * 4);
+        assert_eq!(side % PHONE_QR_SCALE, 0);
+        // The quiet zone is white; the finder pattern's corner is black.
+        let quiet = PHONE_QR_QUIET * PHONE_QR_SCALE;
+        assert_eq!(&pixels[..4], &[255, 255, 255, 255]);
+        let corner = (quiet * side + quiet) * 4;
+        assert_eq!(&pixels[corner..corner + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
     fn agent_chat_page_inlines_vendored_renderers() {
+        use gitterm::chat_page::{AGENT_CHAT_VENDOR_JS, AGENT_CHAT_VENDOR_SLOT};
         let html = agent_chat_html();
         assert!(!html.contains(AGENT_CHAT_VENDOR_SLOT));
         assert!(html.contains("marked v12"));

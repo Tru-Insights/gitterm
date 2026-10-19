@@ -2,6 +2,8 @@ pub mod claude_chats;
 pub mod client;
 pub mod config;
 pub mod git;
+pub mod phone_http;
+pub mod phones;
 pub mod protocol;
 pub mod server;
 pub mod sessions;

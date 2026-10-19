@@ -19,10 +19,18 @@ impl AgentConfigFile {
         Self::file_path_under(&dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
     }
 
+    /// The agent's config dir (`~/.config/gitterm-v5-agent`), which also
+    /// holds its paired phones. `None` without a home directory.
+    pub fn dir() -> Option<PathBuf> {
+        dirs::home_dir().map(|home| Self::dir_under(&home))
+    }
+
+    fn dir_under(home: &std::path::Path) -> PathBuf {
+        home.join(".config").join(AGENT_CONFIG_DIR_NAME)
+    }
+
     fn file_path_under(home: &std::path::Path) -> PathBuf {
-        home.join(".config")
-            .join(AGENT_CONFIG_DIR_NAME)
-            .join("config.json")
+        Self::dir_under(home).join("config.json")
     }
 
     pub fn load() -> Option<Self> {

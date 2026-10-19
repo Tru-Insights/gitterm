@@ -1,6 +1,7 @@
 pub mod agentd;
 pub mod browser_control;
 pub mod browser_mcp;
+pub mod chat_page;
 pub mod chats;
 pub mod codex_review;
 pub mod codex_runner;

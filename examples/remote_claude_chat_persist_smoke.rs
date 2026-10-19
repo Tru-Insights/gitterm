@@ -191,6 +191,7 @@ async fn start_agent(name: &str, limits: ChatLimits, token: &str) -> SocketAddr 
         auth_token: token.to_string(),
         agent_name: name.to_string(),
         claude_chat_limits: limits,
+        phone: None,
     }));
     addr
 }

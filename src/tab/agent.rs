@@ -143,7 +143,7 @@ pub enum AgentEvent {
 impl AgentEvent {
     /// The echo of a prompt the human submitted, as the chat page renders it.
     pub(crate) fn user_prompt(text: &str) -> Self {
-        Self::Other(serde_json::json!({"type": "user_prompt", "text": text}))
+        Self::Other(gitterm::chat_page::user_prompt_payload(text))
     }
 
     /// The echo of a submitted prompt. Attached images ride along as
@@ -174,13 +174,7 @@ impl AgentEvent {
     pub(crate) fn webview_payload(&self) -> Option<serde_json::Value> {
         match self {
             Self::Other(value) => Some(value.clone()),
-            Self::Harness(ev) => match serde_json::to_value(ev) {
-                Ok(event) => Some(serde_json::json!({"kind": "harness", "event": event})),
-                Err(e) => {
-                    eprintln!("[agent] could not serialize harness event {ev:?}: {e}");
-                    None
-                }
-            },
+            Self::Harness(ev) => gitterm::chat_page::harness_payload(ev),
             // The typed pi variants are not produced yet.
             _ => None,
         }
@@ -199,12 +193,7 @@ impl From<TranscriptEntry> for AgentEvent {
 /// The Agent call whose subagent `ev` starts, if it is a subagent start.
 pub(crate) fn subagent_started(ev: &AgentEvent) -> Option<&str> {
     match ev {
-        AgentEvent::Harness(HarnessEvent::SubagentEvent {
-            parent_tool_use_id,
-            event,
-        }) if matches!(**event, HarnessEvent::TurnStarted { .. }) => {
-            Some(parent_tool_use_id.as_str())
-        }
+        AgentEvent::Harness(event) => gitterm::chat_page::subagent_started(event),
         _ => None,
     }
 }
@@ -212,7 +201,7 @@ pub(crate) fn subagent_started(ev: &AgentEvent) -> Option<&str> {
 /// The timeline marker for when Agent call `parent`'s subagent started
 /// (Unix ms). The chat page uses it when the start was not seen live.
 pub(crate) fn subagent_started_at(parent: &str, at_ms: i64) -> serde_json::Value {
-    serde_json::json!({ "kind": "subagent_started_at", "id": parent, "at_ms": at_ms })
+    gitterm::chat_page::subagent_started_at(parent, at_ms)
 }
 
 /// Whether a resumed session's earlier timeline has been read back from
