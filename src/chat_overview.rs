@@ -230,6 +230,10 @@ pub(crate) struct ChatSnapshot {
 pub(crate) struct DetachedActivity {
     /// The parent chat's title as far as it is known.
     pub(crate) parent: String,
+    /// The parent conversation, when the Chats index knows it: the
+    /// selected-chat summary lists the delegations of a chat no tab holds
+    /// (TRU-155).
+    pub(crate) parent_chat: Option<ChatRef>,
     pub(crate) machine: String,
     pub(crate) child: ChildActivity,
 }
@@ -348,17 +352,17 @@ enum Latest<'a> {
 /// conversation: a walk copies no tool input (a Write's can be a whole
 /// file) and parses only the calls a step or label reads.
 #[derive(Debug, Clone)]
-struct ToolCall<'a> {
-    id: &'a str,
-    name: &'a str,
+pub(crate) struct ToolCall<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) name: &'a str,
     input: &'a Value,
     /// `ItemInputDelta` fragments: concatenated they are the whole input
     /// (Claude), or one full document (ACP).
-    deltas: Vec<&'a str>,
+    pub(crate) deltas: Vec<&'a str>,
 }
 
 impl<'a> ToolCall<'a> {
-    fn new(id: &'a str, name: &'a str, input: &'a Value) -> Self {
+    pub(crate) fn new(id: &'a str, name: &'a str, input: &'a Value) -> Self {
         Self {
             id,
             name,
@@ -369,7 +373,7 @@ impl<'a> ToolCall<'a> {
 
     /// The input as far as it has arrived: the streamed document once it
     /// parses, else what the call was announced with.
-    fn input(&self) -> std::borrow::Cow<'a, Value> {
+    pub(crate) fn input(&self) -> std::borrow::Cow<'a, Value> {
         if !self.deltas.is_empty() {
             if let Ok(value) = serde_json::from_str::<Value>(&self.deltas.concat()) {
                 return std::borrow::Cow::Owned(value);
@@ -1241,8 +1245,10 @@ pub(crate) fn detached_activity(
     let child = delegation_activity(delegation, task_title, target);
     keep_delegation(delegation, &child, now).then(|| DetachedActivity {
         parent: parent_chat
+            .as_ref()
             .map(|(_, title)| title.to_string())
             .unwrap_or_else(|| delegation.parent.workspace.clone()),
+        parent_chat: parent_chat.map(|(chat, _)| chat),
         machine: machine.to_string(),
         child,
     })
@@ -1970,6 +1976,7 @@ mod tests {
             chats: vec![working, earlier, idle, old, asking],
             detached: vec![DetachedActivity {
                 parent: "closed chat".into(),
+                parent_chat: None,
                 machine: "This Mac".into(),
                 child: ChildActivity {
                     status: ChildStatus::Running,
@@ -2187,6 +2194,7 @@ mod tests {
             NavTarget::OpenChat(ChatRef::local("p1"))
         );
         assert_eq!(detached.parent, "Parent chat");
+        assert_eq!(detached.parent_chat, Some(ChatRef::local("p1")));
         // Finished long before the window: not news.
         let old = delegation(DelegationKind::Review, DelegationStatus::Completed);
         assert_eq!(detached_activity(&old, None, None, "This Mac", now), None);

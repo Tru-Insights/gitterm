@@ -37,6 +37,7 @@ mod webview;
 mod agent;
 mod chat_overview;
 mod chat_rank;
+mod chat_summary;
 mod config;
 mod events;
 mod tab;
@@ -385,6 +386,18 @@ fn replay_agent_conversation_in_webview(
         WebviewSurface::Agent(tab_id),
         &format!("window.__replay({json})"),
     );
+}
+
+/// The summary (TRU-155) of a conversation read back from its transcript.
+/// Blocking-sized for a long transcript; run off the UI thread.
+fn chat_digest_from_timeline(
+    timeline: Vec<gitterm::harness::transcript::TimedEntry>,
+) -> chat_summary::ChatDigest {
+    let events: Vec<tab::AgentEvent> = timeline
+        .into_iter()
+        .map(|timed| tab::AgentEvent::from(timed.entry))
+        .collect();
+    chat_summary::digest(&events)
 }
 
 /// A transcript read-back as a chat timeline, with each delegation card's
@@ -3098,6 +3111,12 @@ fn post_needs_you_notification(title: &str, body: &str) {
 type ChatOverviewCache =
     std::cell::RefCell<Option<(u64, Instant, std::rc::Rc<chat_overview::OverviewSnapshot>)>>;
 
+/// A selected conversation's live summary (TRU-155): the chat tab it was
+/// built from, the key it was built for, when, and the digest. Same
+/// rebuild rule as the overview's, per tab.
+type ChatDigestCache =
+    std::cell::RefCell<Option<(usize, u64, Instant, std::rc::Rc<chat_summary::ChatDigest>)>>;
+
 /// Least time between two overview snapshot builds. A streaming chat
 /// changes the key on every delta; the menu poll redraws every
 /// `MENU_POLL_INTERVAL_MS`, so the overview trails by well under a second.
@@ -5722,7 +5741,20 @@ pub enum Event {
     MachineReconnect(String),
     SelectChat(chats::ChatRef),
     CloseChatPreview,
-    ChatPreviewLoaded(chats::ChatRef, chats::ChatPreview),
+    /// A selected conversation's preview tail and its summary (TRU-155),
+    /// both read off the UI thread.
+    ChatPreviewLoaded(
+        chats::ChatRef,
+        chats::ChatPreview,
+        Box<chat_summary::ChatDigest>,
+    ),
+    /// Fold or unfold the raw conversation under a selected chat's
+    /// summary (TRU-155; per app run).
+    ToggleChatPreviewRaw,
+    /// Show the whole latest ask in a selected chat's summary, or clip it.
+    ToggleChatSummaryAsk,
+    /// Show the whole latest reply in a selected chat's summary, or clip it.
+    ToggleChatSummaryReply,
     /// Resume a conversation as a new tab in its recorded cwd (registry
     /// rule: focuses the existing tab instead if one owns the session).
     ResumeChatAsTab(chats::ChatRef),
@@ -6057,6 +6089,20 @@ struct App {
     /// Preview tail for the most recently selected chat, keyed by session
     /// id so a stale load never renders under the wrong chat.
     chat_preview: Option<(chats::ChatRef, chats::ChatPreview)>,
+    /// The summary derived with `chat_preview` (TRU-155): from the whole
+    /// transcript (a local or remote Claude chat) or the preview tail.
+    /// Stands in for a conversation no native chat tab holds.
+    chat_preview_digest: Option<(chats::ChatRef, std::rc::Rc<chat_summary::ChatDigest>)>,
+    /// The summary of a selected conversation an open chat tab holds,
+    /// derived from its live buffer and rebuilt only when its key changes.
+    chat_digest_cache: ChatDigestCache,
+    /// The raw conversation under a selected chat's summary is unfolded
+    /// (folded by default; per app run).
+    chat_preview_raw_expanded: bool,
+    /// The summary's latest ask / latest reply is shown whole; reset when
+    /// another conversation is selected.
+    chat_summary_ask_expanded: bool,
+    chat_summary_reply_expanded: bool,
     /// Jev client for relevance ordering (TRU-141); None without
     /// TYPESAFE_API_KEY, and then the panel offers no toggle.
     jev_client: Option<gitterm::jev::JevClient>,
@@ -11002,19 +11048,44 @@ impl App {
     ) -> Task<Event> {
         Task::perform(
             async move {
-                let preview =
-                    match tokio::task::spawn_blocking(move || chats::load_preview(&path, backend))
-                        .await
-                    {
-                        Ok(preview) => preview,
-                        Err(err) => {
-                            eprintln!("[chats] preview task failed: {err}");
-                            chats::ChatPreview::default()
+                // The summary (TRU-155) reads the whole transcript once,
+                // here, next to the preview tail; never in `view`.
+                let (preview, digest) = match tokio::task::spawn_blocking(move || {
+                    let preview = chats::load_preview(&path, backend);
+                    let digest = match backend {
+                        chats::ChatBackend::Claude => {
+                            match gitterm::harness::transcript::load_claude_history(&path) {
+                                Ok(timeline) => chat_digest_from_timeline(timeline),
+                                Err(err) => {
+                                    eprintln!(
+                                        "[chats] summary: cannot read {}: {err}; using the preview tail",
+                                        path.display()
+                                    );
+                                    chat_summary::digest_messages(&preview.messages)
+                                }
+                            }
+                        }
+                        // No event read-back for these transcripts.
+                        chats::ChatBackend::Codex | chats::ChatBackend::Pi => {
+                            chat_summary::digest_messages(&preview.messages)
                         }
                     };
-                (chat, preview)
+                    (preview, digest)
+                })
+                .await
+                {
+                    Ok(loaded) => loaded,
+                    Err(err) => {
+                        eprintln!("[chats] preview task failed: {err}");
+                        (
+                            chats::ChatPreview::default(),
+                            chat_summary::ChatDigest::default(),
+                        )
+                    }
+                };
+                (chat, preview, digest)
             },
-            |(chat, preview)| Event::ChatPreviewLoaded(chat, preview),
+            |(chat, preview, digest)| Event::ChatPreviewLoaded(chat, preview, Box::new(digest)),
         )
     }
 
@@ -11026,7 +11097,8 @@ impl App {
     ) -> Task<Event> {
         Task::perform(
             async move {
-                let preview = match RemoteAgentBackend::new(client)
+                let backend_client = RemoteAgentBackend::new(client);
+                let preview = match backend_client
                     .chat_preview(path.to_string_lossy().into_owned(), backend)
                     .await
                 {
@@ -11036,9 +11108,38 @@ impl App {
                         chats::ChatPreview::default()
                     }
                 };
-                (chat, preview)
+                // A Claude chat's summary (TRU-155) reads its timeline back
+                // as a remote chat tab does (`ClaudeChatHistory`); anything
+                // else has only the preview tail.
+                let timeline = match backend {
+                    chats::ChatBackend::Claude => {
+                        match backend_client.claude_chat_history(chat.id.clone()).await {
+                            Ok(Some(timeline)) => Some(timeline),
+                            Ok(None) => {
+                                eprintln!(
+                                    "[chats] summary: the remote has no transcript for {}; using the preview tail",
+                                    chat.id
+                                );
+                                None
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "[chats] summary: remote history for {} failed: {err}; using the preview tail",
+                                    chat.id
+                                );
+                                None
+                            }
+                        }
+                    }
+                    chats::ChatBackend::Codex | chats::ChatBackend::Pi => None,
+                };
+                let digest = match timeline {
+                    Some(timeline) => chat_digest_from_timeline(timeline),
+                    None => chat_summary::digest_messages(&preview.messages),
+                };
+                (chat, preview, digest)
             },
-            |(chat, preview)| Event::ChatPreviewLoaded(chat, preview),
+            |(chat, preview, digest)| Event::ChatPreviewLoaded(chat, preview, Box::new(digest)),
         )
     }
 
@@ -13136,6 +13237,11 @@ impl App {
             chat_overview_idle_expanded: false,
             roster_reveal_held: HashMap::new(),
             chat_preview: None,
+            chat_preview_digest: None,
+            chat_digest_cache: ChatDigestCache::default(),
+            chat_preview_raw_expanded: false,
+            chat_summary_ask_expanded: false,
+            chat_summary_reply_expanded: false,
             jev_client: gitterm::jev::JevClient::from_env(),
             chat_rank: chat_rank::ChatRankState::default(),
             chat_snippets: Arc::new(Mutex::new(chat_rank::SnippetCache::default())),
@@ -15228,6 +15334,43 @@ fi
         let snapshot = std::rc::Rc::new(self.build_chat_overview());
         *cache = Some((key, Instant::now(), snapshot.clone()));
         snapshot
+    }
+
+    /// The summary of a selected conversation (TRU-155). An open native
+    /// chat tab's live buffer wins, rebuilt only when its revision moves;
+    /// otherwise (a terminal tab, no tab, a buffer not read back yet) the
+    /// digest loaded with the preview. `None` while that is loading.
+    fn selected_chat_digest(
+        &self,
+        chat: &chats::ChatRef,
+    ) -> Option<std::rc::Rc<chat_summary::ChatDigest>> {
+        let live = self
+            .find_chat_tab(chat)
+            .map(|(ws_idx, tab_idx)| &self.workspaces[ws_idx].tabs[tab_idx])
+            .and_then(|tab| tab.agent_session().map(|session| (tab.id, session)))
+            .filter(|(_, session)| !session.conversation.is_empty());
+        let Some((tab_id, session)) = live else {
+            return self
+                .chat_preview_digest
+                .as_ref()
+                .filter(|(loaded, _)| loaded == chat)
+                .map(|(_, digest)| digest.clone());
+        };
+        let mut hasher = DefaultHasher::new();
+        session.revision.hash(&mut hasher);
+        session.conversation.len().hash(&mut hasher);
+        let key = hasher.finish();
+        let mut cache = self.chat_digest_cache.borrow_mut();
+        if let Some((cached_tab, cached_key, built_at, digest)) = cache.as_ref() {
+            if *cached_tab == tab_id
+                && (*cached_key == key || built_at.elapsed() < OVERVIEW_REBUILD_MIN)
+            {
+                return Some(digest.clone());
+            }
+        }
+        let digest = std::rc::Rc::new(chat_summary::digest(&session.conversation));
+        *cache = Some((tab_id, key, Instant::now(), digest.clone()));
+        Some(digest)
     }
 
     /// A hash of everything the overview snapshot is built from: per tab
@@ -21687,8 +21830,18 @@ fi
                 }
                 self.settle_agent_surface();
             }
-            Event::ChatPreviewLoaded(chat, preview) => {
+            Event::ChatPreviewLoaded(chat, preview, digest) => {
+                self.chat_preview_digest = Some((chat.clone(), std::rc::Rc::new(*digest)));
                 self.chat_preview = Some((chat, preview));
+            }
+            Event::ToggleChatPreviewRaw => {
+                self.chat_preview_raw_expanded = !self.chat_preview_raw_expanded;
+            }
+            Event::ToggleChatSummaryAsk => {
+                self.chat_summary_ask_expanded = !self.chat_summary_ask_expanded;
+            }
+            Event::ToggleChatSummaryReply => {
+                self.chat_summary_reply_expanded = !self.chat_summary_reply_expanded;
             }
             Event::ResumeChatAsTab(chat) => {
                 return self.resume_chat_as_tab(chat, false);
@@ -23869,6 +24022,8 @@ fi
         if let Some(tab) = self.active_tab_mut() {
             tab.selected_chat = Some(chat.clone());
         }
+        self.chat_summary_ask_expanded = false;
+        self.chat_summary_reply_expanded = false;
         if let Some((path, backend)) = source {
             return match chat.remote_id.clone() {
                 None => Self::request_chat_preview(chat, path, backend),
@@ -32164,9 +32319,6 @@ fi
             .into()
     }
 
-    /// Main-pane preview for the chat selected in the Chats sidebar:
-    /// metadata header + lazily loaded transcript tail. Read-only —
-    /// resume actions land in slice 2.
     /// One Chats overview row: glyph, title, where it lives, what it is
     /// doing, and a right-hand figure. Clicking goes to its target.
     fn view_overview_row(&self, row: OverviewRow) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -32510,6 +32662,310 @@ fi
             .into()
     }
 
+    /// The summary of a conversation selected in the Chats panel (TRU-155),
+    /// top to bottom, each section left out when it has nothing: what it
+    /// is doing now, what was asked, its plan, the agents working for it,
+    /// the files it touched, what waits on the human and its latest reply.
+    /// Reads the cached digest and overview snapshot; only clock-relative
+    /// figures are computed per frame.
+    fn view_chat_summary<'a>(
+        &'a self,
+        tab: &TabState,
+        entry: &chats::ChatIndexEntry,
+        chat: &chats::ChatRef,
+        snapshot: Option<&chat_overview::ChatSnapshot>,
+        agents: &[chat_overview::ChildActivity],
+        digest: Option<&chat_summary::ChatDigest>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        use chat_overview::{ChatState, ChildStatus, NavTarget};
+        use chat_summary::{clip_lines, TodoStatus, WaitingAsk};
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let now = std::time::SystemTime::now();
+        let header = |label: &str, count: Option<String>| {
+            let mut header = Row::new().spacing(8).push(
+                text(label.to_string())
+                    .size(10)
+                    .color(theme.text_secondary()),
+            );
+            if let Some(count) = count {
+                header = header.push(text(count).size(10).color(theme.text_muted()));
+            }
+            header
+        };
+        let link_color = theme.accent();
+        let link_style = move |_theme: &Theme, status: button::Status| button::Style {
+            background: None,
+            text_color: match status {
+                button::Status::Hovered | button::Status::Pressed => link_color,
+                _ => iced::Color {
+                    a: 0.85,
+                    ..link_color
+                },
+            },
+            ..Default::default()
+        };
+        // Long text clipped to `lines`, with a more/less toggle.
+        let clipped = |label: &str,
+                       full: &str,
+                       lines: usize,
+                       expanded: bool,
+                       color: iced::Color,
+                       toggle: Event| {
+            let (shown, cut) = clip_lines(full, lines);
+            let mut section = column![
+                header(label, None),
+                text(if expanded { full.to_string() } else { shown })
+                    .size(font_small)
+                    .color(color),
+            ]
+            .spacing(4);
+            if cut {
+                section = section.push(
+                    button(
+                        text(if expanded { "less" } else { "more" })
+                            .size(font_small - 1.0)
+                            .color(link_color),
+                    )
+                    .padding(0)
+                    .style(link_style)
+                    .on_press(toggle),
+                );
+            }
+            section
+        };
+
+        let mut out = Column::new().spacing(14);
+
+        if let Some(step) = snapshot
+            .filter(|snapshot| snapshot.state == ChatState::Working)
+            .and_then(|snapshot| snapshot.step.clone())
+        {
+            out = out.push(
+                column![
+                    header("DOING NOW", None),
+                    text(step).size(font_small).color(theme.text_primary()),
+                ]
+                .spacing(4),
+            );
+        }
+
+        let Some(digest) = digest else {
+            out = out.push(
+                text("reading the conversation…")
+                    .size(font_small)
+                    .color(theme.text_muted()),
+            );
+            return out.into();
+        };
+
+        if let Some(ask) = &digest.latest_ask {
+            out = out.push(clipped(
+                "ASKED FOR",
+                ask,
+                chat_summary::ASK_PREVIEW_LINES,
+                self.chat_summary_ask_expanded,
+                theme.text_primary(),
+                Event::ToggleChatSummaryAsk,
+            ));
+        }
+
+        if !digest.todos.is_empty() {
+            let done = digest
+                .todos
+                .iter()
+                .filter(|item| item.status == TodoStatus::Completed)
+                .count();
+            let mut list = column![header(
+                "PROGRESS",
+                Some(format!("{done}/{}", digest.todos.len()))
+            )]
+            .spacing(3);
+            for item in &digest.todos {
+                let (glyph, glyph_color, text_color) = match item.status {
+                    TodoStatus::Completed => ("✓", theme.success(), theme.text_secondary()),
+                    TodoStatus::InProgress => ("▶", theme.accent(), theme.text_primary()),
+                    TodoStatus::Pending => ("○", theme.text_muted(), theme.text_secondary()),
+                    TodoStatus::Cancelled => ("–", theme.text_muted(), theme.text_muted()),
+                };
+                list = list.push(
+                    row![
+                        text(glyph).size(font_small).color(glyph_color),
+                        text(item.text.clone()).size(font_small).color(text_color),
+                    ]
+                    .spacing(8),
+                );
+            }
+            out = out.push(list);
+        }
+
+        if !agents.is_empty() {
+            let mut list = column![header("AGENTS", Some(agents.len().to_string()))].spacing(2);
+            for child in agents {
+                let (icon, icon_color) = match child.status {
+                    ChildStatus::Running => ("▶", theme.success()),
+                    ChildStatus::Queued => ("…", theme.text_muted()),
+                    ChildStatus::Blocked => ("●", theme.warning()),
+                    ChildStatus::Done => ("✓", theme.success()),
+                    ChildStatus::Failed => ("!", theme.danger()),
+                    ChildStatus::Stopped => ("○", theme.text_muted()),
+                };
+                let time = if child.status.is_active() {
+                    child
+                        .started_at
+                        .and_then(|at| now.duration_since(at).ok())
+                        .map(chat_overview::format_elapsed)
+                } else {
+                    child.finished_at.map(|at| match chats::format_age(at) {
+                        age if age == "now" => "just now".to_string(),
+                        age => format!("{age} ago"),
+                    })
+                };
+                let detail = match child.step.as_ref().or(child.result.as_ref()) {
+                    Some(what) => format!("{} · {what}", child.status.label()),
+                    None => child.status.label().to_string(),
+                };
+                list = list.push(self.view_overview_row(OverviewRow {
+                    icon,
+                    icon_color,
+                    title: child.label.clone(),
+                    meta: String::new(),
+                    detail: Some((detail, theme.text_secondary())),
+                    right: time.unwrap_or_default(),
+                    target: child.target.clone(),
+                    indent: 0.0,
+                }));
+            }
+            out = out.push(list);
+        }
+
+        if !digest.files_touched.is_empty() {
+            // The file viewer covers a chat tab's Chats pane at once; on a
+            // terminal tab the Chats pane stays on top, so paths there (and
+            // a remote's) are plain text.
+            let openable = chat.remote_id.is_none() && matches!(tab.kind, TabKind::Agent(_));
+            let total = digest.files_touched.len();
+            let mut list = column![header("FILES TOUCHED", Some(total.to_string()))].spacing(2);
+            for path in digest.files_touched.iter().take(chat_summary::FILES_SHOWN) {
+                let full = entry.cwd.join(path);
+                let shown = full
+                    .strip_prefix(&entry.cwd)
+                    .ok()
+                    .filter(|relative| !relative.as_os_str().is_empty())
+                    .map(|relative| relative.display().to_string())
+                    .unwrap_or_else(|| path.clone());
+                if openable {
+                    list = list.push(
+                        button(text(shown).size(font_small).color(link_color))
+                            .padding(0)
+                            .style(link_style)
+                            .on_press(Event::ViewFile(SourcePath::Local(full))),
+                    );
+                } else {
+                    list = list.push(text(shown).size(font_small).color(theme.text_secondary()));
+                }
+            }
+            if total > chat_summary::FILES_SHOWN {
+                list = list.push(
+                    text(format!("+{} more", total - chat_summary::FILES_SHOWN))
+                        .size(font_small - 1.0)
+                        .color(theme.text_muted()),
+                );
+            }
+            out = out.push(list);
+        }
+
+        if let Some((snapshot, what)) = snapshot.and_then(|snapshot| match &snapshot.state {
+            ChatState::NeedsYou { what } => Some((snapshot, what)),
+            _ => None,
+        }) {
+            let ask_color = theme.warning();
+            let mut list = column![header("WAITING ON YOU", None)].spacing(4);
+            if digest.waiting.is_empty() {
+                list = list.push(text(what.clone()).size(font_small).color(ask_color));
+            }
+            for ask in &digest.waiting {
+                match ask {
+                    WaitingAsk::Permission { tool, detail } => {
+                        list = list.push(
+                            text(format!("Permission · {tool}"))
+                                .size(font_small)
+                                .color(ask_color),
+                        );
+                        if let Some(detail) = detail {
+                            list = list.push(
+                                text(clip_lines(detail, chat_summary::ASK_PREVIEW_LINES).0)
+                                    .size(font_small)
+                                    .font(iced::Font::MONOSPACE)
+                                    .color(theme.text_primary()),
+                            );
+                        }
+                    }
+                    WaitingAsk::Question { questions } => {
+                        list = list.push(text("Question").size(font_small).color(ask_color));
+                        for question in questions {
+                            list = list.push(
+                                text(question.clone())
+                                    .size(font_small)
+                                    .color(theme.text_primary()),
+                            );
+                        }
+                    }
+                }
+            }
+            // On a chat page the prompt panel sits above the composer;
+            // the page flashes it once there.
+            let target = match &snapshot.target {
+                NavTarget::Tab(tab_id)
+                    if self
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| &workspace.tabs)
+                        .any(|tab| tab.id == *tab_id && tab.agent_session().is_some()) =>
+                {
+                    NavTarget::Roster {
+                        tab_id: *tab_id,
+                        key: "ask".to_string(),
+                    }
+                }
+                other => other.clone(),
+            };
+            if target != NavTarget::Nowhere {
+                list = list.push(
+                    button(text("Go to prompt").size(font_small).color(ask_color))
+                        .style(move |_theme, _status| button::Style {
+                            background: None,
+                            border: iced::Border {
+                                width: 1.0,
+                                color: ask_color,
+                                radius: 5.0.into(),
+                            },
+                            ..Default::default()
+                        })
+                        .padding([4, 12])
+                        .on_press(Event::ChatOverviewGo(target)),
+                );
+            }
+            out = out.push(list);
+        }
+
+        if let Some(reply) = &digest.latest_reply {
+            out = out.push(clipped(
+                "LATEST REPLY",
+                reply,
+                chat_summary::REPLY_PREVIEW_LINES,
+                self.chat_summary_reply_expanded,
+                theme.text_secondary(),
+                Event::ToggleChatSummaryReply,
+            ));
+        }
+
+        out.into()
+    }
+
+    /// Main-pane view of the conversation selected in the Chats panel: a
+    /// header (title, where and what runs it, state, actions), its summary
+    /// (TRU-155) and the raw preview tail folded under it.
     fn view_chat_preview<'a>(
         &'a self,
         tab: &'a TabState,
@@ -32550,25 +33006,105 @@ fi
         let machine_unreachable = entry_remote_id
             .and_then(|remote_id| self.remote_chat_indexes.get(remote_id))
             .is_some_and(|state| state.error.is_some());
-        let mut meta = Row::new()
-            .spacing(14)
+
+        // The chat as the Chats overview holds it while it is open or
+        // running (TRU-155): its state, step, cost and agents.
+        let overview = self.chat_overview_snapshot();
+        let (snapshot, agents) = chat_summary::chat_in_overview(&overview, selected);
+        let snapshot = snapshot.cloned();
+        let agents: Vec<chat_overview::ChildActivity> = agents.into_iter().cloned().collect();
+        let digest = self.selected_chat_digest(selected);
+
+        // Where it lives and what runs it: machine · repo · branch ·
+        // harness · model.
+        let harness_label = snapshot
+            .as_ref()
+            .map_or(entry.backend.label(), |snapshot| snapshot.harness.label());
+        let mut place = vec![match &snapshot {
+            Some(snapshot) => snapshot.machine.clone(),
+            None => self.chat_machine_name(entry_remote_id),
+        }];
+        place.push(
+            snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.repo.clone())
+                .unwrap_or_else(|| entry.group_name()),
+        );
+        if let Some(branch) = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.branch.clone())
+            .or_else(|| entry.branch.clone())
+        {
+            place.push(branch);
+        }
+        let mut place_row = Row::new()
+            .spacing(10)
             .push(
-                text(format!("● {}", entry.backend.label()))
+                text(format!("● {harness_label}"))
                     .size(font_small)
                     .color(self.chat_backend_color(entry.backend)),
             )
             .push(
-                text(match &machine_name {
-                    Some(name) => format!("@ {name}"),
-                    None => "this mac".to_string(),
-                })
-                .size(font_small)
-                .color(if machine_name.is_some() {
-                    theme.accent()
-                } else {
-                    theme.text_muted()
-                }),
-            )
+                text(place.join(" · "))
+                    .size(font_small)
+                    .color(if machine_name.is_some() {
+                        theme.accent()
+                    } else {
+                        theme.text_secondary()
+                    }),
+            );
+        if let Some(model) = snapshot.as_ref().and_then(|s| s.model.clone()) {
+            place_row = place_row.push(text(model).size(font_small).color(theme.text_muted()));
+        }
+
+        // State, elapsed and cost so far: known only while it is open or
+        // running.
+        let state_row = snapshot.as_ref().map(|snapshot| {
+            use chat_overview::ChatState;
+            let (label, color) = match &snapshot.state {
+                ChatState::NeedsYou { .. } => ("waiting for you", theme.warning()),
+                ChatState::Working => ("working", theme.success()),
+                ChatState::Idle => ("idle", theme.text_secondary()),
+                ChatState::Exited => ("exited", theme.text_muted()),
+            };
+            let mut state_row = Row::new()
+                .spacing(10)
+                .align_y(iced::Alignment::Center)
+                .push(
+                    container(text(label).size(font_small - 1.0).color(color))
+                        .padding([1, 8])
+                        .style(move |_| container::Style {
+                            border: iced::Border {
+                                color,
+                                width: 1.0,
+                                radius: 8.0.into(),
+                            },
+                            ..Default::default()
+                        }),
+                );
+            let elapsed = (snapshot.state == ChatState::Working)
+                .then_some(snapshot.turn_started_at)
+                .flatten()
+                .and_then(|at| std::time::SystemTime::now().duration_since(at).ok());
+            if let Some(elapsed) = elapsed {
+                state_row = state_row.push(
+                    text(chat_overview::format_elapsed(elapsed))
+                        .size(font_small)
+                        .color(theme.text_secondary()),
+                );
+            }
+            if let Some(cost) = snapshot.cost_usd {
+                state_row = state_row.push(
+                    text(format!("{} so far", chat_overview::format_cost(cost)))
+                        .size(font_small)
+                        .color(theme.text_secondary()),
+                );
+            }
+            state_row
+        });
+
+        let mut meta = Row::new()
+            .spacing(14)
             .push(
                 text(chats::format_size(entry.size))
                     .size(font_small)
@@ -32582,13 +33118,6 @@ fi
         if let Some(count) = preview.and_then(|p| p.message_count) {
             meta = meta.push(
                 text(format!("{count} messages"))
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-            );
-        }
-        if let Some(branch) = &entry.branch {
-            meta = meta.push(
-                text(branch.clone())
                     .size(font_small)
                     .color(theme.text_secondary()),
             );
@@ -32739,12 +33268,20 @@ fi
             }
         }
 
-        let header = row![
-            column![
-                text(entry.title.clone())
-                    .size(font + 2.0)
-                    .color(theme.text_primary()),
-                meta,
+        let mut header_lines = column![
+            text(entry.title.clone())
+                .size(font + 2.0)
+                .color(theme.text_primary()),
+            place_row,
+        ]
+        .spacing(6)
+        .width(Length::Fill);
+        if let Some(state_row) = state_row {
+            header_lines = header_lines.push(state_row);
+        }
+        header_lines = header_lines
+            .push(meta)
+            .push(
                 text(format!(
                     "{}{}{}",
                     if cwd_gone { "⚠ " } else { "" },
@@ -32753,10 +33290,10 @@ fi
                 ))
                 .size(font_small)
                 .color(cwd_color),
-                actions,
-            ]
-            .spacing(6)
-            .width(Length::Fill),
+            )
+            .push(actions);
+        let header = row![
+            header_lines,
             button(text("✕").size(font).color(theme.text_secondary()))
                 .style(self.ghost_button_style())
                 .padding([2, 8])
@@ -32765,15 +33302,49 @@ fi
         .spacing(10);
 
         let mut body = Column::new().spacing(12).padding([14, 18]);
-        match preview {
-            None => {
+        body = body.push(self.view_chat_summary(
+            tab,
+            entry,
+            selected,
+            snapshot.as_ref(),
+            &agents,
+            digest.as_deref(),
+        ));
+
+        // The raw conversation, folded under the summary (per app run).
+        let raw_expanded = self.chat_preview_raw_expanded;
+        body = body.push(
+            button(
+                row![
+                    text(if raw_expanded { "▾" } else { "▸" })
+                        .size(10)
+                        .color(theme.text_secondary()),
+                    text("CONVERSATION").size(10).color(theme.text_secondary()),
+                    text(match preview {
+                        Some(preview) => format!("last {}", preview.messages.len()),
+                        None => String::new(),
+                    })
+                    .size(10)
+                    .color(theme.text_muted()),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .style(self.ghost_button_style())
+            .padding([4, 6])
+            .width(Length::Fill)
+            .on_press(Event::ToggleChatPreviewRaw),
+        );
+        match raw_expanded.then_some(preview) {
+            None => {}
+            Some(None) => {
                 body = body.push(
                     text("loading preview…")
                         .size(font_small)
                         .color(theme.text_muted()),
                 );
             }
-            Some(preview) => {
+            Some(Some(preview)) => {
                 if let Some(count) = preview.message_count {
                     let shown = preview.messages.len() as u64;
                     if count > shown {

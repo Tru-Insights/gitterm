@@ -461,7 +461,7 @@
   details.dlg.blocked .dlg-kind, details.dlg.waiting .dlg-kind { color: var(--warn); }
   details.dlg.waiting .dlg-state, details.dlg.blocked .dlg-state { color: var(--warn); }
   .dlg-path { font-family: var(--mono); font-size: 11.5px; color: var(--fg-muted); word-break: break-all; margin: 2px 0 6px; }
-  details.dlg.flash, details.tool.flash { outline: 1px solid var(--accent); }
+  details.dlg.flash, details.tool.flash, #request-panel.flash { outline: 1px solid var(--accent); }
   details.dlg > summary {
     cursor: pointer; user-select: none; list-style: none;
     padding: 6px 10px; display: flex; gap: 8px; align-items: baseline;
@@ -2223,6 +2223,15 @@
     return null;
   }
   function revealRosterKey(key) {
+    // A Chats summary's "Go to prompt" (TRU-155): flash the request panel
+    // above the composer. Nothing is focused, so a stray Enter answers
+    // nothing.
+    if (key === 'ask') {
+      if (!panelEl.classList.contains('visible')) return false;
+      panelEl.classList.add('flash');
+      setTimeout(() => panelEl.classList.remove('flash'), 900);
+      return true;
+    }
     const row = rosterRowFor(key);
     if (!row) return false;
     if (rosterHidden.delete(key)) renderRoster();
