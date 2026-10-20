@@ -39,13 +39,15 @@ const LAST_SEEN_PERSIST_INTERVAL: u64 = 5 * 60;
 
 pub const PHONES_FILE_NAME: &str = "phones.json";
 
-/// What a paired phone may do. Stage 1 grants only `View`.
+/// What a paired phone may do. A pairing grants the scope it was created
+/// with; a phone that should act is paired again (no in-place upgrade).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhoneScope {
     /// Read chats; never send anything to Claude.
     View,
-    /// Also send messages and answer prompts (stage 2).
+    /// Also send messages, answer permission prompts and questions, and
+    /// stop the running turn of a chat on the agent.
     Act,
 }
 
@@ -66,20 +68,17 @@ impl PhoneScope {
         }
     }
 
-    /// The scope a pairing grants when `requested` is asked for. Sending
-    /// from a phone is stage 2, so every phone views for now.
+    /// The scope a pairing grants when `requested` is asked for: the one
+    /// asked for.
     pub fn granted(requested: Self) -> Self {
-        match requested {
-            Self::View | Self::Act => Self::View,
-        }
+        requested
     }
 
     /// Whether a phone with this scope may send a command into a chat.
-    /// Refused for every scope until stage 2 adds the act path.
     pub fn may_send_commands(self) -> Result<(), &'static str> {
         match self {
             Self::View => Err("this phone is paired to view only; it cannot send to Claude"),
-            Self::Act => Err("sending from a phone is not available yet"),
+            Self::Act => Ok(()),
         }
     }
 }
@@ -645,13 +644,23 @@ mod tests {
     }
 
     #[test]
-    fn stage_one_grants_view_even_when_act_is_asked() {
-        let (_dir, registry, _) = registry();
-        let pairing = registry.create_pairing("phone", PhoneScope::Act).unwrap();
-        assert_eq!(pairing.scope, PhoneScope::View);
+    fn a_pairing_grants_the_scope_it_was_created_with() {
+        let (dir, registry, _) = registry();
+        let act = registry.create_pairing("phone", PhoneScope::Act).unwrap();
+        assert_eq!(act.scope, PhoneScope::Act);
+        let paired = registry.redeem(&act.code).unwrap();
+        assert_eq!(paired.phone.scope, PhoneScope::Act);
+        let view = registry.create_pairing("tablet", PhoneScope::View).unwrap();
+        assert_eq!(view.scope, PhoneScope::View);
         assert_eq!(
-            registry.redeem(&pairing.code).unwrap().phone.scope,
+            registry.redeem(&view.code).unwrap().phone.scope,
             PhoneScope::View
+        );
+        // The scope survives a restart.
+        let reloaded = PhoneRegistry::load(dir.path()).unwrap();
+        assert_eq!(
+            reloaded.authenticate(&paired.token).map(|p| p.scope),
+            Some(PhoneScope::Act)
         );
         assert_eq!(PhoneScope::parse("").unwrap(), PhoneScope::View);
         assert_eq!(PhoneScope::parse("act").unwrap(), PhoneScope::Act);
@@ -659,10 +668,9 @@ mod tests {
     }
 
     #[test]
-    fn view_scope_may_not_send_commands() {
+    fn only_act_scope_may_send_commands() {
         assert!(PhoneScope::View.may_send_commands().is_err());
-        // Stage 2 opens this; until then nothing sends.
-        assert!(PhoneScope::Act.may_send_commands().is_err());
+        assert_eq!(PhoneScope::Act.may_send_commands(), Ok(()));
     }
 
     #[test]

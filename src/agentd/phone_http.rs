@@ -1,4 +1,4 @@
-//! The agent's phone web app (TRU-151, stage 1: view only).
+//! The agent's phone web app (TRU-151).
 //!
 //! A small HTTP server beside the gRPC one, on the agent's host at the
 //! next port up (`--phone-addr` overrides, `off` disables). Plain HTTP:
@@ -13,10 +13,14 @@
 //! logged by proxies).
 //!
 //! Live chats travel over a WebSocket rather than server-sent events: it
-//! carries the token in its first frame instead of the URL, and stage 2's
-//! commands can ride the same socket the way the desktop's gRPC stream
-//! carries them. In view scope every message a phone sends after its hello
-//! is refused here, server-side.
+//! carries the token in its first frame instead of the URL, and a phone's
+//! commands ride the same socket the way the desktop's gRPC stream carries
+//! them. After its hello, a phone paired with act scope may send exactly
+//! three commands (`PhoneCommand`): a message, an answer to a permission
+//! prompt or question, and an interrupt. It can never stop the chat,
+//! change its model or mode, or start one. Every message from a view-scope
+//! phone, and anything else from an act-scope one, is refused here,
+//! server-side, and never reaches Claude.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -32,8 +36,9 @@ use warp::hyper::Body;
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
-use super::claude_chats::{ChatActivity, ChatAttachment, ClaudeChatRegistry, Gap, SeqEvent};
+use super::claude_chats::{Chat, ChatActivity, ChatAttachment, ClaudeChatRegistry, Gap, SeqEvent};
 use super::phones::{PairError, PhoneInfo, PhoneRegistry, Throttle};
+use crate::harness::{HarnessCommand, RuntimeDecision, UserPrompt};
 
 /// Where the phone server listens and keeps its paired phones.
 #[derive(Debug, Clone)]
@@ -53,7 +58,14 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Pings keep mobile networks from dropping an idle socket and find
 /// phones that went away without closing it.
 const SOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
-const MAX_SOCKET_MESSAGE_BYTES: usize = 64 * 1024;
+/// Longest message text a phone may send, in bytes.
+const MAX_PHONE_PROMPT_BYTES: usize = 64 * 1024;
+/// Largest socket message: room for a prompt at its cap once JSON-escaped,
+/// or an answer carrying an edited tool input. Anything larger fails the
+/// socket.
+const MAX_SOCKET_MESSAGE_BYTES: usize = 256 * 1024;
+/// Longest runtime request id a phone may name.
+const MAX_REQUEST_ID_CHARS: usize = 256;
 const MAX_PAIR_BODY_BYTES: u64 = 4 * 1024;
 
 /// WebSocket close codes the pages act on.
@@ -812,16 +824,8 @@ async fn relay(
                     continue;
                 }
                 // Anything else is an attempt to act on the chat.
-                if let Err(refusal) = phone.scope.may_send_commands() {
-                    eprintln!(
-                        "[phone] {}: refused a message on chat {} ({} scope)",
-                        phone.id,
-                        attachment.opened.chat_id,
-                        phone.scope.label()
-                    );
-                    send_json(sink, json!({"type": "refused", "message": refusal}))
-                        .await
-                        .map_err(gone)?;
+                if let Some(reply) = act(phone, &attachment.chat, &message) {
+                    send_json(sink, reply).await.map_err(gone)?;
                 }
             }
             live = attachment.live.recv() => {
@@ -850,6 +854,192 @@ async fn relay(
                     }
                 }
             }
+        }
+    }
+}
+
+/// The commands an act-scope phone may send on its socket.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PhoneCommand {
+    /// A user message. `id` (a UUID the page makes) becomes the message's
+    /// `UserPrompt::id`, so the page knows its own echo.
+    Send { id: String, text: String },
+    /// An answer to a runtime request, in the chat page's own
+    /// `RuntimeDecision` shape.
+    Answer {
+        request_id: String,
+        decision: RuntimeDecision,
+    },
+    /// Stop the running turn (not the chat).
+    Interrupt,
+}
+
+impl PhoneCommand {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Send { .. } => "send",
+            Self::Answer { .. } => "answer",
+            Self::Interrupt => "interrupt",
+        }
+    }
+}
+
+/// Why a phone's message did not reach Claude, as the frame the phone
+/// gets: `refused` (not allowed), `invalid` (malformed or too large) or
+/// `failed` (allowed, but the chat could not take it). Carries the
+/// message's `id` or `request_id` when it had one.
+fn rejection(kind: &str, message: impl Into<String>, about: Option<(&str, &str)>) -> Value {
+    let mut frame = json!({"type": kind, "message": message.into()});
+    if let Some((key, value)) = about {
+        frame[key] = json!(value);
+    }
+    frame
+}
+
+/// Read and check one message from a phone: the command it asks for, or
+/// the frame that turns it down. Never panics on any input.
+fn phone_command(phone: &PhoneInfo, chat: &Chat, message: &Message) -> Result<PhoneCommand, Value> {
+    if let Err(refusal) = phone.scope.may_send_commands() {
+        return Err(rejection("refused", refusal, None));
+    }
+    let Ok(text) = message.to_str() else {
+        return Err(rejection(
+            "invalid",
+            "commands are JSON text messages",
+            None,
+        ));
+    };
+    let value: Value = serde_json::from_str(text)
+        .map_err(|err| rejection("invalid", format!("a command must be JSON ({err})"), None))?;
+    match value.get("type").and_then(Value::as_str) {
+        Some("send" | "answer" | "interrupt") => {}
+        Some(other) => {
+            return Err(rejection(
+                "refused",
+                format!(
+                    "a phone can send a message, answer a prompt or stop the turn; {other:?} is not allowed"
+                ),
+                None,
+            ))
+        }
+        None => return Err(rejection("invalid", "a command needs a \"type\"", None)),
+    }
+    let command: PhoneCommand = serde_json::from_value(value)
+        .map_err(|err| rejection("invalid", format!("malformed command: {err}"), None))?;
+    match &command {
+        PhoneCommand::Send { id, text } => {
+            let about = Some(("id", id.as_str()));
+            if uuid::Uuid::parse_str(id).is_err() {
+                return Err(rejection("invalid", "a message id must be a UUID", about));
+            }
+            if text.trim().is_empty() {
+                return Err(rejection("invalid", "the message is empty", about));
+            }
+            if text.len() > MAX_PHONE_PROMPT_BYTES {
+                return Err(rejection(
+                    "invalid",
+                    format!(
+                        "the message is {} KiB; a phone can send at most {} KiB",
+                        text.len().div_ceil(1024),
+                        MAX_PHONE_PROMPT_BYTES / 1024
+                    ),
+                    about,
+                ));
+            }
+        }
+        PhoneCommand::Answer { request_id, .. } => {
+            if request_id.is_empty() || request_id.chars().count() > MAX_REQUEST_ID_CHARS {
+                return Err(rejection("invalid", "invalid request id", None));
+            }
+            // Answered already (here or on another client), or ended with
+            // its turn: say so to this phone alone rather than have Claude
+            // report it to every client.
+            if !chat.awaits_answer(request_id) {
+                return Err(rejection(
+                    "refused",
+                    "that prompt was already answered",
+                    Some(("request_id", request_id)),
+                ));
+            }
+        }
+        PhoneCommand::Interrupt => {}
+    }
+    Ok(command)
+}
+
+/// Act on one message from a phone: pass an allowed command to the chat,
+/// or refuse it. `Some` is the frame to send the phone back; an accepted
+/// command needs none (its effects arrive as chat events).
+fn act(phone: &PhoneInfo, chat: &Chat, message: &Message) -> Option<Value> {
+    let command = match phone_command(phone, chat, message) {
+        Ok(command) => command,
+        Err(frame) => {
+            eprintln!(
+                "[phone] {}: {} a message on chat {} ({} scope): {}",
+                phone.id,
+                frame["type"].as_str().unwrap_or("refused"),
+                chat.chat_id(),
+                phone.scope.label(),
+                frame["message"].as_str().unwrap_or("")
+            );
+            return Some(frame);
+        }
+    };
+    let kind = command.kind();
+    // Logged without the message text.
+    let (harness_command, about) = match command {
+        PhoneCommand::Send { id, text } => {
+            eprintln!(
+                "[phone] {}: send {id} ({} bytes) on chat {}",
+                phone.id,
+                text.len(),
+                chat.chat_id()
+            );
+            let about = ("id", id.clone());
+            let prompt = UserPrompt {
+                text,
+                images: Vec::new(),
+                id: Some(id),
+            };
+            (HarnessCommand::SendUserMessage(prompt), Some(about))
+        }
+        PhoneCommand::Answer {
+            request_id,
+            decision,
+        } => {
+            eprintln!(
+                "[phone] {}: answer {request_id} on chat {}",
+                phone.id,
+                chat.chat_id()
+            );
+            let about = ("request_id", request_id.clone());
+            (
+                HarnessCommand::Answer {
+                    request_id,
+                    decision,
+                },
+                Some(about),
+            )
+        }
+        PhoneCommand::Interrupt => {
+            eprintln!("[phone] {}: interrupt on chat {}", phone.id, chat.chat_id());
+            (HarnessCommand::Interrupt, None)
+        }
+    };
+    match chat.send(harness_command) {
+        Ok(()) => None,
+        Err(err) => {
+            eprintln!(
+                "[phone] {}: chat {} could not take a {kind}: {err}",
+                phone.id,
+                chat.chat_id()
+            );
+            Some(rejection(
+                "failed",
+                format!("the chat could not take that: {err}"),
+                about.as_ref().map(|(key, value)| (*key, value.as_str())),
+            ))
         }
     }
 }
@@ -936,10 +1126,43 @@ mod tests {
         }
     }
 
-    fn paired_token(phones: &PhoneRegistry) -> (String, String) {
-        let pairing = phones.create_pairing("phone", PhoneScope::View).unwrap();
+    fn paired_token(phones: &PhoneRegistry, scope: PhoneScope) -> (String, String) {
+        let pairing = phones.create_pairing("phone", scope).unwrap();
         let paired = phones.redeem(&pairing.code).unwrap();
         (paired.token, paired.phone.id)
+    }
+
+    /// A socket that said hello to the fixture's chat with a phone of
+    /// `scope`, past its `opened` and `history` frames.
+    async fn open_socket(fx: &Fixture, scope: PhoneScope) -> warp::test::WsClient {
+        let (token, _) = paired_token(&fx.phones, scope);
+        let mut client = warp::test::ws()
+            .path("/api/ws")
+            .handshake(routes(fx.state.clone()))
+            .await
+            .unwrap();
+        client
+            .send_text(json!({"type": "hello", "token": token, "chat_id": fx.chat_id}).to_string())
+            .await;
+        let opened = recv_json(&mut client).await;
+        assert_eq!(opened["type"], "opened");
+        assert_eq!(opened["scope"], scope.label());
+        assert_eq!(recv_json(&mut client).await["type"], "history");
+        client
+    }
+
+    async fn next_command(fx: &mut Fixture) -> HarnessCommand {
+        tokio::time::timeout(Duration::from_secs(5), fx.commands.recv())
+            .await
+            .expect("a command in time")
+            .expect("the fake process is alive")
+    }
+
+    /// The next relayed harness event on the socket.
+    async fn next_event(client: &mut warp::test::WsClient) -> Value {
+        let frame = recv_json(client).await;
+        assert_eq!(frame["type"], "event", "{frame}");
+        frame["event"]["event"].clone()
     }
 
     async fn recv_json(client: &mut warp::test::WsClient) -> Value {
@@ -998,7 +1221,7 @@ mod tests {
     #[tokio::test]
     async fn a_viewing_socket_gets_events_and_cannot_send() {
         let mut fx = fixture();
-        let (token, phone_id) = paired_token(&fx.phones);
+        let (token, phone_id) = paired_token(&fx.phones, PhoneScope::View);
         fx.events
             .send(HarnessEvent::TextDelta("before".into()))
             .unwrap();
@@ -1030,13 +1253,18 @@ mod tests {
         let first_seq = live["seq"].as_u64().unwrap();
         assert!(first_seq >= 1);
 
-        // Anything the phone sends is refused and never reaches Claude.
-        client
-            .send_text(json!({"type": "command", "command": {"type": "interrupt"}}).to_string())
-            .await;
-        assert_eq!(recv_json(&mut client).await["type"], "refused");
-        client.send_text("not even json").await;
-        assert_eq!(recv_json(&mut client).await["type"], "refused");
+        // Anything the phone sends is refused and never reaches Claude,
+        // the act commands included.
+        for message in [
+            json!({"type": "interrupt"}).to_string(),
+            json!({"type": "send", "id": uuid::Uuid::new_v4().to_string(), "text": "hi"})
+                .to_string(),
+            json!({"type": "command", "command": {"type": "interrupt"}}).to_string(),
+            "not even json".to_string(),
+        ] {
+            client.send_text(message).await;
+            assert_eq!(recv_json(&mut client).await["type"], "refused");
+        }
         assert!(fx.commands.try_recv().is_err());
 
         // Revoking closes the socket.
@@ -1053,9 +1281,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_acting_socket_sends_answers_and_interrupts() {
+        let mut fx = fixture();
+        let mut client = open_socket(&fx, PhoneScope::Act).await;
+
+        // A message reaches Claude with the page's id and no images, and
+        // comes back to the phone as the chat's echo.
+        let id = uuid::Uuid::new_v4().to_string();
+        client
+            .send_text(json!({"type": "send", "id": id, "text": "run the tests"}).to_string())
+            .await;
+        assert_eq!(
+            next_command(&mut fx).await,
+            HarnessCommand::SendUserMessage(UserPrompt {
+                text: "run the tests".into(),
+                images: Vec::new(),
+                id: Some(id.clone()),
+            })
+        );
+        let echo = next_event(&mut client).await;
+        assert_eq!(echo["type"], "user_message_echo");
+        assert_eq!(echo["data"]["id"], id.as_str());
+        assert_eq!(echo["data"]["text"], "run the tests");
+        assert_eq!(echo["data"]["image_count"], 0);
+
+        // An answer, in the chat page's decision shape, to a prompt that
+        // is waiting.
+        fx.events
+            .send(crate::harness::HarnessEvent::RuntimeRequest {
+                request_id: "r1".into(),
+                tool_use_id: "t1".into(),
+                kind: crate::harness::RuntimeRequestKind::Permission {
+                    tool_name: "Bash".into(),
+                    input: json!({"command": "cargo test"}),
+                    suggestions: Vec::new(),
+                    decision_reason: None,
+                },
+            })
+            .unwrap();
+        assert_eq!(next_event(&mut client).await["type"], "runtime_request");
+        client
+            .send_text(
+                json!({"type": "answer", "request_id": "r1", "decision": {"kind": "allow"}})
+                    .to_string(),
+            )
+            .await;
+        assert_eq!(
+            next_command(&mut fx).await,
+            HarnessCommand::Answer {
+                request_id: "r1".into(),
+                decision: RuntimeDecision::Allow {
+                    updated_input: None,
+                    remember: None,
+                },
+            }
+        );
+        let deny = json!({"type": "answer", "request_id": "r1",
+            "decision": {"kind": "deny", "message": "not now"}});
+        client.send_text(deny.to_string()).await;
+        assert_eq!(
+            next_command(&mut fx).await,
+            HarnessCommand::Answer {
+                request_id: "r1".into(),
+                decision: RuntimeDecision::Deny {
+                    message: "not now".into()
+                },
+            }
+        );
+        // Once resolved (by any client), a late answer goes no further.
+        fx.events
+            .send(crate::harness::HarnessEvent::RuntimeRequestResolved {
+                request_id: "r1".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            next_event(&mut client).await["type"],
+            "runtime_request_resolved"
+        );
+        client.send_text(deny.to_string()).await;
+        let late = recv_json(&mut client).await;
+        assert_eq!(late["type"], "refused");
+        assert_eq!(late["request_id"], "r1");
+
+        client
+            .send_text(json!({"type": "interrupt"}).to_string())
+            .await;
+        assert_eq!(next_command(&mut fx).await, HarnessCommand::Interrupt);
+        assert!(fx.commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_oversized_or_forbidden_commands_never_reach_claude() {
+        let mut fx = fixture();
+        let mut client = open_socket(&fx, PhoneScope::Act).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let cases = [
+            ("not json".to_string(), "invalid"),
+            (json!({"text": "no type"}).to_string(), "invalid"),
+            (
+                json!({"type": "send", "text": "no id"}).to_string(),
+                "invalid",
+            ),
+            (json!({"type": "send", "id": id}).to_string(), "invalid"),
+            (
+                json!({"type": "send", "id": "not-a-uuid", "text": "hi"}).to_string(),
+                "invalid",
+            ),
+            (
+                json!({"type": "send", "id": id, "text": "  \n "}).to_string(),
+                "invalid",
+            ),
+            (
+                json!({"type": "send", "id": id, "text": "x".repeat(MAX_PHONE_PROMPT_BYTES + 1)})
+                    .to_string(),
+                "invalid",
+            ),
+            (
+                json!({"type": "answer", "request_id": "r1", "decision": {"kind": "maybe"}})
+                    .to_string(),
+                "invalid",
+            ),
+            (
+                json!({"type": "answer", "request_id": "nobody-asked",
+                    "decision": {"kind": "allow"}})
+                .to_string(),
+                "refused",
+            ),
+            // Never from a phone: stopping the chat, its model or mode,
+            // withdrawing, or a raw harness command.
+            (json!({"type": "shutdown"}).to_string(), "refused"),
+            (
+                json!({"type": "set_model", "data": "opus"}).to_string(),
+                "refused",
+            ),
+            (
+                json!({"type": "set_permission_mode", "data": "bypassPermissions"}).to_string(),
+                "refused",
+            ),
+            (
+                json!({"type": "send_user_message", "data": {"text": "hi", "images": []}})
+                    .to_string(),
+                "refused",
+            ),
+        ];
+        for (message, expected) in cases {
+            client.send_text(message.clone()).await;
+            let reply = recv_json(&mut client).await;
+            assert_eq!(reply["type"], expected, "{message:.80}: {reply}");
+            assert!(reply["message"].as_str().is_some_and(|m| !m.is_empty()));
+        }
+        // The oversized message is named by its id, so the page can mark
+        // it unsent.
+        client
+            .send_text(
+                json!({"type": "send", "id": id, "text": "x".repeat(MAX_PHONE_PROMPT_BYTES + 1)})
+                    .to_string(),
+            )
+            .await;
+        assert_eq!(recv_json(&mut client).await["id"], id.as_str());
+        client.send(Message::binary(b"{}".to_vec())).await;
+        assert_eq!(recv_json(&mut client).await["type"], "invalid");
+        assert!(fx.commands.try_recv().is_err());
+
+        // A message past the socket's cap ends the socket instead.
+        client
+            .send_text("x".repeat(MAX_SOCKET_MESSAGE_BYTES + 1))
+            .await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.recv())
+            .await
+            .unwrap();
+        assert!(match closed {
+            Ok(message) => message.is_close(),
+            Err(_) => true,
+        });
+        assert!(fx.commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn a_socket_needs_a_valid_token_and_a_running_chat() {
         let fx = fixture();
-        let (token, _) = paired_token(&fx.phones);
+        let (token, _) = paired_token(&fx.phones, PhoneScope::View);
         let hello = |token: &str, chat: &str| {
             json!({"type": "hello", "token": token, "chat_id": chat}).to_string()
         };

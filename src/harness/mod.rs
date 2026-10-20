@@ -204,6 +204,18 @@ pub enum HarnessEvent {
         machine: String,
         history_gap: bool,
     },
+    /// A user message a client of an agent-owned chat sent (TRU-151),
+    /// recorded by the agent in the chat's event stream so every other
+    /// client (the desktop, a phone) shows it too. `id` is the message's
+    /// `UserPrompt::id`: a client that already drew the message under that
+    /// id skips it. Images are never relayed, only how many there were.
+    /// Raised by the agent, never by a harness or a local chat.
+    UserMessageEcho {
+        id: Option<String>,
+        text: String,
+        #[serde(default)]
+        image_count: usize,
+    },
 }
 
 /// A live native harness session: the handle a chat tab sends commands to.
@@ -389,6 +401,22 @@ mod tests {
                 "status": {"state": "failed", "message": "boom"},
                 "usage": {}, "cost_usd": 0.5}})
         );
+    }
+
+    #[test]
+    fn user_message_echo_serializes_for_the_page() {
+        let echo = HarnessEvent::UserMessageEcho {
+            id: Some("u1".into()),
+            text: "hi".into(),
+            image_count: 2,
+        };
+        let value = serde_json::to_value(&echo).unwrap();
+        assert_eq!(
+            value,
+            json!({"type": "user_message_echo",
+                   "data": {"id": "u1", "text": "hi", "image_count": 2}})
+        );
+        assert_eq!(serde_json::from_value::<HarnessEvent>(value).unwrap(), echo);
     }
 
     #[test]

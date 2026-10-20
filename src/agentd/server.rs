@@ -607,14 +607,9 @@ impl GitTermAgent for GitTermAgentService {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         eprintln!(
-            "[phone] created a pairing for {:?} ({} scope{}), expiring at {expires_unix_secs}",
+            "[phone] created a pairing for {:?} ({} scope), expiring at {expires_unix_secs}",
             request.device_name.trim(),
             pairing.scope.label(),
-            if pairing.scope != requested {
-                format!(", {} was asked", requested.label())
-            } else {
-                String::new()
-            }
         );
         Ok(Response::new(CreatePhonePairingResponse {
             pairing_url: format!("{}/pair#{}", phone.base_url, pairing.code),
@@ -2059,7 +2054,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
-        // Asking for act still pairs a viewer in stage 1.
+        // A pairing grants the scope asked for.
         let pairing = service
             .create_phone_pairing(Request::new(CreatePhonePairingRequest {
                 device_name: "Tracey's iPhone".into(),
@@ -2068,7 +2063,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(pairing.scope, "view");
+        assert_eq!(pairing.scope, "act");
         assert_eq!(
             pairing.pairing_url,
             format!("http://100.64.0.1:7778/pair#{}", pairing.code)
@@ -2083,7 +2078,7 @@ mod tests {
             .phones;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "Tracey's iPhone");
-        assert_eq!(listed[0].scope, "view");
+        assert_eq!(listed[0].scope, "act");
 
         let revoked = service
             .revoke_phone(Request::new(RevokePhoneRequest {

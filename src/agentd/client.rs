@@ -99,7 +99,7 @@ pub struct PhonePairing {
     /// Open on the phone; the code is in its fragment.
     pub pairing_url: String,
     pub expires_unix_secs: u64,
-    /// The scope the phone gets ("view" in stage 1).
+    /// The scope the phone gets ("view" or "act").
     pub scope: String,
 }
 

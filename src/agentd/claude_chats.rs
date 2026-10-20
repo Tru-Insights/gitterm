@@ -311,12 +311,26 @@ impl Chat {
 
     /// Pass a client's command to the process. Any client may send any
     /// command; `Shutdown` stops the chat for everyone.
+    ///
+    /// A user message is first recorded in the event stream as
+    /// `UserMessageEcho` (TRU-151), so every other attached client, and
+    /// any that attaches later and replays it, shows it too. It is
+    /// recorded before the process gets it, so the echo always comes ahead
+    /// of the message's lifecycle events and the turn it starts.
     pub fn send(&self, command: HarnessCommand) -> Result<(), String> {
-        if matches!(command, HarnessCommand::Shutdown) {
-            eprintln!(
+        match &command {
+            HarnessCommand::Shutdown => eprintln!(
                 "[agent] claude_chat {}: a client asked it to shut down",
                 self.chat_id
-            );
+            ),
+            HarnessCommand::SendUserMessage(prompt) => {
+                self.ingest(&HarnessEvent::UserMessageEcho {
+                    id: prompt.id.clone(),
+                    text: prompt.text.clone(),
+                    image_count: prompt.images.len(),
+                });
+            }
+            _ => {}
         }
         self.lock().last_activity = (self.clock)();
         self.process.send(command)
@@ -330,6 +344,17 @@ impl Chat {
 
     pub fn head_seq(&self) -> u64 {
         self.lock().head_seq
+    }
+
+    /// Whether runtime request `request_id` is still waiting for an answer
+    /// (raised, and not yet resolved by any client's answer or the turn's
+    /// end).
+    pub fn awaits_answer(&self, request_id: &str) -> bool {
+        self.lock()
+            .standing
+            .requests
+            .iter()
+            .any(|(id, _)| id == request_id)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ChatState> {
@@ -1006,6 +1031,74 @@ mod tests {
         a.chat.send(HarnessCommand::Interrupt).unwrap();
         b.chat.send(HarnessCommand::Interrupt).unwrap();
         assert_eq!(h.commands(0).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_sent_message_is_echoed_in_order_and_replayed_on_reattach() {
+        let h = Harness::new(ChatLimits::default());
+        let mut sender = h.registry.start_or_attach(config(Some("s1")), None);
+        let chat_id = sender.opened.chat_id.clone();
+        let mut other = h.registry.attach(&chat_id, None).unwrap();
+        h.emit(0, HarnessEvent::TextDelta("before".into())); // 1
+        settle(&sender.chat, 1).await;
+
+        let image = crate::harness::ImageAttachment {
+            media_type: "image/png".into(),
+            data: "aGk=".into(),
+        };
+        let prompt = crate::harness::UserPrompt {
+            text: "look at this".into(),
+            images: vec![image],
+            id: Some("u1".into()),
+        };
+        sender
+            .chat
+            .send(HarnessCommand::SendUserMessage(prompt.clone()))
+            .unwrap(); // 2
+                       // The process still gets the whole message, images and all.
+        assert_eq!(h.commands(0), vec![HarnessCommand::SendUserMessage(prompt)]);
+        h.emit(
+            0,
+            HarnessEvent::MessageLifecycle {
+                id: "u1".into(),
+                state: crate::harness::MessageState::Queued,
+            },
+        ); // 3
+        settle(&sender.chat, 3).await;
+
+        let echo = HarnessEvent::UserMessageEcho {
+            id: Some("u1".into()),
+            text: "look at this".into(),
+            image_count: 1,
+        };
+        for attachment in [&mut sender, &mut other] {
+            let seen: Vec<SeqEvent> = (0..3)
+                .map(|_| attachment.live.try_recv().unwrap())
+                .collect();
+            assert_eq!(seqs(&seen), vec![1, 2, 3]);
+            assert_eq!(decode(&seen[1]), echo);
+            assert!(matches!(
+                decode(&seen[2]),
+                HarnessEvent::MessageLifecycle { .. }
+            ));
+        }
+        // Only the count of images is relayed, never their bytes.
+        assert!(!sender.chat.events_after(1).unwrap()[0]
+            .json
+            .contains("aGk="));
+
+        // A client that saw through 1 gets the echo again on reattach.
+        drop(other);
+        let back = h.registry.attach(&chat_id, Some(1)).unwrap();
+        assert_eq!(seqs(&back.replay), vec![2, 3]);
+        assert_eq!(decode(&back.replay[0]), echo);
+        // It is not a standing event: a fresh attach (which reads the
+        // transcript) does not get it redelivered.
+        let fresh = h.registry.attach(&chat_id, None).unwrap();
+        assert!(fresh
+            .redelivered
+            .iter()
+            .all(|event| !matches!(decode(event), HarnessEvent::UserMessageEcho { .. })));
     }
 
     #[tokio::test]
