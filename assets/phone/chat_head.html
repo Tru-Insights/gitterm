@@ -1,8 +1,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <style>
   /* Phone view of the desktop chat page (TRU-151): a narrow, touch-sized
-     layout, a top bar instead of the composer, and nothing that acts on
-     the chat. */
+     layout with a top bar. The composer and the prompt answers show only
+     while a phone paired to act is live on a running chat
+     (body.phone-act); a view-only phone (body.phone-view) and saved
+     history only read. */
   html, body { height: 100%; height: 100dvh; -webkit-text-size-adjust: 100%; }
   body {
     font-size: 15px;
@@ -10,10 +12,21 @@
     padding: calc(env(safe-area-inset-top) + 6px) calc(env(safe-area-inset-right) + 6px) calc(env(safe-area-inset-bottom) + 6px) calc(env(safe-area-inset-left) + 6px);
   }
   #messages { padding: 10px 11px; -webkit-overflow-scrolling: touch; }
-  #composer, #stop, #submit { display: none !important; }
-  /* Prompts show what Claude waits on; answering is the desktop's. */
-  .rq-actions, .rq-options, .rq-other { display: none !important; }
-  #request-panel::after {
+  #composer { display: none !important; }
+  body.phone-act #composer { display: flex !important; }
+  /* No model, effort, mode, checkout or review from a phone, and no
+     images: only Send and Stop. */
+  body.phone-act #toolbar .tb-chips, #attachments { display: none !important; }
+  body.phone-act #toolbar .tb-send { flex: 1; justify-content: flex-end; }
+  body.phone-act #toolbar .tb-send button { padding: 8px 18px; font-size: 15px; min-height: 38px; }
+  /* 16px keeps iOS from zooming into the field on focus. */
+  body.phone-act #prompt { font-size: 16px; max-height: 30vh; }
+  /* Withdrawing a queued message is the desktop's. */
+  .queued-tag button { display: none !important; }
+  /* Prompts show what Claude waits on; only an acting phone answers. */
+  body:not(.phone-act) .rq-actions, body:not(.phone-act) .rq-options, body:not(.phone-act) .rq-other { display: none !important; }
+  body.phone-act .rq-actions button, body.phone-act .rq-options button { min-height: 36px; }
+  body.phone-view #request-panel::after {
     content: "Claude is waiting for an answer in GitTerm. This phone can only view.";
     display: block;
     margin-top: 6px;

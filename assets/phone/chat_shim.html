@@ -3,9 +3,11 @@
 // from Rust through wry; on a phone the same entry points
 // (__resetConversation / __replay / __appendEvent) are fed from the
 // agent's socket (a running chat) or its history API (a past one).
-// Stage 1 is view only: the host bridge (window.ipc) opens links and
-// drops every action, and the agent refuses anything a viewing socket
-// sends anyway.
+// The host bridge (window.ipc) opens links, and for a phone paired to act
+// on a live chat it carries the page's send, answer and stop over the
+// socket; every other page action is dropped. The agent refuses anything
+// a view-only phone sends anyway, and everything but those three from any
+// phone.
 (function () {
   'use strict';
   const TOKEN_KEY = 'gitterm.phone.token';
@@ -33,6 +35,44 @@
   }
 
   // ---- host bridge ---------------------------------------------------------
+  let socket = null;
+  let actScope = false;   // the socket's `opened` said this phone may act
+  function canAct() {
+    return actScope && socket != null && socket.readyState === WebSocket.OPEN;
+  }
+  // Show the composer and prompt answers only while the phone can act.
+  function refreshAct() {
+    document.body.classList.toggle('phone-act', canAct());
+  }
+  // A message id the agent accepts (a UUID). crypto.randomUUID needs a
+  // secure context, which a plain-HTTP tailnet page is not.
+  function newMessageId() {
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const h = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+  }
+  function sendCommand(command) {
+    socket.send(JSON.stringify(command));
+  }
+  function sendPrompt(message) {
+    const text = typeof message.text === 'string' ? message.text : '';
+    if (Array.isArray(message.images) && message.images.length) {
+      fail('Images cannot be sent from a phone; the message was not sent.');
+      return;
+    }
+    if (!text.trim()) return;
+    const id = newMessageId();
+    // The local echo; the agent's echo of the same id is then skipped.
+    window.__appendEvent({ kind: 'harness', event: { type: 'user_message_echo', data: { id, text, image_count: 0 } } });
+    try {
+      sendCommand({ type: 'send', id, text });
+    } catch (e) {
+      console.error('phone: could not send a message', e);
+      window.__markPromptUnsent(id, 'the connection dropped');
+    }
+  }
   window.ipc = {
     postMessage(raw) {
       let message = null;
@@ -42,10 +82,46 @@
         return;
       }
       if (message.type === 'hostkey') return;
-      console.warn('phone: view only; "' + message.type + '" is not sent');
+      const command = { submit: 'send', answer: 'answer', stop: 'interrupt' }[message.type];
+      if (!command) {
+        console.warn('phone: "' + message.type + '" is not sent from a phone');
+        return;
+      }
+      if (!canAct()) {
+        console.warn('phone: "' + message.type + '" is not sent: ' + (actScope ? 'not connected' : 'this phone can only view'));
+        if (actScope) fail('Not connected to the chat; nothing was sent.');
+        return;
+      }
+      try {
+        if (command === 'send') sendPrompt(message);
+        else if (command === 'answer') sendCommand({ type: 'answer', request_id: message.requestId, decision: message.decision });
+        else sendCommand({ type: 'interrupt' });
+      } catch (e) {
+        console.error('phone: could not send ' + command, e);
+        fail('Could not send that to the chat: ' + e);
+      }
     },
   };
-  window.__setTabId(0, null, null);
+  // Every chat the phone app opens is a Claude chat.
+  window.__setTabId(0, 'default', null);
+  document.getElementById('prompt').placeholder = 'Message Claude…';
+  // No images from a phone: paste and drop of files stop here, before the
+  // page's own handlers attach them.
+  function hasFiles(transfer) {
+    return !!transfer && Array.from(transfer.types || []).includes('Files');
+  }
+  window.addEventListener('paste', (e) => {
+    const items = e.clipboardData ? Array.from(e.clipboardData.items || []) : [];
+    if (!items.some((it) => it.kind === 'file')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    console.warn('phone: images cannot be attached from a phone');
+  }, true);
+  window.addEventListener('drop', (e) => {
+    if (!hasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
 
   const token = localStorage.getItem(TOKEN_KEY);
   if (!token) {
@@ -98,7 +174,6 @@
   }
 
   // ---- a running chat ---------------------------------------------------------
-  let socket = null;
   let lastSeq = null;     // the last seq shown; a reconnect resumes after it
   let finished = false;   // exited / revoked / unpaired: do not reconnect
   let retry = 0;
@@ -122,6 +197,7 @@
     };
     ws.onclose = () => {
       if (socket === ws) socket = null;
+      refreshAct();
       if (finished) return;
       const delay = Math.min(15000, 1000 * Math.pow(2, retry));
       retry += 1;
@@ -136,6 +212,9 @@
       case 'opened':
         retry = 0;
         if (message.claude_session_id) sessionId = message.claude_session_id;
+        actScope = message.scope === 'act';
+        document.body.classList.toggle('phone-view', !actScope);
+        refreshAct();
         state('Live', 'live');
         return;
       case 'history':
@@ -150,8 +229,15 @@
         else if (lastSeq == null) lastSeq = 0;
         return;
       case 'refused':
-        fail(message.message || 'The agent refused that.');
+      case 'invalid':
+      case 'failed': {
+        // A message, answer or stop the agent did not pass on.
+        // A message's bubble says so itself; anything else gets a line.
+        const why = message.message || 'The agent refused that.';
+        if (typeof message.id === 'string' && window.__markPromptUnsent(message.id, why)) return;
+        fail(why);
         return;
+      }
       case 'gap':
         // Fell behind the agent's buffer: reattach; the agent sends the
         // history again.
@@ -159,6 +245,8 @@
         return;
       case 'exited':
         finished = true;
+        actScope = false;
+        refreshAct();
         state('Ended', 'warn');
         return;
       case 'not_running':
@@ -168,6 +256,8 @@
       case 'revoked':
       case 'unauthorized':
         finished = true;
+        actScope = false;
+        refreshAct();
         localStorage.removeItem(TOKEN_KEY);
         state('Not paired', 'err');
         fail(message.type === 'revoked'
