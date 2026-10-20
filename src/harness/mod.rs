@@ -19,6 +19,7 @@
 //! `serde_json::Value`. This module has no iced dependency; the UI layer
 //! maps these events onto tabs and the webview.
 
+pub mod acp;
 pub mod claude;
 pub mod transcript;
 
@@ -93,6 +94,11 @@ pub enum HarnessEvent {
         permission_mode: Option<String>,
         /// The harness's model list, passed through.
         models: Vec<Value>,
+        /// The session modes the harness offers (ACP agents), in the chat
+        /// page's `{value, displayName, description}` shape. Empty for
+        /// Claude, whose permission modes the page knows.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modes: Vec<Value>,
     },
     /// The harness began working on a user message. Carries the session id
     /// the harness reports for this turn (Claude assigns it on the first
@@ -174,6 +180,12 @@ pub enum HarnessEvent {
         effort: Option<String>,
         applied: Option<String>,
     },
+    /// A resumed ACP session's earlier timeline, as the agent replayed it
+    /// through `session/load` (TRU-153). Emitted once, before `Ready`; the
+    /// tab takes it as its history read-back rather than showing it live.
+    HistoryReplayed {
+        entries: Vec<transcript::TranscriptEntry>,
+    },
     Error(String),
     ProcessExited {
         code: Option<i32>,
@@ -192,6 +204,21 @@ pub enum HarnessEvent {
         machine: String,
         history_gap: bool,
     },
+}
+
+/// A live native harness session: the handle a chat tab sends commands to.
+pub enum HarnessSession {
+    Claude(claude::ClaudeSession),
+    Acp(acp::AcpSession),
+}
+
+impl HarnessSession {
+    pub fn send(&self, command: HarnessCommand) -> Result<(), String> {
+        match self {
+            Self::Claude(session) => session.send(command),
+            Self::Acp(session) => session.send(command),
+        }
+    }
 }
 
 /// The human's answer to a `RuntimeRequest`.
@@ -507,6 +534,19 @@ mod tests {
                 session_id: Some("s".into()),
                 permission_mode: Some("default".into()),
                 models: vec![json!({"value": "haiku"})],
+                modes: Vec::new(),
+            },
+            HarnessEvent::Ready {
+                session_id: Some("g".into()),
+                permission_mode: Some("plan".into()),
+                models: Vec::new(),
+                modes: vec![json!({"value": "plan", "displayName": "Plan"})],
+            },
+            HarnessEvent::HistoryReplayed {
+                entries: vec![
+                    transcript::TranscriptEntry::UserPrompt("hi".into()),
+                    transcript::TranscriptEntry::Harness(HarnessEvent::TextDelta("yo".into())),
+                ],
             },
             HarnessEvent::TurnStarted {
                 session_id: None,

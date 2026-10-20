@@ -875,6 +875,7 @@ mod tests {
                 session_id: None,
                 permission_mode: Some("default".into()),
                 models: Vec::new(),
+                modes: Vec::new(),
             },
         );
         h.emit(0, turn_started("s1"));
@@ -912,6 +913,7 @@ mod tests {
                 session_id: None,
                 permission_mode: Some("default".into()),
                 models: Vec::new(),
+                modes: Vec::new(),
             },
         ); // 1
         h.emit(0, turn_started("s1")); // 2

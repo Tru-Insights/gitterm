@@ -63,6 +63,7 @@ fn show(ev: &HarnessEvent) {
             session_id,
             permission_mode,
             models,
+            ..
         } => println!(
             "[event] ready session_id={session_id:?} mode={permission_mode:?} models={}",
             models.len()

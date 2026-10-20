@@ -4,6 +4,7 @@ use crate::browser_control::{
     BrowserCaptureMode, BrowserControlService, BrowserKey, BrowserLaunchOptions, BrowserLocator,
     BrowserNodeSelector, BrowserOperation, BrowserSnapshot, BrowserViewport, BrowserWaitCondition,
 };
+use crate::harness::acp::AcpMcpServer;
 use crate::harness::claude::ClaudeMcpServer;
 use axum::{
     body::Body,
@@ -91,6 +92,19 @@ impl BrowserMcpConnection {
             config: claude_mcp_config(&self.endpoint),
             allowed_tools: claude_allowed_tools(),
             env: self.terminal_environment().into(),
+        }
+    }
+
+    /// The browser server for an ACP chat (Gemini, OpenCode; TRU-153),
+    /// with its bearer header carried literally in `session/new`.
+    pub fn acp_mcp_server(&self) -> AcpMcpServer {
+        AcpMcpServer {
+            name: "gitterm_browser".to_string(),
+            url: self.endpoint.clone(),
+            headers: vec![(
+                "Authorization".to_string(),
+                format!("Bearer {}", self.token),
+            )],
         }
     }
 }

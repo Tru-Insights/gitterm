@@ -4,6 +4,7 @@
 //! command bridge and is handled by the Iced application event loop, preserving
 //! one owner for persistence, worktree provisioning, tabs, and UI state.
 
+use crate::harness::acp::AcpMcpServer;
 use crate::harness::claude::ClaudeMcpServer;
 use axum::{
     body::Body,
@@ -358,6 +359,21 @@ impl TaskMcpConnection {
             config: claude_mcp_config(&caller_endpoint(&self.endpoint, caller)),
             allowed_tools: vec![CLAUDE_ALLOWED_TOOLS.to_string()],
             env: self.terminal_environment(caller).into(),
+        }
+    }
+
+    /// The task server for an ACP chat (Gemini, OpenCode; TRU-153): the
+    /// same URL and caller attribution as `claude_mcp_server`. ACP carries
+    /// header values literally, so the bearer token rides in the
+    /// `session/new` frame on the agent's stdin.
+    pub fn acp_mcp_server(&self, caller: Option<&str>) -> AcpMcpServer {
+        AcpMcpServer {
+            name: "gitterm_tasks".to_string(),
+            url: caller_endpoint(&self.endpoint, caller),
+            headers: vec![(
+                "Authorization".to_string(),
+                format!("Bearer {}", self.token),
+            )],
         }
     }
 

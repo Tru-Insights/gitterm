@@ -344,6 +344,7 @@ impl ClaudeFrameParser {
                     session_id: resume.clone(),
                     permission_mode: body["current_permission_mode"].as_str().map(str::to_string),
                     models: body["models"].as_array().cloned().unwrap_or_default(),
+                    modes: Vec::new(),
                 }));
             }
             (HostRequest::Initialize { .. }, Err(e)) => out.push(ParsedFrame::Event(
@@ -857,7 +858,7 @@ fn extra_bin_dirs() -> Vec<PathBuf> {
 }
 
 /// The PATH for the child: the inherited PATH plus the usual install dirs.
-fn child_path() -> OsString {
+pub(super) fn child_path() -> OsString {
     let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -2263,6 +2264,7 @@ mod tests {
             session_id,
             permission_mode,
             models,
+            ..
         }] = evs.as_slice()
         else {
             panic!("expected one Ready, got {evs:?}");
@@ -3044,6 +3046,7 @@ mod tests {
             session_id: Some("s1".into()),
             permission_mode: None,
             models: Vec::new(),
+            modes: Vec::new(),
         };
         let request = HarnessEvent::RuntimeRequest {
             request_id: "r1".into(),
