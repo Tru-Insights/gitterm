@@ -2,8 +2,8 @@ use git2::{DiffOptions, Repository, Status, StatusOptions};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{
-    button, column, container, image, pick_list, row, scrollable, text, text_editor, text_input,
-    Column, Row, Stack,
+    button, checkbox, column, container, image, pick_list, row, scrollable, text, text_editor,
+    text_input, Column, Row, Stack,
 };
 use iced::{color, Length, Size, Subscription, Task, Theme};
 use iced_term::{SearchMatch, TerminalView};
@@ -5644,6 +5644,8 @@ pub enum Event {
     PhonePanelOpen(String),
     PhonePanelClose,
     PhoneDeviceNameChanged(String),
+    /// "Allow sending and approving" ticked or cleared.
+    PhoneAllowActToggled(bool),
     PhonePairingCreate,
     /// remote id, the new pairing or why not.
     PhonePairingCreated(String, Result<PhonePairing, String>),
@@ -6959,6 +6961,9 @@ struct PhonePanel {
     machine_name: String,
     /// Shown in the paired-phones list.
     device_name: String,
+    /// "Allow sending and approving": the next pairing gets act scope.
+    /// Off by default; a phone already paired keeps its scope.
+    allow_act: bool,
     pairing: Option<PhonePairingView>,
     /// `None` while loading.
     phones: Option<Vec<PairedPhoneInfo>>,
@@ -6970,8 +6975,19 @@ struct PhonePanel {
 #[derive(Debug, Clone)]
 struct PhonePairingView {
     url: String,
+    /// The scope the agent granted ("view" or "act").
+    scope: String,
     expires_unix_secs: u64,
     qr: iced::widget::image::Handle,
+}
+
+/// How the pairing panel names a phone scope from the agent.
+fn phone_scope_label(scope: &str) -> String {
+    match scope {
+        "view" => "view only".to_string(),
+        "act" => "can send and approve".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Pixels per QR module in the pairing panel, and the quiet zone around
@@ -23132,6 +23148,7 @@ fi
                     remote_id,
                     machine_name,
                     device_name: "iPhone".to_string(),
+                    allow_act: false,
                     pairing: None,
                     phones: None,
                     busy: false,
@@ -23148,6 +23165,11 @@ fi
                     panel.device_name = value;
                 }
             }
+            Event::PhoneAllowActToggled(allow) => {
+                if let Some(panel) = self.phone_panel.as_mut() {
+                    panel.allow_act = allow;
+                }
+            }
             Event::PhonePairingCreate => {
                 let Some(panel) = self.phone_panel.as_mut() else {
                     return Task::none();
@@ -23160,6 +23182,7 @@ fi
                     panel.error = Some("Name the phone first.".to_string());
                     return Task::none();
                 }
+                let scope = if panel.allow_act { "act" } else { "view" };
                 let Some((remote_id, client)) = self.phone_panel_client() else {
                     return Task::none();
                 };
@@ -23170,7 +23193,7 @@ fi
                 return Task::perform(
                     async move {
                         let result = RemoteAgentBackend::new(client)
-                            .create_phone_pairing(device_name, "view".to_string())
+                            .create_phone_pairing(device_name, scope.to_string())
                             .await
                             .map_err(|err| err.to_string());
                         (remote_id, result)
@@ -23190,6 +23213,7 @@ fi
                 let view = result.and_then(|pairing| {
                     phone_pairing_qr(&pairing.pairing_url).map(|qr| PhonePairingView {
                         url: pairing.pairing_url,
+                        scope: pairing.scope,
                         expires_unix_secs: pairing.expires_unix_secs,
                         qr,
                     })
@@ -24897,11 +24921,36 @@ fi
                 .color(text_primary),
             text(
                 "Scan the code with the phone's camera; the phone must be on the \
-                 same tailnet. It can view this machine's chats, not send to them.",
+                 same tailnet. It can view this machine's chats; allowed to send, \
+                 it can also message them, answer their prompts and stop a turn. \
+                 To change what a phone may do, revoke it and pair it again.",
             )
             .size(11)
             .color(text_muted),
             name_row,
+            checkbox(panel.allow_act)
+                .label("Allow sending and approving")
+                .on_toggle_maybe((!panel.busy).then_some(Event::PhoneAllowActToggled))
+                .size(14)
+                .text_size(12)
+                .style(move |_theme: &Theme, status: checkbox::Status| {
+                    let checked = matches!(
+                        status,
+                        checkbox::Status::Active { is_checked: true }
+                            | checkbox::Status::Hovered { is_checked: true }
+                            | checkbox::Status::Disabled { is_checked: true }
+                    );
+                    checkbox::Style {
+                        background: if checked { accent } else { bg_base }.into(),
+                        icon_color: bg_base,
+                        border: iced::Border {
+                            color: if checked { accent } else { border_color },
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        text_color: Some(text_primary),
+                    }
+                }),
         ]
         .spacing(10)
         .padding([24, 28]);
@@ -24919,7 +24968,8 @@ fi
                         .font(mono)
                         .color(text_secondary),
                     text(format!(
-                        "Works once · expires at {}",
+                        "{} · works once · expires at {}",
+                        phone_scope_label(&pairing.scope),
                         local_clock_time(pairing.expires_unix_secs)
                     ))
                     .size(10)
@@ -24956,7 +25006,7 @@ fi
                         row![
                             column![
                                 text(phone.name.clone()).size(12).color(text_primary),
-                                text(format!("{} · {seen}", phone.scope))
+                                text(format!("{} · {seen}", phone_scope_label(&phone.scope)))
                                     .size(10)
                                     .color(text_muted),
                             ]
