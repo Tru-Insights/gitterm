@@ -359,6 +359,25 @@ pub fn insert_agent_composer_text(tab_id: usize, text: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Open one roster row's activity (a subagent's block or a delegation's
+/// card, by the page's roster key) in agent tab `tab_id`'s page, as a
+/// click on the row would (`window.__revealRosterItem`, TRU-154). Returns
+/// whether the page existed; the caller holds the key otherwise.
+pub fn reveal_agent_roster_row(tab_id: usize, key: &str) -> bool {
+    let literal = serde_json::Value::String(key.to_string());
+    let script = format!("window.__revealRosterItem && window.__revealRosterItem({literal})");
+    with_existing_slot(WebviewSurface::Agent(tab_id), |slot| {
+        let Some(webview) = slot.webview.as_ref() else {
+            return false;
+        };
+        if let Err(e) = webview.evaluate_script(&script) {
+            eprintln!("[agent-webview] roster reveal failed for tab={tab_id} key={key}: {e}");
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
 /// Paste the system pasteboard into agent tab `tab_id`'s page, where its
 /// focus or selection is, as an Edit menu's Paste would: the page forwards
 /// Cmd+V (GitTerm has no Edit menu, so WebKit never gets `paste:` from the

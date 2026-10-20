@@ -280,6 +280,11 @@ pub(crate) struct AgentSession {
     /// (TRU-152). Not in the conversation, so a page rebuilt meanwhile is
     /// given it again.
     pub(crate) remote_disconnected: Option<AgentEvent>,
+    /// Bumped on every `record`, merged fragments included, so the Chats
+    /// overview knows when to rebuild its snapshot (TRU-154).
+    pub(crate) revision: u64,
+    /// Turn and subagent times seen live; the buffer carries no clock.
+    pub(crate) live_times: crate::chat_overview::LiveTimes,
 }
 
 impl AgentSession {
@@ -296,6 +301,8 @@ impl AgentSession {
             pending_requests: Vec::new(),
             history: HistoryLoad::NotLoaded,
             remote_disconnected: None,
+            revision: 0,
+            live_times: crate::chat_overview::LiveTimes::default(),
         }
     }
 
@@ -316,6 +323,8 @@ impl AgentSession {
     /// subagent's start is followed by when it started, so a rebuilt page
     /// still knows its elapsed time and where it falls in the roster.
     pub(crate) fn record(&mut self, ev: AgentEvent) {
+        self.revision = self.revision.wrapping_add(1);
+        self.live_times.observe(&ev, std::time::SystemTime::now());
         if let (Some(AgentEvent::Harness(last)), AgentEvent::Harness(next)) =
             (self.conversation.last_mut(), &ev)
         {

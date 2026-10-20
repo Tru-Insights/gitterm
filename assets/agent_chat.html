@@ -2206,6 +2206,33 @@
     if (rosterTimer) { clearInterval(rosterTimer); rosterTimer = null; }
     renderRoster();
   }
+  // Open one roster row's activity from the host (a Chats overview click,
+  // TRU-154): `sub:<tool_use_id>` or `dlg:<delegation id>`, the roster's
+  // own keys. A row not on the page yet (it is being rebuilt) is tried
+  // once more when the replay ends.
+  let pendingReveal = null;
+  function rosterRowFor(key) {
+    if (key.startsWith('sub:')) {
+      const sub = subagents.find((s) => 'sub:' + s.item.card.dataset.toolId === key);
+      return sub ? subagentRow(sub) : null;
+    }
+    if (key.startsWith('dlg:')) {
+      const card = cards.get(key.slice(4));
+      return card && card.data ? delegationRow(card) : null;
+    }
+    return null;
+  }
+  function revealRosterKey(key) {
+    const row = rosterRowFor(key);
+    if (!row) return false;
+    if (rosterHidden.delete(key)) renderRoster();
+    revealRosterTarget(row);
+    return true;
+  }
+  window.__revealRosterItem = function (key) {
+    if (typeof key !== 'string' || !key) return;
+    pendingReveal = revealRosterKey(key) ? null : key;
+  };
 
 
   // ---- runtime requests (panel above the composer) -----------------------
@@ -2654,6 +2681,11 @@
     renderRoster();
     follow = true;
     messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (pendingReveal) {
+      const key = pendingReveal;
+      pendingReveal = null;
+      revealRosterKey(key);
+    }
   };
 
   window.__resetConversation = function () {
@@ -2720,6 +2752,7 @@
     if (cmdOnly && (digit || k.toLowerCase() === 't')) return true; // Cmd+1…9, Cmd+T
     if (cmdOnly && k.toLowerCase() === 'v') return true; // Cmd+V: paste, sent back as the native paste: action
     if (e.metaKey && e.shiftKey && !e.ctrlKey && !e.altKey && k.toLowerCase() === 'u') return true; // Cmd+Shift+U
+    if (e.metaKey && e.shiftKey && !e.ctrlKey && !e.altKey && k.toLowerCase() === 'o') return true; // Cmd+Shift+O
     if (k === 'Escape' && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) return !pageHasOpenLayer();
     return false;
   }

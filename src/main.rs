@@ -35,6 +35,7 @@ mod webview;
 
 // New modules
 mod agent;
+mod chat_overview;
 mod chat_rank;
 mod config;
 mod events;
@@ -512,6 +513,8 @@ enum GlobalShortcut {
     UsageView,
     /// Cmd+T: the task switcher.
     TaskSwitcher,
+    /// Cmd+Shift+O: the Chats overview (TRU-154).
+    ChatsOverview,
     /// Escape with no modifiers: dismiss the topmost app overlay. The key
     /// handler resolves Escape against app state itself; it is listed here
     /// so a chat page can forward it.
@@ -544,6 +547,14 @@ fn global_shortcut(key: &Key, modifiers: Modifiers) -> Option<GlobalShortcut> {
             }
             if modifiers.command() && modifiers.shift() && c.eq_ignore_ascii_case("u") {
                 return Some(GlobalShortcut::UsageView);
+            }
+            if modifiers.command()
+                && modifiers.shift()
+                && !modifiers.control()
+                && !modifiers.alt()
+                && c.eq_ignore_ascii_case("o")
+            {
+                return Some(GlobalShortcut::ChatsOverview);
             }
             if modifiers.command()
                 && !modifiers.shift()
@@ -3081,6 +3092,36 @@ fn post_needs_you_notification(title: &str, body: &str) {
     });
 }
 
+/// The Chats overview's snapshot, the key it was built for and when
+/// (TRU-154). A cell because `view` takes `&self` and builds it on first
+/// need.
+type ChatOverviewCache =
+    std::cell::RefCell<Option<(u64, Instant, std::rc::Rc<chat_overview::OverviewSnapshot>)>>;
+
+/// Least time between two overview snapshot builds. A streaming chat
+/// changes the key on every delta; the menu poll redraws every
+/// `MENU_POLL_INTERVAL_MS`, so the overview trails by well under a second.
+const OVERVIEW_REBUILD_MIN: Duration = Duration::from_millis(250);
+
+/// How often the visible Chats overview asks a remote which Claude chats
+/// it runs (`ListClaudeChats`). Never while the overview is hidden.
+const OVERVIEW_REMOTE_POLL: Duration = Duration::from_secs(10);
+
+/// One clickable row of the Chats overview (TRU-154), ready to draw.
+struct OverviewRow {
+    icon: &'static str,
+    icon_color: iced::Color,
+    title: String,
+    /// Where it lives and what runs it; empty for nested rows.
+    meta: String,
+    detail: Option<(String, iced::Color)>,
+    /// Elapsed time, age or cost, right-aligned.
+    right: String,
+    target: chat_overview::NavTarget,
+    /// Left inset for a row nested under its chat.
+    indent: f32,
+}
+
 /// One row of the Chats panel's Open section (TRU-148): an open tab, where
 /// it lives, and what orders it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3826,6 +3867,9 @@ struct TabState {
     created_at: Instant,
     // Sidebar mode (Git or Files)
     sidebar_mode: SidebarMode,
+    // The mode this tab was in before the Chats panel opened; a jump out
+    // of the Chats overview returns the tab to it (TRU-154).
+    sidebar_mode_before_chats: SidebarMode,
     // Local working directory of this tab (terminal-tracked for terminal
     // tabs; used as the cwd for spawning consoles/agents/new tabs). For
     // local tabs the file browser mirrors it; remote browsing never touches
@@ -3915,6 +3959,7 @@ impl TabState {
             file_index: -1,
             created_at: Instant::now(),
             sidebar_mode: SidebarMode::Git,
+            sidebar_mode_before_chats: SidebarMode::Git,
             files: FilesState::at(SourcePath::Local(current_dir.clone())),
             current_dir,
             search: SearchState::default(),
@@ -4079,6 +4124,12 @@ impl TabState {
     /// A conversation picked in the Chats panel is being previewed.
     fn chat_preview_open(&self) -> bool {
         self.sidebar_mode == SidebarMode::Chats && self.selected_chat.is_some()
+    }
+
+    /// The Chats panel is open with nothing selected: the main pane is the
+    /// Chats overview (TRU-154).
+    fn chats_overview_open(&self) -> bool {
+        self.sidebar_mode == SidebarMode::Chats && self.selected_chat.is_none()
     }
 
     fn viewing_file_path(&self) -> Option<&Path> {
@@ -5653,6 +5704,13 @@ pub enum Event {
     ToggleChatOpenSection,
     /// Focus an open tab by id, switching workspace when needed.
     FocusTabById(usize),
+    /// Show the Chats overview (TRU-154): the Chats panel with nothing
+    /// selected, from wherever the user is (Cmd+Shift+O).
+    ChatsOverviewOpen,
+    /// Go where a Chats overview row points.
+    ChatOverviewGo(chat_overview::NavTarget),
+    /// Fold or unfold the overview's "Idle but open" section.
+    ToggleChatOverviewIdle,
     /// Fold/unfold one machine group in the workspace bar.
     ToggleMachineGroup(String),
     /// Open/close the machine label menu in the workspace bar.
@@ -5978,6 +6036,24 @@ struct App {
     /// chats are asked. Kept when a fetch fails, so a running chat is never
     /// offered a second process on a stale "not running".
     remote_running_chats: HashMap<String, Vec<RunningClaudeChat>>,
+    /// Bumped whenever `remote_running_chats` changes, for the Chats
+    /// overview's snapshot key (TRU-154).
+    remote_running_chats_revision: u64,
+    /// When the Chats overview last asked each remote for its running
+    /// chats, and whether that ask is still out. Polled only while the
+    /// overview is on screen, at most every `OVERVIEW_REMOTE_POLL`.
+    overview_running_polled: HashMap<String, (Instant, bool)>,
+    /// The Chats overview's snapshot and the key it was built for. Built
+    /// in `view` on first need and rebuilt only when the key changes, so a
+    /// frame costs a cheap key, not a walk of every conversation.
+    chat_overview_cache: ChatOverviewCache,
+    /// The overview's "Idle but open" section is unfolded (folded by
+    /// default; per app run).
+    chat_overview_idle_expanded: bool,
+    /// A roster row to open in a chat page that is not built yet (an
+    /// overview click on a subagent or worker), delivered on
+    /// `AgentWebviewCreated` like `dictation_held`.
+    roster_reveal_held: HashMap<usize, String>,
     /// Preview tail for the most recently selected chat, keyed by session
     /// id so a stale load never renders under the wrong chat.
     chat_preview: Option<(chats::ChatRef, chats::ChatPreview)>,
@@ -13054,6 +13130,11 @@ impl App {
             machine_menu: None,
             remote_chat_indexes: HashMap::new(),
             remote_running_chats: HashMap::new(),
+            remote_running_chats_revision: 0,
+            overview_running_polled: HashMap::new(),
+            chat_overview_cache: ChatOverviewCache::default(),
+            chat_overview_idle_expanded: false,
+            roster_reveal_held: HashMap::new(),
             chat_preview: None,
             jev_client: gitterm::jev::JevClient::from_env(),
             chat_rank: chat_rank::ChatRankState::default(),
@@ -15041,6 +15122,346 @@ fi
         rows
     }
 
+    /// Whether the Chats overview is on screen (TRU-154): the active tab has
+    /// the Chats panel open with nothing selected, and neither the Usage
+    /// view nor a chat tab's file or diff covers it.
+    fn chats_overview_visible(&self) -> bool {
+        !self.usage_view.open
+            && self.active_tab().is_some_and(|tab| {
+                tab.chats_overview_open()
+                    && !(matches!(tab.kind, TabKind::Agent(_))
+                        && (tab.viewing_file_path().is_some() || tab.selected_file.is_some()))
+            })
+    }
+
+    /// Ask each connected remote that owns its Claude chats which are
+    /// running, at most every `OVERVIEW_REMOTE_POLL` and one ask at a time,
+    /// and only while the Chats overview is on screen. An ask that never
+    /// answered is retried after six poll periods.
+    fn poll_overview_remote_chats(&mut self) -> Task<Event> {
+        if !self.chats_overview_visible() {
+            return Task::none();
+        }
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .remote_agent_defs
+            .iter()
+            .map(|agent| agent.id.clone())
+            .filter(|remote_id| self.remote_owns_claude_chats(remote_id))
+            .filter(
+                |remote_id| match self.overview_running_polled.get(remote_id) {
+                    Some((at, true)) => now.duration_since(*at) >= OVERVIEW_REMOTE_POLL * 6,
+                    Some((at, false)) => now.duration_since(*at) >= OVERVIEW_REMOTE_POLL,
+                    None => true,
+                },
+            )
+            .collect();
+        let mut tasks = Vec::with_capacity(due.len());
+        for remote_id in due {
+            tasks.push(self.request_remote_running_chats(&remote_id));
+            self.overview_running_polled.insert(remote_id, (now, true));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Follow a Chats overview row (TRU-154). Landing on a tab closes the
+    /// Chats panel there (back to the panel it had before), so the tab
+    /// shows its own content; a subagent or worker row also opens that
+    /// agent's activity in the chat page.
+    fn chat_overview_go(&mut self, target: chat_overview::NavTarget) -> Task<Event> {
+        use chat_overview::NavTarget;
+        let (jump, arrived_at, reveal) = match target {
+            NavTarget::Tab(tab_id) => (
+                self.jump_to_attention_target(AttentionTarget::Tab(tab_id)),
+                Some(tab_id),
+                None,
+            ),
+            NavTarget::Roster { tab_id, key } => (
+                self.jump_to_attention_target(AttentionTarget::Tab(tab_id)),
+                Some(tab_id),
+                Some((tab_id, key)),
+            ),
+            NavTarget::OpenChat(chat) => {
+                let jump = self.resume_chat_as_chat_tab(chat.clone());
+                let arrived_at = self
+                    .find_chat_tab(&chat)
+                    .map(|(ws_idx, tab_idx)| self.workspaces[ws_idx].tabs[tab_idx].id);
+                (jump, arrived_at, None)
+            }
+            NavTarget::Task(task_id) => return self.enter_task_context(&task_id),
+            NavTarget::Nowhere => return Task::none(),
+        };
+        let mut tasks = vec![jump];
+        let front = self.front_tab_id();
+        if arrived_at.is_none() || front != arrived_at {
+            // The jump did not land (it logged why); stay on the overview.
+            return Task::batch(tasks);
+        }
+        let back_to = self
+            .active_tab()
+            .filter(|tab| tab.sidebar_mode == SidebarMode::Chats)
+            .map(|tab| tab.sidebar_mode_before_chats);
+        if let Some(mode) = back_to {
+            if let Some(tab) = self.active_tab_mut() {
+                tab.selected_chat = None;
+            }
+            tasks.push(self.update(Event::SetSidebarMode(mode)));
+        }
+        if let Some((tab_id, key)) = reveal {
+            if !webview::reveal_agent_roster_row(tab_id, &key) {
+                // Its page is built on show; delivered on AgentWebviewCreated.
+                self.roster_reveal_held.insert(tab_id, key);
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// The Chats overview's snapshot, rebuilt only when its key changed.
+    fn chat_overview_snapshot(&self) -> std::rc::Rc<chat_overview::OverviewSnapshot> {
+        let key = self.chat_overview_key();
+        let mut cache = self.chat_overview_cache.borrow_mut();
+        if let Some((cached_key, built_at, snapshot)) = cache.as_ref() {
+            if *cached_key == key || built_at.elapsed() < OVERVIEW_REBUILD_MIN {
+                return snapshot.clone();
+            }
+        }
+        let snapshot = std::rc::Rc::new(self.build_chat_overview());
+        *cache = Some((key, Instant::now(), snapshot.clone()));
+        snapshot
+    }
+
+    /// A hash of everything the overview snapshot is built from: per tab
+    /// its identity, attention, title topic and chat session (with the
+    /// session's revision, which every recorded event bumps), the
+    /// delegations' states, the remotes' running chats and the indexes'
+    /// sizes. Cheap enough per frame; a change rebuilds the snapshot.
+    fn chat_overview_key(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for workspace in &self.workspaces {
+            self.remote_agent_id_for_workspace(workspace)
+                .hash(&mut hasher);
+            workspace.name.hash(&mut hasher);
+            for tab in &workspace.tabs {
+                tab.id.hash(&mut hasher);
+                tab.chat_session_id.hash(&mut hasher);
+                tab.repo_name.hash(&mut hasher);
+                tab.branch_name.hash(&mut hasher);
+                tab.is_running().hash(&mut hasher);
+                tab.attention
+                    .map(|attention| attention.reason.label())
+                    .hash(&mut hasher);
+                tab.terminal_title()
+                    .map(strip_title_status_glyphs)
+                    .hash(&mut hasher);
+                if let Some(session) = tab.agent_session() {
+                    session.revision.hash(&mut hasher);
+                    session.conversation.len().hash(&mut hasher);
+                    std::mem::discriminant(&session.state).hash(&mut hasher);
+                    session.pending_requests.len().hash(&mut hasher);
+                    session.session_id.hash(&mut hasher);
+                }
+            }
+        }
+        if let Some(store) = self.task_store.as_ref() {
+            for delegation in store.delegations() {
+                delegation.delegation_id.hash(&mut hasher);
+                delegation.status.label().hash(&mut hasher);
+                delegation.updated_at.hash(&mut hasher);
+                delegation.dismissed_at.is_some().hash(&mut hasher);
+            }
+        }
+        self.remote_running_chats_revision.hash(&mut hasher);
+        self.chat_index.len().hash(&mut hasher);
+        self.remote_chat_indexes
+            .values()
+            .map(|state| state.entries.len())
+            .sum::<usize>()
+            .hash(&mut hasher);
+        self.remote_agent_defs.len().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Build the Chats overview snapshot (TRU-154) from the open tabs on
+    /// every machine, the delegations in the task store and the chats the
+    /// remotes say they run. Walks every chat tab's conversation, so it
+    /// runs only when `chat_overview_key` changes.
+    fn build_chat_overview(&self) -> chat_overview::OverviewSnapshot {
+        use chat_overview::{
+            Harness, RemoteChatState, SessionInput, TabInput, TabRuns, TerminalInput,
+        };
+        let now = std::time::SystemTime::now();
+        let delegations: &[gitterm::tasks::Delegation] = self
+            .task_store
+            .as_ref()
+            .map(TaskStore::delegations)
+            .unwrap_or(&[]);
+        let task_title = |delegation: &gitterm::tasks::Delegation| match &delegation.child {
+            gitterm::tasks::DelegationChild::TaskSession { task_id, .. } => self
+                .task_store
+                .as_ref()
+                .and_then(|store| store.get(task_id))
+                .map(|task| match &task.issue {
+                    Some(issue) => format!("{} {}", issue.key, task.title),
+                    None => task.title.clone(),
+                }),
+            _ => None,
+        };
+
+        let mut snapshot = chat_overview::OverviewSnapshot::default();
+        let mut open_uids: HashSet<&str> = HashSet::new();
+        for workspace in &self.workspaces {
+            let remote_id = self.remote_agent_id_for_workspace(workspace);
+            let machine = self.chat_machine_name(remote_id);
+            // Tool paths in steps read relative to where the agent works.
+            let root = match &workspace.location {
+                WorkspaceLocation::RemoteAgent { root, .. } => PathBuf::from(root),
+                _ => workspace.dir.clone(),
+            };
+            for tab in &workspace.tabs {
+                let session = tab.agent_session();
+                let chat = tab
+                    .chat_session_id
+                    .as_deref()
+                    .or_else(|| session.and_then(|session| session.session_id.as_deref()))
+                    .map(|id| chats::ChatRef::new(remote_id, id));
+                let entry = chat.as_ref().and_then(|chat| self.find_chat_entry(chat));
+                let runs = match session {
+                    Some(session) => TabRuns::Chat(SessionInput {
+                        harness: match session.backend() {
+                            tab::AgentBackend::Claude => Harness::Claude,
+                            tab::AgentBackend::Acp(gitterm::harness::acp::AcpAgent::Gemini) => {
+                                Harness::Gemini
+                            }
+                            tab::AgentBackend::Acp(gitterm::harness::acp::AcpAgent::OpenCode) => {
+                                Harness::OpenCode
+                            }
+                            tab::AgentBackend::Pi => Harness::Pi,
+                        },
+                        conversation: &session.conversation,
+                        pending_requests: session.pending_requests.len(),
+                        streaming: matches!(session.state, tab::AgentSessionState::Streaming),
+                        stopped: matches!(session.state, tab::AgentSessionState::Stopped),
+                        configured_model: session.config.chat_model(),
+                        live_times: &session.live_times,
+                    }),
+                    None => TabRuns::Terminal(TerminalInput {
+                        harness: chat_overview::terminal_harness(
+                            entry.map(|entry| entry.backend),
+                            tab.startup_command(),
+                            tab.terminal_title(),
+                        ),
+                        // A blocked worker shows as its own row.
+                        needs_you: tab
+                            .attention
+                            .map(|attention| attention.reason)
+                            .filter(|reason| *reason == AttentionReason::HumanInputRequired)
+                            .map(AttentionReason::label),
+                        running: tab.is_running(),
+                    }),
+                };
+                // The Open section's tabs, plus terminals running a CLI.
+                if let TabRuns::Terminal(terminal) = &runs {
+                    if tab.chat_session_id.is_none()
+                        && tab.attention.is_none()
+                        && terminal.harness == Harness::Terminal
+                    {
+                        continue;
+                    }
+                }
+                open_uids.insert(tab.session_uid.as_str());
+                let cwd = if tab.current_dir.starts_with(&root) {
+                    tab.current_dir.as_path()
+                } else {
+                    root.as_path()
+                };
+                let display_title = self.tab_display_title(tab);
+                snapshot.chats.push(chat_overview::tab_snapshot(
+                    TabInput {
+                        tab_id: tab.id,
+                        index_title: entry.map(|entry| entry.title.as_str()),
+                        chat,
+                        display_title,
+                        machine: &machine,
+                        repo: &tab.repo_name,
+                        branch: (tab.is_git_repo && !tab.branch_name.is_empty())
+                            .then_some(tab.branch_name.as_str()),
+                        cwd: Some(cwd),
+                        runs,
+                        delegations: delegations
+                            .iter()
+                            .filter(|delegation| delegation.parent.session_uid == tab.session_uid)
+                            .map(|delegation| (delegation, task_title(delegation)))
+                            .collect(),
+                    },
+                    now,
+                ));
+            }
+        }
+
+        // Persistent chats a remote runs that no tab holds (TRU-152).
+        for agent in &self.remote_agent_defs {
+            let Some(running) = self.remote_running_chats.get(&agent.id) else {
+                continue;
+            };
+            let machine = self.chat_machine_name(Some(&agent.id));
+            for chat in running {
+                let chat_ref = (!chat.claude_session_id.is_empty())
+                    .then(|| chats::ChatRef::new(Some(&agent.id), &chat.claude_session_id));
+                if chat_ref
+                    .as_ref()
+                    .is_some_and(|chat_ref| self.find_chat_tab(chat_ref).is_some())
+                {
+                    continue;
+                }
+                let entry = chat_ref
+                    .as_ref()
+                    .and_then(|chat_ref| self.find_chat_entry(chat_ref));
+                snapshot.chats.push(chat_overview::remote_chat_snapshot(
+                    chat_ref.clone(),
+                    entry.map(|entry| entry.title.as_str()),
+                    &chat.cwd,
+                    &machine,
+                    entry.and_then(|entry| entry.branch.as_deref()),
+                    match chat.state {
+                        RunningClaudeChatState::Idle => RemoteChatState::Idle,
+                        RunningClaudeChatState::TurnRunning => RemoteChatState::TurnRunning,
+                        RunningClaudeChatState::AwaitingInput => RemoteChatState::AwaitingInput,
+                    },
+                ));
+            }
+        }
+
+        // Delegations whose requesting chat is not open in a tab.
+        for delegation in delegations
+            .iter()
+            .filter(|delegation| !open_uids.contains(delegation.parent.session_uid.as_str()))
+        {
+            let parent_chat = delegation
+                .parent
+                .chat_session_id
+                .as_deref()
+                .and_then(|id| self.find_chat_entry_any(id))
+                .map(|(remote, entry)| {
+                    (chats::ChatRef::new(remote, &entry.id), entry.title.as_str())
+                });
+            let machine = self.chat_machine_name(
+                parent_chat
+                    .as_ref()
+                    .and_then(|(chat, _)| chat.remote_id.as_deref()),
+            );
+            if let Some(detached) = chat_overview::detached_activity(
+                delegation,
+                task_title(delegation).as_deref(),
+                parent_chat,
+                &machine,
+                now,
+            ) {
+                snapshot.detached.push(detached);
+            }
+        }
+        snapshot
+    }
+
     /// What a tab is called outside its strip: the chat's own title when
     /// the index knows it, then the harness topic, then the repo.
     fn tab_display_title<'a>(&'a self, tab: &'a TabState) -> &'a str {
@@ -16110,6 +16531,8 @@ fi
             Event::Tick => {
                 let mut tasks: Vec<Task<Event>> = Vec::new();
                 self.watch_open_files();
+                // Remote running chats, only while the Chats overview shows.
+                tasks.push(self.poll_overview_remote_chats());
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
@@ -17766,6 +18189,9 @@ fi
                     );
                     webview::insert_agent_composer_text(tab_id, &text);
                 }
+                if let Some(key) = self.roster_reveal_held.remove(&tab_id) {
+                    webview::reveal_agent_roster_row(tab_id, &key);
+                }
                 return self.refresh_delegation_head(tab_id);
             }
             Event::AgentHistoryUnavailable(tab_id, error) => {
@@ -18754,6 +19180,9 @@ fi
                         Some(GlobalShortcut::UsageView) => {
                             return self.update(Event::UsageViewToggle);
                         }
+                        Some(GlobalShortcut::ChatsOverview) => {
+                            return self.update(Event::ChatsOverviewOpen);
+                        }
                         Some(GlobalShortcut::SelectWorkspace(num))
                             if num <= self.workspaces.len() =>
                         {
@@ -18916,6 +19345,10 @@ fi
                         // Cmd+Shift+U - Open the Usage view
                         if global_shortcut(&key, modifiers) == Some(GlobalShortcut::UsageView) {
                             return Task::done(Event::UsageViewToggle);
+                        }
+                        // Cmd+Shift+O - the Chats overview (TRU-154)
+                        if global_shortcut(&key, modifiers) == Some(GlobalShortcut::ChatsOverview) {
+                            return Task::done(Event::ChatsOverviewOpen);
                         }
                     }
                 }
@@ -20249,7 +20682,17 @@ fi
                 return self.close_task_tab(prompt);
             }
             Event::SetSidebarMode(mode) => {
+                let leaving_chats = mode != SidebarMode::Chats
+                    && self
+                        .active_tab()
+                        .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Chats);
                 let task = self.set_sidebar_mode(mode);
+                if leaving_chats {
+                    // The Chats panel covered a chat tab's page (TRU-154),
+                    // which may have been evicted meanwhile: build it again
+                    // if so, not just show it.
+                    return Task::batch([task, self.present_active_tab_surfaces()]);
+                }
                 self.settle_agent_surface();
                 return task;
             }
@@ -21159,6 +21602,31 @@ fi
             Event::FocusTabById(tab_id) => {
                 return self.jump_to_attention_target(AttentionTarget::Tab(tab_id));
             }
+            Event::ChatsOverviewOpen => {
+                let mut tasks = Vec::new();
+                if self.usage_view.open {
+                    tasks.push(self.update(Event::UsageViewClose));
+                }
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.selected_chat = None;
+                }
+                if self
+                    .active_tab()
+                    .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Chats)
+                {
+                    self.settle_agent_surface();
+                } else {
+                    tasks.push(self.update(Event::SetSidebarMode(SidebarMode::Chats)));
+                }
+                tasks.push(self.poll_overview_remote_chats());
+                return Task::batch(tasks);
+            }
+            Event::ChatOverviewGo(target) => {
+                return self.chat_overview_go(target);
+            }
+            Event::ToggleChatOverviewIdle => {
+                self.chat_overview_idle_expanded = !self.chat_overview_idle_expanded;
+            }
             Event::RemoteChatIndexLoaded(remote_id, result) => {
                 let state = self
                     .remote_chat_indexes
@@ -21185,21 +21653,29 @@ fi
                     }
                 }
             }
-            Event::RemoteRunningChatsLoaded(remote_id, result) => match result {
-                Ok(chats) => {
-                    eprintln!(
-                        "[remote-chat] {remote_id} is running {} Claude chat(s)",
-                        chats.len()
-                    );
-                    self.remote_running_chats.insert(remote_id.clone(), chats);
-                    return self.attach_running_remote_chat_tabs(&remote_id);
+            Event::RemoteRunningChatsLoaded(remote_id, result) => {
+                if let Some((_, in_flight)) = self.overview_running_polled.get_mut(&remote_id) {
+                    *in_flight = false;
                 }
-                Err(err) => {
-                    eprintln!(
-                        "[remote-chat] could not list the running chats on {remote_id} (keeping the last list): {err}"
-                    );
+                match result {
+                    Ok(chats) => {
+                        if self.remote_running_chats.get(&remote_id) != Some(&chats) {
+                            eprintln!(
+                                "[remote-chat] {remote_id} is running {} Claude chat(s)",
+                                chats.len()
+                            );
+                            self.remote_running_chats_revision += 1;
+                        }
+                        self.remote_running_chats.insert(remote_id.clone(), chats);
+                        return self.attach_running_remote_chat_tabs(&remote_id);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[remote-chat] could not list the running chats on {remote_id} (keeping the last list): {err}"
+                        );
+                    }
                 }
-            },
+            }
             Event::SelectChat(chat) => {
                 let task = self.select_chat(chat);
                 self.settle_agent_surface();
@@ -22749,6 +23225,7 @@ fi
                 if tab.file_viewer().is_some()
                     || tab.selected_file.is_some()
                     || tab.chat_preview_open()
+                    || tab.chats_overview_open()
                 {
                     ActiveTabSurface::AgentFileOverlay
                 } else {
@@ -22823,6 +23300,9 @@ fi
         let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
         if let Some(tab) = self.active_tab_mut() {
             if tab.sidebar_mode != mode {
+                if mode == SidebarMode::Chats {
+                    tab.sidebar_mode_before_chats = tab.sidebar_mode;
+                }
                 if active_workspace_is_remote
                     && !active_workspace_is_remote_agent
                     && mode != SidebarMode::Remote
@@ -23042,12 +23522,15 @@ fi
             self.destroy_agent_page(tab_id, "tab closed");
         }
         let workspaces = &self.workspaces;
-        self.dictation_held.retain(|&tab_id, _| {
+        let is_chat_tab = |tab_id: usize| {
             workspaces
                 .iter()
                 .flat_map(|ws| ws.tabs.iter())
                 .any(|t| t.id == tab_id && matches!(t.kind, TabKind::Agent(_)))
-        });
+        };
+        self.dictation_held.retain(|&tab_id, _| is_chat_tab(tab_id));
+        self.roster_reveal_held
+            .retain(|&tab_id, _| is_chat_tab(tab_id));
     }
 
     /// Put a dictation transcript into chat tab `tab_id`'s composer at the
@@ -24963,6 +25446,7 @@ fi
         content_col = content_col.push(shortcut_row("Cmd + ↑", "Return to General"));
         content_col = content_col.push(shortcut_row("Cmd + 0", "Open task overview"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + U", "Open usage view"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + O", "Chats overview"));
         content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to next needs-you"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + W", "Close workspace"));
         content_col = content_col.push(shortcut_row("Cmd + B", "Toggle sidebar"));
@@ -27392,10 +27876,10 @@ fi
                     // Git diff for a selected file covers the chat the same
                     // way it covers a terminal; the Agent surface is hidden.
                     freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
-                } else if tab.chat_preview_open() {
+                } else if tab.chat_preview_open() || tab.chats_overview_open() {
                     // A chat picked in the Chats panel previews over the chat
-                    // page. Unlike terminal tabs the page stays while the
-                    // panel is merely open: nothing typed there can leak.
+                    // page; with nothing picked the Chats overview does
+                    // (TRU-154), as on terminal tabs.
                     freeze_time!("view_chat_preview", { self.view_chat_preview(tab) })
                 } else {
                     // Agent tabs render the chat UI in the Agent webview surface,
@@ -31683,6 +32167,349 @@ fi
     /// Main-pane preview for the chat selected in the Chats sidebar:
     /// metadata header + lazily loaded transcript tail. Read-only —
     /// resume actions land in slice 2.
+    /// One Chats overview row: glyph, title, where it lives, what it is
+    /// doing, and a right-hand figure. Clicking goes to its target.
+    fn view_overview_row(&self, row: OverviewRow) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let mut lines = Column::new()
+            .spacing(1)
+            .width(Length::Fill)
+            .push(text(row.title).size(font_small).color(theme.text_primary()));
+        if !row.meta.is_empty() {
+            lines = lines.push(
+                text(row.meta)
+                    .size(font_small - 1.0)
+                    .color(theme.text_muted()),
+            );
+        }
+        if let Some((detail, color)) = row.detail {
+            lines = lines.push(text(detail).size(font_small).color(color));
+        }
+        let content = row![
+            text(row.icon).size(font_small).color(row.icon_color),
+            lines,
+            text(row.right)
+                .size(font_small - 1.0)
+                .color(theme.text_secondary()),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Start);
+        let button = button(content)
+            .padding(iced::Padding {
+                top: 5.0,
+                right: 10.0,
+                bottom: 5.0,
+                left: 10.0 + row.indent,
+            })
+            .width(Length::Fill)
+            .style(self.ghost_button_style());
+        match row.target {
+            chat_overview::NavTarget::Nowhere => button.into(),
+            target => button.on_press(Event::ChatOverviewGo(target)).into(),
+        }
+    }
+
+    /// The Chats overview (TRU-154), the main pane while the Chats panel
+    /// is open with nothing selected: what needs the human, what is
+    /// working, what finished in the last four hours, and what sits idle,
+    /// across this Mac and the connected remotes. Reads the cached
+    /// snapshot; only the clock-relative figures are computed per frame.
+    fn view_chat_overview(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        use chat_overview::{format_cost, format_elapsed, ChatSnapshot, ChatState, WorkingRow};
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let snapshot = self.chat_overview_snapshot();
+        let now = std::time::SystemTime::now();
+        let sections = chat_overview::sections(&snapshot, now);
+        let elapsed = |at: Option<std::time::SystemTime>| {
+            at.and_then(|at| now.duration_since(at).ok())
+                .map(format_elapsed)
+                .unwrap_or_default()
+        };
+        let with_cost = |figure: String, cost: Option<f64>| match (figure.is_empty(), cost) {
+            (_, None) => figure,
+            (true, Some(cost)) => format_cost(cost),
+            (false, Some(cost)) => format!("{figure} · {}", format_cost(cost)),
+        };
+        let place = |chat: &ChatSnapshot| {
+            let mut parts = vec![chat.machine.clone()];
+            match &chat.branch {
+                Some(branch) => parts.push(format!("{} · {branch}", chat.repo)),
+                None => parts.push(chat.repo.clone()),
+            }
+            parts.push(chat.harness.label().to_string());
+            if let Some(model) = &chat.model {
+                parts.push(model.clone());
+            }
+            parts.join(" · ")
+        };
+        let with_parent = |title: &str, parent: Option<&str>| match parent {
+            Some(parent) => format!("{title} · for {parent}"),
+            None => title.to_string(),
+        };
+        let section_header = |label: &str, count: usize| {
+            row![
+                text(label.to_string())
+                    .size(10)
+                    .color(theme.text_secondary()),
+                text(format!("{count}")).size(10).color(theme.text_muted()),
+            ]
+            .spacing(8)
+            .padding(iced::Padding {
+                top: 14.0,
+                right: 6.0,
+                bottom: 4.0,
+                left: 6.0,
+            })
+        };
+
+        // Header: what is going on, and which machines are in view.
+        let mut summary = vec![format!("{} open", snapshot.chats.len())];
+        if !sections.working.is_empty() {
+            summary.insert(0, format!("{} working", sections.working.len()));
+        }
+        if !sections.needs_you.is_empty() {
+            summary.insert(0, format!("{} need you", sections.needs_you.len()));
+        }
+        let mut machines = Row::new().spacing(14).push(
+            text("This Mac")
+                .size(font_small - 1.0)
+                .color(theme.text_muted()),
+        );
+        for agent in &self.remote_agent_defs {
+            let (status, color) = self.chat_machine_status(Some(&agent.id));
+            machines = machines.push(
+                row![
+                    text(agent.name.clone())
+                        .size(font_small - 1.0)
+                        .color(theme.text_muted()),
+                    text(status).size(font_small - 1.0).color(color),
+                ]
+                .spacing(6),
+            );
+        }
+        let mut body = Column::new().spacing(2).padding([14, 18]).push(
+            column![
+                text("Overview")
+                    .size(font + 2.0)
+                    .color(theme.text_primary()),
+                text(summary.join(" · "))
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+                machines,
+            ]
+            .spacing(4),
+        );
+
+        if snapshot.is_empty() && sections.finished.is_empty() {
+            body = body.push(
+                container(
+                    column![
+                        text("Nothing open or running")
+                            .size(font)
+                            .color(theme.text_secondary()),
+                        text(
+                            "Chats, CLI sessions and Codex delegations show up here while they \
+                             are open or running, on this Mac and connected machines. Pick a \
+                             conversation on the left to preview it."
+                        )
+                        .size(font_small)
+                        .color(theme.text_muted()),
+                    ]
+                    .spacing(6)
+                    .align_x(iced::Alignment::Center),
+                )
+                .padding([40, 20])
+                .center_x(Length::Fill),
+            );
+            return scrollable(body)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+
+        if !sections.needs_you.is_empty() {
+            body = body.push(section_header("NEEDS YOU", sections.needs_you.len()));
+            let ask_color = if self.attention_pulse_bright {
+                theme.peach()
+            } else {
+                theme.warning()
+            };
+            for row in &sections.needs_you {
+                let mut meta = row.machine.to_string();
+                if let Some(harness) = row.harness {
+                    meta.push_str(" · ");
+                    meta.push_str(harness.label());
+                }
+                body = body.push(self.view_overview_row(OverviewRow {
+                    icon: "●",
+                    icon_color: ask_color,
+                    title: with_parent(row.title, row.parent),
+                    meta,
+                    detail: Some((row.what.to_string(), ask_color)),
+                    right: String::new(),
+                    target: row.target.clone(),
+                    indent: 0.0,
+                }));
+            }
+        }
+
+        if !sections.working.is_empty() {
+            body = body.push(section_header("WORKING NOW", sections.working.len()));
+            for row in &sections.working {
+                match row {
+                    WorkingRow::Chat(chat) => {
+                        body = body.push(self.view_overview_row(OverviewRow {
+                            icon: "▶",
+                            icon_color: theme.success(),
+                            title: chat.title.clone(),
+                            meta: place(chat),
+                            detail: Some((
+                                chat.step.clone().unwrap_or_else(|| "Working".to_string()),
+                                theme.text_secondary(),
+                            )),
+                            right: with_cost(elapsed(chat.turn_started_at), chat.cost_usd),
+                            target: chat.target.clone(),
+                            indent: 0.0,
+                        }));
+                        for child in chat.children.iter().filter(|c| c.status.is_active()) {
+                            body = body.push(self.view_overview_row(OverviewRow {
+                                icon: "↳",
+                                icon_color: if child.status == chat_overview::ChildStatus::Running {
+                                    theme.success()
+                                } else {
+                                    theme.text_muted()
+                                },
+                                title: child.label.clone(),
+                                meta: String::new(),
+                                detail:
+                                    Some(
+                                        (
+                                            child.step.clone().unwrap_or_else(|| {
+                                                child.status.label().to_string()
+                                            }),
+                                            theme.text_secondary(),
+                                        ),
+                                    ),
+                                right: elapsed(child.started_at),
+                                target: child.target.clone(),
+                                indent: 22.0,
+                            }));
+                        }
+                    }
+                    WorkingRow::Detached(detached) => {
+                        let child = &detached.child;
+                        body =
+                            body.push(self.view_overview_row(OverviewRow {
+                                icon: "▶",
+                                icon_color: theme.success(),
+                                title: child.label.clone(),
+                                meta: format!("for {} · {}", detached.parent, detached.machine),
+                                detail:
+                                    Some(
+                                        (
+                                            child.step.clone().unwrap_or_else(|| {
+                                                child.status.label().to_string()
+                                            }),
+                                            theme.text_secondary(),
+                                        ),
+                                    ),
+                                right: elapsed(child.started_at),
+                                target: child.target.clone(),
+                                indent: 0.0,
+                            }));
+                    }
+                }
+            }
+        }
+
+        if !sections.finished.is_empty() {
+            body = body.push(section_header(
+                "RECENTLY FINISHED · LAST 4 HOURS",
+                sections.finished.len(),
+            ));
+            for row in &sections.finished {
+                let age = chats::format_age(row.at);
+                let age = if age == "now" {
+                    "just now".to_string()
+                } else {
+                    format!("{age} ago")
+                };
+                body = body.push(self.view_overview_row(OverviewRow {
+                    icon: if row.failed { "!" } else { "✓" },
+                    icon_color: if row.failed {
+                        theme.danger()
+                    } else {
+                        theme.success()
+                    },
+                    title: with_parent(row.title, row.parent),
+                    meta: row.machine.to_string(),
+                    detail: Some((row.result.to_string(), theme.text_secondary())),
+                    right: with_cost(age, row.cost_usd),
+                    target: row.target.clone(),
+                    indent: 0.0,
+                }));
+            }
+        }
+
+        if !sections.idle.is_empty() {
+            let expanded = self.chat_overview_idle_expanded;
+            body = body.push(
+                button(
+                    row![
+                        text(if expanded { "▾" } else { "▸" })
+                            .size(10)
+                            .color(theme.text_secondary()),
+                        text("IDLE BUT OPEN").size(10).color(theme.text_secondary()),
+                        text(format!("{}", sections.idle.len()))
+                            .size(10)
+                            .color(theme.text_muted()),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                )
+                .style(self.ghost_button_style())
+                .padding(iced::Padding {
+                    top: 10.0,
+                    right: 6.0,
+                    bottom: 4.0,
+                    left: 6.0,
+                })
+                .width(Length::Fill)
+                .on_press(Event::ToggleChatOverviewIdle),
+            );
+            if expanded {
+                for chat in &sections.idle {
+                    let exited = chat.state == ChatState::Exited;
+                    let detail = if exited {
+                        Some(("Exited".to_string(), theme.text_muted()))
+                    } else {
+                        chat.last_finished
+                            .as_ref()
+                            .map(|turn| (turn.result.clone(), theme.text_muted()))
+                    };
+                    body = body.push(self.view_overview_row(OverviewRow {
+                        icon: if exited { "○" } else { "✦" },
+                        icon_color: theme.text_muted(),
+                        title: chat.title.clone(),
+                        meta: place(chat),
+                        detail,
+                        right: chat.cost_usd.map(format_cost).unwrap_or_default(),
+                        target: chat.target.clone(),
+                        indent: 0.0,
+                    }));
+                }
+            }
+        }
+
+        scrollable(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     fn view_chat_preview<'a>(
         &'a self,
         tab: &'a TabState,
@@ -31692,14 +32519,7 @@ fi
         let font_small = self.ui_font_small();
 
         let Some(selected) = tab.selected_chat.as_ref() else {
-            return container(
-                text("select a conversation to preview it")
-                    .size(font)
-                    .color(theme.text_muted()),
-            )
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into();
+            return self.view_chat_overview();
         };
         let entry_remote_id = selected.remote_id.as_deref();
         let Some(entry) = self.find_chat_entry(selected) else {
@@ -36806,6 +37626,12 @@ mod tests {
                 Some(GlobalShortcut::TaskSwitcher)
             );
         }
+        for o in ["o", "O"] {
+            assert_eq!(
+                chord(ch(o), Modifiers::COMMAND | Modifiers::SHIFT),
+                Some(GlobalShortcut::ChatsOverview)
+            );
+        }
         assert_eq!(
             chord(escape.clone(), Modifiers::empty()),
             Some(GlobalShortcut::Escape)
@@ -36828,6 +37654,14 @@ mod tests {
         assert_eq!(chord(ch("1"), Modifiers::empty()), None);
         assert_eq!(chord(ch("1"), Modifiers::ALT), None);
         assert_eq!(chord(ch("u"), Modifiers::COMMAND), None);
+        assert_eq!(chord(ch("o"), Modifiers::COMMAND), None);
+        assert_eq!(
+            chord(
+                ch("o"),
+                Modifiers::COMMAND | Modifiers::SHIFT | Modifiers::ALT
+            ),
+            None
+        );
         // Cmd+Shift+T is the theme toggle; Ctrl+Cmd+T stays free.
         assert_eq!(chord(ch("t"), Modifiers::COMMAND | Modifiers::SHIFT), None);
         assert_eq!(chord(ch("t"), Modifiers::COMMAND | Modifiers::CTRL), None);
@@ -36875,6 +37709,10 @@ mod tests {
             (
                 hostkey("t", true, false, false, false),
                 GlobalShortcut::TaskSwitcher,
+            ),
+            (
+                hostkey("O", true, false, true, false),
+                GlobalShortcut::ChatsOverview,
             ),
             (
                 hostkey("Escape", false, false, false, false),
@@ -36966,6 +37804,19 @@ mod tests {
     fn agent_chat_page_exposes_composer_insert() {
         let html = agent_chat_html();
         assert!(html.contains("window.__insertComposerText = function (text)"));
+    }
+
+    #[test]
+    fn agent_chat_page_reveals_roster_rows_for_the_overview() {
+        let html = agent_chat_html();
+        assert!(html.contains("window.__revealRosterItem = function (key)"));
+        // The overview's keys are the roster's own.
+        assert!(html.contains("key: 'sub:' + sub.item.card.dataset.toolId"));
+        assert!(html.contains("key: 'dlg:' + d.delegation_id"));
+        // A page still replaying gets the reveal when the replay ends.
+        assert!(html.contains("if (pendingReveal) {"));
+        // Cmd+Shift+O reaches the app from a focused chat page.
+        assert!(html.contains("k.toLowerCase() === 'o') return true; // Cmd+Shift+O"));
     }
 
     #[test]
