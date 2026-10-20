@@ -10713,10 +10713,18 @@ impl App {
     fn open_local_workspace_index(&self, cwd: &Path, repo_root: &Path) -> Option<usize> {
         let canonical_cwd = self.canonical_task_workspace_directory(cwd);
         let canonical_repo_root = self.canonical_task_workspace_directory(repo_root);
-        self.workspaces.iter().position(|ws| {
-            matches!(ws.location, WorkspaceLocation::Local { .. })
-                && (canonical_cwd.starts_with(&ws.dir) || canonical_repo_root.starts_with(&ws.dir))
-        })
+        // The deepest root wins, so a broad workspace (say one at
+        // ~/GitRepo) doesn't swallow chats whose repo has its own.
+        self.workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, ws)| {
+                matches!(ws.location, WorkspaceLocation::Local { .. })
+                    && (canonical_cwd.starts_with(&ws.dir)
+                        || canonical_repo_root.starts_with(&ws.dir))
+            })
+            .max_by_key(|(_, ws)| ws.dir.components().count())
+            .map(|(idx, _)| idx)
     }
 
     fn ensure_local_workspace_for_chat(
@@ -10735,12 +10743,18 @@ impl App {
         let cwd = canonical_cwd.as_path();
         let repo_root = canonical_repo_root.as_path();
         let contains = |dir: &Path| cwd.starts_with(dir) || repo_root.starts_with(dir);
-        let closed_idx = self.closed_workspace_configs.iter().position(|cfg| {
-            matches!(
-                cfg.location,
-                None | Some(config::WorkspaceLocationConfig::Local { .. })
-            ) && contains(Path::new(&cfg.dir))
-        });
+        let closed_idx = self
+            .closed_workspace_configs
+            .iter()
+            .enumerate()
+            .filter(|(_, cfg)| {
+                matches!(
+                    cfg.location,
+                    None | Some(config::WorkspaceLocationConfig::Local { .. })
+                ) && contains(Path::new(&cfg.dir))
+            })
+            .max_by_key(|(_, cfg)| Path::new(&cfg.dir).components().count())
+            .map(|(idx, _)| idx);
         let workspace = if let Some(closed_idx) = closed_idx {
             let cfg = self.closed_workspace_configs.remove(closed_idx);
             let mut ws = Workspace::new(cfg.name.clone(), PathBuf::from(&cfg.dir), cfg.color);
