@@ -15518,6 +15518,21 @@ fi
                     root.as_path()
                 };
                 let display_title = self.tab_display_title(tab);
+                // CLI terminal tabs often carry no repo name of their own;
+                // fall back to the conversation's indexed repo, then to
+                // the directory's name.
+                let repo = if tab.repo_name.is_empty() {
+                    entry.map(|entry| entry.group_name()).unwrap_or_else(|| {
+                        cwd.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    })
+                } else {
+                    tab.repo_name.clone()
+                };
+                let branch = (tab.is_git_repo && !tab.branch_name.is_empty())
+                    .then_some(tab.branch_name.as_str())
+                    .or_else(|| entry.and_then(|entry| entry.branch.as_deref()));
                 snapshot.chats.push(chat_overview::tab_snapshot(
                     TabInput {
                         tab_id: tab.id,
@@ -15525,9 +15540,8 @@ fi
                         chat,
                         display_title,
                         machine: &machine,
-                        repo: &tab.repo_name,
-                        branch: (tab.is_git_repo && !tab.branch_name.is_empty())
-                            .then_some(tab.branch_name.as_str()),
+                        repo: &repo,
+                        branch,
                         cwd: Some(cwd),
                         runs,
                         delegations: delegations
@@ -28035,7 +28049,7 @@ fi
                     // A chat picked in the Chats panel previews over the chat
                     // page; with nothing picked the Chats overview does
                     // (TRU-154), as on terminal tabs.
-                    freeze_time!("view_chat_preview", { self.view_chat_preview(tab) })
+                    freeze_time!("view_chat_preview", { self.view_chats_pane(tab) })
                 } else {
                     // Agent tabs render the chat UI in the Agent webview surface,
                     // positioned by `calculate_webview_bounds` and managed via
@@ -28053,7 +28067,7 @@ fi
                 // The whole main pane belongs to Chats while the panel is
                 // open — also keeps the terminal out of the widget tree so
                 // typing in the chats search can never leak into the PTY.
-                freeze_time!("view_chat_preview", { self.view_chat_preview(tab) })
+                freeze_time!("view_chat_preview", { self.view_chats_pane(tab) })
             } else if tab.viewing_file_path().is_some() {
                 freeze_time!("view_file_content", { self.view_file_content(tab) })
             } else if tab.selected_file.is_some() {
@@ -32397,6 +32411,16 @@ fi
             }
             parts.join(" · ")
         };
+        let row_place = |machine: &str, repo: &str, branch: Option<&str>| {
+            let mut parts = vec![machine.to_string()];
+            if !repo.is_empty() {
+                parts.push(match branch {
+                    Some(branch) => format!("{repo} · {branch}"),
+                    None => repo.to_string(),
+                });
+            }
+            parts.join(" · ")
+        };
         let with_parent = |title: &str, parent: Option<&str>| match parent {
             Some(parent) => format!("{title} · for {parent}"),
             None => title.to_string(),
@@ -32490,7 +32514,7 @@ fi
                 theme.warning()
             };
             for row in &sections.needs_you {
-                let mut meta = row.machine.to_string();
+                let mut meta = row_place(row.machine, row.repo, row.branch);
                 if let Some(harness) = row.harness {
                     meta.push_str(" · ");
                     meta.push_str(harness.label());
@@ -32597,7 +32621,7 @@ fi
                         theme.success()
                     },
                     title: with_parent(row.title, row.parent),
-                    meta: row.machine.to_string(),
+                    meta: row_place(row.machine, row.repo, row.branch),
                     detail: Some((row.result.to_string(), theme.text_secondary())),
                     right: with_cost(age, row.cost_usd),
                     target: row.target.clone(),
@@ -32961,6 +32985,24 @@ fi
         }
 
         out.into()
+    }
+
+    /// The Chats main pane on the theme's base colour. On a chat tab the
+    /// area behind it is the bare window (the chat page is hidden), which
+    /// is white, so the pane paints its own background.
+    fn view_chats_pane<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let bg = self.theme.bg_base();
+        container(self.view_chat_preview(tab))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into()
     }
 
     /// Main-pane view of the conversation selected in the Chats panel: a
