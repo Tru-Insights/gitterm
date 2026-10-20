@@ -209,6 +209,42 @@ impl AgentEvent {
         Self::Other(echo)
     }
 
+    /// The echo of a prompt another client of an agent-owned chat sent (a
+    /// phone, TRU-151), as the page's own `user_prompt`: `id` lets the
+    /// page and the tab tell it from their own echoes, `queued` marks it
+    /// sent while a turn runs, and `image_count` says how many images it
+    /// carried (their bytes are never relayed).
+    pub(crate) fn relayed_prompt(
+        id: Option<&str>,
+        text: &str,
+        image_count: usize,
+        queued: bool,
+    ) -> Self {
+        let mut echo = serde_json::json!({"type": "user_prompt", "text": text});
+        if let Some(id) = id {
+            echo["id"] = serde_json::json!(id);
+            if queued {
+                echo["queued"] = serde_json::json!(true);
+            }
+        }
+        if image_count > 0 {
+            echo["image_count"] = serde_json::json!(image_count);
+        }
+        Self::Other(echo)
+    }
+
+    /// The id of a `user_prompt` echo that carries one.
+    pub(crate) fn prompt_id(&self) -> Option<&str> {
+        match self {
+            Self::Other(value)
+                if value.get("type").and_then(|v| v.as_str()) == Some("user_prompt") =>
+            {
+                value.get("id").and_then(|v| v.as_str())
+            }
+            _ => None,
+        }
+    }
+
     /// The JSON the chat webview's `__appendEvent` receives. Harness events
     /// are wrapped so the page can tell them from pi's raw stream shapes.
     pub(crate) fn webview_payload(&self) -> Option<serde_json::Value> {
@@ -316,6 +352,15 @@ impl AgentSession {
             && self.conversation.is_empty())
         .then_some(self.session_id.as_deref())
         .flatten()
+    }
+
+    /// Whether the conversation already shows the prompt sent under `id`
+    /// (this tab's own echo, or one relayed earlier).
+    pub(crate) fn shows_prompt(&self, id: &str) -> bool {
+        self.conversation
+            .iter()
+            .rev()
+            .any(|ev| ev.prompt_id() == Some(id))
     }
 
     /// Append an event to the conversation buffer, merging consecutive
@@ -963,6 +1008,40 @@ mod tests {
             false,
             &AgentSessionState::Streaming
         ));
+    }
+
+    #[test]
+    fn relayed_prompts_are_user_prompts_known_by_id() {
+        let mut session = AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        let own = UserPrompt {
+            text: "mine".into(),
+            images: Vec::new(),
+            id: Some("u1".into()),
+        };
+        session.record(AgentEvent::submitted_prompt(&own, false));
+        session.record(AgentEvent::Harness(HarnessEvent::TextDelta("ok".into())));
+        assert!(session.shows_prompt("u1"));
+        assert!(!session.shows_prompt("u2"));
+
+        let relayed = AgentEvent::relayed_prompt(Some("u2"), "from the phone", 2, true);
+        assert_eq!(
+            relayed.webview_payload().unwrap(),
+            serde_json::json!({"type": "user_prompt", "text": "from the phone",
+                               "id": "u2", "queued": true, "image_count": 2})
+        );
+        session.record(relayed);
+        assert!(session.shows_prompt("u2"));
+        // No id: never marked queued (nothing could withdraw it).
+        assert_eq!(
+            AgentEvent::relayed_prompt(None, "hi", 0, true)
+                .webview_payload()
+                .unwrap(),
+            serde_json::json!({"type": "user_prompt", "text": "hi"})
+        );
     }
 
     #[test]

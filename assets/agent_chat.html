@@ -328,6 +328,8 @@
                 color: var(--fg-muted); white-space: normal; }
   .queued-tag button { width: 18px; height: 18px; padding: 0; border-radius: 9px; font-size: 12px;
                        line-height: 16px; }
+  /* A relayed prompt's images stay on the device that sent them (TRU-151). */
+  .user-note { margin-top: 6px; font-size: 11px; color: var(--fg-muted); white-space: normal; }
   .user-images { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
   .user-images:last-child { margin-bottom: 0; }
   .user-images img { max-width: 160px; max-height: 120px; border-radius: 6px; display: block;
@@ -626,6 +628,7 @@
                    : 'Queued · Claude reads it at its next step';
   }
   const queued = new Map();   // message id -> {msg, tag, x}: sent mid-turn, not yet picked up
+  const prompts = new Map();  // message id -> its bubble: every client's echo of it is shown once
   let replaying = false;      // __replay is feeding the buffer
   let rosterSeq = 0;          // roster: creation order of subagents and cards
   let follow = true;          // live-follow: stick to the bottom
@@ -2542,6 +2545,12 @@
         setBusy(false);
         break;
       }
+      case 'user_message_echo':
+        // A prompt any client of an agent-owned chat sent (TRU-151); the
+        // sender's own bubble under the same id makes this a no-op.
+        // Sent while a turn runs, Claude queues it.
+        showUserPrompt({ text: d.text, id: d.id, image_count: d.image_count, queued: busy });
+        break;
       case 'message_lifecycle':
         queuedLifecycle(d.id, d.state);
         break;
@@ -2631,6 +2640,58 @@
     // session / agent_start / turn_start and anything else: quiet.
   }
 
+  // ---- the human's messages ------------------------------------------------
+  // A prompt as a user bubble: `{text, id?, images?, image_count?, queued?}`.
+  // A prompt with an id is shown once, whichever client's echo of it
+  // arrives first.
+  function showUserPrompt(event) {
+    const id = typeof event.id === 'string' && event.id ? event.id : null;
+    if (id && prompts.has(id)) return;
+    endSegment(); endThinking();
+    const msg = el('div', 'user-msg');
+    if (Array.isArray(event.images) && event.images.length) {
+      const strip = el('div', 'user-images');
+      for (const im of event.images) {
+        const img = el('img');
+        img.src = 'data:' + im.media_type + ';base64,' + im.data;
+        img.alt = 'attached image';
+        img.onload = scrollIfFollowing;
+        strip.append(img);
+      }
+      msg.append(strip);
+    }
+    if (event.text) msg.append(document.createTextNode(event.text));
+    const imageCount = typeof event.image_count === 'number' ? event.image_count : 0;
+    if (imageCount > 0) {
+      msg.append(el('div', 'user-note', imageCount === 1 ? '1 image attached on the sending device'
+                                                          : imageCount + ' images attached on the sending device'));
+    }
+    if (id) { msg.dataset.msgId = id; prompts.set(id, msg); }
+    // Sent while Claude works: it joins Claude's queue and the turn
+    // (and its activity clock) carries on.
+    const isQueued = event.queued === true && id != null;
+    if (isQueued) markQueued(msg, id);
+    append(msg);
+    follow = true;
+    if (isQueued && busy) return;
+    setBusy(true);
+    startActivity('Starting');
+  }
+  // A prompt the chat never took (the phone's socket refused it or was
+  // down): its bubble stays, marked, so the text can be sent again.
+  window.__markPromptUnsent = function (id, reason) {
+    const msg = prompts.get(id);
+    if (!msg) return false;
+    const q = queued.get(id);
+    if (q) { q.tag.remove(); queued.delete(id); }
+    msg.classList.remove('queued');
+    msg.classList.add('unsent');
+    msg.append(el('div', 'user-note', 'Not sent' + (reason ? ': ' + reason : '')));
+    // Not queued, it made the page busy; no turn runs for it.
+    if (!q && busy) { finishActivity('Not sent', 'failed'); setBusy(false); }
+    return true;
+  };
+
   // ---- entry points (called from Rust) -------------------------------------
   window.__appendEvent = function (event) {
     if (!event || typeof event !== 'object') return;
@@ -2639,32 +2700,7 @@
       if (event.kind === 'delegation_anchor') { delegationAnchor(event.delegation_id); return; }
       if (event.kind === 'subagent_started_at') { subagentStartedAt(event.id, event.at_ms); return; }
       if (event.kind === 'delegation') { delegationEvent(event); return; }
-      if (event.type === 'user_prompt') {
-        endSegment(); endThinking();
-        const msg = el('div', 'user-msg');
-        if (Array.isArray(event.images) && event.images.length) {
-          const strip = el('div', 'user-images');
-          for (const im of event.images) {
-            const img = el('img');
-            img.src = 'data:' + im.media_type + ';base64,' + im.data;
-            img.alt = 'attached image';
-            img.onload = scrollIfFollowing;
-            strip.append(img);
-          }
-          msg.append(strip);
-        }
-        if (event.text) msg.append(document.createTextNode(event.text));
-        // Sent while Claude works: it joins Claude's queue and the turn
-        // (and its activity clock) carries on.
-        const isQueued = event.queued === true && typeof event.id === 'string';
-        if (isQueued) markQueued(msg, event.id);
-        append(msg);
-        follow = true;
-        if (isQueued && busy) return;
-        setBusy(true);
-        startActivity('Starting');
-        return;
-      }
+      if (event.type === 'user_prompt') { showUserPrompt(event); return; }
       legacyEvent(event);
     } catch (e) {
       console.error('render failed for event', event, e);
@@ -2700,7 +2736,7 @@
   window.__resetConversation = function () {
     messagesEl.innerHTML = '';
     segment = null; thinking = null;
-    items.clear(); pending.clear(); subTools.clear(); queued.clear();
+    items.clear(); pending.clear(); subTools.clear(); queued.clear(); prompts.clear();
     resetDelegations();
     if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
     activityEl.className = 'activity';

@@ -8513,6 +8513,55 @@ impl App {
         }
     }
 
+    /// A prompt the agent echoed for a remote chat tab (TRU-151). The
+    /// tab's own prompts are already on screen under their ids and are
+    /// skipped; one another client of the chat sent (a phone) is shown as
+    /// a user message, and the turn it starts or joins counts as running
+    /// here as it would for a prompt sent from this tab.
+    fn agent_prompt_echoed(
+        &mut self,
+        tab_id: usize,
+        id: Option<String>,
+        text: String,
+        image_count: usize,
+    ) -> Task<Event> {
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|t| t.id == tab_id)
+        else {
+            eprintln!("[remote-chat] tab {tab_id}: a prompt echo for a closed tab");
+            return Task::none();
+        };
+        let task_id = tab.task_id.clone();
+        let Some(session) = tab.agent_session_mut() else {
+            eprintln!("[remote-chat] tab {tab_id}: a prompt echo for a tab that is not a chat");
+            return Task::none();
+        };
+        if id.as_deref().is_some_and(|id| session.shows_prompt(id)) {
+            return Task::none();
+        }
+        eprintln!(
+            "[remote-chat] tab {tab_id}: another client sent a prompt ({} chars, {image_count} images, id {id:?})",
+            text.chars().count()
+        );
+        let queued = session.submit_queues();
+        let echo = tab::AgentEvent::relayed_prompt(id.as_deref(), &text, image_count, queued);
+        let running = session.harness.is_some();
+        if running {
+            session.state = tab::AgentSessionState::Streaming;
+        }
+        push_agent_event_to_webview(tab_id, &echo);
+        session.record(echo);
+        let Some(task_id) = task_id.filter(|_| running) else {
+            return Task::none();
+        };
+        tab.task_live_state = Some(TaskSessionLiveState::Working);
+        self.apply_task_session_signal(&task_id, None);
+        Task::none()
+    }
+
     /// The client for a remote chat tab's machine, from the freshest
     /// config. The error names what is missing, for the chat to show.
     fn remote_chat_client(&self, remote_id: &str) -> Result<RemoteAgentClientConfig, String> {
@@ -18695,6 +18744,16 @@ fi
                 ),
             ) => {
                 return self.remote_chat_link_changed(tab_id, link);
+            }
+            Event::AgentEventReceived(
+                tab_id,
+                tab::AgentEvent::Harness(HarnessEvent::UserMessageEcho {
+                    id,
+                    text,
+                    image_count,
+                }),
+            ) => {
+                return self.agent_prompt_echoed(tab_id, id, text, image_count);
             }
             Event::AgentEventReceived(
                 tab_id,
