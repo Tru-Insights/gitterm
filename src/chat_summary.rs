@@ -9,13 +9,18 @@
 //! from its messages. The header and the agents come from the Chats
 //! overview's [`ChatSnapshot`]. No iced types, no app state.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use gitterm::chats::{ChatPreviewMessage, ChatRef};
+use gitterm::harness::transcript::is_agent_tool;
 use gitterm::harness::{HarnessEvent, ItemKind, MessageState, RuntimeRequestKind};
 use serde_json::Value;
 
-use crate::chat_overview::{ChatSnapshot, ChildActivity, OverviewSnapshot, ToolCall};
+use crate::chat_overview::{
+    first_line, first_line_raw, one_line, short_path, ChatGist, ChatSnapshot, ChildActivity,
+    OverviewSnapshot, ToolCall,
+};
 use crate::tab::AgentEvent;
 
 /// Lines of the latest ask shown before "more".
@@ -26,6 +31,12 @@ pub(crate) const REPLY_PREVIEW_LINES: usize = 16;
 pub(crate) const FILES_SHOWN: usize = 8;
 /// Characters a clipped line may run to; a minified blob is one "line".
 const CLIP_LINE_CHARS: usize = 200;
+/// Longest reply line or question on an overview row.
+const ROW_LINE_CHARS: usize = 140;
+/// Longest command or detail quoted in an overview row's ask.
+const ASK_DETAIL_CHARS: usize = 60;
+/// Claude's tool for asking the human structured questions.
+const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TodoStatus {
@@ -390,6 +401,264 @@ pub(crate) fn digest_messages(messages: &[ChatPreviewMessage]) -> ChatDigest {
             .find(|message| !message.is_user && !message.text.trim().is_empty())
             .map(|message| message.text.trim().to_string()),
         ..ChatDigest::default()
+    }
+}
+
+/// A digest in a few words, for a Chats overview row (TRU-154): the ask on
+/// one line, the reply's first line, the plan's progress (cancelled items
+/// left out) and the count of files touched.
+pub(crate) fn gist(digest: &ChatDigest) -> ChatGist {
+    gist_of(
+        digest.latest_ask.as_deref(),
+        digest.latest_reply.as_deref(),
+        &digest.todos,
+        digest.files_touched.len(),
+    )
+}
+
+fn gist_of(asked: Option<&str>, reply: Option<&str>, todos: &[TodoItem], files: usize) -> ChatGist {
+    let planned = todos
+        .iter()
+        .filter(|todo| todo.status != TodoStatus::Cancelled);
+    ChatGist {
+        asked: asked
+            .map(|ask| one_line(ask, ROW_LINE_CHARS))
+            .filter(|ask| !ask.is_empty()),
+        reply: reply
+            .map(first_line)
+            .filter(|line| !line.is_empty())
+            .map(|line| one_line(line, ROW_LINE_CHARS)),
+        todos_done: planned
+            .clone()
+            .filter(|todo| todo.status == TodoStatus::Completed)
+            .count(),
+        todos_total: planned.count(),
+        files,
+    }
+}
+
+/// Todo lists a [`TranscriptTracker`] keeps, newest last: the latest
+/// stands until a result says it failed, then the one before it.
+const TRACKED_TODO_LISTS: usize = 4;
+
+/// A Claude CLI transcript's gist and open ask, kept current by feeding it
+/// only what was appended since the last read (TRU-154): a long session's
+/// transcript runs to a hundred MB and more, too much to read back whole
+/// every few seconds. Holds no events, only the state [`digest`]'s walk
+/// would end with, under the same rules (a parity test holds it to them).
+/// Transcript events carry whole tool inputs (no streamed deltas), and
+/// their turn ends are the read-back's own markers, so neither matters.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TranscriptTracker {
+    /// The human's latest request.
+    asked: Option<String>,
+    /// (call id, list) of the latest todo calls that have not failed.
+    todo_lists: Vec<(String, Vec<TodoItem>)>,
+    /// Path -> edit calls naming it that have not failed.
+    touched: HashMap<String, usize>,
+    /// Edit calls still without a result: id -> the paths they name.
+    unresolved_edits: HashMap<String, Vec<String>>,
+    /// The latest finished reply segment, and the one being written.
+    reply: Option<String>,
+    segment: String,
+    /// The next reply text starts a new segment.
+    segment_break: bool,
+    /// Top-level calls with no result since the last prompt, oldest first:
+    /// (id, the ask; `None` for an Agent call, which waits on its
+    /// subagent).
+    open: Vec<(String, Option<WaitingAsk>)>,
+    /// Results written ahead of their call (Claude does, now and then).
+    early_results: HashSet<String>,
+}
+
+impl TranscriptTracker {
+    /// Take in the next events of the transcript, in order.
+    pub(crate) fn feed(&mut self, events: &[AgentEvent]) {
+        for event in events {
+            match event {
+                AgentEvent::Harness(event) => self.event(event, true),
+                AgentEvent::Other(value)
+                    if value.get("type").and_then(Value::as_str) == Some("user_prompt") =>
+                {
+                    let text = value.get("text").and_then(Value::as_str).unwrap_or("");
+                    if is_human_request(text) {
+                        self.asked = Some(text.trim().to_string());
+                    }
+                    self.segment_break = true;
+                    // A new prompt abandons whatever the last turn left
+                    // open; a call cut off like that never gets a result.
+                    self.open.clear();
+                    self.early_results.clear();
+                    self.unresolved_edits.clear();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn event(&mut self, event: &HarnessEvent, top_level: bool) {
+        match event {
+            HarnessEvent::ItemStarted {
+                id,
+                kind: ItemKind::ToolCall { name, input },
+            } => {
+                let answered = top_level && self.early_results.remove(id);
+                let paths = edited_paths(name, input);
+                if !paths.is_empty() {
+                    for path in &paths {
+                        *self.touched.entry(path.clone()).or_default() += 1;
+                    }
+                    self.unresolved_edits.insert(id.clone(), paths);
+                }
+                if !top_level {
+                    return;
+                }
+                if is_todo_tool(name) {
+                    if let Some(list) = todo_list(input) {
+                        self.todo_lists.push((id.clone(), list));
+                        let excess = self.todo_lists.len().saturating_sub(TRACKED_TODO_LISTS);
+                        self.todo_lists.drain(..excess);
+                    }
+                }
+                self.segment_break = true;
+                if !answered {
+                    let ask = (!is_agent_tool(name)).then(|| call_ask(name, input));
+                    self.open.push((id.clone(), ask));
+                }
+            }
+            HarnessEvent::ItemCompleted { id, is_error, .. } => {
+                if let Some(paths) = self.unresolved_edits.remove(id) {
+                    if *is_error {
+                        for path in paths {
+                            if let Some(count) = self.touched.get_mut(&path) {
+                                *count -= 1;
+                                if *count == 0 {
+                                    self.touched.remove(&path);
+                                }
+                            }
+                        }
+                    }
+                }
+                if *is_error {
+                    self.todo_lists.retain(|(call, _)| call != id);
+                }
+                if !top_level {
+                    return;
+                }
+                match self.open.iter().position(|(call, _)| call == id) {
+                    Some(index) => {
+                        self.open.remove(index);
+                    }
+                    None => {
+                        self.early_results.insert(id.clone());
+                    }
+                }
+            }
+            HarnessEvent::TextDelta(text) if top_level => {
+                if self.segment_break {
+                    if !self.segment.trim().is_empty() {
+                        self.reply = Some(self.segment.trim().to_string());
+                    }
+                    self.segment.clear();
+                    self.segment_break = false;
+                }
+                self.segment.push_str(text);
+            }
+            HarnessEvent::TurnCompleted { .. } if top_level => self.segment_break = true,
+            HarnessEvent::SubagentEvent { event, .. } => self.event(event, false),
+            _ => {}
+        }
+    }
+
+    /// The transcript so far in a few words.
+    pub(crate) fn gist(&self) -> ChatGist {
+        let reply = if self.segment.trim().is_empty() {
+            self.reply.as_deref()
+        } else {
+            Some(self.segment.trim())
+        };
+        let todos = self
+            .todo_lists
+            .last()
+            .map(|(_, list)| list.as_slice())
+            .unwrap_or(&[]);
+        gist_of(self.asked.as_deref(), reply, todos, self.touched.len())
+    }
+
+    /// The ask the transcript leaves open: its oldest top-level call that
+    /// has no result yet, after the last prompt. A CLI writes the call
+    /// before it asks for approval, so while its terminal says it needs
+    /// the human this is what it asks. `None` when nothing is open or the
+    /// oldest open call is an Agent call (its subagent's calls are not in
+    /// the transcript).
+    pub(crate) fn pending(&self) -> Option<WaitingAsk> {
+        self.open.first().and_then(|(_, ask)| ask.clone())
+    }
+}
+
+/// What a tool call would ask the human: AskUserQuestion's questions, or
+/// approval for the call and what it acts on.
+fn call_ask(name: &str, input: &Value) -> WaitingAsk {
+    if name == ASK_USER_QUESTION_TOOL {
+        WaitingAsk::Question {
+            questions: input
+                .get("questions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|question| str_field(question, "question"))
+                .map(str::to_string)
+                .collect(),
+        }
+    } else {
+        WaitingAsk::Permission {
+            tool: name.to_string(),
+            detail: permission_detail(input).filter(|detail| detail != name),
+        }
+    }
+}
+
+/// An open ask in one line for an overview row: "Allow Bash: `cargo
+/// publish`?", "Edit src/main.rs?", the question itself. `cwd` shortens
+/// paths.
+pub(crate) fn ask_line(ask: &WaitingAsk, cwd: Option<&Path>) -> String {
+    match ask {
+        WaitingAsk::Question { questions } => match questions.split_first() {
+            Some((first, [])) => one_line(first, ROW_LINE_CHARS),
+            Some((first, more)) => {
+                format!("{} (+{} more)", one_line(first, ROW_LINE_CHARS), more.len())
+            }
+            None => "A question for you".to_string(),
+        },
+        WaitingAsk::Permission { tool, detail } => {
+            let detail = detail.as_deref();
+            match (tool.as_str(), detail) {
+                ("Bash", Some(command)) => format!(
+                    "Allow Bash: `{}`?",
+                    one_line(first_line_raw(command), ASK_DETAIL_CHARS)
+                ),
+                ("Edit" | "MultiEdit" | "NotebookEdit", Some(path)) => {
+                    format!("Edit {}?", short_path(path, cwd))
+                }
+                ("Write", Some(path)) => format!("Write {}?", short_path(path, cwd)),
+                ("ExitPlanMode", _) => "Approve the plan?".to_string(),
+                (tool, detail) => {
+                    // MCP tools are `mcp__<server>__<tool>`.
+                    let tool = tool
+                        .strip_prefix("mcp__")
+                        .map(|rest| rest.split_once("__").map_or(rest, |(_, tool)| tool))
+                        .unwrap_or(tool);
+                    let tool = one_line(tool, ASK_DETAIL_CHARS);
+                    match detail {
+                        Some(detail) => format!(
+                            "Allow {tool}: {}?",
+                            one_line(first_line_raw(detail), ASK_DETAIL_CHARS)
+                        ),
+                        None => format!("Allow {tool}?"),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -826,6 +1095,8 @@ mod tests {
             cost_usd: None,
             children: vec![child("sub")],
             last_finished: None,
+            gist: None,
+            last_activity: None,
             target: NavTarget::Tab(1),
         };
         let detached = |label: &str, parent_chat: Option<ChatRef>| DetachedActivity {
@@ -849,6 +1120,266 @@ mod tests {
         let (none, agents) = chat_in_overview(&overview, &ChatRef::local("c2"));
         assert!(none.is_none());
         assert_eq!(agents.len(), 1);
+    }
+
+    /// The ask a whole transcript leaves open.
+    fn pending_tool_ask(conversation: &[AgentEvent]) -> Option<WaitingAsk> {
+        let mut tracker = TranscriptTracker::default();
+        tracker.feed(conversation);
+        tracker.pending()
+    }
+
+    fn transcript(lines: &[Value]) -> Vec<AgentEvent> {
+        let text = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        parse_claude_transcript(&text)
+            .into_iter()
+            .map(AgentEvent::from)
+            .collect()
+    }
+
+    fn assistant_tool(id: &str, name: &str, input: Value) -> Value {
+        json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": id, "name": name, "input": input}
+        ]}})
+    }
+
+    fn tool_result(id: &str) -> Value {
+        json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": id, "content": "ok"}
+        ]}})
+    }
+
+    #[test]
+    fn a_transcript_ending_in_an_unanswered_bash_call_asks_to_allow_it() {
+        let events = transcript(&[
+            json!({"type": "user", "message": {"role": "user", "content": "Publish the crate"}}),
+            assistant_tool("b1", "Bash", json!({"command": "cargo test"})),
+            tool_result("b1"),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Tests pass. Publishing."}
+            ]}}),
+            assistant_tool(
+                "b2",
+                "Bash",
+                json!({"command": "cargo publish\n--allow-dirty", "description": "Publish"}),
+            ),
+        ]);
+        let ask = pending_tool_ask(&events).expect("an open call");
+        assert_eq!(
+            ask,
+            WaitingAsk::Permission {
+                tool: "Bash".into(),
+                detail: Some("cargo publish\n--allow-dirty".into())
+            }
+        );
+        assert_eq!(ask_line(&ask, None), "Allow Bash: `cargo publish`?");
+
+        // Answered (allowed or denied): nothing is open.
+        let mut answered = events.clone();
+        answered.extend(transcript(&[tool_result("b2")]));
+        assert_eq!(pending_tool_ask(&answered), None);
+        // A new prompt abandons the call.
+        let mut moved_on = events;
+        moved_on.push(AgentEvent::user_prompt("never mind"));
+        assert_eq!(pending_tool_ask(&moved_on), None);
+    }
+
+    #[test]
+    fn a_transcript_ending_in_ask_user_question_shows_the_question() {
+        let events = transcript(&[
+            json!({"type": "user", "message": {"role": "user", "content": "Set up the database"}}),
+            assistant_tool(
+                "q1",
+                "AskUserQuestion",
+                json!({"questions": [
+                    {"question": "Which database should I use?", "header": "DB",
+                     "options": [{"label": "Postgres"}, {"label": "SQLite"}], "multiSelect": false},
+                    {"question": "Keep the old schema?", "header": "Schema", "options": []}
+                ]}),
+            ),
+        ]);
+        let ask = pending_tool_ask(&events).expect("an open question");
+        assert_eq!(
+            ask,
+            WaitingAsk::Question {
+                questions: vec![
+                    "Which database should I use?".into(),
+                    "Keep the old schema?".into()
+                ]
+            }
+        );
+        assert_eq!(
+            ask_line(&ask, None),
+            "Which database should I use? (+1 more)"
+        );
+    }
+
+    #[test]
+    fn an_open_agent_call_waits_on_its_subagent_not_the_human() {
+        let events = transcript(&[
+            json!({"type": "user", "message": {"role": "user", "content": "Find the callers"}}),
+            assistant_tool("a1", "Agent", json!({"description": "find callers"})),
+        ]);
+        assert_eq!(pending_tool_ask(&events), None);
+        // Parallel calls: the oldest open one is the ask.
+        let events = transcript(&[
+            json!({"type": "user", "message": {"role": "user", "content": "Fix it"}}),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/r/a.rs"}},
+                {"type": "tool_use", "id": "e1", "name": "Edit", "input": {"file_path": "/r/src/main.rs"}},
+                {"type": "tool_use", "id": "w1", "name": "Write", "input": {"file_path": "/r/b.rs"}}
+            ]}}),
+            tool_result("r1"),
+        ]);
+        let ask = pending_tool_ask(&events).expect("an open edit");
+        assert_eq!(ask_line(&ask, Some(Path::new("/r"))), "Edit src/main.rs?");
+    }
+
+    #[test]
+    fn the_tracker_fed_in_pieces_matches_the_digest_of_the_whole_transcript() {
+        let lines = [
+            json!({"type": "user", "message": {"role": "user", "content": "Add a retry to the uploader"}}),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "I'll plan it."},
+                {"type": "tool_use", "id": "tw1", "name": "TodoWrite", "input": {"todos": [
+                    {"content": "Find the uploader", "status": "completed", "activeForm": "Finding"},
+                    {"content": "Add the retry", "status": "in_progress", "activeForm": "Adding"},
+                    {"content": "Skip this", "status": "cancelled", "activeForm": "Skipping"}
+                ]}}
+            ]}}),
+            tool_result("tw1"),
+            assistant_tool("ed1", "Edit", json!({"file_path": "/r/src/upload.rs"})),
+            tool_result("ed1"),
+            // A denied write touched nothing; a failed todo list is not the plan.
+            assistant_tool(
+                "w1",
+                "Write",
+                json!({"file_path": "/r/denied.rs", "content": "x"}),
+            ),
+            json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "w1", "content": "denied", "is_error": true}
+            ]}}),
+            assistant_tool(
+                "tw2",
+                "TodoWrite",
+                json!({"todos": [
+                    {"content": "Broken", "status": "pending"}
+                ]}),
+            ),
+            json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tw2", "content": "bad", "is_error": true}
+            ]}}),
+            assistant_tool("ed2", "MultiEdit", json!({"file_path": "/r/src/upload.rs"})),
+            tool_result("ed2"),
+            assistant_tool(
+                "ed3",
+                "Write",
+                json!({"file_path": "/r/tests/retry.rs", "content": "t"}),
+            ),
+            tool_result("ed3"),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Added a retry with backoff.\n\nDetails below."}
+            ]}}),
+            json!({"type": "user", "message": {"role": "user", "content": "<system-reminder>x</system-reminder>"}}),
+            json!({"type": "user", "message": {"role": "user", "content": "Now publish it"}}),
+            assistant_tool("b1", "Bash", json!({"command": "cargo publish"})),
+        ];
+        let whole = transcript(&lines);
+        let expected = gist(&digest(&whole));
+        assert_eq!(
+            expected,
+            ChatGist {
+                asked: Some("Now publish it".into()),
+                reply: Some("Added a retry with backoff.".into()),
+                todos_done: 1,
+                todos_total: 2,
+                files: 2,
+            }
+        );
+        // Every split point: the file read in two pieces, each parsed on
+        // its own as the overview reads appended lines.
+        for split in 0..=lines.len() {
+            let mut tracker = TranscriptTracker::default();
+            tracker.feed(&transcript(&lines[..split]));
+            tracker.feed(&transcript(&lines[split..]));
+            assert_eq!(tracker.gist(), expected, "split at {split}");
+            assert_eq!(
+                tracker.pending(),
+                Some(WaitingAsk::Permission {
+                    tool: "Bash".into(),
+                    detail: Some("cargo publish".into())
+                }),
+                "split at {split}"
+            );
+        }
+        assert_eq!(
+            TranscriptTracker::default().gist(),
+            gist(&ChatDigest::default())
+        );
+    }
+
+    #[test]
+    fn ask_lines_name_the_tool_and_what_it_acts_on() {
+        let permission = |tool: &str, detail: Option<&str>| WaitingAsk::Permission {
+            tool: tool.into(),
+            detail: detail.map(str::to_string),
+        };
+        let cwd = Some(Path::new("/repo"));
+        assert_eq!(
+            ask_line(&permission("Write", Some("/repo/src/new.rs")), cwd),
+            "Write src/new.rs?"
+        );
+        assert_eq!(
+            ask_line(&permission("ExitPlanMode", None), cwd),
+            "Approve the plan?"
+        );
+        assert_eq!(
+            ask_line(&permission("WebFetch", Some("https://docs.rs/iced")), cwd),
+            "Allow WebFetch: https://docs.rs/iced?"
+        );
+        assert_eq!(
+            ask_line(&permission("mcp__github__create_issue", None), cwd),
+            "Allow create_issue?"
+        );
+        assert_eq!(
+            ask_line(&WaitingAsk::Question { questions: vec![] }, cwd),
+            "A question for you"
+        );
+    }
+
+    #[test]
+    fn gist_trims_the_ask_takes_the_reply_line_and_counts_progress() {
+        let todo = |text: &str, status| TodoItem {
+            text: text.into(),
+            status,
+        };
+        let digest = ChatDigest {
+            latest_ask: Some("  Port the parser\n  to the new API  ".into()),
+            todos: vec![
+                todo("a", TodoStatus::Completed),
+                todo("b", TodoStatus::Completed),
+                todo("c", TodoStatus::InProgress),
+                todo("d", TodoStatus::Cancelled),
+            ],
+            files_touched: vec!["/r/a.rs".into(), "/r/b.rs".into()],
+            latest_reply: Some("\n## Ported\n\nAll tests pass.".into()),
+            waiting: Vec::new(),
+        };
+        assert_eq!(
+            gist(&digest),
+            ChatGist {
+                asked: Some("Port the parser to the new API".into()),
+                reply: Some("Ported".into()),
+                todos_done: 2,
+                todos_total: 3,
+                files: 2,
+            }
+        );
+        assert_eq!(gist(&ChatDigest::default()), ChatGist::default());
     }
 
     #[test]

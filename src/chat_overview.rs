@@ -29,6 +29,8 @@ pub(crate) const RECENT_WINDOW: Duration = Duration::from_secs(4 * 60 * 60);
 const STEP_DETAIL_CHARS: usize = 60;
 /// Longest one-line result or ask.
 const LINE_CHARS: usize = 140;
+/// Longest "Asked for" on a row's summary line.
+const ASKED_CHARS: usize = 100;
 
 /// What runs the chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +224,60 @@ pub(crate) struct ChatSnapshot {
     pub(crate) cost_usd: Option<f64>,
     pub(crate) children: Vec<ChildActivity>,
     pub(crate) last_finished: Option<FinishedTurn>,
+    /// What the conversation says about itself, for the row's summary
+    /// line; `None` when no source has it (a remote chat not selected).
+    pub(crate) gist: Option<ChatGist>,
+    /// When the conversation last moved, as far as GitTerm knows: a live
+    /// event, the transcript's mtime, else the Chats index's.
+    pub(crate) last_activity: Option<SystemTime>,
     pub(crate) target: NavTarget,
+}
+
+/// A conversation in a few words, for an overview row: the human's latest
+/// request, the first line of the latest reply, the plan's progress and
+/// how many files it touched. Derived from a `chat_summary::ChatDigest`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChatGist {
+    /// One line, trimmed.
+    pub(crate) asked: Option<String>,
+    /// The latest reply's first line.
+    pub(crate) reply: Option<String>,
+    pub(crate) todos_done: usize,
+    /// Items on the latest todo list, cancelled ones left out; 0 when the
+    /// chat has none.
+    pub(crate) todos_total: usize,
+    pub(crate) files: usize,
+}
+
+/// A row's summary line: "Asked for: <ask> · 4/7 done · 6 files", each
+/// part left out when unknown. `None` when nothing is known.
+pub(crate) fn gist_line(gist: &ChatGist) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(asked) = gist.asked.as_deref().filter(|asked| !asked.is_empty()) {
+        parts.push(format!("Asked for: {}", one_line(asked, ASKED_CHARS)));
+    }
+    if gist.todos_total > 0 {
+        parts.push(format!("{}/{} done", gist.todos_done, gist.todos_total));
+    }
+    match gist.files {
+        0 => {}
+        1 => parts.push("1 file".to_string()),
+        files => parts.push(format!("{files} files")),
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// How long ago `at` was at `now`: "just now", "2m ago", "3h ago",
+/// "4d ago". A clock a little ahead (another machine's) reads "just now".
+pub(crate) fn format_ago(at: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(at).map_or(0, |age| age.as_secs());
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        86_400..=2_591_999 => format!("{}d ago", secs / 86_400),
+        _ => format!("{}mo ago", secs / 2_592_000),
+    }
 }
 
 /// A delegation whose parent chat is not open in a tab.
@@ -257,6 +312,9 @@ impl OverviewSnapshot {
 pub(crate) struct LiveTimes {
     pub(crate) turn_started: Option<SystemTime>,
     pub(crate) turn_finished: Option<SystemTime>,
+    /// The last conversational event: a turn starting or ending, reply
+    /// text, a tool call or result, a prompt for the human.
+    pub(crate) last_activity: Option<SystemTime>,
     /// Agent tool call id -> when its subagent finished.
     pub(crate) children_finished: HashMap<String, SystemTime>,
     turn_open: bool,
@@ -268,6 +326,19 @@ impl LiveTimes {
         let AgentEvent::Harness(event) = event else {
             return;
         };
+        if matches!(
+            event,
+            HarnessEvent::TurnStarted { .. }
+                | HarnessEvent::TurnCompleted { .. }
+                | HarnessEvent::TextDelta(_)
+                | HarnessEvent::ItemStarted { .. }
+                | HarnessEvent::ItemCompleted { .. }
+                | HarnessEvent::RuntimeRequest { .. }
+                | HarnessEvent::RuntimeRequestResolved { .. }
+                | HarnessEvent::SubagentEvent { .. }
+        ) {
+            self.last_activity = Some(now);
+        }
         match event {
             HarnessEvent::TurnStarted { .. } if !self.turn_open => {
                 self.turn_open = true;
@@ -705,7 +776,7 @@ fn turn_result(last_reply: &str, status: &TurnStatus) -> String {
 }
 
 /// The first line with text, without markdown's leading markers.
-fn first_line(text: &str) -> &str {
+pub(crate) fn first_line(text: &str) -> &str {
     text.lines()
         .map(|line| line.trim().trim_start_matches(['#', '>', '*', '-']).trim())
         .find(|line| !line.is_empty())
@@ -725,7 +796,7 @@ pub(crate) fn one_line(text: &str, max: usize) -> String {
 
 /// A path for a step: relative to `cwd` when under it, else the last two
 /// components.
-fn short_path(path: &str, cwd: Option<&Path>) -> String {
+pub(crate) fn short_path(path: &str, cwd: Option<&Path>) -> String {
     let full = Path::new(path);
     if let Some(relative) = cwd.and_then(|cwd| full.strip_prefix(cwd).ok()) {
         if !relative.as_os_str().is_empty() {
@@ -816,7 +887,7 @@ pub(crate) fn describe_tool(name: &str, input: &Value, cwd: Option<&Path>) -> St
     }
 }
 
-fn first_line_raw(text: &str) -> &str {
+pub(crate) fn first_line_raw(text: &str) -> &str {
     text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
@@ -991,6 +1062,9 @@ pub(crate) struct TerminalInput<'a> {
     pub(crate) harness: Harness,
     /// Its attention says it wants the human: the label.
     pub(crate) needs_you: Option<&'a str>,
+    /// The ask its transcript leaves open (a tool call with no result
+    /// yet), in plain words: what `needs_you` waits on.
+    pub(crate) pending_ask: Option<String>,
     pub(crate) running: bool,
 }
 
@@ -1016,6 +1090,9 @@ pub(crate) struct TabInput<'a> {
     pub(crate) runs: TabRuns<'a>,
     /// Delegations this tab requested, each with its worker's task title.
     pub(crate) delegations: Vec<(&'a Delegation, Option<String>)>,
+    /// The conversation in a few words, when its digest is known.
+    pub(crate) gist: Option<ChatGist>,
+    pub(crate) last_activity: Option<SystemTime>,
 }
 
 /// Whether a delegation belongs in the snapshot at `now`: not dismissed,
@@ -1087,7 +1164,10 @@ pub(crate) fn tab_snapshot(input: TabInput<'_>, now: SystemTime) -> ChatSnapshot
         TabRuns::Terminal(terminal) => {
             let state = match terminal.needs_you {
                 Some(what) => ChatState::NeedsYou {
-                    what: what.to_string(),
+                    what: terminal
+                        .pending_ask
+                        .clone()
+                        .unwrap_or_else(|| what.to_string()),
                 },
                 None if terminal.running => ChatState::Working,
                 None => ChatState::Idle,
@@ -1174,6 +1254,8 @@ pub(crate) fn tab_snapshot(input: TabInput<'_>, now: SystemTime) -> ChatSnapshot
         state,
         children,
         last_finished,
+        gist: input.gist,
+        last_activity: input.last_activity,
         target: NavTarget::Tab(tab_id),
     }
 }
@@ -1221,6 +1303,8 @@ pub(crate) fn remote_chat_snapshot(
         cost_usd: None,
         children: Vec::new(),
         last_finished: None,
+        gist: None,
+        last_activity: None,
         target: chat.clone().map_or(NavTarget::Nowhere, NavTarget::OpenChat),
         chat,
     }
@@ -1274,6 +1358,9 @@ pub(crate) struct NeedsYouRow<'a> {
     pub(crate) branch: Option<&'a str>,
     pub(crate) what: &'a str,
     pub(crate) harness: Option<Harness>,
+    /// The chat's gist; `None` for a blocked worker.
+    pub(crate) gist: Option<&'a ChatGist>,
+    pub(crate) last_activity: Option<SystemTime>,
     pub(crate) target: &'a NavTarget,
 }
 
@@ -1298,6 +1385,8 @@ pub(crate) struct FinishedRow<'a> {
     pub(crate) result: &'a str,
     pub(crate) failed: bool,
     pub(crate) cost_usd: Option<f64>,
+    /// The chat's gist; `None` for a child's run.
+    pub(crate) gist: Option<&'a ChatGist>,
     pub(crate) target: &'a NavTarget,
 }
 
@@ -1327,6 +1416,8 @@ pub(crate) fn sections(snapshot: &OverviewSnapshot, now: SystemTime) -> Sections
                 branch: chat.branch.as_deref(),
                 what,
                 harness: Some(chat.harness),
+                gist: chat.gist.as_ref(),
+                last_activity: chat.last_activity,
                 target: &chat.target,
             }),
             ChatState::Working => out.working.push(WorkingRow::Chat(chat)),
@@ -1344,6 +1435,7 @@ pub(crate) fn sections(snapshot: &OverviewSnapshot, now: SystemTime) -> Sections
                     result: &turn.result,
                     failed: turn.failed,
                     cost_usd: turn.cost_usd,
+                    gist: chat.gist.as_ref(),
                     target: &chat.target,
                 });
             }
@@ -1358,6 +1450,8 @@ pub(crate) fn sections(snapshot: &OverviewSnapshot, now: SystemTime) -> Sections
                     branch: chat.branch.as_deref(),
                     what: child.result.as_deref().unwrap_or("Blocked"),
                     harness: None,
+                    gist: None,
+                    last_activity: None,
                     target: &child.target,
                 });
             }
@@ -1376,6 +1470,7 @@ pub(crate) fn sections(snapshot: &OverviewSnapshot, now: SystemTime) -> Sections
                     result: child.result.as_deref().unwrap_or(child.status.label()),
                     failed: failed(child.status),
                     cost_usd: None,
+                    gist: None,
                     target: &child.target,
                 });
             }
@@ -1395,6 +1490,8 @@ pub(crate) fn sections(snapshot: &OverviewSnapshot, now: SystemTime) -> Sections
                 branch: None,
                 what: child.result.as_deref().unwrap_or("Blocked"),
                 harness: None,
+                gist: None,
+                last_activity: None,
                 target: &child.target,
             });
         }
@@ -1412,6 +1509,7 @@ pub(crate) fn sections(snapshot: &OverviewSnapshot, now: SystemTime) -> Sections
                 result: child.result.as_deref().unwrap_or(child.status.label()),
                 failed: failed(child.status),
                 cost_usd: None,
+                gist: None,
                 target: &child.target,
             });
         }
@@ -1932,6 +2030,8 @@ mod tests {
             cost_usd: None,
             children: Vec::new(),
             last_finished: None,
+            gist: None,
+            last_activity: None,
             target: NavTarget::Tab(1),
         }
     }
@@ -2048,6 +2148,8 @@ mod tests {
             cwd: Some(Path::new("/repo")),
             runs,
             delegations,
+            gist: None,
+            last_activity: None,
         }
     }
 
@@ -2133,6 +2235,7 @@ mod tests {
             TabRuns::Terminal(TerminalInput {
                 harness: Harness::ClaudeCli,
                 needs_you,
+                pending_ask: None,
                 running,
             })
         };
@@ -2153,6 +2256,118 @@ mod tests {
         assert_eq!(working.last_finished, None);
         let idle = tab_snapshot(tab_input(terminal(None, false), Vec::new()), now);
         assert_eq!(idle.state, ChatState::Idle);
+
+        // The ask its transcript leaves open says what it waits on; the
+        // gist and last activity pass through.
+        let mut input = tab_input(
+            TabRuns::Terminal(TerminalInput {
+                harness: Harness::ClaudeCli,
+                needs_you: Some("Input or approval needed"),
+                pending_ask: Some("Allow Bash: `cargo publish`?".into()),
+                running: false,
+            }),
+            Vec::new(),
+        );
+        let gist = ChatGist {
+            asked: Some("Publish it".into()),
+            files: 2,
+            ..ChatGist::default()
+        };
+        input.gist = Some(gist.clone());
+        input.last_activity = Some(now - Duration::from_secs(120));
+        let asking = tab_snapshot(input, now);
+        assert_eq!(
+            asking.state,
+            ChatState::NeedsYou {
+                what: "Allow Bash: `cargo publish`?".into()
+            }
+        );
+        assert_eq!(asking.gist, Some(gist));
+        let snapshot = OverviewSnapshot {
+            chats: vec![asking],
+            detached: Vec::new(),
+        };
+        let out = sections(&snapshot, now);
+        assert_eq!(
+            out.needs_you[0].gist.and_then(gist_line).as_deref(),
+            Some("Asked for: Publish it · 2 files")
+        );
+        assert_eq!(
+            out.needs_you[0].last_activity.map(|at| format_ago(at, now)),
+            Some("2m ago".to_string())
+        );
+        // An ask the transcript does not name falls back to the label.
+        let fallback = tab_snapshot(
+            tab_input(
+                terminal(Some("Input or approval needed"), false),
+                Vec::new(),
+            ),
+            now,
+        );
+        assert_eq!(
+            fallback.state,
+            ChatState::NeedsYou {
+                what: "Input or approval needed".into()
+            }
+        );
+    }
+
+    #[test]
+    fn gist_line_joins_what_is_known() {
+        let gist = ChatGist {
+            asked: Some("Port the parser to the new API".into()),
+            reply: Some("Ported.".into()),
+            todos_done: 4,
+            todos_total: 7,
+            files: 6,
+        };
+        assert_eq!(
+            gist_line(&gist).as_deref(),
+            Some("Asked for: Port the parser to the new API · 4/7 done · 6 files")
+        );
+        let files_only = ChatGist {
+            files: 1,
+            ..ChatGist::default()
+        };
+        assert_eq!(gist_line(&files_only).as_deref(), Some("1 file"));
+        assert_eq!(gist_line(&ChatGist::default()), None);
+        let long = ChatGist {
+            asked: Some("word ".repeat(40)),
+            ..ChatGist::default()
+        };
+        let line = gist_line(&long).expect("an ask");
+        assert!(line.ends_with('…'));
+        assert_eq!(line.chars().count(), "Asked for: ".len() + ASKED_CHARS);
+    }
+
+    #[test]
+    fn format_ago_reads_like_the_finished_rows() {
+        let now = UNIX_EPOCH + Duration::from_secs(10_000_000);
+        let ago = |secs| format_ago(now - Duration::from_secs(secs), now);
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(150), "2m ago");
+        assert_eq!(ago(3 * 3600 + 5), "3h ago");
+        assert_eq!(ago(2 * 86_400), "2d ago");
+        // Another machine's clock a little ahead.
+        assert_eq!(format_ago(now + Duration::from_secs(30), now), "just now");
+    }
+
+    #[test]
+    fn live_times_note_the_last_conversational_event() {
+        let start = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut times = LiveTimes::default();
+        times.observe(&turn_started(None), start);
+        times.observe(
+            &tool("b1", "Bash", json!({})),
+            start + Duration::from_secs(5),
+        );
+        times.observe(
+            &AgentEvent::Other(json!({"kind": "subagent_started_at"})),
+            start + Duration::from_secs(9),
+        );
+        assert_eq!(times.last_activity, Some(start + Duration::from_secs(5)));
+        times.observe(&completed(None), start + Duration::from_secs(20));
+        assert_eq!(times.last_activity, Some(start + Duration::from_secs(20)));
     }
 
     #[test]

@@ -388,6 +388,126 @@ fn replay_agent_conversation_in_webview(
     );
 }
 
+/// A CLI terminal tab's transcript as the Chats overview reads it (TRU-154):
+/// the file's mtime and size when last checked, its gist, and the ask it
+/// leaves open (a Claude transcript's tool call with no result yet). A
+/// Claude transcript is read incrementally: `offset` is the end of the
+/// last whole line read, `tracker` what those lines said.
+#[derive(Debug, Clone)]
+pub struct TranscriptGist {
+    mtime: std::time::SystemTime,
+    size: u64,
+    offset: u64,
+    tracker: Option<chat_summary::TranscriptTracker>,
+    gist: chat_overview::ChatGist,
+    pending: Option<chat_summary::WaitingAsk>,
+}
+
+/// One transcript the visible Chats overview follows: when it was last
+/// checked, whether a check is out, and what the last read found.
+#[derive(Debug, Default)]
+struct OverviewTranscript {
+    checked_at: Option<Instant>,
+    in_flight: bool,
+    loaded: Option<TranscriptGist>,
+}
+
+/// Bytes read at a time from a transcript; a long session's runs to a
+/// hundred MB and more.
+const TRANSCRIPT_READ_CHUNK: usize = 4 * 1024 * 1024;
+
+/// Hand `on_lines` the whole lines of `path` from byte `offset` on, a
+/// bounded chunk at a time, and return the offset after the last whole
+/// line. A line still being written is left for the next read.
+fn read_whole_lines_from(
+    path: &Path,
+    offset: u64,
+    mut on_lines: impl FnMut(&str),
+) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut consumed = offset;
+    let mut partial: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; TRANSCRIPT_READ_CHUNK];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            return Ok(consumed);
+        }
+        partial.extend_from_slice(&buf[..read]);
+        if let Some(end) = partial.iter().rposition(|byte| *byte == b'\n') {
+            let whole: Vec<u8> = partial.drain(..=end).collect();
+            consumed += whole.len() as u64;
+            on_lines(&String::from_utf8_lossy(&whole));
+        }
+    }
+}
+
+/// Check a CLI chat's transcript for the Chats overview against what the
+/// last check found (`last`): `Ok(None)` while its mtime and size have not
+/// moved. A Claude transcript's new whole lines are read and fed to the
+/// last check's tracker (all of it again only when the file shrank); Codex
+/// and Pi have only the preview tail, so their gist is the ask and the
+/// reply, read from the tail again. Blocking; run off the UI thread.
+fn load_transcript_gist(
+    path: &Path,
+    backend: chats::ChatBackend,
+    last: Option<TranscriptGist>,
+) -> Result<Option<TranscriptGist>, String> {
+    let meta = std::fs::metadata(path).map_err(|err| format!("cannot stat: {err}"))?;
+    let mtime = meta
+        .modified()
+        .map_err(|err| format!("no modification time: {err}"))?;
+    let size = meta.len();
+    if last
+        .as_ref()
+        .is_some_and(|last| last.mtime == mtime && last.size == size)
+    {
+        return Ok(None);
+    }
+    match backend {
+        chats::ChatBackend::Claude => {
+            let (mut tracker, offset) = match last {
+                Some(TranscriptGist {
+                    tracker: Some(tracker),
+                    offset,
+                    ..
+                }) if offset <= size => (tracker, offset),
+                _ => (chat_summary::TranscriptTracker::default(), 0),
+            };
+            let offset = read_whole_lines_from(path, offset, |lines| {
+                let events: Vec<tab::AgentEvent> =
+                    gitterm::harness::transcript::parse_claude_transcript(lines)
+                        .into_iter()
+                        .map(tab::AgentEvent::from)
+                        .collect();
+                tracker.feed(&events);
+            })
+            .map_err(|err| format!("cannot read: {err}"))?;
+            Ok(Some(TranscriptGist {
+                mtime,
+                size,
+                offset,
+                gist: tracker.gist(),
+                pending: tracker.pending(),
+                tracker: Some(tracker),
+            }))
+        }
+        chats::ChatBackend::Codex | chats::ChatBackend::Pi => {
+            let preview = chats::load_preview(path, backend);
+            Ok(Some(TranscriptGist {
+                mtime,
+                size,
+                offset: 0,
+                tracker: None,
+                gist: chat_summary::gist(&chat_summary::digest_messages(&preview.messages)),
+                pending: None,
+            }))
+        }
+    }
+}
+
 /// The summary (TRU-155) of a conversation read back from its transcript.
 /// Blocking-sized for a long transcript; run off the UI thread.
 fn chat_digest_from_timeline(
@@ -3111,11 +3231,12 @@ fn post_needs_you_notification(title: &str, body: &str) {
 type ChatOverviewCache =
     std::cell::RefCell<Option<(u64, Instant, std::rc::Rc<chat_overview::OverviewSnapshot>)>>;
 
-/// A selected conversation's live summary (TRU-155): the chat tab it was
-/// built from, the key it was built for, when, and the digest. Same
-/// rebuild rule as the overview's, per tab.
+/// Each open chat tab's live summary (TRU-155; the overview rows' gist,
+/// TRU-154), by tab id: the key it was built for, when, and the digest.
+/// Same rebuild rule as the overview's, per tab. Closed tabs are dropped
+/// when the overview is rebuilt.
 type ChatDigestCache =
-    std::cell::RefCell<Option<(usize, u64, Instant, std::rc::Rc<chat_summary::ChatDigest>)>>;
+    std::cell::RefCell<HashMap<usize, (u64, Instant, std::rc::Rc<chat_summary::ChatDigest>)>>;
 
 /// Least time between two overview snapshot builds. A streaming chat
 /// changes the key on every delta; the menu poll redraws every
@@ -3126,6 +3247,12 @@ const OVERVIEW_REBUILD_MIN: Duration = Duration::from_millis(250);
 /// it runs (`ListClaudeChats`). Never while the overview is hidden.
 const OVERVIEW_REMOTE_POLL: Duration = Duration::from_secs(10);
 
+/// Least time between two checks of one CLI transcript by the visible
+/// Chats overview. The 5 s `Tick` drives the checks; this a little under
+/// it so a tick that fires a few ms early is not skipped, and opening the
+/// overview right after a tick does not check twice.
+const OVERVIEW_TRANSCRIPT_POLL: Duration = Duration::from_millis(4500);
+
 /// One clickable row of the Chats overview (TRU-154), ready to draw.
 struct OverviewRow {
     icon: &'static str,
@@ -3134,6 +3261,8 @@ struct OverviewRow {
     /// Where it lives and what runs it; empty for nested rows.
     meta: String,
     detail: Option<(String, iced::Color)>,
+    /// The chat's gist (what was asked, progress, files), muted.
+    gist: Option<String>,
     /// Elapsed time, age or cost, right-aligned.
     right: String,
     target: chat_overview::NavTarget,
@@ -5634,6 +5763,9 @@ pub enum Event {
     AgentHistoryUnavailable(usize, String),
     /// The Claude chats a remote's agent is running (TRU-152).
     RemoteRunningChatsLoaded(String, Result<Vec<RunningClaudeChat>, String>),
+    /// A CLI transcript the Chats overview follows was checked (TRU-154):
+    /// `Ok(None)` when it had not changed.
+    OverviewTranscriptLoaded(PathBuf, Result<Option<Box<TranscriptGist>>, String>),
     /// The Agent surface finished building this tab's page. The tab's
     /// buffer is replayed now, from live state, so events that arrived while
     /// the page was under construction (transcript read-back, a fast first
@@ -6075,6 +6207,11 @@ struct App {
     /// chats, and whether that ask is still out. Polled only while the
     /// overview is on screen, at most every `OVERVIEW_REMOTE_POLL`.
     overview_running_polled: HashMap<String, (Instant, bool)>,
+    /// The CLI terminal tabs' transcripts the visible Chats overview
+    /// follows, by path (TRU-154), and a counter bumped whenever one read
+    /// changes, for the overview's snapshot key.
+    overview_transcripts: HashMap<PathBuf, OverviewTranscript>,
+    overview_transcripts_revision: u64,
     /// The Chats overview's snapshot and the key it was built for. Built
     /// in `view` on first need and rebuilt only when the key changes, so a
     /// frame costs a cheap key, not a walk of every conversation.
@@ -6093,8 +6230,8 @@ struct App {
     /// transcript (a local or remote Claude chat) or the preview tail.
     /// Stands in for a conversation no native chat tab holds.
     chat_preview_digest: Option<(chats::ChatRef, std::rc::Rc<chat_summary::ChatDigest>)>,
-    /// The summary of a selected conversation an open chat tab holds,
-    /// derived from its live buffer and rebuilt only when its key changes.
+    /// The summary of each conversation an open chat tab holds, derived
+    /// from its live buffer and rebuilt only when its key changes.
     chat_digest_cache: ChatDigestCache,
     /// The raw conversation under a selected chat's summary is unfolded
     /// (folded by default; per app run).
@@ -13233,6 +13370,8 @@ impl App {
             remote_running_chats: HashMap::new(),
             remote_running_chats_revision: 0,
             overview_running_polled: HashMap::new(),
+            overview_transcripts: HashMap::new(),
+            overview_transcripts_revision: 0,
             chat_overview_cache: ChatOverviewCache::default(),
             chat_overview_idle_expanded: false,
             roster_reveal_held: HashMap::new(),
@@ -15270,6 +15409,74 @@ fi
         Task::batch(tasks)
     }
 
+    /// Check the transcripts of this Mac's CLI terminal tabs (Claude CLI,
+    /// Codex CLI) the Chats index knows, for the overview's rows: at most
+    /// every `OVERVIEW_TRANSCRIPT_POLL` per file, one check at a time, and
+    /// only while the overview is on screen. The check stats the file off
+    /// the UI thread and reads it only when its mtime or size moved.
+    /// Transcripts no tab shows any more are forgotten.
+    fn poll_overview_transcripts(&mut self) -> Task<Event> {
+        if !self.chats_overview_visible() {
+            return Task::none();
+        }
+        let mut wanted: HashMap<PathBuf, chats::ChatBackend> = HashMap::new();
+        for workspace in &self.workspaces {
+            // A remote's transcripts are on the remote; no new RPCs.
+            if self.remote_agent_id_for_workspace(workspace).is_some() {
+                continue;
+            }
+            for tab in workspace
+                .tabs
+                .iter()
+                .filter(|tab| tab.agent_session().is_none())
+            {
+                let Some(entry) = tab
+                    .chat_session_id
+                    .as_deref()
+                    .and_then(|id| self.chat_index.iter().find(|entry| entry.id == id))
+                else {
+                    continue;
+                };
+                wanted.insert(entry.path.clone(), entry.backend);
+            }
+        }
+        self.overview_transcripts
+            .retain(|path, _| wanted.contains_key(path));
+        let now = Instant::now();
+        let mut tasks = Vec::new();
+        for (path, backend) in wanted {
+            let state = self.overview_transcripts.entry(path.clone()).or_default();
+            if state.in_flight
+                || state
+                    .checked_at
+                    .is_some_and(|at| now.duration_since(at) < OVERVIEW_TRANSCRIPT_POLL)
+            {
+                continue;
+            }
+            state.in_flight = true;
+            state.checked_at = Some(now);
+            // The check goes on from what the last read found (a small
+            // state, not the transcript).
+            let last = state.loaded.clone();
+            tasks.push(Task::perform(
+                async move {
+                    let read_path = path.clone();
+                    let result = match tokio::task::spawn_blocking(move || {
+                        load_transcript_gist(&read_path, backend, last)
+                    })
+                    .await
+                    {
+                        Ok(result) => result.map(|loaded| loaded.map(Box::new)),
+                        Err(err) => Err(format!("read task failed: {err}")),
+                    };
+                    (path, result)
+                },
+                |(path, result)| Event::OverviewTranscriptLoaded(path, result),
+            ));
+        }
+        Task::batch(tasks)
+    }
+
     /// Follow a Chats overview row (TRU-154). Landing on a tab closes the
     /// Chats panel there (back to the panel it had before), so the tab
     /// shows its own content; a subagent or worker row also opens that
@@ -15356,21 +15563,30 @@ fi
                 .filter(|(loaded, _)| loaded == chat)
                 .map(|(_, digest)| digest.clone());
         };
+        Some(self.live_chat_digest(tab_id, session))
+    }
+
+    /// A chat tab's digest from its live buffer, from the per-tab cache:
+    /// rebuilt only when the buffer's revision moves, and then at most
+    /// every `OVERVIEW_REBUILD_MIN`.
+    fn live_chat_digest(
+        &self,
+        tab_id: usize,
+        session: &tab::AgentSession,
+    ) -> std::rc::Rc<chat_summary::ChatDigest> {
         let mut hasher = DefaultHasher::new();
         session.revision.hash(&mut hasher);
         session.conversation.len().hash(&mut hasher);
         let key = hasher.finish();
         let mut cache = self.chat_digest_cache.borrow_mut();
-        if let Some((cached_tab, cached_key, built_at, digest)) = cache.as_ref() {
-            if *cached_tab == tab_id
-                && (*cached_key == key || built_at.elapsed() < OVERVIEW_REBUILD_MIN)
-            {
-                return Some(digest.clone());
+        if let Some((cached_key, built_at, digest)) = cache.get(&tab_id) {
+            if *cached_key == key || built_at.elapsed() < OVERVIEW_REBUILD_MIN {
+                return digest.clone();
             }
         }
         let digest = std::rc::Rc::new(chat_summary::digest(&session.conversation));
-        *cache = Some((tab_id, key, Instant::now(), digest.clone()));
-        Some(digest)
+        cache.insert(tab_id, (key, Instant::now(), digest.clone()));
+        digest
     }
 
     /// A hash of everything the overview snapshot is built from: per tab
@@ -15414,12 +15630,17 @@ fi
             }
         }
         self.remote_running_chats_revision.hash(&mut hasher);
-        self.chat_index.len().hash(&mut hasher);
-        self.remote_chat_indexes
-            .values()
-            .map(|state| state.entries.len())
-            .sum::<usize>()
+        self.overview_transcripts_revision.hash(&mut hasher);
+        self.chat_preview_digest
+            .as_ref()
+            .map(|(chat, digest)| (chat, std::rc::Rc::as_ptr(digest) as usize))
             .hash(&mut hasher);
+        self.chat_index_loaded_at.hash(&mut hasher);
+        self.chat_index.len().hash(&mut hasher);
+        for state in self.remote_chat_indexes.values() {
+            state.entries.len().hash(&mut hasher);
+            state.loaded_at.hash(&mut hasher);
+        }
         self.remote_agent_defs.len().hash(&mut hasher);
         hasher.finish()
     }
@@ -15450,8 +15671,18 @@ fi
             _ => None,
         };
 
+        // A conversation's gist from the summary loaded with a selected
+        // chat's preview: all there is for a chat no local source covers
+        // (a remote's), with no new RPCs.
+        let preview_gist = |chat: Option<&chats::ChatRef>| {
+            self.chat_preview_digest
+                .as_ref()
+                .filter(|(loaded, _)| Some(loaded) == chat)
+                .map(|(_, digest)| chat_summary::gist(digest))
+        };
         let mut snapshot = chat_overview::OverviewSnapshot::default();
         let mut open_uids: HashSet<&str> = HashSet::new();
+        let mut chat_tabs: HashSet<usize> = HashSet::new();
         for workspace in &self.workspaces {
             let remote_id = self.remote_agent_id_for_workspace(workspace);
             let machine = self.chat_machine_name(remote_id);
@@ -15468,6 +15699,30 @@ fi
                     .or_else(|| session.and_then(|session| session.session_id.as_deref()))
                     .map(|id| chats::ChatRef::new(remote_id, id));
                 let entry = chat.as_ref().and_then(|chat| self.find_chat_entry(chat));
+                let cwd = if tab.current_dir.starts_with(&root) {
+                    tab.current_dir.as_path()
+                } else {
+                    root.as_path()
+                };
+                // A CLI tab's transcript as the overview last read it
+                // (`poll_overview_transcripts`; this Mac's only).
+                let transcript = entry
+                    .filter(|_| session.is_none() && remote_id.is_none())
+                    .and_then(|entry| self.overview_transcripts.get(&entry.path))
+                    .and_then(|state| state.loaded.as_ref());
+                let gist = match session.filter(|session| !session.conversation.is_empty()) {
+                    Some(session) => {
+                        chat_tabs.insert(tab.id);
+                        Some(chat_summary::gist(&self.live_chat_digest(tab.id, session)))
+                    }
+                    None => transcript
+                        .map(|transcript| transcript.gist.clone())
+                        .or_else(|| preview_gist(chat.as_ref())),
+                };
+                let last_activity = session
+                    .and_then(|session| session.live_times.last_activity)
+                    .or_else(|| transcript.map(|transcript| transcript.mtime))
+                    .or_else(|| entry.map(|entry| entry.mtime));
                 let runs = match session {
                     Some(session) => TabRuns::Chat(SessionInput {
                         harness: match session.backend() {
@@ -15499,6 +15754,9 @@ fi
                             .map(|attention| attention.reason)
                             .filter(|reason| *reason == AttentionReason::HumanInputRequired)
                             .map(AttentionReason::label),
+                        pending_ask: transcript
+                            .and_then(|transcript| transcript.pending.as_ref())
+                            .map(|ask| chat_summary::ask_line(ask, Some(cwd))),
                         running: tab.is_running(),
                     }),
                 };
@@ -15512,11 +15770,6 @@ fi
                     }
                 }
                 open_uids.insert(tab.session_uid.as_str());
-                let cwd = if tab.current_dir.starts_with(&root) {
-                    tab.current_dir.as_path()
-                } else {
-                    root.as_path()
-                };
                 let display_title = self.tab_display_title(tab);
                 // CLI terminal tabs often carry no repo name of their own;
                 // fall back to the conversation's indexed repo, then to
@@ -15549,11 +15802,17 @@ fi
                             .filter(|delegation| delegation.parent.session_uid == tab.session_uid)
                             .map(|delegation| (delegation, task_title(delegation)))
                             .collect(),
+                        gist,
+                        last_activity,
                     },
                     now,
                 ));
             }
         }
+        // Closed chat tabs' digests go with them.
+        self.chat_digest_cache
+            .borrow_mut()
+            .retain(|tab_id, _| chat_tabs.contains(tab_id));
 
         // Persistent chats a remote runs that no tab holds (TRU-152).
         for agent in &self.remote_agent_defs {
@@ -15573,7 +15832,7 @@ fi
                 let entry = chat_ref
                     .as_ref()
                     .and_then(|chat_ref| self.find_chat_entry(chat_ref));
-                snapshot.chats.push(chat_overview::remote_chat_snapshot(
+                let mut remote = chat_overview::remote_chat_snapshot(
                     chat_ref.clone(),
                     entry.map(|entry| entry.title.as_str()),
                     &chat.cwd,
@@ -15584,7 +15843,12 @@ fi
                         RunningClaudeChatState::TurnRunning => RemoteChatState::TurnRunning,
                         RunningClaudeChatState::AwaitingInput => RemoteChatState::AwaitingInput,
                     },
-                ));
+                );
+                // Only what is already fetched: the remote's index and a
+                // preview the human opened.
+                remote.gist = preview_gist(chat_ref.as_ref());
+                remote.last_activity = entry.map(|entry| entry.mtime);
+                snapshot.chats.push(remote);
             }
         }
 
@@ -16688,8 +16952,10 @@ fi
             Event::Tick => {
                 let mut tasks: Vec<Task<Event>> = Vec::new();
                 self.watch_open_files();
-                // Remote running chats, only while the Chats overview shows.
+                // Remote running chats and CLI transcripts, only while the
+                // Chats overview shows.
                 tasks.push(self.poll_overview_remote_chats());
+                tasks.push(self.poll_overview_transcripts());
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
@@ -21776,6 +22042,7 @@ fi
                     tasks.push(self.update(Event::SetSidebarMode(SidebarMode::Chats)));
                 }
                 tasks.push(self.poll_overview_remote_chats());
+                tasks.push(self.poll_overview_transcripts());
                 return Task::batch(tasks);
             }
             Event::ChatOverviewGo(target) => {
@@ -21808,6 +22075,24 @@ fi
                         eprintln!("[chats] remote index fetch for {remote_id} failed: {err}");
                         state.error = Some(err);
                     }
+                }
+            }
+            Event::OverviewTranscriptLoaded(path, result) => {
+                let Some(state) = self.overview_transcripts.get_mut(&path) else {
+                    // Its tab closed while the read was out.
+                    return Task::none();
+                };
+                state.in_flight = false;
+                match result {
+                    Ok(Some(loaded)) => {
+                        state.loaded = Some(*loaded);
+                        self.overview_transcripts_revision += 1;
+                    }
+                    Ok(None) => {}
+                    Err(err) => eprintln!(
+                        "[chats] overview: cannot read the transcript {} (keeping the last read): {err}",
+                        path.display()
+                    ),
                 }
             }
             Event::RemoteRunningChatsLoaded(remote_id, result) => {
@@ -32352,6 +32637,9 @@ fi
         if let Some((detail, color)) = row.detail {
             lines = lines.push(text(detail).size(font_small).color(color));
         }
+        if let Some(gist) = row.gist {
+            lines = lines.push(text(gist).size(font_small - 1.0).color(theme.text_muted()));
+        }
         let content = row![
             text(row.icon).size(font_small).color(row.icon_color),
             lines,
@@ -32382,7 +32670,9 @@ fi
     /// across this Mac and the connected remotes. Reads the cached
     /// snapshot; only the clock-relative figures are computed per frame.
     fn view_chat_overview(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        use chat_overview::{format_cost, format_elapsed, ChatSnapshot, ChatState, WorkingRow};
+        use chat_overview::{
+            format_ago, format_cost, format_elapsed, gist_line, ChatSnapshot, ChatState, WorkingRow,
+        };
         let theme = &self.theme;
         let font = self.ui_font();
         let font_small = self.ui_font_small();
@@ -32394,6 +32684,10 @@ fi
                 .map(format_elapsed)
                 .unwrap_or_default()
         };
+        let ago = |at: Option<std::time::SystemTime>| {
+            at.map(|at| format_ago(at, now)).unwrap_or_default()
+        };
+        let gist = |gist: Option<&chat_overview::ChatGist>| gist.and_then(gist_line);
         let with_cost = |figure: String, cost: Option<f64>| match (figure.is_empty(), cost) {
             (_, None) => figure,
             (true, Some(cost)) => format_cost(cost),
@@ -32525,7 +32819,8 @@ fi
                     title: with_parent(row.title, row.parent),
                     meta,
                     detail: Some((row.what.to_string(), ask_color)),
-                    right: String::new(),
+                    gist: gist(row.gist),
+                    right: ago(row.last_activity),
                     target: row.target.clone(),
                     indent: 0.0,
                 }));
@@ -32546,6 +32841,7 @@ fi
                                 chat.step.clone().unwrap_or_else(|| "Working".to_string()),
                                 theme.text_secondary(),
                             )),
+                            gist: gist(chat.gist.as_ref()),
                             right: with_cost(elapsed(chat.turn_started_at), chat.cost_usd),
                             target: chat.target.clone(),
                             indent: 0.0,
@@ -32569,6 +32865,7 @@ fi
                                             theme.text_secondary(),
                                         ),
                                     ),
+                                gist: None,
                                 right: elapsed(child.started_at),
                                 target: child.target.clone(),
                                 indent: 22.0,
@@ -32592,6 +32889,7 @@ fi
                                             theme.text_secondary(),
                                         ),
                                     ),
+                                gist: None,
                                 right: elapsed(child.started_at),
                                 target: child.target.clone(),
                                 indent: 0.0,
@@ -32607,12 +32905,6 @@ fi
                 sections.finished.len(),
             ));
             for row in &sections.finished {
-                let age = chats::format_age(row.at);
-                let age = if age == "now" {
-                    "just now".to_string()
-                } else {
-                    format!("{age} ago")
-                };
                 body = body.push(self.view_overview_row(OverviewRow {
                     icon: if row.failed { "!" } else { "✓" },
                     icon_color: if row.failed {
@@ -32623,7 +32915,8 @@ fi
                     title: with_parent(row.title, row.parent),
                     meta: row_place(row.machine, row.repo, row.branch),
                     detail: Some((row.result.to_string(), theme.text_secondary())),
-                    right: with_cost(age, row.cost_usd),
+                    gist: gist(row.gist),
+                    right: with_cost(format_ago(row.at, now), row.cost_usd),
                     target: row.target.clone(),
                     indent: 0.0,
                 }));
@@ -32659,12 +32952,16 @@ fi
             if expanded {
                 for chat in &sections.idle {
                     let exited = chat.state == ChatState::Exited;
+                    // How the last turn ended, else (a CLI tab, a chat read
+                    // back) the latest reply's first line.
                     let detail = if exited {
                         Some(("Exited".to_string(), theme.text_muted()))
                     } else {
                         chat.last_finished
                             .as_ref()
-                            .map(|turn| (turn.result.clone(), theme.text_muted()))
+                            .map(|turn| turn.result.clone())
+                            .or_else(|| chat.gist.as_ref().and_then(|gist| gist.reply.clone()))
+                            .map(|line| (line, theme.text_muted()))
                     };
                     body = body.push(self.view_overview_row(OverviewRow {
                         icon: if exited { "○" } else { "✦" },
@@ -32672,7 +32969,8 @@ fi
                         title: chat.title.clone(),
                         meta: place(chat),
                         detail,
-                        right: chat.cost_usd.map(format_cost).unwrap_or_default(),
+                        gist: gist(chat.gist.as_ref()),
+                        right: with_cost(ago(chat.last_activity), chat.cost_usd),
                         target: chat.target.clone(),
                         indent: 0.0,
                     }));
@@ -32855,6 +33153,7 @@ fi
                     title: child.label.clone(),
                     meta: String::new(),
                     detail: Some((detail, theme.text_secondary())),
+                    gist: None,
                     right: time.unwrap_or_default(),
                     target: child.target.clone(),
                     indent: 0.0,
@@ -37709,6 +38008,67 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn overview_transcript_reads_resume_after_the_last_whole_line() {
+        let dir = std::env::temp_dir().join(format!("gitterm-tru154-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chat.jsonl");
+        let line = |value: serde_json::Value| format!("{value}\n");
+        let ask = line(
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": "Publish the crate"}}),
+        );
+        let call = line(
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "cargo publish"}}
+            ]}}),
+        );
+        // The call's line is still being written.
+        let (head, tail) = call.split_at(20);
+        std::fs::write(&path, format!("{ask}{head}")).unwrap();
+
+        let mut seen = String::new();
+        let offset = read_whole_lines_from(&path, 0, |lines| seen.push_str(lines)).unwrap();
+        assert_eq!(seen, ask);
+        assert_eq!(offset, ask.len() as u64);
+
+        let first = load_transcript_gist(&path, chats::ChatBackend::Claude, None)
+            .unwrap()
+            .expect("a first read");
+        assert_eq!(first.offset, ask.len() as u64);
+        assert_eq!(first.gist.asked.as_deref(), Some("Publish the crate"));
+        assert_eq!(first.pending, None);
+        // Unchanged: nothing is read.
+        assert!(
+            load_transcript_gist(&path, chats::ChatBackend::Claude, Some(first.clone()))
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(&path, format!("{ask}{head}{tail}")).unwrap();
+        let second = load_transcript_gist(&path, chats::ChatBackend::Claude, Some(first))
+            .unwrap()
+            .expect("the file grew");
+        assert_eq!(second.offset, (ask.len() + call.len()) as u64);
+        assert_eq!(second.gist.asked.as_deref(), Some("Publish the crate"));
+        assert_eq!(
+            second
+                .pending
+                .as_ref()
+                .map(|ask| chat_summary::ask_line(ask, None)),
+            Some("Allow Bash: `cargo publish`?".to_string())
+        );
+
+        // Rewritten shorter than the last read: read again from the start.
+        std::fs::write(&path, &ask).unwrap();
+        let shrank = load_transcript_gist(&path, chats::ChatBackend::Claude, Some(second))
+            .unwrap()
+            .expect("the file shrank");
+        assert_eq!(shrank.offset, ask.len() as u64);
+        assert_eq!(shrank.gist.asked.as_deref(), Some("Publish the crate"));
+        assert_eq!(shrank.pending, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn slot_task(executor: ExecutorTarget, lifecycle: TaskLifecycle) -> TaskRecord {
         use gitterm::tasks::{GitBase, RepositoryIdentity};
