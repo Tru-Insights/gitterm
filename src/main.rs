@@ -19629,7 +19629,7 @@ fi
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     self.phone_panel = None;
-                    return Task::none();
+                    return self.apply_webview_surfaces();
                 }
 
                 // Remote connect form: Escape closes
@@ -19637,7 +19637,7 @@ fi
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     self.remote_connect_form = None;
-                    return Task::none();
+                    return self.apply_webview_surfaces();
                 }
 
                 // Folder picker: Escape closes
@@ -23025,9 +23025,11 @@ fi
                 // picker stays underneath: a machine saved here shows up
                 // in its selector when the form closes.
                 self.remote_connect_form = Some(RemoteConnectForm::default());
+                return self.apply_webview_surfaces();
             }
             Event::RemoteConnectClose => {
                 self.remote_connect_form = None;
+                return self.apply_webview_surfaces();
             }
             Event::RemoteConnectNameChanged(value) => {
                 if let Some(form) = self.remote_connect_form.as_mut() {
@@ -23062,10 +23064,11 @@ fi
                     busy: false,
                     error: None,
                 });
-                return self.load_paired_phones();
+                return Task::batch([self.load_paired_phones(), self.apply_webview_surfaces()]);
             }
             Event::PhonePanelClose => {
                 self.phone_panel = None;
+                return self.apply_webview_surfaces();
             }
             Event::PhoneDeviceNameChanged(value) => {
                 if let Some(panel) = self.phone_panel.as_mut() {
@@ -23691,8 +23694,13 @@ fi
     /// Something Iced draws covers the content area, so the native
     /// webviews (which would sit on top of it) stay hidden: the Usage view
     /// or the folder picker.
+    /// Iced overlays that native webviews would otherwise cover: while one
+    /// is open the chat and viewer pages are hidden.
     fn webview_overlay_open(&self) -> bool {
-        self.usage_view.open || self.folder_picker.is_some()
+        self.usage_view.open
+            || self.folder_picker.is_some()
+            || self.phone_panel.is_some()
+            || self.remote_connect_form.is_some()
     }
 
     fn visible_webview_surface(&self) -> VisibleSurface {
