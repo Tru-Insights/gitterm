@@ -326,6 +326,20 @@ mod tests {
     }
 
     #[test]
+    fn acp_chat_models_default_and_parse() {
+        let chat: ChatDefaults = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(chat.gemini_model, "gemini-4-argon");
+        assert_eq!(chat.opencode_model, "");
+        let chat: ChatDefaults = serde_json::from_value(serde_json::json!({
+            "gemini_model": "gemini-3.8-flash",
+            "opencode_model": "openrouter/google/gemini-3.6-flash",
+        }))
+        .unwrap();
+        assert_eq!(chat.gemini_model, "gemini-3.8-flash");
+        assert_eq!(chat.opencode_model, "openrouter/google/gemini-3.6-flash");
+    }
+
+    #[test]
     fn terminal_log_mirroring_is_opt_in() {
         let mut serialized = serde_json::to_value(Config::default()).unwrap();
         let object = serialized.as_object_mut().unwrap();
@@ -558,6 +572,11 @@ fn default_chat_model() -> String {
     "opus".to_string()
 }
 
+/// Gemini's flagship model, the Gemini chat default (TRU-153).
+fn default_gemini_model() -> String {
+    "gemini-4-argon".to_string()
+}
+
 /// What a new chat tab starts with (TRU-143). The app has no settings
 /// panel; edit the `chat` object in `config.json`:
 ///
@@ -576,6 +595,11 @@ fn default_chat_model() -> String {
 /// the extension; headless Claude ignores the CLI's own "on by default"
 /// setting, so GitTerm passes the flag. Chats also keep GitTerm's browser,
 /// a separate Chrome profile.
+///
+/// `gemini_model` and `opencode_model` are what new Gemini and OpenCode
+/// chats start on (TRU-153): a model id as the agent lists it, such as
+/// `gemini-4-argon` or `openrouter/google/gemini-3.6-flash`. An empty
+/// `opencode_model` (the default) keeps the model OpenCode itself picks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatDefaults {
     #[serde(default = "default_chat_model")]
@@ -590,6 +614,10 @@ pub struct ChatDefaults {
     pub last: Option<ChatSelection>,
     #[serde(default = "default_true")]
     pub claude_in_chrome: bool,
+    #[serde(default = "default_gemini_model")]
+    pub gemini_model: String,
+    #[serde(default)]
+    pub opencode_model: String,
 }
 
 /// A chat's model and effort (`effort: None` is the model's default).
@@ -608,6 +636,8 @@ impl Default for ChatDefaults {
             remember_last: true,
             last: None,
             claude_in_chrome: true,
+            gemini_model: default_gemini_model(),
+            opencode_model: String::new(),
         }
     }
 }

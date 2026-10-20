@@ -17,9 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSession, ClaudeSessionConfig};
+use gitterm::harness::acp::{AcpAgent, AcpMcpServer, AcpSessionConfig, ACP_WIRE_LOG_ENV};
+use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSessionConfig};
 use gitterm::harness::transcript::TranscriptEntry;
-use gitterm::harness::{HarnessEvent, UserPrompt};
+use gitterm::harness::{HarnessEvent, HarnessSession, UserPrompt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -51,6 +52,16 @@ const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_CLAUDE_WIRE_LOG_DIR";
 pub(crate) enum AgentBackend {
     Pi,
     Claude,
+    /// An Agent Client Protocol agent (Gemini CLI, OpenCode; TRU-153).
+    Acp(AcpAgent),
+}
+
+impl AgentBackend {
+    /// A native harness chat (one long-lived process per tab driven through
+    /// `HarnessSession`): Claude or an ACP agent. Pi runs per turn.
+    pub(crate) fn is_native(self) -> bool {
+        matches!(self, Self::Claude | Self::Acp(_))
+    }
 }
 
 /// Per-backend configuration. Tagged by the `backend` discriminator so this
@@ -72,6 +83,18 @@ pub(crate) enum AgentBackendConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+    /// An ACP agent's chat (TRU-153). `model` empty keeps the agent's own
+    /// choice; `mode` is the agent's session mode (Gemini `default`,
+    /// `autoEdit`, `yolo`, `plan`; OpenCode `build`, `plan`).
+    Acp {
+        agent: AcpAgent,
+        #[serde(default)]
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+    },
 }
 
 impl AgentBackendConfig {
@@ -79,6 +102,23 @@ impl AgentBackendConfig {
         match self {
             Self::Pi { .. } => AgentBackend::Pi,
             Self::Claude { .. } => AgentBackend::Claude,
+            Self::Acp { agent, .. } => AgentBackend::Acp(*agent),
+        }
+    }
+
+    /// The chat's model as configured (Claude and ACP tabs).
+    pub(crate) fn chat_model(&self) -> Option<&str> {
+        match self {
+            Self::Claude { model, .. } | Self::Acp { model, .. } => Some(model),
+            Self::Pi { .. } => None,
+        }
+    }
+
+    /// The chat's effort as configured (Claude and ACP tabs).
+    pub(crate) fn chat_effort(&self) -> Option<&str> {
+        match self {
+            Self::Claude { effort, .. } | Self::Acp { effort, .. } => effort.as_deref(),
+            Self::Pi { .. } => None,
         }
     }
 }
@@ -226,12 +266,12 @@ pub(crate) struct AgentSession {
     /// Lazy: `None` until the first prompt submit, then created and reused
     /// across turns until the tab is closed. Pi only.
     pub(crate) task_handle: Option<AgentTaskHandle>,
-    /// Long-lived native Claude process (Claude backend only). Lazy like
-    /// `task_handle`; dropped (and respawned with `--resume`) when the
-    /// process exits. Dropping a local one shuts the process down; dropping
-    /// a remote one detaches and leaves the chat running on its machine
-    /// (closing the tab sends `Shutdown` first, TRU-152).
-    pub(crate) claude: Option<ClaudeSession>,
+    /// Long-lived native harness process (Claude, or an ACP agent). Lazy
+    /// like `task_handle`; dropped (and respawned resuming the session)
+    /// when the process exits. Dropping a local one shuts the process down;
+    /// dropping a remote Claude one detaches and leaves the chat running on
+    /// its machine (closing the tab sends `Shutdown` first, TRU-152).
+    pub(crate) harness: Option<HarnessSession>,
     /// Runtime requests (permission prompts, questions) awaiting the human.
     pub(crate) pending_requests: Vec<String>,
     /// Transcript read-back for a session restored from `workspaces.json`.
@@ -252,7 +292,7 @@ impl AgentSession {
             session_id: None,
             state: AgentSessionState::Idle,
             task_handle: None,
-            claude: None,
+            harness: None,
             pending_requests: Vec::new(),
             history: HistoryLoad::NotLoaded,
             remote_disconnected: None,
@@ -260,9 +300,11 @@ impl AgentSession {
     }
 
     /// The session id whose transcript should be read back before this tab
-    /// is shown: a resumed session whose timeline is still empty.
+    /// is shown: a resumed session whose timeline is still empty. An ACP
+    /// tab reads it back by starting its agent, which replays the session
+    /// through `session/load`.
     pub(crate) fn history_to_load(&self) -> Option<&str> {
-        (self.backend() == AgentBackend::Claude
+        (self.backend().is_native()
             && self.history == HistoryLoad::NotLoaded
             && self.conversation.is_empty())
         .then_some(self.session_id.as_deref())
@@ -326,6 +368,41 @@ impl AgentSession {
         })
     }
 
+    /// The ACP agent settings for this tab (`None` for other backends).
+    /// `support_dir` is where the adapter writes the agent's support files.
+    pub(crate) fn acp_session_config(
+        &self,
+        cwd: PathBuf,
+        mcp_servers: Vec<AcpMcpServer>,
+        support_dir: PathBuf,
+    ) -> Option<AcpSessionConfig> {
+        let AgentBackendConfig::Acp {
+            agent,
+            model,
+            mode,
+            effort,
+        } = &self.config
+        else {
+            return None;
+        };
+        let model = model.trim();
+        Some(AcpSessionConfig {
+            agent: *agent,
+            cwd,
+            resume: self.session_id.clone(),
+            model: (!model.is_empty()).then(|| model.to_string()),
+            mode: Some(
+                mode.clone()
+                    .unwrap_or_else(|| agent.default_mode().to_string()),
+            ),
+            effort: effort.clone(),
+            mcp_servers,
+            env: Vec::new(),
+            support_dir,
+            wire_log_dir: std::env::var_os(ACP_WIRE_LOG_ENV).map(PathBuf::from),
+        })
+    }
+
     pub(crate) fn backend(&self) -> AgentBackend {
         self.config.backend()
     }
@@ -335,7 +412,7 @@ impl AgentSession {
     /// it at the running turn's next tool boundary, or as the next turn.
     /// A pi tab never gets here mid-turn (its composer waits for the turn).
     pub(crate) fn submit_queues(&self) -> bool {
-        submit_queues(self.backend(), self.claude.is_some(), &self.state)
+        submit_queues(self.backend(), self.harness.is_some(), &self.state)
     }
 
     /// The permission mode the next Claude spawn passes; `None` for pi.
@@ -348,20 +425,24 @@ impl AgentSession {
                     .clone()
                     .unwrap_or_else(|| DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
             ),
+            AgentBackendConfig::Acp { agent, mode, .. } => Some(
+                mode.clone()
+                    .unwrap_or_else(|| agent.default_mode().to_string()),
+            ),
             AgentBackendConfig::Pi { .. } => None,
         }
     }
 }
 
-/// See `AgentSession::submit_queues`: a Claude process is running a turn.
+/// See `AgentSession::submit_queues`: a native harness process is running
+/// a turn. Claude queues the message itself; an ACP session holds it until
+/// the turn ends.
 pub(crate) fn submit_queues(
     backend: AgentBackend,
     process_running: bool,
     state: &AgentSessionState,
 ) -> bool {
-    backend == AgentBackend::Claude
-        && process_running
-        && matches!(state, AgentSessionState::Streaming)
+    backend.is_native() && process_running && matches!(state, AgentSessionState::Streaming)
 }
 
 /// One task's worktree as the chat's checkout chip sees it (TRU-143).
@@ -720,6 +801,9 @@ fn build_command(config: &AgentBackendConfig, prompt: &str) -> Result<Command, S
         AgentBackendConfig::Claude { .. } => {
             Err("Claude tabs use the native harness session, not per-turn processes".to_string())
         }
+        AgentBackendConfig::Acp { .. } => {
+            Err("ACP tabs use the native harness session, not per-turn processes".to_string())
+        }
     }
 }
 
@@ -813,6 +897,63 @@ mod tests {
             checkout_label(ws, Some(Path::new("/wt/task-tree")), ws, same),
             "task-tree"
         );
+    }
+
+    #[test]
+    fn acp_tab_config_round_trips_and_builds_the_session_config() {
+        let config = AgentBackendConfig::Acp {
+            agent: AcpAgent::Gemini,
+            model: "gemini-4-argon".into(),
+            mode: None,
+            effort: None,
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"backend": "acp", "agent": "gemini", "model": "gemini-4-argon"})
+        );
+        let back: AgentBackendConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.backend(), AgentBackend::Acp(AcpAgent::Gemini));
+        let mut session = AgentSession::new(back);
+        session.session_id = Some("g-1".into());
+        assert_eq!(session.history_to_load(), Some("g-1"));
+        assert_eq!(
+            session.configured_permission_mode().as_deref(),
+            Some("default")
+        );
+        let acp = session
+            .acp_session_config(
+                PathBuf::from("/tmp/repo"),
+                Vec::new(),
+                PathBuf::from("/tmp/s"),
+            )
+            .unwrap();
+        assert_eq!(acp.resume.as_deref(), Some("g-1"));
+        assert_eq!(acp.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(acp.mode.as_deref(), Some("default"));
+        // An empty OpenCode model keeps OpenCode's own choice.
+        let opencode = AgentSession::new(AgentBackendConfig::Acp {
+            agent: AcpAgent::OpenCode,
+            model: String::new(),
+            mode: Some("plan".into()),
+            effort: Some("high".into()),
+        });
+        let acp = opencode
+            .acp_session_config(PathBuf::from("/tmp"), Vec::new(), PathBuf::from("/tmp/s"))
+            .unwrap();
+        assert_eq!(acp.model, None);
+        assert_eq!(acp.mode.as_deref(), Some("plan"));
+        assert_eq!(acp.effort.as_deref(), Some("high"));
+        assert!(submit_queues(
+            AgentBackend::Acp(AcpAgent::OpenCode),
+            true,
+            &AgentSessionState::Streaming
+        ));
+        assert!(!submit_queues(
+            AgentBackend::Acp(AcpAgent::OpenCode),
+            false,
+            &AgentSessionState::Streaming
+        ));
     }
 
     #[test]

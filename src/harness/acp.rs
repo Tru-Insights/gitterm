@@ -1634,10 +1634,9 @@ impl Session {
             modes: self.settings.page_modes(),
         });
         // The tab and page start from the tab's config; where the agent
-        // ended up elsewhere (a rejected setting), they follow the agent.
-        if let (Some(_), Some(current)) =
-            (&self.config.model, self.settings.current(Setting::Model))
-        {
+        // ended up elsewhere (a rejected setting, or no model configured),
+        // they follow the agent.
+        if let Some(current) = self.settings.current(Setting::Model) {
             if self.config.model.as_deref() != Some(current.as_str()) {
                 self.emit(HarnessEvent::ModelChanged(current));
             }

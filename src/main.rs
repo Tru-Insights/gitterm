@@ -3387,6 +3387,40 @@ fn new_claude_chat_config(chat_config: &config::ChatDefaults) -> AgentBackendCon
     }
 }
 
+/// A mode, model or effort value from the chat page that can be handed to
+/// an ACP agent, which validates it against what it offers: one short
+/// token without whitespace.
+fn is_harness_token(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.contains(char::is_whitespace)
+}
+
+/// Where ACP chats keep the agents' support files (Gemini's system
+/// settings), inside this instance's config dir.
+fn acp_support_dir() -> PathBuf {
+    config::global_config_dir().join("acp")
+}
+
+/// The config a new Gemini or OpenCode chat tab starts with (TRU-153): the
+/// configured model (`chat.gemini_model` / `chat.opencode_model`; empty
+/// keeps the agent's own) and the agent's default mode, which asks before
+/// edits and shell commands.
+fn new_acp_chat_config(
+    chat_config: &config::ChatDefaults,
+    agent: gitterm::harness::acp::AcpAgent,
+) -> AgentBackendConfig {
+    use gitterm::harness::acp::AcpAgent;
+    let model = match agent {
+        AcpAgent::Gemini => chat_config.gemini_model.trim().to_string(),
+        AcpAgent::OpenCode => chat_config.opencode_model.trim().to_string(),
+    };
+    AgentBackendConfig::Acp {
+        agent,
+        model,
+        mode: Some(agent.default_mode().to_string()),
+        effort: None,
+    }
+}
+
 /// The session of a chat tab resuming Claude session `session_id`: the new
 /// chat config, with the id set the way a restored chat tab has it, so the
 /// transcript is read back when the tab is shown and the first prompt
@@ -5514,6 +5548,9 @@ pub enum Event {
     /// Open a native Claude chat tab in the active workspace (TRU-140),
     /// the + menu's "New chat".
     NewClaudeChatTab,
+    /// Open a Gemini or OpenCode chat tab in the active (local) workspace
+    /// (TRU-153).
+    NewAcpChatTab(gitterm::harness::acp::AcpAgent),
     /// The + menu's "CLI" entry: show the agent presets (TRU-143).
     ShowTabPickerCli,
     /// One streaming event from the agent subprocess (Step 4 will refine the
@@ -8065,7 +8102,7 @@ impl App {
             .flat_map(|ws| ws.tabs.iter())
             .filter_map(|tab| {
                 let session = tab.agent_session()?;
-                if session.backend() != tab::AgentBackend::Claude || session.claude.is_some() {
+                if session.backend() != tab::AgentBackend::Claude || session.harness.is_some() {
                     return None;
                 }
                 let chat_id = running.get(session.session_id.as_deref()?)?;
@@ -8108,7 +8145,7 @@ impl App {
         let Some(session) = tab.agent_session_mut() else {
             return history;
         };
-        if session.claude.is_some() {
+        if session.harness.is_some() {
             return history;
         }
         let Some(config) = session.claude_session_config(repo_path, Vec::new(), chrome) else {
@@ -8120,7 +8157,7 @@ impl App {
         );
         let (claude, rx) =
             gitterm::harness::claude::ClaudeSession::attach_remote(client, config, chat_id);
-        session.claude = Some(claude);
+        session.harness = Some(gitterm::harness::HarnessSession::Claude(claude));
         let bridge = Task::run(
             tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
             move |ev| Event::AgentEventReceived(tab_id, tab::AgentEvent::Harness(ev)),
@@ -8145,7 +8182,7 @@ impl App {
             return;
         };
         let session_id = session.session_id.clone();
-        if let Some(claude) = session.claude.as_ref() {
+        if let Some(claude) = session.harness.as_ref() {
             eprintln!("[remote-chat] tab {tab_id}: closing; stopping its chat on {remote_id}");
             if let Err(e) = claude.send(HarnessCommand::Shutdown) {
                 eprintln!("[remote-chat] tab {tab_id}: could not ask {remote_id} to stop it: {e}");
@@ -8236,7 +8273,7 @@ impl App {
             .iter()
             .find_map(|ws| ws.tabs.iter().find(|t| t.id == tab_id).map(|tab| (ws, tab)))?;
         let session = tab.agent_session()?;
-        if session.backend() != tab::AgentBackend::Claude {
+        if !session.backend().is_native() {
             return None;
         }
         // A remote chat runs in its workspace's directory on that machine;
@@ -8270,7 +8307,7 @@ impl App {
         // bound to the directory it started in.
         let reason = if tab.task_id.is_some() {
             Some("This chat belongs to a task and runs in the task's worktree")
-        } else if session.claude.is_some() || session.session_id.is_some() {
+        } else if session.harness.is_some() || session.session_id.is_some() {
             Some("Set when the chat started; start a new chat to change it")
         } else {
             None
@@ -8309,8 +8346,11 @@ impl App {
         )
     }
 
-    /// The composer chips' starting state for a Claude chat page: the tab's
-    /// configured model and effort, and its checkout. `None` for pi tabs.
+    /// The composer chips' starting state for a native chat page: the tab's
+    /// configured model and effort, its checkout, and which harness drives
+    /// it (`harness`: name, and `acp` for Gemini/OpenCode, whose modes the
+    /// page takes from `ready` and whose messages wait for the turn to end).
+    /// `None` for pi tabs.
     fn chat_composer_state(&self, tab_id: usize) -> Option<serde_json::Value> {
         let session = self
             .workspaces
@@ -8318,13 +8358,19 @@ impl App {
             .flat_map(|ws| ws.tabs.iter())
             .find(|t| t.id == tab_id)?
             .agent_session()?;
-        let tab::AgentBackendConfig::Claude { model, effort, .. } = &session.config else {
-            return None;
+        let harness = match session.backend() {
+            tab::AgentBackend::Claude => serde_json::json!({"name": "Claude", "acp": false}),
+            tab::AgentBackend::Acp(agent) => {
+                serde_json::json!({"name": agent.label(), "acp": true})
+            }
+            tab::AgentBackend::Pi => return None,
         };
+        let model = session.config.chat_model().unwrap_or_default();
         Some(serde_json::json!({
-            "model": model,
-            "effort": effort,
+            "model": (!model.is_empty()).then_some(model),
+            "effort": session.config.chat_effort(),
             "checkout": self.chat_checkout_state(tab_id)?,
+            "harness": harness,
         }))
     }
 
@@ -13386,10 +13432,10 @@ impl App {
                         // Chats registry rule survives restarts.
                         if let Some(session_id) = chat_session_id {
                             if let Some(tab) = workspace.tabs.last_mut() {
-                                // A native Claude chat tab resumes its
-                                // conversation on the next prompt.
+                                // A native chat tab (Claude, or an ACP
+                                // agent) resumes its conversation.
                                 if let Some(session) = tab.agent_session_mut() {
-                                    if session.backend() == tab::AgentBackend::Claude {
+                                    if session.backend().is_native() {
                                         session.session_id = Some(session_id.clone());
                                     }
                                 }
@@ -13987,7 +14033,7 @@ fi
         let terminals = tabs.clone().filter(|tab| tab.terminal().is_some()).count();
         let chats = tabs
             .filter_map(|tab| tab.agent_session())
-            .filter(|session| session.claude.is_some() || session.task_handle.is_some())
+            .filter(|session| session.harness.is_some() || session.task_handle.is_some())
             .count();
         let bottom = self
             .workspaces
@@ -16549,7 +16595,7 @@ fi
                             .flat_map(|ws| ws.tabs.iter())
                             .find(|t| t.id == tab_id)
                             .and_then(|t| t.agent_session())
-                            .and_then(|session| session.claude.as_ref());
+                            .and_then(|session| session.harness.as_ref());
                         match claude {
                             Some(claude) => {
                                 if let Err(e) =
@@ -16695,6 +16741,22 @@ fi
                             )
                             .collect()
                     };
+                // The same servers for an ACP chat, with their bearer headers
+                // carried in the agent's session/new (TRU-153).
+                let mut acp_mcp_servers: Vec<gitterm::harness::acp::AcpMcpServer> =
+                    if remote_chat.is_some() {
+                        Vec::new()
+                    } else {
+                        self.task_mcp
+                            .iter()
+                            .map(|connection| connection.acp_mcp_server(caller.as_deref()))
+                            .chain(
+                                self.browser_mcp
+                                    .iter()
+                                    .map(BrowserMcpConnection::acp_mcp_server),
+                            )
+                            .collect()
+                    };
                 'outer_submit: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id != tab_id {
@@ -16707,10 +16769,78 @@ fi
                             eprintln!("AgentSubmitPrompt: tab {} is not an agent tab", tab_id);
                             return Task::none();
                         };
+                        if let tab::AgentBackend::Acp(agent) = session.backend() {
+                            // ACP agents run on this Mac only (TRU-153).
+                            if let Some((remote_id, _)) = remote_chat.as_ref() {
+                                eprintln!(
+                                    "[agent] tab {tab_id}: {} chats are local only; not starting one for remote {remote_id}",
+                                    agent.label()
+                                );
+                                agent_webview_note(
+                                    tab_id,
+                                    &format!(
+                                        "Not sent: {} chats run on this Mac only.",
+                                        agent.label()
+                                    ),
+                                );
+                                return Task::none();
+                            }
+                            if session.harness.is_none() {
+                                let Some(config) = session.acp_session_config(
+                                    repo_path,
+                                    std::mem::take(&mut acp_mcp_servers),
+                                    acp_support_dir(),
+                                ) else {
+                                    return Task::none();
+                                };
+                                eprintln!(
+                                    "[agent] tab {tab_id}: starting {} in {}",
+                                    agent.label(),
+                                    config.cwd.display()
+                                );
+                                let (acp, rx) = gitterm::harness::acp::AcpSession::spawn(config);
+                                session.harness = Some(gitterm::harness::HarnessSession::Acp(acp));
+                                // A restored tab's history comes back with
+                                // this start (session/load replays it); a
+                                // respawn of a chat already on screen
+                                // ignores the replay.
+                                if session.history_to_load().is_some() {
+                                    session.history = tab::HistoryLoad::Loading;
+                                }
+                                harness_bridge = Some(rx);
+                                claude_spawned = true;
+                            }
+                            // Mid-turn the session holds the message and
+                            // sends it when the turn ends.
+                            let queued = !claude_spawned && session.submit_queues();
+                            if prompt.id.is_none() {
+                                prompt.id = Some(uuid::Uuid::new_v4().to_string());
+                            }
+                            echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
+                            let mut submitted = false;
+                            if let Some(harness) = session.harness.as_ref() {
+                                match harness.send(HarnessCommand::SendUserMessage(prompt.clone()))
+                                {
+                                    Ok(()) => {
+                                        session.state = tab::AgentSessionState::Streaming;
+                                        submitted = true;
+                                    }
+                                    Err(e) => eprintln!("AgentSubmitPrompt failed: {}", e),
+                                }
+                            }
+                            session.record(echo.clone());
+                            if submitted {
+                                if let Some(task_id) = tab_task_id {
+                                    t.task_live_state = Some(TaskSessionLiveState::Working);
+                                    task_started = Some(task_id);
+                                }
+                            }
+                            break 'outer_submit;
+                        }
                         if session.backend() == tab::AgentBackend::Claude {
                             // Native Claude: one long-lived process per tab,
                             // spawned on first prompt (or after it exited).
-                            if session.claude.is_none() {
+                            if session.harness.is_none() {
                                 if let (Some(id), None) =
                                     (session.session_id.clone(), remote_chat.as_ref())
                                 {
@@ -16752,7 +16882,8 @@ fi
                                         return Task::none();
                                     }
                                 };
-                                session.claude = Some(claude);
+                                session.harness =
+                                    Some(gitterm::harness::HarnessSession::Claude(claude));
                                 harness_bridge = Some(rx);
                                 claude_spawned = true;
                             }
@@ -16765,7 +16896,7 @@ fi
                             }
                             echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
                             let mut submitted = false;
-                            if let Some(claude) = session.claude.as_ref() {
+                            if let Some(claude) = session.harness.as_ref() {
                                 match claude.send(HarnessCommand::SendUserMessage(prompt.clone())) {
                                     Ok(()) => {
                                         session.state = tab::AgentSessionState::Streaming;
@@ -16860,7 +16991,7 @@ fi
                     eprintln!("AgentAnswerRequest: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
-                let Some(claude) = session.claude.as_ref() else {
+                let Some(claude) = session.harness.as_ref() else {
                     eprintln!(
                         "AgentAnswerRequest: tab {tab_id} has no live Claude session for request {request_id}"
                     );
@@ -16875,10 +17006,6 @@ fi
                 return Task::none();
             }
             Event::AgentSetPermissionMode(tab_id, mode) => {
-                if !tab::CLAUDE_PERMISSION_MODES.contains(&mode.as_str()) {
-                    eprintln!("AgentSetPermissionMode: tab {tab_id}: unknown mode {mode:?}");
-                    return Task::none();
-                }
                 let Some(session) = self
                     .workspaces
                     .iter_mut()
@@ -16889,14 +17016,38 @@ fi
                     eprintln!("AgentSetPermissionMode: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
-                let tab::AgentBackendConfig::Claude {
-                    permission_mode, ..
-                } = &mut session.config
-                else {
-                    eprintln!("AgentSetPermissionMode: tab {tab_id} is not a Claude tab");
-                    return Task::none();
+                // Claude's modes are known here; an ACP agent lists its own
+                // and refuses one it does not offer.
+                let permission_mode = match &mut session.config {
+                    tab::AgentBackendConfig::Claude {
+                        permission_mode, ..
+                    } => {
+                        if !tab::CLAUDE_PERMISSION_MODES.contains(&mode.as_str()) {
+                            eprintln!(
+                                "AgentSetPermissionMode: tab {tab_id}: unknown mode {mode:?}"
+                            );
+                            return Task::none();
+                        }
+                        permission_mode
+                    }
+                    tab::AgentBackendConfig::Acp {
+                        mode: permission_mode,
+                        ..
+                    } => {
+                        if !is_harness_token(&mode) {
+                            eprintln!(
+                                "AgentSetPermissionMode: tab {tab_id}: refusing mode {mode:?}"
+                            );
+                            return Task::none();
+                        }
+                        permission_mode
+                    }
+                    tab::AgentBackendConfig::Pi { .. } => {
+                        eprintln!("AgentSetPermissionMode: tab {tab_id} is not a native chat tab");
+                        return Task::none();
+                    }
                 };
-                let (ev, config_changed) = if let Some(claude) = session.claude.as_ref() {
+                let (ev, config_changed) = if let Some(claude) = session.harness.as_ref() {
                     // Live process: the CLI decides. The tab config (and the
                     // page) follow its confirmation, PermissionModeChanged in
                     // AgentEventReceived, so a rejected mode is never saved.
@@ -16942,14 +17093,20 @@ fi
                     eprintln!("AgentSetModel: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
-                let tab::AgentBackendConfig::Claude {
-                    model: configured, ..
-                } = &mut session.config
-                else {
-                    eprintln!("AgentSetModel: tab {tab_id} is not a Claude tab");
-                    return Task::none();
+                let is_claude = session.backend() == tab::AgentBackend::Claude;
+                let configured = match &mut session.config {
+                    tab::AgentBackendConfig::Claude {
+                        model: configured, ..
+                    }
+                    | tab::AgentBackendConfig::Acp {
+                        model: configured, ..
+                    } => configured,
+                    tab::AgentBackendConfig::Pi { .. } => {
+                        eprintln!("AgentSetModel: tab {tab_id} is not a native chat tab");
+                        return Task::none();
+                    }
                 };
-                let (ev, config_changed) = if let Some(claude) = session.claude.as_ref() {
+                let (ev, config_changed) = if let Some(claude) = session.harness.as_ref() {
                     // Live process: the tab config, the last selection and
                     // the page follow ModelChanged in AgentEventReceived.
                     match claude.send(HarnessCommand::SetModel(model.clone())) {
@@ -16962,9 +17119,12 @@ fi
                     }
                 } else {
                     // No process yet (or it exited): the next spawn passes
-                    // `--model` from this config.
+                    // `--model` from this config (an ACP session applies it
+                    // once the session exists).
                     configured.clone_from(&model);
-                    self.chat_config.remember_model(&model);
+                    if is_claude {
+                        self.chat_config.remember_model(&model);
+                    }
                     (HarnessEvent::ModelChanged(model), true)
                 };
                 let ev = tab::AgentEvent::Harness(ev);
@@ -16977,13 +17137,6 @@ fi
                 return Task::none();
             }
             Event::AgentSetEffort(tab_id, effort) => {
-                if effort
-                    .as_deref()
-                    .is_some_and(|level| !tab::CLAUDE_EFFORT_LEVELS.contains(&level))
-                {
-                    eprintln!("AgentSetEffort: tab {tab_id}: unknown effort {effort:?}");
-                    return Task::none();
-                }
                 let Some(session) = self
                     .workspaces
                     .iter_mut()
@@ -16994,14 +17147,39 @@ fi
                     eprintln!("AgentSetEffort: tab {tab_id} is not an agent tab");
                     return Task::none();
                 };
-                let tab::AgentBackendConfig::Claude {
-                    effort: configured, ..
-                } = &mut session.config
-                else {
-                    eprintln!("AgentSetEffort: tab {tab_id} is not a Claude tab");
-                    return Task::none();
+                let is_claude = session.backend() == tab::AgentBackend::Claude;
+                let configured = match &mut session.config {
+                    tab::AgentBackendConfig::Claude {
+                        effort: configured, ..
+                    } => {
+                        if effort
+                            .as_deref()
+                            .is_some_and(|level| !tab::CLAUDE_EFFORT_LEVELS.contains(&level))
+                        {
+                            eprintln!("AgentSetEffort: tab {tab_id}: unknown effort {effort:?}");
+                            return Task::none();
+                        }
+                        configured
+                    }
+                    // The agent lists its own levels and refuses others.
+                    tab::AgentBackendConfig::Acp {
+                        effort: configured, ..
+                    } => {
+                        if effort
+                            .as_deref()
+                            .is_some_and(|level| !is_harness_token(level))
+                        {
+                            eprintln!("AgentSetEffort: tab {tab_id}: refusing effort {effort:?}");
+                            return Task::none();
+                        }
+                        configured
+                    }
+                    tab::AgentBackendConfig::Pi { .. } => {
+                        eprintln!("AgentSetEffort: tab {tab_id} is not a native chat tab");
+                        return Task::none();
+                    }
                 };
-                let (ev, config_changed) = if let Some(claude) = session.claude.as_ref() {
+                let (ev, config_changed) = if let Some(claude) = session.harness.as_ref() {
                     // Live process: confirmed by EffortChanged (the
                     // session reads its settings back after the change).
                     match claude.send(HarnessCommand::SetEffort(effort.clone())) {
@@ -17018,7 +17196,9 @@ fi
                 } else {
                     // The next spawn passes `--effort` from this config.
                     configured.clone_from(&effort);
-                    self.chat_config.remember_effort(effort.as_deref());
+                    if is_claude {
+                        self.chat_config.remember_effort(effort.as_deref());
+                    }
                     (
                         HarnessEvent::EffortChanged {
                             effort,
@@ -17473,13 +17653,48 @@ fi
                 let scroll_task = self.scroll_to_active_tab();
                 return Task::batch([scroll_task, self.present_active_tab_surfaces()]);
             }
+            Event::NewAcpChatTab(agent) => {
+                self.tab_picker_visible = false;
+                // ACP chats run on this Mac only in this slice (TRU-153);
+                // the picker does not offer them in a remote workspace.
+                let Some(ws) = self.active_workspace() else {
+                    return Task::none();
+                };
+                if remote_agent_root(&ws.location).is_some() {
+                    eprintln!(
+                        "[agent] {} chats are local only; not opening one in remote workspace {}",
+                        agent.label(),
+                        ws.name
+                    );
+                    return Task::none();
+                }
+                let repo_path = ws.dir.clone();
+                let current_dir = ws
+                    .active_tab()
+                    .map(|t| t.current_dir.clone())
+                    .unwrap_or_else(|| ws.dir.clone());
+                let config = new_acp_chat_config(&self.chat_config, agent);
+                let id = self.next_tab_id;
+                self.next_tab_id += 1;
+                if let Some(ws) = self.active_workspace_mut() {
+                    let mut tab = TabState::new(id, repo_path);
+                    tab.kind = TabKind::Agent(AgentSession::new(config));
+                    tab.set_local_dir(current_dir);
+                    ws.tabs.push(tab);
+                    ws.active_tab = ws.tabs.len() - 1;
+                }
+                eprintln!("[agent] opened {} chat tab id={id}", agent.label());
+                self.mark_workspaces_dirty();
+                let scroll_task = self.scroll_to_active_tab();
+                return Task::batch([scroll_task, self.present_active_tab_surfaces()]);
+            }
             Event::AgentStopRequested(tab_id) => {
                 let mut task_signal: Option<String> = None;
                 'outer_stop: for ws in &mut self.workspaces {
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
                             if let Some(session) = t.agent_session_mut() {
-                                if let Some(claude) = session.claude.as_ref() {
+                                if let Some(claude) = session.harness.as_ref() {
                                     // The process stays alive; the turn ends
                                     // with TurnCompleted { Interrupted }.
                                     if let Err(e) = claude.send(HarnessCommand::Interrupt) {
@@ -17618,6 +17833,38 @@ fi
             ) => {
                 return self.remote_chat_link_changed(tab_id, link);
             }
+            Event::AgentEventReceived(
+                tab_id,
+                tab::AgentEvent::Harness(HarnessEvent::HistoryReplayed { entries }),
+            ) => {
+                // An ACP session's `session/load` replay is the tab's
+                // history read-back (TRU-153), merged ahead of anything live.
+                // A respawn of a chat whose timeline is already on screen
+                // replays it again; that copy is dropped.
+                let loading = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|t| t.id == tab_id)
+                    .and_then(|t| t.agent_session())
+                    .is_some_and(|session| session.history == tab::HistoryLoad::Loading);
+                if !loading {
+                    eprintln!(
+                        "[agent] tab {tab_id}: dropping a replayed history of {} entries; the timeline is already shown",
+                        entries.len()
+                    );
+                    return Task::none();
+                }
+                let delegations = self.delegation_times_for_tab(tab_id);
+                let timed = entries
+                    .into_iter()
+                    .map(|entry| gitterm::harness::transcript::TimedEntry { at: None, entry })
+                    .collect();
+                return Task::done(Event::AgentHistoryLoaded(
+                    tab_id,
+                    history_timeline(timed, &delegations),
+                ));
+            }
             Event::AgentEventReceived(tab_id, ev) => {
                 // Append to the conversation buffer and push the event live
                 // into the tab's chat page, visible or hidden, so a hidden page
@@ -17741,54 +17988,73 @@ fi
                                             }
                                         }
                                         HarnessEvent::PermissionModeChanged(mode) => {
-                                            // Confirmed by the CLI: a respawn
-                                            // or restart starts in this mode.
-                                            if let tab::AgentBackendConfig::Claude {
-                                                permission_mode,
-                                                ..
-                                            } = &mut session.config
-                                            {
-                                                *permission_mode = Some(mode.clone());
-                                                config_changed = true;
+                                            // Confirmed by the harness: a
+                                            // respawn or restart starts in
+                                            // this mode.
+                                            match &mut session.config {
+                                                tab::AgentBackendConfig::Claude {
+                                                    permission_mode,
+                                                    ..
+                                                }
+                                                | tab::AgentBackendConfig::Acp {
+                                                    mode: permission_mode,
+                                                    ..
+                                                } => {
+                                                    *permission_mode = Some(mode.clone());
+                                                    config_changed = true;
+                                                }
+                                                tab::AgentBackendConfig::Pi { .. } => {}
                                             }
                                         }
                                         HarnessEvent::ModelChanged(confirmed) => {
-                                            // Confirmed by the CLI: a respawn
-                                            // starts on this model, and new
-                                            // chats may start on it too.
-                                            if let tab::AgentBackendConfig::Claude {
-                                                model, ..
-                                            } = &mut session.config
-                                            {
-                                                model.clone_from(confirmed);
-                                                config_changed = true;
+                                            // Confirmed by the harness: a
+                                            // respawn starts on this model,
+                                            // and new Claude chats may start
+                                            // on it too (ACP chats start on
+                                            // `chat.gemini_model` /
+                                            // `chat.opencode_model`).
+                                            match &mut session.config {
+                                                tab::AgentBackendConfig::Claude {
+                                                    model, ..
+                                                } => {
+                                                    model.clone_from(confirmed);
+                                                    config_changed = true;
+                                                    self.chat_config.remember_model(confirmed);
+                                                    chat_config_changed = true;
+                                                }
+                                                tab::AgentBackendConfig::Acp { model, .. } => {
+                                                    model.clone_from(confirmed);
+                                                    config_changed = true;
+                                                }
+                                                tab::AgentBackendConfig::Pi { .. } => {}
                                             }
-                                            self.chat_config.remember_model(confirmed);
-                                            chat_config_changed = true;
                                         }
                                         HarnessEvent::EffortChanged {
                                             effort: confirmed, ..
-                                        } => {
-                                            if let tab::AgentBackendConfig::Claude {
-                                                effort, ..
-                                            } = &mut session.config
-                                            {
+                                        } => match &mut session.config {
+                                            tab::AgentBackendConfig::Claude { effort, .. } => {
+                                                effort.clone_from(confirmed);
+                                                config_changed = true;
+                                                self.chat_config
+                                                    .remember_effort(confirmed.as_deref());
+                                                chat_config_changed = true;
+                                            }
+                                            tab::AgentBackendConfig::Acp { effort, .. } => {
                                                 effort.clone_from(confirmed);
                                                 config_changed = true;
                                             }
-                                            self.chat_config.remember_effort(confirmed.as_deref());
-                                            chat_config_changed = true;
-                                        }
+                                            tab::AgentBackendConfig::Pi { .. } => {}
+                                        },
                                         HarnessEvent::ProcessExited { code } => {
                                             // Next prompt respawns with --resume.
-                                            session.claude = None;
+                                            session.harness = None;
                                             session.pending_requests.clear();
                                             if matches!(
                                                 session.state,
                                                 tab::AgentSessionState::Streaming
                                             ) {
                                                 let message = format!(
-                                                    "Claude exited mid-turn (code {code:?})"
+                                                    "The chat's agent exited mid-turn (code {code:?})"
                                                 );
                                                 session.state = tab::AgentSessionState::Errored(
                                                     message.clone(),
@@ -23153,6 +23419,30 @@ fi
         // A remote chat's transcript is on its machine (TRU-152).
         let remote_id = self.tab_remote_id(tab_id);
         let remote_client = remote_id.as_deref().map(|id| self.remote_chat_client(id));
+        // An ACP tab starts its agent here (local workspaces only); it gets
+        // GitTerm's MCP servers under the tab's caller identity.
+        let tab_info = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|t| t.id == tab_id)
+            .map(|t| (t.repo_path.clone(), t.session_uid.clone()));
+        let Some((repo_path, caller)) = tab_info else {
+            return Task::none();
+        };
+        let acp_mcp_servers: Vec<gitterm::harness::acp::AcpMcpServer> = if remote_id.is_some() {
+            Vec::new()
+        } else {
+            self.task_mcp
+                .iter()
+                .map(|connection| connection.acp_mcp_server(Some(&caller)))
+                .chain(
+                    self.browser_mcp
+                        .iter()
+                        .map(BrowserMcpConnection::acp_mcp_server),
+                )
+                .collect()
+        };
         let Some(session) = self
             .workspaces
             .iter_mut()
@@ -23166,6 +23456,37 @@ fi
             return Task::none();
         };
         session.history = tab::HistoryLoad::Loading;
+        if let tab::AgentBackend::Acp(agent) = session.backend() {
+            // An ACP agent replays the session itself: start it, and its
+            // `session/load` history arrives as `HistoryReplayed` on this
+            // tab's event stream (TRU-153).
+            if session.harness.is_some() {
+                return Task::none();
+            }
+            if let Some(remote_id) = &remote_id {
+                eprintln!(
+                    "[agent] tab {tab_id}: {} chats are local only; not resuming on {remote_id}",
+                    agent.label()
+                );
+                session.history = tab::HistoryLoad::Loaded;
+                return Task::none();
+            }
+            let Some(config) =
+                session.acp_session_config(repo_path, acp_mcp_servers, acp_support_dir())
+            else {
+                return Task::none();
+            };
+            eprintln!(
+                "[agent] tab {tab_id}: starting {} to resume session {session_id}",
+                agent.label()
+            );
+            let (acp, rx) = gitterm::harness::acp::AcpSession::spawn(config);
+            session.harness = Some(gitterm::harness::HarnessSession::Acp(acp));
+            use tokio_stream::wrappers::UnboundedReceiverStream;
+            return Task::run(UnboundedReceiverStream::new(rx), move |ev| {
+                Event::AgentEventReceived(tab_id, tab::AgentEvent::Harness(ev))
+            });
+        }
         if let (Some(remote_id), Some(client)) = (remote_id, remote_client) {
             return Task::perform(
                 async move {
@@ -24432,6 +24753,29 @@ fi
                 theme.accent(),
                 Event::NewClaudeChatTab,
             ));
+            // Gemini and OpenCode chats run on this Mac only (TRU-153).
+            let local_workspace = self
+                .active_workspace()
+                .is_some_and(|ws| remote_agent_root(&ws.location).is_none());
+            if local_workspace {
+                for agent in gitterm::harness::acp::AcpAgent::ALL {
+                    let model = match new_acp_chat_config(&self.chat_config, agent) {
+                        AgentBackendConfig::Acp { model, .. } if !model.is_empty() => model,
+                        _ => "its own default model".to_string(),
+                    };
+                    items = items.push(picker_row(
+                        format!("New {} chat", agent.label()),
+                        format!("{} · {model}", agent.label()),
+                        match agent {
+                            gitterm::harness::acp::AcpAgent::Gemini => "\u{2727}", // ✧
+                            gitterm::harness::acp::AcpAgent::OpenCode => "\u{25c7}", // ◇
+                        }
+                        .to_string(),
+                        text_secondary,
+                        Event::NewAcpChatTab(agent),
+                    ));
+                }
+            }
             let cli_names: Vec<&str> = self.agent_presets.iter().map(|p| p.name.as_str()).collect();
             items = items.push(picker_row(
                 "CLI \u{203a}".to_string(), // ›
@@ -36639,6 +36983,41 @@ mod tests {
     }
 
     #[test]
+    fn new_acp_chats_start_on_the_configured_model_and_default_mode() {
+        use gitterm::harness::acp::AcpAgent;
+        let chat = config::ChatDefaults::default();
+        match new_acp_chat_config(&chat, AcpAgent::Gemini) {
+            AgentBackendConfig::Acp {
+                agent,
+                model,
+                mode,
+                effort,
+            } => {
+                assert_eq!(agent, AcpAgent::Gemini);
+                assert_eq!(model, "gemini-4-argon");
+                assert_eq!(mode.as_deref(), Some("default"));
+                assert_eq!(effort, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        let chat = config::ChatDefaults {
+            opencode_model: " openrouter/google/gemini-3.6-flash ".into(),
+            ..config::ChatDefaults::default()
+        };
+        match new_acp_chat_config(&chat, AcpAgent::OpenCode) {
+            AgentBackendConfig::Acp { model, mode, .. } => {
+                assert_eq!(model, "openrouter/google/gemini-3.6-flash");
+                assert_eq!(mode.as_deref(), Some("build"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(is_harness_token("plan"));
+        assert!(is_harness_token("openrouter/google/gemini-3.6-flash"));
+        assert!(!is_harness_token(""));
+        assert!(!is_harness_token("two words"));
+    }
+
+    #[test]
     fn claude_submit_queues_only_while_a_turn_runs() {
         use tab::{AgentBackend, AgentSessionState};
         let queues = |backend, running, state: AgentSessionState| {
@@ -38488,6 +38867,7 @@ mod tests {
                 effort: None,
             }),
             claude_in_chrome: true,
+            ..config::ChatDefaults::default()
         };
         let session = resumed_claude_chat_session(&defaults, "3f2a");
         let tab::AgentBackendConfig::Claude {

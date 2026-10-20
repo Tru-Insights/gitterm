@@ -589,12 +589,18 @@
   window.__currentTabId = null;
   window.__setTabId = function (id, permissionMode, composer) {
     window.__currentTabId = id;
-    // Only Claude takes a message while it works (pi waits for the turn).
+    // Which harness drives the chat: Claude, or an ACP agent (Gemini,
+    // OpenCode; TRU-153) whose modes come from its `ready` and whose
+    // messages sent mid-turn wait for the turn to end. Pi tabs: null.
+    harness = composer && composer.harness ? composer.harness : (permissionMode != null ? { name: 'Claude', acp: false } : null);
+    // Claude and ACP chats take a message while they work (Claude reads it
+    // at its next step; an ACP chat sends it when the turn ends). Pi waits.
     steerable = permissionMode != null;
     resetMode(permissionMode == null ? null : permissionMode);
-    // Only Claude tabs have a permission mode, and only they can review.
-    setReviewAvailable(permissionMode != null);
+    // Only Claude tabs can review (the review runs as a Claude subagent).
+    setReviewAvailable(permissionMode != null && !(harness && harness.acp));
     resetComposerChips(composer || null);
+    promptEl.placeholder = 'Message ' + harnessName() + '... (Enter to send, Shift+Enter for newline)';
   };
 
   const messagesEl = document.getElementById('messages');
@@ -611,7 +617,14 @@
 
   // ---- state -------------------------------------------------------------
   let busy = false;           // a turn is in flight
-  let steerable = false;      // the harness takes messages mid-turn (Claude)
+  let steerable = false;      // the harness takes messages mid-turn (Claude, ACP)
+  let harness = null;         // {name, acp}: the native harness, null for pi
+  function harnessName() { return harness ? harness.name : 'the agent'; }
+  function isAcp() { return !!(harness && harness.acp); }
+  function queuedText() {
+    return isAcp() ? 'Queued · sent when ' + harnessName() + ' finishes this turn'
+                   : 'Queued · Claude reads it at its next step';
+  }
   const queued = new Map();   // message id -> {msg, tag, x}: sent mid-turn, not yet picked up
   let replaying = false;      // __replay is feeding the buffer
   let rosterSeq = 0;          // roster: creation order of subagents and cards
@@ -809,7 +822,9 @@
       case 'WebFetch': return input.url || '';
       case 'WebSearch': return input.query || '';
       case 'Task': case 'Agent': return input.description || '';
-      default: return '';
+      // ACP agents name their tools themselves (OpenCode `shell`, Gemini
+      // a title); show the field that says what the call does.
+      default: return input.command || input.file_path || input.filePath || input.path || input.url || input.query || input.pattern || input.title || '';
     }
   }
   function itemStarted(id, kind) {
@@ -1049,7 +1064,8 @@
     // Typing stays possible while a request is pending; sending waits.
     submitBtn.disabled = !sendAllowed(busy, pending.size, steerable);
     submitBtn.title = busy && !submitBtn.disabled
-      ? 'Claude is working: the message is queued and Claude reads it at its next step'
+      ? (isAcp() ? harnessName() + ' is working: the message is queued and sent when this turn ends'
+                 : 'Claude is working: the message is queued and Claude reads it at its next step')
       : '';
     stopBtn.disabled = !busy;
     if (typeof refreshReviewSubmit === 'function') refreshReviewSubmit();
@@ -1223,9 +1239,22 @@
   const modeWrapEl = document.querySelector('.mode-wrap');
   const modeBtn = document.getElementById('mode');
   const modeMenuEl = document.getElementById('mode-menu');
-  const mode = { current: null, pending: null, extra: [] };
-  function modeLabel(m) { return MODE_LABELS[m] || m; }
-  function modeList() { return MODE_CYCLE.concat(mode.extra); }
+  // `agent`: an ACP agent's modes from its `ready` ({value, displayName}).
+  const mode = { current: null, pending: null, extra: [], agent: null };
+  function modeLabel(m) {
+    if (isAcp()) {
+      const info = (mode.agent || []).find((x) => x && x.value === m);
+      return info && info.displayName ? info.displayName : m;
+    }
+    return MODE_LABELS[m] || m;
+  }
+  function modeList() {
+    if (isAcp()) {
+      const list = (mode.agent || []).map((x) => x.value);
+      return list.concat(mode.extra.filter((m) => !list.includes(m)));
+    }
+    return MODE_CYCLE.concat(mode.extra);
+  }
   function renderMode() {
     modeWrapEl.classList.toggle('visible', mode.current != null);
     if (mode.current == null) { modeMenuEl.classList.remove('visible'); return; }
@@ -1233,7 +1262,7 @@
     modeBtn.classList.toggle('pending', mode.pending != null);
     setChip(modeBtn, 'lock', modeLabel(mode.current) + (mode.pending != null ? ' → ' + modeLabel(mode.pending) + '…' : ''));
     modeMenuEl.innerHTML = '';
-    modeMenuEl.appendChild(el('div', 'hint', 'Permission mode · Shift+Tab cycles'));
+    modeMenuEl.appendChild(el('div', 'hint', (isAcp() ? harnessName() + ' mode' : 'Permission mode') + ' · Shift+Tab cycles'));
     for (const m of modeList()) {
       const b = el('button');
       b.appendChild(el('span', 'mark', m === mode.current ? '✓' : (m === mode.pending ? '…' : '')));
@@ -1244,13 +1273,13 @@
   }
   function confirmMode(m) {
     if (!m) return;
-    if (!MODE_CYCLE.includes(m) && !mode.extra.includes(m)) mode.extra.push(m);
+    if (!modeList().includes(m) && !mode.extra.includes(m)) mode.extra.push(m);
     mode.current = m;
     if (mode.pending === m) mode.pending = null;
     renderMode();
   }
   function resetMode(m) {
-    mode.current = null; mode.pending = null; mode.extra = [];
+    mode.current = null; mode.pending = null; mode.extra = []; mode.agent = null;
     if (m) confirmMode(m); else renderMode();
   }
   function clearPendingMode() {
@@ -1321,7 +1350,8 @@
     for (const m of CHIP_MENUS) if (m !== except) m.classList.remove('visible');
   }
   function modelList() {
-    const list = (chips.models && chips.models.length ? chips.models : FALLBACK_MODELS)
+    const fallback = isAcp() ? [] : FALLBACK_MODELS;
+    const list = (chips.models && chips.models.length ? chips.models : fallback)
       .filter((m) => m && typeof m.value === 'string');
     const cur = chips.model.current;
     if (cur && !list.some((m) => m.value === cur)) return [{ value: cur, displayName: cur }].concat(list);
@@ -1342,6 +1372,11 @@
   // the models (for `default`, the entry's description, which names the
   // model it resolves to); before that, the configured value itself.
   function modelLabel(value) {
+    if (isAcp()) {
+      if (value === 'default') return harnessName() + ' default';
+      const m = chips.models && chips.models.find((x) => x && x.value === value);
+      return m && m.displayName ? m.displayName : value;
+    }
     const base = baseModel(value);
     if (!chips.models) return base === 'default' ? 'Claude settings' : base;
     const m = chips.models.find((x) => x && x.value === base) || modelInfo(value);
@@ -1358,8 +1393,9 @@
     return FALLBACK_EFFORTS;
   }
   // A model the CLI lists without effort support (supportsEffort absent).
+  // An ACP agent's effort is known only once it lists its models.
   function effortSupported() {
-    if (!chips.models) return true;
+    if (!chips.models) return !isAcp();
     const m = modelInfo(chips.model.current);
     return !m || m.supportsEffort === true;
   }
@@ -1397,7 +1433,9 @@
     }
   }
   function renderEffort() {
-    const on = chips.enabled && chips.model.current != null;
+    // An ACP chat shows the chip only for a model with effort levels, and
+    // has no context-window choice.
+    const on = chips.enabled && chips.model.current != null && (!isAcp() || effortSupported());
     effortWrapEl.classList.toggle('visible', on);
     if (!on) { effortMenuEl.classList.remove('visible'); return; }
     const e = chips.effort;
@@ -1408,10 +1446,10 @@
     const context = is1m(cur) ? '1M' : '200k';
     let label = supported ? effortName(e.current) : '';
     if (supported && e.pending != null) label += ' → ' + effortName(e.pending.value) + '…';
-    label = label ? label + ' · ' + context : context;
+    if (!isAcp()) label = label ? label + ' · ' + context : context;
     setChip(effortBtn, 'gauge', label);
     effortBtn.classList.remove('locked');
-    effortBtn.title = (supported ? 'Effort' + (e.current == null && e.applied ? ' (auto runs at ' + e.applied + ')' : '') : 'This model has no effort setting') + ' · context window ' + context;
+    effortBtn.title = (supported ? 'Effort' + (e.current == null && e.applied ? ' (auto runs at ' + e.applied + ')' : '') : 'This model has no effort setting') + (isAcp() ? '' : ' · context window ' + context);
     effortMenuEl.innerHTML = '';
     effortMenuEl.appendChild(el('div', 'section', 'Effort'));
     if (supported) {
@@ -1423,6 +1461,7 @@
     } else {
       effortMenuEl.appendChild(el('div', 'hint', 'This model has no effort setting'));
     }
+    if (isAcp()) return;
     effortMenuEl.appendChild(el('div', 'section', 'Context window'));
     const variant = oneMVariant(cur);
     const pendingModel = chips.model.pending;
@@ -2190,6 +2229,8 @@
     const input = kind.input || {};
     const s = salient(kind.tool_name, input);
     if (kind.tool_name === 'Bash' && s) return s;
+    // An ACP shell call: its command line.
+    if (isAcp() && typeof input.command === 'string' && input.command) return input.command;
     if (s && ['Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(kind.tool_name)) return s;
     return JSON.stringify(input, null, 2);
   }
@@ -2215,6 +2256,12 @@
       const b = actions.appendChild(el('button', null, 'Allow and remember'));
       b.title = 'Saves ' + describeRule(remember) + ' to .claude/settings.local.json';
       b.addEventListener('click', () => answer(requestId, { kind: 'allow', remember }));
+    }
+    // An ACP agent's own "always" options, by its names (TRU-153).
+    for (const option of (kind.suggestions || []).filter((x) => x && x.type === 'acp_option')) {
+      const b = actions.appendChild(el('button', null, option.name || 'Always allow'));
+      b.title = 'Answers with ' + harnessName() + '\'s own option';
+      b.addEventListener('click', () => answer(requestId, { kind: 'allow', remember: option }));
     }
     const reason = actions.appendChild(el('input'));
     reason.type = 'text';
@@ -2351,10 +2398,10 @@
   function markQueued(msg, id) {
     msg.classList.add('queued');
     const tag = el('div', 'queued-tag');
-    const label = el('span', null, 'Queued · Claude reads it at its next step');
+    const label = el('span', null, queuedText());
     const x = el('button', null, '\u00d7');
     x.type = 'button';
-    x.title = 'Withdraw this message (Claude keeps working)';
+    x.title = 'Withdraw this message (' + harnessName() + ' keeps working)';
     x.addEventListener('click', () => {
       x.disabled = true;
       label.textContent = 'Withdrawing…';
@@ -2380,7 +2427,7 @@
   function queuedWithdrawRefused(id, reason) {
     const q = queued.get(id);
     if (!q) return;
-    q.label.textContent = 'Queued · Claude reads it at its next step';
+    q.label.textContent = queuedText();
     q.x.disabled = false;
     note('Not withdrawn: ' + reason, 'warn');
   }
@@ -2391,12 +2438,12 @@
     for (const q of queued.values()) {
       q.msg.classList.remove('queued');
       q.msg.classList.add('unsent');
-      q.label.textContent = 'Not sent: Claude exited before reading it';
+      q.label.textContent = 'Not sent: ' + harnessName() + ' exited before reading it';
       q.x.remove();
     }
     queued.clear();
-    note(n === 1 ? 'A queued message was not delivered because Claude exited; send it again.'
-                 : n + ' queued messages were not delivered because Claude exited; send them again.', 'warn');
+    note(n === 1 ? 'A queued message was not delivered because ' + harnessName() + ' exited; send it again.'
+                 : n + ' queued messages were not delivered because ' + harnessName() + ' exited; send them again.', 'warn');
   }
 
   // ---- harness events ----------------------------------------------------
@@ -2409,9 +2456,11 @@
     const d = ev.data;
     switch (ev.type) {
       case 'ready':
+        if (Array.isArray(d.modes) && d.modes.length) { mode.agent = d.modes; renderMode(); }
         confirmMode(d.permission_mode);
         if (Array.isArray(d.models) && d.models.length) { chips.models = d.models; renderModel(); renderEffort(); }
-        note(d.session_id ? 'Resumed Claude session ' + d.session_id.slice(0, 8) + ' · permission mode ' + (d.permission_mode || '?')
+        if (isAcp()) note(harnessName() + ' session ' + (d.session_id ? d.session_id.slice(0, 12) + ' ' : '') + 'ready · mode ' + modeLabel(d.permission_mode || '?'));
+        else note(d.session_id ? 'Resumed Claude session ' + d.session_id.slice(0, 8) + ' · permission mode ' + (d.permission_mode || '?')
                           : 'Claude session ready · permission mode ' + (d.permission_mode || '?'));
         break;
       case 'turn_started':
@@ -2465,7 +2514,7 @@
         break;
       case 'permission_mode_changed':
         confirmMode(d);
-        note('Permission mode · ' + modeLabel(d));
+        note((isAcp() ? 'Mode · ' : 'Permission mode · ') + modeLabel(d));
         break;
       case 'model_changed':
         confirmModel(d);
@@ -2504,8 +2553,8 @@
         clearPending();
         clearPendingMode();
         clearPendingChips();
-        if (busy) finishActivity('Claude exited', 'failed');
-        note('Claude process exited' + (d.code != null ? ' (code ' + d.code + ')' : '') + '. The next message resumes the session.');
+        if (busy) finishActivity(harnessName() + ' exited', 'failed');
+        note(harnessName() + ' process exited' + (d.code != null ? ' (code ' + d.code + ')' : '') + '. The next message resumes the session.');
         dropQueued();
         setBusy(false);
         break;
