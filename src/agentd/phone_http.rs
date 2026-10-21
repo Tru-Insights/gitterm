@@ -6,7 +6,8 @@
 //! is relative, so `tailscale serve` can front it with HTTPS later.
 //!
 //! Reachable without a device token: the three pages (`/`, `/pair`,
-//! `/chat`, which carry no data) and `POST /api/pair` (which needs a valid
+//! `/chat`, which carry no data), what installs the app on a home screen
+//! (`/manifest.webmanifest` and the icons it names), and `POST /api/pair` (which needs a valid
 //! one-time code, the long one from the QR link or the short one typed
 //! into the home-screen app). Everything else needs `Authorization: Bearer <device
 //! token>`, or, on the WebSocket, the token in the first message (browsers
@@ -80,6 +81,14 @@ const INDEX_HTML: &str = include_str!("../../assets/phone/index.html");
 const PAIR_HTML: &str = include_str!("../../assets/phone/pair.html");
 const CHAT_HEAD: &str = include_str!("../../assets/phone/chat_head.html");
 const CHAT_SHIM: &str = include_str!("../../assets/phone/chat_shim.html");
+/// Home-screen icons, made once from `assets/icon.png` with `sips`:
+/// the macOS icon's margin cropped (`sips -c 1600 1600`), then scaled.
+const ICON_180: &[u8] = include_bytes!("../../assets/phone/icon-180.png");
+const ICON_192: &[u8] = include_bytes!("../../assets/phone/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("../../assets/phone/icon-512.png");
+/// The pages' background (Catppuccin Mocha base), also the app's theme
+/// and splash colour.
+const APP_BACKGROUND: &str = "#1e1e2e";
 
 /// The desktop chat page made a phone page: a viewport and mobile styles
 /// in its head, and the socket shim that feeds `__appendEvent` before its
@@ -222,8 +231,8 @@ fn secure(mut response: Response<Body>) -> Response<Body> {
         (
             header::CONTENT_SECURITY_POLICY,
             "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
-             img-src data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; \
-             frame-ancestors 'none'",
+             img-src data: 'self'; manifest-src 'self'; connect-src 'self' ws: wss:; \
+             base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ),
     ];
     for (name, value) in pairs {
@@ -251,6 +260,38 @@ fn html_response(html: impl Into<Body>) -> Response<Body> {
     secure(response)
 }
 
+fn bytes_response(content_type: &'static str, body: impl Into<Body>) -> Response<Body> {
+    let mut response = Response::new(body.into());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(content_type),
+    );
+    secure(response)
+}
+
+/// The web app manifest that lets a phone add the app to its home screen
+/// and open it full screen. Every URL in it is relative to the manifest,
+/// like the pages' own.
+fn manifest_json(agent_name: &str) -> Value {
+    let icon = |size: u32| {
+        json!({
+            "src": format!("icon-{size}.png"),
+            "sizes": format!("{size}x{size}"),
+            "type": "image/png",
+        })
+    };
+    json!({
+        "name": format!("GitTerm {agent_name}"),
+        "short_name": "GitTerm",
+        "start_url": "./",
+        "scope": "./",
+        "display": "standalone",
+        "theme_color": APP_BACKGROUND,
+        "background_color": APP_BACKGROUND,
+        "icons": [icon(180), icon(192), icon(512)],
+    })
+}
+
 fn client_ip(remote: Option<SocketAddr>) -> IpAddr {
     remote
         .map(|addr| addr.ip())
@@ -275,6 +316,26 @@ pub fn routes(
         .and(warp::path!("chat"))
         .and(with_state.clone())
         .map(|state: PhoneState| html_response(state.chat_html));
+    let manifest = warp::get()
+        .and(warp::path!("manifest.webmanifest"))
+        .and(with_state.clone())
+        .map(|state: PhoneState| {
+            bytes_response(
+                "application/manifest+json",
+                manifest_json(&state.agent_name).to_string(),
+            )
+        });
+    let icon = |name: &'static str, png: &'static [u8]| {
+        warp::get()
+            .and(warp::path(name))
+            .and(warp::path::end())
+            .map(move || bytes_response("image/png", png))
+    };
+    let icons = icon("icon-180.png", ICON_180)
+        .or(icon("icon-192.png", ICON_192))
+        .unify()
+        .or(icon("icon-512.png", ICON_512))
+        .unify();
 
     let pair = warp::post()
         .and(warp::path!("api" / "pair"))
@@ -314,6 +375,10 @@ pub fn routes(
         .or(pair_page)
         .unify()
         .or(chat_page)
+        .unify()
+        .or(manifest)
+        .unify()
+        .or(icons)
         .unify()
         .or(pair)
         .unify()
@@ -1217,6 +1282,59 @@ mod tests {
             .reply(&routes)
             .await;
         assert_eq!(bad_id.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn the_app_installs_without_a_token() {
+        let fx = fixture();
+        let routes = routes(fx.state.clone());
+        let response = warp::test::request()
+            .path("/manifest.webmanifest")
+            .reply(&routes)
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/manifest+json"
+        );
+        let manifest: Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(manifest["name"], "GitTerm test-agent");
+        assert_eq!(manifest["short_name"], "GitTerm");
+        assert_eq!(manifest["start_url"], "./");
+        assert_eq!(manifest["display"], "standalone");
+        assert_eq!(manifest["background_color"], APP_BACKGROUND);
+        let icons = manifest["icons"].as_array().unwrap();
+        assert_eq!(icons.len(), 3);
+        for (icon, size) in icons.iter().zip([180u32, 192, 512]) {
+            let src = icon["src"].as_str().unwrap();
+            assert_eq!(icon["sizes"], format!("{size}x{size}"));
+            let response = warp::test::request()
+                .path(&format!("/{src}"))
+                .reply(&routes)
+                .await;
+            assert_eq!(response.status(), 200, "{src}");
+            assert_eq!(response.headers()["content-type"], "image/png");
+            let png = response.body();
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "{src}");
+            // The IHDR chunk's width and height.
+            let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
+            let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
+            assert_eq!((width, height), (size, size), "{src}");
+        }
+        // Every page links the manifest and the home-screen icon.
+        for page in ["/", "/pair", "/chat"] {
+            let response = warp::test::request().path(page).reply(&routes).await;
+            let html = std::str::from_utf8(response.body()).unwrap();
+            assert!(
+                html.contains(r#"rel="manifest" href="manifest.webmanifest""#),
+                "{page}"
+            );
+            assert!(
+                html.contains(r#"rel="apple-touch-icon" href="icon-180.png""#),
+                "{page}"
+            );
+            assert!(html.contains("viewport-fit=cover"), "{page}");
+        }
     }
 
     #[tokio::test]
