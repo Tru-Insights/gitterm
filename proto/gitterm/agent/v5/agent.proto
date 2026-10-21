@@ -381,6 +381,11 @@ message CreatePhonePairingResponse {
   uint64 expires_unix_secs = 3;
   // The scope the phone is granted when it pairs.
   string scope = 4;
+  // The same pairing as `code`, for typing into the phone's home-screen
+  // app (which cannot open the pairing URL): 8 Crockford base32
+  // characters shown as XXXX-XXXX. Either code spends the pairing.
+  // Empty from an agent older than this field.
+  string short_code = 5;
 }
 
 message ListPhonesRequest {}

@@ -7,7 +7,8 @@
 //!
 //! Reachable without a device token: the three pages (`/`, `/pair`,
 //! `/chat`, which carry no data) and `POST /api/pair` (which needs a valid
-//! one-time code). Everything else needs `Authorization: Bearer <device
+//! one-time code, the long one from the QR link or the short one typed
+//! into the home-screen app). Everything else needs `Authorization: Bearer <device
 //! token>`, or, on the WebSocket, the token in the first message (browsers
 //! cannot set headers on a WebSocket, and a token in the URL would be
 //! logged by proxies).
@@ -1047,7 +1048,7 @@ fn act(phone: &PhoneInfo, chat: &Chat, message: &Message) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::super::claude_chats::{ChatLimits, ChatProcess};
-    use super::super::phones::PhoneScope;
+    use super::super::phones::{PhoneScope, THROTTLE_FREE_FAILURES};
     use super::*;
     use crate::harness::claude::ClaudeSessionConfig;
     use crate::harness::{HarnessCommand, HarnessEvent};
@@ -1216,6 +1217,44 @@ mod tests {
             .reply(&routes)
             .await;
         assert_eq!(bad_id.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn a_typed_short_code_pairs_and_wrong_codes_are_throttled() {
+        let fx = fixture();
+        let routes = routes(fx.state.clone());
+        let pair = |code: &str| {
+            warp::test::request()
+                .method("POST")
+                .path("/api/pair")
+                .remote_addr("100.64.0.9:50000".parse().unwrap())
+                .json(&json!({ "code": code }))
+        };
+        let pairing = fx.phones.create_pairing("app", PhoneScope::Act).unwrap();
+        let typed = format!(" {} ", pairing.short_code.to_ascii_lowercase());
+        let response = pair(&typed).reply(&routes).await;
+        assert_eq!(response.status(), 200);
+        let body: Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["phone"]["scope"], "act");
+        assert!(fx
+            .phones
+            .authenticate(body["token"].as_str().unwrap())
+            .is_some());
+        // Spent, by either code.
+        assert_eq!(pair(&pairing.short_code).reply(&routes).await.status(), 401);
+        assert_eq!(pair(&pairing.code).reply(&routes).await.status(), 401);
+
+        // Wrong codes count toward the address's throttle (two failures
+        // so far); once it holds the address back, even a good code waits.
+        let good = fx.phones.create_pairing("app", PhoneScope::View).unwrap();
+        for _ in 0..THROTTLE_FREE_FAILURES - 2 {
+            assert_eq!(pair("ZZZZ-ZZZZ").reply(&routes).await.status(), 401);
+        }
+        let held = pair(&good.short_code).reply(&routes).await;
+        assert_eq!(held.status(), 429);
+        assert!(held.headers().contains_key("retry-after"));
+        // The held-back attempt did not spend the pairing.
+        assert!(fx.phones.redeem(&good.short_code).is_ok());
     }
 
     #[tokio::test]

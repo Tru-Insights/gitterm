@@ -4,6 +4,13 @@
 //! - A pairing code is 128 random bits, single use, and expires after
 //!   `PAIRING_CODE_TTL`. Codes live only in memory (an agent restart voids
 //!   the outstanding ones), held as SHA-256 digests.
+//! - Each pairing also has a short code: 8 Crockford base32 characters
+//!   (40 bits), shown as `XXXX-XXXX` for a phone to type. A home-screen
+//!   app on iOS keeps its storage apart from Safari's, so it cannot take
+//!   the long code from the QR link; it pairs by the short code instead.
+//!   Either code spends the same pairing. Failed attempts are throttled
+//!   per address (`Throttle`), which keeps 40 bits out of reach within the
+//!   ten minutes a code lives.
 //! - Redeeming a code issues a device token of 256 random bits. The agent
 //!   keeps only the token's SHA-256 digest, with the device's id, name,
 //!   scope and times, in `phones.json` (mode 0600) in its config dir.
@@ -28,6 +35,10 @@ use tokio_util::sync::CancellationToken;
 pub const PAIRING_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Random bytes in a pairing code (128 bits).
 const CODE_BYTES: usize = 16;
+/// Characters in a short pairing code: 8 Crockford base32 symbols, 40 bits.
+const SHORT_CODE_CHARS: usize = 8;
+/// Crockford base32: digits and letters without I, L, O and U.
+const CROCKFORD_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Random bytes in a device token (256 bits).
 const TOKEN_BYTES: usize = 32;
 /// Outstanding codes kept at once; creating another drops the oldest.
@@ -124,11 +135,14 @@ impl From<&PhoneRecord> for PhoneInfo {
     }
 }
 
-/// A new pairing code. `code` is shown once (in the pairing URL) and kept
-/// nowhere in the clear.
+/// A new pairing. `code` is shown once (in the pairing URL) and
+/// `short_code` once (in the desktop's pairing panel); neither is kept
+/// anywhere in the clear.
 #[derive(Debug, Clone)]
 pub struct NewPairing {
     pub code: String,
+    /// The same pairing as `code`, for typing: `XXXX-XXXX`.
+    pub short_code: String,
     pub expires: SystemTime,
     pub scope: PhoneScope,
 }
@@ -154,6 +168,8 @@ pub enum PairError {
 
 struct PendingCode {
     digest: [u8; 32],
+    /// Digest of the normalized short code (`normalize_short_code`).
+    short_digest: [u8; 32],
     device_name: String,
     scope: PhoneScope,
     expires: SystemTime,
@@ -219,7 +235,8 @@ impl PhoneRegistry {
         self.inner.lock().expect("phone registry poisoned")
     }
 
-    /// A one-time code for a phone named `device_name`.
+    /// A one-time pairing for a phone named `device_name`: a long code
+    /// and a short one, either of which spends it.
     pub fn create_pairing(
         &self,
         device_name: &str,
@@ -235,30 +252,55 @@ impl PhoneRegistry {
         while inner.pending.len() >= MAX_PENDING_CODES {
             inner.pending.remove(0);
         }
+        // A short code no outstanding pairing already has, so a typed code
+        // names exactly one pairing.
+        let (short_code, short_digest) = loop {
+            let short_code = self.random_short_code()?;
+            let digest = sha256(&short_code);
+            if !inner
+                .pending
+                .iter()
+                .any(|pending| pending.short_digest == digest)
+            {
+                break (short_code, digest);
+            }
+        };
         inner.pending.push(PendingCode {
             digest: sha256(&code),
+            short_digest,
             device_name,
             scope,
             expires,
         });
         Ok(NewPairing {
             code,
+            short_code: format!(
+                "{}-{}",
+                &short_code[..SHORT_CODE_CHARS / 2],
+                &short_code[SHORT_CODE_CHARS / 2..]
+            ),
             expires,
             scope,
         })
     }
 
-    /// Spend a pairing code: a new device and its token. The code is gone
-    /// after the first attempt that names it, whatever the outcome.
+    /// Spend a pairing by its long code or its short code (as typed: see
+    /// `normalize_short_code`): a new device and its token. The pairing is
+    /// gone after the first attempt that names it, whatever the outcome.
     pub fn redeem(&self, code: &str) -> Result<Paired, PairError> {
         let digest = sha256(code);
+        let short_digest = normalize_short_code(code).map(|short| sha256(&short));
         let now = (self.clock)();
         let mut inner = self.lock();
         inner.pending.retain(|pending| pending.expires > now);
         // Every pending code is compared, in constant time each.
         let mut found = None;
         for (index, pending) in inner.pending.iter().enumerate() {
-            if constant_time_eq(&pending.digest, &digest) {
+            let long = constant_time_eq(&pending.digest, &digest);
+            let short = short_digest
+                .as_ref()
+                .is_some_and(|short| constant_time_eq(&pending.short_digest, short));
+            if long | short {
                 found = Some(index);
             }
         }
@@ -367,6 +409,21 @@ impl PhoneRegistry {
             .child_token()
     }
 
+    /// `SHORT_CODE_CHARS` random Crockford base32 symbols, unformatted.
+    fn random_short_code(&self) -> Result<String, String> {
+        let mut buf = [0u8; SHORT_CODE_CHARS * 5 / 8];
+        self.rng
+            .fill(&mut buf)
+            .map_err(|_| "the system random source failed".to_string())?;
+        let bits = buf
+            .iter()
+            .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
+        Ok((0..SHORT_CODE_CHARS)
+            .rev()
+            .map(|i| char::from(CROCKFORD_ALPHABET[((bits >> (i * 5)) & 0x1f) as usize]))
+            .collect())
+    }
+
     fn random_secret(&self, bytes: usize) -> Result<String, String> {
         let mut buf = vec![0u8; bytes];
         self.rng
@@ -392,6 +449,24 @@ fn validate_device_name(name: &str) -> Result<String, String> {
         return Err("device name must not contain control characters".into());
     }
     Ok(name.to_string())
+}
+
+/// A short code as a phone typed it, in the form it was issued in: upper
+/// case, without spaces or dashes, with O read as 0 and I or L as 1.
+/// `None` when that is not `SHORT_CODE_CHARS` Crockford symbols.
+pub fn normalize_short_code(typed: &str) -> Option<String> {
+    let code: String = typed
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            other => other,
+        })
+        .collect();
+    let valid =
+        code.len() == SHORT_CODE_CHARS && code.bytes().all(|b| CROCKFORD_ALPHABET.contains(&b));
+    valid.then_some(code)
 }
 
 fn sha256(secret: &str) -> [u8; 32] {
@@ -506,7 +581,7 @@ fn restrict_permissions(path: &Path) -> Result<(), String> {
 }
 
 /// Failures before an address is made to wait.
-const THROTTLE_FREE_FAILURES: u32 = 5;
+pub(crate) const THROTTLE_FREE_FAILURES: u32 = 5;
 /// The first wait; each further failure doubles it.
 const THROTTLE_BASE_DELAY: Duration = Duration::from_secs(1);
 const THROTTLE_MAX_DELAY: Duration = Duration::from_secs(15 * 60);
@@ -644,6 +719,97 @@ mod tests {
     }
 
     #[test]
+    fn a_short_code_redeems_once() {
+        let (_dir, registry, _) = registry();
+        let pairing = registry.create_pairing("app", PhoneScope::Act).unwrap();
+        let short = &pairing.short_code;
+        assert_eq!(short.len(), SHORT_CODE_CHARS + 1);
+        assert_eq!(short.as_bytes()[4], b'-');
+        assert!(short
+            .bytes()
+            .filter(|b| *b != b'-')
+            .all(|b| CROCKFORD_ALPHABET.contains(&b)));
+        // Typed loosely: lower case, a space instead of the dash.
+        let typed = short.to_ascii_lowercase().replace('-', " ");
+        let paired = registry.redeem(&typed).unwrap();
+        assert_eq!(paired.phone.name, "app");
+        assert_eq!(paired.phone.scope, PhoneScope::Act);
+        assert_eq!(registry.redeem(short).unwrap_err(), PairError::InvalidCode);
+        // Short codes differ between pairings.
+        let a = registry.create_pairing("a", PhoneScope::View).unwrap();
+        let b = registry.create_pairing("b", PhoneScope::View).unwrap();
+        assert_ne!(a.short_code, b.short_code);
+    }
+
+    #[test]
+    fn short_codes_are_normalized_as_typed() {
+        assert_eq!(
+            normalize_short_code("abcd-efgh").as_deref(),
+            Some("ABCDEFGH")
+        );
+        assert_eq!(
+            normalize_short_code(" ab cd\tef-gh ").as_deref(),
+            Some("ABCDEFGH")
+        );
+        // O reads as 0; I and L read as 1.
+        assert_eq!(
+            normalize_short_code("OoIi-Ll00").as_deref(),
+            Some("00111100")
+        );
+        // U is not Crockford; other symbols and lengths are refused.
+        assert_eq!(normalize_short_code("UUUU-UUUU"), None);
+        assert_eq!(normalize_short_code("ABCD-EFG"), None);
+        assert_eq!(normalize_short_code("ABCD-EFGHJ"), None);
+        assert_eq!(normalize_short_code("ABCD_EFGH"), None);
+        assert_eq!(normalize_short_code(""), None);
+        // A short code typed with the confusable letters redeems.
+        let (_dir, registry, _) = registry();
+        let pairing = registry.create_pairing("app", PhoneScope::View).unwrap();
+        let confused: String = pairing
+            .short_code
+            .chars()
+            .map(|c| match c {
+                '0' => 'o',
+                '1' => 'l',
+                other => other,
+            })
+            .collect();
+        assert!(registry.redeem(&confused).is_ok());
+    }
+
+    #[test]
+    fn the_long_and_short_codes_spend_one_pairing() {
+        let (_dir, registry, _) = registry();
+        let first = registry.create_pairing("first", PhoneScope::View).unwrap();
+        registry.redeem(&first.code).unwrap();
+        assert_eq!(
+            registry.redeem(&first.short_code).unwrap_err(),
+            PairError::InvalidCode
+        );
+        let second = registry.create_pairing("second", PhoneScope::View).unwrap();
+        registry.redeem(&second.short_code).unwrap();
+        assert_eq!(
+            registry.redeem(&second.code).unwrap_err(),
+            PairError::InvalidCode
+        );
+        assert_eq!(registry.list().len(), 2);
+    }
+
+    #[test]
+    fn a_short_code_expires_with_its_pairing() {
+        let (_dir, registry, now) = registry();
+        let early = registry.create_pairing("a", PhoneScope::View).unwrap();
+        let late = registry.create_pairing("b", PhoneScope::View).unwrap();
+        now.fetch_add(PAIRING_CODE_TTL.as_secs() - 1, Ordering::SeqCst);
+        assert!(registry.redeem(&early.short_code).is_ok());
+        now.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            registry.redeem(&late.short_code).unwrap_err(),
+            PairError::InvalidCode
+        );
+    }
+
+    #[test]
     fn a_pairing_grants_the_scope_it_was_created_with() {
         let (dir, registry, _) = registry();
         let act = registry.create_pairing("phone", PhoneScope::Act).unwrap();
@@ -699,6 +865,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains(&paired.token));
         assert!(!text.contains(&pairing.code));
+        assert!(!text.contains(&pairing.short_code));
         assert!(text.contains(&hex(&sha256(&paired.token))));
         #[cfg(unix)]
         {

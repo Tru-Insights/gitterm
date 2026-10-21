@@ -101,6 +101,9 @@ pub struct PhonePairing {
     pub expires_unix_secs: u64,
     /// The scope the phone gets ("view" or "act").
     pub scope: String,
+    /// The same pairing, typed into the phone's home-screen app
+    /// (`XXXX-XXXX`). Empty from an agent that predates short codes.
+    pub short_code: String,
 }
 
 /// A phone paired with an agent.
@@ -804,11 +807,12 @@ impl RemoteAgentBackend {
                 ))
             })?
             .into_inner();
-        // The code itself is only ever used inside the URL.
+        // The long code itself is only ever used inside the URL.
         Ok(PhonePairing {
             pairing_url: response.pairing_url,
             expires_unix_secs: response.expires_unix_secs,
             scope: response.scope,
+            short_code: response.short_code,
         })
     }
 

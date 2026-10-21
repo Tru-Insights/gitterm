@@ -614,6 +614,7 @@ impl GitTermAgent for GitTermAgentService {
         Ok(Response::new(CreatePhonePairingResponse {
             pairing_url: format!("{}/pair#{}", phone.base_url, pairing.code),
             code: pairing.code,
+            short_code: pairing.short_code,
             expires_unix_secs,
             scope: pairing.scope.label().to_string(),
         }))
@@ -2068,6 +2069,8 @@ mod tests {
             pairing.pairing_url,
             format!("http://100.64.0.1:7778/pair#{}", pairing.code)
         );
+        assert_eq!(pairing.short_code.len(), 9);
+        assert_eq!(pairing.short_code.as_bytes()[4], b'-');
         let paired = phones.redeem(&pairing.code).unwrap();
 
         let listed = service
