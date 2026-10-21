@@ -5647,6 +5647,9 @@ pub enum Event {
     /// "Allow sending and approving" ticked or cleared.
     PhoneAllowActToggled(bool),
     PhonePairingCreate,
+    /// An edit to the short-code field, which is read-only: it is a text
+    /// field so the code can be selected and copied; edits are dropped.
+    PhoneShortCodeEdited(String),
     /// remote id, the new pairing or why not.
     PhonePairingCreated(String, Result<PhonePairing, String>),
     /// remote id, its paired phones or why not.
@@ -6975,6 +6978,9 @@ struct PhonePanel {
 #[derive(Debug, Clone)]
 struct PhonePairingView {
     url: String,
+    /// The same pairing, typed into the phone's home-screen app
+    /// (`XXXX-XXXX`). Empty from an agent that predates short codes.
+    short_code: String,
     /// The scope the agent granted ("view" or "act").
     scope: String,
     expires_unix_secs: u64,
@@ -23201,6 +23207,7 @@ fi
                     |(remote_id, result)| Event::PhonePairingCreated(remote_id, result),
                 );
             }
+            Event::PhoneShortCodeEdited(_) => {}
             Event::PhonePairingCreated(remote_id, result) => {
                 let Some(panel) = self
                     .phone_panel
@@ -23213,6 +23220,7 @@ fi
                 let view = result.and_then(|pairing| {
                     phone_pairing_qr(&pairing.pairing_url).map(|qr| PhonePairingView {
                         url: pairing.pairing_url,
+                        short_code: pairing.short_code,
                         scope: pairing.scope,
                         expires_unix_secs: pairing.expires_unix_secs,
                         qr,
@@ -24960,22 +24968,54 @@ fi
                 .filter_method(iced::widget::image::FilterMethod::Nearest)
                 .width(Length::Fixed(240.0))
                 .height(Length::Fixed(240.0));
+            let mut pairing_column = column![container(qr).center_x(Length::Fill)].spacing(6);
+            // An older agent sends no short code; the QR still works.
+            if !pairing.short_code.is_empty() {
+                let short_code = text_input("", &pairing.short_code)
+                    .on_input(Event::PhoneShortCodeEdited)
+                    .size(30)
+                    .font(mono)
+                    .align_x(iced::Alignment::Center)
+                    .width(Length::Fixed(240.0))
+                    .padding([4, 8])
+                    .style(
+                        move |_theme: &Theme, _status: text_input::Status| text_input::Style {
+                            background: iced::Color::TRANSPARENT.into(),
+                            border: iced::Border::default(),
+                            icon: iced::Color::TRANSPARENT,
+                            placeholder: text_muted,
+                            value: text_primary,
+                            selection: accent,
+                        },
+                    );
+                pairing_column = pairing_column
+                    .push(container(short_code).center_x(Length::Fill))
+                    .push(
+                        container(
+                            text("Using the home-screen app? Open it and type this code.")
+                                .size(11)
+                                .color(text_secondary),
+                        )
+                        .center_x(Length::Fill),
+                    );
+            }
             content = content.push(
-                column![
-                    container(qr).center_x(Length::Fill),
-                    text(pairing.url.clone())
-                        .size(11)
-                        .font(mono)
-                        .color(text_secondary),
-                    text(format!(
-                        "{} · works once · expires at {}",
-                        phone_scope_label(&pairing.scope),
-                        local_clock_time(pairing.expires_unix_secs)
-                    ))
-                    .size(10)
-                    .color(text_muted),
-                ]
-                .spacing(6),
+                pairing_column
+                    .push(
+                        text(pairing.url.clone())
+                            .size(11)
+                            .font(mono)
+                            .color(text_secondary),
+                    )
+                    .push(
+                        text(format!(
+                            "{} · works once · expires at {}",
+                            phone_scope_label(&pairing.scope),
+                            local_clock_time(pairing.expires_unix_secs)
+                        ))
+                        .size(10)
+                        .color(text_muted),
+                    ),
             );
         }
 
