@@ -955,6 +955,13 @@
     const d = ev.data;
     switch (ev.type) {
       case 'turn_started':
+        // A finished subagent resumed with SendMessage starts a new run:
+        // time it afresh. A replay takes the start from the marker that
+        // follows this event.
+        if (sub.tracked && sub.state !== 'running') {
+          sub.startMs = replaying ? null : Date.now();
+          sub.endMs = null; sub.durationMs = null; sub.tokens = null;
+        }
         sub.tracked = true;
         sub.state = 'running';
         if (d && d.model) sub.model = d.model;

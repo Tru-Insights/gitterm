@@ -7,7 +7,7 @@
 //! `tests/fixtures/claude/`. `ClaudeSession` owns the process on a
 //! dedicated thread and maps `HarnessCommand`s onto stdin frames.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -133,6 +133,17 @@ pub struct ClaudeFrameParser {
     /// call. Background Bash commands are tasks too; only subagents'
     /// completions become `SubagentEvent`s.
     agent_tasks: HashMap<String, bool>,
+    /// Subagent task id -> the Agent call it runs under. A finished
+    /// background subagent resumed with `SendMessage` reports its
+    /// `task_started` and `task_notification` under the SendMessage call's
+    /// id, while its own frames keep the Agent call as their parent.
+    agent_roots: HashMap<String, String>,
+    /// `SendMessage` calls seen in this stream; one can resume a subagent.
+    resume_calls: HashSet<String>,
+    /// Resumed subagents whose Agent call ran before this process, so it is
+    /// not in `agent_roots`. Their start waits for their first frame, which
+    /// names the Agent call.
+    pending_resumes: HashSet<String>,
 }
 
 impl ClaudeFrameParser {
@@ -158,7 +169,14 @@ impl ClaudeFrameParser {
         // It is wrapped in `SubagentEvent`s so the chat nests it under the
         // parent's tool card instead of mixing it into this turn.
         if let Some(parent) = v.get("parent_tool_use_id").and_then(Value::as_str) {
-            let frames = parse_subagent_frame(parent, &v);
+            let mut frames = parse_subagent_frame(parent, &v);
+            if let Some(task) = v.get("agent_id").and_then(Value::as_str) {
+                if self.pending_resumes.remove(task) {
+                    self.agent_roots
+                        .insert(task.to_string(), parent.to_string());
+                    frames.insert(0, self.start_subagent(parent));
+                }
+            }
             if let Some(text_seen) = self.agent_tasks.get_mut(parent) {
                 for frame in &frames {
                     if let ParsedFrame::Event(HarnessEvent::SubagentEvent { event, .. }) = frame {
@@ -180,25 +198,48 @@ impl ClaudeFrameParser {
                 })]
             }
             // Subagent lifecycle; `tool_use_id` is the parent's Agent call.
+            // A resumed subagent's start and end carry the SendMessage call's
+            // id; both are reported under the Agent call it runs under.
             "system" if str_at("/subtype") == Some("task_started") => {
-                match str_at("/tool_use_id") {
-                    Some(parent) if str_at("/task_type") == Some("local_agent") => {
-                        self.agent_tasks.insert(parent.to_string(), false);
-                        vec![subagent_event(
-                            parent,
-                            HarnessEvent::TurnStarted {
-                                session_id: None,
-                                model: None,
-                            },
-                        )]
-                    }
-                    _ => Vec::new(),
-                }
-            }
-            "system" if str_at("/subtype") == Some("task_notification") => {
-                let Some(parent) = str_at("/tool_use_id") else {
+                let Some(tool_use_id) = str_at("/tool_use_id") else {
                     return Vec::new();
                 };
+                if str_at("/task_type") != Some("local_agent") {
+                    return Vec::new();
+                }
+                let task = str_at("/task_id");
+                let resume = self.resume_calls.remove(tool_use_id);
+                let root = match task.and_then(|t| self.agent_roots.get(t)) {
+                    Some(root) => root.clone(),
+                    None if resume => {
+                        if let Some(task) = task {
+                            self.pending_resumes.insert(task.to_string());
+                        }
+                        return Vec::new();
+                    }
+                    None => {
+                        if let Some(task) = task {
+                            self.agent_roots
+                                .insert(task.to_string(), tool_use_id.to_string());
+                        }
+                        tool_use_id.to_string()
+                    }
+                };
+                vec![self.start_subagent(&root)]
+            }
+            "system" if str_at("/subtype") == Some("task_notification") => {
+                let Some(tool_use_id) = str_at("/tool_use_id") else {
+                    return Vec::new();
+                };
+                let task = str_at("/task_id");
+                if let Some(task) = task {
+                    self.pending_resumes.remove(task);
+                }
+                let parent = match task.and_then(|t| self.agent_roots.get(t)) {
+                    Some(root) => root.clone(),
+                    None => tool_use_id.to_string(),
+                };
+                let parent = parent.as_str();
                 let Some(text_seen) = self.agent_tasks.remove(parent) else {
                     return Vec::new();
                 };
@@ -257,6 +298,18 @@ impl ClaudeFrameParser {
         }
     }
 
+    /// The start of a run of the subagent under Agent call `parent`.
+    fn start_subagent(&mut self, parent: &str) -> ParsedFrame {
+        self.agent_tasks.insert(parent.to_string(), false);
+        subagent_event(
+            parent,
+            HarnessEvent::TurnStarted {
+                session_id: None,
+                model: None,
+            },
+        )
+    }
+
     fn parse_stream_event(&mut self, event: &Value) -> Vec<ParsedFrame> {
         let index = event.get("index").and_then(Value::as_u64);
         let ev = |e| vec![ParsedFrame::Event(e)];
@@ -275,6 +328,9 @@ impl ClaudeFrameParser {
                             )));
                         };
                         self.tool_blocks.insert(index, id.to_string());
+                        if block["name"] == "SendMessage" {
+                            self.resume_calls.insert(id.to_string());
+                        }
                         ev(HarnessEvent::ItemStarted {
                             id: id.to_string(),
                             kind: ItemKind::ToolCall {
@@ -2624,6 +2680,89 @@ mod tests {
                     cost_usd: None,
                 }),
             })
+        );
+    }
+
+    /// The parent and inner event type of each subagent event.
+    fn sub_starts_and_ends(evs: &[HarnessEvent]) -> Vec<(String, &'static str)> {
+        evs.iter()
+            .filter_map(|e| match e {
+                HarnessEvent::SubagentEvent {
+                    parent_tool_use_id,
+                    event,
+                } => Some((
+                    parent_tool_use_id.clone(),
+                    match **event {
+                        HarnessEvent::TurnStarted { .. } => "start",
+                        HarnessEvent::TurnCompleted { .. } => "end",
+                        HarnessEvent::ItemStarted { .. } => "tool",
+                        _ => "other",
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const SEND_MESSAGE_BLOCK: &str = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_send","name":"SendMessage","input":{}}},"parent_tool_use_id":null}"#;
+    const RESUMED_TOOL: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"ls"}}]},"parent_tool_use_id":"toolu_agent","agent_id":"a1"}"#;
+
+    #[test]
+    fn a_subagent_resumed_by_send_message_runs_under_its_agent_call() {
+        // Wire shape from a real session: the resumed run's start and end
+        // carry the SendMessage call's id; its frames keep the Agent call's.
+        let mut p = ClaudeFrameParser::new();
+        let frames = [
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_agent","task_type":"local_agent"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_agent","status":"completed","summary":"first"}"#,
+            SEND_MESSAGE_BLOCK,
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_send","task_type":"local_agent"}"#,
+            RESUMED_TOOL,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_send","status":"completed","summary":"second"}"#,
+        ];
+        let evs = events(
+            &frames
+                .iter()
+                .flat_map(|l| p.parse_line(l))
+                .collect::<Vec<_>>(),
+        );
+        let agent = |kind| ("toolu_agent".to_string(), kind);
+        assert_eq!(
+            sub_starts_and_ends(&evs),
+            vec![
+                agent("start"),
+                agent("other"),
+                agent("end"),
+                agent("start"),
+                agent("tool"),
+                // No text from the run: its summary stands in.
+                agent("other"),
+                agent("end"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_subagent_resumed_from_before_this_process_starts_at_its_first_frame() {
+        // The Agent call ran under an earlier CLI process, so only the
+        // resumed run's first frame names it.
+        let mut p = ClaudeFrameParser::new();
+        p.parse_line(SEND_MESSAGE_BLOCK);
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_send","task_type":"local_agent"}"#;
+        assert!(p.parse_line(started).is_empty());
+        let evs = events(&p.parse_line(RESUMED_TOOL));
+        assert_eq!(
+            sub_starts_and_ends(&evs),
+            vec![
+                ("toolu_agent".to_string(), "start"),
+                ("toolu_agent".to_string(), "tool")
+            ]
+        );
+        let done = r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_send","status":"completed","summary":"s"}"#;
+        let evs = events(&p.parse_line(done));
+        assert_eq!(
+            sub_starts_and_ends(&evs).last(),
+            Some(&("toolu_agent".to_string(), "end"))
         );
     }
 
