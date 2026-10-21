@@ -13,24 +13,47 @@
 <meta name="color-scheme" content="dark" />
 <title>Pair with GitTerm</title>
 <style>
-  :root { --bg: #1e1e2e; --bg-alt: #181825; --fg: #cdd6f4; --muted: #7f849c; --accent: #89b4fa; --ok: #a6e3a1; --err: #f38ba8; --border: #45475a; }
+  :root { --bg: #1e1e2e; --bg-alt: #181825; --card: #24273a; --fg: #cdd6f4; --muted: #7f849c; --accent: #89b4fa; --ok: #a6e3a1; --err: #f38ba8; --border: #45475a; }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; -webkit-text-size-adjust: 100%; }
   main { max-width: 480px; margin: 0 auto; padding: calc(env(safe-area-inset-top) + 32px) calc(env(safe-area-inset-right) + 20px) calc(env(safe-area-inset-bottom) + 32px) calc(env(safe-area-inset-left) + 20px); }
   h1 { font-size: 22px; margin: 0 0 12px; }
   p { margin: 0 0 14px; color: var(--muted); }
-  #status { padding: 14px 16px; border-radius: 12px; background: var(--bg-alt); border: 1px solid var(--border); color: var(--fg); }
+  #choices { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+  #choices button { display: block; width: 100%; padding: 14px 16px; border-radius: 12px; font: inherit; text-align: left; border: 1px solid var(--border); background: var(--card); color: var(--fg); }
+  #choices button.primary { background: var(--accent); border-color: var(--accent); color: #11111b; }
+  #choices button .what { display: block; font-weight: 600; }
+  #choices button .how { display: block; font-size: 14px; opacity: 0.8; }
+  #choices button[aria-pressed="true"] { border-color: var(--accent); }
+  #steps { margin-top: 16px; padding: 14px 16px; border-radius: 12px; background: var(--bg-alt); border: 1px solid var(--accent); }
+  #steps ol { margin: 0; padding-left: 20px; }
+  #steps li { margin: 0 0 8px; }
+  #steps li:last-child { margin: 0; }
+  #steps p { margin: 10px 0 0; font-size: 14px; }
+  #status { margin-top: 16px; padding: 14px 16px; border-radius: 12px; background: var(--bg-alt); border: 1px solid var(--border); color: var(--fg); }
   #status.ok { border-color: var(--ok); }
   #status.err { border-color: var(--err); }
   a.button { display: inline-block; margin-top: 18px; padding: 12px 18px; border-radius: 10px; background: var(--accent); color: #11111b; font-weight: 600; text-decoration: none; }
-  a.button[hidden] { display: none; }
 </style>
 </head>
 <body>
 <main>
   <h1>Pair with GitTerm</h1>
-  <p>This phone gets its own key to view the chats on this machine. GitTerm can revoke it at any time.</p>
-  <div id="status">Pairing…</div>
+  <p id="intro">This phone gets its own key to the chats on this machine. GitTerm can revoke it at any time.</p>
+  <div id="choices" hidden>
+    <button id="use-here" class="primary" type="button"><span class="what">Use in Safari</span><span class="how">Pair this browser now and open the chats.</span></button>
+    <button id="install" type="button" aria-pressed="false"><span class="what">Install as an app</span><span class="how">Full screen from the home screen. Pairs inside the app.</span></button>
+  </div>
+  <div id="steps" hidden>
+    <ol>
+      <li>Tap <strong>Share</strong> (the square with an arrow), then <strong>Add to Home Screen</strong>.</li>
+      <li>Open <strong>GitTerm</strong> from the home screen.</li>
+      <li>Type the code shown in GitTerm, under the QR code.</li>
+    </ol>
+    <p>The app keeps its own pairing, apart from Safari’s, so this link is not used up: the code in GitTerm still works.</p>
+  </div>
+  <div id="status" hidden></div>
   <a id="open" class="button" href="./" hidden>Open chats</a>
 </main>
 <script>
@@ -39,41 +62,79 @@
   const TOKEN_KEY = 'gitterm.phone.token';
   const statusEl = document.getElementById('status');
   const openEl = document.getElementById('open');
+  const choicesEl = document.getElementById('choices');
+  const useHereEl = document.getElementById('use-here');
+  const installEl = document.getElementById('install');
+  const stepsEl = document.getElementById('steps');
+  // Opened from the home screen: iOS sets navigator.standalone; others
+  // report the manifest's display mode.
+  const STANDALONE = window.navigator.standalone === true ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
   function show(text, cls) {
     statusEl.textContent = text;
     statusEl.className = cls || '';
+    statusEl.hidden = !text;
   }
+  // Keep a home-screen app's navigation inside the app.
+  openEl.addEventListener('click', (e) => {
+    e.preventDefault();
+    location.replace(openEl.href);
+  });
   // The code rides in the fragment, which is never sent to a server.
   // Drop it from the address bar and history at once.
   const code = decodeURIComponent((location.hash || '').replace(/^#/, '')).trim();
   history.replaceState(null, '', location.pathname + location.search);
   if (!code) {
-    show('This link has no pairing code. In GitTerm, open the machine menu and choose “Pair a phone…”, then scan the new code.', 'err');
+    show('This link has no pairing code. In GitTerm, open the machine menu and choose “Pair a phone…”, then scan the new code, or open the app and type the code shown there.', 'err');
     if (localStorage.getItem(TOKEN_KEY)) openEl.hidden = false;
     return;
   }
-  fetch('api/pair', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code }),
-    cache: 'no-store',
-  }).then(async (response) => {
-    let body = null;
-    try { body = await response.json(); } catch (e) { console.error('pair: unreadable response', e); }
-    if (!response.ok || !body || !body.token) {
-      const why = (body && body.error) || ('the agent answered ' + response.status);
-      show('Could not pair: ' + why, 'err');
-      return;
-    }
-    localStorage.setItem(TOKEN_KEY, body.token);
-    const phone = body.phone || {};
-    const scope = phone.scope === 'view' ? ' (view only)' : '';
-    show('Paired with ' + (body.agent || 'GitTerm') + ' as “' + (phone.name || 'this phone') + '”' + scope + '.', 'ok');
-    openEl.hidden = false;
-    setTimeout(() => location.replace('./'), 1200);
-  }).catch((e) => {
-    console.error('pair failed', e);
-    show('Could not reach the agent: ' + e, 'err');
+
+  let redeeming = false;
+  function redeem() {
+    if (redeeming) return;
+    redeeming = true;
+    choicesEl.hidden = true;
+    stepsEl.hidden = true;
+    show('Pairing…');
+    fetch('api/pair', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+      cache: 'no-store',
+    }).then(async (response) => {
+      let body = null;
+      try { body = await response.json(); } catch (e) { console.error('pair: unreadable response', e); }
+      if (!response.ok || !body || !body.token) {
+        const why = (body && body.error) || ('the agent answered ' + response.status);
+        show('Could not pair: ' + why, 'err');
+        return;
+      }
+      localStorage.setItem(TOKEN_KEY, body.token);
+      const phone = body.phone || {};
+      const scope = phone.scope === 'view' ? ' (view only)' : '';
+      show('Paired with ' + (body.agent || 'GitTerm') + ' as “' + (phone.name || 'this phone') + '”' + scope + '.', 'ok');
+      openEl.hidden = false;
+      setTimeout(() => location.replace('./'), 1200);
+    }).catch((e) => {
+      console.error('pair failed', e);
+      show('Could not reach the agent: ' + e, 'err');
+    });
+  }
+
+  // Already inside a home-screen app, this storage is the app's: pair it.
+  if (STANDALONE) {
+    redeem();
+    return;
+  }
+  // In Safari, pairing now would pair Safari, not an app installed later,
+  // and spend the code; so ask first.
+  choicesEl.hidden = false;
+  useHereEl.addEventListener('click', redeem);
+  installEl.addEventListener('click', () => {
+    installEl.setAttribute('aria-pressed', 'true');
+    stepsEl.hidden = false;
+    stepsEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   });
 })();
 </script>

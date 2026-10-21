@@ -36,6 +36,21 @@
   #notice { margin-top: 14px; border: 1px solid var(--border); color: var(--fg); }
   #notice.err { border-color: var(--err); }
   #notice[hidden] { display: none; }
+  [hidden] { display: none !important; }
+  /* Pairing inside the app (or Safari) by the short code GitTerm shows. */
+  #pairing { margin-top: 14px; padding: 18px 16px; border-radius: 14px; background: var(--card); border: 1px solid var(--border); }
+  #pairing h2 { margin: 0 0 6px; font-size: 20px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--fg); }
+  #pairing p { margin: 0 0 14px; color: var(--muted); font-size: 15px; }
+  #pair-form { display: flex; flex-direction: column; gap: 10px; }
+  #pair-code { width: 100%; padding: 12px 14px; border-radius: 11px; border: 1px solid var(--border); background: var(--bg-alt); color: var(--fg); font: 600 26px/1.2 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0.12em; text-align: center; text-transform: uppercase; }
+  #pair-code::placeholder { color: var(--border); }
+  #pair-code:focus { outline: none; border-color: var(--accent); }
+  #pair-submit { padding: 13px 18px; border-radius: 11px; border: 0; background: var(--accent); color: #11111b; font: inherit; font-weight: 600; }
+  #pair-submit:disabled { opacity: 0.55; }
+  #pairing #pair-error { margin: 0; color: var(--err); font-size: 14px; }
+  #install { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 14px; }
+  #install strong { color: var(--fg); font-weight: 600; }
+  #install ol { margin: 6px 0 0; padding-left: 20px; }
 </style>
 </head>
 <body>
@@ -45,6 +60,23 @@
 </header>
 <main>
   <div id="notice" hidden></div>
+  <section id="pairing" hidden>
+    <h2>Pair this app</h2>
+    <p id="pair-why">In GitTerm, open the machine’s menu and choose “Pair a phone…”. Type the code shown under the QR code.</p>
+    <form id="pair-form" autocomplete="off" novalidate>
+      <input id="pair-code" name="code" type="text" inputmode="text" autocapitalize="characters" autocorrect="off" spellcheck="false" autocomplete="off" maxlength="40" placeholder="XXXX-XXXX" aria-label="Pairing code" enterkeyhint="go" />
+      <p id="pair-error" role="alert" hidden></p>
+      <button id="pair-submit" type="submit">Pair</button>
+    </form>
+    <div id="install" hidden>
+      <strong>Install it as an app</strong>
+      <ol>
+        <li>Tap Share, then <strong>Add to Home Screen</strong>.</li>
+        <li>Open GitTerm from the home screen and type the code there.</li>
+      </ol>
+      An app on the home screen keeps its own pairing, separate from Safari’s.
+    </div>
+  </section>
   <div id="lists"></div>
 </main>
 <script>
@@ -56,8 +88,24 @@
   const listsEl = document.getElementById('lists');
   const headingEl = document.getElementById('heading');
   const whoEl = document.getElementById('who');
+  const refreshEl = document.getElementById('refresh');
+  const pairingEl = document.getElementById('pairing');
+  const pairWhyEl = document.getElementById('pair-why');
+  const pairFormEl = document.getElementById('pair-form');
+  const pairCodeEl = document.getElementById('pair-code');
+  const pairErrorEl = document.getElementById('pair-error');
+  const pairSubmitEl = document.getElementById('pair-submit');
+  const installEl = document.getElementById('install');
+  // Opened from the home screen: iOS sets navigator.standalone; others
+  // report the manifest's display mode.
+  const STANDALONE = window.navigator.standalone === true ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  // A short code is 8 Crockford base32 characters, typed with or without
+  // its dash.
+  const SHORT_CODE_CHARS = 8;
   let timer = null;
   let loading = false;
+  let pairing = false;
 
   function el(tag, cls, text) {
     const e = document.createElement(tag);
@@ -144,12 +192,80 @@
     }
   }
 
+  // ---- pairing by the typed short code ---------------------------------------
+  function pairError(text) {
+    pairErrorEl.textContent = text || '';
+    pairErrorEl.hidden = !text;
+  }
+  function showPairing(why) {
+    stop();
+    listsEl.textContent = '';
+    whoEl.textContent = '';
+    notice('');
+    refreshEl.hidden = true;
+    if (why) pairWhyEl.textContent = why;
+    installEl.hidden = STANDALONE;
+    pairingEl.hidden = false;
+  }
+  function hidePairing() {
+    pairingEl.hidden = true;
+    refreshEl.hidden = false;
+    pairError('');
+  }
+  async function pair(event) {
+    event.preventDefault();
+    if (pairing) return;
+    const typed = pairCodeEl.value.trim();
+    if (typed.replace(/[\s-]/g, '').length < SHORT_CODE_CHARS) {
+      pairError('A pairing code has 8 characters, like 7K2M-9QXD.');
+      pairCodeEl.focus();
+      return;
+    }
+    pairing = true;
+    pairSubmitEl.disabled = true;
+    pairSubmitEl.textContent = 'Pairing…';
+    pairError('');
+    try {
+      const response = await fetch('api/pair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: typed }),
+        cache: 'no-store',
+      });
+      let body = null;
+      try { body = await response.json(); } catch (e) { console.error('pair: unreadable response', e); }
+      if (response.ok && body && body.token) {
+        localStorage.setItem(TOKEN_KEY, body.token);
+        pairCodeEl.value = '';
+        hidePairing();
+        await load();
+        start();
+        return;
+      }
+      if (response.status === 401) {
+        pairError('That code did not work: it is wrong, already used, or expired (codes last 10 minutes). Check it, or choose “New code” in GitTerm.');
+      } else if (response.status === 429) {
+        const wait = Number(response.headers.get('Retry-After'));
+        pairError('Too many wrong codes. Try again in ' + (wait > 0 ? (wait < 90 ? wait + ' seconds' : Math.ceil(wait / 60) + ' minutes') : 'a while') + '.');
+      } else {
+        pairError('Could not pair: ' + ((body && body.error) || 'the agent answered ' + response.status));
+      }
+      pairCodeEl.select();
+    } catch (e) {
+      console.error('pair: request failed', e);
+      pairError('Could not reach the agent: ' + e);
+    } finally {
+      pairing = false;
+      pairSubmitEl.disabled = false;
+      pairSubmitEl.textContent = 'Pair';
+    }
+  }
+  pairFormEl.addEventListener('submit', pair);
+
   async function load() {
     const token = localStorage.getItem(TOKEN_KEY);
     if (!token) {
-      stop();
-      listsEl.textContent = '';
-      notice('This phone is not paired. In GitTerm, open the machine’s menu, choose “Pair a phone…”, and scan the code.', true);
+      showPairing();
       return;
     }
     if (loading) return;
@@ -160,9 +276,7 @@
       try { body = await response.json(); } catch (e) { console.error('chats: unreadable response', e); }
       if (response.status === 401) {
         localStorage.removeItem(TOKEN_KEY);
-        stop();
-        listsEl.textContent = '';
-        notice('This phone is no longer paired (it was revoked). Pair it again from GitTerm.', true);
+        showPairing('This phone is no longer paired (it was revoked in GitTerm). Choose “Pair a phone…” there and type the new code.');
         return;
       }
       if (!response.ok || !body) {
@@ -179,16 +293,27 @@
     }
   }
   function start() {
-    if (!timer) timer = setInterval(load, REFRESH_MS);
+    if (!timer && localStorage.getItem(TOKEN_KEY)) timer = setInterval(load, REFRESH_MS);
   }
   function stop() {
     if (timer) { clearInterval(timer); timer = null; }
   }
-  document.getElementById('refresh').addEventListener('click', load);
+  refreshEl.addEventListener('click', load);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) { stop(); return; }
+    if (!pairingEl.hidden) return;
     load();
     start();
+  });
+  // A home-screen app can open a plain link in Safari instead of in
+  // itself; same-origin links are followed here so the chats stay in the
+  // app.
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest && e.target.closest('a[href]');
+    if (!a || a.target || e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if (a.origin !== location.origin) return;
+    e.preventDefault();
+    location.assign(a.href);
   });
   headingEl.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
   load();

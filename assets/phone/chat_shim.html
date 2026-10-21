@@ -22,6 +22,14 @@
   const back = bar.appendChild(document.createElement('a'));
   back.href = './';
   back.textContent = '‹ Chats';
+  // The chat page swallows clicks on every link (it opens them through the
+  // host), and a home-screen app could open a plain link in Safari; go
+  // back to the list here, inside the app.
+  back.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    location.assign(back.href);
+  });
   const titleEl = bar.appendChild(document.createElement('div'));
   titleEl.id = 'phone-title';
   titleEl.textContent = title || 'Chat';
