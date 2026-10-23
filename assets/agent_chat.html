@@ -64,7 +64,12 @@
     border-radius: 8px;
     padding: 12px 14px;
     line-height: 1.5;
+    /* The page keeps the view still itself when "Show earlier" restores
+       blocks above it (TRU-157); a second, engine-side adjustment would
+       move it twice. */
+    overflow-anchor: none;
   }
+  #messages > .earlier { display: block; margin: 0 auto 10px; font-size: 12px; padding: 3px 12px; border-radius: 12px; }
   #messages::-webkit-scrollbar { width: 10px; }
   #messages::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
   #jump {
@@ -685,18 +690,104 @@
     scrollQueued = true;
     requestAnimationFrame(() => {
       scrollQueued = false;
-      if (follow) messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (!follow) return;
+      trimWindow();
+      messagesEl.scrollTop = messagesEl.scrollHeight;
     });
   }
   jumpBtn.addEventListener('click', () => {
     follow = true;
     jumpBtn.classList.remove('visible');
+    trimWindow();
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
   function append(node) {
     messagesEl.appendChild(node);
     scrollIfFollowing();
     return node;
+  }
+
+  // ---- history window (TRU-157) --------------------------------------------
+  // Only the newest blocks of the conversation stay in the document. Every
+  // block in it costs layout and paint on each frame a live stream draws,
+  // so a long chat's page got slower with every turn. Older blocks wait in
+  // detached chunks behind a "Show earlier" control. The page's handles on
+  // them (tool cards, subagent blocks, delegation cards, prompt bubbles)
+  // keep pointing at the nodes, so a late event still updates its block
+  // where it waits. Trimming happens only while following the bottom, so
+  // it never pulls away what the human scrolled back to read.
+  const WINDOW_KEEP = 150;  // blocks left in the document after a trim
+  const WINDOW_CHUNK = 50;  // blocks per detached chunk, and per "Show earlier"
+  const earlier = [];       // detached chunks (DocumentFragment), oldest first
+  let earlierBlocks = 0;    // blocks in them
+  const earlierEl = el('button', 'earlier');
+  earlierEl.type = 'button';
+  earlierEl.addEventListener('click', () => showEarlier(1));
+  // Markdown of replayed text that has not been in the document yet:
+  // rendered when its block first is (deferring it halves a long chat's
+  // rebuild).
+  const unrenderedMd = new Map(); // segment's markdown element -> its text
+  function firstBlock() {
+    const first = messagesEl.firstElementChild;
+    return first === earlierEl ? first.nextElementSibling : first;
+  }
+  function liveBlocks() {
+    return messagesEl.childElementCount - (earlierEl.parentNode === messagesEl ? 1 : 0);
+  }
+  function renderEarlierControl() {
+    if (!earlier.length) { earlierEl.remove(); return; }
+    earlierEl.textContent = 'Show earlier · ' + earlierBlocks + (earlierBlocks === 1 ? ' block' : ' blocks') + ' hidden';
+    if (messagesEl.firstElementChild !== earlierEl) messagesEl.insertBefore(earlierEl, messagesEl.firstElementChild);
+  }
+  function renderPendingMarkdown(root) {
+    if (!unrenderedMd.size) return;
+    for (const [mdEl, raw] of unrenderedMd) {
+      if (!root.contains(mdEl)) continue;
+      mdEl.innerHTML = renderMarkdown(raw);
+      unrenderedMd.delete(mdEl);
+    }
+  }
+  // Detach the oldest blocks in whole chunks once the document holds a
+  // chunk more than WINDOW_KEEP.
+  function trimWindow() {
+    const chunks = Math.floor((liveBlocks() - WINDOW_KEEP) / WINDOW_CHUNK);
+    if (chunks < 1) return;
+    for (let c = 0; c < chunks; c++) {
+      const frag = document.createDocumentFragment();
+      for (let i = 0; i < WINDOW_CHUNK; i++) frag.appendChild(firstBlock());
+      earlier.push(frag);
+    }
+    earlierBlocks += chunks * WINDOW_CHUNK;
+    renderEarlierControl();
+  }
+  // Put the newest `n` detached chunks back above the first block, keeping
+  // what is on screen where it is.
+  function showEarlier(n) {
+    n = Math.min(n, earlier.length);
+    if (n < 1) return;
+    const restored = document.createDocumentFragment();
+    for (const frag of earlier.splice(earlier.length - n, n)) {
+      earlierBlocks -= frag.childElementCount;
+      restored.appendChild(frag);
+    }
+    renderPendingMarkdown(restored);
+    const height = messagesEl.scrollHeight;
+    const top = messagesEl.scrollTop;
+    messagesEl.insertBefore(restored, firstBlock());
+    renderEarlierControl();
+    messagesEl.scrollTop = top + (messagesEl.scrollHeight - height);
+  }
+  // Bring a detached block (a roster row's card) back into the document.
+  function showEarlierUntil(node) {
+    if (node.isConnected) return;
+    const i = earlier.findIndex((frag) => frag.contains(node));
+    if (i >= 0) showEarlier(earlier.length - i);
+  }
+  function resetWindow() {
+    earlier.length = 0;
+    earlierBlocks = 0;
+    unrenderedMd.clear();
+    earlierEl.remove();
   }
 
   // ---- markdown ----------------------------------------------------------
@@ -782,7 +873,11 @@
     if (!segment) return;
     const raw = segment.raw;
     const cut = final ? raw.length : raw.lastIndexOf('\n') + 1;
-    if (cut !== segment.renderedUpTo) {
+    if (replaying && final) {
+      // Rendered when the block first is in the document (TRU-157).
+      unrenderedMd.set(segment.mdEl, raw);
+      segment.renderedUpTo = cut;
+    } else if (cut !== segment.renderedUpTo) {
       segment.mdEl.innerHTML = renderMarkdown(raw.slice(0, cut));
       segment.renderedUpTo = cut;
     }
@@ -2176,6 +2271,7 @@
   function revealRosterTarget(row) {
     if (!row) return;
     const target = row.target;
+    showEarlierUntil(target);
     if (target.tagName === 'DETAILS') target.open = true;
     if (row.details) row.details.open = true;
     follow = false;
@@ -2596,7 +2692,9 @@
         // Not fatal: the chat keeps running on its machine and the app
         // reattaches on its own (TRU-152).
         endSegment(); endThinking();
-        if (!linkNote || !linkNote.isConnected) {
+        // A notice in a detached chunk still shows (TRU-157): only a
+        // removed one is replaced.
+        if (!linkNote || !linkNote.parentNode) {
           linkNote = el('div', 'note warn');
           append(linkNote);
         }
@@ -2733,6 +2831,9 @@
     } finally {
       replaying = false;
     }
+    // Only the newest blocks go into layout; the rest wait detached.
+    trimWindow();
+    renderPendingMarkdown(messagesEl);
     if (busy) {
       // Turn still running: keep the label, restart a live clock.
       activity.timed = false;
@@ -2751,6 +2852,7 @@
 
   window.__resetConversation = function () {
     messagesEl.innerHTML = '';
+    resetWindow();
     segment = null; thinking = null;
     items.clear(); pending.clear(); subTools.clear(); queued.clear(); prompts.clear();
     resetDelegations();
