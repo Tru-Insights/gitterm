@@ -13,10 +13,109 @@ use super::protocol::v5::HandshakeRequest;
 use super::protocol::v5::ListDirRequest;
 use super::protocol::v5::ReadFileRequest;
 use super::protocol::v5::{
-    terminal_input, AttachRequest, ChatEntry, ChatPreviewRequest, EnvVar, ListChatsRequest,
-    ListSessionsRequest, Resize, StartSessionRequest, StopSessionRequest, TerminalInput,
+    claude_chat_client_message, terminal_input, AttachRequest, ChatEntry, ChatPreviewRequest,
+    ClaudeChatAttach, ClaudeChatClientMessage, ClaudeChatHistoryRequest, ClaudeChatState,
+    CreatePhonePairingRequest, EnvVar, ListChatsRequest, ListClaudeChatsRequest, ListPhonesRequest,
+    ListSessionsRequest, Resize, RevokePhoneRequest, StartSessionRequest, StopSessionRequest,
+    TerminalInput,
 };
 use super::server::PROTOCOL_VERSION;
+
+/// The agent's side of a remote Claude chat: one harness event as JSON
+/// per item, in order (TRU-152).
+pub type ClaudeChatEventStream = std::pin::Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<String, RemoteAgentClientError>> + Send>,
+>;
+
+/// The agent's side of an attached Claude chat ("claude_chat_persistent"):
+/// `opened` first, then events with their seq.
+pub type ClaudeChatFrameStream = std::pin::Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<ClaudeChatFrame, RemoteAgentClientError>> + Send>,
+>;
+
+/// How an attached chat stream opens: a chat by id after a seq, or a start
+/// (which the agent turns into an attach when its resume id is running).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeChatOpen {
+    Chat {
+        chat_id: String,
+        after_seq: Option<u64>,
+    },
+    Start {
+        start_json: String,
+    },
+}
+
+/// The agent's answer to an attach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeChatOpened {
+    pub chat_id: String,
+    /// Joined a chat that was already running.
+    pub attached: bool,
+    /// Empty until Claude reports it.
+    pub claude_session_id: String,
+    pub head_seq: u64,
+    /// The events after the requested seq are gone: reload the history.
+    pub gap: bool,
+}
+
+/// One message of an attached chat stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeChatFrame {
+    Opened(ClaudeChatOpened),
+    /// A harness event as JSON. `seq` 0 is a notice for this stream only;
+    /// `redelivered` repeats an event the stream's position covers.
+    Event {
+        json: String,
+        seq: u64,
+        redelivered: bool,
+    },
+}
+
+/// What a running chat is doing, from `ListClaudeChats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunningClaudeChatState {
+    Idle,
+    TurnRunning,
+    AwaitingInput,
+}
+
+/// A Claude chat the agent is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningClaudeChat {
+    pub chat_id: String,
+    /// Empty until Claude reports it.
+    pub claude_session_id: String,
+    pub cwd: String,
+    pub state: RunningClaudeChatState,
+    pub created_unix_secs: u64,
+    pub last_activity_unix_secs: u64,
+    pub attached_clients: u32,
+}
+
+/// A one-time phone pairing from `CreatePhonePairing` (TRU-151).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhonePairing {
+    /// Open on the phone; the code is in its fragment.
+    pub pairing_url: String,
+    pub expires_unix_secs: u64,
+    /// The scope the phone gets ("view" or "act").
+    pub scope: String,
+    /// The same pairing, typed into the phone's home-screen app
+    /// (`XXXX-XXXX`). Empty from an agent that predates short codes.
+    pub short_code: String,
+}
+
+/// A phone paired with an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedPhoneInfo {
+    pub id: String,
+    pub name: String,
+    pub scope: String,
+    pub created_unix_secs: u64,
+    /// 0: not used since pairing.
+    pub last_seen_unix_secs: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteAgentClientConfig {
@@ -34,6 +133,8 @@ pub struct RemoteAgentHandshake {
     pub agent_version: String,
     pub protocol_version: u32,
     pub capabilities: Vec<String>,
+    /// Agent user's $HOME; empty from agents that predate the field.
+    pub home_dir: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +151,8 @@ pub struct RemoteAgentDirEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    /// False from agents that predate the field.
+    pub is_git_repo: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +266,7 @@ impl RemoteAgentBackend {
             agent_version: response.agent_version,
             protocol_version: response.protocol_version,
             capabilities: response.capabilities,
+            home_dir: response.home_dir,
         })
     }
 
@@ -207,6 +311,7 @@ impl RemoteAgentBackend {
                     name: entry.name,
                     path: entry.path,
                     is_dir: entry.is_dir,
+                    is_git_repo: entry.is_git_repo,
                 })
                 .collect(),
         })
@@ -480,28 +585,7 @@ impl RemoteAgentBackend {
         use tokio_stream::StreamExt;
 
         let token = resolve_token_ref(&self.config.token_ref)?;
-        // No per-request timeout: this stream is long-lived by design.
-        let endpoint = Endpoint::from_shared(self.config.endpoint.clone())
-            .map_err(|err| {
-                RemoteAgentClientError::new(format!(
-                    "invalid endpoint {}: {err}",
-                    self.config.endpoint
-                ))
-            })?
-            .connect_timeout(Duration::from_secs(5));
-        let endpoint = if self.config.endpoint.starts_with("https://") {
-            endpoint
-                .tls_config(ClientTlsConfig::new().with_enabled_roots())
-                .map_err(|err| RemoteAgentClientError::new(format!("invalid TLS config: {err}")))?
-        } else {
-            endpoint
-        };
-        let channel = endpoint.connect().await.map_err(|err| {
-            RemoteAgentClientError::new(format!(
-                "could not connect to {}: {err:?}",
-                self.config.endpoint
-            ))
-        })?;
+        let channel = connect_long_lived_channel(&self.config.endpoint).await?;
 
         let (input_tx, input_rx) = tokio::sync::mpsc::channel::<TerminalSend>(64);
         let attach = TerminalInput {
@@ -550,6 +634,258 @@ impl RemoteAgentBackend {
         });
 
         Ok((input_tx, Box::pin(output)))
+    }
+
+    /// Open a native Claude chat on the agent (TRU-152): `start_json` is
+    /// the first message, each string from `commands_json` one command
+    /// after it. Returns the agent's events as JSON, in order. Closing
+    /// `commands_json` ends the stream; an agent without
+    /// "claude_chat_persistent" then stops its process, one with it only
+    /// detaches. The connection has no request timeout; it lives as long
+    /// as the chat.
+    pub async fn claude_chat(
+        &self,
+        start_json: String,
+        commands_json: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Result<ClaudeChatEventStream, RemoteAgentClientError> {
+        use tokio_stream::StreamExt;
+
+        let channel = connect_long_lived_channel(&self.config.endpoint).await?;
+        let start = ClaudeChatClientMessage {
+            message: Some(claude_chat_client_message::Message::StartJson(start_json)),
+        };
+        let outbound = tokio_stream::once(start).chain(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(commands_json).map(|json| {
+                ClaudeChatClientMessage {
+                    message: Some(claude_chat_client_message::Message::CommandJson(json)),
+                }
+            }),
+        );
+        let mut request = Request::new(outbound);
+        self.authorize(&mut request)?;
+        let stream = GitTermAgentClient::new(channel)
+            .claude_chat(request)
+            .await
+            .map_err(|err| RemoteAgentClientError::new(format!("claude_chat failed: {err:?}")))?
+            .into_inner();
+        Ok(Box::pin(stream.map(|item| {
+            item.map(|message| message.event_json)
+                .map_err(|err| RemoteAgentClientError::new(format!("claude_chat stream: {err:?}")))
+        })))
+    }
+
+    /// Attach to a Claude chat the agent owns ("claude_chat_persistent"),
+    /// or start one: `open` is the first message, each string from
+    /// `commands_json` one command after it. The stream yields `Opened`
+    /// first, then events with their seq. Closing `commands_json` (or
+    /// dropping the stream) detaches; the chat keeps running. A chat id
+    /// that is no longer running fails with `is_not_found()`.
+    pub async fn claude_chat_attach(
+        &self,
+        open: ClaudeChatOpen,
+        commands_json: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Result<ClaudeChatFrameStream, RemoteAgentClientError> {
+        use tokio_stream::StreamExt;
+
+        let channel = connect_long_lived_channel(&self.config.endpoint).await?;
+        let attach = match open {
+            ClaudeChatOpen::Chat { chat_id, after_seq } => ClaudeChatAttach {
+                chat_id,
+                after_seq,
+                start_json: String::new(),
+            },
+            ClaudeChatOpen::Start { start_json } => ClaudeChatAttach {
+                chat_id: String::new(),
+                after_seq: None,
+                start_json,
+            },
+        };
+        let first = ClaudeChatClientMessage {
+            message: Some(claude_chat_client_message::Message::Attach(attach)),
+        };
+        let outbound = tokio_stream::once(first).chain(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(commands_json).map(|json| {
+                ClaudeChatClientMessage {
+                    message: Some(claude_chat_client_message::Message::CommandJson(json)),
+                }
+            }),
+        );
+        let mut request = Request::new(outbound);
+        self.authorize(&mut request)?;
+        let stream = match GitTermAgentClient::new(channel).claude_chat(request).await {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                return Err(RemoteAgentClientError::not_found(format!(
+                    "claude_chat attach: {}",
+                    status.message()
+                )))
+            }
+            Err(err) => {
+                return Err(RemoteAgentClientError::new(format!(
+                    "claude_chat attach failed: {err:?}"
+                )))
+            }
+        };
+        Ok(Box::pin(stream.map(|item| {
+            item.map(|message| match message.opened {
+                Some(opened) => ClaudeChatFrame::Opened(ClaudeChatOpened {
+                    chat_id: opened.chat_id,
+                    attached: opened.attached,
+                    claude_session_id: opened.claude_session_id,
+                    head_seq: opened.head_seq,
+                    gap: opened.gap,
+                }),
+                None => ClaudeChatFrame::Event {
+                    json: message.event_json,
+                    seq: message.seq,
+                    redelivered: message.redelivered,
+                },
+            })
+            .map_err(|err| RemoteAgentClientError::new(format!("claude_chat stream: {err:?}")))
+        })))
+    }
+
+    /// The Claude chats the agent is running ("claude_chat_persistent").
+    pub async fn list_claude_chats(
+        &self,
+    ) -> Result<Vec<RunningClaudeChat>, RemoteAgentClientError> {
+        let mut request = Request::new(ListClaudeChatsRequest {});
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .list_claude_chats(request)
+            .await
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!("list_claude_chats failed: {err:?}"))
+            })?
+            .into_inner();
+        response
+            .chats
+            .into_iter()
+            .map(|chat| {
+                let state = match ClaudeChatState::try_from(chat.state) {
+                    Ok(ClaudeChatState::Idle) => RunningClaudeChatState::Idle,
+                    Ok(ClaudeChatState::TurnRunning) => RunningClaudeChatState::TurnRunning,
+                    Ok(ClaudeChatState::AwaitingInput) => RunningClaudeChatState::AwaitingInput,
+                    Ok(ClaudeChatState::Unspecified) | Err(_) => {
+                        return Err(RemoteAgentClientError::new(format!(
+                            "list_claude_chats: chat {} has unknown state {}",
+                            chat.chat_id, chat.state
+                        )))
+                    }
+                };
+                Ok(RunningClaudeChat {
+                    chat_id: chat.chat_id,
+                    claude_session_id: chat.claude_session_id,
+                    cwd: chat.cwd,
+                    state,
+                    created_unix_secs: chat.created_unix_secs,
+                    last_activity_unix_secs: chat.last_activity_unix_secs,
+                    attached_clients: chat.attached_clients,
+                })
+            })
+            .collect()
+    }
+
+    /// A one-time pairing for a phone named `device_name` (capability
+    /// "phone").
+    pub async fn create_phone_pairing(
+        &self,
+        device_name: String,
+        scope: String,
+    ) -> Result<PhonePairing, RemoteAgentClientError> {
+        let mut request = Request::new(CreatePhonePairingRequest { device_name, scope });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .create_phone_pairing(request)
+            .await
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!(
+                    "create_phone_pairing failed: {}",
+                    err.message()
+                ))
+            })?
+            .into_inner();
+        // The long code itself is only ever used inside the URL.
+        Ok(PhonePairing {
+            pairing_url: response.pairing_url,
+            expires_unix_secs: response.expires_unix_secs,
+            scope: response.scope,
+            short_code: response.short_code,
+        })
+    }
+
+    /// The phones paired with the agent (capability "phone").
+    pub async fn list_phones(&self) -> Result<Vec<PairedPhoneInfo>, RemoteAgentClientError> {
+        let mut request = Request::new(ListPhonesRequest {});
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .list_phones(request)
+            .await
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!("list_phones failed: {}", err.message()))
+            })?
+            .into_inner();
+        Ok(response
+            .phones
+            .into_iter()
+            .map(|phone| PairedPhoneInfo {
+                id: phone.id,
+                name: phone.name,
+                scope: phone.scope,
+                created_unix_secs: phone.created_unix_secs,
+                last_seen_unix_secs: phone.last_seen_unix_secs,
+            })
+            .collect())
+    }
+
+    /// Revoke a paired phone; `false` when the agent had no phone `id`.
+    pub async fn revoke_phone(&self, id: String) -> Result<bool, RemoteAgentClientError> {
+        let mut request = Request::new(RevokePhoneRequest { id });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = GitTermAgentClient::new(channel)
+            .revoke_phone(request)
+            .await
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!("revoke_phone failed: {}", err.message()))
+            })?
+            .into_inner();
+        Ok(response.revoked)
+    }
+
+    /// A Claude session's timeline from its transcript on the agent's
+    /// machine. `None` when the agent has no transcript for the id.
+    pub async fn claude_chat_history(
+        &self,
+        session_id: String,
+    ) -> Result<Option<Vec<crate::harness::transcript::TimedEntry>>, RemoteAgentClientError> {
+        let mut request = Request::new(ClaudeChatHistoryRequest {
+            session_id: session_id.clone(),
+        });
+        self.authorize(&mut request)?;
+        let channel = connect_channel(&self.config.endpoint).await?;
+        let response = match GitTermAgentClient::new(channel)
+            .claude_chat_history(request)
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(RemoteAgentClientError::new(format!(
+                    "claude_chat_history failed: {err:?}"
+                )))
+            }
+        };
+        serde_json::from_str(&response.timeline_json)
+            .map(Some)
+            .map_err(|err| {
+                RemoteAgentClientError::new(format!(
+                    "claude_chat_history for {session_id}: undecodable timeline: {err}"
+                ))
+            })
     }
 
     fn authorize<T>(&self, request: &mut Request<T>) -> Result<(), RemoteAgentClientError> {
@@ -608,6 +944,29 @@ async fn connect_channel(endpoint: &str) -> Result<Channel, RemoteAgentClientErr
             })?;
     }
 
+    builder.connect().await.map_err(|err| {
+        RemoteAgentClientError::new(format!("could not connect to {endpoint}: {err:?}"))
+    })
+}
+
+/// A channel for a stream that lives as long as its session or chat: a
+/// connect timeout but no per-request timeout. HTTP/2 pings, even while
+/// idle, notice a connection that died silently (the Mac slept, the
+/// network changed) so a chat can reconnect.
+async fn connect_long_lived_channel(endpoint: &str) -> Result<Channel, RemoteAgentClientError> {
+    let builder = Endpoint::from_shared(endpoint.to_string())
+        .map_err(|err| RemoteAgentClientError::new(format!("invalid endpoint {endpoint}: {err}")))?
+        .connect_timeout(Duration::from_secs(5))
+        .http2_keep_alive_interval(Duration::from_secs(20))
+        .keep_alive_timeout(Duration::from_secs(20))
+        .keep_alive_while_idle(true);
+    let builder = if endpoint.starts_with("https://") {
+        builder
+            .tls_config(ClientTlsConfig::new().with_enabled_roots())
+            .map_err(|err| RemoteAgentClientError::new(format!("invalid TLS config: {err}")))?
+    } else {
+        builder
+    };
     builder.connect().await.map_err(|err| {
         RemoteAgentClientError::new(format!("could not connect to {endpoint}: {err:?}"))
     })
@@ -716,13 +1075,28 @@ fn read_keychain_token(_keychain_ref: &str) -> Result<String, RemoteAgentClientE
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAgentClientError {
     message: String,
+    not_found: bool,
 }
 
 impl RemoteAgentClientError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            not_found: false,
         }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            not_found: true,
+        }
+    }
+
+    /// The agent answered, and what was asked for does not exist there
+    /// (as opposed to a transport or auth failure).
+    pub fn is_not_found(&self) -> bool {
+        self.not_found
     }
 }
 

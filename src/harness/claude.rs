@@ -7,7 +7,7 @@
 //! `tests/fixtures/claude/`. `ClaudeSession` owns the process on a
 //! dedicated thread and maps `HarnessCommand`s onto stdin frames.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,11 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use super::{
-    HarnessCommand, HarnessEvent, ItemKind, RuntimeDecision, RuntimeRequestKind, TurnStatus,
+    HarnessCommand, HarnessEvent, ItemKind, MessageState, RuntimeDecision, RuntimeRequestKind,
+    TurnStatus, UserPrompt,
+};
+use crate::agentd::client::{
+    ClaudeChatFrame, ClaudeChatOpen, ClaudeChatOpened, RemoteAgentBackend, RemoteAgentClientConfig,
 };
 
 /// The tool whose `can_use_tool` request is a question for the user rather
@@ -56,6 +60,19 @@ pub enum HostRequest {
     },
     Interrupt,
     SetPermissionMode(String),
+    /// `set_model`; its success reply carries no payload.
+    SetModel(String),
+    /// `apply_flag_settings {effortLevel}`. Its success reply carries no
+    /// payload and the CLI accepts unknown levels without applying them, so
+    /// the session confirms with a `ConfirmEffort` read afterwards.
+    SetEffort(Option<String>),
+    /// `get_settings`, sent after a successful `SetEffort` to read back what
+    /// the session's flag settings now hold.
+    ConfirmEffort(Option<String>),
+    /// `cancel_async_message {message_uuid}`: withdraw a queued user
+    /// message. The reply is `{cancelled: bool}`; a successful cancel also
+    /// arrives as a `command_lifecycle` `cancelled` frame.
+    WithdrawMessage(String),
 }
 
 /// One thing the parser found in a CLI stdout line.
@@ -111,6 +128,22 @@ pub struct ClaudeFrameParser {
     /// Content block index -> tool_use id, for the current message.
     tool_blocks: HashMap<u64, String>,
     host_requests: HashMap<String, HostRequest>,
+    /// Agent calls whose subagent reported `task_started` and has not
+    /// finished -> whether the subagent has sent text since its last tool
+    /// call. Background Bash commands are tasks too; only subagents'
+    /// completions become `SubagentEvent`s.
+    agent_tasks: HashMap<String, bool>,
+    /// Subagent task id -> the Agent call it runs under. A finished
+    /// background subagent resumed with `SendMessage` reports its
+    /// `task_started` and `task_notification` under the SendMessage call's
+    /// id, while its own frames keep the Agent call as their parent.
+    agent_roots: HashMap<String, String>,
+    /// `SendMessage` calls seen in this stream; one can resume a subagent.
+    resume_calls: HashSet<String>,
+    /// Resumed subagents whose Agent call ran before this process, so it is
+    /// not in `agent_roots`. Their start waits for their first frame, which
+    /// names the Agent call.
+    pending_resumes: HashSet<String>,
 }
 
 impl ClaudeFrameParser {
@@ -132,10 +165,31 @@ impl ClaudeFrameParser {
             return vec![ParsedFrame::Unparsed(line.to_string())];
         };
         let str_at = |p: &str| v.pointer(p).and_then(Value::as_str);
-        // Subagent traffic (Task tool) carries a parent tool_use id. The
-        // chat shows the parent tool call only; its internals are not items
-        // of this turn and their block indexes would collide with ours.
-        let from_subagent = v.get("parent_tool_use_id").is_some_and(|p| !p.is_null());
+        // Subagent traffic (Agent tool) carries the parent's tool_use id.
+        // It is wrapped in `SubagentEvent`s so the chat nests it under the
+        // parent's tool card instead of mixing it into this turn.
+        if let Some(parent) = v.get("parent_tool_use_id").and_then(Value::as_str) {
+            let mut frames = parse_subagent_frame(parent, &v);
+            if let Some(task) = v.get("agent_id").and_then(Value::as_str) {
+                if self.pending_resumes.remove(task) {
+                    self.agent_roots
+                        .insert(task.to_string(), parent.to_string());
+                    frames.insert(0, self.start_subagent(parent));
+                }
+            }
+            if let Some(text_seen) = self.agent_tasks.get_mut(parent) {
+                for frame in &frames {
+                    if let ParsedFrame::Event(HarnessEvent::SubagentEvent { event, .. }) = frame {
+                        match **event {
+                            HarnessEvent::TextDelta(_) => *text_seen = true,
+                            HarnessEvent::ItemStarted { .. } => *text_seen = false,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return frames;
+        }
         match str_at("/type").unwrap_or("") {
             "system" if str_at("/subtype") == Some("init") => {
                 vec![ParsedFrame::Event(HarnessEvent::TurnStarted {
@@ -143,15 +197,93 @@ impl ClaudeFrameParser {
                     model: str_at("/model").map(str::to_string),
                 })]
             }
-            "stream_event" if !from_subagent => self.parse_stream_event(&v["event"]),
+            // Subagent lifecycle; `tool_use_id` is the parent's Agent call.
+            // A resumed subagent's start and end carry the SendMessage call's
+            // id; both are reported under the Agent call it runs under.
+            "system" if str_at("/subtype") == Some("task_started") => {
+                let Some(tool_use_id) = str_at("/tool_use_id") else {
+                    return Vec::new();
+                };
+                if str_at("/task_type") != Some("local_agent") {
+                    return Vec::new();
+                }
+                let task = str_at("/task_id");
+                let resume = self.resume_calls.remove(tool_use_id);
+                let root = match task.and_then(|t| self.agent_roots.get(t)) {
+                    Some(root) => root.clone(),
+                    None if resume => {
+                        if let Some(task) = task {
+                            self.pending_resumes.insert(task.to_string());
+                        }
+                        return Vec::new();
+                    }
+                    None => {
+                        if let Some(task) = task {
+                            self.agent_roots
+                                .insert(task.to_string(), tool_use_id.to_string());
+                        }
+                        tool_use_id.to_string()
+                    }
+                };
+                vec![self.start_subagent(&root)]
+            }
+            "system" if str_at("/subtype") == Some("task_notification") => {
+                let Some(tool_use_id) = str_at("/tool_use_id") else {
+                    return Vec::new();
+                };
+                let task = str_at("/task_id");
+                if let Some(task) = task {
+                    self.pending_resumes.remove(task);
+                }
+                let parent = match task.and_then(|t| self.agent_roots.get(t)) {
+                    Some(root) => root.clone(),
+                    None => tool_use_id.to_string(),
+                };
+                let parent = parent.as_str();
+                let Some(text_seen) = self.agent_tasks.remove(parent) else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                // A foreground subagent's final message reaches the parent
+                // only as the Agent tool result; the notification's summary
+                // is that message, so it stands in as the subagent's text.
+                match str_at("/summary") {
+                    Some(summary) if !text_seen && !summary.is_empty() => out.push(subagent_event(
+                        parent,
+                        HarnessEvent::TextDelta(summary.to_string()),
+                    )),
+                    _ => {}
+                }
+                out.push(subagent_event(parent, task_completion(&v)));
+                out
+            }
+            "stream_event" => self.parse_stream_event(&v["event"]),
             // Slash-command replies (`/model sonnet`, `/effort high`, ...) are
             // synthetic assistant messages with no stream deltas; surface
             // their text or the turn looks like it produced nothing.
-            "assistant" if !from_subagent && str_at("/message/model") == Some("<synthetic>") => {
+            "assistant" if str_at("/message/model") == Some("<synthetic>") => {
                 parse_synthetic_assistant(&v)
             }
-            "user" if !from_subagent => parse_tool_results(&v),
+            "user" => parse_tool_results(&v),
             "result" => vec![ParsedFrame::Event(parse_result(&v))],
+            // Queue state of a user message sent with a `uuid` (CLI
+            // capability `msg_lifecycle_v1`). Other states are ignored.
+            "command_lifecycle" => {
+                let state = match str_at("/state") {
+                    Some("queued") => MessageState::Queued,
+                    Some("started") => MessageState::Started,
+                    Some("completed") => MessageState::Completed,
+                    Some("cancelled") => MessageState::Cancelled,
+                    _ => return Vec::new(),
+                };
+                match str_at("/command_uuid") {
+                    Some(id) => vec![ParsedFrame::Event(HarnessEvent::MessageLifecycle {
+                        id: id.to_string(),
+                        state,
+                    })],
+                    None => Vec::new(),
+                }
+            }
             "control_request" => parse_control_request(&v),
             "control_response" => self.parse_control_response(&v),
             "control_cancel_request" => match str_at("/request_id") {
@@ -164,6 +296,18 @@ impl ClaudeFrameParser {
             // session_state_changed, rate_limit_event, keep_alive, ...
             _ => Vec::new(),
         }
+    }
+
+    /// The start of a run of the subagent under Agent call `parent`.
+    fn start_subagent(&mut self, parent: &str) -> ParsedFrame {
+        self.agent_tasks.insert(parent.to_string(), false);
+        subagent_event(
+            parent,
+            HarnessEvent::TurnStarted {
+                session_id: None,
+                model: None,
+            },
+        )
     }
 
     fn parse_stream_event(&mut self, event: &Value) -> Vec<ParsedFrame> {
@@ -184,6 +328,9 @@ impl ClaudeFrameParser {
                             )));
                         };
                         self.tool_blocks.insert(index, id.to_string());
+                        if block["name"] == "SendMessage" {
+                            self.resume_calls.insert(id.to_string());
+                        }
                         ev(HarnessEvent::ItemStarted {
                             id: id.to_string(),
                             kind: ItemKind::ToolCall {
@@ -253,6 +400,7 @@ impl ClaudeFrameParser {
                     session_id: resume.clone(),
                     permission_mode: body["current_permission_mode"].as_str().map(str::to_string),
                     models: body["models"].as_array().cloned().unwrap_or_default(),
+                    modes: Vec::new(),
                 }));
             }
             (HostRequest::Initialize { .. }, Err(e)) => out.push(ParsedFrame::Event(
@@ -272,7 +420,41 @@ impl ClaudeFrameParser {
                     mode,
                 )));
             }
+            (HostRequest::SetModel(model), Err(e)) => out.push(ParsedFrame::Event(
+                HarnessEvent::Error(format!("Claude rejected model {model:?}: {e}")),
+            )),
+            (HostRequest::SetModel(model), Ok(_)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::ModelChanged(
+                    model.clone(),
+                )));
+            }
+            (HostRequest::SetEffort(effort), Err(e))
+            | (HostRequest::ConfirmEffort(effort), Err(e)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::Error(format!(
+                    "Claude did not change the effort to {}: {e}",
+                    effort.as_deref().unwrap_or("auto")
+                ))))
+            }
+            // The session follows up with `ConfirmEffort`.
+            (HostRequest::SetEffort(_), Ok(_)) => {}
+            (HostRequest::ConfirmEffort(requested), Ok(body)) => {
+                out.push(ParsedFrame::Event(confirm_effort(requested, body)));
+            }
             (HostRequest::Interrupt, Ok(_)) => {}
+            // A cancel that took is reported by its `cancelled` lifecycle.
+            (HostRequest::WithdrawMessage(_), Ok(body)) if body["cancelled"] == true => {}
+            (HostRequest::WithdrawMessage(id), Ok(_)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::MessageWithdrawRefused {
+                    id: id.clone(),
+                    reason: "Claude had already picked it up".into(),
+                }))
+            }
+            (HostRequest::WithdrawMessage(id), Err(e)) => {
+                out.push(ParsedFrame::Event(HarnessEvent::MessageWithdrawRefused {
+                    id: id.clone(),
+                    reason: format!("Claude refused: {e}"),
+                }))
+            }
         }
         out.push(ParsedFrame::HostRequestDone {
             request_id: request_id.to_string(),
@@ -280,6 +462,100 @@ impl ClaudeFrameParser {
             result,
         });
         out
+    }
+}
+
+/// Reads a `get_settings` reply after `apply_flag_settings {effortLevel}`.
+/// The flag-settings source holds the session's pinned level (absent once it
+/// is reset); `applied.effort` is what the model actually runs at.
+fn confirm_effort(requested: &Option<String>, body: &Value) -> HarnessEvent {
+    let pinned = body["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|source| source["source"] == "flagSettings")
+        .and_then(|source| source["settings"]["effortLevel"].as_str())
+        .map(str::to_string);
+    if &pinned != requested {
+        return HarnessEvent::Error(format!(
+            "Claude did not apply effort {}: its session settings hold {}",
+            requested.as_deref().unwrap_or("auto"),
+            pinned.as_deref().unwrap_or("no effort level")
+        ));
+    }
+    HarnessEvent::EffortChanged {
+        effort: pinned,
+        applied: body["applied"]["effort"].as_str().map(str::to_string),
+    }
+}
+
+/// Wraps one normalized event as activity of the subagent whose Agent call
+/// is `parent`.
+fn subagent_event(parent: &str, event: HarnessEvent) -> ParsedFrame {
+    ParsedFrame::Event(HarnessEvent::SubagentEvent {
+        parent_tool_use_id: parent.to_string(),
+        event: Box::new(event),
+    })
+}
+
+/// A frame the subagent produced. The CLI sends subagents' turns as whole
+/// `assistant` messages (one content block each) and `user` tool results;
+/// any subagent `stream_event`s would duplicate those, so they are dropped,
+/// which also keeps their block indexes away from the parent's.
+fn parse_subagent_frame(parent: &str, v: &Value) -> Vec<ParsedFrame> {
+    match v["type"].as_str().unwrap_or("") {
+        "assistant" => v
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|block| {
+                let event = match block["type"].as_str()? {
+                    "text" => HarnessEvent::TextDelta(block["text"].as_str()?.to_string()),
+                    "thinking" => {
+                        HarnessEvent::ThinkingDelta(block["thinking"].as_str()?.to_string())
+                    }
+                    "tool_use" => HarnessEvent::ItemStarted {
+                        id: block["id"].as_str()?.to_string(),
+                        kind: ItemKind::ToolCall {
+                            name: block["name"].as_str().unwrap_or("").to_string(),
+                            input: block.get("input").cloned().unwrap_or(Value::Null),
+                        },
+                    },
+                    _ => return None,
+                };
+                Some(subagent_event(parent, event))
+            })
+            .collect(),
+        "user" => parse_tool_results(v)
+            .into_iter()
+            .map(|frame| match frame {
+                ParsedFrame::Event(event) => subagent_event(parent, event),
+                other => other,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A subagent's `system/task_notification` as the end of its work. For a
+/// background agent this, not the Agent tool result, is when it is done.
+fn task_completion(v: &Value) -> HarnessEvent {
+    let status = match v["status"].as_str().unwrap_or("") {
+        "completed" => TurnStatus::Completed,
+        "failed" | "error" => TurnStatus::Failed(
+            v["summary"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("the subagent failed")
+                .to_string(),
+        ),
+        _ => TurnStatus::Interrupted,
+    };
+    HarnessEvent::TurnCompleted {
+        status,
+        usage: v.get("usage").cloned().unwrap_or(Value::Null),
+        cost_usd: None,
     }
 }
 
@@ -438,14 +714,34 @@ enum ControlResponseBody {
     Error { request_id: String, error: String },
 }
 
-fn user_message_frame(text: &str) -> String {
-    json!({
+/// The stream-json `user` line for one prompt. Without images the content
+/// is a single text block (the shape every fixture records). With images it
+/// is the text block first (left out when the text is empty, since the API
+/// rejects empty text blocks) followed by one `image` block per attachment:
+/// `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`.
+/// A prompt with an `id` carries it as the frame's `uuid`, which turns on
+/// the CLI's `command_lifecycle` reports for it.
+pub fn user_message_frame(prompt: &UserPrompt) -> String {
+    let mut content = Vec::with_capacity(1 + prompt.images.len());
+    if prompt.images.is_empty() || !prompt.text.is_empty() {
+        content.push(json!({"type": "text", "text": prompt.text}));
+    }
+    for image in &prompt.images {
+        content.push(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": image.media_type, "data": image.data},
+        }));
+    }
+    let mut frame = json!({
         "type": "user",
         "session_id": "",
-        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        "message": {"role": "user", "content": content},
         "parent_tool_use_id": null
-    })
-    .to_string()
+    });
+    if let Some(id) = &prompt.id {
+        frame["uuid"] = json!(id);
+    }
+    frame.to_string()
 }
 
 fn control_request_frame(request_id: &str, request: Value) -> String {
@@ -554,6 +850,9 @@ pub struct ClaudeSessionConfig {
     pub wire_log_dir: Option<PathBuf>,
     /// GitTerm MCP servers to attach (task and browser controls).
     pub mcp_servers: Vec<ClaudeMcpServer>,
+    /// Attach Claude in Chrome (`--chrome`). Headless Claude does not
+    /// apply the CLI's own default for it.
+    pub chrome: bool,
 }
 
 impl ClaudeSessionConfig {
@@ -571,6 +870,9 @@ impl ClaudeSessionConfig {
         .iter()
         .map(|s| s.to_string())
         .collect();
+        if self.chrome {
+            args.push("--chrome".into());
+        }
         if let Some(model) = &self.model {
             args.push("--model".into());
             args.push(model.clone());
@@ -612,7 +914,7 @@ fn extra_bin_dirs() -> Vec<PathBuf> {
 }
 
 /// The PATH for the child: the inherited PATH plus the usual install dirs.
-fn child_path() -> OsString {
+pub(super) fn child_path() -> OsString {
     let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -638,9 +940,12 @@ pub fn resolve_claude_program() -> Result<PathBuf, String> {
         })
 }
 
-/// Handle to a running Claude session. Dropping it shuts the process down.
+/// Handle to a running Claude session. Dropping a local one shuts the
+/// process down; dropping a remote one on an agent that owns its chats
+/// only detaches (send `Shutdown` first to stop it).
 pub struct ClaudeSession {
     commands: mpsc::UnboundedSender<HarnessCommand>,
+    shutdown_on_drop: bool,
 }
 
 impl ClaudeSession {
@@ -670,7 +975,13 @@ impl ClaudeSession {
         if let Err(e) = spawn_result {
             eprintln!("[claude-harness] could not spawn session thread: {e}");
         }
-        (Self { commands: cmd_tx }, ev_rx)
+        (
+            Self {
+                commands: cmd_tx,
+                shutdown_on_drop: true,
+            },
+            ev_rx,
+        )
     }
 
     pub fn send(&self, command: HarnessCommand) -> Result<(), String> {
@@ -682,7 +993,694 @@ impl ClaudeSession {
 
 impl Drop for ClaudeSession {
     fn drop(&mut self) {
-        let _ = self.commands.send(HarnessCommand::Shutdown);
+        if self.shutdown_on_drop {
+            let _ = self.commands.send(HarnessCommand::Shutdown);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote session (TRU-152)
+// ---------------------------------------------------------------------------
+
+/// The first message of a remote chat stream: the session config minus
+/// what cannot cross machines. MCP servers point at this Mac's GitTerm and
+/// the wire log is a local directory, so neither travels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteClaudeChatStart {
+    /// A directory on the agent's machine.
+    pub cwd: String,
+    pub model: Option<String>,
+    pub permission_mode: String,
+    pub effort: Option<String>,
+    pub resume: Option<String>,
+    pub chrome: bool,
+}
+
+impl RemoteClaudeChatStart {
+    /// The remote start for a desktop config. A config carrying MCP servers
+    /// is refused rather than started without them.
+    pub fn from_config(config: &ClaudeSessionConfig) -> Result<Self, String> {
+        if !config.mcp_servers.is_empty() {
+            return Err(format!(
+                "{} MCP server(s) cannot be attached to a chat on a remote machine",
+                config.mcp_servers.len()
+            ));
+        }
+        if let Some(dir) = &config.wire_log_dir {
+            remote_log(&format!(
+                "wire log {} is local-only; a remote chat does not keep one",
+                dir.display()
+            ));
+        }
+        Ok(Self {
+            cwd: config.cwd.to_string_lossy().into_owned(),
+            model: config.model.clone(),
+            permission_mode: config.permission_mode.clone(),
+            effort: config.effort.clone(),
+            resume: config.resume.clone(),
+            chrome: config.chrome,
+        })
+    }
+
+    /// The agent side's session config, run in `cwd` (the validated,
+    /// canonical form of `self.cwd`).
+    pub fn into_config(self, cwd: PathBuf) -> ClaudeSessionConfig {
+        ClaudeSessionConfig {
+            cwd,
+            model: self.model,
+            permission_mode: self.permission_mode,
+            effort: self.effort,
+            resume: self.resume,
+            wire_log_dir: None,
+            mcp_servers: Vec::new(),
+            chrome: self.chrome,
+        }
+    }
+}
+
+impl ClaudeSession {
+    /// Start `claude` on a remote machine through its GitTerm agent's
+    /// `ClaudeChat` stream, or attach to the chat already running there
+    /// for `config.resume`. Same handle as `spawn`: commands go out over
+    /// the stream and events come back on the channel.
+    ///
+    /// On an agent that owns its chats ("claude_chat_persistent") the chat
+    /// outlives the connection: a lost connection is retried with backoff
+    /// (capped at 30 s) for as long as the handle lives, resuming after the
+    /// last event seen, and shows as `RemoteDisconnected` then
+    /// `RemoteReconnected` (with `history_gap` when events were missed).
+    /// Dropping the handle detaches and leaves the chat running; send
+    /// `Shutdown` first to stop it.
+    ///
+    /// On an older agent the process lives as long as the stream: dropping
+    /// the handle stops it, and a lost connection arrives as `Error`
+    /// followed by `ProcessExited { code: None }`. Either way, failing to
+    /// reach the agent at all does too.
+    pub fn spawn_remote(
+        client: RemoteAgentClientConfig,
+        config: ClaudeSessionConfig,
+    ) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
+        Self::remote(client, config, None)
+    }
+
+    /// Attach to chat `chat_id`, which `ListClaudeChats` reported running
+    /// on an agent that owns its chats, without replay (the tab reads the
+    /// transcript). Never starts a process: a chat that has stopped since
+    /// arrives as `Error` then `ProcessExited { code: None }`, and the next
+    /// message starts one as usual. `config` is the tab's own, for the
+    /// start that follows such an exit. Otherwise as `spawn_remote`.
+    pub fn attach_remote(
+        client: RemoteAgentClientConfig,
+        config: ClaudeSessionConfig,
+        chat_id: String,
+    ) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
+        Self::remote(client, config, Some(chat_id))
+    }
+
+    fn remote(
+        client: RemoteAgentClientConfig,
+        config: ClaudeSessionConfig,
+        chat_id: Option<String>,
+    ) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("claude-remote-session".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ev_tx.send(HarnessEvent::Error(format!(
+                            "could not start the remote Claude session runtime: {e}"
+                        )));
+                        let _ = ev_tx.send(HarnessEvent::ProcessExited { code: None });
+                        return;
+                    }
+                };
+                rt.block_on(run_remote_session(client, config, chat_id, cmd_rx, ev_tx));
+            });
+        if let Err(e) = spawn_result {
+            remote_log(&format!("could not spawn remote session thread: {e}"));
+        }
+        // An older agent stops the process when the stream closes, which
+        // dropping the handle does; a newer one keeps it running.
+        (
+            Self {
+                commands: cmd_tx,
+                shutdown_on_drop: false,
+            },
+            ev_rx,
+        )
+    }
+}
+
+fn remote_log(msg: &str) {
+    eprintln!("[remote-chat] {msg}");
+}
+
+/// First wait before reconnecting a remote chat; doubles per failure.
+const RECONNECT_FIRST_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+/// How long a dropped handle keeps reconnecting to deliver a `Shutdown`
+/// the connection lost.
+const SHUTDOWN_DELIVERY_WINDOW: Duration = Duration::from_secs(15);
+
+/// Relay one remote chat: commands out as JSON, events back from JSON.
+/// Picks the agent's protocol from its handshake. `chat_id`: attach to
+/// that running chat instead of starting (or attaching by resume id).
+async fn run_remote_session(
+    client: RemoteAgentClientConfig,
+    config: ClaudeSessionConfig,
+    chat_id: Option<String>,
+    commands: mpsc::UnboundedReceiver<HarnessCommand>,
+    events: mpsc::UnboundedSender<HarnessEvent>,
+) {
+    let remote = format!("{} ({})", client.name, client.endpoint);
+    let fail = |msg: String| {
+        remote_log(&msg);
+        let _ = events.send(HarnessEvent::Error(msg));
+        let _ = events.send(HarnessEvent::ProcessExited { code: None });
+    };
+    let start = match RemoteClaudeChatStart::from_config(&config) {
+        Ok(start) => start,
+        Err(e) => return fail(format!("could not start Claude on {remote}: {e}")),
+    };
+    let start_json = match serde_json::to_string(&start) {
+        Ok(json) => json,
+        Err(e) => return fail(format!("could not encode the start for {remote}: {e}")),
+    };
+    remote_log(&format!(
+        "start on {remote}: cwd {} model {:?} mode {} resume {:?}",
+        start.cwd, start.model, start.permission_mode, start.resume
+    ));
+    let machine = client.name.clone();
+    let backend = RemoteAgentBackend::new(client);
+    let persistent = match backend.handshake().await {
+        Ok(handshake) => handshake
+            .capabilities
+            .iter()
+            .any(|c| c == crate::agentd::server::CLAUDE_CHAT_PERSISTENT_CAPABILITY),
+        Err(e) => return fail(format!("could not reach {remote}: {e}")),
+    };
+    if persistent {
+        RemoteChatLink {
+            backend,
+            machine,
+            remote,
+            start_json,
+            commands,
+            events,
+            chat_id,
+            attached_once: false,
+            last_seq: 0,
+            replay_only: false,
+            open_requests: std::collections::HashSet::new(),
+            queued: VecDeque::new(),
+            handle_dropped: false,
+            shutdown_requested: false,
+            disconnected: false,
+            backoff: RECONNECT_FIRST_DELAY,
+        }
+        .run()
+        .await;
+    } else if let Some(chat_id) = chat_id {
+        fail(format!(
+            "cannot attach to chat {chat_id}: {remote} predates claude_chat_persistent"
+        ));
+    } else {
+        remote_log(&format!(
+            "{remote} predates claude_chat_persistent; the chat lives as long as this connection"
+        ));
+        run_legacy_remote_session(backend, remote, start_json, commands, events).await;
+    }
+}
+
+/// How one attached stream of a persistent remote chat ended.
+enum StreamEnd {
+    /// The chat's process exited; its exit was forwarded.
+    Exited,
+    /// The handle was dropped and the agent closed the stream: detached.
+    Detached,
+    /// The tab stopped listening.
+    UiGone,
+    /// The connection failed; reconnect.
+    Lost(String),
+}
+
+/// A remote chat on an agent that owns its chats: attach, relay, and on a
+/// lost connection reattach after the last seq seen, for as long as the
+/// handle lives.
+struct RemoteChatLink {
+    backend: RemoteAgentBackend,
+    /// The machine's display name, for the reconnect notice.
+    machine: String,
+    /// Name and endpoint, for logs.
+    remote: String,
+    start_json: String,
+    commands: mpsc::UnboundedReceiver<HarnessCommand>,
+    events: mpsc::UnboundedSender<HarnessEvent>,
+    /// The chat: given when attaching to a listed one, otherwise known
+    /// once the agent has answered the first start.
+    chat_id: Option<String>,
+    /// The agent has answered an attach on this link; later opens resume
+    /// after `last_seq`.
+    attached_once: bool,
+    /// The last sequenced event forwarded to the tab.
+    last_seq: u64,
+    /// The current stream resumed without a gap: the tab already has every
+    /// redelivered event except, possibly, a runtime request.
+    replay_only: bool,
+    /// Runtime requests forwarded and not yet resolved, so a redelivered
+    /// one the tab is already showing is not shown twice.
+    open_requests: std::collections::HashSet<String>,
+    /// Commands not yet handed to a stream (sent while connecting).
+    queued: VecDeque<HarnessCommand>,
+    handle_dropped: bool,
+    shutdown_requested: bool,
+    /// A `RemoteDisconnected` notice is showing.
+    disconnected: bool,
+    backoff: Duration,
+}
+
+impl RemoteChatLink {
+    async fn run(mut self) {
+        let mut shutdown_deadline: Option<tokio::time::Instant> = None;
+        loop {
+            if self.handle_dropped {
+                if !self.shutdown_requested {
+                    remote_log(&format!("{}: handle dropped; detached", self.remote));
+                    return;
+                }
+                // The connection may have taken the Shutdown with it;
+                // sending it again is harmless.
+                if !self.queued.contains(&HarnessCommand::Shutdown) {
+                    self.queued.push_back(HarnessCommand::Shutdown);
+                }
+                let deadline = *shutdown_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + SHUTDOWN_DELIVERY_WINDOW);
+                if tokio::time::Instant::now() >= deadline {
+                    remote_log(&format!(
+                        "{}: could not deliver Shutdown within {}s; the chat keeps running there until its idle stop",
+                        self.remote,
+                        SHUTDOWN_DELIVERY_WINDOW.as_secs()
+                    ));
+                    return;
+                }
+            }
+            let open = match &self.chat_id {
+                None => ClaudeChatOpen::Start {
+                    start_json: self.start_json.clone(),
+                },
+                Some(chat_id) => ClaudeChatOpen::Chat {
+                    chat_id: chat_id.clone(),
+                    after_seq: self.attached_once.then_some(self.last_seq),
+                },
+            };
+            let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+            let error = match self.backend.claude_chat_attach(open, out_rx).await {
+                Ok(stream) => match self.relay(stream, out_tx).await {
+                    StreamEnd::Exited | StreamEnd::Detached | StreamEnd::UiGone => return,
+                    StreamEnd::Lost(error) => error,
+                },
+                Err(e) if e.is_not_found() => {
+                    if self.handle_dropped {
+                        remote_log(&format!("{}: the chat has already stopped", self.remote));
+                        return;
+                    }
+                    let msg = format!(
+                        "The chat on {} is no longer running (stopped there, or its agent restarted): {e}",
+                        self.machine
+                    );
+                    remote_log(&msg);
+                    let _ = self.events.send(HarnessEvent::Error(msg));
+                    let _ = self.events.send(HarnessEvent::ProcessExited { code: None });
+                    return;
+                }
+                Err(e) => {
+                    if !self.attached_once {
+                        let msg = format!("could not start Claude on {}: {e}", self.remote);
+                        remote_log(&msg);
+                        let _ = self.events.send(HarnessEvent::Error(msg));
+                        let _ = self.events.send(HarnessEvent::ProcessExited { code: None });
+                        return;
+                    }
+                    e.to_string()
+                }
+            };
+            if self.handle_dropped && !self.shutdown_requested {
+                remote_log(&format!(
+                    "{}: connection lost ({error}) after the handle was dropped; detached",
+                    self.remote
+                ));
+                return;
+            }
+            remote_log(&format!(
+                "{}: connection lost ({error}); retrying in {}s",
+                self.remote,
+                self.backoff.as_secs()
+            ));
+            if !self.disconnected && !self.handle_dropped {
+                self.disconnected = true;
+                if self
+                    .events
+                    .send(HarnessEvent::RemoteDisconnected {
+                        machine: self.machine.clone(),
+                        error,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if !self.wait_to_retry().await {
+                return;
+            }
+            self.backoff = (self.backoff * 2).min(RECONNECT_MAX_DELAY);
+        }
+    }
+
+    /// Sleep out the backoff, queueing commands meanwhile. `false` when
+    /// the handle was dropped with nothing left to deliver.
+    async fn wait_to_retry(&mut self) -> bool {
+        let wake = tokio::time::Instant::now() + self.backoff;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(wake) => return true,
+                cmd = self.commands.recv(), if !self.handle_dropped => match cmd {
+                    Some(cmd) => {
+                        self.shutdown_requested |= cmd == HarnessCommand::Shutdown;
+                        self.queued.push_back(cmd);
+                    }
+                    None => {
+                        self.handle_dropped = true;
+                        if !self.shutdown_requested {
+                            remote_log(&format!(
+                                "{}: handle dropped while reconnecting; detached",
+                                self.remote
+                            ));
+                            return false;
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// Hand one command to the stream. `false` when the stream is closed.
+    fn send_command(
+        &mut self,
+        out_tx: &mpsc::UnboundedSender<String>,
+        cmd: HarnessCommand,
+    ) -> bool {
+        self.shutdown_requested |= cmd == HarnessCommand::Shutdown;
+        match serde_json::to_string(&cmd) {
+            Ok(json) => {
+                if out_tx.send(json).is_err() {
+                    // Kept for the next stream.
+                    self.queued.push_front(cmd);
+                    return false;
+                }
+                true
+            }
+            Err(e) => {
+                let msg = format!("could not encode {cmd:?} for {}: {e}", self.remote);
+                remote_log(&msg);
+                let _ = self.events.send(HarnessEvent::Error(msg));
+                true
+            }
+        }
+    }
+
+    /// Relay one attached stream until it ends.
+    async fn relay(
+        &mut self,
+        mut stream: crate::agentd::client::ClaudeChatFrameStream,
+        out_tx: mpsc::UnboundedSender<String>,
+    ) -> StreamEnd {
+        use tokio_stream::StreamExt as _;
+
+        let mut out_tx = Some(out_tx);
+        let mut opened = false;
+        let mut exited = false;
+        loop {
+            tokio::select! {
+                cmd = self.commands.recv(), if !self.handle_dropped => match cmd {
+                    Some(cmd) => match out_tx.as_ref().filter(|_| opened) {
+                        Some(tx) => {
+                            let tx = tx.clone();
+                            self.send_command(&tx, cmd);
+                        }
+                        None => {
+                            self.shutdown_requested |= cmd == HarnessCommand::Shutdown;
+                            self.queued.push_back(cmd);
+                        }
+                    },
+                    None => {
+                        // Handle dropped: closing our half detaches (after
+                        // anything queued, such as a Shutdown, goes out).
+                        self.handle_dropped = true;
+                        if opened {
+                            out_tx = None;
+                        }
+                    }
+                },
+                item = stream.next() => match item {
+                    Some(Ok(ClaudeChatFrame::Opened(info))) => {
+                        if opened {
+                            remote_log(&format!("{}: a second opened message was ignored", self.remote));
+                            continue;
+                        }
+                        opened = true;
+                        if !self.on_opened(info) {
+                            return StreamEnd::UiGone;
+                        }
+                        if let Some(tx) = out_tx.clone() {
+                            while let Some(cmd) = self.queued.pop_front() {
+                                if !self.send_command(&tx, cmd) {
+                                    break;
+                                }
+                            }
+                        }
+                        if self.handle_dropped {
+                            out_tx = None;
+                        }
+                    }
+                    Some(Ok(ClaudeChatFrame::Event { json, seq, redelivered })) => {
+                        match self.on_event(&json, seq, redelivered) {
+                            Ok(true) => exited = true,
+                            Ok(false) => {}
+                            Err(()) => return StreamEnd::UiGone,
+                        }
+                    }
+                    Some(Err(e)) => {
+                        if exited {
+                            return StreamEnd::Exited;
+                        }
+                        return StreamEnd::Lost(e.to_string());
+                    }
+                    None => {
+                        if exited {
+                            return StreamEnd::Exited;
+                        }
+                        if self.handle_dropped && opened {
+                            remote_log(&format!("{}: detached", self.remote));
+                            return StreamEnd::Detached;
+                        }
+                        return StreamEnd::Lost(format!("{} ended the chat stream", self.remote));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take in the agent's answer to an attach. `false` when the tab
+    /// stopped listening.
+    fn on_opened(&mut self, info: ClaudeChatOpened) -> bool {
+        let first = !self.attached_once;
+        self.attached_once = true;
+        remote_log(&format!(
+            "{}: {} chat {} (session {:?}, head seq {}, gap {})",
+            self.remote,
+            match (first, info.attached) {
+                (true, true) => "attached to running",
+                (true, false) => "started",
+                (false, _) => "reattached to",
+            },
+            info.chat_id,
+            info.claude_session_id,
+            info.head_seq,
+            info.gap
+        ));
+        self.chat_id = Some(info.chat_id);
+        self.backoff = RECONNECT_FIRST_DELAY;
+        // From the head on, unless the agent is replaying what we missed.
+        self.replay_only = !first && !info.gap;
+        if !self.replay_only {
+            self.last_seq = info.head_seq;
+            self.open_requests.clear();
+        }
+        if first {
+            return true;
+        }
+        self.disconnected = false;
+        self.events
+            .send(HarnessEvent::RemoteReconnected {
+                machine: self.machine.clone(),
+                history_gap: info.gap,
+            })
+            .is_ok()
+    }
+
+    /// Forward one event to the tab unless it already has it. `Ok(true)`
+    /// for the chat's exit; `Err` when the tab stopped listening.
+    fn on_event(&mut self, json: &str, seq: u64, redelivered: bool) -> Result<bool, ()> {
+        let ev = match serde_json::from_str::<HarnessEvent>(json) {
+            Ok(ev) => ev,
+            Err(e) => {
+                let msg = format!(
+                    "undecodable event from {}: {e}: {}",
+                    self.remote,
+                    trim_for_log(json, 200)
+                );
+                remote_log(&msg);
+                return self
+                    .events
+                    .send(HarnessEvent::Error(msg))
+                    .map(|_| false)
+                    .map_err(|_| ());
+            }
+        };
+        if redelivered {
+            let showing = match &ev {
+                HarnessEvent::RuntimeRequest { request_id, .. } => {
+                    self.open_requests.contains(request_id)
+                }
+                // Ready, mode, model, effort and the turn start are
+                // already on a tab that missed nothing.
+                _ => self.replay_only,
+            };
+            if showing {
+                return Ok(false);
+            }
+        } else if seq != 0 {
+            if seq <= self.last_seq {
+                return Ok(false);
+            }
+            if seq != self.last_seq + 1 {
+                remote_log(&format!(
+                    "{}: event seq {seq} after {}; events in between were not received",
+                    self.remote, self.last_seq
+                ));
+            }
+            self.last_seq = seq;
+        }
+        let exited = matches!(ev, HarnessEvent::ProcessExited { .. });
+        match &ev {
+            HarnessEvent::RuntimeRequest { request_id, .. } => {
+                self.open_requests.insert(request_id.clone());
+            }
+            HarnessEvent::RuntimeRequestResolved { request_id } => {
+                self.open_requests.remove(request_id);
+            }
+            HarnessEvent::TurnCompleted { .. } | HarnessEvent::ProcessExited { .. } => {
+                self.open_requests.clear();
+            }
+            _ => {}
+        }
+        self.events.send(ev).map(|_| exited).map_err(|_| ())
+    }
+}
+
+/// Relay a remote chat on an agent from before "claude_chat_persistent":
+/// the process lives as long as this stream.
+async fn run_legacy_remote_session(
+    backend: RemoteAgentBackend,
+    remote: String,
+    start_json: String,
+    mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
+    events: mpsc::UnboundedSender<HarnessEvent>,
+) {
+    use tokio_stream::StreamExt as _;
+
+    let fail = |msg: String| {
+        remote_log(&msg);
+        let _ = events.send(HarnessEvent::Error(msg));
+        let _ = events.send(HarnessEvent::ProcessExited { code: None });
+    };
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+    let mut stream = match backend.claude_chat(start_json, out_rx).await {
+        Ok(stream) => stream,
+        Err(e) => return fail(format!("could not start Claude on {remote}: {e}")),
+    };
+
+    let mut out_tx = Some(out_tx);
+    let mut exited = false;
+    loop {
+        tokio::select! {
+            cmd = commands.recv(), if out_tx.is_some() => {
+                let Some(cmd) = cmd else {
+                    // Handle dropped: closing our half ends the stream, and
+                    // the agent shuts its process down.
+                    out_tx = None;
+                    continue;
+                };
+                let sent = match serde_json::to_string(&cmd) {
+                    Ok(json) => out_tx.as_ref().is_some_and(|tx| tx.send(json).is_ok()),
+                    Err(e) => {
+                        let msg = format!("could not encode {cmd:?} for {remote}: {e}");
+                        remote_log(&msg);
+                        let _ = events.send(HarnessEvent::Error(msg));
+                        continue;
+                    }
+                };
+                if !sent {
+                    let msg = format!("the chat stream to {remote} is closed; {cmd:?} was not sent");
+                    remote_log(&msg);
+                    let _ = events.send(HarnessEvent::Error(msg));
+                }
+            }
+            item = stream.next() => match item {
+                Some(Ok(json)) => match serde_json::from_str::<HarnessEvent>(&json) {
+                    Ok(ev) => {
+                        exited |= matches!(ev, HarnessEvent::ProcessExited { .. });
+                        if events.send(ev).is_err() {
+                            // The tab is gone; dropping the stream cancels
+                            // the call and the agent stops its process.
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "undecodable event from {remote}: {e}: {}",
+                            trim_for_log(&json, 200)
+                        );
+                        remote_log(&msg);
+                        let _ = events.send(HarnessEvent::Error(msg));
+                    }
+                },
+                Some(Err(e)) => {
+                    let msg = format!("lost the connection to {remote}: {e}");
+                    remote_log(&msg);
+                    let _ = events.send(HarnessEvent::Error(msg));
+                    break;
+                }
+                None => {
+                    if !exited {
+                        let msg = format!("{remote} ended the chat stream before Claude exited");
+                        remote_log(&msg);
+                        let _ = events.send(HarnessEvent::Error(msg));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if !exited {
+        let _ = events.send(HarnessEvent::ProcessExited { code: None });
     }
 }
 
@@ -873,6 +1871,9 @@ async fn run_session(
         format!("gitterm_{pid}_{next_id}")
     };
     let mut interrupt_requested = false;
+    // Between `system/init` and `result`. A message sent mid-turn must not
+    // clear an interrupt that turn is still answering.
+    let mut in_turn = false;
 
     // Handshake. Its reply becomes `Ready`.
     let init_id = new_request_id();
@@ -915,7 +1916,12 @@ async fn run_session(
                     match frame {
                         ParsedFrame::Event(ev) => {
                             let ev = match ev {
+                                HarnessEvent::TurnStarted { session_id, model } => {
+                                    in_turn = true;
+                                    HarnessEvent::TurnStarted { session_id, model }
+                                }
                                 HarnessEvent::TurnCompleted { status, usage, cost_usd } => {
+                                    in_turn = false;
                                     let status = match status {
                                         TurnStatus::Failed(_) if interrupt_requested => {
                                             TurnStatus::Interrupted
@@ -961,10 +1967,28 @@ async fn run_session(
                             harness_log(&format!(
                                 "{request:?} ({request_id}) -> {}",
                                 match &result {
+                                    // get_settings carries the user's whole
+                                    // settings (env, tokens); never log it.
+                                    Ok(_) if matches!(request, HostRequest::ConfirmEffort(_)) => {
+                                        "ok (settings not logged)".to_string()
+                                    }
                                     Ok(v) => format!("ok {}", trim_for_log(&v.to_string(), 160)),
                                     Err(e) => format!("error {e}"),
                                 }
                             ));
+                            // An accepted effort change is confirmed by
+                            // reading the session's settings back.
+                            if let (HostRequest::SetEffort(effort), Ok(_)) = (&request, &result) {
+                                let id = new_request_id();
+                                parser.register_host_request(id.clone(), HostRequest::ConfirmEffort(effort.clone()));
+                                if let Err(e) = io
+                                    .write(control_request_frame(&id, json!({"subtype": "get_settings"})))
+                                    .await
+                                {
+                                    harness_log(&e);
+                                    io.emit(HarnessEvent::Error(e));
+                                }
+                            }
                         }
                         ParsedFrame::Unparsed(line) => {
                             harness_log(&format!("non-JSON stdout: {}", trim_for_log(&line, 200)));
@@ -981,10 +2005,27 @@ async fn run_session(
                     continue;
                 };
                 let result = match cmd {
-                    HarnessCommand::SendUserMessage(text) => {
-                        harness_log(&format!("user message ({} chars)", text.len()));
-                        interrupt_requested = false;
-                        io.write(user_message_frame(&text)).await
+                    HarnessCommand::SendUserMessage(prompt) => {
+                        harness_log(&format!(
+                            "user message ({} chars, {} images, id {:?})",
+                            prompt.text.len(),
+                            prompt.images.len(),
+                            prompt.id
+                        ));
+                        if !in_turn {
+                            interrupt_requested = false;
+                        }
+                        io.write(user_message_frame(&prompt)).await
+                    }
+                    HarnessCommand::WithdrawQueuedMessage(message_id) => {
+                        let id = new_request_id();
+                        harness_log(&format!("cancel_async_message {message_id} ({id})"));
+                        parser.register_host_request(id.clone(), HostRequest::WithdrawMessage(message_id.clone()));
+                        io.write(control_request_frame(
+                            &id,
+                            json!({"subtype": "cancel_async_message", "message_uuid": message_id}),
+                        ))
+                        .await
                     }
                     HarnessCommand::Answer { request_id, decision } => {
                         match pending.remove(&request_id) {
@@ -1029,6 +2070,26 @@ async fn run_session(
                         io.write(control_request_frame(
                             &id,
                             json!({"subtype": "set_permission_mode", "mode": mode}),
+                        ))
+                        .await
+                    }
+                    HarnessCommand::SetModel(model) => {
+                        let id = new_request_id();
+                        harness_log(&format!("set_model {model:?} ({id})"));
+                        parser.register_host_request(id.clone(), HostRequest::SetModel(model.clone()));
+                        io.write(control_request_frame(
+                            &id,
+                            json!({"subtype": "set_model", "model": model}),
+                        ))
+                        .await
+                    }
+                    HarnessCommand::SetEffort(effort) => {
+                        let id = new_request_id();
+                        harness_log(&format!("apply_flag_settings effortLevel={effort:?} ({id})"));
+                        parser.register_host_request(id.clone(), HostRequest::SetEffort(effort.clone()));
+                        io.write(control_request_frame(
+                            &id,
+                            json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}),
                         ))
                         .await
                     }
@@ -1115,6 +2176,59 @@ async fn answer_unhandled_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::ImageAttachment;
+
+    #[test]
+    fn text_only_prompt_keeps_the_single_text_block_line() {
+        assert_eq!(
+            user_message_frame(&"hi".into()),
+            r#"{"message":{"content":[{"text":"hi","type":"text"}],"role":"user"},"parent_tool_use_id":null,"session_id":"","type":"user"}"#
+        );
+    }
+
+    #[test]
+    fn image_prompt_puts_text_first_then_base64_image_blocks() {
+        let prompt = UserPrompt {
+            text: "What colour?".into(),
+            images: vec![
+                ImageAttachment {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+                ImageAttachment {
+                    media_type: "image/jpeg".into(),
+                    data: "BBBB".into(),
+                },
+            ],
+            id: None,
+        };
+        let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
+        assert_eq!(
+            v["message"]["content"],
+            json!([
+                {"type": "text", "text": "What colour?"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBB"}},
+            ])
+        );
+        assert_eq!(v["type"], "user");
+    }
+
+    #[test]
+    fn image_only_prompt_leaves_out_the_empty_text_block() {
+        let prompt = UserPrompt {
+            text: String::new(),
+            images: vec![ImageAttachment {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+            id: None,
+        };
+        let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
+        let content = v["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
+    }
 
     fn parse_fixture(parser: &mut ClaudeFrameParser, fixture: &str) -> Vec<ParsedFrame> {
         fixture.lines().flat_map(|l| parser.parse_line(l)).collect()
@@ -1139,8 +2253,57 @@ mod tests {
     const TURN_BASH_DENY: &str = include_str!("../../tests/fixtures/claude/turn_bash_deny.jsonl");
     const TURN_QUESTION: &str = include_str!("../../tests/fixtures/claude/turn_question.jsonl");
     const TURN_INTERRUPT: &str = include_str!("../../tests/fixtures/claude/turn_interrupt.jsonl");
+    // Captured from `claude_harness_smoke --scenario midturn` (TRU-140): a
+    // Bash turn with three messages sent after its first tool call starts
+    // (…b, …c, then …d withdrawn at once via request gitterm_5166_2).
+    // Trimmed to the lifecycle frames, the cancel reply, tool results and
+    // the result.
+    const TURN_MIDTURN_MESSAGES: &str =
+        include_str!("../../tests/fixtures/claude/turn_midturn_messages.jsonl");
     const SET_PERMISSION_MODE_REPLY: &str =
         include_str!("../../tests/fixtures/claude/set_permission_mode_reply.jsonl");
+    // Captured from `claude_harness_smoke --scenario model` (TRU-143):
+    // set_model, apply_flag_settings low, get_settings, apply_flag_settings
+    // null, get_settings. The get_settings replies keep only effortLevel
+    // (the rest is the user's own settings).
+    const MODEL_EFFORT_REPLIES: &str =
+        include_str!("../../tests/fixtures/claude/model_effort_replies.jsonl");
+    // Captured from `claude_harness_smoke --scenario review` (TRU-142):
+    // consecutive deltas on one block merged, signatures and paths redacted.
+    const TURN_SUBAGENT_REVIEW: &str =
+        include_str!("../../tests/fixtures/claude/turn_subagent_review.jsonl");
+    const TURN_SUBAGENT_BACKGROUND: &str =
+        include_str!("../../tests/fixtures/claude/turn_subagent_background.jsonl");
+
+    /// The subagent events for `parent`, unwrapped, plus the number of
+    /// subagent events addressed to any other parent.
+    fn nested(evs: &[HarnessEvent], parent: &str) -> (Vec<HarnessEvent>, usize) {
+        let mut mine = Vec::new();
+        let mut others = 0;
+        for ev in evs {
+            if let HarnessEvent::SubagentEvent {
+                parent_tool_use_id,
+                event,
+            } = ev
+            {
+                if parent_tool_use_id == parent {
+                    mine.push((**event).clone());
+                } else {
+                    others += 1;
+                }
+            }
+        }
+        (mine, others)
+    }
+
+    fn top_level_text(evs: &[HarnessEvent]) -> String {
+        evs.iter()
+            .filter_map(|e| match e {
+                HarnessEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn initialize_reply_becomes_ready() {
@@ -1157,6 +2320,7 @@ mod tests {
             session_id,
             permission_mode,
             models,
+            ..
         }] = evs.as_slice()
         else {
             panic!("expected one Ready, got {evs:?}");
@@ -1373,6 +2537,236 @@ mod tests {
     }
 
     #[test]
+    fn foreground_subagent_nests_under_its_agent_call() {
+        let mut p = ClaudeFrameParser::new();
+        let evs = events(&parse_fixture(&mut p, TURN_SUBAGENT_REVIEW));
+        let agent = "toolu_01Y8qfELQtVXDWYpWrA2LVpU";
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemStarted { id, kind: ItemKind::ToolCall { name, .. } }
+                if id == agent && name == "Agent"
+        )));
+        let (sub, others) = nested(&evs, agent);
+        assert_eq!(others, 0, "{evs:?}");
+        let kinds: Vec<&str> = sub
+            .iter()
+            .map(|e| match e {
+                HarnessEvent::TurnStarted { .. } => "started",
+                HarnessEvent::ItemStarted { .. } => "item",
+                HarnessEvent::ItemCompleted { .. } => "result",
+                HarnessEvent::TextDelta(_) => "text",
+                HarnessEvent::TurnCompleted { .. } => "completed",
+                _ => "other",
+            })
+            .collect();
+        // The brief the parent sent (a subagent `user` text frame) is not
+        // an event; task_progress and task_updated add nothing.
+        assert_eq!(kinds, ["started", "item", "result", "text", "completed"]);
+        assert!(matches!(
+            &sub[1],
+            HarnessEvent::ItemStarted { id, kind: ItemKind::ToolCall { name, input } }
+                if id == "toolu_01V55VdwsBegzZmpoUhcm6DG"
+                    && name == "Bash"
+                    && input["command"].as_str().unwrap().contains("git diff HEAD")
+        ));
+        assert!(matches!(
+            &sub[2],
+            HarnessEvent::ItemCompleted { id, output, is_error: false }
+                if id == "toolu_01V55VdwsBegzZmpoUhcm6DG" && output.contains("values[1:]")
+        ));
+        // A foreground subagent's last message only exists as the
+        // notification summary; it becomes the subagent's text.
+        assert!(
+            matches!(&sub[3], HarnessEvent::TextDelta(t) if t.starts_with("Verdict: needs_changes") && t.contains("F1 [P1] calc.py:4"))
+        );
+        assert!(matches!(
+            &sub[4],
+            HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                cost_usd: None,
+                ..
+            }
+        ));
+        // The subagent's text never reaches the parent's reply stream; the
+        // parent relays the report itself.
+        assert!(!top_level_text(&evs).contains("Model: haiku"));
+        assert!(top_level_text(&evs).contains("F1"));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { id, output, is_error: false }
+                if id == agent && output.contains("F1 [P1] calc.py:4")
+        )));
+        assert!(matches!(
+            evs.last(),
+            Some(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn background_subagent_text_is_not_repeated_by_its_summary() {
+        let mut p = ClaudeFrameParser::new();
+        let evs = events(&parse_fixture(&mut p, TURN_SUBAGENT_BACKGROUND));
+        let agent = "toolu_01Dd3gSqnmMHifQuUBFNNzgL";
+        // The Agent call returns at once; the subagent outlives the turn.
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { id, output, .. }
+                if id == agent && output.starts_with("Async agent launched")
+        )));
+        let (sub, others) = nested(&evs, agent);
+        assert_eq!(others, 0);
+        let tools: Vec<&str> = sub
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::ItemStarted {
+                    kind: ItemKind::ToolCall { name, .. },
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools, ["Bash", "Read"]);
+        let texts: Vec<&String> = sub
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::TextDelta(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].starts_with("Verdict: needs_changes"));
+        assert!(sub.contains(&HarnessEvent::ThinkingDelta(String::new())));
+        assert!(matches!(
+            sub.first(),
+            Some(HarnessEvent::TurnStarted { .. })
+        ));
+        assert!(matches!(
+            sub.last(),
+            Some(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+        // Claude starts a follow-up turn on its own when the agent is done.
+        let turns = evs
+            .iter()
+            .filter(|e| matches!(e, HarnessEvent::TurnStarted { .. }))
+            .count();
+        assert_eq!(turns, 2);
+    }
+
+    #[test]
+    fn background_bash_tasks_are_not_subagents() {
+        let mut p = ClaudeFrameParser::new();
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#;
+        let done = r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_bash","status":"completed","summary":"exit 0"}"#;
+        assert!(p.parse_line(started).is_empty());
+        assert!(p.parse_line(done).is_empty());
+        // A subagent that failed reports the summary as the failure.
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_agent","task_type":"local_agent"}"#;
+        let failed = r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_agent","status":"failed","summary":"API error"}"#;
+        p.parse_line(started);
+        let evs = events(&p.parse_line(failed));
+        assert_eq!(
+            evs.last(),
+            Some(&HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "toolu_agent".into(),
+                event: Box::new(HarnessEvent::TurnCompleted {
+                    status: TurnStatus::Failed("API error".into()),
+                    usage: Value::Null,
+                    cost_usd: None,
+                }),
+            })
+        );
+    }
+
+    /// The parent and inner event type of each subagent event.
+    fn sub_starts_and_ends(evs: &[HarnessEvent]) -> Vec<(String, &'static str)> {
+        evs.iter()
+            .filter_map(|e| match e {
+                HarnessEvent::SubagentEvent {
+                    parent_tool_use_id,
+                    event,
+                } => Some((
+                    parent_tool_use_id.clone(),
+                    match **event {
+                        HarnessEvent::TurnStarted { .. } => "start",
+                        HarnessEvent::TurnCompleted { .. } => "end",
+                        HarnessEvent::ItemStarted { .. } => "tool",
+                        _ => "other",
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const SEND_MESSAGE_BLOCK: &str = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_send","name":"SendMessage","input":{}}},"parent_tool_use_id":null}"#;
+    const RESUMED_TOOL: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"ls"}}]},"parent_tool_use_id":"toolu_agent","agent_id":"a1"}"#;
+
+    #[test]
+    fn a_subagent_resumed_by_send_message_runs_under_its_agent_call() {
+        // Wire shape from a real session: the resumed run's start and end
+        // carry the SendMessage call's id; its frames keep the Agent call's.
+        let mut p = ClaudeFrameParser::new();
+        let frames = [
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_agent","task_type":"local_agent"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_agent","status":"completed","summary":"first"}"#,
+            SEND_MESSAGE_BLOCK,
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_send","task_type":"local_agent"}"#,
+            RESUMED_TOOL,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_send","status":"completed","summary":"second"}"#,
+        ];
+        let evs = events(
+            &frames
+                .iter()
+                .flat_map(|l| p.parse_line(l))
+                .collect::<Vec<_>>(),
+        );
+        let agent = |kind| ("toolu_agent".to_string(), kind);
+        assert_eq!(
+            sub_starts_and_ends(&evs),
+            vec![
+                agent("start"),
+                agent("other"),
+                agent("end"),
+                agent("start"),
+                agent("tool"),
+                // No text from the run: its summary stands in.
+                agent("other"),
+                agent("end"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_subagent_resumed_from_before_this_process_starts_at_its_first_frame() {
+        // The Agent call ran under an earlier CLI process, so only the
+        // resumed run's first frame names it.
+        let mut p = ClaudeFrameParser::new();
+        p.parse_line(SEND_MESSAGE_BLOCK);
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"toolu_send","task_type":"local_agent"}"#;
+        assert!(p.parse_line(started).is_empty());
+        let evs = events(&p.parse_line(RESUMED_TOOL));
+        assert_eq!(
+            sub_starts_and_ends(&evs),
+            vec![
+                ("toolu_agent".to_string(), "start"),
+                ("toolu_agent".to_string(), "tool")
+            ]
+        );
+        let done = r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_send","status":"completed","summary":"s"}"#;
+        let evs = events(&p.parse_line(done));
+        assert_eq!(
+            sub_starts_and_ends(&evs).last(),
+            Some(&("toolu_agent".to_string(), "end"))
+        );
+    }
+
+    #[test]
     fn permission_results_match_the_sdk_shape() {
         let input = json!({"command": "touch x"});
         let suggestion = json!({"type": "addRules", "destination": "localSettings",
@@ -1429,6 +2823,186 @@ mod tests {
     }
 
     #[test]
+    fn set_model_reply_confirms_the_model() {
+        let mut p = ClaudeFrameParser::new();
+        p.register_host_request(
+            "gitterm_30932_2".into(),
+            HostRequest::SetModel("sonnet".into()),
+        );
+        let line = MODEL_EFFORT_REPLIES.lines().next().unwrap();
+        let frames = p.parse_line(line);
+        assert_eq!(
+            events(&frames),
+            vec![HarnessEvent::ModelChanged("sonnet".into())]
+        );
+        assert!(matches!(
+            frames.last(),
+            Some(ParsedFrame::HostRequestDone {
+                request: HostRequest::SetModel(_),
+                result: Ok(_),
+                ..
+            })
+        ));
+        // An unknown model is the CLI's error, not a confirmation.
+        p.register_host_request("m2".into(), HostRequest::SetModel("nonsense".into()));
+        let frames = p.parse_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"m2","error":"Model 'nonsense' not found","error_code":"catalog_unknown"}}"#,
+        );
+        assert!(
+            matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("not found"))
+        );
+    }
+
+    #[test]
+    fn effort_is_confirmed_by_the_settings_read_back() {
+        let mut p = ClaudeFrameParser::new();
+        let low = Some("low".to_string());
+        p.register_host_request(
+            "gitterm_30932_3".into(),
+            HostRequest::SetEffort(low.clone()),
+        );
+        p.register_host_request(
+            "gitterm_30932_4".into(),
+            HostRequest::ConfirmEffort(low.clone()),
+        );
+        p.register_host_request("gitterm_30932_5".into(), HostRequest::SetEffort(None));
+        p.register_host_request("gitterm_30932_6".into(), HostRequest::ConfirmEffort(None));
+        let frames = parse_fixture(&mut p, MODEL_EFFORT_REPLIES);
+        // The apply_flag_settings replies themselves confirm nothing; the
+        // user's own effortLevel (userSettings) is not mistaken for the pin.
+        assert_eq!(
+            events(&frames),
+            vec![
+                HarnessEvent::EffortChanged {
+                    effort: low.clone(),
+                    applied: low.clone()
+                },
+                HarnessEvent::EffortChanged {
+                    effort: None,
+                    applied: Some("medium".into())
+                },
+            ]
+        );
+        // A level the CLI accepted but did not pin is reported, not shown.
+        p.register_host_request(
+            "c1".into(),
+            HostRequest::ConfirmEffort(Some("bogus".into())),
+        );
+        let frames = p.parse_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"c1","response":{"effective":{},"sources":[{"source":"flagSettings","settings":{}}],"applied":{"effort":"low"}}}}"#,
+        );
+        assert!(
+            matches!(&frames[0], ParsedFrame::Event(HarnessEvent::Error(m)) if m.contains("bogus"))
+        );
+    }
+
+    #[test]
+    fn prompt_id_rides_as_the_frame_uuid() {
+        let prompt = UserPrompt {
+            text: "hi".into(),
+            images: Vec::new(),
+            id: Some("00000000-0000-4000-8000-00000000000b".into()),
+        };
+        let v: Value = serde_json::from_str(&user_message_frame(&prompt)).unwrap();
+        assert_eq!(v["uuid"], "00000000-0000-4000-8000-00000000000b");
+        assert_eq!(
+            v["message"]["content"],
+            json!([{"type": "text", "text": "hi"}])
+        );
+        let plain: Value = serde_json::from_str(&user_message_frame(&"hi".into())).unwrap();
+        assert!(plain.get("uuid").is_none());
+    }
+
+    #[test]
+    fn midturn_messages_report_their_queue_state() {
+        use crate::harness::MessageState::*;
+        let mut parser = ClaudeFrameParser::new();
+        parser.register_host_request(
+            "gitterm_5166_2".into(),
+            HostRequest::WithdrawMessage("00000000-0000-4000-8000-00000000000d".into()),
+        );
+        let frames = parse_fixture(&mut parser, TURN_MIDTURN_MESSAGES);
+        let lifecycle: Vec<(char, MessageState)> = events(&frames)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                HarnessEvent::MessageLifecycle { id, state } => {
+                    Some((id.chars().last().unwrap(), state))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lifecycle,
+            [
+                ('b', Queued),
+                ('c', Queued),
+                ('d', Queued),
+                ('d', Cancelled),
+                ('b', Started),
+                ('c', Started),
+                ('b', Completed),
+                ('c', Completed),
+            ]
+        );
+        // The cancel took: its lifecycle says so, the reply adds nothing.
+        assert!(!events(&frames)
+            .iter()
+            .any(|ev| matches!(ev, HarnessEvent::MessageWithdrawRefused { .. })));
+        assert!(frames.iter().any(|f| matches!(
+            f,
+            ParsedFrame::HostRequestDone {
+                request: HostRequest::WithdrawMessage(_),
+                result: Ok(_),
+                ..
+            }
+        )));
+        // Folded into the running turn: one result for all of it.
+        let results = events(&frames)
+            .iter()
+            .filter(|ev| matches!(ev, HarnessEvent::TurnCompleted { .. }))
+            .count();
+        assert_eq!(results, 1);
+    }
+
+    #[test]
+    fn a_withdraw_too_late_or_refused_is_reported() {
+        let mut parser = ClaudeFrameParser::new();
+        parser.register_host_request("w1".into(), HostRequest::WithdrawMessage("m1".into()));
+        parser.register_host_request("w2".into(), HostRequest::WithdrawMessage("m2".into()));
+        let frames = parse_fixture(
+            &mut parser,
+            concat!(
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"w1","response":{"cancelled":false}}}"#,
+                "\n",
+                r#"{"type":"control_response","response":{"subtype":"error","request_id":"w2","error":"Unsupported control request subtype: cancel_async_message"}}"#,
+            ),
+        );
+        assert_eq!(
+            events(&frames),
+            [
+                HarnessEvent::MessageWithdrawRefused {
+                    id: "m1".into(),
+                    reason: "Claude had already picked it up".into()
+                },
+                HarnessEvent::MessageWithdrawRefused {
+                    id: "m2".into(),
+                    reason:
+                        "Claude refused: Unsupported control request subtype: cancel_async_message"
+                            .into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_lifecycle_states_are_ignored() {
+        let mut parser = ClaudeFrameParser::new();
+        assert!(parser
+            .parse_line(r#"{"type":"command_lifecycle","command_uuid":"m1","state":"folded"}"#)
+            .is_empty());
+    }
+
+    #[test]
     fn control_errors_and_cancels() {
         let mut p = ClaudeFrameParser::new();
         p.register_host_request("m1".into(), HostRequest::SetPermissionMode("x".into()));
@@ -1467,8 +3041,16 @@ mod tests {
             resume: Some("sid".into()),
             wire_log_dir: None,
             mcp_servers: Vec::new(),
+            chrome: true,
         };
         let args = cfg.args().join(" ");
+        assert!(args.contains("--chrome"));
+        assert!(!ClaudeSessionConfig {
+            chrome: false,
+            ..cfg.clone()
+        }
+        .args()
+        .contains(&"--chrome".to_string()));
         assert!(args.contains("--permission-prompt-tool stdio"));
         assert!(args.contains("--input-format stream-json"));
         assert!(args.contains("--include-partial-messages"));
@@ -1506,7 +3088,171 @@ mod tests {
             resume: Some("sid".into()),
             wire_log_dir: None,
             mcp_servers,
+            chrome: false,
         }
+    }
+
+    #[test]
+    fn remote_start_carries_the_config_and_round_trips() {
+        let mut config = config_with(Vec::new());
+        config.model = Some("haiku".into());
+        config.effort = Some("low".into());
+        config.chrome = true;
+        config.wire_log_dir = Some(PathBuf::from("/tmp/wire"));
+        let start = RemoteClaudeChatStart::from_config(&config).unwrap();
+        assert_eq!(
+            serde_json::to_value(&start).unwrap(),
+            json!({"cwd": "/tmp", "model": "haiku", "permission_mode": "default",
+                   "effort": "low", "resume": "sid", "chrome": true})
+        );
+        let back: RemoteClaudeChatStart =
+            serde_json::from_str(&serde_json::to_string(&start).unwrap()).unwrap();
+        assert_eq!(back, start);
+        // The agent side never gets a wire log or MCP servers.
+        let agent = back.into_config(PathBuf::from("/private/tmp"));
+        assert_eq!(agent.cwd, PathBuf::from("/private/tmp"));
+        assert_eq!(agent.wire_log_dir, None);
+        assert!(agent.mcp_servers.is_empty());
+        assert_eq!(agent.args(), {
+            let mut local = config.clone();
+            local.wire_log_dir = None;
+            local.args()
+        });
+    }
+
+    #[test]
+    fn remote_start_refuses_mcp_servers() {
+        let config = config_with(vec![mcp_server("gitterm-tasks", "TOKEN", &[])]);
+        let err = RemoteClaudeChatStart::from_config(&config).unwrap_err();
+        assert!(err.contains("remote machine"), "{err}");
+    }
+
+    fn link() -> (RemoteChatLink, mpsc::UnboundedReceiver<HarnessEvent>) {
+        let (_commands_tx, commands) = mpsc::unbounded_channel();
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let link = RemoteChatLink {
+            backend: RemoteAgentBackend::new(RemoteAgentClientConfig {
+                remote_id: "mini".into(),
+                name: "mini".into(),
+                endpoint: "http://127.0.0.1:1".into(),
+                token_ref: "env:UNUSED".into(),
+            }),
+            machine: "mini".into(),
+            remote: "mini (test)".into(),
+            start_json: "{}".into(),
+            commands,
+            events,
+            chat_id: None,
+            attached_once: false,
+            last_seq: 0,
+            replay_only: false,
+            open_requests: std::collections::HashSet::new(),
+            queued: VecDeque::new(),
+            handle_dropped: false,
+            shutdown_requested: false,
+            disconnected: false,
+            backoff: RECONNECT_FIRST_DELAY,
+        };
+        (link, events_rx)
+    }
+
+    fn opened(head_seq: u64, gap: bool) -> ClaudeChatOpened {
+        ClaudeChatOpened {
+            chat_id: "chat-1".into(),
+            attached: true,
+            claude_session_id: "s1".into(),
+            head_seq,
+            gap,
+        }
+    }
+
+    fn wire(ev: &HarnessEvent) -> String {
+        serde_json::to_string(ev).unwrap()
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<HarnessEvent>) -> Vec<HarnessEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[test]
+    fn a_reattached_link_forwards_each_event_once() {
+        let (mut link, mut rx) = link();
+        let ready = HarnessEvent::Ready {
+            session_id: Some("s1".into()),
+            permission_mode: None,
+            models: Vec::new(),
+            modes: Vec::new(),
+        };
+        let request = HarnessEvent::RuntimeRequest {
+            request_id: "r1".into(),
+            tool_use_id: "t1".into(),
+            kind: RuntimeRequestKind::Question {
+                questions: json!([]),
+            },
+        };
+        let delta = |s: &str| HarnessEvent::TextDelta(s.into());
+
+        // First attach to a running chat: its standing state comes through.
+        assert!(link.on_opened(opened(5, false)));
+        assert_eq!(link.on_event(&wire(&ready), 1, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&request), 5, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("a")), 6, false), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("a")), 6, false), Ok(false));
+        assert_eq!(
+            drain(&mut rx),
+            vec![ready.clone(), request.clone(), delta("a")]
+        );
+
+        // Back without a gap: the tab has all of it; only the replay shows.
+        assert!(link.on_opened(opened(7, false)));
+        assert_eq!(link.on_event(&wire(&ready), 1, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&request), 5, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("b")), 7, false), Ok(false));
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                HarnessEvent::RemoteReconnected {
+                    machine: "mini".into(),
+                    history_gap: false
+                },
+                delta("b")
+            ]
+        );
+
+        // Back past the buffer: the tab reloads, so the open prompt is
+        // shown again, and only events after the head follow.
+        assert!(link.on_opened(opened(20, true)));
+        assert_eq!(link.on_event(&wire(&request), 5, true), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("old")), 15, false), Ok(false));
+        assert_eq!(link.on_event(&wire(&delta("c")), 21, false), Ok(false));
+        assert_eq!(
+            link.on_event(
+                &wire(&HarnessEvent::ProcessExited { code: Some(0) }),
+                22,
+                false
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                HarnessEvent::RemoteReconnected {
+                    machine: "mini".into(),
+                    history_gap: true
+                },
+                request,
+                delta("c"),
+                HarnessEvent::ProcessExited { code: Some(0) },
+            ]
+        );
+        // A notice for this stream only (seq 0) always reaches the tab.
+        let notice = HarnessEvent::Error("refused".into());
+        assert_eq!(link.on_event(&wire(&notice), 0, false), Ok(false));
+        assert_eq!(drain(&mut rx), vec![notice]);
     }
 
     fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {

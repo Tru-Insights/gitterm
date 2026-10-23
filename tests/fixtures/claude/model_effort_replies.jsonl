@@ -1,0 +1,5 @@
+{"type":"control_response","response":{"subtype":"success","request_id":"gitterm_30932_2"}}
+{"type":"control_response","response":{"subtype":"success","request_id":"gitterm_30932_3"}}
+{"type":"control_response","response":{"subtype":"success","request_id":"gitterm_30932_4","response":{"effective":{"effortLevel":"low"},"sources":[{"source":"userSettings","settings":{"effortLevel":"high"}},{"source":"flagSettings","settings":{"effortLevel":"low"}}],"applied":{"model":"claude-sonnet-5-5","effort":"low","advisor":null,"ultracode":false,"ultracodeRequested":false,"ultracodeAvailable":true}}}}
+{"type":"control_response","response":{"subtype":"success","request_id":"gitterm_30932_5"}}
+{"type":"control_response","response":{"subtype":"success","request_id":"gitterm_30932_6","response":{"effective":{"effortLevel":"high"},"sources":[{"source":"userSettings","settings":{"effortLevel":"high"}}],"applied":{"model":"claude-sonnet-5-5","effort":"medium","advisor":null,"ultracode":false,"ultracodeRequested":false,"ultracodeAvailable":true}}}}
