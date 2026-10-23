@@ -1435,13 +1435,36 @@ fn stt_start_recording(audio_buffer: Arc<Mutex<Vec<f32>>>) -> Result<(cpal::Stre
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "No input device available".to_string())?;
-
-    let config = device
-        .default_input_config()
-        .map_err(|e| format!("Failed to get input config: {}", e))?;
+    let default = host.default_input_device();
+    let default_config = default.as_ref().map(|device| device.default_input_config());
+    let (device, config) = match (default, default_config) {
+        (Some(device), Some(Ok(config))) => (device, config),
+        (_, default_err) => {
+            // macOS can leave the default input pointing at a device that
+            // has gone (a headset or iPhone mic that disconnected; seen
+            // 2026-10-23). Record from the first input that answers instead.
+            let reason = match default_err {
+                Some(Err(e)) => format!("the default input device failed ({e})"),
+                _ => "there is no default input device".to_string(),
+            };
+            let fallback = host
+                .input_devices()
+                .map_err(|e| format!("Failed to list input devices after {reason}: {e}"))?
+                .find_map(|device| {
+                    let config = device.default_input_config().ok()?;
+                    Some((device, config))
+                })
+                .ok_or_else(|| format!("No working input device: {reason}"))?;
+            eprintln!(
+                "[STT] {reason}; recording from {} instead",
+                fallback
+                    .0
+                    .name()
+                    .unwrap_or_else(|_| "<unknown input device>".to_string())
+            );
+            fallback
+        }
+    };
 
     let sample_rate = config.sample_rate().0;
     let device_name = device
