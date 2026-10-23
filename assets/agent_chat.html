@@ -666,8 +666,17 @@
   function atBottom() {
     return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
   }
+  // Only the human scrolling leaves follow mode. A scroll event can arrive
+  // after the next blocks grew the page (or a closing card shrank it) and
+  // before the frame that follows them down; the view then merely looks
+  // as if it left the bottom.
+  let scrollIntentAt = -Infinity;
+  for (const type of ['wheel', 'touchmove', 'keydown', 'mousedown']) {
+    messagesEl.addEventListener(type, () => { scrollIntentAt = performance.now(); }, { passive: true });
+  }
   messagesEl.addEventListener('scroll', () => {
-    follow = atBottom();
+    if (atBottom()) follow = true;
+    else if (performance.now() - scrollIntentAt < 1000) follow = false;
     jumpBtn.classList.toggle('visible', !follow);
   });
   let scrollQueued = false;
