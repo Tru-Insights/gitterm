@@ -229,12 +229,11 @@ fn parse_rendered_findings(text: &str, repo_root: &Path) -> Option<(String, Vec<
             });
         } else if line.trim().is_empty() {
             body_lines.push("");
-        } else if let Some(body) = line.strip_prefix(BODY_INDENT) {
-            findings.last()?;
-            body_lines.push(body);
         } else {
             // Unindented text after the heading is not part of the format.
-            return None;
+            let body = line.strip_prefix(BODY_INDENT)?;
+            findings.last()?;
+            body_lines.push(body);
         }
     }
     let last = findings.last_mut()?;
