@@ -911,6 +911,9 @@ fn chat_entry_from_proto(entry: ChatEntry) -> Option<crate::chats::ChatIndexEntr
         is_worktree: entry.is_worktree,
         branch: (!entry.branch.is_empty()).then_some(entry.branch),
         title: entry.title,
+        // The wire proto has no latest-topic field yet; remote rows stay
+        // single-line (TRU-158 is local-index only).
+        latest: None,
         mtime: std::time::UNIX_EPOCH + Duration::from_secs(entry.mtime_unix_secs.max(0) as u64),
         size: entry.size_bytes,
         dead_cwd: entry.dead_cwd,
