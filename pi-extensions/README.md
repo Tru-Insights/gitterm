@@ -21,3 +21,18 @@ should be listed.
 
 This supersedes the older hand-maintained `gitterm-browser` extension, which
 only knew the V4 browser variables.
+
+## Skills
+
+`skills/resume-foreign-session/` continues work started in another harness
+(Codex, Claude Code, or an earlier pi session) after a provider outage or a
+deliberate switch: a finder script locates recent transcripts for the current
+directory, and the skill distills them (objective, decisions, state, next
+step) instead of replaying them. Install:
+
+```sh
+cp -R pi-extensions/skills/resume-foreign-session ~/.pi/agent/skills/
+```
+
+Invoke in pi with `/resume-foreign-session` (or just describe the takeover;
+the skill description triggers on it).
