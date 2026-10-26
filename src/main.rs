@@ -17850,16 +17850,33 @@ fi
                             }
                             echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
                             let mut submitted = false;
+                            let mut send_failed = None;
                             if let Some(claude) = session.harness.as_ref() {
                                 match claude.send(HarnessCommand::SendUserMessage(prompt.clone())) {
                                     Ok(()) => {
                                         session.state = tab::AgentSessionState::Streaming;
                                         submitted = true;
                                     }
-                                    Err(e) => eprintln!("AgentSubmitPrompt failed: {}", e),
+                                    Err(e) => {
+                                        eprintln!("AgentSubmitPrompt failed: {}", e);
+                                        send_failed = Some(e);
+                                    }
                                 }
                             }
                             session.record(echo.clone());
+                            if let Some(e) = send_failed {
+                                // The command channel is dead but ProcessExited
+                                // may never arrive (the session thread can fail
+                                // to spawn): drop the handle so the next prompt
+                                // respawns, and tell the page instead of
+                                // swallowing the lost prompt.
+                                session.harness = None;
+                                let ev = tab::AgentEvent::Harness(HarnessEvent::Error(format!(
+                                    "The prompt was not delivered: {e}. Send it again to restart the session."
+                                )));
+                                push_agent_event_to_webview(tab_id, &ev);
+                                session.record(ev);
+                            }
                             if submitted {
                                 if let Some(task_id) = tab_task_id {
                                     t.task_live_state = Some(TaskSessionLiveState::Working);

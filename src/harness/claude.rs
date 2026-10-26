@@ -144,6 +144,9 @@ pub struct ClaudeFrameParser {
     /// not in `agent_roots`. Their start waits for their first frame, which
     /// names the Agent call.
     pending_resumes: HashSet<String>,
+    /// Last permission mode confirmed by the CLI, for deduplicating the
+    /// status frame that follows an acknowledged set_permission_mode.
+    permission_mode: Option<String>,
 }
 
 impl ClaudeFrameParser {
@@ -292,7 +295,15 @@ impl ClaudeFrameParser {
                 }],
                 None => Vec::new(),
             },
-            // assistant (duplicates the stream deltas), status,
+            // The CLI reports permission-mode changes it makes on its own
+            // (leaving plan mode after an approved plan, shift-tab in
+            // another client) in status frames. Without this the chip and
+            // the saved tab config keep claiming a mode the CLI left.
+            "system" if str_at("/subtype") == Some("status") => match str_at("/permissionMode") {
+                Some(mode) => self.permission_mode_changed(mode),
+                None => Vec::new(),
+            },
+            // assistant (duplicates the stream deltas),
             // session_state_changed, rate_limit_event, keep_alive, ...
             _ => Vec::new(),
         }
@@ -308,6 +319,19 @@ impl ClaudeFrameParser {
                 model: None,
             },
         )
+    }
+
+    /// Record a confirmed permission mode and emit the change event once:
+    /// repeated confirmations of the same mode are dropped so a requested
+    /// change is not announced a second time by its status frame.
+    fn permission_mode_changed(&mut self, mode: &str) -> Vec<ParsedFrame> {
+        if self.permission_mode.as_deref() == Some(mode) {
+            return Vec::new();
+        }
+        self.permission_mode = Some(mode.to_string());
+        vec![ParsedFrame::Event(HarnessEvent::PermissionModeChanged(
+            mode.to_string(),
+        ))]
     }
 
     fn parse_stream_event(&mut self, event: &Value) -> Vec<ParsedFrame> {
@@ -416,9 +440,7 @@ impl ClaudeFrameParser {
                 // The CLI echoes the mode it switched to; a success without
                 // the echo still confirms the mode that was asked for.
                 let mode = body["mode"].as_str().unwrap_or(requested).to_string();
-                out.push(ParsedFrame::Event(HarnessEvent::PermissionModeChanged(
-                    mode,
-                )));
+                out.extend(self.permission_mode_changed(&mode));
             }
             (HostRequest::SetModel(model), Err(e)) => out.push(ParsedFrame::Event(
                 HarnessEvent::Error(format!("Claude rejected model {model:?}: {e}")),
@@ -2797,6 +2819,23 @@ mod tests {
             deny,
             json!({"behavior": "deny", "message": "no", "toolUseID": "toolu_1"})
         );
+    }
+
+    #[test]
+    fn cli_initiated_permission_mode_change_updates_the_mode() {
+        let mut p = ClaudeFrameParser::new();
+        let status = concat!(
+            r#"{"type":"system","subtype":"status","status":null,"#,
+            r#""permissionMode":"default","uuid":"u1","session_id":"s1"}"#,
+        );
+        // The CLI left plan mode on its own (for example after an approved
+        // plan): the status frame is the only notice GitTerm gets.
+        assert_eq!(
+            events(&p.parse_line(status)),
+            vec![HarnessEvent::PermissionModeChanged("default".into())]
+        );
+        // The same mode again (keep-alive status) stays quiet.
+        assert_eq!(events(&p.parse_line(status)), vec![]);
     }
 
     #[test]
