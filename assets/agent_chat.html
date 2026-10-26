@@ -13,12 +13,15 @@
     --fg: #cdd6f4;
     --fg-muted: #7f849c;
     --accent: #89b4fa;
-    --border: #585b70;
+    --border: #45475a;
+    --border-strong: #585b70;
     --user: #a6e3a1;
     --result: #94e2d5;
     --tool: #fab387;
+    --warn: #f9e2af;
     --err: #f38ba8;
     --thinking: #7f849c;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -37,76 +40,214 @@
     padding: 10px;
     gap: 8px;
   }
-  #status {
-    font-size: 11px;
-    color: var(--fg-muted);
-    padding: 0 4px;
-    user-select: none;
-  }
-  #status.streaming { color: var(--accent); }
-  #status.errored { color: var(--err); }
-  #status.stopped { color: var(--err); }
+  #timeline-wrap { flex: 1; position: relative; min-height: 0; }
   #messages {
-    flex: 1;
+    position: absolute;
+    inset: 0;
     overflow-y: auto;
     background: var(--bg-alt);
     border-radius: 8px;
-    padding: 10px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 13px;
-    line-height: 1.45;
+    padding: 12px 14px;
+    line-height: 1.5;
   }
   #messages::-webkit-scrollbar { width: 10px; }
-  #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-  .block {
-    margin-bottom: 8px;
-    padding: 6px 10px;
-    border-radius: 6px;
-    border-left: 3px solid var(--border);
+  #messages::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+  #jump {
+    position: absolute;
+    right: 18px;
+    bottom: 12px;
+    display: none;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 12px;
+  }
+  #jump.visible { display: block; }
+
+  /* Timeline blocks */
+  .user-msg {
+    margin: 4px 0 12px auto;
+    max-width: 85%;
+    width: fit-content;
+    padding: 8px 12px;
+    border-radius: 10px;
     background: var(--bg-block);
-  }
-  .block .label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 4px;
-    opacity: 0.85;
-  }
-  .block pre {
-    margin: 0;
+    border: 1px solid var(--border);
     white-space: pre-wrap;
     word-break: break-word;
-    font-family: inherit;
   }
-  .block.user { border-color: var(--user); }
-  .block.user .label { color: var(--user); }
-  .block.text { border-color: var(--accent); }
-  .block.text .label { color: var(--accent); }
-  .block.thinking {
-    border-color: var(--thinking);
-    background: transparent;
-    color: var(--thinking);
-    font-style: italic;
+  .assistant { margin: 6px 0 10px; word-break: break-word; }
+  .assistant .tail { white-space: pre-wrap; }
+  .assistant p { margin: 0 0 8px; }
+  .assistant p:last-child { margin-bottom: 0; }
+  .assistant ul, .assistant ol { margin: 0 0 8px; padding-left: 22px; }
+  .assistant h1, .assistant h2, .assistant h3, .assistant h4 { margin: 12px 0 6px; line-height: 1.3; }
+  .assistant h1 { font-size: 1.3em; } .assistant h2 { font-size: 1.18em; } .assistant h3 { font-size: 1.06em; }
+  .assistant a { color: var(--accent); }
+  .assistant blockquote { margin: 0 0 8px; padding-left: 10px; border-left: 3px solid var(--border-strong); color: var(--fg-muted); }
+  .assistant table { border-collapse: collapse; margin: 0 0 8px; }
+  .assistant th, .assistant td { border: 1px solid var(--border); padding: 3px 8px; }
+  .assistant code { font-family: var(--mono); font-size: 12.5px; background: var(--bg-block); padding: 1px 4px; border-radius: 4px; }
+  .codeblock { position: relative; margin: 0 0 8px; }
+  .codeblock pre {
+    margin: 0;
+    padding: 10px 12px;
+    background: #11111b;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow-x: auto;
   }
-  .block.thinking .label { color: var(--thinking); }
-  .block.tool { border-color: var(--tool); }
-  .block.tool .label { color: var(--tool); }
-  .block.tool_result { border-color: var(--result); }
-  .block.tool_result .label { color: var(--result); }
-  .block.error { border-color: var(--err); }
-  .block.error .label { color: var(--err); }
-  .block.system {
-    border-color: var(--fg-muted);
-    background: transparent;
-    color: var(--fg-muted);
-    font-size: 11px;
+  .codeblock pre code { background: none; padding: 0; font-size: 12.5px; line-height: 1.45; }
+  .codeblock .lang { position: absolute; left: 10px; top: -9px; font-size: 10px; color: var(--fg-muted); background: var(--bg-alt); padding: 0 4px; }
+  .codeblock .copy {
+    position: absolute; right: 6px; top: 6px;
+    font-size: 11px; padding: 2px 8px; opacity: 0;
+    transition: opacity 0.12s;
   }
-  .block.system .label { display: none; }
-  #composer {
+  .codeblock:hover .copy, .codeblock .copy.done { opacity: 1; }
+
+  details.thinking { margin: 4px 0 8px; color: var(--thinking); font-size: 13px; }
+  details.thinking summary { cursor: pointer; user-select: none; font-style: italic; }
+  details.thinking .body { white-space: pre-wrap; padding: 4px 0 0 14px; border-left: 2px solid var(--border); margin-top: 4px; }
+
+  details.tool {
+    margin: 6px 0;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--tool);
+    border-radius: 6px;
+    background: var(--bg);
+    font-size: 13px;
+  }
+  details.tool.error { border-left-color: var(--err); }
+  details.tool.done { border-left-color: var(--result); }
+  details.tool summary {
+    cursor: pointer;
+    user-select: none;
+    padding: 5px 10px;
     display: flex;
-    gap: 6px;
-    align-items: flex-end;
+    gap: 8px;
+    align-items: baseline;
+    list-style: none;
   }
+  details.tool summary::-webkit-details-marker { display: none; }
+  details.tool summary::before { content: '\25B8'; color: var(--fg-muted); font-size: 10px; }
+  details.tool[open] summary::before { content: '\25BE'; }
+  .tool-name { font-weight: 600; color: var(--tool); font-family: var(--mono); font-size: 12.5px; }
+  details.tool.done .tool-name { color: var(--result); }
+  details.tool.error .tool-name { color: var(--err); }
+  .tool-brief { color: var(--fg-muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+  .tool-badge { font-size: 11px; color: var(--warn); white-space: nowrap; }
+  .tool-body { padding: 0 10px 8px; }
+  .tool-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-muted); margin: 6px 0 3px; }
+  .tool-body pre {
+    margin: 0;
+    padding: 6px 8px;
+    background: var(--bg-alt);
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: var(--mono);
+    font-size: 12px;
+    max-height: 320px;
+    overflow: auto;
+  }
+  .tool-body pre.err { color: var(--err); }
+
+  .note { color: var(--fg-muted); font-size: 12px; margin: 6px 0; }
+  .note.warn { color: var(--warn); }
+  .error-block {
+    margin: 6px 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--err);
+    background: rgba(243, 139, 168, 0.08);
+    color: var(--err);
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  /* Legacy pi blocks */
+  .block { margin-bottom: 8px; padding: 6px 10px; border-radius: 6px; border-left: 3px solid var(--border-strong); background: var(--bg-block); }
+  .block .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; opacity: 0.85; }
+  .block pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 13px; }
+  .block.tool { border-color: var(--tool); } .block.tool_result { border-color: var(--result); }
+  .block.thinking { color: var(--thinking); font-style: italic; background: transparent; }
+
+  /* Activity bar */
+  .activity {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 12px;
+    background: var(--bg-block);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--fg-muted);
+    font-size: 12px;
+    font-family: var(--mono);
+  }
+  .activity.visible { display: flex; }
+  .activity-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; flex-shrink: 0; }
+  .activity.waiting .activity-dot { background: var(--warn); }
+  .activity.done .activity-dot { animation: none; background: var(--result); opacity: 0.6; }
+  .activity.failed .activity-dot { animation: none; background: var(--err); }
+  .activity.stopped .activity-dot { animation: none; background: var(--fg-muted); }
+  .activity.done .activity-label, .activity.stopped .activity-label { color: var(--fg-muted); }
+  .activity-label { color: var(--fg); font-weight: 600; }
+  @keyframes pulse { 0%, 100% { opacity: 0.3; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1); } }
+
+  /* Runtime request panel */
+  #request-panel {
+    display: none;
+    border: 1px solid var(--warn);
+    border-radius: 8px;
+    background: var(--bg-block);
+    padding: 10px 12px;
+    max-height: 45vh;
+    overflow-y: auto;
+  }
+  #request-panel.visible { display: block; }
+  .rq-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; }
+  .rq-title { font-weight: 600; }
+  .rq-count { color: var(--fg-muted); font-size: 12px; margin-left: auto; }
+  .rq-desc { color: var(--fg-muted); font-size: 12.5px; margin-bottom: 6px; }
+  .rq-salient {
+    margin: 0 0 8px;
+    padding: 6px 8px;
+    background: var(--bg-alt);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow: auto;
+  }
+  .rq-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .rq-actions input[type=text], .rq-other input {
+    flex: 1;
+    min-width: 160px;
+    padding: 6px 8px;
+    background: var(--bg-input);
+    color: var(--fg);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    font-size: 13px;
+  }
+  .rq-question { margin-bottom: 10px; }
+  .rq-qhead { display: flex; gap: 8px; align-items: baseline; margin-bottom: 5px; }
+  .rq-chip { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--bg); background: var(--accent); border-radius: 4px; padding: 1px 5px; }
+  .rq-hint { color: var(--fg-muted); font-size: 11px; }
+  .rq-options { display: flex; gap: 6px; flex-wrap: wrap; }
+  .rq-options button { text-align: left; }
+  .rq-options button .sub { display: block; font-size: 11px; color: var(--fg-muted); }
+  .rq-options button.selected { border-color: var(--accent); background: rgba(137, 180, 250, 0.18); }
+  .rq-other { margin-top: 6px; display: none; }
+  .rq-other.visible { display: flex; }
+  .rq-sending { color: var(--fg-muted); font-size: 12px; }
+
+  /* Composer */
+  #composer { display: flex; gap: 6px; align-items: flex-end; }
   #prompt {
     flex: 1;
     min-height: 36px;
@@ -114,21 +255,22 @@
     padding: 8px 10px;
     background: var(--bg-input);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-strong);
     border-radius: 6px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 13px;
-    resize: vertical;
+    font-family: inherit;
+    font-size: 13.5px;
+    resize: none;
   }
   #prompt:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
   button {
-    padding: 8px 14px;
+    padding: 7px 14px;
     background: var(--bg-block);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-strong);
     border-radius: 6px;
     cursor: pointer;
     font-size: 13px;
+    font-family: inherit;
   }
   button:hover { background: var(--border); }
   button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
@@ -136,144 +278,806 @@
   button.danger { background: var(--err); color: var(--bg); border-color: var(--err); }
   button.danger:hover { filter: brightness(1.1); }
   button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Permission mode chip (left of Send) and its menu */
+  .mode-wrap { position: relative; display: none; }
+  .mode-wrap.visible { display: block; }
+  #mode { padding: 7px 10px; font-family: var(--mono); font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
+  #mode[data-mode=acceptEdits] { color: var(--accent); border-color: var(--accent); }
+  #mode[data-mode=plan] { color: var(--result); border-color: var(--result); }
+  #mode[data-mode=auto] { color: var(--warn); border-color: var(--warn); }
+  #mode[data-mode=dontAsk], #mode[data-mode=bypassPermissions] { color: var(--err); border-color: var(--err); }
+  #mode.pending { opacity: 0.65; }
+  #mode-menu {
+    display: none;
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 6px);
+    min-width: 190px;
+    padding: 4px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    z-index: 10;
+  }
+  #mode-menu.visible { display: block; }
+  #mode-menu button { display: flex; width: 100%; gap: 8px; border: none; background: transparent; text-align: left; font-size: 12.5px; padding: 5px 8px; }
+  #mode-menu button:hover { background: var(--bg-block); }
+  #mode-menu .mark { width: 12px; color: var(--accent); }
+  #mode-menu .hint { padding: 4px 8px 2px; color: var(--fg-muted); font-size: 11px; white-space: nowrap; }
+
+  /* highlight.js tokens (Catppuccin Mocha) */
+  .hljs-keyword, .hljs-selector-tag, .hljs-built_in { color: #cba6f7; }
+  .hljs-string, .hljs-attr-value, .hljs-template-string { color: #a6e3a1; }
+  .hljs-number, .hljs-literal { color: #fab387; }
+  .hljs-comment, .hljs-quote { color: #6c7086; font-style: italic; }
+  .hljs-title, .hljs-title.function_, .hljs-section { color: #89b4fa; }
+  .hljs-type, .hljs-title.class_ { color: #f9e2af; }
+  .hljs-attr, .hljs-attribute, .hljs-property { color: #89dceb; }
+  .hljs-variable, .hljs-params { color: #f2cdcd; }
+  .hljs-meta, .hljs-symbol { color: #f5c2e7; }
+  .hljs-addition { color: #a6e3a1; } .hljs-deletion { color: #f38ba8; }
+  .hljs-regexp, .hljs-link { color: #f5c2e7; }
 </style>
+<script>/*__VENDOR_JS__*/</script>
 </head>
 <body>
-  <div id="status">Idle</div>
-  <div id="messages"></div>
+  <div id="timeline-wrap">
+    <div id="messages"></div>
+    <button id="jump">&darr; Latest</button>
+  </div>
+  <div id="activity" class="activity">
+    <span class="activity-dot"></span>
+    <span class="activity-label">Starting</span>
+    <span class="activity-meta"></span>
+  </div>
+  <div id="request-panel"></div>
   <div id="composer">
-    <textarea id="prompt" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+    <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+    <div class="mode-wrap">
+      <div id="mode-menu"></div>
+      <button id="mode" title="Permission mode (Shift+Tab in the message box cycles)"></button>
+    </div>
     <button id="submit" class="primary">Send</button>
     <button id="stop" class="danger" disabled>Stop</button>
   </div>
 <script>
+(function () {
+  'use strict';
   // The Rust side calls window.__setTabId(N) when an agent tab is activated.
-  // Every IPC message we post back includes this id so the dispatcher in
-  // Rust can route the prompt/stop to the correct tab.
+  // Every IPC message carries it so Rust routes to the right tab.
+  // `permissionMode` is the Claude tab's configured mode (null for other
+  // backends); the replayed buffer's ready/permission_mode_changed events
+  // override it.
   window.__currentTabId = null;
-  window.__setTabId = function(id) { window.__currentTabId = id; };
+  window.__setTabId = function (id, permissionMode) {
+    window.__currentTabId = id;
+    resetMode(permissionMode == null ? null : permissionMode);
+  };
 
   const messagesEl = document.getElementById('messages');
-  const statusEl = document.getElementById('status');
+  const jumpBtn = document.getElementById('jump');
   const promptEl = document.getElementById('prompt');
   const submitBtn = document.getElementById('submit');
   const stopBtn = document.getElementById('stop');
+  const panelEl = document.getElementById('request-panel');
+  const activityEl = document.getElementById('activity');
+  const activityLabelEl = activityEl.querySelector('.activity-label');
+  const activityMetaEl = activityEl.querySelector('.activity-meta');
 
-  function setStatus(state) {
-    statusEl.className = state;
-    statusEl.textContent = ({
-      idle: 'Idle',
-      streaming: 'Streaming…',
-      stopped: 'Stopped',
-      errored: 'Error',
-    }[state]) || state;
-    submitBtn.disabled = state === 'streaming';
-    stopBtn.disabled = state !== 'streaming';
+  const MAX_TOOL_OUTPUT = 20000;
+
+  // ---- state -------------------------------------------------------------
+  let busy = false;           // a turn is in flight
+  let replaying = false;      // __replay is feeding the buffer
+  let follow = true;          // live-follow: stick to the bottom
+  let segment = null;         // current assistant text segment
+  let thinking = null;        // current thinking block
+  const items = new Map();    // tool_use id -> card state
+  const pending = new Map();  // request_id -> {tool_use_id, kind, sending}
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
   }
-
-  function addBlock(kind, label, body) {
-    const block = document.createElement('div');
-    block.className = 'block ' + kind;
-    if (kind !== 'system' && label) {
-      const lab = document.createElement('div');
-      lab.className = 'label';
-      lab.textContent = label;
-      block.appendChild(lab);
-    }
-    const pre = document.createElement('pre');
-    pre.textContent = body;
-    block.appendChild(pre);
-    messagesEl.appendChild(block);
-    // Stick to bottom unless the user has scrolled up.
-    const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
-    if (nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
-
-  // Reset the conversation surface (called by Rust on tab activation before replay).
-  window.__resetConversation = function() {
-    messagesEl.innerHTML = '';
-    setStatus('idle');
-  };
-
-  // Single-event injection point. Rust calls this with each AgentEvent::Other payload
-  // (the inner serde_json::Value). The shape is whatever pi/claude wrote on stdout —
-  // we branch on `type` and render minimally. Step 9 will polish (markdown, tool
-  // collapse, syntax highlighting, etc.).
-  window.__appendEvent = function(event) {
-    if (!event || typeof event !== 'object') return;
-    const t = event.type;
-    if (t === 'user_prompt') {
-      addBlock('user', 'User', event.text || '');
-      setStatus('streaming');
-    } else if (t === 'session' || t === 'agent_start' || t === 'turn_start') {
-      // Quiet system events — show nothing for now.
-    } else if (t === 'turn_end') {
-      const msg = event.message;
-      if (msg && Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block.type === 'thinking' && block.thinking) {
-            addBlock('thinking', 'Thinking', block.thinking);
-          } else if (block.type === 'text' && block.text) {
-            addBlock('text', 'Assistant', block.text);
-          } else if (block.type === 'toolCall' || block.type === 'tool_use') {
-            const name = block.name || 'tool';
-            const args = block.arguments
-              ? JSON.stringify(block.arguments, null, 2)
-              : '';
-            addBlock('tool', `Tool · ${name}`, args);
-          }
-        }
-      }
-      if (Array.isArray(event.toolResults)) {
-        for (const r of event.toolResults) {
-          const out = typeof r === 'string' ? r : JSON.stringify(r, null, 2);
-          addBlock('tool_result', 'Tool result', out);
-        }
-      }
-    } else if (t === 'done') {
-      setStatus('idle');
-    } else if (t === 'stopped') {
-      setStatus('stopped');
-    } else if (t === 'error') {
-      addBlock('error', 'Error', event.message || JSON.stringify(event));
-      setStatus('errored');
-    } else {
-      // Unknown event — show a one-line system note for debugging until Step 4
-      // ships a typed parser.
-      addBlock('system', '', '· ' + (t || 'unknown event'));
-    }
-  };
-
   function postIpc(payload) {
     if (!window.ipc || typeof window.ipc.postMessage !== 'function') return;
-    window.ipc.postMessage(JSON.stringify({ ...payload, tabId: window.__currentTabId }));
+    window.ipc.postMessage(JSON.stringify(Object.assign({}, payload, { tabId: window.__currentTabId })));
   }
 
+  // ---- scrolling ---------------------------------------------------------
+  function atBottom() {
+    return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
+  }
+  messagesEl.addEventListener('scroll', () => {
+    follow = atBottom();
+    jumpBtn.classList.toggle('visible', !follow);
+  });
+  let scrollQueued = false;
+  function scrollIfFollowing() {
+    if (replaying || !follow || scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(() => {
+      scrollQueued = false;
+      if (follow) messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  }
+  jumpBtn.addEventListener('click', () => {
+    follow = true;
+    jumpBtn.classList.remove('visible');
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+  function append(node) {
+    messagesEl.appendChild(node);
+    scrollIfFollowing();
+    return node;
+  }
+
+  // ---- markdown ----------------------------------------------------------
+  const hasMarked = typeof window.marked !== 'undefined';
+  const hasHljs = typeof window.hljs !== 'undefined';
+  function highlight(code, lang) {
+    if (hasHljs && lang && hljs.getLanguage(lang)) {
+      try { return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value; } catch (e) { console.error('highlight failed', e); }
+    }
+    return escapeHtml(code);
+  }
+  if (hasMarked) {
+    marked.use({
+      gfm: true,
+      // Single newlines are hard breaks: slash-command replies (`/model`,
+      // `/help`) are plain multi-line text, and streamed prose never wraps.
+      breaks: true,
+      renderer: {
+        // Agent output is untrusted: raw HTML is shown as text.
+        html(html) { return escapeHtml(html); },
+        code(code, info) {
+          const lang = (info || '').trim().split(/\s+/)[0] || '';
+          return '<div class="codeblock">' + (lang ? '<span class="lang">' + escapeHtml(lang) + '</span>' : '') +
+            '<button class="copy" type="button">Copy</button><pre><code class="hljs">' + highlight(code, lang) + '</code></pre></div>';
+        },
+        link(href, title, text) {
+          if (!/^(https?:|mailto:)/i.test(href || '')) return text;
+          return '<a href="' + escapeHtml(href) + '"' + (title ? ' title="' + escapeHtml(title) + '"' : '') + '>' + text + '</a>';
+        },
+        // No remote fetches from the chat: images render as links.
+        image(href, title, text) {
+          if (!/^https?:/i.test(href || '')) return escapeHtml(text || '');
+          return '<a href="' + escapeHtml(href) + '">' + escapeHtml(text || href) + '</a>';
+        },
+      },
+    });
+  }
+  function renderMarkdown(src) {
+    if (!hasMarked) return '<p style="white-space:pre-wrap">' + escapeHtml(src) + '</p>';
+    try { return marked.parse(src); } catch (e) {
+      console.error('markdown render failed', e);
+      return '<p style="white-space:pre-wrap">' + escapeHtml(src) + '</p>';
+    }
+  }
+
+  // Copy buttons and links (delegated).
+  function copyText(text, btn) {
+    const done = () => { btn.textContent = 'Copied'; btn.classList.add('done'); setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1200); };
+    const fallback = () => {
+      const ta = el('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { console.error('copy failed', e); }
+      ta.remove();
+      if (ok) done(); else btn.textContent = 'Copy failed';
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      fallback();
+    }
+  }
+  document.addEventListener('click', (e) => {
+    const copy = e.target.closest('.codeblock .copy');
+    if (copy) {
+      const code = copy.parentElement.querySelector('code');
+      copyText(code ? code.textContent : '', copy);
+      return;
+    }
+    const a = e.target.closest('a');
+    if (a) {
+      e.preventDefault();
+      const href = a.getAttribute('href') || '';
+      if (/^https?:/i.test(href)) postIpc({ type: 'open_url', url: href });
+    }
+  });
+
+  // ---- assistant text segments -------------------------------------------
+  // Streamed text is rendered as markdown only up to the last newline; the
+  // unfinished line shows as plain text until it completes.
+  function renderSegment(final) {
+    if (!segment) return;
+    const raw = segment.raw;
+    const cut = final ? raw.length : raw.lastIndexOf('\n') + 1;
+    if (cut !== segment.renderedUpTo) {
+      segment.mdEl.innerHTML = renderMarkdown(raw.slice(0, cut));
+      segment.renderedUpTo = cut;
+    }
+    segment.tailEl.textContent = raw.slice(cut);
+    scrollIfFollowing();
+  }
+  function textDelta(text) {
+    if (!segment) {
+      endThinking();
+      const root = append(el('div', 'assistant'));
+      segment = { raw: '', renderedUpTo: -1, mdEl: root.appendChild(el('div')), tailEl: root.appendChild(el('span', 'tail')), queued: false };
+    }
+    segment.raw += text;
+    if (replaying) return; // rendered once at segment end
+    if (!segment.queued) {
+      segment.queued = true;
+      const s = segment;
+      requestAnimationFrame(() => { s.queued = false; if (segment === s) renderSegment(false); });
+    }
+  }
+  function endSegment() {
+    if (!segment) return;
+    renderSegment(true);
+    segment = null;
+  }
+
+  // ---- thinking ----------------------------------------------------------
+  function thinkingDelta(text) {
+    endSegment();
+    if (!text) return; // redacted thinking: activity bar only
+    if (!thinking) {
+      const d = append(el('details', 'thinking'));
+      d.appendChild(el('summary', null, 'Thinking'));
+      thinking = { details: d, body: d.appendChild(el('div', 'body')) };
+    }
+    thinking.body.textContent += text;
+    scrollIfFollowing();
+  }
+  function endThinking() { thinking = null; }
+
+  // ---- tool cards --------------------------------------------------------
+  function salient(name, input) {
+    if (!input || typeof input !== 'object') return '';
+    switch (name) {
+      case 'Bash': return input.command || '';
+      case 'Read': case 'Write': case 'Edit': case 'MultiEdit': return input.file_path || '';
+      case 'NotebookEdit': return input.notebook_path || '';
+      case 'Grep': case 'Glob': return input.pattern || '';
+      case 'WebFetch': return input.url || '';
+      case 'WebSearch': return input.query || '';
+      case 'Task': case 'Agent': return input.description || '';
+      default: return '';
+    }
+  }
+  function itemStarted(id, kind) {
+    endSegment(); endThinking();
+    const name = kind && kind.name ? kind.name : 'tool';
+    const d = append(el('details', 'tool running'));
+    d.open = true;
+    const summary = d.appendChild(el('summary'));
+    summary.appendChild(el('span', 'tool-name', name));
+    const brief = summary.appendChild(el('span', 'tool-brief'));
+    const badge = summary.appendChild(el('span', 'tool-badge'));
+    const body = d.appendChild(el('div', 'tool-body'));
+    body.appendChild(el('div', 'tool-label', 'Input'));
+    const inputEl = body.appendChild(el('pre'));
+    const item = { card: d, name, brief, badge, body, inputEl, outputEl: null, raw: '', input: kind && kind.input };
+    items.set(id, item);
+    if (item.input && Object.keys(item.input).length) showInput(item, item.input);
+    setActivity('Calling ' + name);
+  }
+  function showInput(item, input) {
+    item.input = input;
+    item.brief.textContent = salient(item.name, input);
+    item.inputEl.textContent = JSON.stringify(input, null, 2);
+  }
+  function itemInputDelta(id, partial) {
+    const item = items.get(id);
+    if (!item) return;
+    item.raw += partial;
+    if (item.raw.trimEnd().endsWith('}')) {
+      try { showInput(item, JSON.parse(item.raw)); setActivity('Running ' + item.name); } catch (e) { /* still streaming */ }
+    }
+  }
+  function itemCompleted(id, output, isError) {
+    const item = items.get(id);
+    if (!item) return;
+    item.card.classList.remove('running');
+    item.card.classList.add(isError ? 'error' : 'done');
+    item.body.appendChild(el('div', 'tool-label', isError ? 'Error' : 'Result'));
+    let text = output || '(no output)';
+    if (text.length > MAX_TOOL_OUTPUT) text = text.slice(0, MAX_TOOL_OUTPUT) + '\n… (' + (output.length - MAX_TOOL_OUTPUT) + ' more characters)';
+    item.outputEl = item.body.appendChild(el('pre', isError ? 'err' : null, text));
+    item.badge.textContent = '';
+    item.card.open = false;
+    setActivity('Thinking');
+    scrollIfFollowing();
+  }
+
+  // ---- activity bar ------------------------------------------------------
+  const activity = { startMs: 0, label: '', timer: null, frozenMs: null, tokens: null, cost: null, timed: true };
+  function fmtDur(ms) {
+    const s = ms / 1000;
+    if (s < 60) return s.toFixed(1) + 's';
+    return Math.floor(s / 60) + 'm ' + Math.floor(s % 60) + 's';
+  }
+  function paintActivity() {
+    activityLabelEl.textContent = activity.label;
+    const parts = [];
+    if (activity.timed) parts.push(fmtDur(activity.frozenMs != null ? activity.frozenMs : Date.now() - activity.startMs));
+    if (activity.tokens) parts.push('↓ ' + activity.tokens + ' tokens');
+    if (activity.cost != null) parts.push('$' + activity.cost.toFixed(4) + ' session');
+    activityMetaEl.textContent = parts.join(' · ');
+  }
+  function startActivity(label) {
+    activity.startMs = Date.now();
+    activity.frozenMs = null; activity.tokens = null; activity.cost = null;
+    activity.timed = !replaying;
+    activity.label = label;
+    activityEl.className = 'activity visible';
+    if (activity.timer) clearInterval(activity.timer);
+    activity.timer = replaying ? null : setInterval(paintActivity, 500);
+    paintActivity();
+  }
+  function setActivity(label, cls) {
+    if (!busy) return;
+    activity.label = label;
+    activityEl.className = 'activity visible' + (cls ? ' ' + cls : '');
+    paintActivity();
+  }
+  function finishActivity(label, cls, tokens, cost) {
+    if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
+    activity.frozenMs = Date.now() - activity.startMs;
+    if (typeof tokens === 'number') activity.tokens = tokens;
+    if (typeof cost === 'number') activity.cost = cost;
+    activity.label = label;
+    activityEl.className = 'activity visible ' + cls;
+    paintActivity();
+  }
+
+  // ---- composer ----------------------------------------------------------
+  function refreshComposer() {
+    // Typing stays possible while a request is pending; sending waits.
+    submitBtn.disabled = busy || pending.size > 0;
+    stopBtn.disabled = !busy;
+  }
+  function setBusy(b) { busy = b; refreshComposer(); }
   function submitPrompt() {
+    if (submitBtn.disabled) return;
     const text = promptEl.value.trim();
     if (!text) return;
     postIpc({ type: 'submit', text });
     promptEl.value = '';
     promptEl.style.height = 'auto';
+    follow = true;
   }
-
   submitBtn.addEventListener('click', submitPrompt);
   stopBtn.addEventListener('click', () => postIpc({ type: 'stop' }));
-
   promptEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       submitPrompt();
+    } else if (e.key === 'Tab' && e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      cycleMode();
     }
   });
-
-  // Auto-grow textarea up to max-height.
   promptEl.addEventListener('input', () => {
     promptEl.style.height = 'auto';
     promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + 'px';
   });
 
-  setStatus('idle');
+  // ---- permission mode ---------------------------------------------------
+  // `current` is only ever a mode the harness confirmed (ready, or the reply
+  // to set_permission_mode) or the configured mode of a tab whose process
+  // has not started yet (the Rust side confirms those itself). `pending` is
+  // the last mode asked for and not yet confirmed.
+  const MODE_LABELS = {
+    default: 'Default', acceptEdits: 'Accept edits', plan: 'Plan mode',
+    auto: 'Auto mode', dontAsk: "Don't ask", bypassPermissions: 'Bypass permissions',
+  };
+  // The CLI's Shift+Tab order. A tab launched in a mode outside it (e.g.
+  // bypassPermissions) keeps that mode at the end so it can cycle back.
+  const MODE_CYCLE = ['default', 'acceptEdits', 'plan', 'auto'];
+  const modeWrapEl = document.querySelector('.mode-wrap');
+  const modeBtn = document.getElementById('mode');
+  const modeMenuEl = document.getElementById('mode-menu');
+  const mode = { current: null, pending: null, extra: [] };
+  function modeLabel(m) { return MODE_LABELS[m] || m; }
+  function modeList() { return MODE_CYCLE.concat(mode.extra); }
+  function renderMode() {
+    modeWrapEl.classList.toggle('visible', mode.current != null);
+    if (mode.current == null) { modeMenuEl.classList.remove('visible'); return; }
+    modeBtn.dataset.mode = mode.current;
+    modeBtn.classList.toggle('pending', mode.pending != null);
+    modeBtn.textContent = modeLabel(mode.current) + (mode.pending != null ? ' → ' + modeLabel(mode.pending) + '…' : '');
+    modeMenuEl.innerHTML = '';
+    modeMenuEl.appendChild(el('div', 'hint', 'Permission mode · Shift+Tab cycles'));
+    for (const m of modeList()) {
+      const b = el('button');
+      b.appendChild(el('span', 'mark', m === mode.current ? '✓' : (m === mode.pending ? '…' : '')));
+      b.appendChild(el('span', null, modeLabel(m)));
+      b.addEventListener('click', () => { modeMenuEl.classList.remove('visible'); requestMode(m); promptEl.focus(); });
+      modeMenuEl.appendChild(b);
+    }
+  }
+  function confirmMode(m) {
+    if (!m) return;
+    if (!MODE_CYCLE.includes(m) && !mode.extra.includes(m)) mode.extra.push(m);
+    mode.current = m;
+    if (mode.pending === m) mode.pending = null;
+    renderMode();
+  }
+  function resetMode(m) {
+    mode.current = null; mode.pending = null; mode.extra = [];
+    if (m) confirmMode(m); else renderMode();
+  }
+  function clearPendingMode() {
+    if (mode.pending == null) return;
+    mode.pending = null;
+    renderMode();
+  }
+  function requestMode(m) {
+    if (mode.current == null || m === (mode.pending != null ? mode.pending : mode.current)) return;
+    mode.pending = m;
+    renderMode();
+    postIpc({ type: 'set_permission_mode', mode: m });
+  }
+  function cycleMode() {
+    if (mode.current == null) return;
+    const list = modeList();
+    const from = list.indexOf(mode.pending != null ? mode.pending : mode.current);
+    requestMode(list[(from + 1) % list.length]);
+  }
+  modeBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    modeMenuEl.classList.toggle('visible');
+  });
+  document.addEventListener('click', (e) => {
+    if (!modeMenuEl.contains(e.target)) modeMenuEl.classList.remove('visible');
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') modeMenuEl.classList.remove('visible');
+  });
+
+  // ---- runtime requests (panel above the composer) -----------------------
+  function answer(requestId, decision) {
+    const req = pending.get(requestId);
+    if (!req || req.sending) return;
+    req.sending = true;
+    postIpc({ type: 'answer', requestId, decision });
+    renderPanel();
+  }
+  function rememberSuggestion(kind) {
+    return (kind.suggestions || []).find((s) => s && s.destination === 'localSettings') || null;
+  }
+  function describeRule(s) {
+    if (!s) return '';
+    if (Array.isArray(s.rules)) return s.rules.map((r) => r.toolName + (r.ruleContent ? '(' + r.ruleContent + ')' : '')).join(', ');
+    if (s.mode) return 'mode ' + s.mode;
+    return s.type || '';
+  }
+  function permissionSalient(kind) {
+    const input = kind.input || {};
+    const s = salient(kind.tool_name, input);
+    if (kind.tool_name === 'Bash' && s) return s;
+    if (s && ['Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(kind.tool_name)) return s;
+    return JSON.stringify(input, null, 2);
+  }
+  function renderPermission(requestId, req) {
+    const kind = req.kind;
+    const frag = document.createDocumentFragment();
+    const head = frag.appendChild(el('div', 'rq-head'));
+    head.appendChild(el('span', 'rq-title', 'Allow ' + kind.tool_name + '?'));
+    if (pending.size > 1) head.appendChild(el('span', 'rq-count', '1 of ' + pending.size));
+    const input = kind.input || {};
+    if (input.description) frag.appendChild(el('div', 'rq-desc', input.description));
+    if (kind.decision_reason) frag.appendChild(el('div', 'rq-desc', kind.decision_reason));
+    frag.appendChild(el('pre', 'rq-salient', permissionSalient(kind)));
+    const actions = frag.appendChild(el('div', 'rq-actions'));
+    if (req.sending) {
+      actions.appendChild(el('span', 'rq-sending', 'Sending answer…'));
+      return frag;
+    }
+    const allow = actions.appendChild(el('button', 'primary', 'Allow once'));
+    allow.addEventListener('click', () => answer(requestId, { kind: 'allow' }));
+    const remember = rememberSuggestion(kind);
+    if (remember) {
+      const b = actions.appendChild(el('button', null, 'Allow and remember'));
+      b.title = 'Saves ' + describeRule(remember) + ' to .claude/settings.local.json';
+      b.addEventListener('click', () => answer(requestId, { kind: 'allow', remember }));
+    }
+    const reason = actions.appendChild(el('input'));
+    reason.type = 'text';
+    reason.placeholder = 'Reason for denying (optional)';
+    const deny = actions.appendChild(el('button', 'danger', 'Deny'));
+    const doDeny = () => answer(requestId, { kind: 'deny', message: reason.value.trim() || 'The user denied this tool call.' });
+    deny.addEventListener('click', doDeny);
+    reason.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doDeny(); } });
+    return frag;
+  }
+  function renderQuestion(requestId, req) {
+    const questions = Array.isArray(req.kind.questions) ? req.kind.questions : [];
+    const frag = document.createDocumentFragment();
+    const head = frag.appendChild(el('div', 'rq-head'));
+    head.appendChild(el('span', 'rq-title', 'Claude has ' + (questions.length === 1 ? 'a question' : questions.length + ' questions')));
+    if (pending.size > 1) head.appendChild(el('span', 'rq-count', '1 of ' + pending.size));
+    if (req.sending) {
+      frag.appendChild(el('span', 'rq-sending', 'Sending answer…'));
+      return frag;
+    }
+    if (!req.answers) req.answers = questions.map(() => ({ selected: new Set(), other: '', otherOn: false }));
+    const submit = el('button', 'primary', 'Submit');
+    const refresh = () => {
+      submit.disabled = !req.answers.every((a) => a.selected.size > 0 || (a.otherOn && a.other.trim()));
+    };
+    questions.forEach((q, qi) => {
+      const st = req.answers[qi];
+      const box = frag.appendChild(el('div', 'rq-question'));
+      const qh = box.appendChild(el('div', 'rq-qhead'));
+      if (q.header) qh.appendChild(el('span', 'rq-chip', q.header));
+      qh.appendChild(el('span', null, q.question || ''));
+      if (q.multiSelect) qh.appendChild(el('span', 'rq-hint', 'choose any'));
+      const opts = box.appendChild(el('div', 'rq-options'));
+      const buttons = [];
+      (q.options || []).forEach((o) => {
+        const b = opts.appendChild(el('button'));
+        b.type = 'button';
+        b.appendChild(document.createTextNode(o.label));
+        if (o.description) b.appendChild(el('span', 'sub', o.description));
+        if (st.selected.has(o.label)) b.classList.add('selected');
+        buttons.push([b, o.label]);
+        b.addEventListener('click', () => {
+          if (q.multiSelect) {
+            if (st.selected.has(o.label)) st.selected.delete(o.label); else st.selected.add(o.label);
+          } else {
+            st.selected = new Set([o.label]);
+            st.otherOn = false;
+          }
+          buttons.forEach(([bb, label]) => bb.classList.toggle('selected', st.selected.has(label)));
+          otherBtn.classList.toggle('selected', st.otherOn);
+          otherRow.classList.toggle('visible', st.otherOn);
+          refresh();
+        });
+      });
+      const otherBtn = opts.appendChild(el('button', st.otherOn ? 'selected' : null, 'Other…'));
+      otherBtn.type = 'button';
+      const otherRow = box.appendChild(el('div', 'rq-other' + (st.otherOn ? ' visible' : '')));
+      const otherInput = otherRow.appendChild(el('input'));
+      otherInput.type = 'text';
+      otherInput.placeholder = 'Your answer';
+      otherInput.value = st.other;
+      otherInput.addEventListener('input', () => { st.other = otherInput.value; refresh(); });
+      otherBtn.addEventListener('click', () => {
+        st.otherOn = !st.otherOn;
+        if (!q.multiSelect && st.otherOn) st.selected = new Set();
+        buttons.forEach(([bb, label]) => bb.classList.toggle('selected', st.selected.has(label)));
+        otherBtn.classList.toggle('selected', st.otherOn);
+        otherRow.classList.toggle('visible', st.otherOn);
+        if (st.otherOn) otherInput.focus();
+        refresh();
+      });
+    });
+    const actions = frag.appendChild(el('div', 'rq-actions'));
+    actions.appendChild(submit);
+    submit.addEventListener('click', () => {
+      const answers = {};
+      questions.forEach((q, qi) => {
+        const st = req.answers[qi];
+        const picked = (q.options || []).map((o) => o.label).filter((l) => st.selected.has(l));
+        if (st.otherOn && st.other.trim()) picked.push(st.other.trim());
+        answers[q.question || ''] = picked.join(', ');
+      });
+      answer(requestId, { kind: 'answer_question', answers });
+    });
+    const deny = actions.appendChild(el('button', null, 'Dismiss'));
+    deny.addEventListener('click', () => answer(requestId, { kind: 'deny', message: 'The user declined to answer.' }));
+    refresh();
+    return frag;
+  }
+  function renderPanel() {
+    panelEl.innerHTML = '';
+    const first = pending.entries().next();
+    if (first.done) {
+      panelEl.classList.remove('visible');
+    } else {
+      const [requestId, req] = first.value;
+      panelEl.appendChild(req.kind.type === 'question' ? renderQuestion(requestId, req) : renderPermission(requestId, req));
+      panelEl.classList.add('visible');
+    }
+    refreshComposer();
+  }
+  function runtimeRequest(d) {
+    endSegment();
+    pending.set(d.request_id, { tool_use_id: d.tool_use_id, kind: d.kind, sending: false });
+    const item = items.get(d.tool_use_id);
+    if (item) item.badge.textContent = d.kind.type === 'question' ? 'waiting for your answer' : 'waiting for approval';
+    setActivity(d.kind.type === 'question' ? 'Waiting for your answer' : 'Waiting for approval: ' + (d.kind.tool_name || ''), 'waiting');
+    renderPanel();
+  }
+  function runtimeResolved(requestId) {
+    const req = pending.get(requestId);
+    if (!req) return;
+    pending.delete(requestId);
+    const item = items.get(req.tool_use_id);
+    if (item) { item.badge.textContent = ''; setActivity('Running ' + item.name); }
+    renderPanel();
+  }
+  function clearPending() {
+    for (const req of pending.values()) {
+      const item = items.get(req.tool_use_id);
+      if (item) item.badge.textContent = '';
+    }
+    pending.clear();
+    renderPanel();
+  }
+
+  // ---- harness events ----------------------------------------------------
+  function note(text, cls) { append(el('div', 'note' + (cls ? ' ' + cls : ''), text)); }
+  function errorBlock(text) { endSegment(); append(el('div', 'error-block', text)); }
+
+  function harnessEvent(ev) {
+    const d = ev.data;
+    switch (ev.type) {
+      case 'ready':
+        confirmMode(d.permission_mode);
+        note(d.session_id ? 'Resumed Claude session ' + d.session_id.slice(0, 8) + ' · permission mode ' + (d.permission_mode || '?')
+                          : 'Claude session ready · permission mode ' + (d.permission_mode || '?'));
+        break;
+      case 'turn_started':
+        break;
+      case 'text_delta':
+        endThinking();
+        textDelta(d);
+        setActivity('Responding');
+        break;
+      case 'thinking_delta':
+        thinkingDelta(d);
+        setActivity('Thinking');
+        break;
+      case 'item_started':
+        itemStarted(d.id, d.kind);
+        break;
+      case 'item_input_delta':
+        itemInputDelta(d.id, d.partial_json);
+        break;
+      case 'item_completed':
+        itemCompleted(d.id, d.output, d.is_error);
+        break;
+      case 'runtime_request':
+        runtimeRequest(d);
+        break;
+      case 'runtime_request_resolved':
+        runtimeResolved(d.request_id);
+        break;
+      case 'turn_completed': {
+        endSegment(); endThinking();
+        clearPending();
+        const st = d.status || {};
+        const tokens = d.usage && typeof d.usage.output_tokens === 'number' ? d.usage.output_tokens : null;
+        if (st.state === 'completed') finishActivity('Done', 'done', tokens, d.cost_usd);
+        else if (st.state === 'interrupted') { finishActivity('Interrupted', 'stopped', tokens, d.cost_usd); note('Interrupted', 'warn'); }
+        else { finishActivity('Failed', 'failed', tokens, d.cost_usd); errorBlock(st.message || 'Turn failed'); }
+        setBusy(false);
+        break;
+      }
+      case 'permission_mode_changed':
+        confirmMode(d);
+        note('Permission mode · ' + modeLabel(d));
+        break;
+      case 'error':
+        // A rejected or undeliverable mode change surfaces as an error.
+        clearPendingMode();
+        errorBlock(d);
+        break;
+      case 'process_exited':
+        endSegment(); endThinking();
+        clearPending();
+        clearPendingMode();
+        if (busy) finishActivity('Claude exited', 'failed');
+        note('Claude process exited' + (d.code != null ? ' (code ' + d.code + ')' : '') + '. The next message resumes the session.');
+        setBusy(false);
+        break;
+      default:
+        console.warn('unknown harness event', ev);
+    }
+  }
+
+  // ---- legacy (pi) events --------------------------------------------------
+  function addBlock(kind, label, body) {
+    const block = el('div', 'block ' + kind);
+    if (label) block.appendChild(el('div', 'label', label));
+    block.appendChild(el('pre', null, body));
+    append(block);
+  }
+  function legacyEvent(event) {
+    const t = event.type;
+    if (t === 'turn_end') {
+      const msg = event.message;
+      if (msg && Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === 'thinking' && block.thinking) addBlock('thinking', 'Thinking', block.thinking);
+          else if (block.type === 'text' && block.text) { textDelta(block.text); endSegment(); }
+          else if (block.type === 'toolCall' || block.type === 'tool_use') addBlock('tool', 'Tool · ' + (block.name || 'tool'), block.arguments ? JSON.stringify(block.arguments, null, 2) : '');
+        }
+      }
+      if (Array.isArray(event.toolResults)) {
+        for (const r of event.toolResults) addBlock('tool_result', 'Tool result', typeof r === 'string' ? r : JSON.stringify(r, null, 2));
+      }
+    } else if (t === 'done') {
+      finishActivity('Done', 'done'); setBusy(false);
+    } else if (t === 'stopped') {
+      finishActivity('Stopped', 'stopped'); setBusy(false);
+    } else if (t === 'error') {
+      errorBlock(event.message || JSON.stringify(event));
+      finishActivity('Failed', 'failed'); setBusy(false);
+    }
+    // session / agent_start / turn_start and anything else: quiet.
+  }
+
+  // ---- entry points (called from Rust) -------------------------------------
+  window.__appendEvent = function (event) {
+    if (!event || typeof event !== 'object') return;
+    try {
+      if (event.kind === 'harness') { harnessEvent(event.event); return; }
+      if (event.type === 'user_prompt') {
+        endSegment(); endThinking();
+        append(el('div', 'user-msg', event.text || ''));
+        follow = true;
+        setBusy(true);
+        startActivity('Starting');
+        return;
+      }
+      legacyEvent(event);
+    } catch (e) {
+      console.error('render failed for event', event, e);
+      errorBlock('Chat view could not render an event: ' + e);
+    }
+  };
+
+  // Replay a tab's buffered conversation in one go.
+  window.__replay = function (events) {
+    replaying = true;
+    try {
+      for (const ev of events) window.__appendEvent(ev);
+      endSegment();
+    } finally {
+      replaying = false;
+    }
+    if (busy) {
+      // Turn still running: keep the label, restart a live clock.
+      activity.timed = false;
+      if (!activity.timer) activity.timer = setInterval(paintActivity, 500);
+    }
+    paintActivity();
+    follow = true;
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  };
+
+  window.__resetConversation = function () {
+    messagesEl.innerHTML = '';
+    segment = null; thinking = null;
+    items.clear(); pending.clear();
+    if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
+    activityEl.className = 'activity';
+    follow = true;
+    jumpBtn.classList.remove('visible');
+    renderPanel();
+    setBusy(false);
+  };
+
+  window.__focusComposer = function () { promptEl.focus(); };
+
+  refreshComposer();
+  promptEl.focus();
+})();
 </script>
 </body>
 </html>

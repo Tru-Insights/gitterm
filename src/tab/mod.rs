@@ -1,8 +1,8 @@
 //! Tab content kinds.
 //!
-//! Today there are two variants: `Terminal` (with an optional file viewer overlay)
-//! and `Agent` (Claude Code or pi-backed conversational tab — data shape only at
-//! this step; subprocess plumbing lands in Step 3).
+//! Today there are two variants: `Terminal` and `Agent` (Claude Code or pi-backed
+//! conversational tab). Either can carry a file viewer overlay, which is held on
+//! `TabState` in main.rs.
 //!
 //! `TabState` itself lives in `main.rs` because it's tightly coupled to many in-binary
 //! helpers (file load, syntax highlight, git status, claude config). Only the tab-kind
@@ -16,7 +16,8 @@ mod agent;
 #[allow(unused_imports)]
 pub(crate) use agent::{
     spawn_agent_task, AgentBackend, AgentBackendConfig, AgentEvent, AgentInput, AgentSession,
-    AgentSessionState, AgentTaskHandle,
+    AgentSessionState, AgentTaskHandle, HistoryLoad, CLAUDE_PERMISSION_MODES,
+    DEFAULT_CLAUDE_PERMISSION_MODE,
 };
 
 use std::path::PathBuf;
@@ -28,8 +29,9 @@ use crate::agent as agent_log;
 use crate::FileVersionSignature;
 use crate::SyntaxHighlightLine;
 
-/// File viewer state attached to a Terminal tab while the user is viewing a file.
-/// Closing the file (Back / Close button) drops this back to None and reveals the terminal.
+/// File viewer state attached to a tab (terminal or agent) while the user is viewing a
+/// file. Closing the file (Back / Close button) drops this back to None and reveals the
+/// tab's own content again.
 pub(crate) struct FileViewerOverlay {
     pub(crate) path: PathBuf,
     pub(crate) file_content: String,
@@ -66,19 +68,14 @@ impl FileViewerOverlay {
     }
 }
 
-/// Per-terminal-tab state. A terminal tab can optionally have a file viewer overlay
-/// open on top of its terminal (modal-style); closing the overlay restores the terminal view.
+/// Per-terminal-tab state. The file viewer overlay that can sit on top of the terminal
+/// lives on `TabState` (main.rs) so agent tabs can host it too.
 pub(crate) struct TerminalTab {
     pub(crate) terminal: Option<iced_term::Terminal>,
     /// Title set by the shell/programs via OSC escape codes.
     pub(crate) terminal_title: Option<String>,
     /// Optional command to run after shell init (e.g. "claude" for Claude Code tabs).
     pub(crate) startup_command: Option<String>,
-    /// Modal file viewer overlay sitting on top of the terminal.
-    pub(crate) file_viewer: Option<FileViewerOverlay>,
-    /// Debounce: most-recent `ViewFile` request this tab received, to suppress double-clicks.
-    pub(crate) last_view_request_path: Option<PathBuf>,
-    pub(crate) last_view_request_at: Option<Instant>,
 }
 
 impl TerminalTab {
@@ -87,14 +84,11 @@ impl TerminalTab {
             terminal: None,
             terminal_title: None,
             startup_command: None,
-            file_viewer: None,
-            last_view_request_path: None,
-            last_view_request_at: None,
         }
     }
 }
 
-/// Tab content kind. Terminal tabs run a shell (with an optional file viewer overlay);
+/// Tab content kind. Terminal tabs run a shell;
 /// Agent tabs host a Claude Code or pi conversation in a wry webview.
 ///
 /// Variant size differs significantly (TerminalTab ~5KB, AgentSession ~200B) but

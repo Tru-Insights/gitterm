@@ -4,6 +4,7 @@ use crate::browser_control::{
     BrowserCaptureMode, BrowserControlService, BrowserKey, BrowserLaunchOptions, BrowserLocator,
     BrowserNodeSelector, BrowserOperation, BrowserSnapshot, BrowserViewport, BrowserWaitCondition,
 };
+use crate::harness::claude::ClaudeMcpServer;
 use axum::{
     body::Body,
     extract::State,
@@ -80,6 +81,18 @@ impl BrowserMcpConnection {
     pub fn codex_config_overrides(&self) -> [String; 4] {
         codex_config_overrides(&self.endpoint)
     }
+
+    /// The browser server for a natively spawned Claude session (chat
+    /// tabs): the same config and read-only pre-approvals
+    /// `configure_claude_command` injects into terminal launches, with the
+    /// token carried in the child environment.
+    pub fn claude_mcp_server(&self) -> ClaudeMcpServer {
+        ClaudeMcpServer {
+            config: claude_mcp_config(&self.endpoint),
+            allowed_tools: claude_allowed_tools(),
+            env: self.terminal_environment().into(),
+        }
+    }
 }
 
 /// Add ephemeral MCP configuration immediately after the Codex executable so
@@ -146,7 +159,20 @@ pub fn configure_claude_command(command: &str, endpoint: &str) -> String {
     if executable_name != "claude" || command.contains("\"gitterm_browser\"") {
         return command.to_string();
     }
-    let config = serde_json::json!({
+    let config = claude_mcp_config(endpoint).to_string();
+    if config.contains('\'') {
+        // Embedded single-quoted; GitTerm never produces such an endpoint.
+        return command.to_string();
+    }
+    let allowed = claude_allowed_tools().join(",");
+    format!(
+        "{executable} --mcp-config='{config}' --allowedTools={allowed}{rest}",
+        rest = &trimmed[executable_end..]
+    )
+}
+
+fn claude_mcp_config(endpoint: &str) -> serde_json::Value {
+    serde_json::json!({
         "mcpServers": {
             "gitterm_browser": {
                 "type": "http",
@@ -157,18 +183,12 @@ pub fn configure_claude_command(command: &str, endpoint: &str) -> String {
             },
         },
     })
-    .to_string();
-    if config.contains('\'') {
-        // Embedded single-quoted; GitTerm never produces such an endpoint.
-        return command.to_string();
-    }
-    let allowed = CLAUDE_ALLOWED_READ_TOOLS
+}
+
+fn claude_allowed_tools() -> Vec<String> {
+    CLAUDE_ALLOWED_READ_TOOLS
         .map(|tool| format!("mcp__gitterm_browser__{tool}"))
-        .join(",");
-    format!(
-        "{executable} --mcp-config='{config}' --allowedTools={allowed}{rest}",
-        rest = &trimmed[executable_end..]
-    )
+        .to_vec()
 }
 
 /// Define a session-local zsh wrapper so Codex launched manually from a
@@ -1083,6 +1103,20 @@ mod tests {
             .codex_config_overrides()
             .iter()
             .any(|value| value.contains(&environment[1].1)));
+
+        // Chat tabs get the terminal launch's config and pre-approvals, with
+        // the token only in the child environment.
+        let server = connection.claude_mcp_server();
+        let config = server.config.to_string();
+        assert!(config.contains("\"gitterm_browser\""));
+        assert!(!config.contains(&environment[1].1));
+        let terminal = configure_claude_command("claude", connection.endpoint());
+        assert!(terminal.contains(&format!("--mcp-config='{config}'")));
+        assert!(terminal.contains(&format!(
+            "--allowedTools={}",
+            server.allowed_tools.join(",")
+        )));
+        assert_eq!(server.env, environment.to_vec());
     }
 
     #[test]

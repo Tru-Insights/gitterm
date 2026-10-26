@@ -4,6 +4,7 @@
 //! command bridge and is handled by the Iced application event loop, preserving
 //! one owner for persistence, worktree provisioning, tabs, and UI state.
 
+use crate::harness::claude::ClaudeMcpServer;
 use axum::{
     body::Body,
     extract::State,
@@ -192,6 +193,18 @@ impl TaskMcpConnection {
 
     pub fn codex_config_overrides(&self) -> [String; 4] {
         codex_config_overrides(&self.endpoint)
+    }
+
+    /// The task server for a natively spawned Claude session (chat tabs):
+    /// the same config and pre-approval `configure_claude_command` injects
+    /// into terminal launches, with the token carried in the child
+    /// environment.
+    pub fn claude_mcp_server(&self) -> ClaudeMcpServer {
+        ClaudeMcpServer {
+            config: claude_mcp_config(&self.endpoint),
+            allowed_tools: vec![CLAUDE_ALLOWED_TOOLS.to_string()],
+            env: self.terminal_environment().into(),
+        }
     }
 
     /// Plain HTTP endpoint for harness notify hooks, on the same
@@ -727,6 +740,20 @@ mod tests {
             .codex_config_overrides()
             .iter()
             .any(|value| value.contains(&environment[1].1)));
+
+        // Chat tabs get the terminal launch's config and pre-approvals, with
+        // the token only in the child environment.
+        let server = connection.claude_mcp_server();
+        let config = server.config.to_string();
+        assert!(config.contains("\"gitterm_tasks\""));
+        assert!(!config.contains(&environment[1].1));
+        let terminal = configure_claude_command("claude", connection.endpoint());
+        assert!(terminal.contains(&format!("--mcp-config='{config}'")));
+        assert!(terminal.contains(&format!(
+            "--allowedTools={}",
+            server.allowed_tools.join(",")
+        )));
+        assert_eq!(server.env, environment.to_vec());
     }
 
     #[test]
