@@ -9749,7 +9749,7 @@ impl App {
         // Return startup tasks (menu init + initial git status for active tab)
         let mut startup_tasks = vec![Task::done(Event::InitMenu), Self::request_syntect_warmup()];
         if !app.active_workspace_is_remote() {
-            if let Some((tab_id, repo_path)) = {
+            let refresh_target = {
                 if let Some(tab) = app.active_tab_mut() {
                     tab.git_status_loading = true;
                     tab.last_poll = Instant::now();
@@ -9757,7 +9757,8 @@ impl App {
                 } else {
                     None
                 }
-            } {
+            };
+            if let Some((tab_id, repo_path)) = refresh_target {
                 startup_tasks.push(Self::request_git_status(tab_id, repo_path));
             }
         }
@@ -9905,7 +9906,7 @@ impl App {
                 self.add_tab_with_command(dir, local_command);
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
-                if let Some((tab_id, repo_path)) = {
+                let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
                         tab.git_status_loading = true;
                         tab.chat_session_id = chat_session_id;
@@ -9913,7 +9914,8 @@ impl App {
                     } else {
                         None
                     }
-                } {
+                };
+                if let Some((tab_id, repo_path)) = refresh_target {
                     return Task::batch([
                         self.scroll_to_active_tab(),
                         self.request_git_status_for_active_source(tab_id, repo_path),
@@ -13214,14 +13216,15 @@ fi
                     self.add_tab_with_command(dir, Some(cmd));
                     self.mark_workspaces_dirty();
                     self.mark_log_server_dirty();
-                    if let Some((tab_id, repo_path)) = {
+                    let refresh_target = {
                         if let Some(tab) = self.active_tab_mut() {
                             tab.git_status_loading = true;
                             Some((tab.id, tab.repo_path.clone()))
                         } else {
                             None
                         }
-                    } {
+                    };
+                    if let Some((tab_id, repo_path)) = refresh_target {
                         return Task::batch([
                             self.scroll_to_active_tab(),
                             self.request_git_status_for_active_source(tab_id, repo_path),
@@ -13393,14 +13396,15 @@ fi
                 self.add_tab(path);
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
-                if let Some((tab_id, repo_path)) = {
+                let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
                         tab.git_status_loading = true;
                         Some((tab.id, tab.repo_path.clone()))
                     } else {
                         None
                     }
-                } {
+                };
+                if let Some((tab_id, repo_path)) = refresh_target {
                     return Task::batch([
                         self.scroll_to_active_tab(),
                         self.request_git_status_for_active_source(tab_id, repo_path),
@@ -15145,7 +15149,7 @@ fi
                 }
 
                 let mut tasks = vec![self.scroll_to_active_tab()];
-                if let Some((tab_id, repo_path)) = {
+                let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
                         tab.git_status_loading = true;
                         tab.last_poll = Instant::now();
@@ -15153,7 +15157,8 @@ fi
                     } else {
                         None
                     }
-                } {
+                };
+                if let Some((tab_id, repo_path)) = refresh_target {
                     tasks.push(self.request_git_status_for_active_source(tab_id, repo_path));
                 }
 
@@ -16932,14 +16937,15 @@ fi
                 self.slide_target = new_target;
                 self.slide_animating = false;
                 self.slide_start_time = None;
-                if let Some((tab_id, repo_path)) = {
+                let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
                         tab.git_status_loading = true;
                         Some((tab.id, tab.repo_path.clone()))
                     } else {
                         None
                     }
-                } {
+                };
+                if let Some((tab_id, repo_path)) = refresh_target {
                     return self.request_git_status_for_active_source(tab_id, repo_path);
                 }
             }
