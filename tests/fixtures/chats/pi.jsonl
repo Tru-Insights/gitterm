@@ -1,0 +1,6 @@
+{"type":"session","version":3,"id":"s-pi","cwd":"/Users/dev/GitRepo/sample"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"sketch the reattach plan"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"Three steps: find the socket, replay, resume."}]}}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"what about stale sockets?"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"Unlink them when connect fails with ECONNREFUSED."}]}}
+{"type":"message","message":{"role":"toolResult","content":[{"type":"text","text":"tool output"}]}}

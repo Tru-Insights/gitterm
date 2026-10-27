@@ -22,6 +22,10 @@ const HEAD_SCAN_BYTES: u64 = 256 * 1024;
 const HEAD_SCAN_LINES: usize = 60;
 /// Bytes read from the end of a transcript for the preview tail.
 const TAIL_READ_BYTES: u64 = 128 * 1024;
+/// Bytes read from the end of a transcript for Claude's own title. The
+/// CLI rewrites its `ai-title` line through the session, so the end of a
+/// file nearly always holds the current one.
+const TITLE_TAIL_BYTES: u64 = 64 * 1024;
 /// Messages shown in the preview tail.
 const PREVIEW_MESSAGES: usize = 8;
 /// Truncation length for titles derived from the first user message.
@@ -70,6 +74,28 @@ impl ChatBackend {
             "pi" => Some(ChatBackend::Pi),
             _ => None,
         }
+    }
+}
+
+/// One conversation on one machine (`remote_id` None = this Mac). A
+/// conversation moved to another machine keeps its session id, so the id
+/// alone can name two transcripts; every lookup goes through both.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChatRef {
+    pub remote_id: Option<String>,
+    pub id: String,
+}
+
+impl ChatRef {
+    pub fn new(remote_id: Option<&str>, id: &str) -> Self {
+        Self {
+            remote_id: remote_id.map(str::to_string),
+            id: id.to_string(),
+        }
+    }
+
+    pub fn local(id: &str) -> Self {
+        Self::new(None, id)
     }
 }
 
@@ -354,21 +380,40 @@ fn scan_head(path: &Path) -> std::io::Result<HeadScan> {
     Ok(out)
 }
 
+/// The latest title Claude generated for a session (`{"type":"ai-title",
+/// "aiTitle":…}` lines), if `lines` hold one.
+fn claude_ai_title(lines: &[String]) -> Option<String> {
+    lines.iter().rev().find_map(|line| {
+        if !line.contains("\"ai-title\"") {
+            return None;
+        }
+        let value: Value = serde_json::from_str(line).ok()?;
+        if value.get("type")?.as_str()? != "ai-title" {
+            return None;
+        }
+        let title = value.get("aiTitle")?.as_str()?.trim();
+        (!title.is_empty()).then(|| title.to_string())
+    })
+}
+
 /// Complete JSONL lines from the last `TAIL_READ_BYTES` of the file.
 fn read_tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
+    read_tail_lines_bounded(path, TAIL_READ_BYTES)
+}
+
+/// Complete JSONL lines from the last `max_bytes` of the file: at most
+/// `max_bytes` are read, and the first line is dropped when the read
+/// starts mid-file (it is a partial line).
+fn read_tail_lines_bounded(path: &Path, max_bytes: u64) -> std::io::Result<Vec<String>> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let start = len.saturating_sub(TAIL_READ_BYTES);
+    let start = len.saturating_sub(max_bytes);
     file.seek(SeekFrom::Start(start))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).or_else(|_| {
-        // A seek can land mid-UTF-8; retry lossily.
-        file.seek(SeekFrom::Start(start))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        buf = String::from_utf8_lossy(&bytes).into_owned();
-        Ok::<usize, std::io::Error>(buf.len())
-    })?;
+    // `take` keeps the read bounded even if the file grows meanwhile.
+    let mut bytes = Vec::new();
+    file.take(max_bytes).read_to_end(&mut bytes)?;
+    // A seek can land mid-UTF-8; that partial first line is dropped below.
+    let buf = String::from_utf8_lossy(&bytes);
     let mut lines: Vec<String> = buf.lines().map(str::to_string).collect();
     // The first line is truncated unless we started at 0.
     if start > 0 && !lines.is_empty() {
@@ -385,7 +430,13 @@ fn index_transcript(path: &Path, backend: ChatBackend) -> Option<ChatIndexEntry>
     if head.headless {
         return None;
     }
-    let title = head.title?;
+    // A session with no real user message is an empty shell, even if
+    // Claude titled it.
+    let first_message_title = head.title?;
+    let title = read_tail_lines_bounded(path, TITLE_TAIL_BYTES)
+        .ok()
+        .and_then(|lines| claude_ai_title(&lines))
+        .unwrap_or(first_message_title);
     let cwd = head.cwd?;
     let id = path.file_stem()?.to_string_lossy().to_string();
     let dead_cwd = !cwd.exists();
@@ -603,7 +654,7 @@ fn index_pi_transcript(path: &Path) -> Option<ChatIndexEntry> {
 }
 
 /// Resolved git identity of a cwd: (main-repo root, is_worktree).
-fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
+pub(crate) fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
     let out = crate::agentd::git::git_command()
         .args([
             "--no-optional-locks",
@@ -631,7 +682,7 @@ fn resolve_repo_root(cwd: &Path) -> Option<(PathBuf, bool)> {
 
 /// All .jsonl files up to `depth` directory levels below `root`
 /// (claude/pi: slug/file = 1; codex: YYYY/MM/DD/file = 3).
-fn jsonl_files_under(root: &Path, depth: usize) -> Vec<PathBuf> {
+pub(crate) fn jsonl_files_under(root: &Path, depth: usize) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut dirs = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, level)) = dirs.pop() {
@@ -772,6 +823,26 @@ pub fn load_preview(path: &Path, backend: ChatBackend) -> ChatPreview {
     let Ok(lines) = read_tail_lines(path) else {
         return ChatPreview::default();
     };
+    preview_from_lines(&lines, backend)
+}
+
+/// Bytes read from the end of a transcript for a ranking snippet
+/// ([`load_snippet_preview`]): smaller than the preview's tail, since a
+/// snippet needs only the last ask and the last reply.
+pub const SNIPPET_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The preview messages in the last [`SNIPPET_TAIL_BYTES`] of a
+/// transcript, parsed as [`load_preview`] parses its tail. Blocking; run
+/// on a background Task. An unreadable file is an error for the caller
+/// to report; a tail with no conversation text is an empty preview.
+pub fn load_snippet_preview(path: &Path, backend: ChatBackend) -> std::io::Result<ChatPreview> {
+    let lines = read_tail_lines_bounded(path, SNIPPET_TAIL_BYTES)?;
+    Ok(preview_from_lines(&lines, backend))
+}
+
+/// The last [`PREVIEW_MESSAGES`] conversation messages of `lines` (oldest
+/// first), and claude's message count when the tail carries one.
+fn preview_from_lines(lines: &[String], backend: ChatBackend) -> ChatPreview {
     let mut messages = Vec::new();
     let mut message_count = None;
     for line in lines.iter().rev() {
@@ -839,6 +910,24 @@ mod tests {
             "message": {"role": "user", "content": text}
         })
         .to_string()
+    }
+
+    #[test]
+    fn index_prefers_claudes_latest_generated_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = user_line("/tmp/x", "main", "it is just coming to my attention");
+        let path = write_transcript(
+            dir.path(),
+            "abc-456.jsonl",
+            &[
+                real.as_str(),
+                r#"{"type":"ai-title","aiTitle":"First guess","sessionId":"abc-456"}"#,
+                r#"{"type":"assistant","message":{"role":"assistant","content":"ok"}}"#,
+                r#"{"type":"ai-title","aiTitle":"Org snapshot billing period regression","sessionId":"abc-456"}"#,
+            ],
+        );
+        let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
+        assert_eq!(entry.title, "Org snapshot billing period regression");
     }
 
     #[test]
@@ -1093,6 +1182,25 @@ mod tests {
         let preview = load_preview(&path, ChatBackend::Codex);
         assert_eq!(preview.messages.len(), PREVIEW_MESSAGES);
         assert_eq!(preview.messages.last().unwrap().text, "turn 11");
+    }
+
+    #[test]
+    fn bounded_tail_drops_the_partial_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_transcript(dir.path(), "t.jsonl", &["aaaaaaaa", "bbbb", "cccc"]);
+        // The file is 18 bytes ("aaaaaaaa\nbbbb\ncccc"): 15 starts inside "a…".
+        assert_eq!(
+            read_tail_lines_bounded(&path, 15).unwrap(),
+            ["bbbb", "cccc"]
+        );
+        // The whole file: nothing dropped.
+        assert_eq!(
+            read_tail_lines_bounded(&path, 1024).unwrap(),
+            ["aaaaaaaa", "bbbb", "cccc"]
+        );
+        // Starting exactly on a line boundary still drops one line: the
+        // reader cannot tell, and a lost line only shortens the tail.
+        assert_eq!(read_tail_lines_bounded(&path, 9).unwrap(), ["cccc"]);
     }
 
     #[test]

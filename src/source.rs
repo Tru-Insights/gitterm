@@ -85,6 +85,9 @@ pub struct SourceDirEntry {
     pub name: String,
     pub path: SourcePath,
     pub is_dir: bool,
+    /// A directory holding a `.git` entry. Remote agents that predate the
+    /// field always report false.
+    pub is_git_repo: bool,
 }
 
 /// One directory listing, shaped identically for every source.
@@ -462,6 +465,7 @@ fn local_list_dir(
         let is_dir = path.is_dir();
         let item = SourceDirEntry {
             name,
+            is_git_repo: is_dir && path.join(".git").exists(),
             path: SourcePath::Local(path),
             is_dir,
         };
@@ -546,6 +550,7 @@ async fn remote_list_dir(
                         name: entry.name,
                         path: SourcePath::Remote(entry.path),
                         is_dir: entry.is_dir,
+                        is_git_repo: entry.is_git_repo,
                     })
                     .collect(),
                 error: None,
@@ -605,6 +610,8 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join("src")).unwrap();
         std::fs::write(repo.path().join("src").join("main.rs"), "fn main() {}").unwrap();
+        // Hidden from the listing, but marks src/ as a repo over the wire.
+        std::fs::create_dir(repo.path().join("src").join(".git")).unwrap();
         std::fs::write(repo.path().join("Cargo.toml"), "[package]\n").unwrap();
         let canonical_root = std::fs::canonicalize(repo.path())
             .unwrap()
@@ -650,6 +657,8 @@ mod tests {
         assert_eq!(listing.parent, None);
         let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["src", "Cargo.toml"]);
+        assert!(listing.entries[0].is_git_repo);
+        assert!(!listing.entries[1].is_git_repo);
 
         // Navigate into src/ using the opaque entry path, as the UI does.
         let src_path = listing.entries[0].path.clone();
@@ -782,6 +791,30 @@ mod tests {
                 ("z-dir".to_string(), true),
                 ("a.txt".to_string(), false),
                 ("beta.txt".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_listing_marks_git_repos() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("repo").join(".git")).unwrap();
+        std::fs::create_dir(root.path().join("worktree")).unwrap();
+        std::fs::write(root.path().join("worktree").join(".git"), "gitdir: x").unwrap();
+        std::fs::create_dir(root.path().join("plain")).unwrap();
+
+        let listing = local_list_dir(1, root.path(), root.path().to_path_buf(), false);
+        let marks: Vec<(String, bool)> = listing
+            .entries
+            .iter()
+            .map(|e| (e.name.clone(), e.is_git_repo))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                ("plain".to_string(), false),
+                ("repo".to_string(), true),
+                ("worktree".to_string(), true),
             ]
         );
     }

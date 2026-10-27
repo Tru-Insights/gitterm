@@ -1,0 +1,10 @@
+Provenance of the chat transcript fixtures used by src/chat_rank.rs tests.
+
+claude.jsonl, codex.jsonl, pi.jsonl   -- SYNTHETIC
+  Hand-written in the on-disk transcript shapes that src/chats.rs parses
+  (claude: type/message.content lines; codex: response_item payload
+  messages; pi: type "message" with message.role/content). No real
+  conversation was copied. Each one mixes conversation lines with lines
+  the snippet must skip (tool calls and results, meta and harness-injected
+  "<...>" user text, developer instructions, bookkeeping) to pin the
+  snippet as "the last human ask plus the last assistant text".

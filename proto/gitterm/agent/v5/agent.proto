@@ -16,6 +16,25 @@ service GitTermAgent {
   // stores (claude/codex/pi) with the same code the desktop uses locally.
   rpc ListChats(ListChatsRequest) returns (ListChatsResponse);
   rpc ChatPreview(ChatPreviewRequest) returns (ChatPreviewResponse);
+  // Native Claude chat (TRU-152), capability "claude_chat". With
+  // capability "claude_chat_persistent" the agent owns each chat's
+  // `claude` process: a stream only attaches to it, and ending the stream
+  // detaches. Before that capability the process lived as long as the
+  // stream.
+  rpc ClaudeChat(stream ClaudeChatClientMessage) returns (stream ClaudeChatServerMessage);
+  // A Claude session's transcript, parsed into the chat timeline.
+  rpc ClaudeChatHistory(ClaudeChatHistoryRequest) returns (ClaudeChatHistoryResponse);
+  // The Claude chats the agent is running (capability
+  // "claude_chat_persistent").
+  rpc ListClaudeChats(ListClaudeChatsRequest) returns (ListClaudeChatsResponse);
+  // Phone access (TRU-151), capability "phone": the agent serves a small
+  // web app on its phone address. A pairing is a one-time code a phone
+  // redeems there for a device token.
+  rpc CreatePhonePairing(CreatePhonePairingRequest) returns (CreatePhonePairingResponse);
+  rpc ListPhones(ListPhonesRequest) returns (ListPhonesResponse);
+  // Forget a paired phone: its token stops working and its open sockets
+  // close at once.
+  rpc RevokePhone(RevokePhoneRequest) returns (RevokePhoneResponse);
 }
 
 message HandshakeRequest {
@@ -29,6 +48,9 @@ message HandshakeResponse {
   string agent_version = 2;
   uint32 protocol_version = 3;
   repeated string capabilities = 4;
+  // The agent user's $HOME, so pickers can start there. Empty from agents
+  // that predate it.
+  string home_dir = 5;
 }
 
 message ListDirRequest {
@@ -49,6 +71,9 @@ message DirEntry {
   string name = 1;
   string path = 2;
   bool is_dir = 3;
+  // Directory contains a `.git` entry (file or dir). False from agents
+  // that predate it.
+  bool is_git_repo = 4;
 }
 
 message ReadFileRequest {
@@ -240,4 +265,150 @@ message ChatPreviewMessage {
 message ChatPreviewResponse {
   repeated ChatPreviewMessage messages = 1;
   optional uint64 message_count = 2;
+}
+
+message ClaudeChatClientMessage {
+  oneof message {
+    // First message only: the session config as JSON (cwd, model,
+    // permission_mode, effort, resume, chrome). With
+    // "claude_chat_persistent", a resume id naming a running chat attaches
+    // to it instead of starting a second process.
+    string start_json = 1;
+    // Every later message: one harness command as JSON.
+    string command_json = 2;
+    // First message only, instead of start_json, from a client that knows
+    // "claude_chat_persistent": attach to a running chat or start one. The
+    // agent answers with `opened` before anything else.
+    ClaudeChatAttach attach = 3;
+  }
+}
+
+message ClaudeChatAttach {
+  // A chat id from an earlier `opened`: attach to that chat, NOT_FOUND when
+  // it is no longer running. Empty: start from start_json, which attaches
+  // instead when its resume id names a running chat.
+  string chat_id = 1;
+  // Replay every buffered event after this seq (the last one this client
+  // saw of the chat). Unset: no replay; the client reads the history
+  // itself (ClaudeChatHistory) and continues from live events.
+  optional uint64 after_seq = 2;
+  // The start config JSON, as in start_json. Required when chat_id is empty.
+  string start_json = 3;
+}
+
+message ClaudeChatServerMessage {
+  // One harness event as JSON. Empty on an `opened` message.
+  string event_json = 1;
+  // Agents with "claude_chat_persistent": the event's place in its chat,
+  // from 1 and increasing by 1 per relayed event. 0 on `opened` and on
+  // notices meant only for this stream (an undecodable command).
+  uint64 seq = 2;
+  // The first message of an `attach` stream; nothing else is set on it.
+  ClaudeChatOpened opened = 3;
+  // An event this stream's position already covers, sent again because it
+  // is still in force: the session's ready / mode / model / effort, the
+  // running turn's start, or an unanswered runtime request (so it can be
+  // answered).
+  bool redelivered = 4;
+}
+
+message ClaudeChatOpened {
+  string chat_id = 1;
+  // True when the stream joined a chat that was already running (no new
+  // process was started).
+  bool attached = 2;
+  // Empty until Claude reports it.
+  string claude_session_id = 3;
+  // The last seq assigned before this stream attached. Live events follow
+  // it; replayed ones (after_seq < seq <= head_seq) come first.
+  uint64 head_seq = 4;
+  // after_seq was set, but events after it are no longer buffered: nothing
+  // is replayed, the client reloads the history and continues from
+  // head_seq. Redelivered state still follows.
+  bool gap = 5;
+}
+
+message ClaudeChatHistoryRequest {
+  string session_id = 1;
+}
+
+message ListClaudeChatsRequest {}
+
+message ListClaudeChatsResponse {
+  repeated ClaudeChatInfo chats = 1;
+}
+
+enum ClaudeChatState {
+  CLAUDE_CHAT_STATE_UNSPECIFIED = 0;
+  // No turn running and nothing awaiting the human.
+  CLAUDE_CHAT_STATE_IDLE = 1;
+  CLAUDE_CHAT_STATE_TURN_RUNNING = 2;
+  // A runtime request (permission prompt, question) is unanswered.
+  CLAUDE_CHAT_STATE_AWAITING_INPUT = 3;
+}
+
+message ClaudeChatInfo {
+  string chat_id = 1;
+  // Empty until Claude reports it.
+  string claude_session_id = 2;
+  string cwd = 3;
+  ClaudeChatState state = 4;
+  uint64 created_unix_secs = 5;
+  uint64 last_activity_unix_secs = 6;
+  uint32 attached_clients = 7;
+}
+
+message ClaudeChatHistoryResponse {
+  // The transcript's timeline entries as a JSON array. A session with no
+  // transcript on the agent's machine is NOT_FOUND instead.
+  string timeline_json = 1;
+}
+
+message CreatePhonePairingRequest {
+  // Shown in the paired-phones list ("Tracey's iPhone").
+  string device_name = 1;
+  // "view" or "act" (empty: "view"). The agent may grant less than asked;
+  // the response says what the phone will get.
+  string scope = 2;
+}
+
+message CreatePhonePairingResponse {
+  // Single use; expires at expires_unix_secs.
+  string code = 1;
+  // http://<phone host:port>/pair#<code>: the code rides in the fragment,
+  // which browsers never send to a server or proxy.
+  string pairing_url = 2;
+  uint64 expires_unix_secs = 3;
+  // The scope the phone is granted when it pairs.
+  string scope = 4;
+  // The same pairing as `code`, for typing into the phone's home-screen
+  // app (which cannot open the pairing URL): 8 Crockford base32
+  // characters shown as XXXX-XXXX. Either code spends the pairing.
+  // Empty from an agent older than this field.
+  string short_code = 5;
+}
+
+message ListPhonesRequest {}
+
+message PairedPhone {
+  string id = 1;
+  string name = 2;
+  // "view" | "act"
+  string scope = 3;
+  uint64 created_unix_secs = 4;
+  // 0: never used since pairing.
+  uint64 last_seen_unix_secs = 5;
+}
+
+message ListPhonesResponse {
+  repeated PairedPhone phones = 1;
+}
+
+message RevokePhoneRequest {
+  string id = 1;
+}
+
+message RevokePhoneResponse {
+  // False when no phone had the id.
+  bool revoked = 1;
 }

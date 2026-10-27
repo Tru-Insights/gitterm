@@ -1,0 +1,51 @@
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#1e1e2e" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="GitTerm" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="apple-touch-icon" href="icon-180.png" />
+<style>
+  /* Phone view of the desktop chat page (TRU-151): a narrow, touch-sized
+     layout with a top bar. The composer and the prompt answers show only
+     while a phone paired to act is live on a running chat
+     (body.phone-act); a view-only phone (body.phone-view) and saved
+     history only read. */
+  html, body { height: 100%; height: 100dvh; -webkit-text-size-adjust: 100%; }
+  body {
+    font-size: 15px;
+    gap: 6px;
+    padding: calc(env(safe-area-inset-top) + 6px) calc(env(safe-area-inset-right) + 6px) calc(env(safe-area-inset-bottom) + 6px) calc(env(safe-area-inset-left) + 6px);
+  }
+  #messages { padding: 10px 11px; -webkit-overflow-scrolling: touch; }
+  #composer { display: none !important; }
+  body.phone-act #composer { display: flex !important; }
+  /* No model, effort, mode, checkout or review from a phone, and no
+     images: only Send and Stop. */
+  body.phone-act #toolbar .tb-chips, #attachments { display: none !important; }
+  body.phone-act #toolbar .tb-send { flex: 1; justify-content: flex-end; }
+  body.phone-act #toolbar .tb-send button { padding: 8px 18px; font-size: 15px; min-height: 38px; }
+  /* 16px keeps iOS from zooming into the field on focus. */
+  body.phone-act #prompt { font-size: 16px; max-height: 30vh; }
+  /* Withdrawing a queued message is the desktop's. */
+  .queued-tag button { display: none !important; }
+  /* Prompts show what Claude waits on; only an acting phone answers. */
+  body:not(.phone-act) .rq-actions, body:not(.phone-act) .rq-options, body:not(.phone-act) .rq-other { display: none !important; }
+  body.phone-act .rq-actions button, body.phone-act .rq-options button { min-height: 36px; }
+  body.phone-view #request-panel::after {
+    content: "Claude is waiting for an answer in GitTerm. This phone can only view.";
+    display: block;
+    margin-top: 6px;
+    color: var(--warn);
+    font-size: 12.5px;
+  }
+  #phone-bar { display: flex; align-items: center; gap: 8px; min-height: 40px; }
+  #phone-bar a { flex: none; padding: 6px 10px; border-radius: 8px; color: var(--accent); text-decoration: none; font-size: 15px; }
+  #phone-title { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--fg); }
+  #phone-state { flex: none; font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--fg-muted); }
+  #phone-state.live { color: var(--user); border-color: var(--user); }
+  #phone-state.warn { color: var(--warn); border-color: var(--warn); }
+  #phone-state.err { color: var(--err); border-color: var(--err); }
+  pre, code { font-size: 12.5px; }
+</style>

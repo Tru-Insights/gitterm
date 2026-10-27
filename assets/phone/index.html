@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#1e1e2e" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="GitTerm" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="apple-touch-icon" href="icon-180.png" />
+<meta name="color-scheme" content="dark" />
+<title>GitTerm chats</title>
+<style>
+  :root { --bg: #1e1e2e; --bg-alt: #181825; --card: #24273a; --fg: #cdd6f4; --muted: #7f849c; --accent: #89b4fa; --ok: #a6e3a1; --warn: #f9e2af; --err: #f38ba8; --border: #45475a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; -webkit-text-size-adjust: 100%; }
+  header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 10px; padding: calc(env(safe-area-inset-top) + 10px) calc(env(safe-area-inset-right) + 16px) 10px calc(env(safe-area-inset-left) + 16px); background: rgba(30, 30, 46, 0.94); border-bottom: 1px solid var(--border); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+  header h1 { flex: 1; min-width: 0; margin: 0; font-size: 19px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header .who { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
+  header button { flex: none; padding: 8px 12px; border-radius: 9px; border: 1px solid var(--border); background: var(--card); color: var(--fg); font: inherit; font-size: 14px; }
+  main { padding: 6px calc(env(safe-area-inset-right) + 12px) calc(env(safe-area-inset-bottom) + 24px) calc(env(safe-area-inset-left) + 12px); }
+  h2 { margin: 18px 4px 8px; font-size: 13px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  li a { display: block; padding: 12px 14px; border-radius: 12px; background: var(--card); border: 1px solid transparent; color: inherit; text-decoration: none; }
+  li a:active { border-color: var(--accent); }
+  .title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-weight: 500; word-break: break-word; }
+  .meta { margin-top: 4px; display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); min-width: 0; }
+  .meta .where { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .badge { flex: none; font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .badge.turn_running { color: var(--accent); border-color: var(--accent); }
+  .badge.awaiting_input { color: var(--warn); border-color: var(--warn); }
+  .badge.live { color: var(--ok); border-color: var(--ok); }
+  .empty, #notice { padding: 14px 16px; border-radius: 12px; background: var(--bg-alt); color: var(--muted); }
+  #notice { margin-top: 14px; border: 1px solid var(--border); color: var(--fg); }
+  #notice.err { border-color: var(--err); }
+  #notice[hidden] { display: none; }
+  [hidden] { display: none !important; }
+  /* Pairing inside the app (or Safari) by the short code GitTerm shows. */
+  #pairing { margin-top: 14px; padding: 18px 16px; border-radius: 14px; background: var(--card); border: 1px solid var(--border); }
+  #pairing h2 { margin: 0 0 6px; font-size: 20px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--fg); }
+  #pairing p { margin: 0 0 14px; color: var(--muted); font-size: 15px; }
+  #pair-form { display: flex; flex-direction: column; gap: 10px; }
+  #pair-code { width: 100%; padding: 12px 14px; border-radius: 11px; border: 1px solid var(--border); background: var(--bg-alt); color: var(--fg); font: 600 26px/1.2 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0.12em; text-align: center; text-transform: uppercase; }
+  #pair-code::placeholder { color: var(--border); }
+  #pair-code:focus { outline: none; border-color: var(--accent); }
+  #pair-submit { padding: 13px 18px; border-radius: 11px; border: 0; background: var(--accent); color: #11111b; font: inherit; font-weight: 600; }
+  #pair-submit:disabled { opacity: 0.55; }
+  #pairing #pair-error { margin: 0; color: var(--err); font-size: 14px; }
+  #install { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 14px; }
+  #install strong { color: var(--fg); font-weight: 600; }
+  #install ol { margin: 6px 0 0; padding-left: 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="heading">Chats<span class="who" id="who"></span></h1>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+<main>
+  <div id="notice" hidden></div>
+  <section id="pairing" hidden>
+    <h2>Pair this app</h2>
+    <p id="pair-why">In GitTerm, open the machine’s menu and choose “Pair a phone…”. Type the code shown under the QR code.</p>
+    <form id="pair-form" autocomplete="off" novalidate>
+      <input id="pair-code" name="code" type="text" inputmode="text" autocapitalize="characters" autocorrect="off" spellcheck="false" autocomplete="off" maxlength="40" placeholder="XXXX-XXXX" aria-label="Pairing code" enterkeyhint="go" />
+      <p id="pair-error" role="alert" hidden></p>
+      <button id="pair-submit" type="submit">Pair</button>
+    </form>
+    <div id="install" hidden>
+      <strong>Install it as an app</strong>
+      <ol>
+        <li>Tap Share, then <strong>Add to Home Screen</strong>.</li>
+        <li>Open GitTerm from the home screen and type the code there.</li>
+      </ol>
+      An app on the home screen keeps its own pairing, separate from Safari’s.
+    </div>
+  </section>
+  <div id="lists"></div>
+</main>
+<script>
+(function () {
+  'use strict';
+  const TOKEN_KEY = 'gitterm.phone.token';
+  const REFRESH_MS = 15000;
+  const noticeEl = document.getElementById('notice');
+  const listsEl = document.getElementById('lists');
+  const headingEl = document.getElementById('heading');
+  const whoEl = document.getElementById('who');
+  const refreshEl = document.getElementById('refresh');
+  const pairingEl = document.getElementById('pairing');
+  const pairWhyEl = document.getElementById('pair-why');
+  const pairFormEl = document.getElementById('pair-form');
+  const pairCodeEl = document.getElementById('pair-code');
+  const pairErrorEl = document.getElementById('pair-error');
+  const pairSubmitEl = document.getElementById('pair-submit');
+  const installEl = document.getElementById('install');
+  // Opened from the home screen: iOS sets navigator.standalone; others
+  // report the manifest's display mode.
+  const STANDALONE = window.navigator.standalone === true ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  // A short code is 8 Crockford base32 characters, typed with or without
+  // its dash.
+  const SHORT_CODE_CHARS = 8;
+  let timer = null;
+  let loading = false;
+  let pairing = false;
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function notice(text, isError) {
+    noticeEl.textContent = text;
+    noticeEl.className = isError ? 'err' : '';
+    noticeEl.hidden = !text;
+  }
+  function age(unixSecs) {
+    if (!unixSecs) return '';
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - unixSecs);
+    if (s < 60) return 'now';
+    if (s < 3600) return Math.floor(s / 60) + 'm';
+    if (s < 86400) return Math.floor(s / 3600) + 'h';
+    return Math.floor(s / 86400) + 'd';
+  }
+  function chatLink(params) {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v) q.set(k, v);
+    return 'chat?' + q.toString();
+  }
+  const STATE_LABEL = { idle: 'Idle', turn_running: 'Working', awaiting_input: 'Needs input' };
+  function lastPart(path) {
+    const parts = String(path || '').split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : String(path || '');
+  }
+
+  function row(href, title, where, badge, badgeCls) {
+    const li = el('li');
+    const a = li.appendChild(el('a'));
+    a.href = href;
+    a.appendChild(el('div', 'title', title));
+    const meta = a.appendChild(el('div', 'meta'));
+    meta.appendChild(el('span', 'where', where));
+    if (badge) meta.appendChild(el('span', 'badge ' + (badgeCls || ''), badge));
+    return li;
+  }
+
+  function render(data) {
+    whoEl.textContent = (data.agent || '') + ' · ' + ((data.phone && data.phone.name) || 'this phone') +
+      (data.phone && data.phone.scope === 'view' ? ' · view only' : '');
+    document.title = (data.agent || 'GitTerm') + ' chats';
+    listsEl.textContent = '';
+
+    listsEl.appendChild(el('h2', null, 'Running'));
+    const running = Array.isArray(data.running) ? data.running : [];
+    if (!running.length) {
+      listsEl.appendChild(el('div', 'empty', 'No chats are running on ' + (data.agent || 'this machine') + '.'));
+    } else {
+      const ul = listsEl.appendChild(el('ul'));
+      for (const chat of running) {
+        const title = chat.title || 'New chat in ' + lastPart(chat.cwd);
+        ul.appendChild(row(
+          chatLink({ chat: chat.chat_id, session: chat.claude_session_id, title }),
+          title,
+          (chat.repo || lastPart(chat.cwd)) + ' · ' + age(chat.last_activity_unix_secs),
+          STATE_LABEL[chat.state] || chat.state,
+          chat.state,
+        ));
+      }
+    }
+
+    listsEl.appendChild(el('h2', null, 'Recent'));
+    const recent = Array.isArray(data.recent) ? data.recent : [];
+    if (!recent.length) {
+      listsEl.appendChild(el('div', 'empty', 'No conversations yet.'));
+    } else {
+      const ul = listsEl.appendChild(el('ul'));
+      for (const chat of recent) {
+        const title = chat.title || lastPart(chat.cwd);
+        const where = [chat.repo, chat.branch].filter(Boolean).join(' · ') + ' · ' + age(chat.mtime_unix_secs);
+        ul.appendChild(row(
+          chatLink({ chat: chat.running_chat_id, session: chat.session_id, title }),
+          title,
+          where,
+          chat.running_chat_id ? 'Live' : '',
+          'live',
+        ));
+      }
+    }
+  }
+
+  // ---- pairing by the typed short code ---------------------------------------
+  function pairError(text) {
+    pairErrorEl.textContent = text || '';
+    pairErrorEl.hidden = !text;
+  }
+  function showPairing(why) {
+    stop();
+    listsEl.textContent = '';
+    whoEl.textContent = '';
+    notice('');
+    refreshEl.hidden = true;
+    if (why) pairWhyEl.textContent = why;
+    installEl.hidden = STANDALONE;
+    pairingEl.hidden = false;
+  }
+  function hidePairing() {
+    pairingEl.hidden = true;
+    refreshEl.hidden = false;
+    pairError('');
+  }
+  async function pair(event) {
+    event.preventDefault();
+    if (pairing) return;
+    const typed = pairCodeEl.value.trim();
+    if (typed.replace(/[\s-]/g, '').length < SHORT_CODE_CHARS) {
+      pairError('A pairing code has 8 characters, like 7K2M-9QXD.');
+      pairCodeEl.focus();
+      return;
+    }
+    pairing = true;
+    pairSubmitEl.disabled = true;
+    pairSubmitEl.textContent = 'Pairing…';
+    pairError('');
+    try {
+      const response = await fetch('api/pair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: typed }),
+        cache: 'no-store',
+      });
+      let body = null;
+      try { body = await response.json(); } catch (e) { console.error('pair: unreadable response', e); }
+      if (response.ok && body && body.token) {
+        localStorage.setItem(TOKEN_KEY, body.token);
+        pairCodeEl.value = '';
+        hidePairing();
+        await load();
+        start();
+        return;
+      }
+      if (response.status === 401) {
+        pairError('That code did not work: it is wrong, already used, or expired (codes last 10 minutes). Check it, or choose “New code” in GitTerm.');
+      } else if (response.status === 429) {
+        const wait = Number(response.headers.get('Retry-After'));
+        pairError('Too many wrong codes. Try again in ' + (wait > 0 ? (wait < 90 ? wait + ' seconds' : Math.ceil(wait / 60) + ' minutes') : 'a while') + '.');
+      } else {
+        pairError('Could not pair: ' + ((body && body.error) || 'the agent answered ' + response.status));
+      }
+      pairCodeEl.select();
+    } catch (e) {
+      console.error('pair: request failed', e);
+      pairError('Could not reach the agent: ' + e);
+    } finally {
+      pairing = false;
+      pairSubmitEl.disabled = false;
+      pairSubmitEl.textContent = 'Pair';
+    }
+  }
+  pairFormEl.addEventListener('submit', pair);
+
+  async function load() {
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (!token) {
+      showPairing();
+      return;
+    }
+    if (loading) return;
+    loading = true;
+    try {
+      const response = await fetch('api/chats', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
+      let body = null;
+      try { body = await response.json(); } catch (e) { console.error('chats: unreadable response', e); }
+      if (response.status === 401) {
+        localStorage.removeItem(TOKEN_KEY);
+        showPairing('This phone is no longer paired (it was revoked in GitTerm). Choose “Pair a phone…” there and type the new code.');
+        return;
+      }
+      if (!response.ok || !body) {
+        notice('Could not list chats: ' + ((body && body.error) || response.status), true);
+        return;
+      }
+      notice('');
+      render(body);
+    } catch (e) {
+      console.error('chats: request failed', e);
+      notice('Could not reach the agent: ' + e, true);
+    } finally {
+      loading = false;
+    }
+  }
+  function start() {
+    if (!timer && localStorage.getItem(TOKEN_KEY)) timer = setInterval(load, REFRESH_MS);
+  }
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+  refreshEl.addEventListener('click', load);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { stop(); return; }
+    if (!pairingEl.hidden) return;
+    load();
+    start();
+  });
+  // A home-screen app can open a plain link in Safari instead of in
+  // itself; same-origin links are followed here so the chats stay in the
+  // app.
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest && e.target.closest('a[href]');
+    if (!a || a.target || e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if (a.origin !== location.origin) return;
+    e.preventDefault();
+    location.assign(a.href);
+  });
+  headingEl.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+  load();
+  start();
+})();
+</script>
+</body>
+</html>

@@ -13,13 +13,14 @@
 // Step 4 ships.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSession, ClaudeSessionConfig};
+use gitterm::harness::acp::{AcpAgent, AcpMcpServer, AcpSessionConfig, ACP_WIRE_LOG_ENV};
+use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSessionConfig};
 use gitterm::harness::transcript::TranscriptEntry;
-use gitterm::harness::HarnessEvent;
+use gitterm::harness::{HarnessEvent, HarnessSession, UserPrompt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -39,6 +40,9 @@ pub(crate) const CLAUDE_PERMISSION_MODES: [&str; 6] = [
     "dontAsk",
     "bypassPermissions",
 ];
+/// Effort levels the CLI accepts (`claude --help`: `--effort <level>`, and
+/// every model's `supportedEffortLevels` in the initialize reply).
+pub(crate) const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// Set to a directory to log every Claude stdin/stdout frame there.
 const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_CLAUDE_WIRE_LOG_DIR";
 
@@ -48,6 +52,16 @@ const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_CLAUDE_WIRE_LOG_DIR";
 pub(crate) enum AgentBackend {
     Pi,
     Claude,
+    /// An Agent Client Protocol agent (Gemini CLI, OpenCode; TRU-153).
+    Acp(AcpAgent),
+}
+
+impl AgentBackend {
+    /// A native harness chat (one long-lived process per tab driven through
+    /// `HarnessSession`): Claude or an ACP agent. Pi runs per turn.
+    pub(crate) fn is_native(self) -> bool {
+        matches!(self, Self::Claude | Self::Acp(_))
+    }
 }
 
 /// Per-backend configuration. Tagged by the `backend` discriminator so this
@@ -69,6 +83,18 @@ pub(crate) enum AgentBackendConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+    /// An ACP agent's chat (TRU-153). `model` empty keeps the agent's own
+    /// choice; `mode` is the agent's session mode (Gemini `default`,
+    /// `autoEdit`, `yolo`, `plan`; OpenCode `build`, `plan`).
+    Acp {
+        agent: AcpAgent,
+        #[serde(default)]
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+    },
 }
 
 impl AgentBackendConfig {
@@ -76,6 +102,23 @@ impl AgentBackendConfig {
         match self {
             Self::Pi { .. } => AgentBackend::Pi,
             Self::Claude { .. } => AgentBackend::Claude,
+            Self::Acp { agent, .. } => AgentBackend::Acp(*agent),
+        }
+    }
+
+    /// The chat's model as configured (Claude and ACP tabs).
+    pub(crate) fn chat_model(&self) -> Option<&str> {
+        match self {
+            Self::Claude { model, .. } | Self::Acp { model, .. } => Some(model),
+            Self::Pi { .. } => None,
+        }
+    }
+
+    /// The chat's effort as configured (Claude and ACP tabs).
+    pub(crate) fn chat_effort(&self) -> Option<&str> {
+        match self {
+            Self::Claude { effort, .. } | Self::Acp { effort, .. } => effort.as_deref(),
+            Self::Pi { .. } => None,
         }
     }
 }
@@ -140,7 +183,66 @@ pub enum AgentEvent {
 impl AgentEvent {
     /// The echo of a prompt the human submitted, as the chat page renders it.
     pub(crate) fn user_prompt(text: &str) -> Self {
-        Self::Other(serde_json::json!({"type": "user_prompt", "text": text}))
+        Self::Other(gitterm::chat_page::user_prompt_payload(text))
+    }
+
+    /// The echo of a submitted prompt. Attached images ride along as
+    /// `images: [{media_type, data}]` so the page can show thumbnails in
+    /// the human's own message. A prompt with an id carries it as `id`, and
+    /// one sent while a turn runs is marked `queued: true`: the page shows
+    /// it as queued, with a withdraw button, until its `message_lifecycle`
+    /// says Claude picked it up. A plain text prompt is the plain echo.
+    pub(crate) fn submitted_prompt(prompt: &UserPrompt, queued: bool) -> Self {
+        if prompt.images.is_empty() && prompt.id.is_none() && !queued {
+            return Self::user_prompt(&prompt.text);
+        }
+        let mut echo = serde_json::json!({"type": "user_prompt", "text": prompt.text});
+        if !prompt.images.is_empty() {
+            echo["images"] = serde_json::json!(prompt.images);
+        }
+        if let Some(id) = &prompt.id {
+            echo["id"] = serde_json::json!(id);
+        }
+        if queued {
+            echo["queued"] = serde_json::json!(true);
+        }
+        Self::Other(echo)
+    }
+
+    /// The echo of a prompt another client of an agent-owned chat sent (a
+    /// phone, TRU-151), as the page's own `user_prompt`: `id` lets the
+    /// page and the tab tell it from their own echoes, `queued` marks it
+    /// sent while a turn runs, and `image_count` says how many images it
+    /// carried (their bytes are never relayed).
+    pub(crate) fn relayed_prompt(
+        id: Option<&str>,
+        text: &str,
+        image_count: usize,
+        queued: bool,
+    ) -> Self {
+        let mut echo = serde_json::json!({"type": "user_prompt", "text": text});
+        if let Some(id) = id {
+            echo["id"] = serde_json::json!(id);
+            if queued {
+                echo["queued"] = serde_json::json!(true);
+            }
+        }
+        if image_count > 0 {
+            echo["image_count"] = serde_json::json!(image_count);
+        }
+        Self::Other(echo)
+    }
+
+    /// The id of a `user_prompt` echo that carries one.
+    pub(crate) fn prompt_id(&self) -> Option<&str> {
+        match self {
+            Self::Other(value)
+                if value.get("type").and_then(|v| v.as_str()) == Some("user_prompt") =>
+            {
+                value.get("id").and_then(|v| v.as_str())
+            }
+            _ => None,
+        }
     }
 
     /// The JSON the chat webview's `__appendEvent` receives. Harness events
@@ -148,13 +250,7 @@ impl AgentEvent {
     pub(crate) fn webview_payload(&self) -> Option<serde_json::Value> {
         match self {
             Self::Other(value) => Some(value.clone()),
-            Self::Harness(ev) => match serde_json::to_value(ev) {
-                Ok(event) => Some(serde_json::json!({"kind": "harness", "event": event})),
-                Err(e) => {
-                    eprintln!("[agent] could not serialize harness event {ev:?}: {e}");
-                    None
-                }
-            },
+            Self::Harness(ev) => gitterm::chat_page::harness_payload(ev),
             // The typed pi variants are not produced yet.
             _ => None,
         }
@@ -168,6 +264,20 @@ impl From<TranscriptEntry> for AgentEvent {
             TranscriptEntry::Harness(ev) => Self::Harness(ev),
         }
     }
+}
+
+/// The Agent call whose subagent `ev` starts, if it is a subagent start.
+pub(crate) fn subagent_started(ev: &AgentEvent) -> Option<&str> {
+    match ev {
+        AgentEvent::Harness(event) => gitterm::chat_page::subagent_started(event),
+        _ => None,
+    }
+}
+
+/// The timeline marker for when Agent call `parent`'s subagent started
+/// (Unix ms). The chat page uses it when the start was not seen live.
+pub(crate) fn subagent_started_at(parent: &str, at_ms: i64) -> serde_json::Value {
+    gitterm::chat_page::subagent_started_at(parent, at_ms)
 }
 
 /// Whether a resumed session's earlier timeline has been read back from
@@ -192,14 +302,25 @@ pub(crate) struct AgentSession {
     /// Lazy: `None` until the first prompt submit, then created and reused
     /// across turns until the tab is closed. Pi only.
     pub(crate) task_handle: Option<AgentTaskHandle>,
-    /// Long-lived native Claude process (Claude backend only). Lazy like
-    /// `task_handle`; dropped (and respawned with `--resume`) when the
-    /// process exits. Dropping it shuts the process down.
-    pub(crate) claude: Option<ClaudeSession>,
+    /// Long-lived native harness process (Claude, or an ACP agent). Lazy
+    /// like `task_handle`; dropped (and respawned resuming the session)
+    /// when the process exits. Dropping a local one shuts the process down;
+    /// dropping a remote Claude one detaches and leaves the chat running on
+    /// its machine (closing the tab sends `Shutdown` first, TRU-152).
+    pub(crate) harness: Option<HarnessSession>,
     /// Runtime requests (permission prompts, questions) awaiting the human.
     pub(crate) pending_requests: Vec<String>,
     /// Transcript read-back for a session restored from `workspaces.json`.
     pub(crate) history: HistoryLoad,
+    /// A remote chat's "reconnecting" notice while its connection is down
+    /// (TRU-152). Not in the conversation, so a page rebuilt meanwhile is
+    /// given it again.
+    pub(crate) remote_disconnected: Option<AgentEvent>,
+    /// Bumped on every `record`, merged fragments included, so the Chats
+    /// overview knows when to rebuild its snapshot (TRU-154).
+    pub(crate) revision: u64,
+    /// Turn and subagent times seen live; the buffer carries no clock.
+    pub(crate) live_times: crate::chat_overview::LiveTimes,
 }
 
 impl AgentSession {
@@ -212,60 +333,71 @@ impl AgentSession {
             session_id: None,
             state: AgentSessionState::Idle,
             task_handle: None,
-            claude: None,
+            harness: None,
             pending_requests: Vec::new(),
             history: HistoryLoad::NotLoaded,
+            remote_disconnected: None,
+            revision: 0,
+            live_times: crate::chat_overview::LiveTimes::default(),
         }
     }
 
     /// The session id whose transcript should be read back before this tab
-    /// is shown: a resumed session whose timeline is still empty.
+    /// is shown: a resumed session whose timeline is still empty. An ACP
+    /// tab reads it back by starting its agent, which replays the session
+    /// through `session/load`.
     pub(crate) fn history_to_load(&self) -> Option<&str> {
-        (self.backend() == AgentBackend::Claude
+        (self.backend().is_native()
             && self.history == HistoryLoad::NotLoaded
             && self.conversation.is_empty())
         .then_some(self.session_id.as_deref())
         .flatten()
     }
 
+    /// Whether the conversation already shows the prompt sent under `id`
+    /// (this tab's own echo, or one relayed earlier).
+    pub(crate) fn shows_prompt(&self, id: &str) -> bool {
+        self.conversation
+            .iter()
+            .rev()
+            .any(|ev| ev.prompt_id() == Some(id))
+    }
+
     /// Append an event to the conversation buffer, merging consecutive
-    /// streaming fragments so tab switches replay a compact buffer.
+    /// streaming fragments so tab switches replay a compact buffer. A
+    /// subagent's start is followed by when it started, so a rebuilt page
+    /// still knows its elapsed time and where it falls in the roster.
     pub(crate) fn record(&mut self, ev: AgentEvent) {
-        use HarnessEvent as H;
+        self.revision = self.revision.wrapping_add(1);
+        self.live_times.observe(&ev, std::time::SystemTime::now());
         if let (Some(AgentEvent::Harness(last)), AgentEvent::Harness(next)) =
             (self.conversation.last_mut(), &ev)
         {
-            match (last, next) {
-                (H::TextDelta(a), H::TextDelta(b)) | (H::ThinkingDelta(a), H::ThinkingDelta(b)) => {
-                    a.push_str(b);
-                    return;
-                }
-                (
-                    H::ItemInputDelta {
-                        id: a_id,
-                        partial_json: a,
-                    },
-                    H::ItemInputDelta {
-                        id: b_id,
-                        partial_json: b,
-                    },
-                ) if a_id == b_id => {
-                    a.push_str(b);
-                    return;
-                }
-                _ => {}
+            if merge_fragment(last, next) {
+                return;
             }
         }
+        let started = subagent_started(&ev).map(str::to_string);
         self.conversation.push(ev);
+        if let Some(parent) = started {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            self.conversation
+                .push(AgentEvent::Other(subagent_started_at(&parent, now_ms)));
+        }
     }
 
     /// The Claude process settings for this tab. `model` "default" (or
     /// empty) leaves the model to the user's Claude settings. `mcp_servers`
-    /// are the GitTerm MCP servers the app attaches (task and browser).
+    /// are the GitTerm MCP servers the app attaches (task and browser);
+    /// `chrome` attaches Claude in Chrome (`chat.claude_in_chrome`).
     pub(crate) fn claude_session_config(
         &self,
         cwd: PathBuf,
         mcp_servers: Vec<ClaudeMcpServer>,
+        chrome: bool,
     ) -> Option<ClaudeSessionConfig> {
         let AgentBackendConfig::Claude {
             model,
@@ -286,11 +418,55 @@ impl AgentSession {
             resume: self.session_id.clone(),
             wire_log_dir: std::env::var_os(CLAUDE_WIRE_LOG_ENV).map(PathBuf::from),
             mcp_servers,
+            chrome,
+        })
+    }
+
+    /// The ACP agent settings for this tab (`None` for other backends).
+    /// `support_dir` is where the adapter writes the agent's support files.
+    pub(crate) fn acp_session_config(
+        &self,
+        cwd: PathBuf,
+        mcp_servers: Vec<AcpMcpServer>,
+        support_dir: PathBuf,
+    ) -> Option<AcpSessionConfig> {
+        let AgentBackendConfig::Acp {
+            agent,
+            model,
+            mode,
+            effort,
+        } = &self.config
+        else {
+            return None;
+        };
+        let model = model.trim();
+        Some(AcpSessionConfig {
+            agent: *agent,
+            cwd,
+            resume: self.session_id.clone(),
+            model: (!model.is_empty()).then(|| model.to_string()),
+            mode: Some(
+                mode.clone()
+                    .unwrap_or_else(|| agent.default_mode().to_string()),
+            ),
+            effort: effort.clone(),
+            mcp_servers,
+            env: Vec::new(),
+            support_dir,
+            wire_log_dir: std::env::var_os(ACP_WIRE_LOG_ENV).map(PathBuf::from),
         })
     }
 
     pub(crate) fn backend(&self) -> AgentBackend {
         self.config.backend()
+    }
+
+    /// Whether a prompt submitted now joins Claude's queue instead of
+    /// starting a turn: a Claude process is running a turn. The CLI takes
+    /// it at the running turn's next tool boundary, or as the next turn.
+    /// A pi tab never gets here mid-turn (its composer waits for the turn).
+    pub(crate) fn submit_queues(&self) -> bool {
+        submit_queues(self.backend(), self.harness.is_some(), &self.state)
     }
 
     /// The permission mode the next Claude spawn passes; `None` for pi.
@@ -303,8 +479,140 @@ impl AgentSession {
                     .clone()
                     .unwrap_or_else(|| DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
             ),
+            AgentBackendConfig::Acp { agent, mode, .. } => Some(
+                mode.clone()
+                    .unwrap_or_else(|| agent.default_mode().to_string()),
+            ),
             AgentBackendConfig::Pi { .. } => None,
         }
+    }
+}
+
+/// See `AgentSession::submit_queues`: a native harness process is running
+/// a turn. Claude queues the message itself; an ACP session holds it until
+/// the turn ends.
+pub(crate) fn submit_queues(
+    backend: AgentBackend,
+    process_running: bool,
+    state: &AgentSessionState,
+) -> bool {
+    backend.is_native() && process_running && matches!(state, AgentSessionState::Streaming)
+}
+
+/// One task's worktree as the chat's checkout chip sees it (TRU-143).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TaskWorktreeInfo<'a> {
+    pub(crate) title: &'a str,
+    /// The task's local workspace directory (`None` for remote workspaces).
+    pub(crate) workspace_dir: Option<&'a Path>,
+    pub(crate) worktree: Option<&'a Path>,
+    /// The worktree is prepared (`TaskWorktreeState::Ready`).
+    pub(crate) ready: bool,
+    pub(crate) archived: bool,
+}
+
+/// A directory a chat can start in.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct CheckoutChoice {
+    pub(crate) label: String,
+    pub(crate) detail: String,
+    pub(crate) path: PathBuf,
+}
+
+/// The label of the workspace's own checkout in the chip.
+pub(crate) const CURRENT_CHECKOUT_LABEL: &str = "Current checkout";
+
+fn dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// What the checkout chip offers before a chat's first message: the
+/// workspace's current checkout, then every prepared, unarchived task
+/// worktree of that workspace, each once. `same_path` compares directories
+/// (the app canonicalises; tests compare literally).
+pub(crate) fn checkout_choices<'a>(
+    workspace_dir: &Path,
+    tasks: impl IntoIterator<Item = TaskWorktreeInfo<'a>>,
+    same_path: impl Fn(&Path, &Path) -> bool,
+) -> Vec<CheckoutChoice> {
+    let mut choices = vec![CheckoutChoice {
+        label: CURRENT_CHECKOUT_LABEL.to_string(),
+        detail: workspace_dir.display().to_string(),
+        path: workspace_dir.to_path_buf(),
+    }];
+    for task in tasks {
+        let (Some(task_workspace), Some(worktree)) = (task.workspace_dir, task.worktree) else {
+            continue;
+        };
+        if !task.ready || task.archived || !same_path(task_workspace, workspace_dir) {
+            continue;
+        }
+        if choices.iter().any(|c| same_path(&c.path, worktree)) {
+            continue;
+        }
+        choices.push(CheckoutChoice {
+            label: dir_name(worktree),
+            detail: task.title.to_string(),
+            path: worktree.to_path_buf(),
+        });
+    }
+    choices
+}
+
+/// The chip's label for a chat running in `tab_dir`: the task worktree's
+/// name for a task-linked tab, "Current checkout" for the workspace's own
+/// directory, else the directory's name (a task worktree picked in the chip).
+pub(crate) fn checkout_label(
+    tab_dir: &Path,
+    task_worktree: Option<&Path>,
+    workspace_dir: &Path,
+    same_path: impl Fn(&Path, &Path) -> bool,
+) -> String {
+    if let Some(worktree) = task_worktree {
+        return dir_name(worktree);
+    }
+    if same_path(tab_dir, workspace_dir) {
+        return CURRENT_CHECKOUT_LABEL.to_string();
+    }
+    dir_name(tab_dir)
+}
+
+/// Fold `next` into `last` when both are fragments of the same stream:
+/// text, thinking, one tool call's input, or any of those from the same
+/// subagent. Returns whether `next` was absorbed.
+fn merge_fragment(last: &mut HarnessEvent, next: &HarnessEvent) -> bool {
+    use HarnessEvent as H;
+    match (last, next) {
+        (H::TextDelta(a), H::TextDelta(b)) | (H::ThinkingDelta(a), H::ThinkingDelta(b)) => {
+            a.push_str(b);
+            true
+        }
+        (
+            H::ItemInputDelta {
+                id: a_id,
+                partial_json: a,
+            },
+            H::ItemInputDelta {
+                id: b_id,
+                partial_json: b,
+            },
+        ) if a_id == b_id => {
+            a.push_str(b);
+            true
+        }
+        (
+            H::SubagentEvent {
+                parent_tool_use_id: a_parent,
+                event: a,
+            },
+            H::SubagentEvent {
+                parent_tool_use_id: b_parent,
+                event: b,
+            },
+        ) if a_parent == b_parent => merge_fragment(a, b),
+        _ => false,
     }
 }
 
@@ -547,5 +855,243 @@ fn build_command(config: &AgentBackendConfig, prompt: &str) -> Result<Command, S
         AgentBackendConfig::Claude { .. } => {
             Err("Claude tabs use the native harness session, not per-turn processes".to_string())
         }
+        AgentBackendConfig::Acp { .. } => {
+            Err("ACP tabs use the native harness session, not per-turn processes".to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(parent: &str, event: HarnessEvent) -> AgentEvent {
+        AgentEvent::Harness(HarnessEvent::SubagentEvent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(event),
+        })
+    }
+
+    fn harness(events: &[AgentEvent]) -> Vec<&HarnessEvent> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Harness(h) => Some(h),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn task<'a>(
+        title: &'a str,
+        workspace: &'a str,
+        worktree: &'a str,
+        ready: bool,
+        archived: bool,
+    ) -> TaskWorktreeInfo<'a> {
+        TaskWorktreeInfo {
+            title,
+            workspace_dir: Some(Path::new(workspace)),
+            worktree: Some(Path::new(worktree)),
+            ready,
+            archived,
+        }
+    }
+
+    #[test]
+    fn checkout_choices_are_the_checkout_then_this_workspaces_ready_worktrees() {
+        let same = |a: &Path, b: &Path| a == b;
+        let ws = Path::new("/repo");
+        let tasks = [
+            task("Add chips", "/repo", "/wt/tru-143-chips", true, false),
+            task("Other repo", "/other", "/wt/other", true, false),
+            task("Not prepared", "/repo", "/wt/preparing", false, false),
+            task("Done", "/repo", "/wt/archived", true, true),
+            task("Same tree again", "/repo", "/wt/tru-143-chips", true, false),
+            TaskWorktreeInfo {
+                title: "Remote",
+                workspace_dir: None,
+                worktree: Some(Path::new("/wt/remote")),
+                ready: true,
+                archived: false,
+            },
+            task("Fix review", "/repo", "/wt/tru-142-review", true, false),
+        ];
+        let choices = checkout_choices(ws, tasks, same);
+        let summary: Vec<(&str, &str, &Path)> = choices
+            .iter()
+            .map(|c| (c.label.as_str(), c.detail.as_str(), c.path.as_path()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Current checkout", "/repo", Path::new("/repo")),
+                ("tru-143-chips", "Add chips", Path::new("/wt/tru-143-chips")),
+                (
+                    "tru-142-review",
+                    "Fix review",
+                    Path::new("/wt/tru-142-review")
+                ),
+            ]
+        );
+        // No tasks: the checkout alone.
+        assert_eq!(checkout_choices(ws, [], same).len(), 1);
+    }
+
+    #[test]
+    fn checkout_label_names_the_task_worktree_or_the_checkout() {
+        let same = |a: &Path, b: &Path| a == b;
+        let ws = Path::new("/repo");
+        assert_eq!(checkout_label(ws, None, ws, same), "Current checkout");
+        assert_eq!(
+            checkout_label(Path::new("/wt/tru-143"), None, ws, same),
+            "tru-143"
+        );
+        assert_eq!(
+            checkout_label(ws, Some(Path::new("/wt/task-tree")), ws, same),
+            "task-tree"
+        );
+    }
+
+    #[test]
+    fn acp_tab_config_round_trips_and_builds_the_session_config() {
+        let config = AgentBackendConfig::Acp {
+            agent: AcpAgent::Gemini,
+            model: "gemini-4-argon".into(),
+            mode: None,
+            effort: None,
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"backend": "acp", "agent": "gemini", "model": "gemini-4-argon"})
+        );
+        let back: AgentBackendConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.backend(), AgentBackend::Acp(AcpAgent::Gemini));
+        let mut session = AgentSession::new(back);
+        session.session_id = Some("g-1".into());
+        assert_eq!(session.history_to_load(), Some("g-1"));
+        assert_eq!(
+            session.configured_permission_mode().as_deref(),
+            Some("default")
+        );
+        let acp = session
+            .acp_session_config(
+                PathBuf::from("/tmp/repo"),
+                Vec::new(),
+                PathBuf::from("/tmp/s"),
+            )
+            .unwrap();
+        assert_eq!(acp.resume.as_deref(), Some("g-1"));
+        assert_eq!(acp.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(acp.mode.as_deref(), Some("default"));
+        // An empty OpenCode model keeps OpenCode's own choice.
+        let opencode = AgentSession::new(AgentBackendConfig::Acp {
+            agent: AcpAgent::OpenCode,
+            model: String::new(),
+            mode: Some("plan".into()),
+            effort: Some("high".into()),
+        });
+        let acp = opencode
+            .acp_session_config(PathBuf::from("/tmp"), Vec::new(), PathBuf::from("/tmp/s"))
+            .unwrap();
+        assert_eq!(acp.model, None);
+        assert_eq!(acp.mode.as_deref(), Some("plan"));
+        assert_eq!(acp.effort.as_deref(), Some("high"));
+        assert!(submit_queues(
+            AgentBackend::Acp(AcpAgent::OpenCode),
+            true,
+            &AgentSessionState::Streaming
+        ));
+        assert!(!submit_queues(
+            AgentBackend::Acp(AcpAgent::OpenCode),
+            false,
+            &AgentSessionState::Streaming
+        ));
+    }
+
+    #[test]
+    fn relayed_prompts_are_user_prompts_known_by_id() {
+        let mut session = AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        let own = UserPrompt {
+            text: "mine".into(),
+            images: Vec::new(),
+            id: Some("u1".into()),
+        };
+        session.record(AgentEvent::submitted_prompt(&own, false));
+        session.record(AgentEvent::Harness(HarnessEvent::TextDelta("ok".into())));
+        assert!(session.shows_prompt("u1"));
+        assert!(!session.shows_prompt("u2"));
+
+        let relayed = AgentEvent::relayed_prompt(Some("u2"), "from the phone", 2, true);
+        assert_eq!(
+            relayed.webview_payload().unwrap(),
+            serde_json::json!({"type": "user_prompt", "text": "from the phone",
+                               "id": "u2", "queued": true, "image_count": 2})
+        );
+        session.record(relayed);
+        assert!(session.shows_prompt("u2"));
+        // No id: never marked queued (nothing could withdraw it).
+        assert_eq!(
+            AgentEvent::relayed_prompt(None, "hi", 0, true)
+                .webview_payload()
+                .unwrap(),
+            serde_json::json!({"type": "user_prompt", "text": "hi"})
+        );
+    }
+
+    #[test]
+    fn record_coalesces_subagent_deltas_per_parent() {
+        let mut session = AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        session.record(AgentEvent::Harness(HarnessEvent::TextDelta(
+            "parent ".into(),
+        )));
+        session.record(sub("a", HarnessEvent::TextDelta("one ".into())));
+        session.record(sub("a", HarnessEvent::TextDelta("two".into())));
+        // A different subagent, or a non-delta, starts a new entry.
+        session.record(sub("b", HarnessEvent::TextDelta("other".into())));
+        session.record(sub("b", HarnessEvent::ThinkingDelta("hm".into())));
+        session.record(sub("b", HarnessEvent::ThinkingDelta("m".into())));
+        session.record(sub(
+            "b",
+            HarnessEvent::ItemCompleted {
+                id: "t".into(),
+                output: String::new(),
+                is_error: false,
+            },
+        ));
+        session.record(sub(
+            "b",
+            HarnessEvent::ItemCompleted {
+                id: "t2".into(),
+                output: String::new(),
+                is_error: false,
+            },
+        ));
+        // Subagent text does not merge into the parent's text either way.
+        session.record(AgentEvent::Harness(HarnessEvent::TextDelta("more".into())));
+
+        let got = harness(&session.conversation);
+        assert_eq!(got.len(), 7, "{got:?}");
+        assert_eq!(got[0], &HarnessEvent::TextDelta("parent ".into()));
+        let AgentEvent::Harness(expected) = sub("a", HarnessEvent::TextDelta("one two".into()))
+        else {
+            unreachable!()
+        };
+        assert_eq!(got[1], &expected);
+        let AgentEvent::Harness(expected) = sub("b", HarnessEvent::ThinkingDelta("hmm".into()))
+        else {
+            unreachable!()
+        };
+        assert_eq!(got[3], &expected);
+        assert_eq!(got[6], &HarnessEvent::TextDelta("more".into()));
     }
 }

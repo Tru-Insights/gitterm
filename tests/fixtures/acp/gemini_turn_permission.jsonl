@@ -1,0 +1,10 @@
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Running the command."}}}}
+{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"g1","options":[{"optionId":"proceed_always","name":"Allow for this session","kind":"allow_always"},{"optionId":"proceed_once","name":"Allow","kind":"allow_once"},{"optionId":"cancel","name":"Reject","kind":"reject_once"}],"toolCall":{"toolCallId":"run_shell_command-1792461000000-1","status":"pending","title":"echo hi","content":[],"locations":[],"kind":"execute"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"tool_call_update","toolCallId":"run_shell_command-1792461000000-1","status":"completed","title":"echo hi","content":[{"type":"content","content":{"type":"text","text":"hi"}}],"locations":[],"kind":"execute"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"tool_call","toolCallId":"write_file-1792461000001-2","status":"in_progress","title":"Writing to a.txt","content":[],"locations":[{"path":"/tmp/a.txt"}],"kind":"edit"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"tool_call_update","toolCallId":"write_file-1792461000001-2","status":"failed","content":[{"type":"content","content":{"type":"text","text":"Permission denied"}}],"kind":"edit"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"plan","entries":[{"content":"step","priority":"medium","status":"pending"}]}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"plan","entries":[]}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"g1","update":{"sessionUpdate":"current_mode_update","currentModeId":"autoEdit"}}}
+{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}

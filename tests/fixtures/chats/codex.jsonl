@@ -1,0 +1,7 @@
+{"type":"session_meta","payload":{"id":"s-codex","cwd":"/Users/dev/GitRepo/sample","originator":"codex-tui","source":"cli","git":{"branch":"feat/retry"}}}
+{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"developer instructions"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>cwd</environment_context>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add exponential backoff to the uploader"}]}}
+{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Backoff now doubles from 500 ms, capped at 8 s."}]}}
+{"type":"event_msg","payload":{"type":"token_count"}}
