@@ -402,6 +402,7 @@ mod tests {
             is_worktree: false,
             branch: Some(format!("branch-{id}")),
             title: format!("Title {id}"),
+            latest: None,
             mtime: SystemTime::now() - Duration::from_secs(mins_ago * 60 + 5),
             size: 10,
             dead_cwd: false,

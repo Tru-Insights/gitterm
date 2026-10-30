@@ -32668,7 +32668,7 @@ fi
                         meta =
                             meta.push(text("⚠ dir gone").size(font_small - 1.0).color(theme.red()));
                     }
-                    let content = column![
+                    let mut content = Column::new().spacing(2).push(
                         row![
                             text("●")
                                 .size(8)
@@ -32678,9 +32678,17 @@ fi
                                 .color(theme.text_primary()),
                         ]
                         .spacing(6),
-                        meta,
-                    ]
-                    .spacing(2);
+                    );
+                    // A long-lived session keeps its opening title above;
+                    // this line says what it has become since (TRU-158).
+                    if let Some(latest) = &entry.latest {
+                        content = content.push(
+                            text(format!("↳ {latest}"))
+                                .size(font_small - 1.0)
+                                .color(theme.text_secondary()),
+                        );
+                    }
+                    let content = content.push(meta);
                     let mut btn = button(content)
                         .padding([6, 8])
                         .width(Length::Fill)
@@ -40764,6 +40772,7 @@ mod tests {
             is_worktree: false,
             branch: Some("main".to_string()),
             title: "a chat".to_string(),
+            latest: None,
             mtime: std::time::SystemTime::UNIX_EPOCH,
             size: 1,
             dead_cwd,

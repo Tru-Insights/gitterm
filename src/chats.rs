@@ -49,6 +49,11 @@ pub struct ChatIndexEntry {
     pub is_worktree: bool,
     pub branch: Option<String>,
     pub title: String,
+    /// The newest real user message in the transcript tail, when it says
+    /// something different from `title`. A long-lived session keeps its
+    /// opening title for recognition; this line says what the session has
+    /// become since (TRU-158). Claude backend only.
+    pub latest: Option<String>,
     pub mtime: SystemTime,
     pub size: u64,
     /// The recorded cwd no longer exists on disk.
@@ -396,6 +401,23 @@ fn claude_ai_title(lines: &[String]) -> Option<String> {
     })
 }
 
+/// The newest real user message among `lines`, title-formatted. Reuses
+/// the same tail read as [`claude_ai_title`], so finding it costs no
+/// extra I/O.
+fn latest_user_title(lines: &[String]) -> Option<String> {
+    lines.iter().rev().find_map(|line| {
+        let meta = serde_json::from_str::<LineMeta>(line).ok()?;
+        if meta.kind.as_deref() != Some("user") || !meta.is_real_message() {
+            return None;
+        }
+        let text = meta.message_text()?;
+        if is_synthetic_user_text(&text) {
+            return None;
+        }
+        Some(title_from_text(&text))
+    })
+}
+
 /// Complete JSONL lines from the last `TAIL_READ_BYTES` of the file.
 fn read_tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
     read_tail_lines_bounded(path, TAIL_READ_BYTES)
@@ -433,10 +455,9 @@ fn index_transcript(path: &Path, backend: ChatBackend) -> Option<ChatIndexEntry>
     // A session with no real user message is an empty shell, even if
     // Claude titled it.
     let first_message_title = head.title?;
-    let title = read_tail_lines_bounded(path, TITLE_TAIL_BYTES)
-        .ok()
-        .and_then(|lines| claude_ai_title(&lines))
-        .unwrap_or(first_message_title);
+    let tail = read_tail_lines_bounded(path, TITLE_TAIL_BYTES).unwrap_or_default();
+    let title = claude_ai_title(&tail).unwrap_or(first_message_title);
+    let latest = latest_user_title(&tail).filter(|line| *line != title);
     let cwd = head.cwd?;
     let id = path.file_stem()?.to_string_lossy().to_string();
     let dead_cwd = !cwd.exists();
@@ -449,6 +470,7 @@ fn index_transcript(path: &Path, backend: ChatBackend) -> Option<ChatIndexEntry>
         is_worktree: false,
         branch: head.branch,
         title,
+        latest,
         mtime: meta.modified().ok()?,
         size: meta.len(),
         dead_cwd,
@@ -597,6 +619,7 @@ fn index_codex_transcript(path: &Path) -> Option<ChatIndexEntry> {
         is_worktree: false,
         branch,
         title: title?,
+        latest: None,
         mtime: meta.modified().ok()?,
         size: meta.len(),
         dead_cwd,
@@ -647,6 +670,7 @@ fn index_pi_transcript(path: &Path) -> Option<ChatIndexEntry> {
         is_worktree: false,
         branch: None,
         title: title?,
+        latest: None,
         mtime: meta.modified().ok()?,
         size: meta.len(),
         dead_cwd,
@@ -928,6 +952,48 @@ mod tests {
         );
         let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
         assert_eq!(entry.title, "Org snapshot billing period regression");
+    }
+
+    #[test]
+    fn index_surfaces_the_latest_user_message_when_it_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let opener = user_line("/tmp/x", "main", "what logging do we have for studio beta");
+        let newer = user_line(
+            "/tmp/x",
+            "main",
+            "now enforce verified org context in the api",
+        );
+        let path = write_transcript(
+            dir.path(),
+            "abc-789.jsonl",
+            &[
+                opener.as_str(),
+                r#"{"type":"assistant","message":{"role":"assistant","content":"ok"}}"#,
+                newer.as_str(),
+            ],
+        );
+        let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
+        assert_eq!(entry.title, "what logging do we have for studio beta");
+        assert_eq!(
+            entry.latest.as_deref(),
+            Some("now enforce verified org context in the api")
+        );
+    }
+
+    #[test]
+    fn index_omits_latest_when_the_session_never_moved_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let only = user_line("/tmp/x", "main", "fix the flaky test in ci");
+        let path = write_transcript(
+            dir.path(),
+            "abc-790.jsonl",
+            &[
+                only.as_str(),
+                r#"{"type":"assistant","message":{"role":"assistant","content":"ok"}}"#,
+            ],
+        );
+        let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
+        assert_eq!(entry.latest, None);
     }
 
     #[test]
@@ -1261,6 +1327,7 @@ mod tests {
             is_worktree: true,
             branch: None,
             title: "t".into(),
+            latest: None,
             mtime: SystemTime::UNIX_EPOCH,
             size: 1,
             dead_cwd: false,
