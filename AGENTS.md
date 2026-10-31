@@ -10,9 +10,9 @@ conflict.
 
 ## Workflow Facts
 
-- Project: `gitterm-v5`
-- Default base branch: `v5`
-- Protected branches: `v4`, `v5`
+- Project: `gitterm-v6`
+- Default base branch: `v6`
+- Protected branches: `v4`, `v5`, `v6`
 - Issue provider: `linear`
 - Issue key pattern: `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`
 - Issue required in commits: `true`
@@ -218,7 +218,7 @@ Agent memory is private runtime state, not repository source of truth.
 
 ### Project
 
-GitTerm V5 — a Rust desktop app: terminal multiplexer + git status viewer + file
+GitTerm V6 — a Rust desktop app: terminal multiplexer + git status viewer + file
 explorer + agent (Claude Code / pi) host, built with the
 [Iced](https://github.com/iced-rs/iced) v0.14 GUI framework. macOS-first;
 Windows CI exists.
@@ -255,31 +255,37 @@ Windows CI exists.
 
 ### Persistence
 
-- Config: `~/.config/gitterm-v5/config.json` (global) +
-  `~/.config/gitterm-v5/instance-<pid>/config.json` (per-instance). Per-instance
+- Config: `~/.config/gitterm-v6/config.json` (global) +
+  `~/.config/gitterm-v6/instance-<pid>/config.json` (per-instance). Per-instance
   values override globals.
-- Workspaces: `~/.config/gitterm-v5/workspaces.json`.
+- Workspaces: `~/.config/gitterm-v6/workspaces.json`.
 - All paths resolved via `dirs::home_dir()` — on Windows that's
-  `%USERPROFILE%\.config\gitterm-v5\`.
-- V5 must remain runtime-isolated from V4 and V3: do not reuse earlier config paths,
-  bundle identifiers, app names, log-server port ranges, helper state, temporary
-  artifact names, or future browser profiles.
+  `%USERPROFILE%\.config\gitterm-v6\`.
+- V6 must remain runtime-isolated from V5, V4 and V3: do not reuse earlier config
+  paths, bundle identifiers, app and binary names, port ranges, env var names,
+  agent proto package, agent config dir/service label, helper state, temporary
+  artifact names, or browser profiles. The one sanctioned read of V5 state is
+  the first-launch import (`src/config_import.rs`), which copies from
+  `~/.config/gitterm-v5` (or `GITTERM_V5_CONFIG_DIR`) and never writes there.
 - **A second instance must never share the real config dir.** Tracey runs the
   installed V5 all day. `workspaces.json`, `tasks.json`, `profiles.json`,
   `remote-agents.json`, `browser-profile/`, `worktrees/` and `task-briefs/`
   are shared across instances and each instance writes back its whole view
-  (last writer wins), so a dev or test launch against `~/.config/gitterm-v5`
+  (last writer wins), so a dev or test launch against `~/.config/gitterm-v6`
   can erase or resurrect tabs, tasks and chat sessions in the running app and
   contend for the Chrome profile lock. Every dev/test launch, by an agent or
-  in a try-it checklist, sets `GITTERM_V5_CONFIG_DIR` to an absolute isolated
+  in a try-it checklist, sets `GITTERM_V6_CONFIG_DIR` to an absolute isolated
   directory, seeded with copies of the files above when the test needs real
   workspaces:
 
   ```
-  D=$HOME/.config/gitterm-v5-<purpose>
-  mkdir -p "$D" && cp ~/.config/gitterm-v5/{workspaces.json,tasks.json,profiles.json} "$D"/ 2>/dev/null
-  GITTERM_V5_CONFIG_DIR="$D" cargo run
+  D=$HOME/.config/gitterm-v6-<purpose>
+  mkdir -p "$D" && cp ~/.config/gitterm-v6/{workspaces.json,tasks.json,profiles.json} "$D"/ 2>/dev/null
+  GITTERM_V6_CONFIG_DIR="$D" cargo run
   ```
+
+  An isolated instance skips the V5 import unless `GITTERM_V5_CONFIG_DIR`
+  also points at a fixture dir, so it never reads the real V5 state.
 
   Never kill, signal, or replace the bundle of the running instance; prefer a
   headless example over driving the GUI to verify a change.
@@ -307,7 +313,7 @@ Windows CI exists.
 - Voice is enabled by default (the `stt` default feature pulls `whisper-rs` +
   `cpal`). Use `--no-default-features` only for a build without voice.
 - macOS bundle: `cargo bundle --release` produces
-  `target/release/bundle/osx/GitTerm V5.app`. Install via `cp -R` to
+  `target/release/bundle/osx/GitTerm V6.app`. Install via `cp -R` to
   `/Applications/`.
 - Excalidraw is an optional feature: add `--features excalidraw` to enable.
 

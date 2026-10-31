@@ -8,18 +8,18 @@ use gitterm::agentd::server::{self, AgentServerConfig};
 #[cfg(unix)]
 mod attach;
 
-const DEFAULT_ADDR: &str = "127.0.0.1:8787";
-const AGENT_ADDR_ENV: &str = "GITTERM_V5_AGENT_ADDR";
-const AGENT_TOKEN_ENV: &str = "GITTERM_V5_AGENT_TOKEN";
-const AGENT_NAME_ENV: &str = "GITTERM_V5_AGENT_NAME";
+const DEFAULT_ADDR: &str = "127.0.0.1:8797";
+const AGENT_ADDR_ENV: &str = "GITTERM_V6_AGENT_ADDR";
+const AGENT_TOKEN_ENV: &str = "GITTERM_V6_AGENT_TOKEN";
+const AGENT_NAME_ENV: &str = "GITTERM_V6_AGENT_NAME";
 /// Overrides where the agent keeps its paired phones (tests and smoke runs
 /// that must not touch the real config dir).
-const AGENT_CONFIG_DIR_ENV: &str = "GITTERM_V5_AGENT_CONFIG_DIR";
+const AGENT_CONFIG_DIR_ENV: &str = "GITTERM_V6_AGENT_CONFIG_DIR";
 
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
-        eprintln!("gitterm-v5-agent: {err}");
+        eprintln!("gitterm-v6-agent: {err}");
         std::process::exit(1);
     }
 }
@@ -30,16 +30,16 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some("serve") => {
             let config = parse_serve_config(args)?;
             eprintln!(
-                "gitterm-v5-agent serving {} as {}",
+                "gitterm-v6-agent serving {} as {}",
                 config.bind_addr, config.agent_name
             );
             match &config.phone {
                 Some(phone) => eprintln!(
-                    "gitterm-v5-agent phone app on {} (paired phones in {})",
+                    "gitterm-v6-agent phone app on {} (paired phones in {})",
                     phone.bind_addr,
                     phone.store_dir.display()
                 ),
-                None => eprintln!("gitterm-v5-agent phone app off"),
+                None => eprintln!("gitterm-v6-agent phone app off"),
             }
             server::serve(config).await
         }
@@ -168,24 +168,24 @@ fn next_arg(
 fn hostname_fallback() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "gitterm-v5-agent".to_string())
+        .unwrap_or_else(|_| "gitterm-v6-agent".to_string())
 }
 
 fn print_usage() {
     eprintln!(
         "Usage:
-  gitterm-v5-agent serve [--addr HOST:PORT] [--token TOKEN] [--name NAME]
+  gitterm-v6-agent serve [--addr HOST:PORT] [--token TOKEN] [--name NAME]
                          [--phone-addr HOST:PORT|off]
-  gitterm-v5-agent attach --endpoint URL --token-ref REF --session ID
-  gitterm-v5-agent sessions --endpoint URL --token-ref REF [--workspace ID]
-  gitterm-v5-agent start --endpoint URL --token-ref REF --workspace ID --cwd DIR [--kind K] --cmd CMD
-  gitterm-v5-agent stop --endpoint URL --token-ref REF --session ID
+  gitterm-v6-agent attach --endpoint URL --token-ref REF --session ID
+  gitterm-v6-agent sessions --endpoint URL --token-ref REF [--workspace ID]
+  gitterm-v6-agent start --endpoint URL --token-ref REF --workspace ID --cwd DIR [--kind K] --cmd CMD
+  gitterm-v6-agent stop --endpoint URL --token-ref REF --session ID
 
 Environment:
   {AGENT_ADDR_ENV}    default: {DEFAULT_ADDR}
   {AGENT_TOKEN_ENV}   required unless --token is passed
-  {AGENT_NAME_ENV}    default: HOSTNAME/COMPUTERNAME/gitterm-v5-agent
-  {AGENT_CONFIG_DIR_ENV}  default: ~/.config/gitterm-v5-agent (paired phones)
+  {AGENT_NAME_ENV}    default: HOSTNAME/COMPUTERNAME/gitterm-v6-agent
+  {AGENT_CONFIG_DIR_ENV}  default: ~/.config/gitterm-v6-agent (paired phones)
 
 Phone app:
   Served on the agent's host at the next port up (--addr 100.x.y.z:7777
@@ -193,7 +193,7 @@ Phone app:
   --phone-addr off turns it off.
 
 Config:
-  ~/.config/gitterm-v5-agent/config.json may set bind_addr and agent_name.
+  ~/.config/gitterm-v6-agent/config.json may set bind_addr and agent_name.
   Tokens are intentionally supplied by env/CLI in this skeleton."
     );
 }
@@ -219,11 +219,11 @@ mod tests {
     }
 
     #[test]
-    fn default_endpoint_and_environment_are_v5_only() {
-        assert_eq!(DEFAULT_ADDR, "127.0.0.1:8787");
-        assert_ne!(DEFAULT_ADDR, "127.0.0.1:8777");
-        assert!(AGENT_ADDR_ENV.starts_with("GITTERM_V5_"));
-        assert!(AGENT_TOKEN_ENV.starts_with("GITTERM_V5_"));
-        assert!(AGENT_NAME_ENV.starts_with("GITTERM_V5_"));
+    fn default_endpoint_and_environment_are_v6_only() {
+        assert_eq!(DEFAULT_ADDR, "127.0.0.1:8797");
+        assert_ne!(DEFAULT_ADDR, "127.0.0.1:8787");
+        assert!(AGENT_ADDR_ENV.starts_with("GITTERM_V6_"));
+        assert!(AGENT_TOKEN_ENV.starts_with("GITTERM_V6_"));
+        assert!(AGENT_NAME_ENV.starts_with("GITTERM_V6_"));
     }
 }
