@@ -155,6 +155,7 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
         wire_log_dir: Some(root.join("wire")),
         mcp_servers: vec![task.claude_mcp_server(Some(CALLER))],
         chrome: false,
+        guidelines_file: None,
     };
     let (session, mut events) = ClaudeSession::spawn(config);
     let prompt = "Call the mcp__gitterm_tasks__review_request tool exactly once with target \

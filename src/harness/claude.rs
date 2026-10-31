@@ -875,6 +875,10 @@ pub struct ClaudeSessionConfig {
     /// Attach Claude in Chrome (`--chrome`). Headless Claude does not
     /// apply the CLI's own default for it.
     pub chrome: bool,
+    /// GitTerm's change guidelines (TRU-174), appended to Claude's system
+    /// prompt with `--append-system-prompt-file`. The caller checks the
+    /// file is readable: a missing one makes the CLI refuse to start.
+    pub guidelines_file: Option<PathBuf>,
 }
 
 impl ClaudeSessionConfig {
@@ -906,6 +910,10 @@ impl ClaudeSessionConfig {
         if let Some(effort) = &self.effort {
             args.push("--effort".into());
             args.push(effort.clone());
+        }
+        if let Some(path) = &self.guidelines_file {
+            args.push("--append-system-prompt-file".into());
+            args.push(path.to_string_lossy().into_owned());
         }
         // The `=` form keeps each JSON document a single value of these
         // variadic options; repeated flags accumulate, one pair per server.
@@ -1055,6 +1063,12 @@ impl RemoteClaudeChatStart {
                 dir.display()
             ));
         }
+        if let Some(path) = &config.guidelines_file {
+            remote_log(&format!(
+                "guidelines {} are local-only; a remote chat starts without them",
+                path.display()
+            ));
+        }
         Ok(Self {
             cwd: config.cwd.to_string_lossy().into_owned(),
             model: config.model.clone(),
@@ -1077,6 +1091,10 @@ impl RemoteClaudeChatStart {
             wire_log_dir: None,
             mcp_servers: Vec::new(),
             chrome: self.chrome,
+            // Remote chats are out of TRU-174's scope: carrying them means
+            // a field on `RemoteClaudeChatStart` and the agent reading its
+            // own machine's guidelines file here.
+            guidelines_file: None,
         }
     }
 }
@@ -3081,6 +3099,7 @@ mod tests {
             wire_log_dir: None,
             mcp_servers: Vec::new(),
             chrome: true,
+            guidelines_file: None,
         };
         let args = cfg.args().join(" ");
         assert!(args.contains("--chrome"));
@@ -3128,6 +3147,7 @@ mod tests {
             wire_log_dir: None,
             mcp_servers,
             chrome: false,
+            guidelines_file: None,
         }
     }
 

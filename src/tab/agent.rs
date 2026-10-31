@@ -392,12 +392,14 @@ impl AgentSession {
     /// The Claude process settings for this tab. `model` "default" (or
     /// empty) leaves the model to the user's Claude settings. `mcp_servers`
     /// are the GitTerm MCP servers the app attaches (task and browser);
-    /// `chrome` attaches Claude in Chrome (`chat.claude_in_chrome`).
+    /// `chrome` attaches Claude in Chrome (`chat.claude_in_chrome`);
+    /// `guidelines_file` appends GitTerm's change guidelines (TRU-174).
     pub(crate) fn claude_session_config(
         &self,
         cwd: PathBuf,
         mcp_servers: Vec<ClaudeMcpServer>,
         chrome: bool,
+        guidelines_file: Option<PathBuf>,
     ) -> Option<ClaudeSessionConfig> {
         let AgentBackendConfig::Claude {
             model,
@@ -419,6 +421,7 @@ impl AgentSession {
             wire_log_dir: std::env::var_os(CLAUDE_WIRE_LOG_ENV).map(PathBuf::from),
             mcp_servers,
             chrome,
+            guidelines_file,
         })
     }
 
@@ -685,7 +688,12 @@ impl AgentTaskHandle {
 /// turn, streams its stdout JSON, and emits a terminating `Other(...)` event
 /// when the turn completes (so the UI can flip state from Streaming to Idle).
 /// Closing the receiver / dropping the handle ends the task naturally.
-pub(crate) fn spawn_agent_task(config: AgentBackendConfig, repo_path: PathBuf) -> AgentTaskHandle {
+/// `guidelines_file` is appended to every turn's system prompt (TRU-174).
+pub(crate) fn spawn_agent_task(
+    config: AgentBackendConfig,
+    repo_path: PathBuf,
+    guidelines_file: Option<PathBuf>,
+) -> AgentTaskHandle {
     let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let stop_slot: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
@@ -697,7 +705,14 @@ pub(crate) fn spawn_agent_task(config: AgentBackendConfig, repo_path: PathBuf) -
                 .enable_all()
                 .build()
                 .expect("agent tokio runtime");
-            rt.block_on(agent_loop(config, repo_path, input_rx, event_tx, stop_slot));
+            rt.block_on(agent_loop(
+                config,
+                repo_path,
+                guidelines_file,
+                input_rx,
+                event_tx,
+                stop_slot,
+            ));
         });
     }
 
@@ -712,6 +727,7 @@ pub(crate) fn spawn_agent_task(config: AgentBackendConfig, repo_path: PathBuf) -
 async fn agent_loop(
     config: AgentBackendConfig,
     repo_path: PathBuf,
+    guidelines_file: Option<PathBuf>,
     mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     stop_slot: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -724,7 +740,15 @@ async fn agent_loop(
                     *g = Some(stop_tx);
                 }
 
-                let result = run_turn(&config, &repo_path, &prompt, &event_tx, stop_rx).await;
+                let result = run_turn(
+                    &config,
+                    &repo_path,
+                    guidelines_file.as_deref(),
+                    &prompt,
+                    &event_tx,
+                    stop_rx,
+                )
+                .await;
 
                 if let Ok(mut g) = stop_slot.lock() {
                     g.take();
@@ -748,11 +772,12 @@ async fn agent_loop(
 async fn run_turn(
     config: &AgentBackendConfig,
     repo_path: &PathBuf,
+    guidelines_file: Option<&Path>,
     prompt: &str,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
-    let mut cmd = build_command(config, prompt)?;
+    let mut cmd = build_command(config, prompt, guidelines_file)?;
     cmd.current_dir(repo_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -826,7 +851,11 @@ async fn run_turn(
     Ok(())
 }
 
-fn build_command(config: &AgentBackendConfig, prompt: &str) -> Result<Command, String> {
+fn build_command(
+    config: &AgentBackendConfig,
+    prompt: &str,
+    guidelines_file: Option<&Path>,
+) -> Result<Command, String> {
     match config {
         AgentBackendConfig::Pi {
             model,
@@ -847,6 +876,10 @@ fn build_command(config: &AgentBackendConfig, prompt: &str) -> Result<Command, S
                     cmd.arg("--thinking").arg("medium");
                 }
             }
+            // pi reads an existing file given as the value.
+            if let Some(path) = guidelines_file {
+                cmd.arg("--append-system-prompt").arg(path);
+            }
             cmd.arg(prompt);
             Ok(cmd)
         }
@@ -864,6 +897,62 @@ fn build_command(config: &AgentBackendConfig, prompt: &str) -> Result<Command, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_turns_append_the_guidelines_file_before_the_prompt() {
+        let config = AgentBackendConfig::Pi {
+            model: "m".into(),
+            session_path: None,
+            thinking: None,
+        };
+        let args = |guidelines: Option<&Path>| -> Vec<String> {
+            build_command(&config, "hi", guidelines)
+                .unwrap()
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            args(Some(Path::new("/cfg/agent-guidelines.md"))),
+            [
+                "--print",
+                "--mode",
+                "json",
+                "--model",
+                "m",
+                "--append-system-prompt",
+                "/cfg/agent-guidelines.md",
+                "hi"
+            ]
+        );
+        assert!(!args(None).contains(&"--append-system-prompt".to_string()));
+    }
+
+    #[test]
+    fn claude_chats_pass_the_guidelines_file() {
+        let session = AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        let config = session
+            .claude_session_config(
+                PathBuf::from("/tmp"),
+                Vec::new(),
+                false,
+                Some(PathBuf::from("/cfg/agent-guidelines.md")),
+            )
+            .unwrap();
+        assert!(config
+            .args()
+            .join(" ")
+            .contains("--append-system-prompt-file /cfg/agent-guidelines.md"));
+        let without = session
+            .claude_session_config(PathBuf::from("/tmp"), Vec::new(), false, None)
+            .unwrap();
+        assert!(!without.args().join(" ").contains("--append-system-prompt"));
+    }
 
     fn sub(parent: &str, event: HarnessEvent) -> AgentEvent {
         AgentEvent::Harness(HarnessEvent::SubagentEvent {

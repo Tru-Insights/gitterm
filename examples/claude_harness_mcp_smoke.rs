@@ -93,6 +93,7 @@ async fn main() {
             browser.claude_mcp_server(Some(CALLER)),
         ],
         chrome: false,
+        guidelines_file: None,
     };
     println!("argv: {}", config.args().join(" "));
     let (session, mut events) = ClaudeSession::spawn(config);

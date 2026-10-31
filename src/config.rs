@@ -159,6 +159,19 @@ mod tests {
         let written = serde_json::to_value(&cfg).unwrap();
         assert!(written.get("parked").is_none());
         assert!(written.get("done_at").is_none());
+        // Guidelines are on unless the workspace switched them off (TRU-174).
+        assert!(!cfg.guidelines_off);
+        assert!(written.get("guidelines_off").is_none());
+        let off: WorkspaceConfig = serde_json::from_str(&old.replace(
+            r#""active": false"#,
+            r#""active": false, "guidelines_off": true"#,
+        ))
+        .unwrap();
+        assert!(off.guidelines_off);
+        assert_eq!(
+            serde_json::to_value(&off).unwrap()["guidelines_off"],
+            serde_json::json!(true)
+        );
 
         // An open workspace is never on the Parked list.
         let open: WorkspaceConfig =
@@ -1192,6 +1205,10 @@ pub struct WorkspaceConfig {
     /// the Parked list but stays in this file; its chats stay findable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done_at: Option<String>,
+    /// Agents started in this workspace get no change guidelines
+    /// (TRU-174). See `gitterm::guidelines`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guidelines_off: bool,
 }
 
 /// Why and when a workspace was parked (TRU-171).

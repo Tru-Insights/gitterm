@@ -581,6 +581,9 @@ pub fn codex_run(delegation: &Delegation, config_root: &Path) -> Result<CodexRun
         kind,
         cwd: delegation.parent.cwd.clone(),
         model: model.map(str::to_string),
+        // The caller adds them: whether they apply depends on the
+        // workspace (TRU-174).
+        guidelines: None,
         log_path: log_path(config_root, id),
     })
 }

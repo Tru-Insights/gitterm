@@ -1175,6 +1175,7 @@ mod tests {
                 wire_log_dir: None,
                 mcp_servers: Vec::new(),
                 chrome: false,
+                guidelines_file: None,
             },
             None,
         );
