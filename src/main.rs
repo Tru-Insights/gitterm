@@ -6473,6 +6473,10 @@ struct App {
     slide_animating: bool,
     slide_start_time: Option<Instant>,
     slide_start_offset: f32,
+    /// The workspace (uid) a slide or swipe started from: its panel stays
+    /// in the slide until the slide settles, though the bar may hide it
+    /// (TRU-175).
+    slide_from: Option<u64>,
     // User scroll tracking (for swipe debounce)
     last_user_scroll: Option<Instant>,
     // Edge peek state
@@ -11056,18 +11060,21 @@ impl App {
         }
     }
 
-    /// The bar's machine groups and chips in display order (TRU-175).
-    fn workspace_bar_layout(&self) -> Vec<workspace_bar::BarGroup> {
-        let chips: Vec<workspace_bar::BarChip> = self
-            .workspaces
+    /// What the bar layout reads of each workspace, in Vec order.
+    fn workspace_bar_chips(&self) -> Vec<workspace_bar::BarChip> {
+        self.workspaces
             .iter()
             .map(|ws| workspace_bar::BarChip {
                 group: self.machine_group_key(ws),
                 work: ws.is_work(),
             })
-            .collect();
+            .collect()
+    }
+
+    /// The bar's machine groups and chips in display order (TRU-175).
+    fn workspace_bar_layout(&self) -> Vec<workspace_bar::BarGroup> {
         workspace_bar::bar_layout(
-            &chips,
+            &self.workspace_bar_chips(),
             self.active_workspace_idx,
             &self.collapsed_machine_groups,
             &self.collapsed_repo_groups,
@@ -11083,6 +11090,54 @@ impl App {
     fn visible_workspace_at(&self, num: usize) -> Option<usize> {
         num.checked_sub(1)
             .and_then(|n| self.visible_workspace_order().get(n).copied())
+    }
+
+    /// The content slide's panels left to right (TRU-175): the bar's
+    /// visible order, plus the workspace a slide started from until it
+    /// settles.
+    fn slide_order(&self) -> Vec<usize> {
+        let from = self
+            .slide_from
+            .and_then(|uid| self.workspace_index_by_uid(uid));
+        workspace_bar::slide_order(
+            &self.workspace_bar_chips(),
+            self.active_workspace_idx,
+            from,
+            &self.collapsed_machine_groups,
+            &self.collapsed_repo_groups,
+        )
+    }
+
+    /// Where workspace `idx`'s panel starts in the content slide.
+    fn slide_offset_of(&self, idx: usize) -> f32 {
+        let position = self
+            .slide_order()
+            .iter()
+            .position(|&i| i == idx)
+            .unwrap_or(0);
+        position as f32 * self.content_viewport_width()
+    }
+
+    /// Makes `idx` active and animates the content slide to it. A settled
+    /// slide starts from the active workspace's panel, which stays in the
+    /// slide until it settles.
+    fn begin_slide_to(&mut self, idx: usize) {
+        let settled = !self.slide_animating && self.last_user_scroll.is_none();
+        if settled || self.slide_from.is_none() {
+            self.slide_from = self
+                .workspaces
+                .get(self.active_workspace_idx)
+                .map(|ws| ws.uid);
+        }
+        let from = self.active_workspace_idx;
+        self.active_workspace_idx = idx;
+        if settled {
+            self.slide_offset = self.slide_offset_of(from);
+        }
+        self.slide_start_offset = self.slide_offset;
+        self.slide_target = self.slide_offset_of(idx);
+        self.slide_start_time = Some(Instant::now());
+        self.slide_animating = true;
     }
 
     /// Keep the workspace Vec grouped by machine (local first, then each
@@ -11249,8 +11304,8 @@ impl App {
     }
 
     fn snap_slide_to_active_workspace(&mut self) {
-        let viewport_width = self.content_viewport_width();
-        let new_target = self.active_workspace_idx as f32 * viewport_width;
+        self.slide_from = None;
+        let new_target = self.slide_offset_of(self.active_workspace_idx);
         self.slide_offset = new_target;
         self.slide_target = new_target;
         self.slide_animating = false;
@@ -11494,12 +11549,8 @@ impl App {
         self.sync_plans_dir();
 
         // Snap slide to new active workspace (no animation)
-        let viewport_width = self.content_viewport_width();
-        let new_target = self.active_workspace_idx as f32 * viewport_width;
-        self.slide_offset = new_target;
-        self.slide_target = new_target;
-        self.slide_animating = false;
-        self.slide_start_time = None;
+        self.snap_slide_to_active_workspace();
+        let new_target = self.slide_target;
 
         let scroll_task = iced::advanced::widget::operate(
             iced::advanced::widget::operation::scrollable::scroll_to(
@@ -15313,6 +15364,7 @@ impl App {
             slide_animating: false,
             slide_start_time: None,
             slide_start_offset: 0.0,
+            slide_from: None,
             last_user_scroll: None,
             edge_peek_left: false,
             edge_peek_right: false,
@@ -15525,8 +15577,7 @@ impl App {
         app.register_remote_agent_connection_defaults();
 
         // Set initial slide position for active workspace
-        let viewport_width = app.content_viewport_width();
-        let initial_offset = app.active_workspace_idx as f32 * viewport_width;
+        let initial_offset = app.slide_offset_of(app.active_workspace_idx);
         app.slide_offset = initial_offset;
         app.slide_target = initial_offset;
 
@@ -16653,12 +16704,7 @@ fi
             self.sync_visible_terminals();
             self.mark_workspaces_dirty();
             self.sync_plans_dir();
-            let viewport_width = self.content_viewport_width();
-            let target = self.active_workspace_idx as f32 * viewport_width;
-            self.slide_offset = target;
-            self.slide_target = target;
-            self.slide_animating = false;
-            self.slide_start_time = None;
+            self.snap_slide_to_active_workspace();
             let remote_agent_workspace = self
                 .active_workspace()
                 .is_some_and(|workspace| self.remote_agent_id_for_workspace(workspace).is_some());
@@ -16746,12 +16792,7 @@ fi
         self.mark_log_server_dirty();
         self.sync_plans_dir();
 
-        let viewport_width = self.content_viewport_width();
-        let target = self.active_workspace_idx as f32 * viewport_width;
-        self.slide_offset = target;
-        self.slide_target = target;
-        self.slide_animating = false;
-        self.slide_start_time = None;
+        self.snap_slide_to_active_workspace();
 
         Task::batch([
             self.scroll_to_active_workspace_bar(),
@@ -23277,8 +23318,13 @@ fi
                 if !self.dragging_divider && !self.dragging_console_divider {
                     let content_x = x - SPINE_WIDTH; // x relative to content area
                     let content_width = self.content_viewport_width();
-                    let has_left = self.active_workspace_idx > 0;
-                    let has_right = self.active_workspace_idx + 1 < self.workspaces.len();
+                    let order = self.slide_order();
+                    let position = order
+                        .iter()
+                        .position(|&idx| idx == self.active_workspace_idx)
+                        .unwrap_or(0);
+                    let has_left = position > 0;
+                    let has_right = position + 1 < order.len();
 
                     let near_left = has_left && (0.0..EDGE_PEEK_ZONE).contains(&content_x);
                     let near_right = has_right
@@ -23731,12 +23777,8 @@ fi
                 self.console_height = self.console_height.clamp(32.0, (height - 140.0).max(32.0));
 
                 // Recalculate slide position for new viewport width (snap, no animation)
-                let viewport_width = self.content_viewport_width();
-                let new_target = self.active_workspace_idx as f32 * viewport_width;
-                self.slide_offset = new_target;
-                self.slide_target = new_target;
-                self.slide_animating = false;
-                self.slide_start_time = None;
+                self.snap_slide_to_active_workspace();
+                let new_target = self.slide_target;
 
                 let scroll_task = iced::advanced::widget::operate(
                     iced::advanced::widget::operation::scrollable::scroll_to(
@@ -24937,17 +24979,9 @@ fi
                     }
                 }
                 if idx < self.workspaces.len() && idx != self.active_workspace_idx {
-                    let viewport_width = self.content_viewport_width();
-                    let target = idx as f32 * viewport_width;
-
-                    // Start animation from current position
-                    self.slide_start_offset = self.slide_offset;
-                    self.slide_target = target;
-                    self.slide_start_time = Some(Instant::now());
-                    self.slide_animating = true;
-
-                    // Update active workspace immediately (tab bar + console switch instantly)
-                    self.active_workspace_idx = idx;
+                    // Start the slide and update the active workspace
+                    // immediately (tab bar + console switch instantly).
+                    self.begin_slide_to(idx);
                     let selected_task_is_in_workspace = self
                         .selected_task_id
                         .as_deref()
@@ -25012,13 +25046,14 @@ fi
                     if let Some(last_scroll) = self.last_user_scroll {
                         if last_scroll.elapsed().as_millis() >= SWIPE_DEBOUNCE_MS as u128 {
                             self.last_user_scroll = None;
-                            let viewport_width = self.content_viewport_width();
-                            let target = self.active_workspace_idx as f32 * viewport_width;
+                            let target = self.slide_offset_of(self.active_workspace_idx);
                             if (self.slide_offset - target).abs() > 1.0 {
                                 self.slide_start_offset = self.slide_offset;
                                 self.slide_target = target;
                                 self.slide_start_time = Some(Instant::now());
                                 self.slide_animating = true;
+                            } else {
+                                self.snap_slide_to_active_workspace();
                             }
                         }
                     }
@@ -25037,6 +25072,10 @@ fi
                         self.slide_offset = self.slide_target;
                         self.slide_animating = false;
                         self.slide_start_time = None;
+                        // Settled: the starting panel leaves the slide.
+                        if self.last_user_scroll.is_none() {
+                            self.snap_slide_to_active_workspace();
+                        }
                     }
 
                     let offset_x = self.slide_offset;
@@ -25070,10 +25109,18 @@ fi
                         let offset = viewport.absolute_offset().x;
                         self.slide_offset = offset;
                         self.last_user_scroll = Some(Instant::now());
+                        if self.slide_from.is_none() {
+                            self.slide_from = self.active_workspace().map(|ws| ws.uid);
+                        }
 
-                        // Update active workspace based on current scroll position
-                        let nearest = ((offset + viewport_width * 0.5) / viewport_width) as usize;
-                        let nearest = nearest.min(self.workspaces.len().saturating_sub(1));
+                        // Update active workspace based on current scroll
+                        // position, in the slide's order (TRU-175).
+                        let order = self.slide_order();
+                        let position = ((offset + viewport_width * 0.5) / viewport_width) as usize;
+                        let nearest = order
+                            .get(position.min(order.len().saturating_sub(1)))
+                            .copied()
+                            .unwrap_or(self.active_workspace_idx);
                         if nearest != self.active_workspace_idx {
                             self.active_workspace_idx = nearest;
                             self.sync_visible_terminals();
@@ -25488,12 +25535,7 @@ fi
 
                 // Snap slide state to new workspace position
                 // (no scroll_to needed — view renders active workspace directly when not animating)
-                let viewport_width = self.content_viewport_width();
-                let new_target = self.active_workspace_idx as f32 * viewport_width;
-                self.slide_offset = new_target;
-                self.slide_target = new_target;
-                self.slide_animating = false;
-                self.slide_start_time = None;
+                self.snap_slide_to_active_workspace();
                 let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
                         tab.git_status_loading = true;
@@ -25727,41 +25769,25 @@ fi
                     .map(|ws| ws.active_tab)
                     .unwrap_or(0);
 
-                // Search from (current_ws, current_tab + 1), wrapping around all workspaces/tabs
-                let mut ws_idx = start_ws;
-                let mut tab_idx = start_tab + 1;
-                for _ in 0..(ws_count * 100) {
-                    // upper bound to prevent infinite loop
-                    if let Some(ws) = self.workspaces.get(ws_idx) {
-                        if tab_idx < ws.tabs.len() {
-                            if ws.tabs[tab_idx].needs_attention() {
-                                // Found one — switch to it
-                                if ws_idx != self.active_workspace_idx {
-                                    // Animate workspace switch
-                                    let viewport_width = self.content_viewport_width();
-                                    let target = ws_idx as f32 * viewport_width;
-                                    self.slide_start_offset = self.slide_offset;
-                                    self.slide_target = target;
-                                    self.slide_start_time = Some(Instant::now());
-                                    self.slide_animating = true;
-                                    self.active_workspace_idx = ws_idx;
-                                    self.sync_plans_dir();
-                                }
-                                // Route through TabSelect so task context,
-                                // rail state, and the webview stay in sync.
-                                return self.update(Event::TabSelect(tab_idx));
-                            }
-                            tab_idx += 1;
-                            continue;
-                        }
+                // Search from (current_ws, current_tab + 1), wrapping around
+                // the workspaces in the bar's visible order (TRU-175).
+                let order = self.visible_workspace_order();
+                let found = workspace_bar::next_attention(
+                    &order,
+                    start_ws,
+                    start_tab,
+                    |ws| self.workspaces.get(ws).map_or(0, |ws| ws.tabs.len()),
+                    |ws, tab| self.workspaces[ws].tabs[tab].needs_attention(),
+                );
+                if let Some((ws_idx, tab_idx)) = found {
+                    if ws_idx != self.active_workspace_idx {
+                        // Animate workspace switch
+                        self.begin_slide_to(ws_idx);
+                        self.sync_plans_dir();
                     }
-                    // Move to next workspace, first tab
-                    ws_idx = (ws_idx + 1) % ws_count;
-                    tab_idx = 0;
-                    // If we've wrapped back to start and checked past current tab, we're done
-                    if ws_idx == start_ws && tab_idx > start_tab {
-                        break;
-                    }
+                    // Route through TabSelect so task context,
+                    // rail state, and the webview stay in sync.
+                    return self.update(Event::TabSelect(tab_idx));
                 }
                 // No session tab needs attention — extend the jump to tasks
                 // whose attention lives only on the rail (a WaitingForInput
@@ -30287,7 +30313,11 @@ fi
         let mut dots = Column::new().spacing(8).align_x(iced::Alignment::Center);
         let items = self.attention_items();
 
-        for (idx, ws) in self.workspaces.iter().enumerate() {
+        // The bar's visible order, so the nth dot is the nth chip (TRU-175).
+        for idx in self.visible_workspace_order() {
+            let Some(ws) = self.workspaces.get(idx) else {
+                continue;
+            };
             let is_active = idx == self.active_workspace_idx;
             let ws_color = ws.color.color(theme);
             let inactive_color = theme.surface2();
@@ -31460,23 +31490,30 @@ fi
 
         let mut panels = Row::new().spacing(0);
 
-        for (idx, ws) in self.workspaces.iter().enumerate() {
+        // Panels in the slide's order, the bar's visible order (TRU-175).
+        let order = self.slide_order();
+        let active_pos = order.iter().position(|&idx| idx == active_idx).unwrap_or(0);
+        for (pos, ws) in order
+            .iter()
+            .filter_map(|&idx| self.workspaces.get(idx))
+            .enumerate()
+        {
             // Only render full content for active workspace and immediate neighbors
-            let panel: Element<'_, Event, Theme, iced::Renderer> =
-                if (idx as i32 - active_idx as i32).unsigned_abs() <= 1 {
-                    self.view_workspace_content(ws)
-                } else {
-                    // Distant workspace: render colored placeholder
-                    let bg = theme.bg_base();
-                    container(iced::widget::Space::new())
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .style(move |_| container::Style {
-                            background: Some(bg.into()),
-                            ..Default::default()
-                        })
-                        .into()
-                };
+            let panel: Element<'_, Event, Theme, iced::Renderer> = if pos.abs_diff(active_pos) <= 1
+            {
+                self.view_workspace_content(ws)
+            } else {
+                // Distant workspace: render colored placeholder
+                let bg = theme.bg_base();
+                container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(bg.into()),
+                        ..Default::default()
+                    })
+                    .into()
+            };
 
             let panel_container = container(panel)
                 .width(Length::Fixed(viewport_width))

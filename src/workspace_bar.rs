@@ -7,8 +7,10 @@
 //! one, as before.
 //!
 //! This is display order only: `App::workspaces` keeps its order, so
-//! persisted indices and `active_workspace` are untouched. The bar and
-//! Ctrl+1-9 both read [`visible_order`], so the nth key is the nth chip.
+//! persisted indices and `active_workspace` are untouched. The bar,
+//! Ctrl+1-9, the left spine's dots, the attention jump
+//! ([`next_attention`]) and the content slide ([`slide_order`]) all read
+//! [`visible_order`], so the nth key, dot and panel is the nth chip.
 
 use std::collections::HashSet;
 
@@ -56,6 +58,36 @@ pub(crate) fn bar_layout(
     folded_machines: &HashSet<String>,
     collapsed_repos: &HashSet<String>,
 ) -> Vec<BarGroup> {
+    layout_pinned(chips, &[active], folded_machines, collapsed_repos)
+}
+
+/// The content slide's workspaces left to right: the visible order, also
+/// keeping `from` (the workspace a slide or swipe started from) in place
+/// until the slide settles, so the panels do not shift under it.
+pub(crate) fn slide_order(
+    chips: &[BarChip],
+    active: usize,
+    from: Option<usize>,
+    folded_machines: &HashSet<String>,
+    collapsed_repos: &HashSet<String>,
+) -> Vec<usize> {
+    let pinned: Vec<usize> = std::iter::once(active).chain(from).collect();
+    visible_order(&layout_pinned(
+        chips,
+        &pinned,
+        folded_machines,
+        collapsed_repos,
+    ))
+}
+
+/// `bar_layout` where every index in `pinned` stays visible the way the
+/// active workspace does.
+fn layout_pinned(
+    chips: &[BarChip],
+    pinned: &[usize],
+    folded_machines: &HashSet<String>,
+    collapsed_repos: &HashSet<String>,
+) -> Vec<BarGroup> {
     let mut groups: Vec<BarGroup> = Vec::new();
     for (idx, chip) in chips.iter().enumerate() {
         let pos = match groups.iter().position(|group| group.key == chip.group) {
@@ -74,7 +106,7 @@ pub(crate) fn bar_layout(
         };
         let group = &mut groups[pos];
         group.size += 1;
-        let is_active = idx == active;
+        let is_active = pinned.contains(&idx);
         if group.folded {
             if is_active {
                 if chip.work {
@@ -111,6 +143,41 @@ pub(crate) fn visible_order(groups: &[BarGroup]) -> Vec<usize> {
         .iter()
         .flat_map(|group| group.work.iter().chain(&group.folders).copied())
         .collect()
+}
+
+/// The next tab needing attention after the active one, as (workspace,
+/// tab): the active workspace's later tabs, then each workspace after it
+/// in `order` (wrapping), then the active workspace's earlier tabs and
+/// the active tab itself. `tab_count(ws)` and `needs(ws, tab)` read the
+/// app. A workspace missing from `order` is never visited, except the
+/// active one.
+pub(crate) fn next_attention(
+    order: &[usize],
+    active: usize,
+    active_tab: usize,
+    tab_count: impl Fn(usize) -> usize,
+    needs: impl Fn(usize, usize) -> bool,
+) -> Option<(usize, usize)> {
+    let later = (active_tab + 1..tab_count(active)).map(|tab| (active, tab));
+    let start = order.iter().position(|&idx| idx == active);
+    let others: Vec<usize> = match start {
+        Some(pos) => order[pos + 1..]
+            .iter()
+            .chain(&order[..pos])
+            .copied()
+            .collect(),
+        None => order.to_vec(),
+    };
+    let elsewhere = others
+        .into_iter()
+        .flat_map(|ws| (0..tab_count(ws)).map(move |tab| (ws, tab)));
+    let earlier = (0..=active_tab)
+        .filter(|&tab| tab < tab_count(active))
+        .map(|tab| (active, tab));
+    later
+        .chain(elsewhere)
+        .chain(earlier)
+        .find(|&(ws, tab)| needs(ws, tab))
 }
 
 #[cfg(test)]
@@ -227,5 +294,69 @@ mod tests {
         // Active elsewhere: the folded group shows no chips.
         let groups = bar_layout(&chips, 0, &set(&["agent:box-one"]), &set(&[]));
         assert_eq!(visible_order(&groups), [0]);
+    }
+
+    #[test]
+    fn the_slide_keeps_its_starting_workspace_until_it_settles() {
+        let chips = [
+            chip("local", false),
+            chip("local", true),
+            chip("local", false),
+            chip("agent:box-one", true),
+        ];
+        let collapsed = set(&["local"]);
+        // Settled on hidden folder 2: it shows after the work.
+        assert_eq!(
+            slide_order(&chips, 2, None, &set(&[]), &collapsed),
+            [1, 2, 3]
+        );
+        // Sliding from 2 to 3: 2 stays in place until the slide settles.
+        assert_eq!(
+            slide_order(&chips, 3, Some(2), &set(&[]), &collapsed),
+            [1, 2, 3]
+        );
+        // Settled on 3: the collapsed folders leave the slide.
+        assert_eq!(slide_order(&chips, 3, None, &set(&[]), &collapsed), [1, 3]);
+        // Sliding to a hidden folder from work: both stay visible.
+        assert_eq!(
+            slide_order(&chips, 0, Some(3), &set(&[]), &collapsed),
+            [1, 0, 3]
+        );
+    }
+
+    #[test]
+    fn next_attention_follows_the_visible_order_and_wraps() {
+        // Visible order [1, 0, 3]; workspace 2 is hidden.
+        let order = [1, 0, 3];
+        let tabs = |ws: usize| [2, 3, 1, 2][ws];
+        let waiting = |marks: &'static [(usize, usize)]| {
+            move |ws: usize, tab: usize| marks.contains(&(ws, tab))
+        };
+        // From workspace 1 tab 0: its own tab 1 first.
+        assert_eq!(
+            next_attention(&order, 1, 0, tabs, waiting(&[(1, 1), (0, 0)])),
+            Some((1, 1))
+        );
+        // Then the next visible workspace, not the next index.
+        assert_eq!(
+            next_attention(&order, 1, 2, tabs, waiting(&[(3, 1), (0, 1)])),
+            Some((0, 1))
+        );
+        // Hidden workspaces are skipped.
+        assert_eq!(next_attention(&order, 1, 2, tabs, waiting(&[(2, 0)])), None);
+        // Wraps past the end back to the active workspace's earlier tabs.
+        assert_eq!(
+            next_attention(&order, 3, 1, tabs, waiting(&[(3, 0)])),
+            Some((3, 0))
+        );
+        assert_eq!(
+            next_attention(&order, 3, 1, tabs, waiting(&[(1, 0), (3, 0)])),
+            Some((1, 0))
+        );
+        // The active tab itself is found last.
+        assert_eq!(
+            next_attention(&order, 0, 1, tabs, waiting(&[(0, 1)])),
+            Some((0, 1))
+        );
     }
 }
