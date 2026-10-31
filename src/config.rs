@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -66,6 +66,38 @@ pub fn instance_config_dir() -> PathBuf {
     global_config_dir().join(format!("instance-{}", instance_id()))
 }
 
+/// The gh account each GitHub owner's repos run as (TRU-173), in the shared
+/// config dir, not the per-instance `config.json`, so it survives restarts:
+///
+/// ```json
+/// { "acme": "acme-dev", "acme-labs": "dev-personal" }
+/// ```
+///
+/// The PR watch reads and the overview's Approve and Merge run with
+/// `GH_TOKEN="$(gh auth token --user <user>)"` for that command only. An
+/// owner with no entry uses gh's active account.
+pub const GITHUB_ACCOUNTS_FILE: &str = "github-accounts.json";
+
+pub fn load_github_accounts() -> BTreeMap<String, String> {
+    load_github_accounts_from(&global_config_dir())
+}
+
+fn load_github_accounts_from(dir: &Path) -> BTreeMap<String, String> {
+    let path = dir.join(GITHUB_ACCOUNTS_FILE);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(error) => {
+            eprintln!("[config] cannot read {}: {error}", path.display());
+            return BTreeMap::new();
+        }
+    };
+    serde_json::from_str(&contents).unwrap_or_else(|error| {
+        eprintln!("[config] ignoring {}: {error}", path.display());
+        BTreeMap::new()
+    })
+}
+
 /// Print instance info on startup
 pub fn print_instance_info() {
     eprintln!("{APP_NAME} instance: {}", instance_id());
@@ -78,6 +110,22 @@ pub fn print_instance_info() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_accounts_file_parses_and_tolerates_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_github_accounts_from(dir.path()).is_empty());
+        std::fs::write(
+            dir.path().join(GITHUB_ACCOUNTS_FILE),
+            r#"{"acme":"acme-dev","acme-labs":"dev-personal"}"#,
+        )
+        .unwrap();
+        let accounts = load_github_accounts_from(dir.path());
+        assert_eq!(accounts.get("acme").map(String::as_str), Some("acme-dev"));
+        assert_eq!(accounts.len(), 2);
+        std::fs::write(dir.path().join(GITHUB_ACCOUNTS_FILE), "not json").unwrap();
+        assert!(load_github_accounts_from(dir.path()).is_empty());
+    }
 
     #[test]
     fn workspace_config_loads_old_entries_and_round_trips_parking() {

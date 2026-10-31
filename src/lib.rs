@@ -10,6 +10,8 @@ pub mod delegations;
 pub mod gh_identity;
 pub mod harness;
 pub mod jev;
+pub mod merge_plan;
+pub mod pr_watch;
 pub mod resource_watch;
 pub mod review;
 pub mod task_mcp;

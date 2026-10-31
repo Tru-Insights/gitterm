@@ -32,6 +32,7 @@ use serde_json::Value;
 
 use crate::chats::{ChatBackend, ChatIndexEntry};
 use crate::harness::HarnessEvent;
+use crate::merge_plan::{self, PrRef};
 use crate::tasks::{Delegation, DelegationChild, DelegationKind, TaskCreatorKind, TaskRecord};
 use crate::worktree_follow::{self, ToolInputTracker, WorktreeInfo};
 
@@ -57,6 +58,10 @@ pub struct ChatFacts {
     pub checkouts: Vec<CheckoutTouch>,
     #[serde(default)]
     pub children: Vec<ChatChild>,
+    /// PRs the chat created (TRU-173): a `gh pr create` Bash result naming
+    /// a GitHub PR URL. Written by the hosting tab only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prs: Vec<PrRef>,
     /// "Index older chats" has scanned this chat's transcript; it never
     /// scans it again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -160,6 +165,15 @@ impl ChatFacts {
             && self.repos_touched.is_empty()
             && self.checkouts.is_empty()
             && self.children.is_empty()
+            && self.prs.is_empty()
+    }
+
+    /// Records a PR the chat created, once.
+    pub fn add_pr(&mut self, pr: PrRef) {
+        let id = pr.key().id();
+        if !self.prs.iter().any(|known| known.key().id() == id) {
+            self.prs.push(pr);
+        }
     }
 
     pub fn add_issue_key(&mut self, key: &str) {
@@ -495,11 +509,16 @@ pub struct RawFacts {
     pub touches: Vec<RawTouch>,
     pub issue_keys: Vec<String>,
     pub children: Vec<ChatChild>,
+    /// PRs from `gh pr create` results (live tabs only).
+    pub prs: Vec<PrRef>,
 }
 
 impl RawFacts {
     pub fn is_empty(&self) -> bool {
-        self.touches.is_empty() && self.issue_keys.is_empty() && self.children.is_empty()
+        self.touches.is_empty()
+            && self.issue_keys.is_empty()
+            && self.children.is_empty()
+            && self.prs.is_empty()
     }
 
     pub fn observe_tool_call(
@@ -549,6 +568,7 @@ impl RawFacts {
 
     fn append(&mut self, other: RawFacts) {
         self.touches.extend(other.touches);
+        self.prs.extend(other.prs);
         for key in other.issue_keys {
             if !self.issue_keys.contains(&key) {
                 self.issue_keys.push(key);
@@ -572,6 +592,9 @@ impl RawFacts {
         }
         for child in self.children {
             facts.add_child(child);
+        }
+        for pr in self.prs {
+            facts.add_pr(pr);
         }
     }
 }
@@ -717,6 +740,9 @@ pub fn write_facts(path: &Path, facts: &ChatFacts) -> Result<(), String> {
 pub struct LiveFacts {
     tracker: ToolInputTracker,
     pending: RawFacts,
+    /// Bash calls running `gh pr create` whose result has not arrived
+    /// (TRU-173); their result names the PR.
+    pr_create_calls: HashSet<String>,
     last_flush: Option<Instant>,
     in_flight: bool,
 }
@@ -726,6 +752,29 @@ impl LiveFacts {
         if let Some(call) = self.tracker.observe_calls(event, is_facts_tool) {
             self.pending
                 .observe_tool_call(&call.id, &call.name, &call.input, home, &now_stamp());
+            let creates_pr = call.name == "Bash"
+                && call
+                    .input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(merge_plan::is_gh_pr_create);
+            if creates_pr {
+                self.pr_create_calls.insert(call.id);
+            }
+        }
+        self.observe_results(event);
+    }
+
+    /// A `gh pr create` result (the call's input may complete with the
+    /// same event, so this runs after the tracker).
+    fn observe_results(&mut self, event: &HarnessEvent) {
+        match event {
+            HarnessEvent::SubagentEvent { event, .. } => self.observe_results(event),
+            HarnessEvent::ItemCompleted { id, output, .. } if self.pr_create_calls.remove(id) => {
+                self.pending.prs.extend(merge_plan::pr_urls_in(output));
+            }
+            HarnessEvent::ProcessExited { .. } => self.pr_create_calls.clear(),
+            _ => {}
         }
     }
 
@@ -1572,6 +1621,103 @@ branch refs/heads/tracey/tru-12-thing
         assert!(live.take_due(t0 + Duration::from_secs(1), true).is_some());
         live.flush_done();
         assert_eq!(live.take_due(t0 + LIVE_FLUSH_DEBOUNCE * 2, true), None);
+    }
+
+    #[test]
+    fn live_frames_record_prs_from_gh_pr_create_results_only() {
+        let mut live = LiveFacts::default();
+        let bash = |id: &str, command: &str| HarnessEvent::ItemStarted {
+            id: id.into(),
+            kind: ItemKind::ToolCall {
+                name: "Bash".into(),
+                input: json!({ "command": command }),
+            },
+        };
+        let done = |id: &str, output: &str| HarnessEvent::ItemCompleted {
+            id: id.into(),
+            output: output.into(),
+            is_error: false,
+        };
+        // A PR URL in another command's output is not a PR this chat made.
+        live.observe(&bash("b1", "gh pr view 12 --json url"), None);
+        live.observe(&done("b1", "https://github.com/acme/api/pull/12"), None);
+        live.observe(
+            &bash("b2", "git push -u origin HEAD && gh pr create --fill"),
+            None,
+        );
+        live.observe(
+            &done(
+                "b2",
+                "Creating pull request for prj-101 into main in acme/api\n\nhttps://github.com/acme/api/pull/13\n",
+            ),
+            None,
+        );
+        // A subagent's PR counts for this chat; its input arrives streamed.
+        live.observe(
+            &HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "a1".into(),
+                event: Box::new(HarnessEvent::ItemStarted {
+                    id: "s1".into(),
+                    kind: ItemKind::ToolCall {
+                        name: "Bash".into(),
+                        input: json!({}),
+                    },
+                }),
+            },
+            None,
+        );
+        live.observe(
+            &HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "a1".into(),
+                event: Box::new(HarnessEvent::ItemInputDelta {
+                    id: "s1".into(),
+                    partial_json: r#"{"command":"gh pr create --draft --repo acme/web"}"#.into(),
+                }),
+            },
+            None,
+        );
+        live.observe(
+            &HarnessEvent::SubagentEvent {
+                parent_tool_use_id: "a1".into(),
+                event: Box::new(done("s1", "https://github.com/acme/web/pull/7")),
+            },
+            None,
+        );
+        let raw = live.take_due(Instant::now(), true).expect("PRs are due");
+        assert_eq!(
+            raw.prs
+                .iter()
+                .map(|pr| pr.key().label())
+                .collect::<Vec<_>>(),
+            vec!["acme/api#13", "acme/web#7"]
+        );
+        let mut facts = ChatFacts::default();
+        raw.resolve_into(&mut facts, &mut GitResolver::default());
+        facts.add_pr(PrRef {
+            repo: "ACME/api".into(),
+            number: 13,
+            url: "https://github.com/ACME/api/pull/13".into(),
+        });
+        assert_eq!(facts.prs.len(), 2);
+        assert!(!facts.is_empty());
+    }
+
+    #[test]
+    fn facts_files_without_prs_load_and_write_unchanged() {
+        let old = r#"{"issue_keys":["PRJ-101"],"repos_touched":[],"checkouts":[],"children":[]}"#;
+        let facts: ChatFacts = serde_json::from_str(old).unwrap();
+        assert!(facts.prs.is_empty());
+        let written = serde_json::to_string(&facts).unwrap();
+        assert_eq!(written, old);
+        let mut with_pr = facts;
+        with_pr.add_pr(PrRef {
+            repo: "acme/api".into(),
+            number: 12,
+            url: "https://github.com/acme/api/pull/12".into(),
+        });
+        let round: ChatFacts =
+            serde_json::from_str(&serde_json::to_string(&with_pr).unwrap()).unwrap();
+        assert_eq!(round, with_pr);
     }
 
     fn entry(id: &str, title: &str) -> ChatIndexEntry {
