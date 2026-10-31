@@ -338,6 +338,24 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_repo_groups_are_additive_and_round_trip() {
+        // An old file loads with every Repos zone expanded and writes
+        // nothing new.
+        let old: WorkspacesFile = serde_json::from_str(OLD_WORKSPACES_JSON).unwrap();
+        assert!(old.collapsed_repo_groups.is_empty());
+        let encoded = serde_json::to_value(&old).unwrap();
+        assert!(encoded.get("collapsed_repo_groups").is_none(), "{encoded}");
+
+        let mut collapsed = old.clone();
+        collapsed.collapsed_repo_groups = vec!["local".into(), "agent:box-one".into()];
+        let json = serde_json::to_string_pretty(&collapsed).unwrap();
+        let read: WorkspacesFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.collapsed_repo_groups, ["local", "agent:box-one"]);
+        assert_eq!(read.workspaces.len(), 2);
+        assert_eq!(read.active_workspace, 0);
+    }
+
+    #[test]
     fn test_resolve_config_dir_override_unset() {
         assert_eq!(resolve_config_dir_override(None), None);
     }
@@ -1045,6 +1063,11 @@ pub struct WorkspacesFile {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub remote_agents: Vec<RemoteAgentConfig>,
+    /// Machine group keys ("local", "agent:<id>", ...) whose `Repos` zone
+    /// on the bottom bar is collapsed (TRU-175). Shared across instances
+    /// and restarts; empty (every zone expanded) by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_repo_groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
