@@ -183,6 +183,63 @@ mod tests {
         );
     }
 
+    /// A workspaces file as written before TRU-169: no `chats` anywhere.
+    const OLD_WORKSPACES_JSON: &str = r#"{
+      "workspaces": [
+        {
+          "name": "api-server",
+          "abbrev": "AP",
+          "dir": "/w/api-server",
+          "color": "blue",
+          "tabs": [{ "dir": "/w/api-server" }],
+          "run_command": null,
+          "bottom_terminals": [],
+          "env": { "LINEAR_TEAM": "PRJ" }
+        },
+        {
+          "name": "acme",
+          "abbrev": "AC",
+          "dir": "/w/acme",
+          "color": "green",
+          "tabs": [],
+          "active": false
+        }
+      ],
+      "active_workspace": 0
+    }"#;
+
+    #[test]
+    fn workspace_owned_chats_are_additive_and_round_trip() {
+        // An old file loads unchanged: no owned chats, other fields intact.
+        let old: WorkspacesFile = serde_json::from_str(OLD_WORKSPACES_JSON).unwrap();
+        assert_eq!(old.workspaces.len(), 2);
+        assert!(old.workspaces.iter().all(|ws| ws.chats.is_empty()));
+        assert_eq!(old.workspaces[0].env["LINEAR_TEAM"], "PRJ");
+        assert!(!old.workspaces[1].active);
+        // Without chats nothing new is written.
+        let encoded = serde_json::to_value(&old).unwrap();
+        for ws in encoded["workspaces"].as_array().unwrap() {
+            assert!(ws.get("chats").is_none(), "{ws}");
+        }
+
+        // With chats, through a file on disk and back.
+        let mut owning = old.clone();
+        owning.workspaces[1].name = "Cloud migration".into();
+        owning.workspaces[1].chats = vec!["root-a".into(), "root-b".into()];
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workspaces.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&owning).unwrap()).unwrap();
+        let read: WorkspacesFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(read.workspaces[1].name, "Cloud migration");
+        assert_eq!(read.workspaces[1].chats, ["root-a", "root-b"]);
+        assert!(read.workspaces[0].chats.is_empty());
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw["workspaces"][0].get("chats").is_none());
+        assert_eq!(raw["workspaces"][1]["chats"][1], "root-b");
+    }
+
     #[test]
     fn test_resolve_config_dir_override_unset() {
         assert_eq!(resolve_config_dir_override(None), None);
@@ -987,6 +1044,13 @@ pub struct WorkspaceConfig {
     /// workspaces.json so their env vars and settings are preserved for reopening.
     #[serde(default = "default_true")]
     pub active: bool,
+    /// Root chat session ids this workspace owns (TRU-169). A workspace
+    /// that owns chats is a piece of work: its overview reads these chats
+    /// and their children wherever they ran, and resuming one opens it
+    /// here. Empty keeps the folder-scoped behaviour. A chat belongs to
+    /// at most one workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chats: Vec<String>,
 }
 
 fn default_true() -> bool {
