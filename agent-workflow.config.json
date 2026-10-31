@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "project": {
-    "name": "gitterm-v5",
+    "name": "gitterm-v6",
     "instructionFile": "AGENTS.md"
   },
   "harnesses": {
@@ -33,8 +33,8 @@
     "requireIssueInPr": true
   },
   "git": {
-    "defaultBaseBranch": "v5",
-    "protectedBranches": ["v4", "v5"],
+    "defaultBaseBranch": "v6",
+    "protectedBranches": ["v4", "v5", "v6"],
     "hooksPath": ".githooks"
   },
   "github": {
