@@ -1,5 +1,7 @@
+pub mod agent_browser;
 pub mod agentd;
 pub mod browser_control;
+pub mod browser_engine;
 pub mod browser_mcp;
 pub mod chat_facts;
 pub mod chat_page;
