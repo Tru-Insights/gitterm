@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use hyper::{body::to_bytes, Client, Uri};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -65,6 +65,8 @@ const MAX_VIEWPORT_WIDTH: u32 = 7_680;
 const MAX_VIEWPORT_HEIGHT: u32 = 4_320;
 const BROWSER_PROFILE_NAME: &str = "GitTerm V5 Browser";
 const DEFAULT_BROWSER_TARGET_NAME: &str = "primary";
+/// Longest owner label a chat-owned tab's title prefix shows (TRU-176).
+const MAX_OWNER_LABEL_CHARS: usize = 24;
 // Catppuccin Mocha mauve (#cba6f7) encoded as Chrome's signed ARGB SkColor.
 const BROWSER_PROFILE_COLOR: i64 = -3_430_665;
 
@@ -78,7 +80,7 @@ pub struct BrowserControlError {
 }
 
 impl BrowserControlError {
-    fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -217,6 +219,9 @@ pub struct BrowserOperationOutcome {
 #[derive(Clone)]
 pub struct BrowserEvidence {
     pub id: u64,
+    /// The chat (calling tab's `session_uid`) whose target was captured.
+    /// Evidence is matched and paired within one owner (TRU-176).
+    pub owner: String,
     pub target: String,
     pub label: String,
     pub capture_mode: BrowserCaptureMode,
@@ -234,6 +239,7 @@ impl fmt::Debug for BrowserEvidence {
         formatter
             .debug_struct("BrowserEvidence")
             .field("id", &self.id)
+            .field("owner", &self.owner)
             .field("target", &self.target)
             .field("label", &self.label)
             .field("capture_mode", &self.capture_mode)
@@ -660,6 +666,216 @@ struct ManagedBrowserTarget {
     target_id: String,
     viewport: Option<BrowserViewport>,
     session: Option<CdpSession>,
+    /// Identifier of the session's owner-title script (TRU-176), so a
+    /// label change or a release can remove it.
+    title_script: Option<String>,
+}
+
+impl ManagedBrowserTarget {
+    fn unattached(target_id: String) -> Self {
+        Self {
+            target_id,
+            viewport: None,
+            session: None,
+            title_script: None,
+        }
+    }
+}
+
+/// A managed page target's identity (TRU-176): the chat that owns it (the
+/// calling tab's `session_uid`) and the name that chat gave it. Names are
+/// scoped per owner, so two chats' `primary` are different Chrome tabs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TargetKey {
+    owner: String,
+    name: String,
+}
+
+impl TargetKey {
+    fn new(owner: &str, name: &str) -> Self {
+        Self {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+/// Which chat owns which managed page target (TRU-176). A Chrome tab absent
+/// from `targets` belongs to no chat: a tab the user opened, a tab whose
+/// chat closed, and every tab after a GitTerm restart. No caller can reach
+/// one, and no caller can reach another caller's target.
+#[derive(Default)]
+struct BrowserTargetRegistry {
+    targets: HashMap<TargetKey, ManagedBrowserTarget>,
+    /// Each owner's target for calls that omit `target`.
+    active: HashMap<String, String>,
+    /// The target any chat used last: what the UI's Focus brings forward.
+    window: Option<TargetKey>,
+    /// Display label per owner for the tab title prefix, set by GitTerm.
+    labels: HashMap<String, String>,
+}
+
+impl BrowserTargetRegistry {
+    /// The caller's target named `target`, or its active target when
+    /// omitted (its default `primary` when it has none). Never another
+    /// owner's, whatever the name.
+    fn key(&self, owner: &str, target: Option<&str>) -> Result<TargetKey> {
+        if owner.is_empty() {
+            return Err(BrowserControlError::new(
+                "browser targets belong to the chat that opened them, and this call names no chat",
+            ));
+        }
+        let name = match target {
+            Some(name) => validate_browser_target_name(name)?,
+            None => self
+                .active
+                .get(owner)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_BROWSER_TARGET_NAME),
+        };
+        Ok(TargetKey::new(owner, name))
+    }
+
+    fn get(&self, key: &TargetKey) -> Option<&ManagedBrowserTarget> {
+        self.targets.get(key)
+    }
+
+    fn owns_any(&self, owner: &str) -> bool {
+        self.targets.keys().any(|key| key.owner == owner)
+    }
+
+    fn is_managed(&self, target_id: &str) -> bool {
+        self.targets
+            .values()
+            .any(|managed| managed.target_id == target_id)
+    }
+
+    fn mark_active(&mut self, key: &TargetKey) {
+        self.active.insert(key.owner.clone(), key.name.clone());
+        self.window = Some(key.clone());
+    }
+
+    /// Forget one target; its owner's default moves to its first remaining
+    /// target by name.
+    fn remove(&mut self, key: &TargetKey) -> Option<ManagedBrowserTarget> {
+        let removed = self.targets.remove(key)?;
+        if self.active.get(&key.owner) == Some(&key.name) {
+            self.reset_active(&key.owner);
+        }
+        if self.window.as_ref() == Some(key) {
+            self.window = None;
+        }
+        Some(removed)
+    }
+
+    fn reset_active(&mut self, owner: &str) {
+        match self
+            .targets
+            .keys()
+            .filter(|key| key.owner == owner)
+            .map(|key| key.name.clone())
+            .min()
+        {
+            Some(name) => {
+                self.active.insert(owner.to_string(), name);
+            }
+            None => {
+                self.active.remove(owner);
+            }
+        }
+    }
+
+    /// Drop targets whose Chrome tab no longer exists.
+    fn retain_live(&mut self, live_targets: &[DevToolsTarget]) {
+        self.targets.retain(|_, managed| {
+            live_targets
+                .iter()
+                .any(|target| target.id == managed.target_id && target.kind == "page")
+        });
+        let stale_owners = self
+            .active
+            .iter()
+            .filter(|(owner, name)| !self.targets.contains_key(&TargetKey::new(owner, name)))
+            .map(|(owner, _)| owner.clone())
+            .collect::<Vec<_>>();
+        for owner in stale_owners {
+            self.reset_active(&owner);
+        }
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|key| !self.targets.contains_key(key))
+        {
+            self.window = None;
+        }
+    }
+
+    /// The caller's own live targets, by name, titles without its prefix.
+    fn infos(&self, owner: &str, live_targets: &[DevToolsTarget]) -> Vec<BrowserTargetInfo> {
+        let active = self.active.get(owner).map(String::as_str);
+        let prefix = self.title_prefix(owner);
+        let mut result = self
+            .targets
+            .iter()
+            .filter(|(key, _)| key.owner == owner)
+            .filter_map(|(key, managed)| {
+                live_targets
+                    .iter()
+                    .find(|target| target.id == managed.target_id && target.kind == "page")
+                    .map(|target| BrowserTargetInfo {
+                        name: key.name.clone(),
+                        target_id: target.id.clone(),
+                        url: target.url.clone(),
+                        title: strip_owner_prefix(&target.title, &prefix),
+                        active: active == Some(key.name.as_str()),
+                    })
+            })
+            .collect::<Vec<_>>();
+        result.sort_by(|left, right| left.name.cmp(&right.name));
+        result
+    }
+
+    /// Give up every target of `owners`; their tabs become the user's.
+    fn release(&mut self, owners: &HashSet<String>) -> Vec<(TargetKey, ManagedBrowserTarget)> {
+        let keys = self
+            .targets
+            .keys()
+            .filter(|key| owners.contains(&key.owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        let released = keys
+            .into_iter()
+            .filter_map(|key| self.targets.remove(&key).map(|managed| (key, managed)))
+            .collect();
+        self.active.retain(|owner, _| !owners.contains(owner));
+        self.labels.retain(|owner, _| !owners.contains(owner));
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|key| owners.contains(&key.owner))
+        {
+            self.window = None;
+        }
+        released
+    }
+
+    /// Forget every target (Chrome stopped); owner labels stay.
+    fn clear(&mut self) {
+        self.targets.clear();
+        self.active.clear();
+        self.window = None;
+    }
+
+    /// The title prefix of an owner's tabs: its label, or a short form of
+    /// its id until GitTerm has named it.
+    fn title_prefix(&self, owner: &str) -> String {
+        let label = self
+            .labels
+            .get(owner)
+            .cloned()
+            .unwrap_or_else(|| owner.chars().take(8).collect());
+        format!("[{label}] ")
+    }
 }
 
 /// Owns one visible Chrome process and its dedicated GitTerm V5 profile.
@@ -667,12 +883,18 @@ struct ManagedBrowserTarget {
 /// Dropping the controller terminates the child process. Chrome is launched
 /// without headless flags and its DevTools listener is bound to loopback on a
 /// random OS-assigned port.
+///
+/// Page targets belong to the chat that opened them (TRU-176): every target
+/// operation takes the calling chat as `owner` and resolves names in that
+/// chat's namespace only.
 pub struct BrowserController {
     profile_dir: PathBuf,
     child: Option<Child>,
     endpoint: Option<DevToolsEndpoint>,
-    active_target_name: Option<String>,
-    targets: HashMap<String, ManagedBrowserTarget>,
+    registry: BrowserTargetRegistry,
+    /// The blank page Chrome opened when this controller launched it; the
+    /// first caller's default target adopts it instead of opening another.
+    launch_blank_target: Option<String>,
     last_exit: Option<String>,
     stderr_log: Arc<Mutex<Vec<u8>>>,
     stderr_task: Option<JoinHandle<()>>,
@@ -684,8 +906,8 @@ impl BrowserController {
             profile_dir: browser_profile_dir(v5_global_config_dir.as_ref()),
             child: None,
             endpoint: None,
-            active_target_name: None,
-            targets: HashMap::new(),
+            registry: BrowserTargetRegistry::default(),
+            launch_blank_target: None,
             last_exit: None,
             stderr_log: Arc::new(Mutex::new(Vec::new())),
             stderr_task: None,
@@ -755,8 +977,14 @@ impl BrowserController {
         loop {
             if let Some(endpoint) = read_devtools_active_port(&active_port_path)? {
                 match list_page_targets(endpoint.port).await {
-                    Ok(_) => {
+                    Ok(live_targets) => {
                         self.endpoint = Some(endpoint);
+                        self.launch_blank_target = match live_targets.as_slice() {
+                            [only] if only.kind == "page" && only.url == "about:blank" => {
+                                Some(only.id.clone())
+                            }
+                            _ => None,
+                        };
                         return self.status().await;
                     }
                     Err(error) if Instant::now() < deadline => {
@@ -828,10 +1056,12 @@ impl BrowserController {
             (BrowserState::Stopped, None)
         };
 
+        // The window's view: the target any chat used last.
         let target_id = self
-            .active_target_name
+            .registry
+            .window
             .as_ref()
-            .and_then(|name| self.targets.get(name))
+            .and_then(|key| self.registry.get(key))
             .map(|target| target.target_id.clone());
         Ok(BrowserStatus {
             state,
@@ -839,9 +1069,19 @@ impl BrowserController {
             devtools_port: self.endpoint.as_ref().map(|endpoint| endpoint.port),
             process_id: self.child.as_ref().and_then(Child::id),
             target_id,
-            active_target: self.active_target_name.clone(),
+            active_target: self.registry.window.as_ref().map(|key| key.name.clone()),
             detail,
         })
+    }
+
+    /// `status` as one chat sees it: the active target is its own.
+    pub async fn status_for(&mut self, owner: &str) -> Result<BrowserStatus> {
+        let key = self.registry.key(owner, None)?;
+        let mut status = self.status().await?;
+        let managed = self.registry.get(&key);
+        status.target_id = managed.map(|target| target.target_id.clone());
+        status.active_target = managed.map(|_| key.name);
+        Ok(status)
     }
 
     /// Refresh process state and adopt a live DevTools endpoint left by
@@ -864,18 +1104,15 @@ impl BrowserController {
         self.status_snapshot()
     }
 
-    pub async fn navigate(&mut self, raw_url: &str) -> Result<NavigationResult> {
-        self.navigate_in(None, raw_url).await
-    }
-
     pub async fn navigate_in(
         &mut self,
+        owner: &str,
         target: Option<&str>,
         raw_url: &str,
     ) -> Result<NavigationResult> {
         let url = validate_navigation_url(raw_url)?;
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+        let key = self.registry.key(owner, target)?;
+        let session = self.page_session_for(&key).await?;
         let result = session
             .command("Page.navigate", json!({ "url": url.as_str() }))
             .await?;
@@ -904,17 +1141,15 @@ impl BrowserController {
         })
     }
 
-    pub async fn snapshot(&mut self) -> Result<BrowserSnapshot> {
-        self.snapshot_in(None, BrowserCaptureMode::Viewport).await
-    }
-
     pub async fn snapshot_in(
         &mut self,
+        owner: &str,
         target: Option<&str>,
         capture_mode: BrowserCaptureMode,
     ) -> Result<BrowserSnapshot> {
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+        let key = self.registry.key(owner, target)?;
+        let prefix = self.registry.title_prefix(owner);
+        let session = self.page_session_for(&key).await?;
 
         let page_state = session
             .command(
@@ -958,16 +1193,16 @@ impl BrowserController {
             })?;
         let (console_errors, failed_requests) = session.diagnostics().await;
         let viewport = self
-            .targets
-            .get(&target_name)
+            .registry
+            .get(&key)
             .and_then(|target| target.viewport)
             .unwrap_or(state.viewport);
 
         Ok(BrowserSnapshot {
-            target: target_name,
+            target: key.name,
             capture_mode,
             url: state.url,
-            title: state.title,
+            title: strip_owner_prefix(&state.title, &prefix),
             loading_state: state.loading_state,
             visible_text: state.visible_text,
             interactive_elements: state.interactive_elements,
@@ -979,17 +1214,14 @@ impl BrowserController {
     }
 
     /// Click one strictly located visible element using CDP mouse events.
-    pub async fn click(&mut self, locator: &BrowserLocator) -> Result<BrowserActionTarget> {
-        self.click_in(None, locator).await
-    }
-
     pub async fn click_in(
         &mut self,
+        owner: &str,
         target: Option<&str>,
         locator: &BrowserLocator,
     ) -> Result<BrowserActionTarget> {
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+        let key = self.registry.key(owner, target)?;
+        let session = self.page_session_for(&key).await?;
         let target = resolve_locator(session, locator, LocatorPreparation::Point).await?;
         session
             .command(
@@ -1031,22 +1263,15 @@ impl BrowserController {
     }
 
     /// Replace the contents of one editable element and leave it focused.
-    pub async fn type_text(
-        &mut self,
-        locator: &BrowserLocator,
-        text: &str,
-    ) -> Result<BrowserActionTarget> {
-        self.type_text_in(None, locator, text).await
-    }
-
     pub async fn type_text_in(
         &mut self,
+        owner: &str,
         target: Option<&str>,
         locator: &BrowserLocator,
         text: &str,
     ) -> Result<BrowserActionTarget> {
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+        let key = self.registry.key(owner, target)?;
+        let session = self.page_session_for(&key).await?;
         let target = resolve_locator(session, locator, LocatorPreparation::ReplaceText).await?;
         session
             .command("Input.insertText", json!({ "text": text }))
@@ -1055,14 +1280,15 @@ impl BrowserController {
     }
 
     /// Press one supported non-text key against the currently focused element.
-    pub async fn press(&mut self, key: BrowserKey) -> Result<()> {
-        self.press_in(None, key).await
-    }
-
-    pub async fn press_in(&mut self, target: Option<&str>, key: BrowserKey) -> Result<()> {
+    pub async fn press_in(
+        &mut self,
+        owner: &str,
+        target: Option<&str>,
+        key: BrowserKey,
+    ) -> Result<()> {
         let descriptor = key_descriptor(key);
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+        let target_key = self.registry.key(owner, target)?;
+        let session = self.page_session_for(&target_key).await?;
         let mut key_down = json!({
             "type": if descriptor.text.is_some() { "keyDown" } else { "rawKeyDown" },
             "key": descriptor.key,
@@ -1091,13 +1317,14 @@ impl BrowserController {
     }
 
     /// Reload the current page and wait for a new document to finish loading.
-    pub async fn reload(&mut self, ignore_cache: bool) -> Result<()> {
-        self.reload_in(None, ignore_cache).await
-    }
-
-    pub async fn reload_in(&mut self, target: Option<&str>, ignore_cache: bool) -> Result<()> {
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+    pub async fn reload_in(
+        &mut self,
+        owner: &str,
+        target: Option<&str>,
+        ignore_cache: bool,
+    ) -> Result<()> {
+        let key = self.registry.key(owner, target)?;
+        let session = self.page_session_for(&key).await?;
         let previous_time_origin = page_time_origin(session).await?;
         session
             .command("Page.reload", json!({ "ignoreCache": ignore_cache }))
@@ -1111,18 +1338,15 @@ impl BrowserController {
     }
 
     /// Apply responsive device metrics to the controlled page target.
-    pub async fn resize(&mut self, viewport: BrowserViewport) -> Result<BrowserViewport> {
-        self.resize_in(None, viewport).await
-    }
-
     pub async fn resize_in(
         &mut self,
+        owner: &str,
         target: Option<&str>,
         viewport: BrowserViewport,
     ) -> Result<BrowserViewport> {
         let viewport = viewport.validate()?;
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+        let key = self.registry.key(owner, target)?;
+        let session = self.page_session_for(&key).await?;
         session
             .command(
                 "Emulation.setDeviceMetricsOverride",
@@ -1134,20 +1358,18 @@ impl BrowserController {
                 }),
             )
             .await?;
-        self.targets
-            .get_mut(&target_name)
-            .ok_or_else(|| browser_target_not_found(&target_name))?
+        self.registry
+            .targets
+            .get_mut(&key)
+            .ok_or_else(|| browser_target_not_found(&key.name))?
             .viewport = Some(viewport);
         Ok(viewport)
     }
 
     /// Scroll the page at the current viewport center using a CDP wheel event.
-    pub async fn scroll(&mut self, delta_x: f64, delta_y: f64) -> Result<()> {
-        self.scroll_in(None, delta_x, delta_y).await
-    }
-
     pub async fn scroll_in(
         &mut self,
+        owner: &str,
         target: Option<&str>,
         delta_x: f64,
         delta_y: f64,
@@ -1162,8 +1384,8 @@ impl BrowserController {
                 "browser scroll deltas must be finite and between -{MAX_SCROLL_DELTA} and {MAX_SCROLL_DELTA}"
             )));
         }
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+        let key = self.registry.key(owner, target)?;
+        let session = self.page_session_for(&key).await?;
         let result = session
             .command(
                 "Runtime.evaluate",
@@ -1199,13 +1421,13 @@ impl BrowserController {
         Ok(())
     }
 
-    pub async fn diagnostics(&mut self) -> Result<BrowserDiagnostics> {
-        self.diagnostics_in(None).await
-    }
-
-    pub async fn diagnostics_in(&mut self, target: Option<&str>) -> Result<BrowserDiagnostics> {
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+    pub async fn diagnostics_in(
+        &mut self,
+        owner: &str,
+        target: Option<&str>,
+    ) -> Result<BrowserDiagnostics> {
+        let key = self.registry.key(owner, target)?;
+        let session = self.page_session_for(&key).await?;
         let (console_errors, failed_requests) = session.diagnostics().await;
         Ok(BrowserDiagnostics {
             console_errors,
@@ -1213,37 +1435,33 @@ impl BrowserController {
         })
     }
 
-    pub async fn dom_outline(&mut self) -> Result<BrowserDomOutline> {
-        self.dom_outline_in(None).await
-    }
-
-    pub async fn dom_outline_in(&mut self, target: Option<&str>) -> Result<BrowserDomOutline> {
-        let target_name = self.target_name(target)?;
-        let expression = dom_outline_expression(&target_name)?;
-        let session = self.page_session_named(&target_name).await?;
+    pub async fn dom_outline_in(
+        &mut self,
+        owner: &str,
+        target: Option<&str>,
+    ) -> Result<BrowserDomOutline> {
+        let key = self.registry.key(owner, target)?;
+        let prefix = self.registry.title_prefix(owner);
+        let expression = dom_outline_expression(&key.name)?;
+        let session = self.page_session_for(&key).await?;
         let mut outline: BrowserDomOutline =
             evaluate_by_value(session, &expression, "DOM outline").await?;
         outline.url =
             sanitize_diagnostic_url(&outline.url).unwrap_or_else(|| "URL unavailable".to_string());
+        outline.title = strip_owner_prefix(&outline.title, &prefix);
         Ok(outline)
-    }
-
-    pub async fn node_details(
-        &mut self,
-        selector: &BrowserNodeSelector,
-    ) -> Result<BrowserNodeDetails> {
-        self.node_details_in(None, selector).await
     }
 
     pub async fn node_details_in(
         &mut self,
+        owner: &str,
         target: Option<&str>,
         selector: &BrowserNodeSelector,
     ) -> Result<BrowserNodeDetails> {
         selector.validate()?;
-        let target_name = self.target_name(target)?;
-        let expression = node_details_expression(&target_name, selector)?;
-        let session = self.page_session_named(&target_name).await?;
+        let key = self.registry.key(owner, target)?;
+        let expression = node_details_expression(&key.name, selector)?;
+        let session = self.page_session_for(&key).await?;
         let evaluation: NodeDetailsEvaluation =
             evaluate_by_value(session, &expression, "DOM node details").await?;
         if let Some(error) = evaluation.error {
@@ -1258,16 +1476,9 @@ impl BrowserController {
     }
 
     /// Wait for page state with a bounded, explicit timeout.
-    pub async fn wait_for(
-        &mut self,
-        condition: &BrowserWaitCondition,
-        max_wait: Duration,
-    ) -> Result<()> {
-        self.wait_for_in(None, condition, max_wait).await
-    }
-
     pub async fn wait_for_in(
         &mut self,
+        owner: &str,
         target: Option<&str>,
         condition: &BrowserWaitCondition,
         max_wait: Duration,
@@ -1278,22 +1489,20 @@ impl BrowserController {
             ));
         }
         validate_wait_condition(condition)?;
-        let target_name = self.target_name(target)?;
-        let session = self.page_session_named(&target_name).await?;
+        let key = self.registry.key(owner, target)?;
+        let session = self.page_session_for(&key).await?;
         wait_for_condition(session, condition, max_wait).await
     }
 
     /// Wait until the current document reports a complete loading state.
-    pub async fn wait_for_ready(&mut self, max_wait: Duration) -> Result<()> {
-        self.wait_for_ready_in(None, max_wait).await
-    }
-
     pub async fn wait_for_ready_in(
         &mut self,
+        owner: &str,
         target: Option<&str>,
         max_wait: Duration,
     ) -> Result<()> {
         self.wait_for_in(
+            owner,
             target,
             &BrowserWaitCondition::LoadingState {
                 state: BrowserLoadingState::Complete,
@@ -1303,18 +1512,44 @@ impl BrowserController {
         .await
     }
 
-    /// Bring the managed page target to the front of its Chrome window.
+    /// Bring the window's page forward for the user: the target a chat used
+    /// last, or else whichever page Chrome lists first, without claiming it
+    /// for any chat.
     pub async fn focus(&mut self) -> Result<()> {
-        let target = self.target_name(None)?;
-        self.focus_target(&target).await
+        let endpoint = self.running_endpoint()?;
+        let live_targets = list_page_targets(endpoint.port).await?;
+        self.registry.retain_live(&live_targets);
+        if let Some(key) = self.registry.window.clone() {
+            self.page_session_for(&key)
+                .await?
+                .command("Page.bringToFront", json!({}))
+                .await?;
+            return Ok(());
+        }
+        let websocket_url = live_targets
+            .iter()
+            .filter(|target| target.kind == "page")
+            .find_map(|target| target.web_socket_debugger_url.clone())
+            .ok_or_else(|| BrowserControlError::new("Chrome has no page to bring forward"))?;
+        CdpSession::connect(&websocket_url)
+            .await?
+            .command("Page.bringToFront", json!({}))
+            .await?;
+        Ok(())
     }
 
-    pub async fn open_target(&mut self, name: &str, raw_url: &str) -> Result<BrowserTargetInfo> {
-        let name = validate_browser_target_name(name)?.to_string();
+    pub async fn open_target(
+        &mut self,
+        owner: &str,
+        name: &str,
+        raw_url: &str,
+    ) -> Result<BrowserTargetInfo> {
+        let key = self.registry.key(owner, Some(name))?;
         let url = validate_navigation_url(raw_url)?;
-        if self.targets.contains_key(&name) {
+        if self.registry.get(&key).is_some() {
             return Err(BrowserControlError::new(format!(
-                "browser target '{name}' already exists"
+                "browser target '{}' already exists",
+                key.name
             )));
         }
         let session = self.browser_session().await?;
@@ -1326,46 +1561,29 @@ impl BrowserController {
             .and_then(Value::as_str)
             .ok_or_else(|| BrowserControlError::new("Target.createTarget omitted its targetId"))?
             .to_string();
-        self.targets.insert(
-            name.clone(),
-            ManagedBrowserTarget {
-                target_id: target_id.clone(),
-                viewport: None,
-                session: None,
-            },
+        self.registry.targets.insert(
+            key.clone(),
+            ManagedBrowserTarget::unattached(target_id.clone()),
         );
-        self.active_target_name = Some(name.clone());
+        self.registry.mark_active(&key);
         let deadline = Instant::now() + TARGET_STARTUP_TIMEOUT;
         loop {
-            match self.focus_target(&name).await {
+            match self.focus_key(&key).await {
                 Ok(()) => break,
                 Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(25)).await,
                 Err(error) => {
-                    let cleanup = match session
-                        .command("Target.closeTarget", json!({ "targetId": target_id }))
-                        .await
-                    {
-                        Ok(result)
-                            if result.get("success").and_then(Value::as_bool) == Some(true) =>
-                        {
-                            "the incomplete target was closed".to_string()
-                        }
-                        Ok(_) => "Chrome did not close the incomplete target".to_string(),
-                        Err(cleanup_error) => {
-                            format!("closing the incomplete target also failed: {cleanup_error}")
-                        }
-                    };
-                    self.targets.remove(&name);
-                    self.active_target_name = self.targets.keys().min().cloned();
+                    let cleanup = close_incomplete_target(&session, &target_id).await;
+                    self.registry.remove(&key);
                     return Err(BrowserControlError::new(format!(
-                        "created browser target '{name}' but could not initialize it within {} seconds: {error}; {cleanup}",
+                        "created browser target '{}' but could not initialize it within {} seconds: {error}; {cleanup}",
+                        key.name,
                         TARGET_STARTUP_TIMEOUT.as_secs()
                     )));
                 }
             }
         }
         Ok(BrowserTargetInfo {
-            name,
+            name: key.name,
             target_id,
             url: url.into(),
             title: String::new(),
@@ -1373,62 +1591,41 @@ impl BrowserController {
         })
     }
 
-    pub async fn targets(&mut self) -> Result<Vec<BrowserTargetInfo>> {
+    /// The caller's own targets. A caller with none gets its default
+    /// target opened, as on its first page operation.
+    pub async fn targets(&mut self, owner: &str) -> Result<Vec<BrowserTargetInfo>> {
+        let default_key = self
+            .registry
+            .key(owner, Some(DEFAULT_BROWSER_TARGET_NAME))?;
         let endpoint = self.running_endpoint()?;
         let mut live_targets = list_page_targets(endpoint.port).await?;
-        self.targets.retain(|_, managed| {
-            live_targets
-                .iter()
-                .any(|target| target.id == managed.target_id && target.kind == "page")
-        });
-        if self.targets.is_empty() {
-            self.active_target_name = None;
-            self.page_session_named(DEFAULT_BROWSER_TARGET_NAME).await?;
+        self.registry.retain_live(&live_targets);
+        if !self.registry.owns_any(owner) {
+            self.page_session_for(&default_key).await?;
             live_targets = list_page_targets(endpoint.port).await?;
-        } else if self
-            .active_target_name
-            .as_ref()
-            .is_some_and(|name| !self.targets.contains_key(name))
-        {
-            self.active_target_name = self.targets.keys().min().cloned();
         }
-        let active = self.active_target_name.as_deref();
-        let mut result = self
-            .targets
-            .iter()
-            .filter_map(|(name, managed)| {
-                live_targets
-                    .iter()
-                    .find(|target| target.id == managed.target_id && target.kind == "page")
-                    .map(|target| BrowserTargetInfo {
-                        name: name.clone(),
-                        target_id: target.id.clone(),
-                        url: target.url.clone(),
-                        title: target.title.clone(),
-                        active: active == Some(name.as_str()),
-                    })
-            })
-            .collect::<Vec<_>>();
-        result.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(result)
+        Ok(self.registry.infos(owner, &live_targets))
     }
 
-    pub async fn focus_target(&mut self, name: &str) -> Result<()> {
-        let name = validate_browser_target_name(name)?.to_string();
-        self.page_session_named(&name)
+    pub async fn focus_target(&mut self, owner: &str, name: &str) -> Result<()> {
+        let key = self.registry.key(owner, Some(name))?;
+        self.focus_key(&key).await
+    }
+
+    async fn focus_key(&mut self, key: &TargetKey) -> Result<()> {
+        self.page_session_for(key)
             .await?
             .command("Page.bringToFront", json!({}))
             .await?;
-        self.active_target_name = Some(name);
         Ok(())
     }
 
-    pub async fn close_target(&mut self, name: &str) -> Result<()> {
-        let name = validate_browser_target_name(name)?.to_string();
+    pub async fn close_target(&mut self, owner: &str, name: &str) -> Result<()> {
+        let key = self.registry.key(owner, Some(name))?;
         let target_id = self
-            .targets
-            .get(&name)
-            .ok_or_else(|| browser_target_not_found(&name))?
+            .registry
+            .get(&key)
+            .ok_or_else(|| browser_target_not_found(&key.name))?
             .target_id
             .clone();
         let session = self.browser_session().await?;
@@ -1437,14 +1634,85 @@ impl BrowserController {
             .await?;
         if result.get("success").and_then(Value::as_bool) != Some(true) {
             return Err(BrowserControlError::new(format!(
-                "Chrome did not close browser target '{name}'"
+                "Chrome did not close browser target '{}'",
+                key.name
             )));
         }
-        self.targets.remove(&name);
-        if self.active_target_name.as_deref() == Some(name.as_str()) {
-            self.active_target_name = self.targets.keys().min().cloned();
-        }
+        self.registry.remove(&key);
         Ok(())
+    }
+
+    /// Give up the targets of chats that closed (TRU-176). Their tabs stay
+    /// open without the owner prefix and belong to the user from then on,
+    /// like any tab GitTerm did not open for a chat.
+    pub async fn release_owners(&mut self, owners: &HashSet<String>) -> Result<()> {
+        let mut failures = Vec::new();
+        for (key, managed) in self.registry.release(owners) {
+            let Some(session) = managed
+                .session
+                .as_ref()
+                .filter(|session| !session.is_finished())
+            else {
+                continue;
+            };
+            if let Err(error) =
+                set_owner_title(session, managed.title_script.as_deref(), None).await
+            {
+                failures.push(format!("'{}': {error}", key.name));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BrowserControlError::new(format!(
+                "released the closed chats' browser targets, but could not clear the owner prefix of {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// Record each chat's display label and re-mark the open tabs of any
+    /// chat whose label changed (TRU-176). `labels` names every live chat.
+    pub async fn set_owner_labels(&mut self, labels: HashMap<String, String>) -> Result<()> {
+        let labels = labels
+            .into_iter()
+            .filter_map(|(owner, label)| owner_label(&label).map(|label| (owner, label)))
+            .collect::<HashMap<_, _>>();
+        let changed = self
+            .registry
+            .targets
+            .keys()
+            .filter(|key| labels.get(&key.owner) != self.registry.labels.get(&key.owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.registry.labels = labels;
+        let mut failures = Vec::new();
+        for key in changed {
+            let prefix = self.registry.title_prefix(&key.owner);
+            let Some(managed) = self.registry.targets.get_mut(&key) else {
+                continue;
+            };
+            let Some(session) = managed
+                .session
+                .as_ref()
+                .filter(|session| !session.is_finished())
+            else {
+                continue;
+            };
+            let previous = managed.title_script.take();
+            match set_owner_title(session, previous.as_deref(), Some(&prefix)).await {
+                Ok(script) => managed.title_script = script,
+                Err(error) => failures.push(format!("'{}': {error}", key.name)),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BrowserControlError::new(format!(
+                "could not update the owner prefix of browser targets {}",
+                failures.join("; ")
+            )))
+        }
     }
 
     pub async fn disconnect(&mut self) -> Result<()> {
@@ -1521,16 +1789,6 @@ impl BrowserController {
             .ok_or_else(|| BrowserControlError::new("running browser has no DevTools endpoint"))
     }
 
-    fn target_name(&self, target: Option<&str>) -> Result<String> {
-        match target {
-            Some(name) => Ok(validate_browser_target_name(name)?.to_string()),
-            None => Ok(self
-                .active_target_name
-                .clone()
-                .unwrap_or_else(|| DEFAULT_BROWSER_TARGET_NAME.to_string())),
-        }
-    }
-
     async fn browser_session(&mut self) -> Result<CdpSession> {
         let endpoint = self.running_endpoint()?;
         let websocket_url = format!(
@@ -1540,49 +1798,42 @@ impl BrowserController {
         CdpSession::connect(&websocket_url).await
     }
 
-    async fn page_session_named(&mut self, name: &str) -> Result<&CdpSession> {
-        let name = validate_browser_target_name(name)?.to_string();
+    /// The DevTools session of one owner's target, attached on first use.
+    /// Only the owner's default target is opened on demand; any other name
+    /// the owner has not opened (including every other owner's target) is
+    /// reported as not found before Chrome is consulted.
+    async fn page_session_for(&mut self, key: &TargetKey) -> Result<&CdpSession> {
+        let mapped_target_id = self
+            .registry
+            .get(key)
+            .map(|target| target.target_id.clone());
+        if mapped_target_id.is_none() && key.name != DEFAULT_BROWSER_TARGET_NAME {
+            return Err(browser_target_not_found(&key.name));
+        }
         let endpoint = self.running_endpoint()?;
         let live_targets = list_page_targets(endpoint.port).await?;
-        let mapped_target_id = self
-            .targets
-            .get(&name)
-            .map(|target| target.target_id.clone());
-        let target = mapped_target_id
-            .as_deref()
-            .and_then(|target_id| {
-                live_targets.iter().find(|target| {
+        let target = match mapped_target_id.as_deref() {
+            Some(target_id) => live_targets
+                .iter()
+                .find(|target| {
                     target.id == target_id
                         && target.kind == "page"
                         && target.web_socket_debugger_url.is_some()
                 })
-            })
-            .or_else(|| {
-                (name == DEFAULT_BROWSER_TARGET_NAME && mapped_target_id.is_none()).then(|| {
-                    live_targets.iter().find(|target| {
-                        target.kind == "page"
-                            && target.web_socket_debugger_url.is_some()
-                            && !self
-                                .targets
-                                .values()
-                                .any(|managed| managed.target_id == target.id)
-                    })
-                })?
-            })
-            .cloned()
-            .ok_or_else(|| browser_target_not_found(&name))?;
+                .cloned()
+                .ok_or_else(|| browser_target_not_found(&key.name))?,
+            None => self.open_default_target(&live_targets).await?,
+        };
         let target_id = target.id.clone();
         let websocket_url = target.web_socket_debugger_url.clone().ok_or_else(|| {
             BrowserControlError::new("Chrome page target did not expose a WebSocket debugger URL")
         })?;
+        let prefix = self.registry.title_prefix(&key.owner);
         let managed = self
+            .registry
             .targets
-            .entry(name.clone())
-            .or_insert_with(|| ManagedBrowserTarget {
-                target_id: target_id.clone(),
-                viewport: None,
-                session: None,
-            });
+            .entry(key.clone())
+            .or_insert_with(|| ManagedBrowserTarget::unattached(target_id.clone()));
         let needs_session = managed.target_id != target_id
             || managed.session.as_ref().is_none_or(CdpSession::is_finished);
         if needs_session {
@@ -1591,22 +1842,84 @@ impl BrowserController {
             session.command("Runtime.enable", json!({})).await?;
             session.command("Log.enable", json!({})).await?;
             session.command("Network.enable", json!({})).await?;
+            // The owner mark is for the user's eyes; a page that refuses
+            // it (mid-navigation, say) must not fail the agent's operation.
+            let title_script = match set_owner_title(&session, None, Some(&prefix)).await {
+                Ok(script) => script,
+                Err(error) => {
+                    eprintln!(
+                        "could not mark browser target '{}' with its owning chat: {error}",
+                        key.name
+                    );
+                    None
+                }
+            };
             managed.target_id = target_id;
             managed.viewport = None;
             managed.session = Some(session);
+            managed.title_script = title_script;
         }
-        self.active_target_name = Some(name.clone());
-        self.targets
-            .get(&name)
+        self.registry.mark_active(key);
+        self.registry
+            .get(key)
             .and_then(|managed| managed.session.as_ref())
             .ok_or_else(|| {
                 BrowserControlError::new("Chrome page target has no active DevTools session")
             })
     }
 
+    /// A fresh page for a caller's default target: the blank page Chrome
+    /// opened at launch while no chat holds it, else a new blank tab. Never
+    /// a page someone else is using: the user's tabs stay theirs.
+    async fn open_default_target(
+        &mut self,
+        live_targets: &[DevToolsTarget],
+    ) -> Result<DevToolsTarget> {
+        if let Some(launch_blank) = self.launch_blank_target.take() {
+            if let Some(target) = live_targets.iter().find(|target| {
+                target.id == launch_blank
+                    && target.kind == "page"
+                    && target.url == "about:blank"
+                    && target.web_socket_debugger_url.is_some()
+                    && !self.registry.is_managed(&target.id)
+            }) {
+                return Ok(target.clone());
+            }
+        }
+        let session = self.browser_session().await?;
+        let result = session
+            .command("Target.createTarget", json!({ "url": "about:blank" }))
+            .await?;
+        let target_id = result
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserControlError::new("Target.createTarget omitted its targetId"))?
+            .to_string();
+        let deadline = Instant::now() + TARGET_STARTUP_TIMEOUT;
+        loop {
+            let endpoint = self.running_endpoint()?;
+            let listed = list_page_targets(endpoint.port).await?;
+            if let Some(target) = listed.into_iter().find(|target| {
+                target.id == target_id
+                    && target.kind == "page"
+                    && target.web_socket_debugger_url.is_some()
+            }) {
+                return Ok(target);
+            }
+            if Instant::now() >= deadline {
+                let cleanup = close_incomplete_target(&session, &target_id).await;
+                return Err(BrowserControlError::new(format!(
+                    "opened a page for the default browser target '{DEFAULT_BROWSER_TARGET_NAME}' but Chrome did not list it within {} seconds; {cleanup}",
+                    TARGET_STARTUP_TIMEOUT.as_secs()
+                )));
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     fn clear_targets(&mut self) {
-        self.active_target_name = None;
-        self.targets.clear();
+        self.registry.clear();
+        self.launch_blank_target = None;
     }
 
     async fn terminate_child(&mut self) -> String {
@@ -1758,21 +2071,32 @@ impl BrowserControlService {
         self.controller.lock().await.status().await
     }
 
-    pub async fn navigate(&self, url: &str) -> Result<NavigationResult> {
-        self.controller.lock().await.navigate(url).await
+    /// Browser status as one chat sees it: its own active target.
+    pub async fn status_for(&self, owner: &str) -> Result<BrowserStatus> {
+        self.controller.lock().await.status_for(owner).await
     }
 
-    pub async fn navigate_in(&self, target: Option<&str>, url: &str) -> Result<NavigationResult> {
-        self.controller.lock().await.navigate_in(target, url).await
+    pub async fn navigate_in(
+        &self,
+        owner: &str,
+        target: Option<&str>,
+        url: &str,
+    ) -> Result<NavigationResult> {
+        self.controller
+            .lock()
+            .await
+            .navigate_in(owner, target, url)
+            .await
     }
 
-    pub async fn snapshot(&self) -> Result<BrowserSnapshot> {
-        self.capture(None, "Snapshot", BrowserCaptureMode::Viewport)
+    pub async fn snapshot(&self, owner: &str) -> Result<BrowserSnapshot> {
+        self.capture(owner, None, "Snapshot", BrowserCaptureMode::Viewport)
             .await
     }
 
     pub async fn capture(
         &self,
+        owner: &str,
         target: Option<&str>,
         label: &str,
         capture_mode: BrowserCaptureMode,
@@ -1782,7 +2106,7 @@ impl BrowserControlService {
             .controller
             .lock()
             .await
-            .snapshot_in(target, capture_mode)
+            .snapshot_in(owner, target, capture_mode)
             .await?;
         let mut telemetry = self.telemetry.lock().await;
         telemetry.next_evidence_id += 1;
@@ -1790,6 +2114,7 @@ impl BrowserControlService {
         telemetry.snapshot.revision += 1;
         let evidence = BrowserEvidence {
             id,
+            owner: owner.to_string(),
             target: snapshot.target.clone(),
             label,
             capture_mode: snapshot.capture_mode,
@@ -1808,44 +2133,47 @@ impl BrowserControlService {
         Ok(snapshot)
     }
 
-    pub async fn targets(&self) -> Result<Vec<BrowserTargetInfo>> {
-        self.controller.lock().await.targets().await
+    pub async fn targets(&self, owner: &str) -> Result<Vec<BrowserTargetInfo>> {
+        self.controller.lock().await.targets(owner).await
     }
 
-    pub async fn open_target(&self, name: &str, url: &str) -> Result<BrowserTargetInfo> {
-        self.controller.lock().await.open_target(name, url).await
+    pub async fn open_target(
+        &self,
+        owner: &str,
+        name: &str,
+        url: &str,
+    ) -> Result<BrowserTargetInfo> {
+        self.controller
+            .lock()
+            .await
+            .open_target(owner, name, url)
+            .await
     }
 
-    pub async fn focus_target(&self, name: &str) -> Result<()> {
-        self.controller.lock().await.focus_target(name).await
+    pub async fn focus_target(&self, owner: &str, name: &str) -> Result<()> {
+        self.controller.lock().await.focus_target(owner, name).await
     }
 
-    pub async fn close_target(&self, name: &str) -> Result<()> {
-        self.controller.lock().await.close_target(name).await
-    }
-
-    pub async fn click(&self, locator: &BrowserLocator) -> Result<BrowserActionTarget> {
-        self.controller.lock().await.click(locator).await
+    pub async fn close_target(&self, owner: &str, name: &str) -> Result<()> {
+        self.controller.lock().await.close_target(owner, name).await
     }
 
     pub async fn click_in(
         &self,
+        owner: &str,
         target: Option<&str>,
         locator: &BrowserLocator,
     ) -> Result<BrowserActionTarget> {
-        self.controller.lock().await.click_in(target, locator).await
-    }
-
-    pub async fn type_text(
-        &self,
-        locator: &BrowserLocator,
-        text: &str,
-    ) -> Result<BrowserActionTarget> {
-        self.controller.lock().await.type_text(locator, text).await
+        self.controller
+            .lock()
+            .await
+            .click_in(owner, target, locator)
+            .await
     }
 
     pub async fn type_text_in(
         &self,
+        owner: &str,
         target: Option<&str>,
         locator: &BrowserLocator,
         text: &str,
@@ -1853,116 +2181,111 @@ impl BrowserControlService {
         self.controller
             .lock()
             .await
-            .type_text_in(target, locator, text)
+            .type_text_in(owner, target, locator, text)
             .await
     }
 
-    pub async fn press(&self, key: BrowserKey) -> Result<()> {
-        self.controller.lock().await.press(key).await
-    }
-
-    pub async fn press_in(&self, target: Option<&str>, key: BrowserKey) -> Result<()> {
-        self.controller.lock().await.press_in(target, key).await
-    }
-
-    pub async fn reload(&self, ignore_cache: bool) -> Result<()> {
-        self.controller.lock().await.reload(ignore_cache).await
-    }
-
-    pub async fn reload_in(&self, target: Option<&str>, ignore_cache: bool) -> Result<()> {
+    pub async fn press_in(&self, owner: &str, target: Option<&str>, key: BrowserKey) -> Result<()> {
         self.controller
             .lock()
             .await
-            .reload_in(target, ignore_cache)
+            .press_in(owner, target, key)
             .await
     }
 
-    pub async fn resize(&self, viewport: BrowserViewport) -> Result<BrowserViewport> {
-        self.controller.lock().await.resize(viewport).await
+    pub async fn reload_in(
+        &self,
+        owner: &str,
+        target: Option<&str>,
+        ignore_cache: bool,
+    ) -> Result<()> {
+        self.controller
+            .lock()
+            .await
+            .reload_in(owner, target, ignore_cache)
+            .await
     }
 
     pub async fn resize_in(
         &self,
+        owner: &str,
         target: Option<&str>,
         viewport: BrowserViewport,
     ) -> Result<BrowserViewport> {
         self.controller
             .lock()
             .await
-            .resize_in(target, viewport)
+            .resize_in(owner, target, viewport)
             .await
     }
 
-    pub async fn scroll(&self, delta_x: f64, delta_y: f64) -> Result<()> {
-        self.controller.lock().await.scroll(delta_x, delta_y).await
-    }
-
-    pub async fn scroll_in(&self, target: Option<&str>, delta_x: f64, delta_y: f64) -> Result<()> {
+    pub async fn scroll_in(
+        &self,
+        owner: &str,
+        target: Option<&str>,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> Result<()> {
         self.controller
             .lock()
             .await
-            .scroll_in(target, delta_x, delta_y)
+            .scroll_in(owner, target, delta_x, delta_y)
             .await
     }
 
-    pub async fn diagnostics(&self) -> Result<BrowserDiagnostics> {
-        self.controller.lock().await.diagnostics().await
+    pub async fn diagnostics_in(
+        &self,
+        owner: &str,
+        target: Option<&str>,
+    ) -> Result<BrowserDiagnostics> {
+        self.controller
+            .lock()
+            .await
+            .diagnostics_in(owner, target)
+            .await
     }
 
-    pub async fn diagnostics_in(&self, target: Option<&str>) -> Result<BrowserDiagnostics> {
-        self.controller.lock().await.diagnostics_in(target).await
-    }
-
-    pub async fn dom_outline(&self) -> Result<BrowserDomOutline> {
-        self.controller.lock().await.dom_outline().await
-    }
-
-    pub async fn dom_outline_in(&self, target: Option<&str>) -> Result<BrowserDomOutline> {
-        self.controller.lock().await.dom_outline_in(target).await
-    }
-
-    pub async fn node_details(&self, selector: &BrowserNodeSelector) -> Result<BrowserNodeDetails> {
-        self.controller.lock().await.node_details(selector).await
+    pub async fn dom_outline_in(
+        &self,
+        owner: &str,
+        target: Option<&str>,
+    ) -> Result<BrowserDomOutline> {
+        self.controller
+            .lock()
+            .await
+            .dom_outline_in(owner, target)
+            .await
     }
 
     pub async fn node_details_in(
         &self,
+        owner: &str,
         target: Option<&str>,
         selector: &BrowserNodeSelector,
     ) -> Result<BrowserNodeDetails> {
         self.controller
             .lock()
             .await
-            .node_details_in(target, selector)
+            .node_details_in(owner, target, selector)
             .await
     }
 
-    pub async fn wait_for_ready(&self, max_wait: Duration) -> Result<()> {
-        self.controller.lock().await.wait_for_ready(max_wait).await
-    }
-
-    pub async fn wait_for_ready_in(&self, target: Option<&str>, max_wait: Duration) -> Result<()> {
-        self.controller
-            .lock()
-            .await
-            .wait_for_ready_in(target, max_wait)
-            .await
-    }
-
-    pub async fn wait_for(
+    pub async fn wait_for_ready_in(
         &self,
-        condition: &BrowserWaitCondition,
+        owner: &str,
+        target: Option<&str>,
         max_wait: Duration,
     ) -> Result<()> {
         self.controller
             .lock()
             .await
-            .wait_for(condition, max_wait)
+            .wait_for_ready_in(owner, target, max_wait)
             .await
     }
 
     pub async fn wait_for_in(
         &self,
+        owner: &str,
         target: Option<&str>,
         condition: &BrowserWaitCondition,
         max_wait: Duration,
@@ -1970,22 +2293,47 @@ impl BrowserControlService {
         self.controller
             .lock()
             .await
-            .wait_for_in(target, condition, max_wait)
+            .wait_for_in(owner, target, condition, max_wait)
             .await
     }
 
+    /// The UI's Focus: bring the window's page forward for the user.
     pub async fn focus(&self) -> Result<()> {
         self.controller.lock().await.focus().await
+    }
+
+    /// The chats that closed give up their targets (TRU-176); the tabs stay
+    /// open and become the user's.
+    pub async fn release_owners(&self, owners: &HashSet<String>) -> Result<()> {
+        self.controller.lock().await.release_owners(owners).await
+    }
+
+    /// Every live chat's display label, for its tabs' title prefix.
+    pub async fn set_owner_labels(&self, labels: HashMap<String, String>) -> Result<()> {
+        self.controller.lock().await.set_owner_labels(labels).await
     }
 
     pub async fn disconnect(&self) -> Result<()> {
         self.controller.lock().await.disconnect().await
     }
+
+    /// Test seam: claim a page target for `owner` without Chrome.
+    #[cfg(test)]
+    pub(crate) async fn insert_test_target(&self, owner: &str, name: &str, target_id: &str) {
+        let mut controller = self.controller.lock().await;
+        let key = TargetKey::new(owner, name);
+        controller.registry.targets.insert(
+            key.clone(),
+            ManagedBrowserTarget::unattached(target_id.to_string()),
+        );
+        controller.registry.mark_active(&key);
+    }
 }
 
 fn retain_browser_evidence(snapshot: &mut BrowserTelemetrySnapshot, evidence: BrowserEvidence) {
     if let Some(index) = snapshot.evidence.iter().position(|retained| {
-        retained.target == evidence.target
+        retained.owner == evidence.owner
+            && retained.target == evidence.target
             && retained.label == evidence.label
             && retained.capture_mode == evidence.capture_mode
             && retained.viewport == evidence.viewport
@@ -3233,6 +3581,148 @@ fn browser_target_not_found(name: &str) -> BrowserControlError {
     ))
 }
 
+/// Close a page Chrome created but GitTerm could not take over, and say
+/// how that went for the caller's error.
+async fn close_incomplete_target(session: &CdpSession, target_id: &str) -> String {
+    match session
+        .command("Target.closeTarget", json!({ "targetId": target_id }))
+        .await
+    {
+        Ok(result) if result.get("success").and_then(Value::as_bool) == Some(true) => {
+            "the incomplete target was closed".to_string()
+        }
+        Ok(_) => "Chrome did not close the incomplete target".to_string(),
+        Err(cleanup_error) => {
+            format!("closing the incomplete target also failed: {cleanup_error}")
+        }
+    }
+}
+
+/// A chat's display label for its tabs' title prefix: one line, no control
+/// characters, at most `MAX_OWNER_LABEL_CHARS`. None when nothing is left.
+fn owner_label(label: &str) -> Option<String> {
+    let cleaned = label
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.chars().count() <= MAX_OWNER_LABEL_CHARS {
+        return Some(cleaned);
+    }
+    let mut truncated = cleaned
+        .chars()
+        .take(MAX_OWNER_LABEL_CHARS - 1)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    truncated.push('…');
+    Some(truncated)
+}
+
+/// A page title as its owner's tools report it: without the owner prefix
+/// GitTerm adds for the user's benefit.
+fn strip_owner_prefix(title: &str, prefix: &str) -> String {
+    title.strip_prefix(prefix).unwrap_or(title).to_string()
+}
+
+/// Mark (or, with `prefix` None, unmark) a chat-owned page's tab title
+/// with its owner (TRU-176), on the current document and on every document
+/// this session loads later. `previous` is the session's earlier
+/// new-document script, removed first. Returns the new script's identifier.
+async fn set_owner_title(
+    session: &CdpSession,
+    previous: Option<&str>,
+    prefix: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(identifier) = previous {
+        session
+            .command(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                json!({ "identifier": identifier }),
+            )
+            .await?;
+    }
+    let source = owner_title_script(prefix)?;
+    let identifier = match prefix {
+        Some(_) => {
+            let added = session
+                .command(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": source }),
+                )
+                .await?;
+            Some(
+                added
+                    .get("identifier")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        BrowserControlError::new(
+                            "Page.addScriptToEvaluateOnNewDocument omitted its identifier",
+                        )
+                    })?
+                    .to_string(),
+            )
+        }
+        None => None,
+    };
+    let _: bool = evaluate_by_value(session, &source, "the owner title prefix").await?;
+    Ok(identifier)
+}
+
+/// The page script behind the owner title prefix. It first undoes any
+/// prefix it set before; then, with a prefix, keeps that prefix in front of
+/// `document.title` as the page changes its title.
+fn owner_title_script(prefix: Option<&str>) -> Result<String> {
+    let prefix = serde_json::to_string(&prefix).map_err(|error| {
+        BrowserControlError::new(format!(
+            "failed to serialize the owner title prefix: {error}"
+        ))
+    })?;
+    Ok(format!(
+        r#"(() => {{
+  const key = Symbol.for("gitterm.browserOwner");
+  const previous = window[key];
+  if (previous) {{
+    if (previous.observer) previous.observer.disconnect();
+    if (document.title.startsWith(previous.prefix)) {{
+      document.title = document.title.slice(previous.prefix.length);
+    }}
+    delete window[key];
+  }}
+  const prefix = {prefix};
+  if (prefix === null) return true;
+  const state = {{ prefix, observer: null }};
+  window[key] = state;
+  const apply = () => {{
+    if (!document.title.startsWith(prefix)) document.title = prefix + document.title;
+  }};
+  const watch = () => {{
+    if (window[key] !== state) return;
+    apply();
+    const root = document.head || document.documentElement;
+    if (!root) return;
+    state.observer = new MutationObserver(apply);
+    state.observer.observe(root, {{ childList: true, subtree: true, characterData: true }});
+  }};
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", watch, {{ once: true }});
+  }} else {{
+    watch();
+  }}
+  return true;
+}})()"#
+    ))
+}
+
 async fn full_page_capture_params(session: &CdpSession, device_scale_factor: f64) -> Result<Value> {
     let metrics = session.command("Page.getLayoutMetrics", json!({})).await?;
     let width = metrics
@@ -4025,6 +4515,7 @@ mod tests {
         let mut telemetry = BrowserTelemetrySnapshot::default();
         let evidence = |id: u64, target: String| BrowserEvidence {
             id,
+            owner: "chat-a".to_string(),
             target,
             label: "account-settings".to_string(),
             capture_mode: BrowserCaptureMode::Viewport,
@@ -4052,7 +4543,235 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(telemetry.latest_evidence.unwrap().id, 8);
+        assert_eq!(telemetry.latest_evidence.as_ref().unwrap().id, 8);
+
+        // Another chat's capture with the same target name and label is
+        // its own evidence, not a replacement (TRU-176).
+        retain_browser_evidence(
+            &mut telemetry,
+            BrowserEvidence {
+                owner: "chat-b".to_string(),
+                ..evidence(9, "target-2".to_string())
+            },
+        );
+        let target_two = telemetry
+            .evidence
+            .iter()
+            .filter(|capture| capture.target == "target-2")
+            .map(|capture| (capture.owner.as_str(), capture.id))
+            .collect::<Vec<_>>();
+        assert_eq!(target_two, vec![("chat-a", 8), ("chat-b", 9)]);
+    }
+
+    fn live_page(id: &str, title: &str) -> DevToolsTarget {
+        DevToolsTarget {
+            id: id.to_string(),
+            kind: "page".to_string(),
+            url: format!("https://example.com/{id}"),
+            title: title.to_string(),
+            web_socket_debugger_url: Some(format!("ws://127.0.0.1:9/devtools/page/{id}")),
+        }
+    }
+
+    fn registry_with(targets: &[(&str, &str, &str)]) -> BrowserTargetRegistry {
+        let mut registry = BrowserTargetRegistry::default();
+        for (owner, name, target_id) in targets {
+            let key = TargetKey::new(owner, name);
+            registry.targets.insert(
+                key.clone(),
+                ManagedBrowserTarget::unattached(target_id.to_string()),
+            );
+            registry.mark_active(&key);
+        }
+        registry
+    }
+
+    #[test]
+    fn target_names_are_scoped_to_their_owning_chat() {
+        let registry = registry_with(&[
+            ("chat-a", "primary", "tab-1"),
+            ("chat-b", "primary", "tab-2"),
+        ]);
+        let a = registry.key("chat-a", Some("primary")).unwrap();
+        let b = registry.key("chat-b", Some("primary")).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(registry.get(&a).unwrap().target_id, "tab-1");
+        assert_eq!(registry.get(&b).unwrap().target_id, "tab-2");
+        // Names stay validated whoever asks.
+        assert!(registry.key("chat-a", Some("Not Valid")).is_err());
+    }
+
+    #[test]
+    fn listing_shows_only_the_callers_own_targets() {
+        let mut registry = registry_with(&[
+            ("chat-a", "primary", "tab-1"),
+            ("chat-a", "design", "tab-2"),
+            ("chat-b", "primary", "tab-3"),
+        ]);
+        registry
+            .labels
+            .insert("chat-a".to_string(), "Settings work".to_string());
+        let live = vec![
+            live_page("tab-1", "[Settings work] Home"),
+            live_page("tab-2", "Design"),
+            live_page("tab-3", "Other chat page"),
+            live_page("tab-4", "The user's own tab"),
+        ];
+        let listed = registry.infos("chat-a", &live);
+        let names = listed
+            .iter()
+            .map(|target| (target.name.as_str(), target.title.as_str(), target.active))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![("design", "Design", true), ("primary", "Home", false)]
+        );
+        let other = registry.infos("chat-b", &live);
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].target_id, "tab-3");
+        // A chat that opened nothing sees nothing, not the user's tab.
+        assert!(registry.infos("chat-c", &live).is_empty());
+    }
+
+    #[tokio::test]
+    async fn another_chats_target_is_reported_as_not_found() {
+        let temp = tempdir().unwrap();
+        let mut controller = BrowserController::new(temp.path());
+        controller.registry = registry_with(&[("chat-a", "design", "tab-1")]);
+        let foreign = [
+            controller
+                .close_target("chat-b", "design")
+                .await
+                .unwrap_err(),
+            controller
+                .focus_target("chat-b", "design")
+                .await
+                .unwrap_err(),
+            controller
+                .navigate_in("chat-b", Some("design"), "https://example.com/")
+                .await
+                .unwrap_err(),
+            controller
+                .click_in("chat-b", Some("design"), &BrowserLocator::text("Save"))
+                .await
+                .unwrap_err(),
+        ];
+        let missing = browser_target_not_found("design").to_string();
+        for error in foreign {
+            assert_eq!(error.to_string(), missing);
+        }
+        // The owner reaches its own target: the failure is Chrome not
+        // running, not a missing target.
+        let own = controller
+            .close_target("chat-a", "design")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(own.contains("browser is not running"), "{own}");
+    }
+
+    #[test]
+    fn omitting_target_means_the_callers_own_active_target_or_its_default() {
+        let mut registry =
+            registry_with(&[("chat-a", "design", "tab-1"), ("chat-b", "review", "tab-2")]);
+        // chat-b used a target last, so it holds the window, but chat-a's
+        // default is still its own.
+        assert_eq!(registry.window, Some(TargetKey::new("chat-b", "review")));
+        assert_eq!(
+            registry.key("chat-a", None).unwrap(),
+            TargetKey::new("chat-a", "design")
+        );
+        // A chat with no targets gets its own default, never another's.
+        assert_eq!(
+            registry.key("chat-c", None).unwrap(),
+            TargetKey::new("chat-c", DEFAULT_BROWSER_TARGET_NAME)
+        );
+        // Closing the active target moves the default to a remaining one.
+        registry.targets.insert(
+            TargetKey::new("chat-a", "before"),
+            ManagedBrowserTarget::unattached("tab-3".to_string()),
+        );
+        registry.remove(&TargetKey::new("chat-a", "design"));
+        assert_eq!(
+            registry.key("chat-a", None).unwrap(),
+            TargetKey::new("chat-a", "before")
+        );
+        registry.remove(&TargetKey::new("chat-a", "before"));
+        assert_eq!(
+            registry.key("chat-a", None).unwrap(),
+            TargetKey::new("chat-a", DEFAULT_BROWSER_TARGET_NAME)
+        );
+    }
+
+    #[test]
+    fn a_closed_chats_targets_become_ownerless() {
+        let mut registry = registry_with(&[
+            ("chat-a", "primary", "tab-1"),
+            ("chat-a", "design", "tab-2"),
+            ("chat-b", "primary", "tab-3"),
+        ]);
+        registry
+            .labels
+            .insert("chat-a".to_string(), "Settings work".to_string());
+        let closed = HashSet::from(["chat-a".to_string()]);
+        let mut released = registry
+            .release(&closed)
+            .into_iter()
+            .map(|(key, managed)| (key.name, managed.target_id))
+            .collect::<Vec<_>>();
+        released.sort();
+        assert_eq!(
+            released,
+            vec![
+                ("design".to_string(), "tab-2".to_string()),
+                ("primary".to_string(), "tab-1".to_string())
+            ]
+        );
+        // The tabs are no longer managed, so no chat can reach them, and
+        // no chat's default target can adopt them.
+        assert!(!registry.is_managed("tab-1"));
+        assert!(!registry.is_managed("tab-2"));
+        assert!(!registry.owns_any("chat-a"));
+        assert!(!registry.labels.contains_key("chat-a"));
+        let live = vec![live_page("tab-1", "Home"), live_page("tab-3", "Other")];
+        assert!(registry.infos("chat-a", &live).is_empty());
+        // The other chat keeps its target.
+        assert_eq!(registry.infos("chat-b", &live).len(), 1);
+    }
+
+    #[test]
+    fn a_call_without_an_owning_chat_is_refused() {
+        let registry = registry_with(&[("chat-a", "primary", "tab-1")]);
+        let error = registry.key("", None).unwrap_err().to_string();
+        assert!(error.contains("names no chat"), "{error}");
+        assert!(registry.key("", Some("primary")).is_err());
+    }
+
+    #[test]
+    fn owner_labels_are_short_single_line_and_stripped_from_reported_titles() {
+        assert_eq!(
+            owner_label("  Fix the\nlogin form "),
+            Some("Fix the login form".to_string())
+        );
+        assert_eq!(owner_label("\t\n"), None);
+        let long = owner_label("Investigate the flaky checkout end-to-end test").unwrap();
+        assert_eq!(long.chars().count(), MAX_OWNER_LABEL_CHARS);
+        assert!(long.ends_with('…'));
+
+        let registry = BrowserTargetRegistry::default();
+        // Unnamed owners show a short form of their id.
+        assert_eq!(registry.title_prefix("7d1c2a4e-0b3f"), "[7d1c2a4e] ");
+        assert_eq!(strip_owner_prefix("[7d1c2a4e] Home", "[7d1c2a4e] "), "Home");
+        assert_eq!(
+            strip_owner_prefix("[DEV] Home", "[7d1c2a4e] "),
+            "[DEV] Home"
+        );
+
+        let script = owner_title_script(Some("[Fix \"it\"] ")).unwrap();
+        assert!(script.contains(r#"const prefix = "[Fix \"it\"] ";"#));
+        assert!(owner_title_script(None)
+            .unwrap()
+            .contains("const prefix = null;"));
     }
 
     #[test]
@@ -4121,8 +4840,14 @@ mod tests {
     async fn scroll_rejects_unbounded_or_non_finite_deltas_before_browser_access() {
         let temp = tempdir().unwrap();
         let mut controller = BrowserController::new(temp.path());
-        assert!(controller.scroll(f64::NAN, 0.0).await.is_err());
-        assert!(controller.scroll(0.0, 100_001.0).await.is_err());
+        assert!(controller
+            .scroll_in("chat-a", None, f64::NAN, 0.0)
+            .await
+            .is_err());
+        assert!(controller
+            .scroll_in("chat-a", None, 0.0, 100_001.0)
+            .await
+            .is_err());
     }
 
     #[test]
@@ -4236,6 +4961,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "launches a visible local Chrome instance"]
     async fn visible_chrome_status_navigate_snapshot_smoke() {
+        const SMOKE_OWNER: &str = "smoke-chat";
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -4304,13 +5030,15 @@ mod tests {
         assert!(status.devtools_port.is_some());
 
         let url = format!("http://{address}/");
-        service.navigate(&url).await.unwrap();
+        service.navigate_in(SMOKE_OWNER, None, &url).await.unwrap();
         service
-            .wait_for_ready(Duration::from_secs(5))
+            .wait_for_ready_in(SMOKE_OWNER, None, Duration::from_secs(5))
             .await
             .unwrap();
         service
-            .wait_for(
+            .wait_for_in(
+                SMOKE_OWNER,
+                None,
                 &BrowserWaitCondition::Text {
                     text: "delayed-ready".to_string(),
                     exact: true,
@@ -4320,7 +5048,9 @@ mod tests {
             .await
             .unwrap();
         service
-            .wait_for(
+            .wait_for_in(
+                SMOKE_OWNER,
+                None,
                 &BrowserWaitCondition::Url {
                     url: url.clone(),
                     exact: true,
@@ -4330,8 +5060,13 @@ mod tests {
             .await
             .unwrap();
         service.focus().await.unwrap();
-        let target_id = service.status().await.unwrap().target_id.unwrap();
-        let snapshot = service.snapshot().await.unwrap();
+        let target_id = service
+            .status_for(SMOKE_OWNER)
+            .await
+            .unwrap()
+            .target_id
+            .unwrap();
+        let snapshot = service.snapshot(SMOKE_OWNER).await.unwrap();
         assert_eq!(snapshot.url, url);
         assert_eq!(snapshot.title, "GitTerm browser smoke");
         assert!(snapshot.screenshot_png.starts_with(b"\x89PNG\r\n\x1a\n"));
@@ -4359,7 +5094,9 @@ mod tests {
             BrowserLocator::role("button", "Run smoke action")
         );
         service
-            .wait_for(
+            .wait_for_in(
+                SMOKE_OWNER,
+                None,
                 &BrowserWaitCondition::Locator {
                     locator: button.locator.clone(),
                 },
@@ -4368,9 +5105,14 @@ mod tests {
             .await
             .unwrap();
 
-        service.scroll(0.0, 400.0).await.unwrap();
         service
-            .wait_for(
+            .scroll_in(SMOKE_OWNER, None, 0.0, 400.0)
+            .await
+            .unwrap();
+        service
+            .wait_for_in(
+                SMOKE_OWNER,
+                None,
                 &BrowserWaitCondition::Text {
                     text: "scrolled".to_string(),
                     exact: true,
@@ -4381,40 +5123,57 @@ mod tests {
             .unwrap();
 
         let mobile = BrowserViewport::mobile(390, 844, 3.0);
-        service.resize(mobile).await.unwrap();
-        assert_eq!(service.snapshot().await.unwrap().viewport, mobile);
+        service.resize_in(SMOKE_OWNER, None, mobile).await.unwrap();
+        assert_eq!(
+            service.snapshot(SMOKE_OWNER).await.unwrap().viewport,
+            mobile
+        );
 
-        service.click(&button.locator).await.unwrap();
+        service
+            .click_in(SMOKE_OWNER, None, &button.locator)
+            .await
+            .unwrap();
         assert!(service
-            .snapshot()
+            .snapshot(SMOKE_OWNER)
             .await
             .unwrap()
             .visible_text
             .contains("clicked"));
 
         let input = BrowserLocator::role("textbox", "Smoke input");
-        service.type_text(&input, "typed value").await.unwrap();
-        let typed_snapshot = service.snapshot().await.unwrap();
+        service
+            .type_text_in(SMOKE_OWNER, None, &input, "typed value")
+            .await
+            .unwrap();
+        let typed_snapshot = service.snapshot(SMOKE_OWNER).await.unwrap();
         assert!(typed_snapshot
             .interactive_elements
             .iter()
             .any(|element| element.text == "typed value"));
 
-        service.press(BrowserKey::Enter).await.unwrap();
+        service
+            .press_in(SMOKE_OWNER, None, BrowserKey::Enter)
+            .await
+            .unwrap();
         assert!(service
-            .snapshot()
+            .snapshot(SMOKE_OWNER)
             .await
             .unwrap()
             .visible_text
             .contains("submitted:typed value"));
 
-        service.reload(false).await.unwrap();
+        service.reload_in(SMOKE_OWNER, None, false).await.unwrap();
         assert_eq!(
-            service.status().await.unwrap().target_id.as_deref(),
+            service
+                .status_for(SMOKE_OWNER)
+                .await
+                .unwrap()
+                .target_id
+                .as_deref(),
             Some(target_id.as_str())
         );
         assert!(service
-            .snapshot()
+            .snapshot(SMOKE_OWNER)
             .await
             .unwrap()
             .visible_text
@@ -4422,6 +5181,7 @@ mod tests {
 
         let primary_capture = service
             .capture(
+                SMOKE_OWNER,
                 Some(DEFAULT_BROWSER_TARGET_NAME),
                 "smoke-route",
                 BrowserCaptureMode::FullPage,
@@ -4432,7 +5192,7 @@ mod tests {
         assert_eq!(primary_capture.capture_mode, BrowserCaptureMode::FullPage);
 
         let outline = service
-            .dom_outline_in(Some(DEFAULT_BROWSER_TARGET_NAME))
+            .dom_outline_in(SMOKE_OWNER, Some(DEFAULT_BROWSER_TARGET_NAME))
             .await
             .unwrap();
         assert_eq!(outline.target, DEFAULT_BROWSER_TARGET_NAME);
@@ -4448,6 +5208,7 @@ mod tests {
         let status_ref = status_node.node_ref.clone();
         let details = service
             .node_details_in(
+                SMOKE_OWNER,
                 Some(DEFAULT_BROWSER_TARGET_NAME),
                 &BrowserNodeSelector::NodeRef {
                     node_ref: status_ref.clone(),
@@ -4467,6 +5228,7 @@ mod tests {
             .any(|property| property.name == "gap" && property.value == "12px"));
         let button_details = service
             .node_details_in(
+                SMOKE_OWNER,
                 Some(DEFAULT_BROWSER_TARGET_NAME),
                 &BrowserNodeSelector::Locator {
                     locator: BrowserLocator::role("button", "Run smoke action"),
@@ -4478,6 +5240,7 @@ mod tests {
         assert_eq!(button_details.name.as_deref(), Some("Run smoke action"));
         let form_details = service
             .node_details_in(
+                SMOKE_OWNER,
                 Some(DEFAULT_BROWSER_TARGET_NAME),
                 &BrowserNodeSelector::Locator {
                     locator: BrowserLocator::css("form"),
@@ -4488,11 +5251,12 @@ mod tests {
         assert!(form_details.outer_html.contains("[redacted]"));
         assert!(!form_details.outer_html.contains("must-not-leak"));
         service
-            .reload_in(Some(DEFAULT_BROWSER_TARGET_NAME), false)
+            .reload_in(SMOKE_OWNER, Some(DEFAULT_BROWSER_TARGET_NAME), false)
             .await
             .unwrap();
         let stale_error = service
             .node_details_in(
+                SMOKE_OWNER,
                 Some(DEFAULT_BROWSER_TARGET_NAME),
                 &BrowserNodeSelector::NodeRef {
                     node_ref: status_ref,
@@ -4502,24 +5266,28 @@ mod tests {
             .unwrap_err();
         assert!(stale_error.to_string().contains("stale"));
 
-        service.open_target("implementation", &url).await.unwrap();
         service
-            .wait_for_ready_in(Some("implementation"), Duration::from_secs(5))
+            .open_target(SMOKE_OWNER, "implementation", &url)
             .await
             .unwrap();
         service
-            .resize_in(Some("implementation"), mobile)
+            .wait_for_ready_in(SMOKE_OWNER, Some("implementation"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        service
+            .resize_in(SMOKE_OWNER, Some("implementation"), mobile)
             .await
             .unwrap();
         service
             .capture(
+                SMOKE_OWNER,
                 Some("implementation"),
                 "smoke-route",
                 BrowserCaptureMode::FullPage,
             )
             .await
             .unwrap();
-        let targets = service.targets().await.unwrap();
+        let targets = service.targets(SMOKE_OWNER).await.unwrap();
         assert_eq!(targets.len(), 2);
         assert!(targets.iter().any(|target| target.name == "primary"));
         assert!(targets
@@ -4540,21 +5308,32 @@ mod tests {
         assert_eq!(paired.len(), 2);
         assert_ne!(paired[0].target, paired[1].target);
 
-        service.close_target("implementation").await.unwrap();
         service
-            .focus_target(DEFAULT_BROWSER_TARGET_NAME)
+            .close_target(SMOKE_OWNER, "implementation")
+            .await
+            .unwrap();
+        service
+            .focus_target(SMOKE_OWNER, DEFAULT_BROWSER_TARGET_NAME)
             .await
             .unwrap();
 
         let attached_service = BrowserControlService::new(&config_root);
         assert_eq!(
-            attached_service.status().await.unwrap().state,
+            attached_service
+                .status_for(SMOKE_OWNER)
+                .await
+                .unwrap()
+                .state,
             BrowserState::Running
         );
         attached_service.focus().await.unwrap();
         attached_service.disconnect().await.unwrap();
         assert_eq!(
-            attached_service.status().await.unwrap().state,
+            attached_service
+                .status_for(SMOKE_OWNER)
+                .await
+                .unwrap()
+                .state,
             BrowserState::Stopped
         );
         drop(service);

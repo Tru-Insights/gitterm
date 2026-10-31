@@ -6278,6 +6278,8 @@ pub enum Event {
     BrowserDisconnect,
     BrowserDisconnected(Result<(), String>),
     BrowserTelemetryLoaded(BrowserTelemetrySnapshot),
+    /// Browser owners synced with the open tabs (TRU-176).
+    BrowserOwnersSynced(Result<(), String>),
     BrowserEvidenceOpen,
     BrowserEvidenceClose,
     // Speech-to-text events
@@ -6336,13 +6338,18 @@ fn compact_browser_error(error: &str) -> String {
     }
 }
 
+/// The latest capture and its comparison partner: another target of the
+/// same chat (TRU-176), preferring the same label, mode and viewport.
 fn paired_browser_evidence(evidence: &[BrowserEvidence]) -> Vec<&BrowserEvidence> {
     let Some(anchor) = evidence.iter().max_by_key(|capture| capture.id) else {
         return Vec::new();
     };
-    let partner = evidence
-        .iter()
-        .filter(|capture| capture.target != anchor.target)
+    let candidates = || {
+        evidence
+            .iter()
+            .filter(|capture| capture.owner == anchor.owner && capture.target != anchor.target)
+    };
+    let partner = candidates()
         .filter(|capture| {
             capture.label == anchor.label
                 && capture.capture_mode == anchor.capture_mode
@@ -6350,17 +6357,11 @@ fn paired_browser_evidence(evidence: &[BrowserEvidence]) -> Vec<&BrowserEvidence
         })
         .max_by_key(|capture| capture.id)
         .or_else(|| {
-            evidence
-                .iter()
-                .filter(|capture| capture.target != anchor.target && capture.label == anchor.label)
+            candidates()
+                .filter(|capture| capture.label == anchor.label)
                 .max_by_key(|capture| capture.id)
         })
-        .or_else(|| {
-            evidence
-                .iter()
-                .filter(|capture| capture.target != anchor.target)
-                .max_by_key(|capture| capture.id)
-        });
+        .or_else(|| candidates().max_by_key(|capture| capture.id));
     let mut selected = evidence
         .iter()
         .filter(|capture| {
@@ -6461,6 +6462,9 @@ struct App {
     browser_error: Option<String>,
     browser_error_sticky: bool,
     browser_telemetry: BrowserTelemetrySnapshot,
+    // Each open tab's browser owner label (by `session_uid`) as last sent
+    // to the browser (TRU-176); a uid that drops out releases its targets.
+    browser_owner_labels: HashMap<String, String>,
     browser_evidence_open: bool,
     browser_evidence_handles: HashMap<u64, image::Handle>,
     console_expanded: bool,
@@ -15353,6 +15357,7 @@ impl App {
             browser_error,
             browser_error_sticky: false,
             browser_telemetry: BrowserTelemetrySnapshot::default(),
+            browser_owner_labels: HashMap::new(),
             browser_evidence_open: false,
             browser_evidence_handles: HashMap::new(),
             console_expanded: config.console_expanded,
@@ -16175,7 +16180,7 @@ fi
             .map(|cfg| cfg.env.into_iter().collect())
             .unwrap_or_default();
         if let Some(connection) = &self.browser_mcp {
-            extra_env.extend(connection.terminal_environment());
+            extra_env.extend(connection.terminal_environment(Some(&tab.session_uid)));
         }
         if let Some(connection) = &self.task_mcp {
             extra_env.extend(connection.terminal_environment(Some(&tab.session_uid)));
@@ -16219,11 +16224,12 @@ fi
             })
             .map(|cfg| cfg.env.into_iter().collect())
             .unwrap_or_default();
+        // Bottom-panel terminals are not tabs and have no caller identity;
+        // the browser tools refuse callers without one (TRU-176).
         if let Some(connection) = &self.browser_mcp {
-            extra_env.extend(connection.terminal_environment());
+            extra_env.extend(connection.terminal_environment(None));
         }
         if let Some(connection) = &self.task_mcp {
-            // Bottom-panel terminals are not tabs and have no caller identity.
             extra_env.extend(connection.terminal_environment(None));
         }
         let extra_env_refs: Vec<(&str, &str)> = extra_env
@@ -17788,6 +17794,62 @@ fi
         self.browser_mcp.as_ref().map(BrowserMcpConnection::browser)
     }
 
+    /// The label a tab's browser targets show in their Chrome tab titles
+    /// (TRU-176): its conversation's title once indexed, else what the tab
+    /// itself shows.
+    fn browser_owner_label(&self, tab: &TabState) -> String {
+        self.chat_tab_title(tab, None)
+            .or_else(|| tab.terminal_title())
+            .unwrap_or(tab.repo_name.as_str())
+            .to_string()
+    }
+
+    /// Keep the browser's target owners in step with the open tabs
+    /// (TRU-176). A tab that closed since the last sync releases its
+    /// targets, which stay open as the user's; every open tab's label marks
+    /// its targets' Chrome tab titles. Only uids seen open before are ever
+    /// released, so a tab opened mid-sync cannot lose its targets.
+    fn sync_browser_owners(&mut self) -> Task<Event> {
+        let Some(browser) = self.browser_service() else {
+            return Task::none();
+        };
+        let labels: HashMap<String, String> = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .map(|tab| (tab.session_uid.clone(), self.browser_owner_label(tab)))
+            .collect();
+        if labels == self.browser_owner_labels {
+            return Task::none();
+        }
+        let released: HashSet<String> = self
+            .browser_owner_labels
+            .keys()
+            .filter(|owner| !labels.contains_key(*owner))
+            .cloned()
+            .collect();
+        self.browser_owner_labels = labels.clone();
+        Task::perform(
+            async move {
+                let mut errors = Vec::new();
+                if !released.is_empty() {
+                    if let Err(error) = browser.release_owners(&released).await {
+                        errors.push(error.to_string());
+                    }
+                }
+                if let Err(error) = browser.set_owner_labels(labels).await {
+                    errors.push(error.to_string());
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
+            },
+            Event::BrowserOwnersSynced,
+        )
+    }
+
     fn request_browser_status(&mut self) -> Task<Event> {
         if self.browser_status_loading || self.browser_action.is_some() {
             return Task::none();
@@ -18388,6 +18450,11 @@ fi
                 }
                 self.browser_telemetry = telemetry;
             }
+            Event::BrowserOwnersSynced(result) => {
+                if let Err(error) = result {
+                    eprintln!("could not sync browser target owners with the open tabs: {error}");
+                }
+            }
             Event::BrowserEvidenceOpen => {
                 if !self.browser_telemetry.evidence.is_empty()
                     && !self.browser_evidence_handles.is_empty()
@@ -18690,6 +18757,8 @@ fi
                 tasks.push(self.poll_workspace_overview());
                 // The PR watch (TRU-173): one background poll when PRs are due.
                 tasks.push(self.poll_pr_watch());
+                // Closed tabs release their browser targets (TRU-176).
+                tasks.push(self.sync_browser_owners());
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
@@ -19329,9 +19398,9 @@ fi
                             .iter()
                             .map(|connection| connection.claude_mcp_server(caller.as_deref()))
                             .chain(
-                                self.browser_mcp
-                                    .iter()
-                                    .map(BrowserMcpConnection::claude_mcp_server),
+                                self.browser_mcp.iter().map(|connection| {
+                                    connection.claude_mcp_server(caller.as_deref())
+                                }),
                             )
                             .collect()
                     };
@@ -19347,7 +19416,7 @@ fi
                             .chain(
                                 self.browser_mcp
                                     .iter()
-                                    .map(BrowserMcpConnection::acp_mcp_server),
+                                    .map(|connection| connection.acp_mcp_server(caller.as_deref())),
                             )
                             .collect()
                     };
@@ -26567,7 +26636,7 @@ fi
                 .chain(
                     self.browser_mcp
                         .iter()
-                        .map(BrowserMcpConnection::acp_mcp_server),
+                        .map(|connection| connection.acp_mcp_server(Some(&caller))),
                 )
                 .collect()
         };
@@ -26675,13 +26744,21 @@ fi
         let scrollback = self.scrollback_lines;
         let theme = self.theme;
         let font_size = self.terminal_font_size;
-        let browser_environment = self
-            .browser_mcp
-            .as_ref()
-            .map(BrowserMcpConnection::terminal_environment)
-            .map(|environment| environment.into_iter().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let browser_environment_refs: Vec<(&str, &str)> = browser_environment
+        // Each tab's browser URL names that tab as its caller (TRU-176);
+        // bottom-panel terminals have none.
+        let browser_mcp = self.browser_mcp.as_ref();
+        let browser_environment = |caller: Option<&str>| -> Vec<(String, String)> {
+            browser_mcp
+                .map(|connection| {
+                    connection
+                        .terminal_environment(caller)
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let bottom_browser_environment = browser_environment(None);
+        let browser_environment_refs: Vec<(&str, &str)> = bottom_browser_environment
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
@@ -26689,13 +26766,18 @@ fi
         let mut recreated_bottom = 0usize;
 
         for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
+            let tab_browser_environment = browser_environment(Some(&tab.session_uid));
+            let tab_browser_environment_refs: Vec<(&str, &str)> = tab_browser_environment
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
             let settings = Self::build_terminal_settings(
                 &tab.repo_path,
                 None,
                 scrollback,
                 &theme,
                 font_size,
-                &browser_environment_refs,
+                &tab_browser_environment_refs,
             );
             match iced_term::Terminal::new(tab.id as u64, settings) {
                 Ok(mut terminal) => {
@@ -41995,6 +42077,7 @@ mod tests {
     ) -> BrowserEvidence {
         BrowserEvidence {
             id,
+            owner: "chat-a".to_string(),
             target: target.to_string(),
             label: label.to_string(),
             capture_mode: BrowserCaptureMode::Viewport,
@@ -43416,6 +43499,35 @@ mod tests {
         assert_eq!(pair[0].target, "design");
         assert_eq!(pair[1].target, "implementation");
         assert!(pair.iter().all(|capture| capture.label == "settings"));
+    }
+
+    #[test]
+    fn evidence_pairing_stays_within_the_latest_captures_chat() {
+        let desktop = gitterm::browser_control::BrowserViewport::desktop(1_280, 720);
+        let mut other_chat = test_browser_evidence(2, "implementation", "settings", desktop);
+        other_chat.owner = "chat-b".to_string();
+        let evidence = vec![
+            test_browser_evidence(1, "before", "other-route", desktop),
+            other_chat,
+            test_browser_evidence(3, "design", "settings", desktop),
+        ];
+        let pair = paired_browser_evidence(&evidence);
+        assert_eq!(pair.len(), 2);
+        assert!(pair.iter().all(|capture| capture.owner == "chat-a"));
+        assert_eq!(pair[0].target, "before");
+        assert_eq!(pair[1].target, "design");
+
+        // A chat with one target has nothing to pair with.
+        let lone = vec![
+            test_browser_evidence(4, "design", "settings", desktop),
+            BrowserEvidence {
+                owner: "chat-b".to_string(),
+                ..test_browser_evidence(5, "implementation", "settings", desktop)
+            },
+        ];
+        let pair = paired_browser_evidence(&lone);
+        assert_eq!(pair.len(), 1);
+        assert_eq!(pair[0].id, 5);
     }
 
     #[test]
