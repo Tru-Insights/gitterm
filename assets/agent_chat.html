@@ -396,6 +396,9 @@
   .chip.pending { opacity: 0.65; }
   .chip.locked { cursor: default; }
   .chip.locked:hover { background: var(--bg-block); }
+  /* GitTerm's change guidelines are on for this chat (TRU-174) */
+  #guidelines-mark { display: none; cursor: default; }
+  #guidelines-mark.visible { display: inline-flex; }
   .chip-menu {
     display: none;
     position: absolute;
@@ -575,6 +578,7 @@
           <div class="chip-menu" id="checkout-menu"></div>
           <button class="chip" id="checkout"></button>
         </div>
+        <span class="chip" id="guidelines-mark" title="GitTerm adds its change guidelines to this agent's system prompt (workspace settings switch them off)">guidelines</span>
       </div>
       <div class="tb-send">
         <button id="submit" class="primary">Send</button>
@@ -592,10 +596,15 @@
   // backends); the replayed buffer's ready/permission_mode_changed events
   // override it. `composer` (null for other backends) is the Claude tab's
   // configured {model, effort, checkout}; replayed model_changed /
-  // effort_changed events override the first two.
+  // effort_changed events override the first two. `guidelines` shows the
+  // change guidelines marker (TRU-174).
   window.__currentTabId = null;
-  window.__setTabId = function (id, permissionMode, composer) {
+  window.__setGuidelines = function (on) {
+    document.getElementById('guidelines-mark').classList.toggle('visible', on === true);
+  };
+  window.__setTabId = function (id, permissionMode, composer, guidelines) {
     window.__currentTabId = id;
+    window.__setGuidelines(guidelines);
     // Which harness drives the chat: Claude, or an ACP agent (Gemini,
     // OpenCode; TRU-153) whose modes come from its `ready` and whose
     // messages sent mid-turn wait for the turn to end. Pi tabs: null.

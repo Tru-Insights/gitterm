@@ -134,6 +134,7 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
         wire_log_dir: Some(root.join("wire")),
         mcp_servers: vec![task.claude_mcp_server(Some(PARENT))],
         chrome: false,
+        guidelines_file: None,
     };
     let (session, mut events) = ClaudeSession::spawn(config);
     let prompt = "Hand the find_user fix to a Codex worker: call the \
