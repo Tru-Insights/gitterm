@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -78,6 +78,25 @@ pub fn print_instance_info() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_without_github_accounts_loads_and_writes_unchanged() {
+        let old = r#"{"theme":"dark"}"#;
+        let config: Config = serde_json::from_str(old).unwrap();
+        assert!(config.github_accounts.is_empty());
+        let written = serde_json::to_value(&config).unwrap();
+        assert!(written.get("github_accounts").is_none());
+
+        let mapped: Config =
+            serde_json::from_str(r#"{"theme":"dark","github_accounts":{"acme":"acme-dev"}}"#)
+                .unwrap();
+        assert_eq!(
+            mapped.github_accounts.get("acme").map(String::as_str),
+            Some("acme-dev")
+        );
+        let back: Config = serde_json::from_str(&serde_json::to_string(&mapped).unwrap()).unwrap();
+        assert_eq!(back.github_accounts, mapped.github_accounts);
+    }
 
     #[test]
     fn workspace_config_loads_old_entries_and_round_trips_parking() {
@@ -650,6 +669,17 @@ pub struct Config {
     /// macOS notifications (TRU-148).
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    /// The gh account each GitHub owner's repos run as (TRU-173): the PR
+    /// watch reads and the overview's Approve and Merge run with
+    /// `GH_TOKEN="$(gh auth token --user <user>)"` for that command only.
+    /// An owner with no entry uses gh's active account. Edit it in
+    /// `config.json`:
+    ///
+    /// ```json
+    /// "github_accounts": { "acme": "acme-dev", "acme-labs": "dev-personal" }
+    /// ```
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub github_accounts: BTreeMap<String, String>,
 }
 
 /// Which macOS notifications GitTerm posts (TRU-148). Edit the
@@ -953,6 +983,7 @@ impl Default for Config {
             policy: gitterm::workers::ModelPolicy::default(),
             usage: gitterm::usage::UsageConfig::default(),
             notifications: NotificationsConfig::default(),
+            github_accounts: BTreeMap::new(),
         }
     }
 }

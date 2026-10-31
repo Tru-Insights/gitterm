@@ -234,6 +234,15 @@ pub struct ListDelegationsRequest {
     pub status: Option<String>,
 }
 
+/// `merge_plan_set` (TRU-173): the whole plan for the calling chat's root.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MergePlanSetRequest {
+    /// Every PR of the work, in the order to merge them. Replaces the
+    /// previous plan; an empty list clears it (holds the user has not
+    /// cleared stay on PRs still listed).
+    pub entries: Vec<crate::merge_plan::PlanEntry>,
+}
+
 /// A harness-emitted session event crossing the notify bridge, e.g. a
 /// Codex `agent-turn-complete`. Task identity comes from the notify URL
 /// GitTerm injected at launch, never from the payload.
@@ -262,6 +271,10 @@ pub enum TaskControlOperation {
     DelegateTask(DelegateTaskRequest),
     GetDelegation(GetDelegationRequest),
     ListDelegations(ListDelegationsRequest),
+    /// Merge plan tools (TRU-173), for the caller's root chat. Like the
+    /// delegation tools, these only reach the bridge with a caller.
+    MergePlanSet(MergePlanSetRequest),
+    MergePlanGet,
 }
 
 #[derive(Clone)]
@@ -605,11 +618,32 @@ impl TaskMcpTools {
         operation: TaskControlOperation,
         parts: &Parts,
     ) -> CallToolResult {
+        self.dispatch_with_caller(operation, parts, || missing_caller_error(tool))
+            .await
+    }
+
+    /// As `dispatch_for_caller`, with the refusal `missing` explains.
+    async fn dispatch_with_caller(
+        &self,
+        operation: TaskControlOperation,
+        parts: &Parts,
+        missing: impl FnOnce() -> String,
+    ) -> CallToolResult {
         let Some(caller) = caller_from_query(parts.uri.query()) else {
-            return tool_error(missing_caller_error(tool));
+            return tool_error(missing());
         };
         task_result(dispatch_operation(&self.commands, operation, Some(caller)).await)
     }
+}
+
+/// Why a merge plan tool refused a call that named no calling tab
+/// (TRU-173).
+pub fn missing_plan_caller_error(tool: &str) -> String {
+    format!(
+        "{tool} needs the calling GitTerm tab's identity, and this call has none. A merge plan \
+         belongs to the root chat of the tab that sets it, so call it through the task MCP URL \
+         GitTerm gave that tab (it ends in ?{TASK_MCP_CALLER_QUERY}=<session id>)."
+    )
 }
 
 /// Why a delegation tool refused a call that named no calling tab.
@@ -871,6 +905,42 @@ impl TaskMcpTools {
         )
         .await
     }
+
+    #[tool(
+        description = "Set the merge plan for the PRs of your piece of work. GitTerm stores it for your chat's root (coordinator) chat, replacing the previous plan, shows it in the workspace overview as PRs \u{00B7} merge order, and watches each PR, telling the user when one needs them. List every PR in the order to merge it. step orders explicitly (1 = first); after names PRs of the plan (owner/name#n) that must be merged first; a PR whose base branch is another plan PR's head branch in the same repo is ordered after it automatically; everything else keeps list order. hold says why a PR must wait for something GitTerm cannot see, e.g. \"until acme/api#12 is in production\"; only the user clears a hold, so a plan that omits a hold the PR already has keeps it. method is merge (the default), squash or rebase. GitTerm never approves or merges on its own: the user does, from the overview. Returns the stored plan with live state, as merge_plan_get.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn merge_plan_set(
+        &self,
+        Parameters(request): Parameters<MergePlanSetRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        self.dispatch_with_caller(TaskControlOperation::MergePlanSet(request), &parts, || {
+            missing_plan_caller_error("merge_plan_set")
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read the merge plan of your chat's root (coordinator) chat with live GitHub state per PR: state (open, draft, merged, closed), checks, review decision, conflicts, its position, its status (next, ready, blocked, held, draft, merged, closed, unknown) and what it waits for, plus the next PR to merge and the PRs this work created that the plan does not list yet (unplanned_prs). Live state comes from GitTerm's watch, polled every couple of minutes; a PR not read yet has live: null.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn merge_plan_get(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
+        self.dispatch_with_caller(TaskControlOperation::MergePlanGet, &parts, || {
+            missing_plan_caller_error("merge_plan_get")
+        })
+        .await
+    }
 }
 
 #[tool_handler]
@@ -1114,8 +1184,14 @@ mod tests {
     #[test]
     fn tool_surface_separates_read_and_write_operations() {
         let routes = TaskMcpTools::tool_router();
-        assert_eq!(routes.list_all().len(), 11);
-        for name in ["task_list", "task_get", "delegation_get", "delegation_list"] {
+        assert_eq!(routes.list_all().len(), 13);
+        for name in [
+            "task_list",
+            "task_get",
+            "delegation_get",
+            "delegation_list",
+            "merge_plan_get",
+        ] {
             assert_eq!(
                 routes
                     .get(name)
@@ -1134,6 +1210,7 @@ mod tests {
             "review_request",
             "consult_request",
             "delegate_task",
+            "merge_plan_set",
         ] {
             assert_eq!(
                 routes
@@ -1399,7 +1476,24 @@ mod tests {
             .expect("authorized MCP initialization timed out")
             .expect("authorized MCP initialization failed");
         let tools = client.list_tools(Default::default()).await.unwrap();
-        assert_eq!(tools.tools.len(), 11);
+        assert_eq!(tools.tools.len(), 13);
+        // The merge plan tools as an agent sees them (TRU-173).
+        let schema_of = |name: &str| {
+            let tool = tools
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} is listed"));
+            Value::Object(tool.input_schema.as_ref().clone())
+        };
+        let set = schema_of("merge_plan_set");
+        assert_eq!(set["required"], serde_json::json!(["entries"]));
+        let entry = serde_json::to_string(&set).unwrap();
+        for field in ["repo", "number", "step", "after", "hold", "method", "note"] {
+            assert!(entry.contains(&format!("\"{field}\"")), "{entry}");
+        }
+        let get = schema_of("merge_plan_get");
+        assert!(get.get("required").is_none(), "{get}");
         let result = client
             .call_tool(
                 rmcp::model::CallToolRequestParams::new("task_list").with_arguments(

@@ -1547,6 +1547,7 @@ mod tests {
                 task_id: None,
                 title: Some("Fable review of identity design".into()),
             }],
+            prs: Vec::new(),
             backfilled: false,
         });
         assert_eq!(
