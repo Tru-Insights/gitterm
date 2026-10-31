@@ -91,6 +91,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_config_loads_old_entries_and_round_trips_parking() {
+        // A workspace closed before parking existed: `active:false`, no
+        // `parked` or `done_at`. It loads unchanged and lists as parked.
+        let old = r#"{
+            "name": "acme-portal",
+            "abbrev": "AP",
+            "dir": "/tmp/acme/portal",
+            "color": "blue",
+            "tabs": [],
+            "active": false
+        }"#;
+        let cfg: WorkspaceConfig = serde_json::from_str(old).unwrap();
+        assert!(!cfg.active);
+        assert_eq!(cfg.parked, None);
+        assert_eq!(cfg.done_at, None);
+        assert!(cfg.is_parked());
+        // Writing it back adds no new keys.
+        let written = serde_json::to_value(&cfg).unwrap();
+        assert!(written.get("parked").is_none());
+        assert!(written.get("done_at").is_none());
+
+        // An open workspace is never on the Parked list.
+        let open: WorkspaceConfig =
+            serde_json::from_str(&old.replace(r#""active": false"#, r#""active": true"#)).unwrap();
+        assert!(!open.is_parked());
+
+        // Parked with a note, then done: both fields survive a round trip.
+        let mut parked = cfg.clone();
+        parked.parked = Some(ParkedInfo {
+            note: "Waiting on PRJ-101 review".to_string(),
+            parked_at: "2026-10-30T09:00:00+00:00".to_string(),
+        });
+        let json = serde_json::to_string(&parked).unwrap();
+        let back: WorkspaceConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.parked, parked.parked);
+        assert!(back.is_parked());
+        parked.done_at = Some("2026-10-31T09:00:00+00:00".to_string());
+        let back: WorkspaceConfig =
+            serde_json::from_str(&serde_json::to_string(&parked).unwrap()).unwrap();
+        assert_eq!(back.done_at.as_deref(), Some("2026-10-31T09:00:00+00:00"));
+        assert!(!back.is_parked());
+
+        // A note-less parked entry (hand-edited) still loads.
+        let bare: ParkedInfo =
+            serde_json::from_str(r#"{"parked_at":"2026-10-30T09:00:00+00:00"}"#).unwrap();
+        assert_eq!(bare.note, "");
+    }
+
+    #[test]
     fn test_instance_id_generation() {
         let id = instance_id();
         assert!(!id.is_empty());
@@ -1063,6 +1112,31 @@ pub struct WorkspaceConfig {
     /// at most one workspace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chats: Vec<String>,
+    /// Set when × parked this workspace (TRU-171): the note to come back
+    /// to and when. A closed entry without it (closed before parking
+    /// existed) lists as parked with an empty note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<ParkedInfo>,
+    /// When the work was marked done (RFC 3339). A done workspace leaves
+    /// the Parked list but stays in this file; its chats stay findable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_at: Option<String>,
+}
+
+/// Why and when a workspace was parked (TRU-171).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedInfo {
+    #[serde(default)]
+    pub note: String,
+    /// RFC 3339.
+    pub parked_at: String,
+}
+
+impl WorkspaceConfig {
+    /// On the Parked list: closed and not done.
+    pub fn is_parked(&self) -> bool {
+        !self.active && self.done_at.is_none()
+    }
 }
 
 fn default_true() -> bool {

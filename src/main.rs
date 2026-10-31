@@ -92,8 +92,8 @@ use webview::WebviewSurface;
 
 // Start with just config for now to avoid conflicts
 use config::{
-    AgentPreset, BottomTerminalConfig, Config, QuickCommand, RemoteAgentConfig, RemoteAgentsFile,
-    RemoteSessionConfig, RemoteSessionsFile, WorkspaceColor, WorkspaceConfig,
+    AgentPreset, BottomTerminalConfig, Config, ParkedInfo, QuickCommand, RemoteAgentConfig,
+    RemoteAgentsFile, RemoteSessionConfig, RemoteSessionsFile, WorkspaceColor, WorkspaceConfig,
     WorkspaceLocationConfig, WorkspaceTabConfig, WorkspacesFile,
 };
 use events::SidebarMode;
@@ -1760,6 +1760,77 @@ struct NewWorkForm {
 
 fn new_work_name_input_id() -> iced::widget::Id {
     iced::widget::Id::new("new-work-name-input")
+}
+
+/// × on a workspace (TRU-171): park it with a note to come back to.
+#[derive(Debug, Clone)]
+struct ParkSheet {
+    /// The workspace being parked.
+    uid: u64,
+    note: String,
+    /// The note as prefilled; while `note` still equals it, a chat index
+    /// that lands later may refill it.
+    prefilled: String,
+}
+
+fn park_note_input_id() -> iced::widget::Id {
+    iced::widget::Id::new("park-note-input")
+}
+
+/// A Parked list row's entry in `closed_workspace_configs`, by name and
+/// folder rather than position, so a click never lands on a neighbour
+/// after the list changed underneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedKey {
+    name: String,
+    dir: String,
+}
+
+impl ParkedKey {
+    fn of(cfg: &WorkspaceConfig) -> Self {
+        Self {
+            name: cfg.name.clone(),
+            dir: cfg.dir.clone(),
+        }
+    }
+
+    fn matches(&self, cfg: &WorkspaceConfig) -> bool {
+        cfg.name == self.name && cfg.dir == self.dir
+    }
+}
+
+/// The Park sheet's prefilled note (TRU-171): the latest line of the
+/// workspace's most recent root chat, its TRU-158 `latest` else its
+/// title. Children fold under their coordinators, so they never supply
+/// it. Empty when the workspace has no indexed chat.
+fn park_note_prefill(chats: &[&chats::ChatIndexEntry]) -> String {
+    chats
+        .iter()
+        .filter(|entry| entry.root_id.is_none())
+        .max_by_key(|entry| entry.mtime)
+        .map(|entry| entry.latest.clone().unwrap_or_else(|| entry.title.clone()))
+        .unwrap_or_default()
+}
+
+/// The Parked list (TRU-171): indices of the parked entries of `configs`
+/// (closed, not done), most recently parked first. Entries closed before
+/// parking existed have no `parked_at` and follow in file order.
+fn parked_order(configs: &[WorkspaceConfig]) -> Vec<usize> {
+    let mut order: Vec<(usize, Option<std::time::SystemTime>)> = configs
+        .iter()
+        .enumerate()
+        .filter(|(_, cfg)| cfg.is_parked())
+        .map(|(idx, cfg)| {
+            let at = cfg
+                .parked
+                .as_ref()
+                .and_then(|parked| overview::parse_stamp(&parked.parked_at));
+            (idx, at)
+        })
+        .collect();
+    // Stable: equal stamps (and all the stamp-less) keep file order.
+    order.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    order.into_iter().map(|(idx, _)| idx).collect()
 }
 
 fn workspace_rename_input_id() -> iced::widget::Id {
@@ -5828,7 +5899,15 @@ pub enum Event {
     WindowUnfocused,
     // Workspace events
     WorkspaceSelect(usize),
+    /// × on a workspace: opens the Park sheet (TRU-171).
     WorkspaceClose(usize),
+    ParkNoteChanged(String),
+    ParkSubmit,
+    ParkCancel,
+    /// `⏸ n parked`: open or close the Parked list.
+    ParkedListToggle,
+    ParkedResume(ParkedKey),
+    ParkedDone(ParkedKey),
     WorkspaceCreate,
     WorkspaceCreateLocal,
     WorkspaceCreated(Option<PathBuf>),
@@ -6450,6 +6529,10 @@ struct App {
     chat_add_to_workspace_open: bool,
     /// The "New workspace…" name form (TRU-169), when open.
     new_work_form: Option<NewWorkForm>,
+    /// The Park sheet × opened (TRU-171), when open.
+    park_sheet: Option<ParkSheet>,
+    /// The Parked list `⏸ n parked` opens (TRU-171).
+    parked_list_open: bool,
     /// Generation counter for branch diff loads.
     branch_diff_generation: u64,
     chat_index_loading: bool,
@@ -7751,55 +7834,7 @@ impl App {
         let mut configs: Vec<WorkspaceConfig> = self
             .workspaces
             .iter()
-            .map(|ws| WorkspaceConfig {
-                name: ws.name.clone(),
-                abbrev: ws.abbrev.clone(),
-                dir: workspace_config_dir(ws),
-                color: ws.color,
-                location: workspace_location_config_from_location(&ws.location),
-                remote_session: self
-                    .remote_session_for_workspace(ws)
-                    .map(remote_session_config_from_definition),
-                active_tab: Some(ws.active_tab),
-                tabs: ws
-                    .tabs
-                    .iter()
-                    .map(|tab| WorkspaceTabConfig {
-                        // Terminal-style tabs persist their tracked local
-                        // cwd; source-browsing tabs persist the browser dir
-                        // so remote workspaces restore where they left off.
-                        dir: if matches!(ws.location, WorkspaceLocation::RemoteAgent { .. })
-                            && tab.startup_command().is_none()
-                        {
-                            tab.files.dir.display()
-                        } else {
-                            tab.current_dir.to_string_lossy().to_string()
-                        },
-                        repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
-                        startup_command: tab.startup_command().map(String::from),
-                        tab_kind: match &tab.kind {
-                            TabKind::Terminal(_) => None, // omitted for backward compat
-                            TabKind::Agent(_) => Some("agent".to_string()),
-                        },
-                        agent_config: tab.agent_session().map(|s| s.config.clone()),
-                        chat_session_id: tab.chat_session_id.clone(),
-                        task_id: tab.task_id.clone(),
-                        task_session_id: tab.task_session_id.clone(),
-                        session_uid: Some(tab.session_uid.clone()),
-                    })
-                    .collect(),
-                run_command: ws.console.run_command.clone(),
-                bottom_terminals: ws
-                    .bottom_terminals
-                    .iter()
-                    .map(|bt| BottomTerminalConfig {
-                        dir: bt.cwd.to_string_lossy().to_string(),
-                    })
-                    .collect(),
-                env: ws.env.clone(),
-                active: true,
-                chats: ws.chats.clone(),
-            })
+            .map(|ws| self.workspace_config(ws))
             .collect();
 
         // Append closed workspace configs so their env/settings survive
@@ -7814,7 +7849,67 @@ impl App {
                 configs.push(closed.clone());
             }
         }
+        self.save_workspace_configs(configs);
+    }
 
+    /// An open workspace as `workspaces.json` stores it: settings, tabs
+    /// and bottom terminals. Parking (TRU-171) stores the same entry with
+    /// `active: false`, so resuming restores the tabs.
+    fn workspace_config(&self, ws: &Workspace) -> WorkspaceConfig {
+        WorkspaceConfig {
+            name: ws.name.clone(),
+            abbrev: ws.abbrev.clone(),
+            dir: workspace_config_dir(ws),
+            color: ws.color,
+            location: workspace_location_config_from_location(&ws.location),
+            remote_session: self
+                .remote_session_for_workspace(ws)
+                .map(remote_session_config_from_definition),
+            active_tab: Some(ws.active_tab),
+            tabs: ws
+                .tabs
+                .iter()
+                .map(|tab| WorkspaceTabConfig {
+                    // Terminal-style tabs persist their tracked local
+                    // cwd; source-browsing tabs persist the browser dir
+                    // so remote workspaces restore where they left off.
+                    dir: if matches!(ws.location, WorkspaceLocation::RemoteAgent { .. })
+                        && tab.startup_command().is_none()
+                    {
+                        tab.files.dir.display()
+                    } else {
+                        tab.current_dir.to_string_lossy().to_string()
+                    },
+                    repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
+                    startup_command: tab.startup_command().map(String::from),
+                    tab_kind: match &tab.kind {
+                        TabKind::Terminal(_) => None, // omitted for backward compat
+                        TabKind::Agent(_) => Some("agent".to_string()),
+                    },
+                    agent_config: tab.agent_session().map(|s| s.config.clone()),
+                    chat_session_id: tab.chat_session_id.clone(),
+                    task_id: tab.task_id.clone(),
+                    task_session_id: tab.task_session_id.clone(),
+                    session_uid: Some(tab.session_uid.clone()),
+                })
+                .collect(),
+            run_command: ws.console.run_command.clone(),
+            bottom_terminals: ws
+                .bottom_terminals
+                .iter()
+                .map(|bt| BottomTerminalConfig {
+                    dir: bt.cwd.to_string_lossy().to_string(),
+                })
+                .collect(),
+            env: ws.env.clone(),
+            active: true,
+            chats: ws.chats.clone(),
+            parked: None,
+            done_at: None,
+        }
+    }
+
+    fn save_workspace_configs(&self, configs: Vec<WorkspaceConfig>) {
         let mut remote_session_defs = RemoteSessionsFile::load()
             .map(|file| remote_session_definitions_from_config(&file.remote_sessions))
             .unwrap_or_default();
@@ -11175,19 +11270,255 @@ impl App {
     }
 
     /// Reopens the closed local workspace config at `closed_idx` (its
-    /// name, colour, env, run command and owned chats), activates it and
-    /// leaves it tabless; the caller adds the tab.
+    /// name, colour, env, run command, owned chats and the tabs it was
+    /// parked with, TRU-171) and activates it; the caller adds its tab.
+    /// An entry closed before parking kept no tabs and reopens tabless, as
+    /// does a done one: finished work comes back for the chat being
+    /// resumed, not with its old terminals and sessions. Reopening ends
+    /// parked and done alike.
     fn reopen_closed_local_workspace(&mut self, closed_idx: usize) -> usize {
-        let cfg = self.closed_workspace_configs.remove(closed_idx);
-        let mut ws = Workspace::new(cfg.name.clone(), PathBuf::from(&cfg.dir), cfg.color);
-        ws.abbrev = cfg.abbrev.clone();
-        ws.env = cfg.env.clone();
-        ws.chats = cfg.chats.clone();
-        if let Some(cmd) = &cfg.run_command {
-            ws.console.run_command = Some(cmd.clone());
-            ws.console.status = ConsoleStatus::Stopped;
+        let mut cfg = self.closed_workspace_configs.remove(closed_idx);
+        if cfg.done_at.is_some() {
+            cfg.tabs.clear();
+            cfg.bottom_terminals.clear();
+            cfg.active_tab = None;
         }
+        self.drop_tabs_open_elsewhere(&mut cfg);
+        let ws = self.restore_workspace_from_config(&cfg, false);
         self.push_and_activate_workspace(ws)
+    }
+
+    // -----------------------------------------------------------------------
+    // Parking (TRU-171): × parks a workspace with a note; the Parked list
+    // resumes it or marks it done.
+
+    /// One conversation, one tab: a parked tab whose conversation was
+    /// opened elsewhere meanwhile is not restored.
+    fn drop_tabs_open_elsewhere(&self, cfg: &mut WorkspaceConfig) {
+        let remote_id = match &cfg.location {
+            Some(config::WorkspaceLocationConfig::RemoteAgent { remote_id, .. }) => {
+                Some(remote_id.clone())
+            }
+            _ => None,
+        };
+        let active = cfg.active_tab;
+        let mut kept = Vec::with_capacity(cfg.tabs.len());
+        let mut kept_active = None;
+        for (idx, tab) in std::mem::take(&mut cfg.tabs).into_iter().enumerate() {
+            if let Some(id) = tab.chat_session_id.as_deref() {
+                if self
+                    .find_chat_tab(&chats::ChatRef::new(remote_id.as_deref(), id))
+                    .is_some()
+                {
+                    eprintln!(
+                        "[workspace] not restoring {:?}'s tab for chat {id}: it is open in another tab",
+                        cfg.name
+                    );
+                    continue;
+                }
+            }
+            if active == Some(idx) {
+                kept_active = Some(kept.len());
+            }
+            kept.push(tab);
+        }
+        cfg.tabs = kept;
+        cfg.active_tab = kept_active;
+    }
+
+    /// The chats a workspace's note and overview read: its owned roots and
+    /// their children, else every chat in its folder.
+    fn workspace_chat_entries(&self, ws: &Workspace) -> Vec<&chats::ChatIndexEntry> {
+        let entries = self.chat_entries_for_machine(self.remote_agent_id_for_workspace(ws));
+        if ws.owns_chats() {
+            overview::chats_under(entries, &ws.chats)
+        } else {
+            overview::work_chats(entries, &ws.dir)
+        }
+    }
+
+    /// × on workspace `idx`: the Park sheet, its note prefilled from the
+    /// workspace's most recent chat. The last open workspace cannot be
+    /// parked (the bar always shows one).
+    fn open_park_sheet(&mut self, idx: usize) -> Task<Event> {
+        if idx >= self.workspaces.len() || self.workspaces.len() <= 1 {
+            return Task::none();
+        }
+        let ws = &self.workspaces[idx];
+        let uid = ws.uid;
+        let remote = self.remote_agent_id_for_workspace(ws).is_some();
+        let note = park_note_prefill(&self.workspace_chat_entries(ws));
+        self.machine_menu = None;
+        self.parked_list_open = false;
+        self.park_sheet = Some(ParkSheet {
+            uid,
+            note: note.clone(),
+            prefilled: note,
+        });
+        // A stale index refills the note when it lands (`refill_park_note`).
+        let index = if remote {
+            self.refresh_chat_index_if_stale()
+        } else {
+            self.refresh_local_chat_index_if_stale()
+        };
+        Task::batch([
+            self.apply_webview_surfaces(),
+            index,
+            iced::widget::operation::focus(park_note_input_id()),
+            iced::widget::operation::select_all(park_note_input_id()),
+        ])
+    }
+
+    /// A chat index landed while the Park sheet is open: refill a note the
+    /// user has not edited.
+    fn refill_park_note(&mut self) {
+        let Some(uid) = self.park_sheet.as_ref().map(|sheet| sheet.uid) else {
+            return;
+        };
+        let Some(ws) = self.workspaces.iter().find(|ws| ws.uid == uid) else {
+            return;
+        };
+        let note = park_note_prefill(&self.workspace_chat_entries(ws));
+        if let Some(sheet) = self.park_sheet.as_mut() {
+            if sheet.note == sheet.prefilled {
+                sheet.note = note.clone();
+                sheet.prefilled = note;
+            }
+        }
+    }
+
+    /// Whether a chat tab in the workspace is mid-turn: parking stops it.
+    fn workspace_chat_working(ws: &Workspace) -> bool {
+        ws.tabs.iter().any(|tab| {
+            tab.agent_session()
+                .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming))
+        })
+    }
+
+    /// Park: what closing did, keeping the tabs. The entry stays in
+    /// `workspaces.json` (`active: false`) with its tabs, bottom terminals
+    /// and the note; its processes stop with the tabs.
+    fn park_workspace(&mut self, uid: u64, note: &str) -> Task<Event> {
+        let Some(idx) = self.workspace_index_by_uid(uid) else {
+            eprintln!("[workspace] cannot park uid={uid}: no longer open");
+            return self.apply_webview_surfaces();
+        };
+        if self.workspaces.len() <= 1 {
+            eprintln!("[workspace] cannot park uid={uid}: it is the last open workspace");
+            return self.apply_webview_surfaces();
+        }
+        self.dismiss_viewer_surface();
+        let mut cfg = self.workspace_config(&self.workspaces[idx]);
+        cfg.active = false;
+        cfg.parked = Some(ParkedInfo {
+            note: note.trim().to_string(),
+            parked_at: chrono::Utc::now().to_rfc3339(),
+        });
+        eprintln!(
+            "[workspace] parked {:?} with {} tab(s)",
+            cfg.name,
+            cfg.tabs.len()
+        );
+        self.closed_workspace_configs.push(cfg);
+        // Its tabs are dropped, so its remote chats stop too.
+        let tab_ids: Vec<usize> = self.workspaces[idx].tabs.iter().map(|tab| tab.id).collect();
+        for tab_id in tab_ids {
+            self.stop_remote_chat_for_closing_tab(tab_id);
+        }
+        // Kill console process before removing workspace
+        self.workspaces[idx].console.kill_process();
+        self.workspaces.remove(idx);
+        if self.active_workspace_idx >= self.workspaces.len() {
+            self.active_workspace_idx = self.workspaces.len() - 1;
+        }
+        self.sync_visible_terminals();
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.sync_plans_dir();
+
+        // Snap slide to new active workspace (no animation)
+        let viewport_width = self.content_viewport_width();
+        let new_target = self.active_workspace_idx as f32 * viewport_width;
+        self.slide_offset = new_target;
+        self.slide_target = new_target;
+        self.slide_animating = false;
+        self.slide_start_time = None;
+
+        let scroll_task = iced::advanced::widget::operate(
+            iced::advanced::widget::operation::scrollable::scroll_to(
+                workspace_scrollable_id(),
+                scrollable::AbsoluteOffset {
+                    x: Some(new_target),
+                    y: None,
+                },
+            ),
+        );
+        let remote_agent_task = self.ensure_active_remote_agent_connection(false);
+        // The sheet is gone: show the now-active workspace's chat page.
+        Task::batch([
+            scroll_task,
+            remote_agent_task,
+            self.present_active_tab_surfaces(),
+        ])
+    }
+
+    /// Resume: the parked entry comes back with its tabs through the path
+    /// startup restores workspaces with, and becomes active.
+    fn resume_parked_workspace(&mut self, key: &ParkedKey) -> Task<Event> {
+        let Some(pos) = self
+            .closed_workspace_configs
+            .iter()
+            .position(|cfg| cfg.is_parked() && key.matches(cfg))
+        else {
+            eprintln!(
+                "[workspace] cannot resume {:?} ({}): not parked",
+                key.name, key.dir
+            );
+            return Task::none();
+        };
+        let mut cfg = self.closed_workspace_configs.remove(pos);
+        self.drop_tabs_open_elsewhere(&mut cfg);
+        let ws = self.restore_workspace_from_config(&cfg, true);
+        eprintln!(
+            "[workspace] resumed {:?} with {} tab(s)",
+            ws.name,
+            ws.tabs.len()
+        );
+        self.parked_list_open = false;
+        self.push_and_activate_workspace(ws);
+        self.sync_visible_terminals();
+        let git_task = match self.active_tab().map(|tab| (tab.id, tab.repo_path.clone())) {
+            Some((tab_id, repo_path)) => {
+                self.request_git_status_for_active_source(tab_id, repo_path)
+            }
+            None => Task::none(),
+        };
+        Task::batch([
+            git_task,
+            self.refresh_worktrees_for_active_tab(),
+            self.refresh_files_for_active_tab(),
+            self.ensure_active_remote_agent_connection(false),
+            self.scroll_to_active_workspace_bar(),
+            self.present_active_tab_surfaces(),
+        ])
+    }
+
+    /// Done: the entry leaves the Parked list and stays in the file.
+    fn mark_parked_done(&mut self, key: &ParkedKey) {
+        let Some(cfg) = self
+            .closed_workspace_configs
+            .iter_mut()
+            .find(|cfg| cfg.is_parked() && key.matches(cfg))
+        else {
+            eprintln!(
+                "[workspace] cannot mark {:?} ({}) done: not parked",
+                key.name, key.dir
+            );
+            return;
+        };
+        cfg.done_at = Some(chrono::Utc::now().to_rfc3339());
+        eprintln!("[workspace] {:?} marked done", cfg.name);
+        self.mark_workspaces_dirty();
     }
 
     /// Adds `workspace` to the bar in machine order, makes it active and
@@ -11397,6 +11728,11 @@ impl App {
             repo_root.as_deref(),
             &repo_name,
         );
+        // A reopened parked workspace may have brought the chat's tab
+        // back (TRU-171): focus it rather than open a second one.
+        if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chats::ChatRef::local(&id)) {
+            return self.focus_workspace_tab(ws_idx, tab_idx);
+        }
         if ws_idx != self.active_workspace_idx {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
@@ -11476,6 +11812,11 @@ impl App {
             repo_root.as_deref(),
             &repo_name,
         );
+        // A reopened parked workspace may have brought the chat's tab
+        // back (TRU-171): focus it rather than open a second one.
+        if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chats::ChatRef::local(&id)) {
+            return self.focus_workspace_tab(ws_idx, tab_idx);
+        }
         if ws_idx != self.active_workspace_idx {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
@@ -14268,6 +14609,380 @@ fn load_task_store_for_startup(
 }
 
 impl App {
+    /// A workspace rebuilt from its `workspaces.json` entry: settings,
+    /// tabs (chat tabs resume their conversations on the next prompt;
+    /// task tabs reopen their recorded conversation) and bottom
+    /// terminals. Startup restores open entries through it, and resuming
+    /// a parked workspace (TRU-171) goes through the same path. An entry
+    /// with no tabs gets the workspace-root tab when `default_tab`, else
+    /// stays tabless for the caller to fill.
+    fn restore_workspace_from_config(
+        &mut self,
+        ws_config: &WorkspaceConfig,
+        default_tab: bool,
+    ) -> Workspace {
+        let remote_session = ws_config
+            .remote_session
+            .as_ref()
+            .map(remote_session_definition_from_config)
+            .or_else(|| {
+                self.remote_session_defs
+                    .iter()
+                    .find(|session| remote_workspace_name(session) == ws_config.name)
+                    .cloned()
+            });
+        let dir = PathBuf::from(&ws_config.dir);
+        let home = std::env::var("HOME").unwrap_or_default();
+        // If workspace dir is $HOME, name the workspace after its first tab's repo instead
+        let name = if remote_session.is_some() {
+            ws_config.name.clone()
+        } else if dir == Path::new(&home) && ws_config.chats.is_empty() {
+            ws_config
+                .tabs
+                .first()
+                .map(|t| PathBuf::from(&t.dir))
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| ws_config.name.clone())
+        } else {
+            ws_config.name.clone()
+        };
+        let location = workspace_location_from_config(
+            ws_config.location.as_ref(),
+            &dir,
+            remote_session.as_ref(),
+            &self.remote_agent_defs,
+        );
+        let inferred_remote_agent_location = ws_config.location.is_none()
+            && remote_session.as_ref().is_some_and(|session| {
+                remote_agent_for_session(&self.remote_agent_defs, session).is_some()
+            });
+        let mut workspace = if let Some(remote_session) = remote_session {
+            let mut workspace = Workspace::new_remote(remote_session, ws_config.color);
+            workspace.name = name;
+            workspace.dir = dir.clone();
+            workspace
+        } else {
+            Workspace::new(name, dir.clone(), ws_config.color)
+        };
+        workspace.location = location;
+        if let Some(root) = remote_agent_root(&workspace.location) {
+            workspace.dir = PathBuf::from(root);
+            if inferred_remote_agent_location {
+                self.workspaces_dirty = true;
+                self.next_workspace_save_at =
+                    Some(Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS));
+            }
+        }
+        workspace.abbrev = ws_config.abbrev.clone();
+        workspace.env = ws_config.env.clone();
+        workspace.chats = ws_config.chats.clone();
+        // Restore saved run command if present
+        if let Some(cmd) = &ws_config.run_command {
+            workspace.console.run_command = Some(cmd.clone());
+            workspace.console.status = ConsoleStatus::Stopped;
+        }
+
+        let workspace_is_remote_agent =
+            matches!(workspace.location, WorkspaceLocation::RemoteAgent { .. });
+        let remote_agent_root = remote_agent_root(&workspace.location).map(str::to_string);
+        let mut remote_agent_files_tab_added = false;
+        if ws_config.tabs.is_empty() {
+            // Reopen paths pass `default_tab: false` and add their own tab.
+            if default_tab && workspace_is_remote_agent {
+                let root = remote_agent_root
+                    .clone()
+                    .unwrap_or_else(|| dir.to_string_lossy().to_string());
+                self.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
+            } else if default_tab && workspace.remote_session.is_none() {
+                // Always have at least one local tab.
+                self.add_tab_to_workspace(&mut workspace, dir);
+            }
+        } else {
+            for tab_config in &ws_config.tabs {
+                // Tabs saved before caller identity existed get a
+                // fresh uid (TabState::new); save once so it sticks.
+                let restored_session_uid = tab_config.session_uid.clone();
+                if restored_session_uid.is_none() {
+                    self.workspaces_dirty = true;
+                    self.next_workspace_save_at =
+                        Some(Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS));
+                }
+                if workspace_is_remote_agent {
+                    let Some(root) = remote_agent_root.as_deref() else {
+                        continue;
+                    };
+                    if tab_config.startup_command.is_some() {
+                        // Legacy SSH/tmux terminal tab: keeps its
+                        // remote session dir purely for display.
+                        let local_cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                        self.add_tab_to_workspace_with_command(
+                            &mut workspace,
+                            local_cwd,
+                            Some(PathBuf::from(&tab_config.dir)),
+                            tab_config.startup_command.clone(),
+                            restored_session_uid,
+                        );
+                        continue;
+                    }
+                    // A native Claude chat tab (TRU-152) comes back
+                    // as a remote chat in its recorded directory,
+                    // resuming its conversation on the next prompt.
+                    if let (Some("agent"), Some(agent_config @ AgentBackendConfig::Claude { .. })) = (
+                        tab_config.tab_kind.as_deref(),
+                        tab_config.agent_config.as_ref(),
+                    ) {
+                        let dir = tab_config
+                            .repo_dir
+                            .clone()
+                            .unwrap_or_else(|| root.to_string());
+                        let mut session = AgentSession::new(agent_config.clone());
+                        session.session_id = tab_config.chat_session_id.clone();
+                        let mut tab = self.new_remote_claude_chat_tab(&dir, session);
+                        tab.chat_session_id = tab_config.chat_session_id.clone();
+                        if let Some(uid) = restored_session_uid {
+                            tab.session_uid = uid;
+                        }
+                        workspace.tabs.push(tab);
+                        workspace.active_tab = workspace.tabs.len() - 1;
+                        continue;
+                    }
+                    if remote_agent_files_tab_added {
+                        continue;
+                    }
+                    // The persisted browse dir is validated by the
+                    // agent on the first listing; errors show in the
+                    // sidebar rather than being second-guessed here.
+                    self.add_remote_agent_tab_to_workspace(
+                        &mut workspace,
+                        root.to_string(),
+                        Some(tab_config.dir.clone()),
+                    );
+                    if let (Some(uid), Some(tab)) =
+                        (restored_session_uid, workspace.tabs.last_mut())
+                    {
+                        tab.session_uid = uid;
+                    }
+                    remote_agent_files_tab_added = true;
+                    continue;
+                }
+                let tab_dir = PathBuf::from(&tab_config.dir);
+                let repo_dir = tab_config
+                    .repo_dir
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        Repository::discover(&tab_dir)
+                            .ok()
+                            .and_then(|repo| repo.workdir().map(PathBuf::from))
+                    })
+                    .unwrap_or_else(|| tab_dir.clone());
+                let current_dir = if tab_dir.is_dir() {
+                    tab_dir
+                } else {
+                    repo_dir.clone()
+                };
+                // A task tab reopens its recorded conversation on
+                // launch — relaunching the persisted plain harness
+                // command would fork a fresh session and flip the
+                // task back to Running, hiding the Resume verb.
+                let mut startup_command = tab_config.startup_command.clone();
+                let mut chat_session_id = tab_config.chat_session_id.clone();
+                // Fixed before the terminal starts so the Codex
+                // notify hook can carry the session identity.
+                let restored_task_session_id = tab_config.task_id.as_ref().map(|_| {
+                    tab_config
+                        .task_session_id
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                });
+                if startup_command.is_some() {
+                    let conversation = tab_config.task_id.as_ref().and_then(|task_id| {
+                        let task = self.task_store.as_ref()?.get(task_id)?;
+                        let own_session = task.sessions.iter().find(|session| {
+                            Some(&session.task_session_id) == tab_config.task_session_id.as_ref()
+                        });
+                        own_session
+                            .and_then(|session| session.conversation.as_ref())
+                            .or_else(|| {
+                                // pi/codex conversations are linked to
+                                // synthetic session records by the
+                                // Chats sync; fall back to the task's
+                                // latest conversation of this tab's own
+                                // backend, so a Codex tab never
+                                // relaunches another session's Claude
+                                // resume.
+                                let own_backend = own_session.and_then(|session| match session
+                                    .harness
+                                    .as_ref()
+                                    .map(|harness| &harness.kind)
+                                {
+                                    Some(HarnessKind::TerminalPreset { preset_name }) => self
+                                        .agent_presets
+                                        .iter()
+                                        .find(|preset| &preset.name == preset_name)
+                                        .and_then(preset_conversation_backend),
+                                    Some(HarnessKind::NativeClaude) => {
+                                        Some(HarnessConversationBackend::Claude)
+                                    }
+                                    Some(HarnessKind::NativePi) => {
+                                        Some(HarnessConversationBackend::Pi)
+                                    }
+                                    None => None,
+                                })?;
+                                task.sessions.iter().rev().find_map(|session| {
+                                    session
+                                        .conversation
+                                        .as_ref()
+                                        .filter(|conversation| conversation.backend == own_backend)
+                                })
+                            })
+                    });
+                    if let Some(conversation) = conversation {
+                        let mut command = conversation_resume_command(conversation);
+                        if conversation.backend == HarnessConversationBackend::Codex {
+                            if let (Some(task_id), Some(task_session_id)) = (
+                                tab_config.task_id.as_ref(),
+                                restored_task_session_id.as_ref(),
+                            ) {
+                                command = self.codex_task_notify_command(
+                                    command,
+                                    task_id,
+                                    task_session_id,
+                                );
+                            }
+                        }
+                        startup_command = Some(command);
+                        chat_session_id = Some(conversation.session_id.clone());
+                    } else if let Some(session_id) = startup_command
+                        .as_deref()
+                        .and_then(|command| command.strip_prefix("claude --resume "))
+                        .map(str::trim)
+                    {
+                        // A persisted resume against a Claude session
+                        // that never received a message (the transcript
+                        // is only written on first message) errors on
+                        // launch; start a fresh session instead.
+                        if !session_id.contains(char::is_whitespace)
+                            && !chats::claude_session_exists(session_id)
+                        {
+                            startup_command = Some("claude".to_string());
+                            chat_session_id = None;
+                        }
+                    } else if let Some((resume, session_id)) =
+                        startup_command.as_deref().and_then(|command| {
+                            resume_for_preassigned_claude_launch(
+                                command,
+                                chats::claude_session_exists,
+                            )
+                        })
+                    {
+                        // A plain `claude --session-id X` launch whose
+                        // session has since been written cannot be
+                        // re-run (the CLI refuses: "Session ID X is
+                        // already in use"); resume it instead.
+                        startup_command = Some(resume);
+                        chat_session_id = Some(session_id);
+                    }
+                }
+                match (
+                    tab_config.tab_kind.as_deref(),
+                    tab_config.agent_config.as_ref(),
+                ) {
+                    (Some("agent"), Some(agent_config)) => {
+                        self.add_agent_tab_to_workspace(
+                            &mut workspace,
+                            repo_dir,
+                            Some(current_dir),
+                            agent_config.clone(),
+                        );
+                        // No terminal: the chat process (and its MCP
+                        // URL) starts on the first prompt.
+                        if let (Some(uid), Some(tab)) =
+                            (restored_session_uid.clone(), workspace.tabs.last_mut())
+                        {
+                            tab.session_uid = uid;
+                        }
+                    }
+                    (Some("agent"), None) => {
+                        eprintln!(
+                            "WARN: tab_kind=\"agent\" without agent_config; falling back to terminal tab for {}",
+                            repo_dir.display()
+                        );
+                        self.add_tab_to_workspace_with_command(
+                            &mut workspace,
+                            repo_dir,
+                            Some(current_dir),
+                            startup_command.clone(),
+                            restored_session_uid.clone(),
+                        );
+                    }
+                    (Some(other), _) if other != "terminal" => {
+                        eprintln!(
+                            "WARN: unknown tab_kind={:?}; falling back to terminal tab for {}",
+                            other,
+                            repo_dir.display()
+                        );
+                        self.add_tab_to_workspace_with_command(
+                            &mut workspace,
+                            repo_dir,
+                            Some(current_dir),
+                            startup_command.clone(),
+                            restored_session_uid.clone(),
+                        );
+                    }
+                    _ => {
+                        self.add_tab_to_workspace_with_command(
+                            &mut workspace,
+                            repo_dir,
+                            Some(current_dir),
+                            startup_command.clone(),
+                            restored_session_uid.clone(),
+                        );
+                    }
+                }
+                // Restore the tab↔conversation mapping so the
+                // Chats registry rule survives restarts.
+                if let Some(session_id) = chat_session_id {
+                    if let Some(tab) = workspace.tabs.last_mut() {
+                        // A native chat tab (Claude, or an ACP
+                        // agent) resumes its conversation.
+                        if let Some(session) = tab.agent_session_mut() {
+                            if session.backend().is_native() {
+                                session.session_id = Some(session_id.clone());
+                            }
+                        }
+                        tab.chat_session_id = Some(session_id);
+                    }
+                }
+                if let Some(task_id) = &tab_config.task_id {
+                    if let Some(tab) = workspace.tabs.last_mut() {
+                        tab.task_id = Some(task_id.clone());
+                        tab.task_session_id = restored_task_session_id.clone();
+                    }
+                }
+            }
+        }
+
+        // Restore bottom panel terminals
+        for bt_config in &ws_config.bottom_terminals {
+            let bt = self.create_bottom_terminal(PathBuf::from(&bt_config.dir));
+            workspace.bottom_terminals.push(bt);
+        }
+
+        workspace.active_tab = ws_config
+            .active_tab
+            .filter(|idx| *idx < workspace.tabs.len())
+            .or_else(|| {
+                workspace.tabs.iter().position(|tab| {
+                    paths_equal(&tab.repo_path, &workspace.dir)
+                        || paths_equal(&tab.current_dir, &workspace.dir)
+                })
+            })
+            .unwrap_or(0);
+
+        workspace
+    }
+
     fn new() -> (Self, Task<Event>) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = Config::load();
@@ -14604,6 +15319,8 @@ impl App {
             workspace_rename: None,
             chat_add_to_workspace_open: false,
             new_work_form: None,
+            park_sheet: None,
+            parked_list_open: false,
             branch_diff_generation: 0,
             chat_index_loading: false,
             chat_index_loaded_at: None,
@@ -14678,374 +15395,7 @@ impl App {
                     app.closed_workspace_configs.push(ws_config.clone());
                     continue;
                 }
-                let remote_session = ws_config
-                    .remote_session
-                    .as_ref()
-                    .map(remote_session_definition_from_config)
-                    .or_else(|| {
-                        app.remote_session_defs
-                            .iter()
-                            .find(|session| remote_workspace_name(session) == ws_config.name)
-                            .cloned()
-                    });
-                let dir = PathBuf::from(&ws_config.dir);
-                let home = std::env::var("HOME").unwrap_or_default();
-                // If workspace dir is $HOME, name the workspace after its first tab's repo instead
-                let name = if remote_session.is_some() {
-                    ws_config.name.clone()
-                } else if dir == Path::new(&home) && ws_config.chats.is_empty() {
-                    ws_config
-                        .tabs
-                        .first()
-                        .map(|t| PathBuf::from(&t.dir))
-                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                        .unwrap_or_else(|| ws_config.name.clone())
-                } else {
-                    ws_config.name.clone()
-                };
-                let location = workspace_location_from_config(
-                    ws_config.location.as_ref(),
-                    &dir,
-                    remote_session.as_ref(),
-                    &app.remote_agent_defs,
-                );
-                let inferred_remote_agent_location = ws_config.location.is_none()
-                    && remote_session.as_ref().is_some_and(|session| {
-                        remote_agent_for_session(&app.remote_agent_defs, session).is_some()
-                    });
-                let mut workspace = if let Some(remote_session) = remote_session {
-                    let mut workspace = Workspace::new_remote(remote_session, ws_config.color);
-                    workspace.name = name;
-                    workspace.dir = dir.clone();
-                    workspace
-                } else {
-                    Workspace::new(name, dir.clone(), ws_config.color)
-                };
-                workspace.location = location;
-                if let Some(root) = remote_agent_root(&workspace.location) {
-                    workspace.dir = PathBuf::from(root);
-                    if inferred_remote_agent_location {
-                        app.workspaces_dirty = true;
-                        app.next_workspace_save_at = Some(
-                            Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS),
-                        );
-                    }
-                }
-                workspace.abbrev = ws_config.abbrev.clone();
-                workspace.env = ws_config.env.clone();
-                workspace.chats = ws_config.chats.clone();
-                // Restore saved run command if present
-                if let Some(cmd) = &ws_config.run_command {
-                    workspace.console.run_command = Some(cmd.clone());
-                    workspace.console.status = ConsoleStatus::Stopped;
-                }
-
-                let workspace_is_remote_agent =
-                    matches!(workspace.location, WorkspaceLocation::RemoteAgent { .. });
-                let remote_agent_root = remote_agent_root(&workspace.location).map(str::to_string);
-                let mut remote_agent_files_tab_added = false;
-                if ws_config.tabs.is_empty() {
-                    if workspace_is_remote_agent {
-                        let root = remote_agent_root
-                            .clone()
-                            .unwrap_or_else(|| dir.to_string_lossy().to_string());
-                        app.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
-                    } else if workspace.remote_session.is_none() {
-                        // Always have at least one local tab.
-                        app.add_tab_to_workspace(&mut workspace, dir);
-                    }
-                } else {
-                    for tab_config in &ws_config.tabs {
-                        // Tabs saved before caller identity existed get a
-                        // fresh uid (TabState::new); save once so it sticks.
-                        let restored_session_uid = tab_config.session_uid.clone();
-                        if restored_session_uid.is_none() {
-                            app.workspaces_dirty = true;
-                            app.next_workspace_save_at = Some(
-                                Instant::now() + Duration::from_millis(WORKSPACES_SAVE_DEBOUNCE_MS),
-                            );
-                        }
-                        if workspace_is_remote_agent {
-                            let Some(root) = remote_agent_root.as_deref() else {
-                                continue;
-                            };
-                            if tab_config.startup_command.is_some() {
-                                // Legacy SSH/tmux terminal tab: keeps its
-                                // remote session dir purely for display.
-                                let local_cwd =
-                                    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-                                app.add_tab_to_workspace_with_command(
-                                    &mut workspace,
-                                    local_cwd,
-                                    Some(PathBuf::from(&tab_config.dir)),
-                                    tab_config.startup_command.clone(),
-                                    restored_session_uid,
-                                );
-                                continue;
-                            }
-                            // A native Claude chat tab (TRU-152) comes back
-                            // as a remote chat in its recorded directory,
-                            // resuming its conversation on the next prompt.
-                            if let (
-                                Some("agent"),
-                                Some(agent_config @ AgentBackendConfig::Claude { .. }),
-                            ) = (
-                                tab_config.tab_kind.as_deref(),
-                                tab_config.agent_config.as_ref(),
-                            ) {
-                                let dir = tab_config
-                                    .repo_dir
-                                    .clone()
-                                    .unwrap_or_else(|| root.to_string());
-                                let mut session = AgentSession::new(agent_config.clone());
-                                session.session_id = tab_config.chat_session_id.clone();
-                                let mut tab = app.new_remote_claude_chat_tab(&dir, session);
-                                tab.chat_session_id = tab_config.chat_session_id.clone();
-                                if let Some(uid) = restored_session_uid {
-                                    tab.session_uid = uid;
-                                }
-                                workspace.tabs.push(tab);
-                                workspace.active_tab = workspace.tabs.len() - 1;
-                                continue;
-                            }
-                            if remote_agent_files_tab_added {
-                                continue;
-                            }
-                            // The persisted browse dir is validated by the
-                            // agent on the first listing; errors show in the
-                            // sidebar rather than being second-guessed here.
-                            app.add_remote_agent_tab_to_workspace(
-                                &mut workspace,
-                                root.to_string(),
-                                Some(tab_config.dir.clone()),
-                            );
-                            if let (Some(uid), Some(tab)) =
-                                (restored_session_uid, workspace.tabs.last_mut())
-                            {
-                                tab.session_uid = uid;
-                            }
-                            remote_agent_files_tab_added = true;
-                            continue;
-                        }
-                        let tab_dir = PathBuf::from(&tab_config.dir);
-                        let repo_dir = tab_config
-                            .repo_dir
-                            .as_ref()
-                            .map(PathBuf::from)
-                            .or_else(|| {
-                                Repository::discover(&tab_dir)
-                                    .ok()
-                                    .and_then(|repo| repo.workdir().map(PathBuf::from))
-                            })
-                            .unwrap_or_else(|| tab_dir.clone());
-                        let current_dir = if tab_dir.is_dir() {
-                            tab_dir
-                        } else {
-                            repo_dir.clone()
-                        };
-                        // A task tab reopens its recorded conversation on
-                        // launch — relaunching the persisted plain harness
-                        // command would fork a fresh session and flip the
-                        // task back to Running, hiding the Resume verb.
-                        let mut startup_command = tab_config.startup_command.clone();
-                        let mut chat_session_id = tab_config.chat_session_id.clone();
-                        // Fixed before the terminal starts so the Codex
-                        // notify hook can carry the session identity.
-                        let restored_task_session_id = tab_config.task_id.as_ref().map(|_| {
-                            tab_config
-                                .task_session_id
-                                .clone()
-                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-                        });
-                        if startup_command.is_some() {
-                            let conversation = tab_config.task_id.as_ref().and_then(|task_id| {
-                                let task = app.task_store.as_ref()?.get(task_id)?;
-                                let own_session = task.sessions.iter().find(|session| {
-                                    Some(&session.task_session_id)
-                                        == tab_config.task_session_id.as_ref()
-                                });
-                                own_session
-                                    .and_then(|session| session.conversation.as_ref())
-                                    .or_else(|| {
-                                        // pi/codex conversations are linked to
-                                        // synthetic session records by the
-                                        // Chats sync; fall back to the task's
-                                        // latest conversation of this tab's own
-                                        // backend, so a Codex tab never
-                                        // relaunches another session's Claude
-                                        // resume.
-                                        let own_backend = own_session.and_then(|session| {
-                                            match session
-                                                .harness
-                                                .as_ref()
-                                                .map(|harness| &harness.kind)
-                                            {
-                                                Some(HarnessKind::TerminalPreset {
-                                                    preset_name,
-                                                }) => app
-                                                    .agent_presets
-                                                    .iter()
-                                                    .find(|preset| &preset.name == preset_name)
-                                                    .and_then(preset_conversation_backend),
-                                                Some(HarnessKind::NativeClaude) => {
-                                                    Some(HarnessConversationBackend::Claude)
-                                                }
-                                                Some(HarnessKind::NativePi) => {
-                                                    Some(HarnessConversationBackend::Pi)
-                                                }
-                                                None => None,
-                                            }
-                                        })?;
-                                        task.sessions.iter().rev().find_map(|session| {
-                                            session.conversation.as_ref().filter(|conversation| {
-                                                conversation.backend == own_backend
-                                            })
-                                        })
-                                    })
-                            });
-                            if let Some(conversation) = conversation {
-                                let mut command = conversation_resume_command(conversation);
-                                if conversation.backend == HarnessConversationBackend::Codex {
-                                    if let (Some(task_id), Some(task_session_id)) = (
-                                        tab_config.task_id.as_ref(),
-                                        restored_task_session_id.as_ref(),
-                                    ) {
-                                        command = app.codex_task_notify_command(
-                                            command,
-                                            task_id,
-                                            task_session_id,
-                                        );
-                                    }
-                                }
-                                startup_command = Some(command);
-                                chat_session_id = Some(conversation.session_id.clone());
-                            } else if let Some(session_id) = startup_command
-                                .as_deref()
-                                .and_then(|command| command.strip_prefix("claude --resume "))
-                                .map(str::trim)
-                            {
-                                // A persisted resume against a Claude session
-                                // that never received a message (the transcript
-                                // is only written on first message) errors on
-                                // launch; start a fresh session instead.
-                                if !session_id.contains(char::is_whitespace)
-                                    && !chats::claude_session_exists(session_id)
-                                {
-                                    startup_command = Some("claude".to_string());
-                                    chat_session_id = None;
-                                }
-                            } else if let Some((resume, session_id)) =
-                                startup_command.as_deref().and_then(|command| {
-                                    resume_for_preassigned_claude_launch(
-                                        command,
-                                        chats::claude_session_exists,
-                                    )
-                                })
-                            {
-                                // A plain `claude --session-id X` launch whose
-                                // session has since been written cannot be
-                                // re-run (the CLI refuses: "Session ID X is
-                                // already in use"); resume it instead.
-                                startup_command = Some(resume);
-                                chat_session_id = Some(session_id);
-                            }
-                        }
-                        match (
-                            tab_config.tab_kind.as_deref(),
-                            tab_config.agent_config.as_ref(),
-                        ) {
-                            (Some("agent"), Some(agent_config)) => {
-                                app.add_agent_tab_to_workspace(
-                                    &mut workspace,
-                                    repo_dir,
-                                    Some(current_dir),
-                                    agent_config.clone(),
-                                );
-                                // No terminal: the chat process (and its MCP
-                                // URL) starts on the first prompt.
-                                if let (Some(uid), Some(tab)) =
-                                    (restored_session_uid.clone(), workspace.tabs.last_mut())
-                                {
-                                    tab.session_uid = uid;
-                                }
-                            }
-                            (Some("agent"), None) => {
-                                eprintln!(
-                                    "WARN: tab_kind=\"agent\" without agent_config; falling back to terminal tab for {}",
-                                    repo_dir.display()
-                                );
-                                app.add_tab_to_workspace_with_command(
-                                    &mut workspace,
-                                    repo_dir,
-                                    Some(current_dir),
-                                    startup_command.clone(),
-                                    restored_session_uid.clone(),
-                                );
-                            }
-                            (Some(other), _) if other != "terminal" => {
-                                eprintln!(
-                                    "WARN: unknown tab_kind={:?}; falling back to terminal tab for {}",
-                                    other,
-                                    repo_dir.display()
-                                );
-                                app.add_tab_to_workspace_with_command(
-                                    &mut workspace,
-                                    repo_dir,
-                                    Some(current_dir),
-                                    startup_command.clone(),
-                                    restored_session_uid.clone(),
-                                );
-                            }
-                            _ => {
-                                app.add_tab_to_workspace_with_command(
-                                    &mut workspace,
-                                    repo_dir,
-                                    Some(current_dir),
-                                    startup_command.clone(),
-                                    restored_session_uid.clone(),
-                                );
-                            }
-                        }
-                        // Restore the tab↔conversation mapping so the
-                        // Chats registry rule survives restarts.
-                        if let Some(session_id) = chat_session_id {
-                            if let Some(tab) = workspace.tabs.last_mut() {
-                                // A native chat tab (Claude, or an ACP
-                                // agent) resumes its conversation.
-                                if let Some(session) = tab.agent_session_mut() {
-                                    if session.backend().is_native() {
-                                        session.session_id = Some(session_id.clone());
-                                    }
-                                }
-                                tab.chat_session_id = Some(session_id);
-                            }
-                        }
-                        if let Some(task_id) = &tab_config.task_id {
-                            if let Some(tab) = workspace.tabs.last_mut() {
-                                tab.task_id = Some(task_id.clone());
-                                tab.task_session_id = restored_task_session_id.clone();
-                            }
-                        }
-                    }
-                }
-
-                // Restore bottom panel terminals
-                for bt_config in &ws_config.bottom_terminals {
-                    let bt = app.create_bottom_terminal(PathBuf::from(&bt_config.dir));
-                    workspace.bottom_terminals.push(bt);
-                }
-
-                workspace.active_tab = ws_config
-                    .active_tab
-                    .filter(|idx| *idx < workspace.tabs.len())
-                    .or_else(|| {
-                        workspace.tabs.iter().position(|tab| {
-                            paths_equal(&tab.repo_path, &workspace.dir)
-                                || paths_equal(&tab.current_dir, &workspace.dir)
-                        })
-                    })
-                    .unwrap_or(0);
-
+                let workspace = app.restore_workspace_from_config(ws_config, true);
                 app.workspaces.push(workspace);
             }
 
@@ -17970,6 +18320,7 @@ fi
                 if self.task_switcher_open
                     || self.new_task_form.is_some()
                     || self.new_work_form.is_some()
+                    || self.park_sheet.is_some()
                     || self.task_tab_close_prompt.is_some()
                     || self.task_worktree_delete_prompt.is_some()
                     || self.task_publish_prompt.is_some()
@@ -20695,6 +21046,7 @@ fi
                 if self.task_switcher_open
                     || self.new_task_form.is_some()
                     || self.new_work_form.is_some()
+                    || self.park_sheet.is_some()
                     || self.task_tab_close_prompt.is_some()
                     || self.task_worktree_delete_prompt.is_some()
                     || self.task_publish_prompt.is_some()
@@ -20993,6 +21345,21 @@ fi
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     return self.update(Event::NewWorkCancel);
+                }
+
+                // Park sheet (TRU-171): Enter parks, Escape cancels. The
+                // note field's own submit also parks; the second is a no-op.
+                if self.park_sheet.is_some() {
+                    match key.as_ref() {
+                        Key::Named(key::Named::Escape) => return self.update(Event::ParkCancel),
+                        Key::Named(key::Named::Enter) => return self.update(Event::ParkSubmit),
+                        _ => {}
+                    }
+                }
+
+                // Parked list: Escape closes
+                if self.parked_list_open && matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
+                    return self.update(Event::ParkedListToggle);
                 }
 
                 // Inline workspace rename: Escape cancels
@@ -23303,6 +23670,7 @@ fi
                 self.chat_index_loading = false;
                 self.chat_index_loaded_at = Some(Instant::now());
                 self.sync_task_sessions_from_chat_index();
+                self.refill_park_note();
                 // Workspace overviews read the index (TRU-167).
                 let dirs: Vec<OverviewKey> = self.workspace_overviews.keys().cloned().collect();
                 for dir in &dirs {
@@ -23728,6 +24096,7 @@ fi
                     Ok(entries) => {
                         state.entries = entries;
                         state.error = None;
+                        self.refill_park_note();
                         // "Resume as Chat" needs the agent's capabilities;
                         // a remote whose workspace was never opened has not
                         // been handshaken yet (no-op when it has). Which of
@@ -24624,66 +24993,35 @@ fi
                 }
             }
             Event::WorkspaceClose(idx) => {
-                self.dismiss_viewer_surface();
-                if idx < self.workspaces.len() && self.workspaces.len() > 1 {
-                    // Stash the workspace config (env, color, etc.) before removing,
-                    // so it's preserved in workspaces.json for reopening later.
-                    let ws = &self.workspaces[idx];
-                    let remote_session = self
-                        .remote_session_for_workspace(ws)
-                        .map(remote_session_config_from_definition);
-                    self.closed_workspace_configs.push(WorkspaceConfig {
-                        name: ws.name.clone(),
-                        abbrev: ws.abbrev.clone(),
-                        dir: ws.dir.to_string_lossy().to_string(),
-                        color: ws.color,
-                        location: workspace_location_config_from_location(&ws.location),
-                        active_tab: None,
-                        tabs: Vec::new(), // Don't preserve tabs for closed workspaces
-                        run_command: ws.console.run_command.clone(),
-                        bottom_terminals: Vec::new(),
-                        env: ws.env.clone(),
-                        remote_session,
-                        active: false,
-                        chats: ws.chats.clone(),
-                    });
-                    // Its tabs are discarded, so its remote chats stop too.
-                    let tab_ids: Vec<usize> =
-                        self.workspaces[idx].tabs.iter().map(|tab| tab.id).collect();
-                    for tab_id in tab_ids {
-                        self.stop_remote_chat_for_closing_tab(tab_id);
-                    }
-                    // Kill console process before removing workspace
-                    self.workspaces[idx].console.kill_process();
-                    self.workspaces.remove(idx);
-                    if self.active_workspace_idx >= self.workspaces.len() {
-                        self.active_workspace_idx = self.workspaces.len() - 1;
-                    }
-                    self.sync_visible_terminals();
-                    self.mark_workspaces_dirty();
-                    self.mark_log_server_dirty();
-                    self.sync_plans_dir();
-
-                    // Snap slide to new active workspace (no animation)
-                    let viewport_width = self.content_viewport_width();
-                    let new_target = self.active_workspace_idx as f32 * viewport_width;
-                    self.slide_offset = new_target;
-                    self.slide_target = new_target;
-                    self.slide_animating = false;
-                    self.slide_start_time = None;
-
-                    let scroll_task = iced::advanced::widget::operate(
-                        iced::advanced::widget::operation::scrollable::scroll_to(
-                            workspace_scrollable_id(),
-                            scrollable::AbsoluteOffset {
-                                x: Some(new_target),
-                                y: None,
-                            },
-                        ),
-                    );
-                    let remote_agent_task = self.ensure_active_remote_agent_connection(false);
-                    return Task::batch([scroll_task, remote_agent_task]);
+                return self.open_park_sheet(idx);
+            }
+            Event::ParkNoteChanged(note) => {
+                if let Some(sheet) = self.park_sheet.as_mut() {
+                    sheet.note = note;
                 }
+            }
+            Event::ParkSubmit => {
+                let Some(sheet) = self.park_sheet.take() else {
+                    return Task::none();
+                };
+                return self.park_workspace(sheet.uid, &sheet.note);
+            }
+            Event::ParkCancel => {
+                self.park_sheet = None;
+                return Task::batch([self.apply_webview_surfaces(), self.focus_main_terminal()]);
+            }
+            Event::ParkedListToggle => {
+                self.parked_list_open = !self.parked_list_open;
+                if self.parked_list_open {
+                    self.machine_menu = None;
+                }
+                return self.apply_webview_surfaces();
+            }
+            Event::ParkedResume(key) => {
+                return self.resume_parked_workspace(&key);
+            }
+            Event::ParkedDone(key) => {
+                self.mark_parked_done(&key);
             }
             Event::WorkspaceCreate => {
                 // The picker's machine selector (with its "connect a
@@ -25389,6 +25727,8 @@ fi
             || self.phone_panel.is_some()
             || self.remote_connect_form.is_some()
             || self.new_work_form.is_some()
+            || self.park_sheet.is_some()
+            || self.parked_list_open
     }
 
     fn visible_webview_surface(&self) -> VisibleSurface {
@@ -26402,6 +26742,20 @@ fi
             Stack::new()
                 .push(main_view)
                 .push(self.view_new_work_modal())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.park_sheet.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_park_sheet())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.parked_list_open {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_parked_list())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -27854,6 +28208,202 @@ fi
             ..Default::default()
         })
         .into()
+    }
+
+    /// A centred card over a dimmed backdrop, as the other sheets draw.
+    fn view_sheet_card<'a>(
+        &self,
+        card: Column<'a, Event, Theme, iced::Renderer>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let bg_surface = theme.bg_surface();
+        let border_color = theme.border();
+        let backdrop_color = iced::Color {
+            a: 0.8,
+            ..theme.bg_crust()
+        };
+        let card = container(card)
+            .padding([20, 24])
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop_color.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    /// × on a workspace (TRU-171): a note, prefilled from its most recent
+    /// chat, and Park. Parking stops the workspace's processes; a chat
+    /// mid-turn is named, not blocking.
+    fn view_park_sheet(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let Some(sheet) = &self.park_sheet else {
+            return iced::widget::Space::new().into();
+        };
+        let Some(ws) = self.workspaces.iter().find(|ws| ws.uid == sheet.uid) else {
+            return iced::widget::Space::new().into();
+        };
+        let mut card = Column::new()
+            .spacing(10)
+            .width(Length::Fixed(440.0))
+            .push(
+                text(format!("Park {}", ws.name))
+                    .size(font)
+                    .color(theme.text_primary()),
+            )
+            .push(
+                text("It leaves the bar and keeps its tabs. Its terminals and chats stop; Resume from ⏸ parked brings them back.")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            )
+            .push(
+                text_input("Where you left off", &sheet.note)
+                    .id(park_note_input_id())
+                    .on_input(Event::ParkNoteChanged)
+                    .on_submit(Event::ParkSubmit)
+                    .size(font_small)
+                    .padding([6, 8]),
+            );
+        if Self::workspace_chat_working(ws) {
+            card = card.push(
+                text("● a chat is still working; parking stops it")
+                    .size(font_small)
+                    .color(theme.warning()),
+            );
+        }
+        card = card.push(
+            row![
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("Cancel").size(font_small))
+                    .style(button::text)
+                    .padding([6, 12])
+                    .on_press(Event::ParkCancel),
+                button(text("Park").size(font_small))
+                    .style(button::primary)
+                    .padding([6, 12])
+                    .on_press(Event::ParkSubmit),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        );
+        self.view_sheet_card(card)
+    }
+
+    /// The Parked list (TRU-171): each parked workspace's name, note, age
+    /// and owned chats, most recently parked first, with Resume and Done.
+    fn view_parked_list(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let order = parked_order(&self.closed_workspace_configs);
+        let mut rows = Column::new().spacing(8);
+        if order.is_empty() {
+            rows = rows.push(
+                text("Nothing parked.")
+                    .size(font_small)
+                    .color(theme.text_muted()),
+            );
+        }
+        for idx in order {
+            let cfg = &self.closed_workspace_configs[idx];
+            let key = ParkedKey::of(cfg);
+            let age = cfg
+                .parked
+                .as_ref()
+                .and_then(|parked| overview::parse_stamp(&parked.parked_at))
+                .map(overview::age_label);
+            let note = cfg
+                .parked
+                .as_ref()
+                .map(|parked| parked.note.as_str())
+                .filter(|note| !note.is_empty());
+            let owned = match cfg.chats.len() {
+                0 => "folder".to_string(),
+                1 => "1 chat".to_string(),
+                n => format!("{n} chats"),
+            };
+            let mut head = Row::new()
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .push(
+                    text(cfg.name.clone())
+                        .size(font_small)
+                        .color(cfg.color.color(theme))
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .push(text(owned).size(font_small - 1.0).color(theme.text_muted()));
+            if let Some(age) = age {
+                head = head.push(text(age).size(font_small - 1.0).color(theme.text_muted()));
+            }
+            let note_line = match note {
+                Some(note) => text(note.to_string())
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+                None => text("No note").size(font_small).color(theme.text_muted()),
+            };
+            let row_content = row![
+                column![head, note_line].spacing(2).width(Length::Fill),
+                button(text("Resume").size(font_small))
+                    .style(button::primary)
+                    .padding([4, 10])
+                    .on_press(Event::ParkedResume(key.clone())),
+                button(text("Done").size(font_small))
+                    .style(button::text)
+                    .padding([4, 10])
+                    .on_press(Event::ParkedDone(key)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+            let row_bg = theme.bg_base();
+            rows = rows.push(container(row_content).padding([6, 8]).style(move |_| {
+                container::Style {
+                    background: Some(row_bg.into()),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            }));
+        }
+        let card = Column::new()
+            .spacing(10)
+            .width(Length::Fixed(520.0))
+            .push(text("Parked").size(font).color(theme.text_primary()))
+            .push(
+                text("Resume brings a workspace back with its tabs. Done takes it off this list; its chats stay in Chats.")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            )
+            .push(container(scrollable(rows)).max_height(420.0))
+            .push(
+                row![
+                    iced::widget::Space::new().width(Length::Fill),
+                    button(text("Close").size(font_small))
+                        .style(button::text)
+                        .padding([6, 12])
+                        .on_press(Event::ParkedListToggle),
+                ]
+                .align_y(iced::Alignment::Center),
+            );
+        self.view_sheet_card(card)
     }
 
     fn view_workspace_settings_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -29310,15 +29860,44 @@ fi
                 ..Default::default()
             });
 
-        let bar_inner = row![
-            scrollable_bar,
-            control_separator,
-            container(browser_controls).padding([0, 6]),
-            help_btn
-        ]
-        .spacing(0)
-        .align_y(iced::Alignment::Center)
-        .width(Length::Fill);
+        // `⏸ n parked` opens the Parked list (TRU-171); hidden at none.
+        let parked_count = self
+            .closed_workspace_configs
+            .iter()
+            .filter(|cfg| cfg.is_parked())
+            .count();
+        let parked_btn = (parked_count > 0).then(|| {
+            let parked_color = theme.text_muted();
+            let parked_hover = theme.text_secondary();
+            button(
+                text(format!("\u{23F8} {parked_count} parked"))
+                    .size(11)
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .style(move |_theme, status| button::Style {
+                background: Some(iced::Color::TRANSPARENT.into()),
+                text_color: if matches!(status, button::Status::Hovered) {
+                    parked_hover
+                } else {
+                    parked_color
+                },
+                ..Default::default()
+            })
+            .padding([6, 10])
+            .on_press(Event::ParkedListToggle)
+        });
+
+        let mut bar_inner = row![scrollable_bar];
+        if let Some(parked_btn) = parked_btn {
+            bar_inner = bar_inner.push(parked_btn);
+        }
+        let bar_inner = bar_inner
+            .push(control_separator)
+            .push(container(browser_controls).padding([0, 6]))
+            .push(help_btn)
+            .spacing(0)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill);
 
         let bar_container =
             container(bar_inner)
@@ -43858,6 +44437,104 @@ mod tests {
         assert_eq!(
             session_tab_label(None, "a-very-long-terminal-title", false, false),
             "a-very-long-termina…"
+        );
+    }
+
+    /// A root chat `id` titled `title`, last touched `secs` after the epoch.
+    fn note_chat(id: &str, title: &str, latest: Option<&str>, secs: u64) -> chats::ChatIndexEntry {
+        chats::ChatIndexEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+            latest: latest.map(str::to_string),
+            mtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            ..chat_entry(chats::ChatBackend::Claude, false)
+        }
+    }
+
+    #[test]
+    fn park_note_prefill_reads_the_most_recent_root_chats_latest_line() {
+        let older = note_chat(
+            "a",
+            "Set up acme billing",
+            Some("Add the PRJ-101 test"),
+            100,
+        );
+        let newer = note_chat("b", "Fix acme login", Some("Ship the redirect fix"), 200);
+        assert_eq!(
+            park_note_prefill(&[&older, &newer]),
+            "Ship the redirect fix"
+        );
+
+        // No latest line: the title.
+        let titled = note_chat("c", "Fix acme login", None, 300);
+        assert_eq!(park_note_prefill(&[&older, &titled]), "Fix acme login");
+
+        // A newer child folds under its coordinator and never supplies it.
+        let mut child = note_chat("d", "Worker: run the tests", None, 400);
+        child.root_id = Some("b".to_string());
+        assert_eq!(
+            park_note_prefill(&[&newer, &child]),
+            "Ship the redirect fix"
+        );
+
+        // No chats: an empty note.
+        assert_eq!(park_note_prefill(&[]), "");
+    }
+
+    fn closed_config(name: &str, parked_at: Option<&str>) -> WorkspaceConfig {
+        WorkspaceConfig {
+            name: name.to_string(),
+            abbrev: "AC".to_string(),
+            dir: format!("/tmp/{name}"),
+            color: WorkspaceColor::Blue,
+            location: None,
+            remote_session: None,
+            active_tab: None,
+            tabs: Vec::new(),
+            run_command: None,
+            bottom_terminals: Vec::new(),
+            env: HashMap::new(),
+            active: false,
+            chats: Vec::new(),
+            parked: parked_at.map(|at| ParkedInfo {
+                note: String::new(),
+                parked_at: at.to_string(),
+            }),
+            done_at: None,
+        }
+    }
+
+    #[test]
+    fn parked_order_puts_the_most_recently_parked_first() {
+        let mut open = closed_config("acme-open", None);
+        open.active = true;
+        let mut done = closed_config("acme-done", Some("2026-10-31T12:00:00+00:00"));
+        done.done_at = Some("2026-10-31T13:00:00+00:00".to_string());
+        let configs = vec![
+            closed_config("acme-old-close", None),
+            closed_config("acme-monday", Some("2026-10-26T09:00:00+00:00")),
+            open,
+            closed_config("acme-friday", Some("2026-10-30T17:00:00+00:00")),
+            done,
+            closed_config("acme-legacy", None),
+            // A different offset that is still the latest instant.
+            closed_config("acme-sydney", Some("2026-10-31T09:00:00+10:00")),
+        ];
+        let names: Vec<&str> = parked_order(&configs)
+            .into_iter()
+            .map(|idx| configs[idx].name.as_str())
+            .collect();
+        // Open and done entries are off the list; closes from before
+        // parking existed follow in file order.
+        assert_eq!(
+            names,
+            [
+                "acme-sydney",
+                "acme-friday",
+                "acme-monday",
+                "acme-old-close",
+                "acme-legacy"
+            ]
         );
     }
 }
