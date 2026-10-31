@@ -3,16 +3,21 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub const APP_NAME: &str = "GitTerm V5";
-pub const WINDOW_TITLE: &str = "GitTerm V5 Development";
-pub const CONFIG_DIR_NAME: &str = "gitterm-v5";
-pub const CONFIG_DIR_ENV: &str = "GITTERM_V5_CONFIG_DIR";
-pub const INSTANCE_ID_ENV: &str = "GITTERM_V5_INSTANCE_ID";
+pub const APP_NAME: &str = "GitTerm V6";
+pub const WINDOW_TITLE: &str = "GitTerm V6 Development";
+pub const CONFIG_DIR_NAME: &str = "gitterm-v6";
+pub const CONFIG_DIR_ENV: &str = "GITTERM_V6_CONFIG_DIR";
+pub const INSTANCE_ID_ENV: &str = "GITTERM_V6_INSTANCE_ID";
+
+/// The V5 runtime's config dir and its override variable. V6 only reads
+/// them, once, to import V5 state on first launch (see `config_import`).
+pub const V5_CONFIG_DIR_NAME: &str = "gitterm-v5";
+pub const V5_CONFIG_DIR_ENV: &str = "GITTERM_V5_CONFIG_DIR";
 
 // Global instance ID for this process
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
-// Config directory override, read once from GITTERM_V5_CONFIG_DIR
+// Config directory override, read once from GITTERM_V6_CONFIG_DIR
 static CONFIG_DIR_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Get or generate the unique instance ID for this GitTerm process
@@ -23,9 +28,9 @@ pub fn instance_id() -> &'static str {
     })
 }
 
-/// The config directory override from GITTERM_V5_CONFIG_DIR, if set.
+/// The config directory override from GITTERM_V6_CONFIG_DIR, if set.
 /// Dev/test instances set this so they can never read or write the
-/// real ~/.config/gitterm-v5/* state of a running V5 instance.
+/// real ~/.config/gitterm-v6/* state of a running V6 instance.
 pub fn config_dir_override() -> Option<&'static PathBuf> {
     CONFIG_DIR_OVERRIDE
         .get_or_init(|| resolve_config_dir_override(std::env::var_os(CONFIG_DIR_ENV)))
@@ -33,15 +38,21 @@ pub fn config_dir_override() -> Option<&'static PathBuf> {
 }
 
 fn resolve_config_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    resolve_dir_override(CONFIG_DIR_ENV, raw)
+}
+
+/// Validate a config-dir override read from `env_name`: absolute and
+/// non-empty, otherwise ignored with a log line.
+pub fn resolve_dir_override(env_name: &str, raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let raw = raw?;
     if raw.is_empty() {
-        eprintln!("{CONFIG_DIR_ENV} is set but empty; ignoring override");
+        eprintln!("{env_name} is set but empty; ignoring override");
         return None;
     }
     let path = PathBuf::from(raw);
     if path.is_relative() {
         eprintln!(
-            "{CONFIG_DIR_ENV} is relative ({}); ignoring override",
+            "{env_name} is relative ({}); ignoring override",
             path.display()
         );
         return None;
@@ -147,27 +158,28 @@ mod tests {
     fn default_config_dir_is_isolated_from_earlier_versions() {
         let home = PathBuf::from("/test-home");
         let path = default_config_dir(&home);
-        assert_eq!(path, PathBuf::from("/test-home/.config/gitterm-v5"));
+        assert_eq!(path, PathBuf::from("/test-home/.config/gitterm-v6"));
+        assert_ne!(path, PathBuf::from("/test-home/.config/gitterm-v5"));
         assert_ne!(path, PathBuf::from("/test-home/.config/gitterm-v4"));
         assert_ne!(path, PathBuf::from("/test-home/.config/gitterm"));
     }
 
     #[test]
-    fn runtime_identity_environment_is_v5_only() {
-        assert_eq!(APP_NAME, "GitTerm V5");
-        assert_eq!(WINDOW_TITLE, "GitTerm V5 Development");
-        assert_eq!(CONFIG_DIR_ENV, "GITTERM_V5_CONFIG_DIR");
-        assert_eq!(INSTANCE_ID_ENV, "GITTERM_V5_INSTANCE_ID");
-        assert_ne!(CONFIG_DIR_ENV, "GITTERM_V4_CONFIG_DIR");
-        assert_ne!(INSTANCE_ID_ENV, "GITTERM_V4_INSTANCE_ID");
+    fn runtime_identity_environment_is_v6_only() {
+        assert_eq!(APP_NAME, "GitTerm V6");
+        assert_eq!(WINDOW_TITLE, "GitTerm V6 Development");
+        assert_eq!(CONFIG_DIR_ENV, "GITTERM_V6_CONFIG_DIR");
+        assert_eq!(INSTANCE_ID_ENV, "GITTERM_V6_INSTANCE_ID");
+        assert_ne!(CONFIG_DIR_ENV, V5_CONFIG_DIR_ENV);
+        assert_ne!(INSTANCE_ID_ENV, "GITTERM_V5_INSTANCE_ID");
     }
 
     #[test]
-    fn task_worktree_root_defaults_beneath_the_v5_config_root() {
-        let root = PathBuf::from("/test-home/.config/gitterm-v5");
+    fn task_worktree_root_defaults_beneath_the_v6_config_root() {
+        let root = PathBuf::from("/test-home/.config/gitterm-v6");
         assert_eq!(
             task_worktree_root_for_config_root(&root),
-            PathBuf::from("/test-home/.config/gitterm-v5/worktrees")
+            PathBuf::from("/test-home/.config/gitterm-v6/worktrees")
         );
 
         let mut serialized = serde_json::to_value(Config::default()).unwrap();

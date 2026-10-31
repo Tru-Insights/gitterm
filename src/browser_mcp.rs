@@ -41,9 +41,9 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub const BROWSER_MCP_TOKEN_ENV: &str = "GITTERM_V5_BROWSER_MCP_TOKEN";
-pub const BROWSER_MCP_URL_ENV: &str = "GITTERM_V5_BROWSER_MCP_URL";
-const BROWSER_MCP_BASE_PORT: u16 = 24_030;
+pub const BROWSER_MCP_TOKEN_ENV: &str = "GITTERM_V6_BROWSER_MCP_TOKEN";
+pub const BROWSER_MCP_URL_ENV: &str = "GITTERM_V6_BROWSER_MCP_URL";
+const BROWSER_MCP_BASE_PORT: u16 = 34_030;
 const BROWSER_MCP_PORTS_PER_INSTANCE: u16 = 10;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 60_000;
@@ -254,20 +254,20 @@ pub struct BrowserMcpServer {
     browser: BrowserControlService,
 }
 
-/// Reserve an endpoint from the V5-only loopback range synchronously so
+/// Reserve an endpoint from the V6-only loopback range synchronously so
 /// terminal environments can be constructed before Iced starts polling
 /// asynchronous startup tasks.
 pub fn prepare(
-    v5_global_config_dir: impl AsRef<Path>,
+    v6_global_config_dir: impl AsRef<Path>,
     instance_id: &str,
 ) -> std::io::Result<(BrowserMcpConnection, BrowserMcpServer)> {
-    let listener = bind_v5_loopback_listener(instance_id)?;
+    let listener = bind_v6_loopback_listener(instance_id)?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let endpoint = format!("http://127.0.0.1:{port}/mcp");
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let cancellation = CancellationToken::new();
-    let browser = BrowserControlService::new(v5_global_config_dir);
+    let browser = BrowserControlService::new(v6_global_config_dir);
     Ok((
         BrowserMcpConnection {
             endpoint,
@@ -290,7 +290,7 @@ fn browser_mcp_port_range(instance_id: &str) -> std::ops::Range<u16> {
     start..(start + BROWSER_MCP_PORTS_PER_INSTANCE)
 }
 
-fn bind_v5_loopback_listener(instance_id: &str) -> io::Result<std::net::TcpListener> {
+fn bind_v6_loopback_listener(instance_id: &str) -> io::Result<std::net::TcpListener> {
     let mut last_error = None;
     for port in browser_mcp_port_range(instance_id) {
         match std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)) {
@@ -301,7 +301,7 @@ fn bind_v5_loopback_listener(instance_id: &str) -> io::Result<std::net::TcpListe
     Err(last_error.unwrap_or_else(|| {
         io::Error::new(
             io::ErrorKind::AddrNotAvailable,
-            "GitTerm V5 browser MCP port range is empty",
+            "GitTerm V6 browser MCP port range is empty",
         )
     }))
 }
@@ -309,7 +309,7 @@ fn bind_v5_loopback_listener(instance_id: &str) -> io::Result<std::net::TcpListe
 impl BrowserMcpServer {
     pub async fn run(self) -> Result<(), String> {
         let listener = tokio::net::TcpListener::from_std(self.listener).map_err(|error| {
-            format!("failed to activate the GitTerm V5 browser MCP listener: {error}")
+            format!("failed to activate the GitTerm V6 browser MCP listener: {error}")
         })?;
         let tools = BrowserMcpTools::new(self.browser);
         let mcp_service: StreamableHttpService<BrowserMcpTools, LocalSessionManager> =
@@ -328,7 +328,7 @@ impl BrowserMcpServer {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await
-            .map_err(|error| format!("GitTerm V5 browser MCP server stopped: {error}"))
+            .map_err(|error| format!("GitTerm V6 browser MCP server stopped: {error}"))
     }
 }
 
@@ -518,7 +518,7 @@ impl BrowserMcpTools {
     }
 
     #[tool(
-        description = "Open the visible Chrome instance using GitTerm V5's isolated browser profile.",
+        description = "Open the visible Chrome instance using GitTerm V6's isolated browser profile.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -987,11 +987,11 @@ impl ServerHandler for BrowserMcpTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                "gitterm-v5-browser",
+                "gitterm-v6-browser",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V5. Call browser_open before page operations. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Use browser_dom_outline for bounded page structure, then browser_node_inspect with its document-scoped node_ref for layout and computed styles; node references become stale after navigation. Prefer semantic role or text locators; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
+                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V6. Call browser_open before page operations. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Use browser_dom_outline for bounded page structure, then browser_node_inspect with its document-scoped node_ref for layout and computed styles; node references become stale after navigation. Prefer semantic role or text locators; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
             )
     }
 }
@@ -1095,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_uses_v5_loopback_range_and_memory_only_token_environment() {
+    fn connection_uses_v6_loopback_range_and_memory_only_token_environment() {
         let temp = tempdir().unwrap();
         let (connection, _server) = prepare(temp.path(), "connection-test").unwrap();
         assert!(connection.endpoint().starts_with("http://127.0.0.1:"));
@@ -1106,8 +1106,8 @@ mod tests {
             .trim_end_matches("/mcp")
             .parse::<u16>()
             .unwrap();
-        assert!((BROWSER_MCP_BASE_PORT..25_030).contains(&port));
-        assert!(!(13_030..14_030).contains(&port));
+        assert!((BROWSER_MCP_BASE_PORT..35_030).contains(&port));
+        assert!(!(24_030..25_030).contains(&port));
         let environment = connection.terminal_environment();
         assert_eq!(environment[0].0, BROWSER_MCP_URL_ENV);
         assert_eq!(environment[0].1, connection.endpoint());
@@ -1213,7 +1213,7 @@ mod tests {
             "{configured}"
         );
         assert!(configured.contains("\"url\":\"http://127.0.0.1:45678/mcp\""));
-        assert!(configured.contains("\"Authorization\":\"Bearer ${GITTERM_V5_BROWSER_MCP_TOKEN}\""));
+        assert!(configured.contains("\"Authorization\":\"Bearer ${GITTERM_V6_BROWSER_MCP_TOKEN}\""));
         assert!(configured.contains("--allowedTools=mcp__gitterm_browser__browser_status,"));
         assert!(configured.contains("mcp__gitterm_browser__browser_node_inspect"));
         assert!(!configured.contains("mcp__gitterm_browser__browser_click"));
