@@ -1108,7 +1108,7 @@ impl BrowserMcpTools {
     }
 
     #[tool(
-        description = "Immediately disconnect and terminate the GitTerm-owned visible Chrome process.",
+        description = "Disconnect this chat from the GitTerm browser: close this chat's own page targets and drop their sessions. Chrome keeps running, and other chats' targets and the user's own tabs stay open; only the user can stop the browser, from GitTerm.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1121,7 +1121,7 @@ impl BrowserMcpTools {
             self.run_agent_operation(
                 BrowserOperation::Disconnect,
                 &parts,
-                |browser, _caller| async move { browser.disconnect().await },
+                |browser, caller| async move { browser.disconnect_owner(&caller).await },
             )
             .await,
         )
@@ -1323,6 +1323,49 @@ mod tests {
         let telemetry = browser.telemetry().await;
         assert!(telemetry.last_agent_operation.is_none());
         assert!(telemetry.active_agent_operation.is_none());
+    }
+
+    #[tokio::test]
+    async fn one_callers_disconnect_leaves_chrome_other_chats_and_the_users_tabs() {
+        let devtools = crate::browser_control::test_support::FakeDevTools::start(&[
+            "tab-a", "tab-b", "tab-user",
+        ])
+        .await;
+        let temp = tempdir().unwrap();
+        let browser = BrowserControlService::new(temp.path());
+        browser.attach_test_devtools(devtools.port).await;
+        browser
+            .insert_test_target("chat-a", "primary", "tab-a")
+            .await;
+        browser
+            .insert_test_target("chat-b", "primary", "tab-b")
+            .await;
+        let tools = BrowserMcpTools::new(browser);
+        let chat_a = || Extension(request_parts("/mcp?caller=chat-a"));
+        let chat_b = || Extension(request_parts("/mcp?caller=chat-b"));
+
+        let result = tools.browser_disconnect(chat_a()).await;
+        assert_eq!(result.is_error, Some(false));
+        let outcome = result.structured_content.unwrap();
+        assert_eq!(outcome["closed_targets"], serde_json::json!(["primary"]));
+        assert_eq!(outcome["browser_running"], true);
+        assert_eq!(
+            *devtools.calls.lock().unwrap(),
+            vec!["Target.closeTarget:tab-a".to_string()]
+        );
+        assert_eq!(
+            *devtools.pages.lock().unwrap(),
+            vec!["tab-b".to_string(), "tab-user".to_string()]
+        );
+
+        // chat-b still has its target; the user's tab is nobody's.
+        let listed = tools.browser_targets(chat_b()).await;
+        assert_eq!(listed.is_error, Some(false));
+        let listed = listed.structured_content.unwrap();
+        let listed = listed["result"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["targetId"], "tab-b");
+        assert_eq!(listed[0]["active"], true);
     }
 
     #[tokio::test]

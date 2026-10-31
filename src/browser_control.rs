@@ -126,6 +126,14 @@ pub struct BrowserTargetInfo {
     pub active: bool,
 }
 
+/// What an agent's disconnect did (TRU-176): the caller's targets it
+/// closed. Chrome itself is left running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowserOwnerDisconnect {
+    pub closed_targets: Vec<String>,
+    pub browser_running: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserOperation {
     Status,
@@ -172,7 +180,7 @@ impl BrowserOperation {
             Self::Network => "Inspecting network",
             Self::Dom => "Inspecting page structure",
             Self::Styles => "Inspecting node styles",
-            Self::Disconnect => "Disconnecting",
+            Self::Disconnect => "Closing chat's targets",
         }
     }
 
@@ -197,7 +205,7 @@ impl BrowserOperation {
             Self::Network => "Network inspected",
             Self::Dom => "Page structure inspected",
             Self::Styles => "Node styles inspected",
-            Self::Disconnect => "Browser disconnected",
+            Self::Disconnect => "Chat's targets closed",
         }
     }
 }
@@ -742,6 +750,14 @@ impl BrowserTargetRegistry {
 
     fn owns_any(&self, owner: &str) -> bool {
         self.targets.keys().any(|key| key.owner == owner)
+    }
+
+    fn owned_keys(&self, owner: &str) -> Vec<TargetKey> {
+        self.targets
+            .keys()
+            .filter(|key| key.owner == owner)
+            .cloned()
+            .collect()
     }
 
     fn is_managed(&self, target_id: &str) -> bool {
@@ -1642,6 +1658,61 @@ impl BrowserController {
         Ok(())
     }
 
+    /// An agent's disconnect (TRU-176): close the caller's own targets and
+    /// drop their sessions. Chrome keeps running, and other chats' targets
+    /// and the user's tabs are untouched; stopping the whole browser is the
+    /// user's action in GitTerm's UI (`disconnect`). With Chrome not
+    /// running there is nothing to close, and the targets are forgotten.
+    pub async fn disconnect_owner(&mut self, owner: &str) -> Result<BrowserOwnerDisconnect> {
+        self.registry.key(owner, None)?;
+        let browser_running = self.status_snapshot()?.state == BrowserState::Running;
+        let session = if browser_running {
+            let endpoint = self.running_endpoint()?;
+            let live_targets = list_page_targets(endpoint.port).await?;
+            self.registry.retain_live(&live_targets);
+            Some(self.browser_session().await?)
+        } else {
+            None
+        };
+        let mut keys = self.registry.owned_keys(owner);
+        keys.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut closed_targets = Vec::new();
+        let mut failures = Vec::new();
+        for key in keys {
+            let Some(managed) = self.registry.remove(&key) else {
+                continue;
+            };
+            let Some(session) = session.as_ref() else {
+                closed_targets.push(key.name);
+                continue;
+            };
+            match session
+                .command(
+                    "Target.closeTarget",
+                    json!({ "targetId": managed.target_id }),
+                )
+                .await
+            {
+                Ok(result) if result.get("success").and_then(Value::as_bool) == Some(true) => {
+                    closed_targets.push(key.name);
+                }
+                Ok(_) => failures.push(format!("'{}': Chrome did not close it", key.name)),
+                Err(error) => failures.push(format!("'{}': {error}", key.name)),
+            }
+        }
+        if failures.is_empty() {
+            Ok(BrowserOwnerDisconnect {
+                closed_targets,
+                browser_running,
+            })
+        } else {
+            Err(BrowserControlError::new(format!(
+                "disconnected this chat from the browser, but could not close its targets {}; they stay open as the user's tabs",
+                failures.join("; ")
+            )))
+        }
+    }
+
     /// Give up the targets of chats that closed (TRU-176). Their tabs stay
     /// open without the owner prefix and belong to the user from then on,
     /// like any tab GitTerm did not open for a chat.
@@ -2313,8 +2384,15 @@ impl BrowserControlService {
         self.controller.lock().await.set_owner_labels(labels).await
     }
 
+    /// Stop the whole browser: the user's action in GitTerm's UI only.
     pub async fn disconnect(&self) -> Result<()> {
         self.controller.lock().await.disconnect().await
+    }
+
+    /// An agent's disconnect: close the caller's own targets, leaving
+    /// Chrome, other chats' targets and the user's tabs alone.
+    pub async fn disconnect_owner(&self, owner: &str) -> Result<BrowserOwnerDisconnect> {
+        self.controller.lock().await.disconnect_owner(owner).await
     }
 
     /// Test seam: claim a page target for `owner` without Chrome.
@@ -2327,6 +2405,129 @@ impl BrowserControlService {
             ManagedBrowserTarget::unattached(target_id.to_string()),
         );
         controller.registry.mark_active(&key);
+    }
+
+    /// Test seam: treat a `test_support::FakeDevTools` as the running
+    /// browser.
+    #[cfg(test)]
+    pub(crate) async fn attach_test_devtools(&self, port: u16) {
+        self.controller.lock().await.endpoint = Some(DevToolsEndpoint {
+            port,
+            browser_websocket_path: "/devtools/browser/fake".to_string(),
+        });
+    }
+}
+
+/// A stand-in for Chrome's DevTools endpoint, for tests that must observe
+/// which CDP commands an operation sends without launching Chrome.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    pub(crate) struct FakeDevTools {
+        pub port: u16,
+        /// Page target ids Chrome would list; closing one removes it.
+        pub pages: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Every CDP method received, with its `targetId` when it has one.
+        pub calls: Arc<std::sync::Mutex<Vec<String>>>,
+        server: JoinHandle<()>,
+    }
+
+    impl Drop for FakeDevTools {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl FakeDevTools {
+        pub(crate) async fn start(pages: &[&str]) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let pages = Arc::new(std::sync::Mutex::new(
+                pages
+                    .iter()
+                    .map(|page| page.to_string())
+                    .collect::<Vec<_>>(),
+            ));
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (server_pages, server_calls) = (Arc::clone(&pages), Arc::clone(&calls));
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (pages, calls) = (Arc::clone(&server_pages), Arc::clone(&server_calls));
+                    tokio::spawn(serve(socket, port, pages, calls));
+                }
+            });
+            Self {
+                port,
+                pages,
+                calls,
+                server,
+            }
+        }
+    }
+
+    async fn serve(
+        mut socket: tokio::net::TcpStream,
+        port: u16,
+        pages: Arc<std::sync::Mutex<Vec<String>>>,
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let mut head = [0_u8; 16];
+        let Ok(read) = socket.peek(&mut head).await else {
+            return;
+        };
+        if head[..read].starts_with(b"GET /json/list") {
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let listed = pages
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "type": "page",
+                        "url": format!("https://example.com/{id}"),
+                        "title": id,
+                        "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/{id}"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let body = Value::Array(listed).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            return;
+        }
+        let Ok(mut websocket) = tokio_tungstenite::accept_async(socket).await else {
+            return;
+        };
+        while let Some(Ok(Message::Text(text))) = websocket.next().await {
+            let request: Value = serde_json::from_str(&text).unwrap();
+            let method = request["method"].as_str().unwrap_or_default().to_string();
+            let target_id = request["params"]["targetId"].as_str().map(str::to_string);
+            calls.lock().unwrap().push(match &target_id {
+                Some(target_id) => format!("{method}:{target_id}"),
+                None => method.clone(),
+            });
+            let result = match (method.as_str(), target_id) {
+                ("Target.closeTarget", Some(target_id)) => {
+                    pages.lock().unwrap().retain(|page| *page != target_id);
+                    json!({ "success": true })
+                }
+                _ => json!({}),
+            };
+            let reply = json!({ "id": request["id"], "result": result }).to_string();
+            if websocket.send(Message::Text(reply)).await.is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -4737,6 +4938,73 @@ mod tests {
         assert!(registry.infos("chat-a", &live).is_empty());
         // The other chat keeps its target.
         assert_eq!(registry.infos("chat-b", &live).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_agent_disconnect_closes_only_the_callers_targets() {
+        let devtools =
+            test_support::FakeDevTools::start(&["tab-a1", "tab-a2", "tab-b1", "tab-user"]).await;
+        let temp = tempdir().unwrap();
+        let mut controller = BrowserController::new(temp.path());
+        controller.endpoint = Some(DevToolsEndpoint {
+            port: devtools.port,
+            browser_websocket_path: "/devtools/browser/fake".to_string(),
+        });
+        controller.registry = registry_with(&[
+            ("chat-a", "primary", "tab-a1"),
+            ("chat-a", "design", "tab-a2"),
+            ("chat-b", "primary", "tab-b1"),
+        ]);
+
+        let outcome = controller.disconnect_owner("chat-a").await.unwrap();
+        assert_eq!(
+            outcome,
+            BrowserOwnerDisconnect {
+                closed_targets: vec!["design".to_string(), "primary".to_string()],
+                browser_running: true,
+            }
+        );
+        // Only chat-a's tabs were closed; Chrome was not asked to stop.
+        assert_eq!(
+            *devtools.calls.lock().unwrap(),
+            vec![
+                "Target.closeTarget:tab-a2".to_string(),
+                "Target.closeTarget:tab-a1".to_string()
+            ]
+        );
+        assert_eq!(
+            *devtools.pages.lock().unwrap(),
+            vec!["tab-b1".to_string(), "tab-user".to_string()]
+        );
+        assert_eq!(
+            controller.status_snapshot().unwrap().state,
+            BrowserState::Running
+        );
+        assert!(!controller.registry.owns_any("chat-a"));
+        let live = vec![live_page("tab-b1", "Other"), live_page("tab-user", "Mine")];
+        assert_eq!(controller.registry.infos("chat-b", &live).len(), 1);
+        assert!(!controller.registry.is_managed("tab-user"));
+
+        // A second disconnect has nothing left to close.
+        let again = controller.disconnect_owner("chat-a").await.unwrap();
+        assert!(again.closed_targets.is_empty());
+        assert_eq!(devtools.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_agent_disconnect_without_chrome_forgets_only_the_callers_targets() {
+        let temp = tempdir().unwrap();
+        let mut controller = BrowserController::new(temp.path());
+        controller.registry = registry_with(&[
+            ("chat-a", "design", "tab-1"),
+            ("chat-b", "primary", "tab-2"),
+        ]);
+        let outcome = controller.disconnect_owner("chat-a").await.unwrap();
+        assert_eq!(outcome.closed_targets, vec!["design".to_string()]);
+        assert!(!outcome.browser_running);
+        assert!(!controller.registry.owns_any("chat-a"));
+        assert!(controller.registry.owns_any("chat-b"));
+        assert!(controller.disconnect_owner("").await.is_err());
     }
 
     #[test]

@@ -5254,8 +5254,32 @@ pub enum BottomPanelTab {
     Terminal(usize), // index into bottom_terminals vec
 }
 
+/// The browser caller identity of a bottom-panel terminal (TRU-176). Its
+/// `id` is unique for the run; browser ownership never outlives the run, so
+/// no persisted identity is needed. Cannot collide with a tab's uuid.
+fn bottom_terminal_caller(id: usize) -> String {
+    format!("terminal-{id}")
+}
+
+/// What a bottom terminal's browser tabs show as their owner: the repo its
+/// directory is in (the nearest ancestor holding `.git`, else the directory
+/// itself), plus "terminal". Computed once, when the terminal is created.
+fn bottom_terminal_browser_label(cwd: &Path) -> String {
+    let root = cwd
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(cwd);
+    let repo = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    format!("{repo} terminal")
+}
+
 struct BottomTerminal {
     id: usize,
+    /// Owner label of this terminal's browser targets (TRU-176).
+    browser_label: String,
     terminal: Option<iced_term::Terminal>,
     title: Option<String>,
     cwd: PathBuf,
@@ -16224,10 +16248,13 @@ fi
             })
             .map(|cfg| cfg.env.into_iter().collect())
             .unwrap_or_default();
-        // Bottom-panel terminals are not tabs and have no caller identity;
-        // the browser tools refuse callers without one (TRU-176).
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        // Bottom-panel terminals are not tabs: the task tools see no caller,
+        // but the browser tools need one, so each terminal owns its browser
+        // targets under a per-run id (TRU-176).
         if let Some(connection) = &self.browser_mcp {
-            extra_env.extend(connection.terminal_environment(None));
+            extra_env.extend(connection.terminal_environment(Some(&bottom_terminal_caller(id))));
         }
         if let Some(connection) = &self.task_mcp {
             extra_env.extend(connection.terminal_environment(None));
@@ -16237,8 +16264,6 @@ fi
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
         let settings = Self::build_terminal_settings(
             &cwd,
             None,
@@ -16261,6 +16286,7 @@ fi
         };
         BottomTerminal {
             id,
+            browser_label: bottom_terminal_browser_label(&cwd),
             terminal,
             title: None,
             cwd,
@@ -17804,8 +17830,8 @@ fi
             .to_string()
     }
 
-    /// Keep the browser's target owners in step with the open tabs
-    /// (TRU-176). A tab that closed since the last sync releases its
+    /// Keep the browser's target owners in step with the open tabs and
+    /// bottom terminals (TRU-176). One that closed since the last sync releases its
     /// targets, which stay open as the user's; every open tab's label marks
     /// its targets' Chrome tab titles. Only uids seen open before are ever
     /// released, so a tab opened mid-sync cannot lose its targets.
@@ -17818,6 +17844,12 @@ fi
             .iter()
             .flat_map(|workspace| workspace.tabs.iter())
             .map(|tab| (tab.session_uid.clone(), self.browser_owner_label(tab)))
+            .chain(
+                self.workspaces
+                    .iter()
+                    .flat_map(|workspace| workspace.bottom_terminals.iter())
+                    .map(|bt| (bottom_terminal_caller(bt.id), bt.browser_label.clone())),
+            )
             .collect();
         if labels == self.browser_owner_labels {
             return Task::none();
@@ -26744,8 +26776,7 @@ fi
         let scrollback = self.scrollback_lines;
         let theme = self.theme;
         let font_size = self.terminal_font_size;
-        // Each tab's browser URL names that tab as its caller (TRU-176);
-        // bottom-panel terminals have none.
+        // Each terminal's browser URL names it as the caller (TRU-176).
         let browser_mcp = self.browser_mcp.as_ref();
         let browser_environment = |caller: Option<&str>| -> Vec<(String, String)> {
             browser_mcp
@@ -26757,11 +26788,6 @@ fi
                 })
                 .unwrap_or_default()
         };
-        let bottom_browser_environment = browser_environment(None);
-        let browser_environment_refs: Vec<(&str, &str)> = bottom_browser_environment
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
         let mut recreated_main = 0usize;
         let mut recreated_bottom = 0usize;
 
@@ -26795,13 +26821,19 @@ fi
         // Recreate bottom panel terminals
         for ws in self.workspaces.iter_mut() {
             for bt in ws.bottom_terminals.iter_mut() {
+                let bt_browser_environment =
+                    browser_environment(Some(&bottom_terminal_caller(bt.id)));
+                let bt_browser_environment_refs: Vec<(&str, &str)> = bt_browser_environment
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str()))
+                    .collect();
                 let settings = Self::build_terminal_settings(
                     &bt.cwd,
                     None,
                     scrollback,
                     &theme,
                     font_size,
-                    &browser_environment_refs,
+                    &bt_browser_environment_refs,
                 );
                 bt.terminal = match iced_term::Terminal::new(bt.id as u64, settings) {
                     Ok(mut t) => {
@@ -43499,6 +43531,22 @@ mod tests {
         assert_eq!(pair[0].target, "design");
         assert_eq!(pair[1].target, "implementation");
         assert!(pair.iter().all(|capture| capture.label == "settings"));
+    }
+
+    #[test]
+    fn bottom_terminals_own_browser_targets_under_a_run_id_and_repo_label() {
+        assert_eq!(bottom_terminal_caller(7), "terminal-7");
+        assert_ne!(bottom_terminal_caller(7), bottom_terminal_caller(8));
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("sample-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src/nested")).unwrap();
+        assert_eq!(
+            bottom_terminal_browser_label(&repo.join("src/nested")),
+            "sample-repo terminal"
+        );
+        let loose = temp.path().join("scratch");
+        assert_eq!(bottom_terminal_browser_label(&loose), "scratch terminal");
     }
 
     #[test]
