@@ -64,7 +64,7 @@ pub const ERR_AUTH_REQUIRED: i64 = -32000;
 const ERR_METHOD_NOT_FOUND: i64 = -32601;
 /// Set to a directory to log every ACP stdin/stdout frame there (MCP
 /// header values are redacted).
-pub const ACP_WIRE_LOG_ENV: &str = "GITTERM_ACP_WIRE_LOG_DIR";
+pub const ACP_WIRE_LOG_ENV: &str = "GITTERM_V6_ACP_WIRE_LOG_DIR";
 
 fn acp_log(msg: &str) {
     eprintln!("[acp] {msg}");

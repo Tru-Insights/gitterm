@@ -40,12 +40,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub const TASK_MCP_TOKEN_ENV: &str = "GITTERM_V5_TASK_MCP_TOKEN";
-pub const TASK_MCP_URL_ENV: &str = "GITTERM_V5_TASK_MCP_URL";
+pub const TASK_MCP_TOKEN_ENV: &str = "GITTERM_V6_TASK_MCP_TOKEN";
+pub const TASK_MCP_URL_ENV: &str = "GITTERM_V6_TASK_MCP_URL";
 /// Query parameter on a tab's task MCP URL naming the calling tab's durable
 /// `session_uid`. The bearer token authenticates; this only attributes.
 pub const TASK_MCP_CALLER_QUERY: &str = "caller";
-const TASK_MCP_BASE_PORT: u16 = 25_030;
+const TASK_MCP_BASE_PORT: u16 = 35_030;
 const TASK_MCP_PORTS_PER_INSTANCE: u16 = 10;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -414,7 +414,7 @@ pub fn prepare(
     instance_id: &str,
     commands: TaskControlSender,
 ) -> io::Result<(TaskMcpConnection, TaskMcpServer)> {
-    let listener = bind_v5_loopback_listener(instance_id)?;
+    let listener = bind_v6_loopback_listener(instance_id)?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let endpoint = format!("http://127.0.0.1:{port}/mcp");
@@ -424,7 +424,7 @@ pub fn prepare(
     // only in memory.
     let token = match std::env::var(TASK_MCP_TOKEN_ENV) {
         Ok(value) if !value.is_empty() => {
-            eprintln!("GitTerm V5 task MCP is using the operator-supplied token from {TASK_MCP_TOKEN_ENV}");
+            eprintln!("GitTerm V6 task MCP is using the operator-supplied token from {TASK_MCP_TOKEN_ENV}");
             value
         }
         _ => format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
@@ -451,7 +451,7 @@ fn task_mcp_port_range(instance_id: &str) -> std::ops::Range<u16> {
     start..(start + TASK_MCP_PORTS_PER_INSTANCE)
 }
 
-fn bind_v5_loopback_listener(instance_id: &str) -> io::Result<std::net::TcpListener> {
+fn bind_v6_loopback_listener(instance_id: &str) -> io::Result<std::net::TcpListener> {
     let mut last_error = None;
     for port in task_mcp_port_range(instance_id) {
         match std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)) {
@@ -462,7 +462,7 @@ fn bind_v5_loopback_listener(instance_id: &str) -> io::Result<std::net::TcpListe
     Err(last_error.unwrap_or_else(|| {
         io::Error::new(
             io::ErrorKind::AddrNotAvailable,
-            "GitTerm V5 task MCP port range is empty",
+            "GitTerm V6 task MCP port range is empty",
         )
     }))
 }
@@ -470,7 +470,7 @@ fn bind_v5_loopback_listener(instance_id: &str) -> io::Result<std::net::TcpListe
 impl TaskMcpServer {
     pub async fn run(self) -> Result<(), String> {
         let listener = tokio::net::TcpListener::from_std(self.listener).map_err(|error| {
-            format!("failed to activate the GitTerm V5 task MCP listener: {error}")
+            format!("failed to activate the GitTerm V6 task MCP listener: {error}")
         })?;
         let notify_state = NotifyState {
             commands: self.commands.clone(),
@@ -494,7 +494,7 @@ impl TaskMcpServer {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await
-            .map_err(|error| format!("GitTerm V5 task MCP server stopped: {error}"))
+            .map_err(|error| format!("GitTerm V6 task MCP server stopped: {error}"))
     }
 }
 
@@ -948,7 +948,7 @@ impl ServerHandler for TaskMcpTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                "gitterm-v5-tasks",
+                "gitterm-v6-tasks",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
@@ -1145,7 +1145,7 @@ mod tests {
     };
 
     #[test]
-    fn connection_uses_v5_task_range_and_memory_only_token_environment() {
+    fn connection_uses_v6_task_range_and_memory_only_token_environment() {
         let (commands, _requests) = mpsc::unbounded_channel();
         let (connection, _server) = prepare("connection-test", commands).unwrap();
         let port = connection
@@ -1154,8 +1154,8 @@ mod tests {
             .trim_end_matches("/mcp")
             .parse::<u16>()
             .unwrap();
-        assert!((TASK_MCP_BASE_PORT..26_030).contains(&port));
-        assert!(!(14_030..15_030).contains(&port));
+        assert!((TASK_MCP_BASE_PORT..36_030).contains(&port));
+        assert!(!(25_030..26_030).contains(&port));
         let environment = connection.terminal_environment(None);
         assert_eq!(environment[0].0, TASK_MCP_URL_ENV);
         assert_eq!(environment[0].1, connection.endpoint());
@@ -1239,7 +1239,7 @@ mod tests {
 
     #[test]
     fn claude_injection_uses_single_value_mcp_config_and_keeps_the_token_out_of_the_command() {
-        let endpoint = "http://127.0.0.1:25031/mcp";
+        let endpoint = "http://127.0.0.1:35031/mcp";
         let configured =
             configure_claude_command("claude --resume abc \"$(cat '/b.md')\"", endpoint);
         assert!(
@@ -1252,8 +1252,8 @@ mod tests {
             "{configured}"
         );
         assert!(!configured.contains("--mcp-config '"));
-        assert!(configured.contains("\"url\":\"http://127.0.0.1:25031/mcp\""));
-        assert!(configured.contains("\"Authorization\":\"Bearer ${GITTERM_V5_TASK_MCP_TOKEN}\""));
+        assert!(configured.contains("\"url\":\"http://127.0.0.1:35031/mcp\""));
+        assert!(configured.contains("\"Authorization\":\"Bearer ${GITTERM_V6_TASK_MCP_TOKEN}\""));
         assert!(!configured.contains("secret"));
         assert_eq!(configure_claude_command(&configured, endpoint), configured);
         assert_eq!(configure_claude_command("codex", endpoint), "codex");
@@ -1341,7 +1341,7 @@ mod tests {
 
     #[test]
     fn task_command_configuration_dispatches_on_the_executable() {
-        let endpoint = "http://127.0.0.1:25031/mcp";
+        let endpoint = "http://127.0.0.1:35031/mcp";
         assert_eq!(
             configure_task_command("codex resume --last", endpoint),
             configure_codex_command("codex resume --last", endpoint)
@@ -1361,7 +1361,7 @@ mod tests {
     fn codex_notify_injection_targets_codex_and_keeps_the_token_out_of_the_command() {
         let configured = configure_codex_notify(
             "codex resume abc123",
-            "http://127.0.0.1:25030/notify",
+            "http://127.0.0.1:35030/notify",
             "task-1",
             "session-1",
         );
@@ -1375,7 +1375,7 @@ mod tests {
         // keeps the TOML override as one shell word.
         assert_eq!(configured.matches('\'').count(), 2);
         assert_eq!(
-            configure_codex_notify(&configured, "http://127.0.0.1:25030/notify", "t", "s"),
+            configure_codex_notify(&configured, "http://127.0.0.1:35030/notify", "t", "s"),
             configured
         );
         assert_eq!(
@@ -1384,7 +1384,7 @@ mod tests {
         );
         assert!(configure_codex_notify(
             "/opt/homebrew/bin/codex --model gpt-5",
-            "http://127.0.0.1:25030/notify",
+            "http://127.0.0.1:35030/notify",
             "t",
             "s"
         )
@@ -1757,7 +1757,7 @@ mod tests {
             &client
                 .call_tool(call(
                     "review_request",
-                    serde_json::json!({ "target": "base", "base_ref": "v5", "focus": "webview lifecycle" }),
+                    serde_json::json!({ "target": "base", "base_ref": "v6", "focus": "webview lifecycle" }),
                 ))
                 .await
                 .unwrap(),
@@ -1802,7 +1802,7 @@ mod tests {
         assert_eq!(record["kind"], "review");
         assert_eq!(record["status"]["state"], "requested");
         assert_eq!(record["parent"]["session_uid"], "tab-a");
-        assert_eq!(record["target"]["mode"]["reference"], "v5");
+        assert_eq!(record["target"]["mode"]["reference"], "v6");
         assert!(record["log_path"]
             .as_str()
             .unwrap()

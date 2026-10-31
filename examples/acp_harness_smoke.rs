@@ -1,9 +1,9 @@
 // TRU-153: prove a native `AcpSession` (Gemini / OpenCode chat tabs) works
 // against the real agent, headless. GitTerm's task and browser MCP servers
-// run in-process on their V5 loopback ranges and are attached exactly as a
+// run in-process on their V6 loopback ranges and are attached exactly as a
 // chat tab attaches them (`acp_mcp_server()`).
 //
-//   env -u GITTERM_V5_TASK_MCP_TOKEN cargo run --example acp_harness_smoke -- \
+//   env -u GITTERM_V6_TASK_MCP_TOKEN cargo run --example acp_harness_smoke -- \
 //       --harness opencode|gemini --model <id> --workdir <empty dir> [--full]
 //
 // OpenCode (and Gemini with --full) runs: a text turn; a shell call needing

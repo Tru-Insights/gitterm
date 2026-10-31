@@ -1,5 +1,5 @@
-//! `gitterm-v5-agent attach` — bridge the current terminal to a remote
-//! session's PTY over the AttachTerminal stream, and `gitterm-v5-agent
+//! `gitterm-v6-agent attach` — bridge the current terminal to a remote
+//! session's PTY over the AttachTerminal stream, and `gitterm-v6-agent
 //! sessions` — list sessions on an agent.
 //!
 //! This is how GitTerm desktop shows remote sessions: a normal local

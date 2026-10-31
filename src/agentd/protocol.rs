@@ -4,6 +4,6 @@
 // double_must_use. The code is regenerated every build, so neither is ours
 // to fix — allow both for the whole generated module.
 #[allow(clippy::result_large_err, clippy::double_must_use)]
-pub mod v5 {
-    tonic::include_proto!("gitterm.agent.v5");
+pub mod v6 {
+    tonic::include_proto!("gitterm.agent.v6");
 }
