@@ -13,7 +13,7 @@
 //! temporary profile, serves neutral pages from a local server, and never
 //! touches the user's Chrome, GitTerm, or `~/.config/gitterm*`.
 //! `GITTERM_AGENT_BROWSER_PATH` names the binary (default
-//! `~/.local/agent-browser/agent-browser`); `GITTERM_V5_CHROME_PATH` names
+//! `~/.local/agent-browser/agent-browser`); `GITTERM_V6_CHROME_PATH` names
 //! Chrome (default: the macOS install).
 
 use gitterm::agent_browser::PINNED_AGENT_BROWSER;
@@ -97,7 +97,7 @@ fn spare_port() -> u16 {
 }
 
 fn launch_chrome(profile: &Path) -> TempChrome {
-    let chrome = std::env::var_os("GITTERM_V5_CHROME_PATH")
+    let chrome = std::env::var_os("GITTERM_V6_CHROME_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")

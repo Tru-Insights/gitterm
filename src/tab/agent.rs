@@ -44,7 +44,7 @@ pub(crate) const CLAUDE_PERMISSION_MODES: [&str; 6] = [
 /// every model's `supportedEffortLevels` in the initialize reply).
 pub(crate) const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// Set to a directory to log every Claude stdin/stdout frame there.
-const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_CLAUDE_WIRE_LOG_DIR";
+const CLAUDE_WIRE_LOG_ENV: &str = "GITTERM_V6_CLAUDE_WIRE_LOG_DIR";
 
 /// Which agent backend this tab is driving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
