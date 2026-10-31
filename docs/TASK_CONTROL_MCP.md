@@ -1,4 +1,4 @@
-# GitTerm V5 Task Control MCP
+# GitTerm V6 Task Control MCP
 
 TRU-106 adds the first agent-facing control surface for GitTerm's durable task
 model. It is a transport adapter into the application, not a second task
@@ -16,10 +16,10 @@ from diverging from the visible application.
 
 ## Security and runtime isolation
 
-- GitTerm reserves a V5-only loopback endpoint in ports `25030-26029`.
+- GitTerm reserves a V6-only loopback endpoint in ports `35030-36029`.
 - Every process receives a random 64-character bearer token held in memory.
 - The URL and token are inherited only by local GitTerm terminals through
-  `GITTERM_V5_TASK_MCP_URL` and `GITTERM_V5_TASK_MCP_TOKEN`.
+  `GITTERM_V6_TASK_MCP_URL` and `GITTERM_V6_TASK_MCP_TOKEN`.
 - Codex receives ephemeral per-process MCP overrides. GitTerm does not modify
   global or repository Codex configuration.
 - The task server has a separate endpoint and token from the browser MCP.
@@ -56,7 +56,7 @@ attaches the task server per process for the harnesses GitTerm knows:
   `default_tools_approval_mode=approve` (plus a `notify` hook for task
   sessions).
 - Claude Code: `--mcp-config='{…}'` with an `http` server whose bearer header
-  is `${GITTERM_V5_TASK_MCP_TOKEN}`, expanded by Claude from the terminal
+  is `${GITTERM_V6_TASK_MCP_TOKEN}`, expanded by Claude from the terminal
   environment, plus `--allowedTools=mcp__gitterm_tasks` so the session can
   record handoffs and launch workers without permission prompts. The `=`
   forms are required — both options are variadic and would otherwise swallow

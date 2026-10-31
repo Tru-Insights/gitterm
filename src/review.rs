@@ -14,7 +14,7 @@ use crate::agentd::git::git_command;
 use crate::task_worktree::{infer_branch_base, resolve_base, resolve_repository};
 
 /// What the reviewer looks at. Serialized as the page sends it:
-/// `{"kind": "branch", "base": "v5"}`, `{"kind": "uncommitted"}`,
+/// `{"kind": "branch", "base": "v6"}`, `{"kind": "uncommitted"}`,
 /// `{"kind": "commit", "sha": "ce922c6"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -363,14 +363,14 @@ mod tests {
     #[test]
     fn branch_prompt_names_model_commands_and_report_shape() {
         let prompt = review_prompt(&request(
-            ReviewTarget::Branch { base: "v5".into() },
+            ReviewTarget::Branch { base: "v6".into() },
             Some("webview lifecycle"),
         ))
         .unwrap();
         assert!(prompt.contains("Agent tool, passing model \"opus\" and run_in_background false"));
         assert!(prompt.contains("exactly one subagent"));
-        assert!(prompt.contains("    git log --oneline v5..HEAD"));
-        assert!(prompt.contains("    git diff v5...HEAD"));
+        assert!(prompt.contains("    git log --oneline v6..HEAD"));
+        assert!(prompt.contains("    git diff v6...HEAD"));
         assert!(prompt.contains("Do not edit, create, delete, stage or commit any file"));
         assert!(prompt.contains("Verdict: correct | needs_changes"));
         assert!(prompt.contains("F1 [P0|P1|P2|P3] path/to/file:LINE - one-line title"));
@@ -381,7 +381,7 @@ mod tests {
         // The brief is delimited so Claude can pass it on verbatim.
         let begin = prompt.find("\nBEGIN BRIEF\n").unwrap();
         let end = prompt.rfind("\nEND BRIEF").unwrap();
-        assert!(begin < end && prompt[begin..end].contains("git diff v5...HEAD"));
+        assert!(begin < end && prompt[begin..end].contains("git diff v6...HEAD"));
     }
 
     #[test]
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn unsafe_targets_and_models_are_rejected() {
-        for base in ["", "-p", "a b", "v5;rm -rf /", "a..b", "$(x)"] {
+        for base in ["", "-p", "a b", "v6;rm -rf /", "a..b", "$(x)"] {
             assert!(
                 review_prompt(&request(ReviewTarget::Branch { base: base.into() }, None)).is_err(),
                 "{base:?}"
@@ -427,12 +427,12 @@ mod tests {
     #[test]
     fn requests_deserialize_from_the_page_shape() {
         let req: ReviewRequest = serde_json::from_value(serde_json::json!({
-            "target": {"kind": "branch", "base": "v5"},
+            "target": {"kind": "branch", "base": "v6"},
             "focus": "tests",
             "model": "opus"
         }))
         .unwrap();
-        assert_eq!(req.target, ReviewTarget::Branch { base: "v5".into() });
+        assert_eq!(req.target, ReviewTarget::Branch { base: "v6".into() });
         // The IPC body as the page posts it: envelope fields ride along.
         let req: ReviewRequest = serde_json::from_value(serde_json::json!({
             "type": "review_request",
@@ -518,7 +518,7 @@ mod tests {
         std::fs::write(tmp.join("a.txt"), "a\n").unwrap();
         git(&tmp, &["add", "a.txt"]);
         git(&tmp, &["commit", "-q", "-m", "a"]);
-        git(&tmp, &["branch", "v5"]);
+        git(&tmp, &["branch", "v6"]);
         git(&tmp, &["checkout", "-q", "-b", "feature"]);
         std::fs::write(tmp.join("b.txt"), "b\n").unwrap();
         git(&tmp, &["add", "b.txt"]);
@@ -535,11 +535,11 @@ mod tests {
         // agent-workflow.config.json names the lane (and makes the tree dirty).
         std::fs::write(
             tmp.join("agent-workflow.config.json"),
-            r#"{"git": {"defaultBaseBranch": "v5"}}"#,
+            r#"{"git": {"defaultBaseBranch": "v6"}}"#,
         )
         .unwrap();
         let ctx = review_context(&tmp, None);
-        assert_eq!(ctx.base.as_deref(), Some("v5"));
+        assert_eq!(ctx.base.as_deref(), Some("v6"));
         assert_eq!(ctx.base_source.as_deref(), Some("agent-workflow"));
         assert!(ctx.dirty);
 
