@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const AGENT_CONFIG_DIR_NAME: &str = "gitterm-v5-agent";
-pub const AGENT_SERVICE_LABEL: &str = "com.cree8.gitterm.v5.agent";
-pub const AGENT_TOKEN_SERVICE: &str = "gitterm-v5-agent";
+pub const AGENT_CONFIG_DIR_NAME: &str = "gitterm-v6-agent";
+pub const AGENT_SERVICE_LABEL: &str = "com.cree8.gitterm.v6.agent";
+pub const AGENT_TOKEN_SERVICE: &str = "gitterm-v6-agent";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentConfigFile {
@@ -19,7 +19,7 @@ impl AgentConfigFile {
         Self::file_path_under(&dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
     }
 
-    /// The agent's config dir (`~/.config/gitterm-v5-agent`), which also
+    /// The agent's config dir (`~/.config/gitterm-v6-agent`), which also
     /// holds its paired phones. `None` without a home directory.
     pub fn dir() -> Option<PathBuf> {
         dirs::home_dir().map(|home| Self::dir_under(&home))
@@ -49,19 +49,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_config_is_isolated_from_v4() {
+    fn agent_config_is_isolated_from_v5() {
         let path = AgentConfigFile::file_path_under(std::path::Path::new("/test-home"));
         assert_eq!(
             path,
-            PathBuf::from("/test-home/.config/gitterm-v5-agent/config.json")
+            PathBuf::from("/test-home/.config/gitterm-v6-agent/config.json")
         );
         assert_ne!(
             path,
-            PathBuf::from("/test-home/.config/gitterm-v4-agent/config.json")
+            PathBuf::from("/test-home/.config/gitterm-v5-agent/config.json")
         );
-        assert_eq!(AGENT_SERVICE_LABEL, "com.cree8.gitterm.v5.agent");
-        assert_eq!(AGENT_TOKEN_SERVICE, "gitterm-v5-agent");
-        assert_ne!(AGENT_SERVICE_LABEL, "com.cree8.gitterm.v4.agent");
-        assert_ne!(AGENT_TOKEN_SERVICE, "gitterm-v4-agent");
+        assert_eq!(AGENT_SERVICE_LABEL, "com.cree8.gitterm.v6.agent");
+        assert_eq!(AGENT_TOKEN_SERVICE, "gitterm-v6-agent");
+        assert_ne!(AGENT_SERVICE_LABEL, "com.cree8.gitterm.v5.agent");
+        assert_ne!(AGENT_TOKEN_SERVICE, "gitterm-v5-agent");
     }
 }
