@@ -46,10 +46,6 @@ pub const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REFRESH_DEADLINE: Duration = Duration::from_secs(45);
 /// Status entries counted per checkout before counting stops ("5000+").
 pub const STATUS_COUNT_CAP: usize = 5000;
-/// Diff lines read for one branch diff before reading stops.
-pub const DIFF_LINE_CAP: usize = 20_000;
-/// Untracked file names listed in an Uncommitted diff.
-const UNTRACKED_LIST_CAP: usize = 200;
 /// Integration branch names tried as a base, remote then local, in this
 /// order on a tie.
 const INTEGRATION_BRANCHES: [&str; 4] = ["develop", "main", "master", "trunk"];
@@ -1520,11 +1516,37 @@ fn git_async(dir: &Path) -> tokio::process::Command {
 
 /// Runs git in `dir`, feeding stdout lines to `on_line` until it returns
 /// false (the process is then killed). Errors name the command and dir.
+/// Output that is not UTF-8 is an error; [`run_git_records`] reads bytes.
 async fn run_git_lines(
     dir: &Path,
     args: &[&str],
     timeout: Duration,
     mut on_line: impl FnMut(&str) -> bool,
+) -> Result<(), String> {
+    let what = || format!("git {} in {}", args.join(" "), dir.display());
+    run_git_records(dir, args, timeout, b'\n', |record| {
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        match std::str::from_utf8(record) {
+            Ok(line) => Ok(on_line(line)),
+            Err(_) => Err(format!(
+                "reading {}: stream did not contain valid UTF-8",
+                what()
+            )),
+        }
+    })
+    .await
+}
+
+/// Runs git in `dir`, feeding each `separator`-terminated stdout record
+/// (without its separator) to `on_record` until it returns `Ok(false)` (the
+/// process is then killed) or an error, which is returned. Errors name the
+/// command and dir.
+pub(crate) async fn run_git_records(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+    separator: u8,
+    mut on_record: impl FnMut(&[u8]) -> Result<bool, String>,
 ) -> Result<(), String> {
     let what = || format!("git {} in {}", args.join(" "), dir.display());
     let run = async {
@@ -1537,17 +1559,21 @@ async fn run_git_lines(
         // Stdout first: these commands write little to stderr, so its pipe
         // never fills while stdout is read. Stopping early must kill git
         // before anything waits on it, or git blocks on a full stdout pipe.
-        let mut lines = BufReader::new(stdout).lines();
+        let mut reader = BufReader::new(stdout);
+        let mut record = Vec::new();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if !on_line(&line) {
-                        // A cap: the exit status says nothing.
+            record.clear();
+            match reader.read_until(separator, &mut record).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let body = record.strip_suffix(&[separator]).unwrap_or(&record);
+                    let keep_going = on_record(body);
+                    if !matches!(keep_going, Ok(true)) {
+                        // A cap or a bad record: the exit status says nothing.
                         let _ = child.start_kill();
-                        return Ok(());
+                        return keep_going.map(|_| ());
                     }
                 }
-                Ok(None) => break,
                 Err(error) => return Err(format!("reading {}: {error}", what())),
             }
         }
@@ -1572,7 +1598,11 @@ async fn run_git_lines(
         .map_err(|_| format!("{} timed out after {}s", what(), timeout.as_secs()))?
 }
 
-async fn git_text(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+pub(crate) async fn git_text(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
     let mut out = String::new();
     run_git_lines(dir, args, timeout, |line| {
         out.push_str(line);
@@ -1975,215 +2005,15 @@ async fn rev_list_counts(checkout: &Path, rev: &str) -> Result<Option<(u32, u32)
 }
 
 // ---------------------------------------------------------------------------
-// Branch diffs.
+// Review sources.
 
-/// Which changes a branch diff shows.
+/// Which changes a review of a checkout shows (`crate::review_pane`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffSource {
-    /// Working tree and index against HEAD, plus untracked file names.
+    /// Working tree and index against HEAD, plus untracked files.
     Uncommitted,
     /// HEAD against its merge-base with the base.
     VsBase,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BranchDiff {
-    pub lines: Vec<crate::agentd::git::FileDiffLine>,
-    pub files: usize,
-    /// Reading stopped at [`DIFF_LINE_CAP`].
-    pub truncated: bool,
-    /// Short merge-base commit for a vs-base diff.
-    pub merge_base: Option<String>,
-}
-
-/// Parses `git diff` unified output into the diff panel's lines: a header
-/// per file and per hunk, numbered context, additions and deletions.
-#[derive(Debug, Default)]
-pub struct UnifiedDiffParser {
-    old_line: u32,
-    new_line: u32,
-    pub out: BranchDiff,
-}
-
-impl UnifiedDiffParser {
-    pub fn feed(&mut self, line: &str) {
-        use crate::agentd::git::{DiffLineKind, FileDiffLine};
-        let header = |content: String| FileDiffLine {
-            content,
-            kind: DiffLineKind::Header,
-            old_line: None,
-            new_line: None,
-        };
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            self.out.files += 1;
-            let name = rest
-                .split_once(" b/")
-                .map(|(_, b)| b)
-                .unwrap_or(rest)
-                .to_string();
-            self.out
-                .lines
-                .push(header(format!("\u{2500}\u{2500} {name}")));
-        } else if let Some(hunk) = line.strip_prefix("@@ ") {
-            let (old, new) = parse_hunk_starts(hunk).unwrap_or((0, 0));
-            self.old_line = old;
-            self.new_line = new;
-            self.out.lines.push(header(line.to_string()));
-        } else if line.starts_with("Binary files ") {
-            self.out.lines.push(header(line.to_string()));
-        } else if line.starts_with("--- ")
-            || line.starts_with("+++ ")
-            || line.starts_with("index ")
-            || line.starts_with('\\')
-            || line.starts_with("new file mode")
-            || line.starts_with("deleted file mode")
-            || line.starts_with("old mode")
-            || line.starts_with("new mode")
-            || line.starts_with("similarity index")
-            || line.starts_with("rename from")
-            || line.starts_with("rename to")
-        {
-        } else if let Some(text) = line.strip_prefix('+') {
-            self.out.lines.push(FileDiffLine {
-                content: text.to_string(),
-                kind: DiffLineKind::Addition,
-                old_line: None,
-                new_line: Some(self.new_line),
-            });
-            self.new_line += 1;
-        } else if let Some(text) = line.strip_prefix('-') {
-            self.out.lines.push(FileDiffLine {
-                content: text.to_string(),
-                kind: DiffLineKind::Deletion,
-                old_line: Some(self.old_line),
-                new_line: None,
-            });
-            self.old_line += 1;
-        } else if let Some(text) = line.strip_prefix(' ') {
-            self.out.lines.push(FileDiffLine {
-                content: text.to_string(),
-                kind: DiffLineKind::Context,
-                old_line: Some(self.old_line),
-                new_line: Some(self.new_line),
-            });
-            self.old_line += 1;
-            self.new_line += 1;
-        }
-    }
-}
-
-/// `-12,5 +14,7 @@ ...` -> (12, 14).
-fn parse_hunk_starts(hunk: &str) -> Option<(u32, u32)> {
-    let mut parts = hunk.split_whitespace();
-    let old = parts.next()?.strip_prefix('-')?;
-    let new = parts.next()?.strip_prefix('+')?;
-    let start = |range: &str| range.split(',').next()?.parse().ok();
-    Some((start(old)?, start(new)?))
-}
-
-/// Loads a whole-checkout diff. Never call on the UI thread.
-pub async fn load_branch_diff(
-    checkout: PathBuf,
-    source: DiffSource,
-    base: Option<String>,
-) -> Result<BranchDiff, String> {
-    let mut parser = UnifiedDiffParser::default();
-    let mut count = 0usize;
-    let mut truncated = false;
-    let base = match source {
-        DiffSource::Uncommitted => None,
-        DiffSource::VsBase => Some(base.ok_or_else(|| {
-            format!(
-                "no base branch found for {}: no task base, tracked branch, or develop/main/master/trunk",
-                checkout.display()
-            )
-        })?),
-    };
-    let range = base.as_deref().map(|base| format!("{base}...HEAD"));
-    let args: Vec<&str> = match &range {
-        None => vec![
-            "--no-optional-locks",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "HEAD",
-            "--",
-        ],
-        Some(range) => vec![
-            "--no-optional-locks",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            range,
-            "--",
-        ],
-    };
-    run_git_lines(&checkout, &args, GIT_TIMEOUT, |line| {
-        count += 1;
-        if count > DIFF_LINE_CAP {
-            truncated = true;
-            return false;
-        }
-        parser.feed(line);
-        true
-    })
-    .await?;
-    let mut diff = parser.out;
-    diff.truncated = truncated;
-    match base {
-        None => {
-            let mut names: Vec<String> = Vec::new();
-            let mut more = false;
-            run_git_lines(
-                &checkout,
-                &[
-                    "--no-optional-locks",
-                    "ls-files",
-                    "--others",
-                    "--exclude-standard",
-                ],
-                GIT_TIMEOUT,
-                |line| {
-                    if names.len() >= UNTRACKED_LIST_CAP {
-                        more = true;
-                        return false;
-                    }
-                    names.push(line.to_string());
-                    true
-                },
-            )
-            .await?;
-            if !names.is_empty() {
-                use crate::agentd::git::{DiffLineKind, FileDiffLine};
-                let more = if more { " (first 200)" } else { "" };
-                diff.lines.push(FileDiffLine {
-                    content: format!("\u{2500}\u{2500} untracked{more}"),
-                    kind: DiffLineKind::Header,
-                    old_line: None,
-                    new_line: None,
-                });
-                diff.files += names.len();
-                for name in names {
-                    diff.lines.push(FileDiffLine {
-                        content: name,
-                        kind: DiffLineKind::Addition,
-                        old_line: None,
-                        new_line: None,
-                    });
-                }
-            }
-        }
-        Some(base) => {
-            let text = git_text(
-                &checkout,
-                &["--no-optional-locks", "merge-base", &base, "HEAD"],
-                GIT_TIMEOUT,
-            )
-            .await?;
-            diff.merge_base = text.trim().get(..7).map(str::to_string);
-        }
-    }
-    Ok(diff)
 }
 
 // ---------------------------------------------------------------------------
@@ -2691,45 +2521,6 @@ mod tests {
         assert_eq!(parse_left_right("1 2 3"), None);
     }
 
-    #[test]
-    fn unified_diff_parses_files_hunks_and_numbers() {
-        let mut parser = UnifiedDiffParser::default();
-        for line in [
-            "diff --git a/src/a.rs b/src/a.rs",
-            "index 1..2 100644",
-            "--- a/src/a.rs",
-            "+++ b/src/a.rs",
-            "@@ -10,3 +10,4 @@ fn x() {",
-            " keep",
-            "-old",
-            "+new",
-            "+more",
-            "\\ No newline at end of file",
-        ] {
-            parser.feed(line);
-        }
-        let out = parser.out;
-        assert_eq!(out.files, 1);
-        use crate::agentd::git::DiffLineKind;
-        let kinds: Vec<(DiffLineKind, Option<u32>, Option<u32>)> = out
-            .lines
-            .iter()
-            .map(|l| (l.kind, l.old_line, l.new_line))
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                (DiffLineKind::Header, None, None),
-                (DiffLineKind::Header, None, None),
-                (DiffLineKind::Context, Some(10), Some(10)),
-                (DiffLineKind::Deletion, Some(11), None),
-                (DiffLineKind::Addition, None, Some(11)),
-                (DiffLineKind::Addition, None, Some(12)),
-            ]
-        );
-        assert!(out.lines[0].content.ends_with("src/a.rs"));
-    }
-
     // -----------------------------------------------------------------------
     // Real git.
 
@@ -2881,24 +2672,45 @@ mod tests {
         assert_eq!(gated.skipped_unchanged, 1);
         assert_eq!(gated.branches[1].vs_base, Some((0, 1)));
 
-        // Both diff sources.
-        let uncommitted = load_branch_diff(owned_wt.clone(), DiffSource::Uncommitted, None)
+        // Both review sources (TRU-178), against the row's own base.
+        use crate::review_pane::{load_review, ReviewTarget};
+        let review = ReviewTarget {
+            checkout: owned_wt.clone(),
+            repo: folder_name(&repo),
+            branch: "feature-standby".into(),
+            owner: owned.owner_label(),
+            base: owned.base.clone(),
+        };
+        let uncommitted = load_review(review.clone(), DiffSource::Uncommitted)
             .await
-            .unwrap();
-        assert_eq!(uncommitted.files, 2, "{:?}", uncommitted.lines);
-        assert!(uncommitted.lines.iter().any(|l| l.content == "changed"));
-        assert!(uncommitted.lines.iter().any(|l| l.content == "scratch.txt"));
-        let vs_base = load_branch_diff(
-            owned_wt.clone(),
-            DiffSource::VsBase,
-            Some("main".to_string()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(vs_base.files, 1);
-        assert!(vs_base.lines.iter().any(|l| l.content == "two"));
+            .unwrap()
+            .diff;
+        let paths: Vec<&str> = uncommitted.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.txt", "scratch.txt"]);
+        let texts = |file: &crate::review_pane::ReviewFile| -> Vec<String> {
+            file.hunks
+                .iter()
+                .flat_map(|hunk| hunk.lines.iter().map(|line| line.text.clone()))
+                .collect()
+        };
+        assert!(texts(&uncommitted.files[0]).contains(&"changed".to_string()));
+        assert_eq!(texts(&uncommitted.files[1]), ["x"]);
+        let vs_base = load_review(review.clone(), DiffSource::VsBase)
+            .await
+            .unwrap()
+            .diff;
+        let paths: Vec<&str> = vs_base.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["b.txt"]);
+        assert_eq!(texts(&vs_base.files[0]), ["two"]);
         assert_eq!(vs_base.merge_base.as_ref().map(String::len), Some(7));
-        let missing = load_branch_diff(owned_wt, DiffSource::VsBase, None).await;
+        let missing = load_review(
+            ReviewTarget {
+                base: None,
+                ..review
+            },
+            DiffSource::VsBase,
+        )
+        .await;
         assert!(missing.is_err());
     }
 

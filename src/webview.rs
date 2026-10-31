@@ -8,8 +8,9 @@
 //   show/hide with the DOM (scroll position, open tool cards, composer draft)
 //   intact. main.rs caps how many pages live at once and destroys the least
 //   recently shown one (`promote_agent_page`).
-// - `WebviewSurface::Viewer` hosts markdown / HTML / excalidraw HTML and the
-//   plans-viewer URL.
+// - `WebviewSurface::Viewer` hosts markdown / HTML / excalidraw HTML, the
+//   plans-viewer URL and the review pane (TRU-178). It is built with an IPC
+//   handler that only the review page's token-stamped messages get through.
 //
 // The app keeps at most one surface visible at a time (see
 // `visible_webview_surface` in main.rs).
@@ -33,7 +34,8 @@ pub enum WebviewSurface {
     /// The chat page of the agent tab with this id; IPC handler installed at
     /// construction.
     Agent(usize),
-    /// File viewer HTML (markdown / HTML / excalidraw) and the plans viewer URL.
+    /// File viewer HTML (markdown / HTML / excalidraw), the plans viewer URL
+    /// and the review pane.
     Viewer,
 }
 
@@ -161,9 +163,22 @@ pub fn set_pending_content_with_ipc(
 /// handler; URL-loaded surfaces communicate only via HTTP back to the warp server.
 #[allow(dead_code)]
 pub fn set_pending_url(surface: WebviewSurface, url: String, bounds: (f32, f32, f32, f32)) {
+    set_pending_url_with_ipc(surface, url, bounds, None);
+}
+
+/// Like `set_pending_url`, but also stages an IPC handler for the surface's
+/// construction (see `set_pending_content_with_ipc`). The Viewer is staged
+/// this way whatever it shows first, so the handler the review pane needs
+/// (TRU-178) is installed when the surface is built.
+pub fn set_pending_url_with_ipc(
+    surface: WebviewSurface,
+    url: String,
+    bounds: (f32, f32, f32, f32),
+    ipc_handler: Option<IpcHandler>,
+) {
     with_slot(surface, |slot| {
         slot.pending = Some((PendingContent::Url(url), bounds));
-        slot.pending_ipc_handler = None;
+        slot.pending_ipc_handler = ipc_handler;
         slot.visible = true;
     });
 }

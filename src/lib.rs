@@ -17,6 +17,7 @@ pub mod merge_plan;
 pub mod pr_watch;
 pub mod resource_watch;
 pub mod review;
+pub mod review_pane;
 pub mod task_mcp;
 pub mod task_worktree;
 pub mod tasks;

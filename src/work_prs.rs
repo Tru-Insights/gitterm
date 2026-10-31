@@ -732,7 +732,7 @@ impl App {
             PrEvent::Review(key) => return self.review_pr(key),
             PrEvent::ReviewResolved(key, checkout) => {
                 return match checkout {
-                    Some(checkout) => self.open_branch_diff(checkout, overview::DiffSource::VsBase),
+                    Some(checkout) => self.open_review(checkout, overview::DiffSource::VsBase),
                     None => {
                         self.open_pr_in_browser(&key);
                         Task::none()
@@ -856,7 +856,7 @@ impl App {
         }
     }
 
-    /// Review: the branch diff vs base when the overview owns a checkout of
+    /// Review: the review pane (TRU-178) vs base when the overview owns a checkout of
     /// the PR's head branch in its repo, else the PR in the browser. Resets
     /// the row's new-comment count.
     fn review_pr(&mut self, key: PrKey) -> Task<Event> {
