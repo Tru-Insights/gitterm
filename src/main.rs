@@ -18002,6 +18002,11 @@ fi
         let Some(browser) = self.browser_service() else {
             return Task::none();
         };
+        // Releasing goes through the engine (TRU-177): the agent-browser
+        // engine keeps its own targets and stops their sessions.
+        let Some(engine) = self.browser_mcp.as_ref().map(BrowserMcpConnection::engine) else {
+            return Task::none();
+        };
         let labels: HashMap<String, String> = self
             .workspaces
             .iter()
@@ -18028,7 +18033,7 @@ fi
             async move {
                 let mut errors = Vec::new();
                 if !released.is_empty() {
-                    if let Err(error) = browser.release_owners(&released).await {
+                    if let Err(error) = engine.release_owners(&released).await {
                         errors.push(error.to_string());
                     }
                 }

@@ -36,8 +36,8 @@ const TARGET_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CHROME_STDERR_BYTES: usize = 16_384;
 const MAX_VISIBLE_TEXT_BYTES: usize = 100_000;
 const MAX_INTERACTIVE_ELEMENTS: usize = 500;
-const MAX_CONSOLE_ERRORS: usize = 100;
-const MAX_NETWORK_FAILURES: usize = 100;
+pub(crate) const MAX_CONSOLE_ERRORS: usize = 100;
+pub(crate) const MAX_NETWORK_FAILURES: usize = 100;
 const MAX_TRACKED_REQUESTS: usize = 512;
 const MAX_DIAGNOSTIC_TEXT_CHARS: usize = 4_000;
 const MAX_DIAGNOSTIC_URL_CHARS: usize = 2_048;
@@ -57,14 +57,14 @@ const MAX_LOCATOR_VALUE_CHARS: usize = 2_000;
 const MAX_BROWSER_TARGET_NAME_CHARS: usize = 32;
 const MAX_EVIDENCE_LABEL_CHARS: usize = 80;
 const MAX_RETAINED_EVIDENCE: usize = 6;
-const MAX_FULL_PAGE_CAPTURE_WIDTH: f64 = 7_680.0;
-const MAX_FULL_PAGE_CAPTURE_HEIGHT: f64 = 20_000.0;
-const MAX_FULL_PAGE_CAPTURE_PIXELS: f64 = 100_000_000.0;
+pub(crate) const MAX_FULL_PAGE_CAPTURE_WIDTH: f64 = 7_680.0;
+pub(crate) const MAX_FULL_PAGE_CAPTURE_HEIGHT: f64 = 20_000.0;
+pub(crate) const MAX_FULL_PAGE_CAPTURE_PIXELS: f64 = 100_000_000.0;
 const MIN_VIEWPORT_DIMENSION: u32 = 200;
 const MAX_VIEWPORT_WIDTH: u32 = 7_680;
 const MAX_VIEWPORT_HEIGHT: u32 = 4_320;
 const BROWSER_PROFILE_NAME: &str = "GitTerm V6 Browser";
-const DEFAULT_BROWSER_TARGET_NAME: &str = "primary";
+pub(crate) const DEFAULT_BROWSER_TARGET_NAME: &str = "primary";
 /// Longest owner label a chat-owned tab's title prefix shows (TRU-176).
 const MAX_OWNER_LABEL_CHARS: usize = 24;
 // Catppuccin Mocha mauve (#cba6f7) encoded as Chrome's signed ARGB SkColor.
@@ -300,6 +300,11 @@ pub enum BrowserLocator {
     Css {
         selector: String,
     },
+    /// A ref such as `e3` from browser_snapshot_refs (agent-browser engine).
+    Ref {
+        #[serde(rename = "ref")]
+        reference: String,
+    },
 }
 
 impl BrowserLocator {
@@ -324,11 +329,12 @@ impl BrowserLocator {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let (kind, value) = match self {
             Self::Role { role, .. } => ("role", role),
             Self::Text { text, .. } => ("text", text),
             Self::Css { selector } => ("CSS selector", selector),
+            Self::Ref { reference } => return snapshot_ref(reference).map(|_| ()),
         };
         if value.trim().is_empty() {
             return Err(BrowserControlError::new(format!(
@@ -357,6 +363,20 @@ impl BrowserLocator {
         }
         Ok(())
     }
+}
+
+/// The bare ref (`e3`) of a `ref` locator, which agents may also write as
+/// `@e3`. Refs are short ASCII ids, so one can never be read as a flag or
+/// a selector by the engine that resolves it.
+pub(crate) fn snapshot_ref(reference: &str) -> Result<&str> {
+    let bare = reference.strip_prefix('@').unwrap_or(reference);
+    let digits = bare.strip_prefix('e').unwrap_or_default();
+    if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(BrowserControlError::new(format!(
+            "browser ref locator must look like e3 (from browser_snapshot_refs), got {reference:?}"
+        )));
+    }
+    Ok(bare)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -397,7 +417,7 @@ impl BrowserViewport {
         }
     }
 
-    fn validate(self) -> Result<Self> {
+    pub(crate) fn validate(self) -> Result<Self> {
         if !(MIN_VIEWPORT_DIMENSION..=MAX_VIEWPORT_WIDTH).contains(&self.width) {
             return Err(BrowserControlError::new(format!(
                 "browser viewport width must be between {MIN_VIEWPORT_DIMENSION} and {MAX_VIEWPORT_WIDTH}, got {}",
@@ -524,7 +544,7 @@ pub enum BrowserNodeSelector {
 }
 
 impl BrowserNodeSelector {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         match self {
             Self::NodeRef { node_ref }
                 if node_ref.trim().is_empty() || node_ref.chars().count() > MAX_NODE_REF_CHARS =>
@@ -582,7 +602,7 @@ pub enum BrowserLoadingState {
 }
 
 impl BrowserLoadingState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Loading => "loading",
             Self::Interactive => "interactive",
@@ -659,10 +679,10 @@ struct DevToolsEndpoint {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DevToolsTarget {
-    id: String,
+pub(crate) struct DevToolsTarget {
+    pub(crate) id: String,
     #[serde(rename = "type")]
-    kind: String,
+    pub(crate) kind: String,
     #[serde(default)]
     url: String,
     #[serde(default)]
@@ -670,7 +690,7 @@ struct DevToolsTarget {
     web_socket_debugger_url: Option<String>,
 }
 
-struct ManagedBrowserTarget {
+pub(crate) struct ManagedBrowserTarget {
     target_id: String,
     viewport: Option<BrowserViewport>,
     session: Option<CdpSession>,
@@ -694,13 +714,13 @@ impl ManagedBrowserTarget {
 /// calling tab's `session_uid`) and the name that chat gave it. Names are
 /// scoped per owner, so two chats' `primary` are different Chrome tabs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TargetKey {
-    owner: String,
-    name: String,
+pub(crate) struct TargetKey {
+    pub(crate) owner: String,
+    pub(crate) name: String,
 }
 
 impl TargetKey {
-    fn new(owner: &str, name: &str) -> Self {
+    pub(crate) fn new(owner: &str, name: &str) -> Self {
         Self {
             owner: owner.to_string(),
             name: name.to_string(),
@@ -712,9 +732,12 @@ impl TargetKey {
 /// from `targets` belongs to no chat: a tab the user opened, a tab whose
 /// chat closed, and every tab after a GitTerm restart. No caller can reach
 /// one, and no caller can reach another caller's target.
-#[derive(Default)]
-struct BrowserTargetRegistry {
-    targets: HashMap<TargetKey, ManagedBrowserTarget>,
+///
+/// Both browser engines (TRU-177) keep their targets in this registry, so
+/// the ownership rules have one implementation: `T` is what an engine keeps
+/// per target besides its Chrome target id.
+pub(crate) struct BrowserTargetRegistry<T = ManagedBrowserTarget> {
+    pub(crate) targets: HashMap<TargetKey, T>,
     /// Each owner's target for calls that omit `target`.
     active: HashMap<String, String>,
     /// The target any chat used last: what the UI's Focus brings forward.
@@ -723,11 +746,33 @@ struct BrowserTargetRegistry {
     labels: HashMap<String, String>,
 }
 
-impl BrowserTargetRegistry {
+/// What the target registry needs from an engine's per-target record.
+pub(crate) trait RegisteredTarget {
+    fn target_id(&self) -> &str;
+}
+
+impl RegisteredTarget for ManagedBrowserTarget {
+    fn target_id(&self) -> &str {
+        &self.target_id
+    }
+}
+
+impl<T> Default for BrowserTargetRegistry<T> {
+    fn default() -> Self {
+        Self {
+            targets: HashMap::new(),
+            active: HashMap::new(),
+            window: None,
+            labels: HashMap::new(),
+        }
+    }
+}
+
+impl<T: RegisteredTarget> BrowserTargetRegistry<T> {
     /// The caller's target named `target`, or its active target when
     /// omitted (its default `primary` when it has none). Never another
     /// owner's, whatever the name.
-    fn key(&self, owner: &str, target: Option<&str>) -> Result<TargetKey> {
+    pub(crate) fn key(&self, owner: &str, target: Option<&str>) -> Result<TargetKey> {
         if owner.is_empty() {
             return Err(BrowserControlError::new(
                 "browser targets belong to the chat that opened them, and this call names no chat",
@@ -744,15 +789,15 @@ impl BrowserTargetRegistry {
         Ok(TargetKey::new(owner, name))
     }
 
-    fn get(&self, key: &TargetKey) -> Option<&ManagedBrowserTarget> {
+    pub(crate) fn get(&self, key: &TargetKey) -> Option<&T> {
         self.targets.get(key)
     }
 
-    fn owns_any(&self, owner: &str) -> bool {
+    pub(crate) fn owns_any(&self, owner: &str) -> bool {
         self.targets.keys().any(|key| key.owner == owner)
     }
 
-    fn owned_keys(&self, owner: &str) -> Vec<TargetKey> {
+    pub(crate) fn owned_keys(&self, owner: &str) -> Vec<TargetKey> {
         self.targets
             .keys()
             .filter(|key| key.owner == owner)
@@ -763,17 +808,17 @@ impl BrowserTargetRegistry {
     fn is_managed(&self, target_id: &str) -> bool {
         self.targets
             .values()
-            .any(|managed| managed.target_id == target_id)
+            .any(|managed| managed.target_id() == target_id)
     }
 
-    fn mark_active(&mut self, key: &TargetKey) {
+    pub(crate) fn mark_active(&mut self, key: &TargetKey) {
         self.active.insert(key.owner.clone(), key.name.clone());
         self.window = Some(key.clone());
     }
 
     /// Forget one target; its owner's default moves to its first remaining
     /// target by name.
-    fn remove(&mut self, key: &TargetKey) -> Option<ManagedBrowserTarget> {
+    pub(crate) fn remove(&mut self, key: &TargetKey) -> Option<T> {
         let removed = self.targets.remove(key)?;
         if self.active.get(&key.owner) == Some(&key.name) {
             self.reset_active(&key.owner);
@@ -806,7 +851,7 @@ impl BrowserTargetRegistry {
         self.targets.retain(|_, managed| {
             live_targets
                 .iter()
-                .any(|target| target.id == managed.target_id && target.kind == "page")
+                .any(|target| target.id == managed.target_id() && target.kind == "page")
         });
         let stale_owners = self
             .active
@@ -827,7 +872,11 @@ impl BrowserTargetRegistry {
     }
 
     /// The caller's own live targets, by name, titles without its prefix.
-    fn infos(&self, owner: &str, live_targets: &[DevToolsTarget]) -> Vec<BrowserTargetInfo> {
+    pub(crate) fn infos(
+        &self,
+        owner: &str,
+        live_targets: &[DevToolsTarget],
+    ) -> Vec<BrowserTargetInfo> {
         let active = self.active.get(owner).map(String::as_str);
         let prefix = self.title_prefix(owner);
         let mut result = self
@@ -837,7 +886,7 @@ impl BrowserTargetRegistry {
             .filter_map(|(key, managed)| {
                 live_targets
                     .iter()
-                    .find(|target| target.id == managed.target_id && target.kind == "page")
+                    .find(|target| target.id == managed.target_id() && target.kind == "page")
                     .map(|target| BrowserTargetInfo {
                         name: key.name.clone(),
                         target_id: target.id.clone(),
@@ -852,7 +901,7 @@ impl BrowserTargetRegistry {
     }
 
     /// Give up every target of `owners`; their tabs become the user's.
-    fn release(&mut self, owners: &HashSet<String>) -> Vec<(TargetKey, ManagedBrowserTarget)> {
+    pub(crate) fn release(&mut self, owners: &HashSet<String>) -> Vec<(TargetKey, T)> {
         let keys = self
             .targets
             .keys()
@@ -1390,16 +1439,7 @@ impl BrowserController {
         delta_x: f64,
         delta_y: f64,
     ) -> Result<()> {
-        const MAX_SCROLL_DELTA: f64 = 100_000.0;
-        if !delta_x.is_finite()
-            || !delta_y.is_finite()
-            || delta_x.abs() > MAX_SCROLL_DELTA
-            || delta_y.abs() > MAX_SCROLL_DELTA
-        {
-            return Err(BrowserControlError::new(format!(
-                "browser scroll deltas must be finite and between -{MAX_SCROLL_DELTA} and {MAX_SCROLL_DELTA}"
-            )));
-        }
+        validate_scroll_deltas(delta_x, delta_y)?;
         let key = self.registry.key(owner, target)?;
         let session = self.page_session_for(&key).await?;
         let result = session
@@ -2172,13 +2212,25 @@ impl BrowserControlService {
         label: &str,
         capture_mode: BrowserCaptureMode,
     ) -> Result<BrowserSnapshot> {
-        let label = validate_evidence_label(label)?.to_string();
+        let label = validate_evidence_label(label)?;
         let snapshot = self
             .controller
             .lock()
             .await
             .snapshot_in(owner, target, capture_mode)
             .await?;
+        self.record_evidence(owner, label, &snapshot).await;
+        Ok(snapshot)
+    }
+
+    /// Retain one labelled capture in the bounded memory-only evidence set,
+    /// returning its evidence id. Both engines' captures land here.
+    pub(crate) async fn record_evidence(
+        &self,
+        owner: &str,
+        label: &str,
+        snapshot: &BrowserSnapshot,
+    ) -> u64 {
         let mut telemetry = self.telemetry.lock().await;
         telemetry.next_evidence_id += 1;
         let id = telemetry.next_evidence_id;
@@ -2187,7 +2239,7 @@ impl BrowserControlService {
             id,
             owner: owner.to_string(),
             target: snapshot.target.clone(),
-            label,
+            label: label.to_string(),
             capture_mode: snapshot.capture_mode,
             title: snapshot.title.clone(),
             display_url: sanitize_diagnostic_url(&snapshot.url),
@@ -2201,7 +2253,48 @@ impl BrowserControlService {
         let revision = telemetry.snapshot.revision;
         drop(telemetry);
         self.telemetry_revision.send_replace(revision);
-        Ok(snapshot)
+        id
+    }
+
+    /// The newest retained evidence `owner` captured of its `target` under
+    /// `label`: a diff baseline (TRU-177). Never another owner's.
+    pub(crate) async fn owned_evidence(
+        &self,
+        owner: &str,
+        target: &str,
+        label: &str,
+    ) -> Option<BrowserEvidence> {
+        self.telemetry
+            .lock()
+            .await
+            .snapshot
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.owner == owner && evidence.target == target && evidence.label == label
+            })
+            .max_by_key(|evidence| evidence.id)
+            .cloned()
+    }
+
+    /// The ids of every evidence entry still retained.
+    pub(crate) async fn retained_evidence_ids(&self) -> HashSet<u64> {
+        self.telemetry
+            .lock()
+            .await
+            .snapshot
+            .evidence
+            .iter()
+            .map(|evidence| evidence.id)
+            .collect()
+    }
+
+    /// The running browser's DevTools port, adopting a live endpoint another
+    /// instance left in the shared profile, as `status` does.
+    pub(crate) async fn running_devtools_port(&self) -> Result<u16> {
+        let mut controller = self.controller.lock().await;
+        controller.status().await?;
+        controller.running_endpoint().map(|endpoint| endpoint.port)
     }
 
     pub async fn targets(&self, owner: &str) -> Result<Vec<BrowserTargetInfo>> {
@@ -2558,31 +2651,31 @@ fn retain_browser_evidence(snapshot: &mut BrowserTelemetrySnapshot, evidence: Br
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SnapshotState {
-    url: String,
-    title: String,
-    loading_state: String,
-    visible_text: String,
-    interactive_elements: Vec<InteractiveElement>,
-    viewport: BrowserViewport,
+pub(crate) struct SnapshotState {
+    pub(crate) url: String,
+    pub(crate) title: String,
+    pub(crate) loading_state: String,
+    pub(crate) visible_text: String,
+    pub(crate) interactive_elements: Vec<InteractiveElement>,
+    pub(crate) viewport: BrowserViewport,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct NodeDetailsEvaluation {
-    error: Option<String>,
-    match_count: usize,
-    details: Option<BrowserNodeDetails>,
+pub(crate) struct NodeDetailsEvaluation {
+    pub(crate) error: Option<String>,
+    pub(crate) match_count: usize,
+    pub(crate) details: Option<BrowserNodeDetails>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ViewportCenter {
-    x: f64,
-    y: f64,
+pub(crate) struct ViewportCenter {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum LocatorPreparation {
+pub(crate) enum LocatorPreparation {
     ResolveOnly,
     Point,
     ReplaceText,
@@ -2600,7 +2693,7 @@ impl LocatorPreparation {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LocatorResolution {
+pub(crate) struct LocatorResolution {
     match_count: usize,
     target: Option<ResolvedActionTarget>,
     error: Option<String>,
@@ -2641,7 +2734,28 @@ async fn resolve_locator(
     let resolution: LocatorResolution = serde_json::from_value(value).map_err(|error| {
         BrowserControlError::new(format!("Chrome returned malformed locator data: {error}"))
     })?;
+    action_target_from_resolution(resolution)
+}
 
+pub(crate) fn validate_scroll_deltas(delta_x: f64, delta_y: f64) -> Result<()> {
+    const MAX_SCROLL_DELTA: f64 = 100_000.0;
+    if !delta_x.is_finite()
+        || !delta_y.is_finite()
+        || delta_x.abs() > MAX_SCROLL_DELTA
+        || delta_y.abs() > MAX_SCROLL_DELTA
+    {
+        return Err(BrowserControlError::new(format!(
+            "browser scroll deltas must be finite and between -{MAX_SCROLL_DELTA} and {MAX_SCROLL_DELTA}"
+        )));
+    }
+    Ok(())
+}
+
+/// The one enabled element a strict locator resolved to, or why it did not
+/// resolve to exactly one. Shared by both engines (TRU-177).
+pub(crate) fn action_target_from_resolution(
+    resolution: LocatorResolution,
+) -> Result<BrowserActionTarget> {
     if let Some(error) = resolution.error {
         return Err(BrowserControlError::new(format!(
             "browser locator could not be resolved: {error}"
@@ -2758,7 +2872,7 @@ struct WaitEvaluation {
     detail: String,
 }
 
-fn validate_wait_condition(condition: &BrowserWaitCondition) -> Result<()> {
+pub(crate) fn validate_wait_condition(condition: &BrowserWaitCondition) -> Result<()> {
     match condition {
         BrowserWaitCondition::Locator { locator } => locator.validate(),
         BrowserWaitCondition::Text { text, .. } => BrowserLocator::Text {
@@ -2813,30 +2927,7 @@ async fn evaluate_wait_condition(
         .await;
     }
 
-    let expression = match condition {
-        BrowserWaitCondition::Url { url, exact } => {
-            let expected = serde_json::to_string(url).map_err(|error| {
-                BrowserControlError::new(format!("failed to serialize browser wait URL: {error}"))
-            })?;
-            format!(
-                "(() => {{ const actual = window.location.href; const expected = {expected}; return {{ matched: {} ? actual === expected : actual.includes(expected), detail: actual }}; }})()",
-                exact
-            )
-        }
-        BrowserWaitCondition::LoadingState { state } => {
-            let expected = serde_json::to_string(state.as_str()).map_err(|error| {
-                BrowserControlError::new(format!(
-                    "failed to serialize browser loading state: {error}"
-                ))
-            })?;
-            format!(
-                "(() => {{ const actual = document.readyState; return {{ matched: actual === {expected}, detail: `last loading state: ${{actual}}` }}; }})()"
-            )
-        }
-        BrowserWaitCondition::Locator { .. } | BrowserWaitCondition::Text { .. } => {
-            unreachable!("locator waits are handled before expression generation")
-        }
-    };
+    let expression = page_state_wait_expression(condition)?;
     let result = session
         .command(
             "Runtime.evaluate",
@@ -2861,6 +2952,58 @@ async fn evaluate_wait_condition(
             .unwrap_or_else(|| "last URL was not an HTTP(S) page".to_string());
     }
     Ok(evaluation)
+}
+
+/// The `{ matched, detail }` expression of a URL or loading-state wait.
+fn page_state_wait_expression(condition: &BrowserWaitCondition) -> Result<String> {
+    match condition {
+        BrowserWaitCondition::Url { url, exact } => {
+            let expected = serde_json::to_string(url).map_err(|error| {
+                BrowserControlError::new(format!("failed to serialize browser wait URL: {error}"))
+            })?;
+            Ok(format!(
+                "(() => {{ const actual = window.location.href; const expected = {expected}; return {{ matched: {} ? actual === expected : actual.includes(expected), detail: actual }}; }})()",
+                exact
+            ))
+        }
+        BrowserWaitCondition::LoadingState { state } => {
+            let expected = serde_json::to_string(state.as_str()).map_err(|error| {
+                BrowserControlError::new(format!(
+                    "failed to serialize browser loading state: {error}"
+                ))
+            })?;
+            Ok(format!(
+                "(() => {{ const actual = document.readyState; return {{ matched: actual === {expected}, detail: `last loading state: ${{actual}}` }}; }})()"
+            ))
+        }
+        BrowserWaitCondition::Locator { .. } | BrowserWaitCondition::Text { .. } => Err(
+            BrowserControlError::new("locator waits have no page-state expression"),
+        ),
+    }
+}
+
+/// A JavaScript expression that is `true` exactly when `condition` holds,
+/// with the gitterm engine's matching rules: a locator or text wait needs
+/// exactly one visible match. The agent-browser engine (TRU-177) waits on
+/// it with `wait --fn`.
+pub(crate) fn wait_condition_predicate(condition: &BrowserWaitCondition) -> Result<String> {
+    let locator = match condition {
+        BrowserWaitCondition::Locator { locator } => locator.clone(),
+        BrowserWaitCondition::Text { text, exact } => BrowserLocator::Text {
+            text: text.clone(),
+            exact: *exact,
+        },
+        BrowserWaitCondition::Url { .. } | BrowserWaitCondition::LoadingState { .. } => {
+            return Ok(format!(
+                "({}).matched === true",
+                page_state_wait_expression(condition)?
+            ));
+        }
+    };
+    let resolution = locator_expression(&locator, LocatorPreparation::ResolveOnly)?;
+    Ok(format!(
+        "(() => {{ const resolution = {resolution}; return !resolution.error && resolution.matchCount === 1; }})()"
+    ))
 }
 
 async fn evaluate_locator_wait(
@@ -3387,7 +3530,7 @@ fn remote_object_text(object: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn sanitize_diagnostic_url(raw_url: &str) -> Option<String> {
+pub(crate) fn sanitize_diagnostic_url(raw_url: &str) -> Option<String> {
     let mut url = Url::parse(raw_url).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
         return None;
@@ -3404,7 +3547,7 @@ fn sanitize_diagnostic_url(raw_url: &str) -> Option<String> {
     )
 }
 
-fn bounded_text(text: &str) -> String {
+pub(crate) fn bounded_text(text: &str) -> String {
     text.chars().take(MAX_DIAGNOSTIC_TEXT_CHARS).collect()
 }
 
@@ -3477,7 +3620,7 @@ fn validate_chrome_executable(path: &Path, source: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn executable_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn executable_on_path(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path)
         .map(|dir| dir.join(name))
@@ -3712,7 +3855,7 @@ fn read_devtools_active_port(path: &Path) -> Result<Option<DevToolsEndpoint>> {
     }))
 }
 
-async fn list_page_targets(port: u16) -> Result<Vec<DevToolsTarget>> {
+pub(crate) async fn list_page_targets(port: u16) -> Result<Vec<DevToolsTarget>> {
     let uri: Uri = format!("http://127.0.0.1:{port}/json/list")
         .parse()
         .map_err(|error| BrowserControlError::new(format!("invalid DevTools URL: {error}")))?;
@@ -3738,7 +3881,7 @@ async fn list_page_targets(port: u16) -> Result<Vec<DevToolsTarget>> {
     })
 }
 
-fn validate_browser_target_name(name: &str) -> Result<&str> {
+pub(crate) fn validate_browser_target_name(name: &str) -> Result<&str> {
     if name.is_empty() || name.chars().count() > MAX_BROWSER_TARGET_NAME_CHARS {
         return Err(BrowserControlError::new(format!(
             "browser target names must contain 1 to {MAX_BROWSER_TARGET_NAME_CHARS} characters"
@@ -3761,7 +3904,7 @@ fn validate_browser_target_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
-fn validate_evidence_label(label: &str) -> Result<&str> {
+pub(crate) fn validate_evidence_label(label: &str) -> Result<&str> {
     let trimmed = label.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_EVIDENCE_LABEL_CHARS {
         return Err(BrowserControlError::new(format!(
@@ -3776,7 +3919,7 @@ fn validate_evidence_label(label: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
-fn browser_target_not_found(name: &str) -> BrowserControlError {
+pub(crate) fn browser_target_not_found(name: &str) -> BrowserControlError {
     BrowserControlError::new(format!(
         "browser target '{name}' does not exist; open it first or list the available targets"
     ))
@@ -3831,7 +3974,7 @@ fn owner_label(label: &str) -> Option<String> {
 
 /// A page title as its owner's tools report it: without the owner prefix
 /// GitTerm adds for the user's benefit.
-fn strip_owner_prefix(title: &str, prefix: &str) -> String {
+pub(crate) fn strip_owner_prefix(title: &str, prefix: &str) -> String {
     title.strip_prefix(prefix).unwrap_or(title).to_string()
 }
 
@@ -3961,7 +4104,7 @@ async fn full_page_capture_params(session: &CdpSession, device_scale_factor: f64
     }))
 }
 
-fn validate_navigation_url(raw_url: &str) -> Result<Url> {
+pub(crate) fn validate_navigation_url(raw_url: &str) -> Result<Url> {
     let url = Url::parse(raw_url).map_err(|error| {
         BrowserControlError::new(format!("browser navigation URL is invalid: {error}"))
     })?;
@@ -3974,7 +4117,16 @@ fn validate_navigation_url(raw_url: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn locator_expression(locator: &BrowserLocator, preparation: LocatorPreparation) -> Result<String> {
+pub(crate) fn locator_expression(
+    locator: &BrowserLocator,
+    preparation: LocatorPreparation,
+) -> Result<String> {
+    if let BrowserLocator::Ref { .. } = locator {
+        return Err(BrowserControlError::new(
+            "browser ref locators come from browser_snapshot_refs and only work with the \
+             agent-browser engine's click and type; use a role, text, or CSS locator here",
+        ));
+    }
     let locator_json = serde_json::to_string(locator).map_err(|error| {
         BrowserControlError::new(format!("failed to serialize browser locator: {error}"))
     })?;
@@ -4130,7 +4282,7 @@ async fn evaluate_by_value<T: DeserializeOwned>(
     })
 }
 
-fn dom_outline_expression(target: &str) -> Result<String> {
+pub(crate) fn dom_outline_expression(target: &str) -> Result<String> {
     let target = serde_json::to_string(target).map_err(|error| {
         BrowserControlError::new(format!("failed to serialize browser target name: {error}"))
     })?;
@@ -4263,7 +4415,10 @@ fn dom_outline_expression(target: &str) -> Result<String> {
         .replace("__MAX_CLASSES__", &MAX_DOM_CLASSES.to_string()))
 }
 
-fn node_details_expression(target: &str, selector: &BrowserNodeSelector) -> Result<String> {
+pub(crate) fn node_details_expression(
+    target: &str,
+    selector: &BrowserNodeSelector,
+) -> Result<String> {
     let target = serde_json::to_string(target).map_err(|error| {
         BrowserControlError::new(format!("failed to serialize browser target name: {error}"))
     })?;
@@ -4467,7 +4622,7 @@ fn node_details_expression(target: &str, selector: &BrowserNodeSelector) -> Resu
         .replace("__MAX_OUTER_HTML__", &MAX_OUTER_HTML_CHARS.to_string()))
 }
 
-fn snapshot_expression() -> String {
+pub(crate) fn snapshot_expression() -> String {
     r#"(() => {
             const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
             const roleFor = (element) => {
@@ -5026,7 +5181,7 @@ mod tests {
         assert_eq!(long.chars().count(), MAX_OWNER_LABEL_CHARS);
         assert!(long.ends_with('…'));
 
-        let registry = BrowserTargetRegistry::default();
+        let registry: BrowserTargetRegistry = BrowserTargetRegistry::default();
         // Unnamed owners show a short form of their id.
         assert_eq!(registry.title_prefix("7d1c2a4e-0b3f"), "[7d1c2a4e] ");
         assert_eq!(strip_owner_prefix("[7d1c2a4e] Home", "[7d1c2a4e] "), "Home");

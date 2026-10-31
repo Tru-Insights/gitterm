@@ -1,10 +1,14 @@
 //! Authenticated loopback MCP exposure for the GitTerm-owned browser controller.
 
+use crate::agent_browser::{
+    BrowserDiff, BrowserDiffMode, BrowserNetworkCaptureAction, BrowserViewportRequest,
+};
 use crate::browser_control::{
     BrowserCaptureMode, BrowserControlError, BrowserControlService, BrowserKey,
     BrowserLaunchOptions, BrowserLocator, BrowserNodeSelector, BrowserOperation, BrowserSnapshot,
     BrowserViewport, BrowserWaitCondition,
 };
+use crate::browser_engine::{BrowserEngine, BrowserEngineKind};
 use crate::harness::acp::AcpMcpServer;
 use crate::harness::claude::ClaudeMcpServer;
 use crate::task_mcp::{caller_endpoint, caller_from_query, TASK_MCP_CALLER_QUERY};
@@ -18,7 +22,7 @@ use axum::{
 };
 use base64::Engine;
 use rmcp::{
-    handler::server::{tool::Extension, wrapper::Parameters},
+    handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
     transport::{
@@ -58,6 +62,7 @@ pub struct BrowserMcpConnection {
     token: String,
     cancellation: CancellationToken,
     browser: BrowserControlService,
+    engine: BrowserEngine,
 }
 
 impl BrowserMcpConnection {
@@ -86,6 +91,12 @@ impl BrowserMcpConnection {
     /// serializes complete browser operations.
     pub fn browser(&self) -> BrowserControlService {
         self.browser.clone()
+    }
+
+    /// The engine behind the browser tools (TRU-177), for the UI's own
+    /// calls that must reach it too, such as releasing closed chats.
+    pub fn engine(&self) -> BrowserEngine {
+        self.engine.clone()
     }
 
     /// Per-run Codex overrides avoid modifying global or project config files.
@@ -164,9 +175,10 @@ pub fn configure_browser_command(command: &str, endpoint: &str) -> String {
 /// The browser tools Claude may call without a permission prompt: exactly the
 /// inspection tools the server annotates `read_only_hint = true`. Mutating
 /// tools (navigate, click, type, …) still prompt, mirroring Codex's
-/// `default_tools_approval_mode=writes`. Kept in sync with the tool router by
-/// `claude_allowed_tools_match_the_read_only_annotations`.
-const CLAUDE_ALLOWED_READ_TOOLS: [&str; 10] = [
+/// `default_tools_approval_mode=writes`. Kept in sync with both engines' tool
+/// routers by `claude_allowed_tools_match_the_read_only_annotations`; the
+/// agent-browser-only names are harmless when the gitterm engine runs.
+const CLAUDE_ALLOWED_READ_TOOLS: [&str; 12] = [
     "browser_status",
     "browser_targets",
     "browser_snapshot",
@@ -177,6 +189,8 @@ const CLAUDE_ALLOWED_READ_TOOLS: [&str; 10] = [
     "browser_target_diagnostics",
     "browser_dom_outline",
     "browser_node_inspect",
+    "browser_snapshot_refs",
+    "browser_diff",
 ];
 
 /// Claude Code: a second `--mcp-config='{…}'` alongside the task server's
@@ -270,7 +284,7 @@ pub struct BrowserMcpServer {
     listener: std::net::TcpListener,
     token: String,
     cancellation: CancellationToken,
-    browser: BrowserControlService,
+    engine: BrowserEngine,
 }
 
 /// Reserve an endpoint from the V6-only loopback range synchronously so
@@ -286,19 +300,25 @@ pub fn prepare(
     let endpoint = format!("http://127.0.0.1:{port}/mcp");
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let cancellation = CancellationToken::new();
-    let browser = BrowserControlService::new(v6_global_config_dir);
+    let shared_config_dir = v6_global_config_dir.as_ref();
+    let browser = BrowserControlService::new(shared_config_dir);
+    // The engine choice is the shared config's browser.json (TRU-177),
+    // read once: the tool list an agent sees depends on it.
+    let engine = BrowserEngine::from_shared_config(shared_config_dir, browser.clone());
+    eprintln!("GitTerm V6 browser engine: {}", engine.describe());
     Ok((
         BrowserMcpConnection {
             endpoint,
             token: token.clone(),
             cancellation: cancellation.clone(),
-            browser: browser.clone(),
+            browser,
+            engine: engine.clone(),
         },
         BrowserMcpServer {
             listener,
             token,
             cancellation,
-            browser,
+            engine,
         },
     ))
 }
@@ -330,7 +350,7 @@ impl BrowserMcpServer {
         let listener = tokio::net::TcpListener::from_std(self.listener).map_err(|error| {
             format!("failed to activate the GitTerm V6 browser MCP listener: {error}")
         })?;
-        let tools = BrowserMcpTools::new(self.browser);
+        let tools = BrowserMcpTools::new(self.engine);
         let mcp_service: StreamableHttpService<BrowserMcpTools, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok::<_, std::io::Error>(tools.clone()),
@@ -380,15 +400,25 @@ async fn authenticate(
 
 #[derive(Clone)]
 struct BrowserMcpTools {
-    browser: BrowserControlService,
+    engine: BrowserEngine,
     agent_operation_lock: Arc<Mutex<()>>,
+    /// The tools this engine offers: the common set, plus the
+    /// agent-browser-only tools when that engine runs (TRU-177).
+    tool_router: ToolRouter<Self>,
 }
 
 impl BrowserMcpTools {
-    fn new(browser: BrowserControlService) -> Self {
+    fn new(engine: BrowserEngine) -> Self {
+        let tool_router = match engine.kind() {
+            Some(BrowserEngineKind::AgentBrowser) => {
+                Self::tool_router() + Self::agent_browser_tool_router()
+            }
+            Some(BrowserEngineKind::Gitterm) | None => Self::tool_router(),
+        };
         Self {
-            browser,
+            engine,
             agent_operation_lock: Arc::new(Mutex::new(())),
+            tool_router,
         }
     }
 
@@ -403,19 +433,18 @@ impl BrowserMcpTools {
         run: Run,
     ) -> crate::browser_control::Result<T>
     where
-        Run: FnOnce(BrowserControlService, String) -> Operation,
+        Run: FnOnce(BrowserEngine, String) -> Operation,
         Operation: Future<Output = crate::browser_control::Result<T>>,
     {
         let Some(caller) = caller_from_query(parts.uri.query()) else {
             return Err(BrowserControlError::new(missing_browser_caller_error()));
         };
         let _serial_operation = self.agent_operation_lock.lock().await;
-        let activity_id = self.browser.begin_agent_operation(operation).await;
-        let result = run(self.browser.clone(), caller).await;
+        let service = self.engine.service();
+        let activity_id = service.begin_agent_operation(operation).await;
+        let result = run(self.engine.clone(), caller).await;
         let error = result.as_ref().err().map(ToString::to_string);
-        self.browser
-            .finish_agent_operation(activity_id, error)
-            .await;
+        service.finish_agent_operation(activity_id, error).await;
         result
     }
 }
@@ -1128,7 +1157,174 @@ impl BrowserMcpTools {
     }
 }
 
-#[tool_handler]
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SnapshotRefsRequest {
+    /// One of this chat's named browser targets. Omit to use its active target.
+    target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DiffRequest {
+    /// One of this chat's named browser targets. Omit to use its active target.
+    target: Option<String>,
+    /// Label of this chat's browser_capture evidence to compare against.
+    baseline_label: String,
+    /// The target that evidence was captured on. Defaults to `target`.
+    baseline_target: Option<String>,
+    mode: BrowserDiffMode,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct NetworkCaptureRequest {
+    /// One of this chat's named browser targets. Omit to use its active target.
+    target: Option<String>,
+    action: BrowserNetworkCaptureAction,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ViewportRequest {
+    /// One of this chat's named browser targets. Omit to use its active target.
+    target: Option<String>,
+    /// Device preset such as "iPhone 15" or "Pixel 9"; or give width and height.
+    device: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    device_scale_factor: Option<f64>,
+}
+
+/// Tools only the agent-browser engine offers (TRU-177). With the gitterm
+/// engine they are not in the tool list at all.
+#[tool_router(router = agent_browser_tool_router)]
+impl BrowserMcpTools {
+    #[tool(
+        description = "Interactive accessibility tree with refs (e3) for click and type ref locators. Capped; says when cut.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_snapshot_refs(
+        &self,
+        Parameters(request): Parameters<SnapshotRefsRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        structured_browser_result(
+            self.run_agent_operation(
+                BrowserOperation::Snapshot,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .snapshot_refs_in(&caller, request.target.as_deref())
+                        .await
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Diff the page against this chat's labelled browser_capture evidence, as accessibility-tree text or pixels.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_diff(
+        &self,
+        Parameters(request): Parameters<DiffRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        match self
+            .run_agent_operation(
+                BrowserOperation::Snapshot,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .diff_in(
+                            &caller,
+                            request.target.as_deref(),
+                            &request.baseline_label,
+                            request.baseline_target.as_deref(),
+                            request.mode,
+                        )
+                        .await
+                },
+            )
+            .await
+        {
+            Ok(diff) => diff_result(diff),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Start or stop recording a target's requests; stop returns method, URL, status, type and timing per request.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_network_capture(
+        &self,
+        Parameters(request): Parameters<NetworkCaptureRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        structured_browser_result(
+            self.run_agent_operation(
+                BrowserOperation::Network,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .network_capture_in(&caller, request.target.as_deref(), request.action)
+                        .await
+                },
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Emulate a device preset or set the viewport size of a target.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn browser_viewport(
+        &self,
+        Parameters(request): Parameters<ViewportRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        let viewport = BrowserViewportRequest {
+            device: request.device,
+            width: request.width,
+            height: request.height,
+            device_scale_factor: request.device_scale_factor,
+        };
+        structured_browser_result(
+            self.run_agent_operation(
+                BrowserOperation::Resize,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .viewport_in(&caller, request.target.as_deref(), &viewport)
+                        .await
+                },
+            )
+            .await,
+        )
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for BrowserMcpTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1166,6 +1362,26 @@ fn snapshot_result(snapshot: BrowserSnapshot) -> CallToolResult {
         ContentBlock::text(text),
         ContentBlock::image(image, "image/png"),
     ]);
+    result.structured_content = Some(structured);
+    result
+}
+
+fn diff_result(diff: BrowserDiff) -> CallToolResult {
+    let structured = match serialize_structured_content(&diff) {
+        Ok(value) => value,
+        Err(error) => {
+            return tool_error(format!("failed to serialize browser diff: {error}"));
+        }
+    };
+    let text = serde_json::to_string_pretty(&structured).unwrap_or_else(|_| structured.to_string());
+    let mut content = vec![ContentBlock::text(text)];
+    if let Some(png) = &diff.diff_png {
+        content.push(ContentBlock::image(
+            base64::engine::general_purpose::STANDARD.encode(png),
+            "image/png",
+        ));
+    }
+    let mut result = CallToolResult::success(content);
     result.structured_content = Some(structured);
     result
 }
@@ -1314,7 +1530,7 @@ mod tests {
     async fn a_call_without_a_caller_is_refused_before_the_browser() {
         let temp = tempdir().unwrap();
         let browser = BrowserControlService::new(temp.path());
-        let tools = BrowserMcpTools::new(browser.clone());
+        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser.clone()));
         for uri in ["/mcp", "/mcp?caller=", "/mcp?other=1"] {
             let result = tools.browser_targets(Extension(request_parts(uri))).await;
             assert_eq!(error_text(&result), missing_browser_caller_error(), "{uri}");
@@ -1340,7 +1556,7 @@ mod tests {
         browser
             .insert_test_target("chat-b", "primary", "tab-b")
             .await;
-        let tools = BrowserMcpTools::new(browser);
+        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser));
         let chat_a = || Extension(request_parts("/mcp?caller=chat-a"));
         let chat_b = || Extension(request_parts("/mcp?caller=chat-b"));
 
@@ -1375,7 +1591,7 @@ mod tests {
         browser
             .insert_test_target("chat-a", "design", "tab-1")
             .await;
-        let tools = BrowserMcpTools::new(browser);
+        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser));
         let chat_a = || Extension(request_parts("/mcp?caller=chat-a"));
         let chat_b = || Extension(request_parts("/mcp?caller=chat-b"));
         let design = || {
@@ -1420,7 +1636,9 @@ mod tests {
     #[test]
     fn tool_surface_marks_inspection_tools_read_only() {
         let temp = tempdir().unwrap();
-        let _tools = BrowserMcpTools::new(BrowserControlService::new(temp.path()));
+        let _tools = BrowserMcpTools::new(BrowserEngine::GitTerm(BrowserControlService::new(
+            temp.path(),
+        )));
         let routes = BrowserMcpTools::tool_router();
         let listed = routes.list_all();
         let find = |name: &str| routes.get(name).unwrap_or_else(|| panic!("missing {name}"));
@@ -1472,6 +1690,54 @@ mod tests {
     }
 
     #[test]
+    fn only_the_agent_browser_engine_lists_its_tools_and_the_list_stays_small() {
+        let temp = tempdir().unwrap();
+        let listed = |engine: BrowserEngine| {
+            let mut tools = BrowserMcpTools::new(engine).tool_router.list_all();
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
+            tools
+        };
+        let gitterm = listed(BrowserEngine::GitTerm(BrowserControlService::new(
+            temp.path(),
+        )));
+        let agent_browser = listed(BrowserEngine::from_config(
+            temp.path(),
+            &crate::browser_engine::BrowserEngineConfig {
+                engine: BrowserEngineKind::AgentBrowser,
+                agent_browser_path: Some(temp.path().join("agent-browser")),
+            },
+            BrowserControlService::new(temp.path()),
+        ));
+        let extras = [
+            "browser_snapshot_refs",
+            "browser_diff",
+            "browser_network_capture",
+            "browser_viewport",
+        ];
+        assert_eq!(gitterm.len(), 22);
+        assert_eq!(agent_browser.len(), 26);
+        assert!(!gitterm
+            .iter()
+            .any(|tool| extras.contains(&tool.name.as_ref())));
+        // The common tools are byte-identical under both engines.
+        let common: Vec<_> = agent_browser
+            .iter()
+            .filter(|tool| !extras.contains(&tool.name.as_ref()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            serde_json::to_string(&common).unwrap(),
+            serde_json::to_string(&gitterm).unwrap()
+        );
+        let gitterm_bytes = serde_json::to_vec(&gitterm).unwrap().len();
+        let agent_browser_bytes = serde_json::to_vec(&agent_browser).unwrap().len();
+        eprintln!(
+            "browser tool list: gitterm engine {gitterm_bytes} bytes, agent-browser engine {agent_browser_bytes} bytes"
+        );
+        assert!(agent_browser_bytes < 40_000, "{agent_browser_bytes}");
+    }
+
+    #[test]
     fn codex_commands_receive_ephemeral_config_without_touching_other_agents() {
         let endpoint = "http://127.0.0.1:45678/mcp";
         let configured = configure_codex_command("codex resume --last", endpoint);
@@ -1509,7 +1775,7 @@ mod tests {
 
     #[test]
     fn claude_allowed_tools_match_the_read_only_annotations() {
-        let routes = BrowserMcpTools::tool_router();
+        let routes = BrowserMcpTools::tool_router() + BrowserMcpTools::agent_browser_tool_router();
         let mut annotated: Vec<String> = routes
             .list_all()
             .into_iter()
@@ -1563,7 +1829,7 @@ mod tests {
     async fn mcp_tools_publish_agent_operation_activity() {
         let temp = tempdir().unwrap();
         let browser = BrowserControlService::new(temp.path());
-        let tools = BrowserMcpTools::new(browser.clone());
+        let tools = BrowserMcpTools::new(BrowserEngine::GitTerm(browser.clone()));
 
         let result = tools
             .browser_status(Extension(request_parts("/mcp?caller=chat-a")))
