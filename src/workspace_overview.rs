@@ -10,19 +10,23 @@
 //! (a worker in a task worktree folds under the coordinator that started
 //! it). Which branches (design decision 13, minus manual Add/Ignore):
 //!
-//! - (a) facts checkouts with edits, or any linked worktree a chat worked
-//!   in; a main checkout only visited by `cd` never counts;
+//! - (a) facts checkouts with edits, or any linked worktree on a branch a
+//!   chat worked in; a main checkout or a detached worktree only visited by
+//!   `cd` never counts;
 //! - (b) task worktrees the chats created (facts children with a task id,
 //!   which `chat_facts::resolve_tree` fills from delegations and tasks);
 //! - (c) worktrees in the work's repos whose branch names one of its issue
-//!   keys.
+//!   keys (keys whose prefix an owned branch or worktree name carries).
 //!
-//! Nothing else in a shared repo appears. Polling (decisions 16 and 18):
-//! only owned checkouts, one `git status --porcelain=v2 --branch` and one
-//! `git rev-list --left-right --count base...HEAD` each, in a background
-//! task with timeouts; a gated refresh first compares a stat of the
-//! checkout's gitdir `index`, `HEAD` and `logs/HEAD` and runs no git when
-//! nothing moved. Status output is counted, never stored, and capped.
+//! Nothing else in a shared repo appears. Repos, branches and keys are read
+//! for a [`Focus`]: the most recently active coordinator by default, or the
+//! union over the last 7 days. Polling (decisions 16, 18): only owned
+//! checkouts, one `git status --porcelain=v2 --branch` and one
+//! `for-each-ref` measuring every base candidate each, in a background task
+//! with timeouts; a gated refresh first compares a stat of the checkout's
+//! gitdir `index`, `HEAD` and `logs/HEAD` and runs no git when nothing
+//! moved. A checkout whose folder is gone gets no git. Status output is
+//! counted, never stored, and capped.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -46,8 +50,12 @@ pub const STATUS_COUNT_CAP: usize = 5000;
 pub const DIFF_LINE_CAP: usize = 20_000;
 /// Untracked file names listed in an Uncommitted diff.
 const UNTRACKED_LIST_CAP: usize = 200;
-/// Local branch names tried, in order, for the repo default base.
-const DEFAULT_BRANCHES: [&str; 4] = ["main", "master", "develop", "trunk"];
+/// Integration branch names tried as a base, remote then local, in this
+/// order on a tie.
+const INTEGRATION_BRANCHES: [&str; 4] = ["develop", "main", "master", "trunk"];
+/// Coordinators active within this are recent: listed by default and the
+/// only ones a union view reads.
+pub const RECENT_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
 
 // ---------------------------------------------------------------------------
 // Chats, repos and issue keys.
@@ -80,6 +88,10 @@ pub struct Coordinator {
     pub title: String,
     pub latest: Option<String>,
     pub mtime: SystemTime,
+    /// Latest activity of the root or any indexed child.
+    pub active: SystemTime,
+    /// Active within [`RECENT_WINDOW`].
+    pub recent: bool,
     /// "35 subagents · 2 workers"; `None` without children.
     pub fan_out: Option<String>,
     /// Children with an index entry of their own (workers, reviews), newest
@@ -115,9 +127,17 @@ pub fn folder_name(path: &Path) -> String {
 }
 
 /// Coordinators of `work` (roots, children folded under them as the Chats
-/// panel folds them), newest first.
-pub fn coordinators(work: &[&ChatIndexEntry], all: &[ChatIndexEntry]) -> Vec<Coordinator> {
-    chats::fold_under_roots(work, all)
+/// panel folds them), most recently active first; `recent` when the root or
+/// a child moved within [`RECENT_WINDOW`] of `now`.
+pub fn coordinators(
+    work: &[&ChatIndexEntry],
+    all: &[ChatIndexEntry],
+    now: SystemTime,
+) -> Vec<Coordinator> {
+    let cutoff = now
+        .checked_sub(RECENT_WINDOW)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut out: Vec<Coordinator> = chats::fold_under_roots(work, all)
         .into_iter()
         .map(|folded| {
             let root = folded.root;
@@ -139,18 +159,86 @@ pub fn coordinators(work: &[&ChatIndexEntry], all: &[ChatIndexEntry]) -> Vec<Coo
                     kind: kind_of(&child.id),
                     mtime: child.mtime,
                 })
-                .collect();
+                .collect::<Vec<CoordinatorChild>>();
+            let active = children
+                .iter()
+                .map(|child| child.mtime)
+                .chain([root.mtime])
+                .max()
+                .unwrap_or(root.mtime);
             Coordinator {
                 id: root.id.clone(),
                 title: root.title.clone(),
                 latest: root.latest.clone(),
                 mtime: root.mtime,
+                active,
+                recent: active >= cutoff,
                 fan_out: root
                     .facts
                     .as_ref()
                     .and_then(chat_facts::ChatFacts::fan_out_line),
                 children,
             }
+        })
+        .collect();
+    out.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+/// Which coordinators the repos, branches and issues are read for: the
+/// interim answer until a workspace owns its chats (design step 4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Focus {
+    /// The most recently active coordinator (the default).
+    #[default]
+    Latest,
+    /// One coordinator, picked by hand.
+    Coordinator(String),
+    /// The union over the recent coordinators.
+    AllRecent,
+}
+
+/// The root ids `focus` reads, from `coordinators` (sorted, most recently
+/// active first). `Latest` takes the newest recent coordinator, else the
+/// newest of all; a picked coordinator that left the list reads as
+/// `Latest`.
+pub fn focused_roots(focus: &Focus, coordinators: &[Coordinator]) -> Vec<String> {
+    let latest = || {
+        coordinators
+            .iter()
+            .find(|c| c.recent)
+            .or_else(|| coordinators.first())
+            .map(|c| vec![c.id.clone()])
+            .unwrap_or_default()
+    };
+    match focus {
+        Focus::Latest => latest(),
+        Focus::Coordinator(id) => {
+            if coordinators.iter().any(|c| &c.id == id) {
+                vec![id.clone()]
+            } else {
+                latest()
+            }
+        }
+        Focus::AllRecent => coordinators
+            .iter()
+            .filter(|c| c.recent)
+            .map(|c| c.id.clone())
+            .collect(),
+    }
+}
+
+/// The chats under `roots`: the roots and every chat folded under them.
+pub fn chats_under<'a>(entries: &'a [ChatIndexEntry], roots: &[String]) -> Vec<&'a ChatIndexEntry> {
+    let roots: HashSet<&str> = roots.iter().map(String::as_str).collect();
+    entries
+        .iter()
+        .filter(|entry| {
+            roots.contains(entry.id.as_str())
+                || entry
+                    .root_id
+                    .as_deref()
+                    .is_some_and(|root| roots.contains(root))
         })
         .collect()
 }
@@ -174,35 +262,28 @@ pub fn repos_touched(work: &[&ChatIndexEntry]) -> Vec<RepoTouched> {
     repos
 }
 
-/// The work's issue keys, most mentioned first, with obvious false
-/// positives dropped: a key needs 2+ digits, or a prefix that also names
-/// one of `branches` or that occurs more than once across `per_chat`
-/// (`GPT-5` or `SHA-1` mentioned once is prose, not an issue).
-pub fn work_issue_keys(per_chat: &[&[String]], branches: &[&str]) -> Vec<String> {
-    let branch_prefixes: HashSet<String> = branches
+/// The work's issue keys, most mentioned first. A key is kept only when
+/// its prefix also appears in one of `names` (the work's owned branch and
+/// worktree folder names): a prefix seen only in chat text never
+/// qualifies. Year-like (`BETA-2026`) and zero-padded (`ARTIST-00`) numbers
+/// are dropped everywhere, including as the source of a prefix.
+pub fn work_issue_keys(per_chat: &[&[String]], names: &[&str]) -> Vec<String> {
+    let name_prefixes: HashSet<String> = names
         .iter()
-        .flat_map(|branch| chat_facts::issue_keys_in_name(branch))
+        .flat_map(|name| chat_facts::issue_keys_in_name(name))
+        .filter(|key| plausible_key(key))
         .filter_map(|key| key_prefix(&key).map(str::to_string))
         .collect();
     let mut key_count: HashMap<&str, usize> = HashMap::new();
-    let mut prefix_count: HashMap<&str, usize> = HashMap::new();
     for keys in per_chat {
         for key in keys.iter() {
             *key_count.entry(key.as_str()).or_default() += 1;
-            if let Some(prefix) = key_prefix(key) {
-                *prefix_count.entry(prefix).or_default() += 1;
-            }
         }
     }
     let mut kept: Vec<(&str, usize)> = key_count
         .into_iter()
         .filter(|(key, _)| {
-            let Some((prefix, digits)) = key.split_once('-') else {
-                return false;
-            };
-            digits.len() >= 2
-                || branch_prefixes.contains(prefix)
-                || prefix_count.get(prefix).copied().unwrap_or(0) > 1
+            plausible_key(key) && key_prefix(key).is_some_and(|p| name_prefixes.contains(p))
         })
         .collect();
     kept.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
@@ -211,6 +292,15 @@ pub fn work_issue_keys(per_chat: &[&[String]], branches: &[&str]) -> Vec<String>
 
 fn key_prefix(key: &str) -> Option<&str> {
     key.split_once('-').map(|(prefix, _)| prefix)
+}
+
+/// Not a year (`-1990`..`-2099`) and not zero-padded (`-00`, `-05`).
+fn plausible_key(key: &str) -> bool {
+    let Some((_, number)) = key.split_once('-') else {
+        return false;
+    };
+    let year_like = number.len() == 4 && (number.starts_with("19") || number.starts_with("20"));
+    !number.starts_with('0') && !year_like
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +362,9 @@ pub struct BranchCandidate {
     /// worktree, whose record holds the common dir).
     pub repo: Option<PathBuf>,
     pub checkout: PathBuf,
+    /// Branch as last seen by the facts or recorded by the task; its name
+    /// (and the checkout folder's) qualify issue-key prefixes.
+    pub branch: Option<String>,
     pub ownership: Ownership,
     pub owner: String,
     /// RFC 3339 time of the latest touch the facts recorded.
@@ -336,10 +429,11 @@ pub fn branch_candidates(work: &[&ChatIndexEntry], tasks: &[TaskInfo]) -> Vec<Br
             let linked = checkout.dir != checkout.repo;
             let ownership = if checkout.edits > 0 {
                 Ownership::Edited
-            } else if linked {
+            } else if linked && checkout.branch.is_some() {
                 Ownership::WorkedIn
             } else {
-                // A main checkout visited by `cd` names nothing.
+                // A main checkout, or a detached worktree, only visited by
+                // `cd` names nothing; a detached one needs edits or a task.
                 continue;
             };
             add_candidate(
@@ -347,6 +441,7 @@ pub fn branch_candidates(work: &[&ChatIndexEntry], tasks: &[TaskInfo]) -> Vec<Br
                 BranchCandidate {
                     repo: Some(checkout.repo.clone()),
                     checkout: checkout.dir.clone(),
+                    branch: checkout.branch.clone(),
                     ownership,
                     owner: chat_owner(entry, &kinds, roots),
                     last: Some(checkout.last.clone()),
@@ -368,6 +463,7 @@ pub fn branch_candidates(work: &[&ChatIndexEntry], tasks: &[TaskInfo]) -> Vec<Br
             BranchCandidate {
                 repo: None,
                 checkout: worktree.clone(),
+                branch: Some(task.branch.clone()),
                 ownership: Ownership::Task,
                 owner: format!("worker {}", task.short_label()),
                 last: None,
@@ -407,6 +503,9 @@ fn add_candidate(out: &mut Vec<BranchCandidate>, candidate: BranchCandidate) {
     if known.repo.is_none() {
         known.repo = candidate.repo;
     }
+    if known.branch.is_none() {
+        known.branch = candidate.branch;
+    }
     if known.task.is_none() {
         known.task = candidate.task;
     }
@@ -438,13 +537,17 @@ pub struct OwnedBranch {
     pub last: Option<String>,
     pub edits: u64,
     pub task: Option<TaskLink>,
+    /// Still listed by git but its folder is gone (a removed `/tmp`
+    /// worktree not yet pruned): shown folded, never read.
+    pub gone: bool,
 }
 
 /// Confirms candidates against `worktrees` (main checkout -> its list,
 /// paths canonical) and adds rule (c): worktrees of `key_repos` whose
 /// branch names one of `issue_keys`. A candidate whose checkout is no
-/// longer a worktree is dropped. Rows come out grouped by `key_repos`
-/// order (then other repos by path), main checkout first, then by branch.
+/// longer a worktree is dropped, and so is a worktree only visited that is
+/// detached now. Rows come out grouped by `key_repos` order (then other
+/// repos by path), main checkout first, then by branch.
 pub fn resolve_owned(
     candidates: &[BranchCandidate],
     issue_keys: &[String],
@@ -464,6 +567,9 @@ pub fn resolve_owned(
         let Some((repo, list, index)) = found else {
             continue;
         };
+        if list[index].branch.is_none() && candidate.ownership == Ownership::WorkedIn {
+            continue;
+        }
         out.push(OwnedBranch {
             repo: repo.clone(),
             checkout: list[index].path.clone(),
@@ -474,6 +580,7 @@ pub fn resolve_owned(
             last: candidate.last.clone(),
             edits: candidate.edits,
             task: candidate.task.clone(),
+            gone: false,
         });
     }
     let wanted: HashSet<&str> = issue_keys.iter().map(String::as_str).collect();
@@ -504,6 +611,7 @@ pub fn resolve_owned(
                 last: None,
                 edits: 0,
                 task: None,
+                gone: false,
             });
         }
     }
@@ -536,7 +644,13 @@ fn locate(list: &[WorktreeInfo], checkout: &Path) -> Option<usize> {
 /// the index, no I/O).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkSummary {
+    /// Every coordinator of the workspace, most recently active first;
+    /// `recent` ones are listed, the rest fold under "older".
     pub coordinators: Vec<Coordinator>,
+    /// The focus asked for, and the roots it resolved to. Repos, branches
+    /// and issues below are those of these roots and their children only.
+    pub focus: Focus,
+    pub focused: Vec<String>,
     pub repos: Vec<RepoTouched>,
     pub issue_keys: Vec<String>,
     pub candidates: Vec<BranchCandidate>,
@@ -549,33 +663,36 @@ pub struct WorkSummary {
 }
 
 impl WorkSummary {
-    pub fn build(entries: &[ChatIndexEntry], ws_dir: &Path, tasks: &[TaskInfo]) -> Self {
-        let work = work_chats(entries, ws_dir);
+    pub fn build(
+        entries: &[ChatIndexEntry],
+        ws_dir: &Path,
+        tasks: &[TaskInfo],
+        focus: &Focus,
+        now: SystemTime,
+    ) -> Self {
+        let all_work = work_chats(entries, ws_dir);
+        let coordinators = coordinators(&all_work, entries, now);
+        let focused = focused_roots(focus, &coordinators);
+        let work = chats_under(entries, &focused);
         let repos = repos_touched(&work);
         let candidates = branch_candidates(&work, tasks);
-        let mut branches: Vec<&str> = work
+        // Owned branch and worktree folder names qualify key prefixes.
+        let folders: Vec<String> = candidates
             .iter()
-            .filter_map(|entry| entry.facts.as_ref())
-            .flat_map(|facts| facts.checkouts.iter())
-            .filter_map(|checkout| checkout.branch.as_deref())
+            .filter(|candidate| candidate.repo.as_ref() != Some(&candidate.checkout))
+            .map(|candidate| folder_name(&candidate.checkout))
             .collect();
-        let work_tasks: HashSet<&str> = candidates
+        let names: Vec<&str> = candidates
             .iter()
-            .filter_map(|candidate| candidate.task.as_ref())
-            .map(|task| task.task_id.as_str())
+            .filter_map(|candidate| candidate.branch.as_deref())
+            .chain(folders.iter().map(String::as_str))
             .collect();
-        branches.extend(
-            tasks
-                .iter()
-                .filter(|task| work_tasks.contains(task.task_id.as_str()))
-                .map(|task| task.branch.as_str()),
-        );
         let per_chat: Vec<&[String]> = work
             .iter()
             .filter_map(|entry| entry.facts.as_ref())
             .map(|facts| facts.issue_keys.as_slice())
             .collect();
-        let issue_keys = work_issue_keys(&per_chat, &branches);
+        let issue_keys = work_issue_keys(&per_chat, &names);
         let mut key_repos: Vec<PathBuf> = repos.iter().map(|repo| repo.dir.clone()).collect();
         for repo in candidates.iter().filter_map(|c| c.repo.as_ref()) {
             if !key_repos.contains(repo) {
@@ -583,136 +700,241 @@ impl WorkSummary {
             }
         }
         Self {
-            coordinators: coordinators(&work, entries),
+            coordinators,
+            focus: focus.clone(),
+            focused,
             repos,
             issue_keys,
             candidates,
             key_repos,
-            chat_count: work.len(),
-            has_facts: work.iter().any(|entry| entry.facts.is_some()),
+            chat_count: all_work.len(),
+            has_facts: all_work.iter().any(|entry| entry.facts.is_some()),
         }
+    }
+
+    /// "Focus: <title>" copy for the header.
+    pub fn focus_label(&self) -> String {
+        match &self.focus {
+            Focus::AllRecent => format!(
+                "All recent work \u{00B7} {} coordinator{}",
+                self.focused.len(),
+                if self.focused.len() == 1 { "" } else { "s" }
+            ),
+            _ => self
+                .focused
+                .first()
+                .and_then(|id| self.coordinators.iter().find(|c| &c.id == id))
+                .map(|c| c.title.clone())
+                .unwrap_or_else(|| "no chats".to_string()),
+        }
+    }
+
+    pub fn recent_count(&self) -> usize {
+        self.coordinators.iter().filter(|c| c.recent).count()
     }
 }
 
 // ---------------------------------------------------------------------------
 // Base selection.
+//
+// A repo's integration branch is not always `origin/HEAD` (one works off
+// `develop` while `main` sits far behind), so every plausible base is
+// measured and the one with the nearest merge-base wins: the fewest
+// commits on HEAD that it lacks. The row names the winner and where it
+// came from, so the comparison is never a guess.
 
-/// Where a row's base came from (decision 15); shown on the row.
+/// Where a row's base came from; shown on the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseSource {
     /// The task's recorded base branch.
     Task,
-    /// The remote's default branch (`origin/HEAD`, else `origin/main` or
-    /// `origin/master`); the diff is against its merge-base.
-    Upstream,
-    /// A local default branch (`main`, `master`, `develop`, `trunk`).
-    RepoDefault,
+    /// The branch's tracking ref, when it is another branch.
+    Tracking,
+    /// `origin/develop`, `origin/main`, `origin/master`, `origin/trunk`.
+    Remote,
+    /// The local forms of those.
+    Local,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseChoice {
+    /// What git is given: `origin/develop`, `develop`, a task's base.
     pub reference: String,
     pub source: BaseSource,
+    /// Candidates that exist here; the base is the nearest of them.
+    pub considered: usize,
 }
 
 impl BaseChoice {
-    /// "task base", "upstream default", "repo default".
     pub fn source_label(&self) -> &'static str {
         match self.source {
             BaseSource::Task => "task base",
-            BaseSource::Upstream => "upstream default",
-            BaseSource::RepoDefault => "repo default",
+            BaseSource::Tracking => "tracked branch",
+            BaseSource::Remote => "remote",
+            BaseSource::Local => "local",
+        }
+    }
+
+    /// "task base, nearest of 4".
+    pub fn describe(&self) -> String {
+        if self.considered > 1 {
+            format!("{}, nearest of {}", self.source_label(), self.considered)
+        } else {
+            self.source_label().to_string()
         }
     }
 }
 
-/// The candidate base refs one repo has.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RepoRefs {
-    /// Short name of the remote default, e.g. `origin/main`.
-    pub upstream: Option<String>,
-    /// Which of `DEFAULT_BRANCHES` exist locally, in that order.
-    pub local: Vec<String>,
+/// A ref that may be a row's base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseCandidate {
+    /// Full ref name measured (`refs/remotes/origin/develop`), or a raw
+    /// revision for a task base that is not a ref.
+    pub refname: String,
+    pub reference: String,
+    pub source: BaseSource,
 }
 
-/// The `for-each-ref` arguments [`parse_repo_refs`] reads.
-pub fn repo_refs_args() -> Vec<String> {
+/// The candidates, in tie-break order: the task base, the tracking ref when
+/// it names another branch than `branch`, then `origin/<integration>` and
+/// the local `<integration>` branches. The checked-out branch itself is
+/// never its own base.
+pub fn base_candidates(
+    task_base: Option<&str>,
+    branch: Option<&str>,
+    upstream: Option<&str>,
+) -> Vec<BaseCandidate> {
+    fn push(out: &mut Vec<BaseCandidate>, refname: String, reference: &str, source: BaseSource) {
+        if !out.iter().any(|known| known.refname == refname) {
+            out.push(BaseCandidate {
+                refname,
+                reference: reference.to_string(),
+                source,
+            });
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(base) = task_base.map(str::trim).filter(|base| !base.is_empty()) {
+        if base.starts_with("refs/") {
+            push(&mut out, base.to_string(), base, BaseSource::Task);
+        } else {
+            push(
+                &mut out,
+                format!("refs/heads/{base}"),
+                base,
+                BaseSource::Task,
+            );
+            push(
+                &mut out,
+                format!("refs/remotes/{base}"),
+                base,
+                BaseSource::Task,
+            );
+        }
+    }
+    if let Some(upstream) = upstream.map(str::trim).filter(|u| !u.is_empty()) {
+        let tail = upstream.split_once('/').map(|(_, rest)| rest);
+        let same = Some(upstream) == branch || (tail.is_some() && tail == branch);
+        if !same {
+            push(
+                &mut out,
+                format!("refs/remotes/{upstream}"),
+                upstream,
+                BaseSource::Tracking,
+            );
+            push(
+                &mut out,
+                format!("refs/heads/{upstream}"),
+                upstream,
+                BaseSource::Tracking,
+            );
+        }
+    }
+    for name in INTEGRATION_BRANCHES {
+        push(
+            &mut out,
+            format!("refs/remotes/origin/{name}"),
+            &format!("origin/{name}"),
+            BaseSource::Remote,
+        );
+    }
+    for name in INTEGRATION_BRANCHES {
+        push(
+            &mut out,
+            format!("refs/heads/{name}"),
+            name,
+            BaseSource::Local,
+        );
+    }
+    if let Some(branch) = branch {
+        let own = format!("refs/heads/{branch}");
+        out.retain(|candidate| candidate.refname != own);
+    }
+    out
+}
+
+/// One `for-each-ref` measuring every candidate ref against HEAD.
+pub fn ahead_behind_args(candidates: &[BaseCandidate]) -> Vec<String> {
     let mut args: Vec<String> = [
         "--no-optional-locks",
         "for-each-ref",
-        "--format=%(refname)%09%(symref)",
-        "refs/remotes/origin/HEAD",
-        "refs/remotes/origin/main",
-        "refs/remotes/origin/master",
+        "--format=%(refname)%09%(ahead-behind:HEAD)",
     ]
     .iter()
     .map(|arg| arg.to_string())
     .collect();
     args.extend(
-        DEFAULT_BRANCHES
+        candidates
             .iter()
-            .map(|name| format!("refs/heads/{name}")),
+            .filter(|candidate| candidate.refname.starts_with("refs/"))
+            .map(|candidate| candidate.refname.clone()),
     );
     args
 }
 
-/// Parses `git for-each-ref --format=%(refname)%09%(symref)` over the refs
-/// of [`repo_refs_args`]. `for-each-ref` also matches refs below a pattern
-/// (`refs/heads/main/x`), so only exact names count.
-pub fn parse_repo_refs(output: &str) -> RepoRefs {
-    let mut origin_head: Option<String> = None;
-    let mut origin_named: Vec<&str> = Vec::new();
-    let mut local: HashSet<&str> = HashSet::new();
-    for line in output.lines() {
-        let (name, symref) = line.split_once('\t').unwrap_or((line, ""));
-        if name == "refs/remotes/origin/HEAD" {
-            origin_head = symref
-                .strip_prefix("refs/remotes/")
-                .filter(|target| !target.is_empty())
-                .map(str::to_string);
-        } else if let Some(short) = name.strip_prefix("refs/remotes/") {
-            if short == "origin/main" || short == "origin/master" {
-                origin_named.push(short);
-            }
-        } else if let Some(short) = name.strip_prefix("refs/heads/") {
-            if DEFAULT_BRANCHES.contains(&short) {
-                local.insert(short);
-            }
-        }
-    }
-    let upstream = origin_head.or_else(|| {
-        ["origin/main", "origin/master"]
-            .into_iter()
-            .find(|name| origin_named.contains(name))
-            .map(str::to_string)
-    });
-    RepoRefs {
-        upstream,
-        local: DEFAULT_BRANCHES
-            .iter()
-            .filter(|name| local.contains(*name))
-            .map(|name| name.to_string())
-            .collect(),
-    }
+/// Parses `%(refname)%09%(ahead-behind:HEAD)` lines into refname ->
+/// `(behind, ahead)` of HEAD against that ref (the atom prints commits only
+/// in the ref, then commits only in HEAD).
+pub fn parse_ahead_behind(output: &str) -> HashMap<String, (u32, u32)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (name, counts) = line.split_once('\t')?;
+            Some((name.to_string(), parse_left_right(counts)?))
+        })
+        .collect()
 }
 
-/// The task's base, else the upstream default, else the repo default.
-pub fn choose_base(task_base: Option<&str>, refs: &RepoRefs) -> Option<BaseChoice> {
-    if let Some(base) = task_base.filter(|base| !base.trim().is_empty()) {
-        return Some(BaseChoice {
-            reference: base.trim().to_string(),
-            source: BaseSource::Task,
-        });
+/// The measured candidate with the nearest merge-base (fewest commits
+/// ahead of it); ties go to candidate order. With its `(behind, ahead)`.
+pub fn choose_nearest(
+    candidates: &[BaseCandidate],
+    measured: &HashMap<String, (u32, u32)>,
+) -> Option<(BaseChoice, (u32, u32))> {
+    let present: Vec<(&BaseCandidate, (u32, u32))> = candidates
+        .iter()
+        .filter_map(|candidate| measured.get(&candidate.refname).map(|c| (candidate, *c)))
+        .collect();
+    let considered = present
+        .iter()
+        .map(|(candidate, _)| candidate.reference.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let mut best: Option<(&BaseCandidate, (u32, u32))> = None;
+    for (candidate, counts) in present {
+        if best.is_none_or(|(_, (_, ahead))| counts.1 < ahead) {
+            best = Some((candidate, counts));
+        }
     }
-    if let Some(upstream) = &refs.upstream {
-        return Some(BaseChoice {
-            reference: upstream.clone(),
-            source: BaseSource::Upstream,
-        });
-    }
-    refs.local.first().map(|local| BaseChoice {
-        reference: local.clone(),
-        source: BaseSource::RepoDefault,
+    best.map(|(candidate, counts)| {
+        (
+            BaseChoice {
+                reference: candidate.reference.clone(),
+                source: candidate.source,
+                considered,
+            },
+            counts,
+        )
     })
 }
 
@@ -1097,7 +1319,8 @@ pub fn age_label(at: SystemTime) -> String {
 }
 
 /// Runs one refresh: sequential git calls, each with [`GIT_TIMEOUT`], no
-/// new call after [`REFRESH_DEADLINE`]. Never call on the UI thread.
+/// new call after [`REFRESH_DEADLINE`]. A checkout whose folder is gone
+/// gets no git call at all. Never call on the UI thread.
 pub async fn refresh(plan: RefreshPlan) -> RefreshOutcome {
     let started = Instant::now();
     let mut outcome = RefreshOutcome {
@@ -1108,19 +1331,28 @@ pub async fn refresh(plan: RefreshPlan) -> RefreshOutcome {
         skipped_unchanged: 0,
         took: Duration::ZERO,
     };
-    let owned_with_base: Vec<(OwnedBranch, Option<BaseChoice>)> = match plan.mode {
-        RefreshMode::Gated => plan
-            .previous
-            .iter()
-            .map(|row| (row.owned.clone(), row.base.clone()))
-            .collect(),
+    let owned: Vec<OwnedBranch> = match plan.mode {
+        RefreshMode::Gated => plan.previous.iter().map(|row| row.owned.clone()).collect(),
         RefreshMode::Full => discover(&plan, &mut outcome, started).await,
     };
-    for (owned, base) in owned_with_base {
+    for mut owned in owned {
+        owned.gone = !owned.checkout.is_dir();
+        if owned.gone {
+            outcome.branches.push(BranchStatus {
+                owned,
+                base: None,
+                status: None,
+                vs_base: None,
+                error: None,
+                stamp: GitdirStamp::default(),
+                checked_at: SystemTime::now(),
+            });
+            continue;
+        }
         let previous = plan
             .previous
             .iter()
-            .find(|row| row.owned.checkout == owned.checkout && row.base == base);
+            .find(|row| row.owned.checkout == owned.checkout && !row.owned.gone);
         let stamp = gitdir_of(&owned.checkout)
             .map(|gitdir| GitdirStamp::read(&gitdir))
             .unwrap_or_default();
@@ -1138,7 +1370,7 @@ pub async fn refresh(plan: RefreshPlan) -> RefreshOutcome {
         } else if started.elapsed() > REFRESH_DEADLINE {
             outcome.branches.push(BranchStatus {
                 owned,
-                base,
+                base: None,
                 status: None,
                 vs_base: None,
                 error: Some("not read: refresh time limit reached".to_string()),
@@ -1147,19 +1379,19 @@ pub async fn refresh(plan: RefreshPlan) -> RefreshOutcome {
             });
             continue;
         }
-        let row = read_checkout(owned, base, stamp, &mut outcome.git_runs).await;
+        let row = read_checkout(owned, stamp, &mut outcome.git_runs).await;
         outcome.branches.push(row);
     }
     outcome.took = started.elapsed();
     outcome
 }
 
-/// Worktree lists per repo, rule (a)/(b)/(c) resolution, bases per row.
+/// Worktree lists per repo, then rule (a)/(b)/(c) resolution.
 async fn discover(
     plan: &RefreshPlan,
     outcome: &mut RefreshOutcome,
     started: Instant,
-) -> Vec<(OwnedBranch, Option<BaseChoice>)> {
+) -> Vec<OwnedBranch> {
     let mut lists: HashMap<PathBuf, Vec<WorktreeInfo>> = HashMap::new();
     // Worktree lists come back canonical; compare like with like.
     let key_repos: Vec<PathBuf> = plan
@@ -1221,35 +1453,13 @@ async fn discover(
             Err(error) => outcome.errors.push(error),
         }
     }
-    let owned = resolve_owned(&candidates, &plan.issue_keys, &key_repos, &lists);
-    let mut refs: HashMap<PathBuf, RepoRefs> = HashMap::new();
-    let mut out = Vec::with_capacity(owned.len());
-    for row in owned {
-        let task_base = row.task.as_ref().map(|task| task.base.as_str());
-        if task_base.is_none() && !refs.contains_key(&row.repo) {
-            let args = repo_refs_args();
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            outcome.git_runs += 1;
-            let parsed = match git_text(&row.repo, &args, GIT_TIMEOUT).await {
-                Ok(text) => parse_repo_refs(&text),
-                Err(error) => {
-                    outcome.errors.push(error);
-                    RepoRefs::default()
-                }
-            };
-            refs.insert(row.repo.clone(), parsed);
-        }
-        let empty = RepoRefs::default();
-        let base = choose_base(task_base, refs.get(&row.repo).unwrap_or(&empty));
-        out.push((row, base));
-    }
-    out
+    resolve_owned(&candidates, &plan.issue_keys, &key_repos, &lists)
 }
 
-/// Status plus ahead/behind for one checkout.
+/// Status, then every base candidate measured against HEAD in one
+/// `for-each-ref` (git 2.41+ `%(ahead-behind)`), the nearest kept.
 async fn read_checkout(
     owned: OwnedBranch,
-    base: Option<BaseChoice>,
     stamp: GitdirStamp,
     git_runs: &mut usize,
 ) -> BranchStatus {
@@ -1275,35 +1485,26 @@ async fn read_checkout(
             None
         }
     };
-    let mut vs_base = None;
-    if let Some(base) = &base {
-        let range = format!("{}...HEAD", base.reference);
-        *git_runs += 1;
-        match git_text(
-            &owned.checkout,
-            &[
-                "--no-optional-locks",
-                "rev-list",
-                "--left-right",
-                "--count",
-                &range,
-                "--",
-            ],
-            GIT_TIMEOUT,
-        )
-        .await
-        {
-            Ok(text) => match parse_left_right(&text) {
-                Some(counts) => vs_base = Some(counts),
-                None => errors.push(format!(
-                    "unexpected rev-list output in {}: {:?}",
-                    owned.checkout.display(),
-                    text.trim()
-                )),
-            },
-            Err(error) => errors.push(error),
+    let task_base = owned.task.as_ref().map(|task| task.base.as_str());
+    let branch = status
+        .as_ref()
+        .and_then(|status| status.head.as_deref())
+        .or(owned.branch.as_deref());
+    let upstream = status
+        .as_ref()
+        .and_then(|status| status.upstream.as_deref());
+    let mut candidates = base_candidates(task_base, branch, upstream);
+    let measured = match measure_bases(&owned.checkout, &mut candidates, git_runs).await {
+        Ok(measured) => measured,
+        Err(error) => {
+            errors.push(error);
+            HashMap::new()
         }
-    }
+    };
+    let (base, vs_base) = match choose_nearest(&candidates, &measured) {
+        Some((base, counts)) => (Some(base), Some(counts)),
+        None => (None, None),
+    };
     BranchStatus {
         owned,
         base,
@@ -1313,6 +1514,81 @@ async fn read_checkout(
         stamp,
         checked_at: SystemTime::now(),
     }
+}
+
+/// `(behind, ahead)` per candidate ref that exists. One `for-each-ref`;
+/// on a git without `%(ahead-behind)`, one listing plus a `rev-list` per
+/// existing candidate. A task base that is no ref (a commit) is measured
+/// as a revision and added to `candidates`.
+async fn measure_bases(
+    checkout: &Path,
+    candidates: &mut Vec<BaseCandidate>,
+    git_runs: &mut usize,
+) -> Result<HashMap<String, (u32, u32)>, String> {
+    let args = ahead_behind_args(candidates);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    *git_runs += 1;
+    let mut measured = match git_text(checkout, &args, GIT_TIMEOUT).await {
+        Ok(text) => parse_ahead_behind(&text),
+        Err(_) => {
+            // Older git: find which candidates exist, measure each.
+            let mut list_args: Vec<&str> =
+                vec!["--no-optional-locks", "for-each-ref", "--format=%(refname)"];
+            list_args.extend(args[3..].iter().copied());
+            *git_runs += 1;
+            let existing = git_text(checkout, &list_args, GIT_TIMEOUT).await?;
+            let mut measured = HashMap::new();
+            for refname in existing.lines().filter(|name| args[3..].contains(name)) {
+                *git_runs += 1;
+                if let Some(counts) = rev_list_counts(checkout, refname).await? {
+                    measured.insert(refname.to_string(), counts);
+                }
+            }
+            measured
+        }
+    };
+    let task_measured = candidates
+        .iter()
+        .any(|c| c.source == BaseSource::Task && measured.contains_key(&c.refname));
+    let raw_task = candidates
+        .iter()
+        .find(|c| c.source == BaseSource::Task)
+        .map(|c| c.reference.clone());
+    if let (false, Some(base)) = (task_measured, raw_task) {
+        *git_runs += 1;
+        if let Ok(Some(counts)) = rev_list_counts(checkout, &base).await {
+            candidates.insert(
+                0,
+                BaseCandidate {
+                    refname: base.clone(),
+                    reference: base.clone(),
+                    source: BaseSource::Task,
+                },
+            );
+            measured.insert(base, counts);
+        }
+    }
+    Ok(measured)
+}
+
+/// `git rev-list --left-right --count <rev>...HEAD`; `Ok(None)` when the
+/// output is not two counts.
+async fn rev_list_counts(checkout: &Path, rev: &str) -> Result<Option<(u32, u32)>, String> {
+    let range = format!("{rev}...HEAD");
+    let text = git_text(
+        checkout,
+        &[
+            "--no-optional-locks",
+            "rev-list",
+            "--left-right",
+            "--count",
+            &range,
+            "--",
+        ],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    Ok(parse_left_right(&text))
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,7 +1711,7 @@ pub async fn load_branch_diff(
         DiffSource::Uncommitted => None,
         DiffSource::VsBase => Some(base.ok_or_else(|| {
             format!(
-                "no base branch found for {}: no task base, upstream default or local main/master",
+                "no base branch found for {}: no task base, tracked branch, or develop/main/master/trunk",
                 checkout.display()
             )
         })?),
@@ -1683,14 +1959,91 @@ mod tests {
     }
 
     #[test]
-    fn issue_keys_drop_single_digit_prose_unless_backed() {
-        let a = keys(&["PRJ-101", "GPT-5", "SHA-1", "OPS-7"]);
-        let b = keys(&["PRJ-101", "OPS-8"]);
-        let c = keys(&["ABC-3"]);
-        let per_chat: Vec<&[String]> = vec![&a, &b, &c];
-        // OPS twice in the work; ABC on a branch; GPT and SHA once each.
-        let kept = work_issue_keys(&per_chat, &["feat/abc-3-thing", "main"]);
-        assert_eq!(kept, ["PRJ-101", "ABC-3", "OPS-7", "OPS-8"]);
+    fn issue_keys_need_a_prefix_on_an_owned_name() {
+        let a = keys(&[
+            "PRJ-101",
+            "GPT-5",
+            "SHA-1",
+            "OPS-7",
+            "BETA-2026",
+            "ARTIST-00",
+            "C8-10014",
+            "RELEASE-7",
+        ]);
+        let b = keys(&["PRJ-101", "PRJ-102", "OPS-8", "LOCAL-2576"]);
+        let per_chat: Vec<&[String]> = vec![&a, &b];
+        // PRJ and OPS name owned branches or worktree folders; RELEASE only
+        // through a year, which never counts; the rest are text only.
+        let kept = work_issue_keys(
+            &per_chat,
+            &[
+                "work/prj-101-standby",
+                "api-server-ops-9",
+                "release-2026",
+                "main",
+            ],
+        );
+        assert_eq!(kept, ["PRJ-101", "OPS-7", "OPS-8", "PRJ-102"]);
+        assert!(work_issue_keys(&per_chat, &[]).is_empty());
+        let padded = keys(&["PRJ-05"]);
+        assert!(work_issue_keys(&[&padded], &["prj-101-x"]).is_empty());
+    }
+
+    #[test]
+    fn focus_picks_the_latest_recent_coordinator_and_scopes_the_work() {
+        let now = SystemTime::now();
+        let ago = |hours: u64| now - Duration::from_secs(hours * 3600);
+        let repo_facts = |dir: &str| ChatFacts {
+            repos_touched: vec![RepoTouch {
+                dir: dir.into(),
+                edits: 1,
+            }],
+            ..ChatFacts::default()
+        };
+        let mut a = entry("a", "/w/x");
+        a.mtime = ago(24);
+        a.facts = Some(repo_facts("/w/infra"));
+        let mut b = entry("b", "/w/y");
+        b.mtime = ago(240);
+        let mut b1 = entry("b1", "/w/y");
+        b1.mtime = ago(2);
+        b1.root_id = Some("b".into());
+        b1.facts = Some(repo_facts("/w/api"));
+        let mut c = entry("c", "/w/z");
+        c.mtime = ago(480);
+        c.facts = Some(repo_facts("/w/old"));
+        let entries = vec![b1, a, b, c];
+
+        let latest = WorkSummary::build(&entries, Path::new("/w"), &[], &Focus::Latest, now);
+        let order: Vec<(&str, bool)> = latest
+            .coordinators
+            .iter()
+            .map(|c| (c.id.as_str(), c.recent))
+            .collect();
+        assert_eq!(order, [("b", true), ("a", true), ("c", false)]);
+        assert_eq!(latest.focused, ["b"]);
+        let dirs =
+            |s: &WorkSummary| -> Vec<PathBuf> { s.repos.iter().map(|r| r.dir.clone()).collect() };
+        assert_eq!(dirs(&latest), [PathBuf::from("/w/api")]);
+
+        let all = WorkSummary::build(&entries, Path::new("/w"), &[], &Focus::AllRecent, now);
+        assert_eq!(all.focused, ["b", "a"]);
+        assert_eq!(
+            dirs(&all),
+            [PathBuf::from("/w/api"), PathBuf::from("/w/infra")],
+            "older coordinators stay out of the union"
+        );
+        let picked = WorkSummary::build(
+            &entries,
+            Path::new("/w"),
+            &[],
+            &Focus::Coordinator("c".into()),
+            now,
+        );
+        assert_eq!(dirs(&picked), [PathBuf::from("/w/old")]);
+        let gone = focused_roots(&Focus::Coordinator("nope".into()), &latest.coordinators);
+        assert_eq!(gone, ["b"]);
+        assert_eq!(latest.recent_count(), 2);
     }
 
     #[test]
@@ -1710,6 +2063,28 @@ mod tests {
                     0,
                     "2026-10-02T00:00:00Z",
                 ),
+                // Detached worktree only visited: not owned.
+                CheckoutTouch {
+                    branch: None,
+                    ..touch(
+                        "/r/infra",
+                        "/tmp/infra-review",
+                        "x",
+                        0,
+                        "2026-10-02T00:00:00Z",
+                    )
+                },
+                // Detached worktree edited: owned.
+                CheckoutTouch {
+                    branch: None,
+                    ..touch(
+                        "/r/infra",
+                        "/tmp/infra-hotfix",
+                        "x",
+                        1,
+                        "2026-10-02T00:00:00Z",
+                    )
+                },
             ],
             children: vec![ChatChild {
                 session_id: "worker".into(),
@@ -1752,52 +2127,51 @@ mod tests {
             [
                 ("/r/api", &Ownership::Edited, "coordinator"),
                 ("/r/infra-prj-1", &Ownership::WorkedIn, "coordinator"),
+                ("/tmp/infra-hotfix", &Ownership::Edited, "coordinator"),
                 ("/cfg/worktrees/api/t1", &Ownership::Task, "worker PRJ-2"),
             ]
         );
-        let task_row = &found[2];
+        let task_row = &found[3];
         assert_eq!(task_row.edits, 4);
         assert_eq!(task_row.repo.as_deref(), Some(Path::new("/r/api")));
+        assert_eq!(task_row.branch.as_deref(), Some("prj-2-x"));
         assert_eq!(task_row.task.as_ref().unwrap().base, "develop");
         assert_eq!(task_row.last.as_deref(), Some("2026-10-03T00:00:00Z"));
     }
 
     #[test]
     fn resolve_drops_gone_checkouts_and_adds_key_matches_only() {
-        let wt = |path: &str, branch: &str| WorktreeInfo {
+        let wt = |path: &str, branch: Option<&str>| WorktreeInfo {
             path: PathBuf::from(path),
-            branch: Some(branch.into()),
+            branch: branch.map(str::to_string),
         };
         let mut lists = HashMap::new();
         lists.insert(
             PathBuf::from("/r/api"),
             vec![
-                wt("/r/api", "main"),
-                wt("/r/api-prj-101", "work/prj-101-standby"),
-                wt("/r/api-prj-1010", "prj-1010-other"),
-                wt("/r/api-ops-9", "ops-9-unrelated"),
-                wt("/r/api-mine", "renamed-branch"),
+                wt("/r/api", Some("main")),
+                wt("/r/api-prj-101", Some("work/prj-101-standby")),
+                wt("/r/api-prj-1010", Some("prj-1010-other")),
+                wt("/r/api-ops-9", Some("ops-9-unrelated")),
+                wt("/r/api-mine", Some("renamed-branch")),
+                wt("/r/api-detached", None),
             ],
         );
+        let candidate = |checkout: &str, ownership: Ownership, edits: u64| BranchCandidate {
+            repo: Some("/r/api".into()),
+            checkout: checkout.into(),
+            branch: Some("old-name".into()),
+            ownership,
+            owner: "coordinator".into(),
+            last: None,
+            edits,
+            task: None,
+        };
         let candidates = vec![
-            BranchCandidate {
-                repo: Some("/r/api".into()),
-                checkout: "/r/api-mine".into(),
-                ownership: Ownership::Edited,
-                owner: "coordinator".into(),
-                last: None,
-                edits: 3,
-                task: None,
-            },
-            BranchCandidate {
-                repo: Some("/r/api".into()),
-                checkout: "/r/api-removed".into(),
-                ownership: Ownership::Edited,
-                owner: "coordinator".into(),
-                last: None,
-                edits: 1,
-                task: None,
-            },
+            candidate("/r/api-mine", Ownership::Edited, 3),
+            candidate("/r/api-removed", Ownership::Edited, 1),
+            // Visited while on a branch, detached now: dropped.
+            candidate("/r/api-detached", Ownership::WorkedIn, 0),
         ];
         let owned = resolve_owned(
             &candidates,
@@ -1829,32 +2203,61 @@ mod tests {
     }
 
     #[test]
-    fn base_prefers_task_then_upstream_then_local_default() {
-        let refs = parse_repo_refs(
-            "refs/remotes/origin/HEAD\trefs/remotes/origin/develop\n\
-             refs/remotes/origin/main\t\n\
-             refs/heads/main\t\n\
-             refs/heads/main/old\t\n\
-             refs/heads/develop\t\n",
-        );
-        assert_eq!(refs.upstream.as_deref(), Some("origin/develop"));
-        assert_eq!(refs.local, ["main", "develop"]);
-        let task = choose_base(Some("release"), &refs).unwrap();
+    fn base_is_the_nearest_candidate() {
+        let refnames = |list: &[BaseCandidate]| -> Vec<String> {
+            list.iter().map(|c| c.refname.clone()).collect()
+        };
+        // A feature branch pushed to its own name: no tracking candidate.
+        let feature = base_candidates(Some("release"), Some("feature-x"), Some("origin/feature-x"));
         assert_eq!(
-            (task.reference.as_str(), task.source),
-            ("release", BaseSource::Task)
+            refnames(&feature),
+            [
+                "refs/heads/release",
+                "refs/remotes/release",
+                "refs/remotes/origin/develop",
+                "refs/remotes/origin/main",
+                "refs/remotes/origin/master",
+                "refs/remotes/origin/trunk",
+                "refs/heads/develop",
+                "refs/heads/main",
+                "refs/heads/master",
+                "refs/heads/trunk",
+            ]
         );
-        let upstream = choose_base(None, &refs).unwrap();
-        assert_eq!(upstream.source, BaseSource::Upstream);
-        let no_head = parse_repo_refs("refs/remotes/origin/master\t\nrefs/heads/master\t\n");
-        assert_eq!(no_head.upstream.as_deref(), Some("origin/master"));
-        let local_only = parse_repo_refs("refs/heads/develop\t\nrefs/heads/trunk\t\n");
-        let base = choose_base(Some("  "), &local_only).unwrap();
+        // The branch is never its own base; its remote form still counts.
+        let develop = base_candidates(None, Some("develop"), Some("origin/develop"));
+        assert!(!refnames(&develop).contains(&"refs/heads/develop".to_string()));
+        assert!(refnames(&develop).contains(&"refs/remotes/origin/develop".to_string()));
+        // Tracking another branch puts it first.
+        let tracking = base_candidates(None, Some("feature"), Some("origin/develop"));
+        assert_eq!(tracking[0].source, BaseSource::Tracking);
+        assert_eq!(tracking[0].reference, "origin/develop");
+
+        let measured = parse_ahead_behind(
+            "refs/remotes/origin/main\t0 762\n\
+             refs/heads/develop\t3 2\n\
+             refs/heads/main\t0 762\n\
+             junk line\n",
+        );
+        let (base, counts) = choose_nearest(&feature, &measured).unwrap();
         assert_eq!(
-            (base.reference.as_str(), base.source),
-            ("develop", BaseSource::RepoDefault)
+            (
+                base.reference.as_str(),
+                base.source,
+                base.considered,
+                counts
+            ),
+            ("develop", BaseSource::Local, 3, (3, 2))
         );
-        assert_eq!(choose_base(None, &RepoRefs::default()), None);
+        assert_eq!(base.describe(), "local, nearest of 3");
+        // A tie goes to candidate order (the remote form first).
+        let tie = HashMap::from([
+            ("refs/heads/develop".to_string(), (0, 2)),
+            ("refs/remotes/origin/develop".to_string(), (0, 2)),
+        ]);
+        let (base, _) = choose_nearest(&feature, &tie).unwrap();
+        assert_eq!(base.reference, "origin/develop");
+        assert_eq!(choose_nearest(&feature, &HashMap::new()), None);
     }
 
     #[test]
@@ -1976,13 +2379,17 @@ mod tests {
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
         git(&repo, &["add", "a.txt"]);
         git(&repo, &["commit", "-q", "-m", "init"]);
-        let owned_wt = root.join("api-server-edit");
+        // The owned worktree's folder names PRJ, which qualifies the
+        // chat's PRJ-101 mention for rule (c).
+        let owned_wt = root.join("api-server-prj-100-edit");
         let unrelated_wt = root.join("api-server-ops-9");
         let keyed_wt = root.join("api-server-prj-101");
+        let gone_wt = root.join("api-server-prj-101-old");
         for (path, branch) in [
             (&owned_wt, "feature-standby"),
             (&unrelated_wt, "ops-9-unrelated"),
             (&keyed_wt, "work/prj-101-cloud"),
+            (&gone_wt, "work/prj-101-old"),
         ] {
             git(
                 &repo,
@@ -2002,6 +2409,8 @@ mod tests {
         git(&owned_wt, &["commit", "-q", "-m", "work"]);
         std::fs::write(owned_wt.join("a.txt"), "changed\n").unwrap();
         std::fs::write(owned_wt.join("scratch.txt"), "x\n").unwrap();
+        // Removed by hand, never pruned: git still lists it.
+        std::fs::remove_dir_all(&gone_wt).unwrap();
 
         let mut chat = entry("c1", repo.to_str().unwrap());
         chat.facts = Some(ChatFacts {
@@ -2020,7 +2429,7 @@ mod tests {
             ..ChatFacts::default()
         });
         let entries = vec![chat];
-        let summary = WorkSummary::build(&entries, &root, &[]);
+        let summary = WorkSummary::build(&entries, &root, &[], &Focus::Latest, SystemTime::now());
         assert_eq!(summary.issue_keys, ["PRJ-101"]);
         let plan = RefreshPlan {
             mode: RefreshMode::Full,
@@ -2041,15 +2450,19 @@ mod tests {
             [
                 (owned_wt.as_path(), Some("feature-standby")),
                 (keyed_wt.as_path(), Some("work/prj-101-cloud")),
+                (gone_wt.as_path(), Some("work/prj-101-old")),
             ],
             "the unrelated worktree must not appear"
         );
+        let gone = &outcome.branches[2];
+        assert!(gone.owned.gone);
+        assert_eq!((&gone.status, &gone.error), (&None, &None));
         let owned = &outcome.branches[0];
         assert_eq!(owned.error, None);
         let base = owned.base.as_ref().unwrap();
         assert_eq!(
             (base.reference.as_str(), base.source),
-            ("main", BaseSource::RepoDefault)
+            ("main", BaseSource::Local)
         );
         assert_eq!(owned.vs_base, Some((0, 1)));
         let status = owned.status.as_ref().unwrap();
@@ -2104,6 +2517,77 @@ mod tests {
         assert_eq!(vs_base.merge_base.as_ref().map(String::len), Some(7));
         let missing = load_branch_diff(owned_wt, DiffSource::VsBase, None).await;
         assert!(missing.is_err());
+    }
+
+    #[tokio::test]
+    async fn real_git_develop_is_the_base_when_main_is_far_behind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = worktree_follow::resolve_for_match(temp.path());
+        let repo = root.join("portal");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&repo, &["checkout", "-q", "-b", "develop"]);
+        for i in 0..30 {
+            git(
+                &repo,
+                &["commit", "-q", "--allow-empty", "-m", &format!("d{i}")],
+            );
+        }
+        let feature = root.join("portal-prj-7");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "prj-7-upload",
+                feature.to_str().unwrap(),
+                "develop",
+            ],
+        );
+        git(&feature, &["commit", "-q", "--allow-empty", "-m", "f1"]);
+        git(&feature, &["commit", "-q", "--allow-empty", "-m", "f2"]);
+        let owned = OwnedBranch {
+            repo: repo.clone(),
+            checkout: feature.clone(),
+            branch: Some("prj-7-upload".into()),
+            is_main: false,
+            ownership: Ownership::Edited,
+            owner: "coordinator".into(),
+            last: None,
+            edits: 1,
+            task: None,
+            gone: false,
+        };
+        let mut runs = 0;
+        let row = read_checkout(owned.clone(), GitdirStamp::default(), &mut runs).await;
+        assert_eq!(row.error, None);
+        let base = row.base.as_ref().unwrap();
+        assert_eq!(
+            (base.reference.as_str(), base.source, base.considered),
+            ("develop", BaseSource::Local, 2)
+        );
+        assert_eq!(row.vs_base, Some((0, 2)), "not 32 ahead of main");
+        assert_eq!(runs, 2, "status plus one for-each-ref");
+
+        // A task base that is a commit, not a ref, is measured as one.
+        let main_commit = git_text(&repo, &["rev-parse", "main"], GIT_TIMEOUT)
+            .await
+            .unwrap();
+        let task_owned = OwnedBranch {
+            task: Some(TaskLink {
+                task_id: "t1".into(),
+                base: main_commit.trim().to_string(),
+                pr_number: None,
+            }),
+            ..owned
+        };
+        let row = read_checkout(task_owned, GitdirStamp::default(), &mut runs).await;
+        let base = row.base.as_ref().unwrap();
+        assert_eq!(base.source, BaseSource::Local, "develop is still nearer");
+        assert_eq!(base.considered, 3);
     }
 
     #[tokio::test]
@@ -2190,20 +2674,46 @@ mod tests {
             entries.len(),
             started.elapsed().as_millis()
         );
+        // Optional: GITTERM_REAL_FOCUS=all, or a coordinator's session id.
+        let focus = match std::env::var("GITTERM_REAL_FOCUS").ok().as_deref() {
+            None | Some("") | Some("latest") => Focus::Latest,
+            Some("all") => Focus::AllRecent,
+            Some(id) => Focus::Coordinator(id.to_string()),
+        };
+        let now = SystemTime::now();
         let built = Instant::now();
-        let summary = WorkSummary::build(&entries, &ws_dir, &tasks);
+        let summary = WorkSummary::build(&entries, &ws_dir, &tasks, &focus, now);
         println!(
             "summary in {}ms: {} chats, facts: {}",
             built.elapsed().as_millis(),
             summary.chat_count,
             summary.has_facts
         );
-        println!("\nCOORDINATORS · {}", summary.coordinators.len());
-        for coordinator in summary.coordinators.iter().take(15) {
+        let union = WorkSummary::build(&entries, &ws_dir, &tasks, &Focus::AllRecent, now);
+        println!(
+            "all recent work: {} coordinators, {} repos, {} candidates, {} keys",
+            union.focused.len(),
+            union.repos.len(),
+            union.candidates.len(),
+            union.issue_keys.len()
+        );
+        println!(
+            "\nCOORDINATORS · {} recent · {} older",
+            summary.recent_count(),
+            summary.coordinators.len() - summary.recent_count()
+        );
+        println!("FOCUS · {:?} · {}", summary.focus, summary.focus_label());
+        for coordinator in summary.coordinators.iter().filter(|c| c.recent).take(15) {
+            let mark = if summary.focused.contains(&coordinator.id) {
+                "\u{25B8}"
+            } else {
+                " "
+            };
             println!(
-                "  {} · {}",
+                "{mark} {} · {} · {}",
                 shorten(&coordinator.title, 70),
-                chats::format_age(coordinator.mtime)
+                chats::format_age(coordinator.active),
+                coordinator.id
             );
             if let Some(fan_out) = &coordinator.fan_out {
                 println!("      fan-out: {fan_out}");
@@ -2243,6 +2753,13 @@ mod tests {
                 repo = Some(row.owned.repo.as_path());
                 println!("  {}", folder_name(&row.owned.repo));
             }
+            if row.owned.gone {
+                println!(
+                    "    (folder gone) {}",
+                    row.owned.branch.as_deref().unwrap_or("(detached)")
+                );
+                continue;
+            }
             let mut parts = vec![short_checkout(&row.owned, home.as_deref())];
             parts.extend(vs_base_label(row));
             if let Some(status) = &row.status {
@@ -2251,7 +2768,7 @@ mod tests {
             }
             parts.push(row.owner_label());
             if let Some(base) = &row.base {
-                parts.push(format!("base {} ({})", base.reference, base.source_label()));
+                parts.push(format!("base {} ({})", base.reference, base.describe()));
             }
             println!(
                 "    {} · {}",

@@ -1691,6 +1691,13 @@ struct WorkspaceOverviewState {
     /// Visible refreshes in a row that changed no number; two or more
     /// stretch the visible tier from 15 s to 30 s.
     unchanged_streak: u32,
+    /// Whose repos, branches and issues show (default: the most recently
+    /// active coordinator).
+    focus: overview::Focus,
+    /// The "▸ n older" coordinators are unfolded.
+    show_older: bool,
+    /// The "Focus ▾" picker is open.
+    focus_menu_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5927,6 +5934,10 @@ pub enum Event {
     WorkspaceOverviewRefreshed(PathBuf, u64, Box<overview::RefreshOutcome>),
     /// Show a coordinator in the Chats panel.
     WorkspaceOverviewOpenChat(String),
+    /// Read repos, branches and issues for another coordinator, or all.
+    WorkspaceOverviewFocus(overview::Focus),
+    WorkspaceOverviewToggleFocusMenu,
+    WorkspaceOverviewToggleOlder,
     /// Open the diff panel on an owned checkout.
     BranchDiffOpen(PathBuf, overview::DiffSource),
     BranchDiffLoaded(usize, u64, Result<BranchDiffPayload, String>),
@@ -11572,8 +11583,19 @@ impl App {
             .as_ref()
             .map(|store| store.tasks().iter().map(overview::TaskInfo::from).collect())
             .unwrap_or_default();
+        let focus = self
+            .workspace_overviews
+            .get(dir)
+            .map(|state| state.focus.clone())
+            .unwrap_or_default();
         let summary = freeze_time!("workspace_overview_summary", {
-            overview::WorkSummary::build(&self.chat_index, dir, &tasks)
+            overview::WorkSummary::build(
+                &self.chat_index,
+                dir,
+                &tasks,
+                &focus,
+                std::time::SystemTime::now(),
+            )
         });
         let state = self
             .workspace_overviews
@@ -11691,7 +11713,7 @@ impl App {
                 state
                     .branches
                     .iter()
-                    .find(|row| row.owned.checkout == checkout)
+                    .find(|row| row.owned.checkout == checkout && !row.owned.gone)
                     .cloned()
             })
         }) else {
@@ -22793,6 +22815,43 @@ fi
                         .start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
                 }
             }
+            Event::WorkspaceOverviewFocus(focus) => {
+                let Some(dir) = self.overview_workspace_dir() else {
+                    return Task::none();
+                };
+                let state = self.workspace_overviews.entry(dir.clone()).or_default();
+                state.focus_menu_open = false;
+                if state.focus == focus {
+                    return Task::none();
+                }
+                state.focus = focus;
+                // The rows on screen belong to the old focus: drop them and
+                // any read in flight for it, then read the new one.
+                state.generation += 1;
+                state.in_flight = false;
+                state.branches.clear();
+                state.errors.clear();
+                state.last_full_refresh = None;
+                state.unchanged_streak = 0;
+                self.rebuild_workspace_overview(&dir);
+                return self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
+            }
+            Event::WorkspaceOverviewToggleFocusMenu => {
+                if let Some(state) = self
+                    .overview_workspace_dir()
+                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
+                {
+                    state.focus_menu_open = !state.focus_menu_open;
+                }
+            }
+            Event::WorkspaceOverviewToggleOlder => {
+                if let Some(state) = self
+                    .overview_workspace_dir()
+                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
+                {
+                    state.show_older = !state.show_older;
+                }
+            }
             Event::WorkspaceOverviewOpenChat(id) => {
                 let mode = self.update(Event::SetSidebarMode(SidebarMode::Chats));
                 let select = self.update(Event::SelectChat(chats::ChatRef::local(&id)));
@@ -30313,7 +30372,7 @@ fi
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         const COORDINATOR_ROWS: usize = 12;
-        const CHILD_ROWS: usize = 4;
+        const OLDER_ROWS: usize = 20;
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
         let font_small = self.ui_font_small();
@@ -30321,6 +30380,7 @@ fi
         let text_secondary = theme.text_secondary();
         let text_muted = theme.text_muted();
         let hover = theme.bg_overlay();
+        let surface0 = theme.surface0();
         let section = |label: String| text(label).size(10).color(text_muted).font(mono);
         let name = self
             .active_workspace()
@@ -30409,103 +30469,140 @@ fi
             content = content.push(hint);
         }
 
-        // Chats: coordinators, their fan-out folded under them.
+        // Focus: whose repos, branches and issues show below.
         if !summary.coordinators.is_empty() {
-            content = content.push(section(format!(
-                "CHATS \u{00B7} {}",
-                summary.coordinators.len()
-            )));
-            let mut chats = Column::new().spacing(2);
-            for coordinator in summary.coordinators.iter().take(COORDINATOR_ROWS) {
-                let mut body = Column::new().spacing(2).push(
-                    row![
-                        text("\u{2726}").size(font_small).color(theme.mauve()),
-                        text(overview::shorten(&coordinator.title, 70))
-                            .size(font_small)
-                            .color(text_primary)
-                            .width(Length::Fill),
-                        text(chats::format_age(coordinator.mtime))
-                            .size(10)
-                            .color(text_muted)
-                            .font(mono),
-                    ]
-                    .spacing(6)
-                    .align_y(iced::Alignment::Center),
-                );
-                if let Some(latest) = &coordinator.latest {
-                    body = body.push(
-                        text(format!("\u{21B3} {}", overview::shorten(latest, 90)))
-                            .size(font_small - 1.0)
-                            .color(text_secondary),
-                    );
-                }
-                if let Some(fan_out) = &coordinator.fan_out {
-                    body = body.push(text(fan_out.clone()).size(10).color(text_muted).font(mono));
-                }
-                for child in coordinator.children.iter().take(CHILD_ROWS) {
-                    let kind = match child.kind {
-                        Some(chat_facts::ChildKind::Worker) => "worker",
-                        Some(chat_facts::ChildKind::Review) => "review",
-                        Some(chat_facts::ChildKind::Consult) => "consult",
-                        Some(chat_facts::ChildKind::Subagent) => "subagent",
-                        None => "chat",
-                    };
-                    body = body.push(
-                        text(format!(
-                            "   {kind} \u{00B7} {} \u{00B7} {}",
-                            overview::shorten(&child.title, 50),
-                            chats::format_age(child.mtime)
+            let focus_button = button(
+                row![
+                    text("Focus:").size(10).color(text_muted).font(mono),
+                    text(overview::shorten(&summary.focus_label(), 46))
+                        .size(font_small)
+                        .color(text_primary)
+                        .width(Length::Fill),
+                    text(if state.focus_menu_open {
+                        "\u{25B4}"
+                    } else {
+                        "\u{25BE}"
+                    })
+                    .size(font_small)
+                    .color(text_muted),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([5, 6])
+            .style(move |_, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        hover
+                    } else {
+                        surface0
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .on_press(Event::WorkspaceOverviewToggleFocusMenu);
+            content = content.push(focus_button);
+            if state.focus_menu_open {
+                let option = |label: String, focus: overview::Focus| {
+                    let active = summary.focus == focus;
+                    button(text(label).size(font_small - 1.0).color(if active {
+                        theme.accent()
+                    } else {
+                        text_primary
+                    }))
+                    .style(self.ghost_button_style())
+                    .padding([3, 8])
+                    .width(Length::Fill)
+                    .on_press(Event::WorkspaceOverviewFocus(focus))
+                };
+                content = content.push(
+                    Column::new()
+                        .spacing(1)
+                        .push(option(
+                            "Most recently active chat".to_string(),
+                            overview::Focus::Latest,
                         ))
-                        .size(10)
-                        .color(text_muted),
-                    );
-                }
-                if coordinator.children.len() > CHILD_ROWS {
-                    body = body.push(
-                        text(format!(
-                            "   \u{2026} {} more",
-                            coordinator.children.len() - CHILD_ROWS
-                        ))
-                        .size(10)
-                        .color(text_muted),
-                    );
-                }
-                chats = chats.push(
-                    button(body)
-                        .width(Length::Fill)
-                        .padding([5, 6])
-                        .style(move |_, status| button::Style {
-                            background: Some(
-                                if matches!(status, button::Status::Hovered) {
-                                    hover
-                                } else {
-                                    iced::Color::TRANSPARENT
-                                }
-                                .into(),
+                        .push(option(
+                            format!(
+                                "All recent work \u{00B7} {} chats, last 7 days",
+                                summary.recent_count()
                             ),
-                            border: iced::Border {
-                                radius: 6.0.into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        })
-                        .on_press(Event::WorkspaceOverviewOpenChat(coordinator.id.clone())),
+                            overview::Focus::AllRecent,
+                        ))
+                        .push(text("or pick a chat below").size(10).color(text_muted)),
                 );
             }
-            if summary.coordinators.len() > COORDINATOR_ROWS {
+        }
+
+        // Chats: coordinators, their fan-out folded under them; the last 7
+        // days listed, older ones folded.
+        if !summary.coordinators.is_empty() {
+            let recent: Vec<&overview::Coordinator> =
+                summary.coordinators.iter().filter(|c| c.recent).collect();
+            let older: Vec<&overview::Coordinator> =
+                summary.coordinators.iter().filter(|c| !c.recent).collect();
+            content = content.push(section(if recent.is_empty() {
+                "CHATS \u{00B7} none in the last 7 days".to_string()
+            } else {
+                format!("CHATS \u{00B7} {} in the last 7 days", recent.len())
+            }));
+            let mut chats = Column::new().spacing(2);
+            for coordinator in recent.iter().take(COORDINATOR_ROWS) {
+                chats = chats.push(self.view_overview_coordinator_row(
+                    coordinator,
+                    summary.focused.contains(&coordinator.id),
+                ));
+            }
+            let more_in_chats = |count: usize| {
+                button(
+                    text(format!("\u{2026} {count} more in Chats"))
+                        .size(10)
+                        .color(theme.accent()),
+                )
+                .style(self.ghost_button_style())
+                .padding([2, 6])
+                .on_press(Event::SetSidebarMode(SidebarMode::Chats))
+            };
+            if recent.len() > COORDINATOR_ROWS {
+                chats = chats.push(more_in_chats(recent.len() - COORDINATOR_ROWS));
+            }
+            if !older.is_empty() {
                 chats = chats.push(
                     button(
                         text(format!(
-                            "\u{2026} {} more in Chats",
-                            summary.coordinators.len() - COORDINATOR_ROWS
+                            "{} {} older",
+                            if state.show_older {
+                                "\u{25BE}"
+                            } else {
+                                "\u{25B8}"
+                            },
+                            older.len()
                         ))
                         .size(10)
-                        .color(theme.accent()),
+                        .color(text_muted)
+                        .font(mono),
                     )
                     .style(self.ghost_button_style())
                     .padding([2, 6])
-                    .on_press(Event::SetSidebarMode(SidebarMode::Chats)),
+                    .on_press(Event::WorkspaceOverviewToggleOlder),
                 );
+                if state.show_older {
+                    for coordinator in older.iter().take(OLDER_ROWS) {
+                        chats = chats.push(self.view_overview_coordinator_row(
+                            coordinator,
+                            summary.focused.contains(&coordinator.id),
+                        ));
+                    }
+                    if older.len() > OLDER_ROWS {
+                        chats = chats.push(more_in_chats(older.len() - OLDER_ROWS));
+                    }
+                }
             }
             content = content.push(chats);
         }
@@ -30526,7 +30623,10 @@ fi
             }
         }
         if !groups.is_empty() {
-            let owned_count: usize = groups.iter().map(|(_, _, rows)| rows.len()).sum();
+            let owned_count: usize = groups
+                .iter()
+                .map(|(_, _, rows)| rows.iter().filter(|row| !row.owned.gone).count())
+                .sum();
             content = content.push(section(format!(
                 "REPOS \u{00B7} {} \u{00B7} BRANCHES \u{00B7} {owned_count}",
                 groups.len()
@@ -30535,6 +30635,10 @@ fi
             let selected = tab.branch_diff.as_ref().map(|view| view.checkout.as_path());
             let mut repos = Column::new().spacing(6);
             for (repo, edits, rows) in groups {
+                // Worktrees git still lists whose folder is gone: one dim
+                // line per repo, never read.
+                let (gone, rows): (Vec<_>, Vec<_>) =
+                    rows.into_iter().partition(|row| row.owned.gone);
                 let oldest = rows.iter().map(|row| row.checked_at).min();
                 let mut head = row![text(overview::folder_name(repo))
                     .size(font_small)
@@ -30560,7 +30664,7 @@ fi
                     );
                 }
                 let mut group = Column::new().spacing(2).push(head);
-                if rows.is_empty() {
+                if rows.is_empty() && gone.is_empty() {
                     let note = if state.last_full_refresh.is_none() {
                         "reading\u{2026}"
                     } else {
@@ -30574,6 +30678,22 @@ fi
                         home.as_deref(),
                         selected == Some(row.owned.checkout.as_path()),
                     ));
+                }
+                if !gone.is_empty() {
+                    let names: Vec<&str> = gone
+                        .iter()
+                        .map(|row| row.owned.branch.as_deref().unwrap_or("(detached)"))
+                        .collect();
+                    group = group.push(
+                        text(format!(
+                            "\u{25B8} {} folder{} gone \u{00B7} {}",
+                            gone.len(),
+                            if gone.len() == 1 { "" } else { "s" },
+                            overview::shorten(&names.join(", "), 60)
+                        ))
+                        .size(10)
+                        .color(theme.overlay0()),
+                    );
                 }
                 repos = repos.push(group);
             }
@@ -30607,6 +30727,106 @@ fi
             );
         }
         finish(content)
+    }
+
+    /// One coordinator: title and age, latest line, fan-out and indexed
+    /// children. Clicking focuses it; the ↗ beside it shows it in Chats.
+    fn view_overview_coordinator_row<'a>(
+        &'a self,
+        coordinator: &'a overview::Coordinator,
+        focused: bool,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        const CHILD_ROWS: usize = 4;
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let font_small = self.ui_font_small();
+        let text_muted = theme.text_muted();
+        let surface0 = theme.surface0();
+        let hover = theme.bg_overlay();
+        let mut body = Column::new().spacing(2).push(
+            row![
+                text("\u{2726}").size(font_small).color(theme.mauve()),
+                text(overview::shorten(&coordinator.title, 70))
+                    .size(font_small)
+                    .color(theme.text_primary())
+                    .width(Length::Fill),
+                text(chats::format_age(coordinator.active))
+                    .size(10)
+                    .color(text_muted)
+                    .font(mono),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
+        if let Some(latest) = &coordinator.latest {
+            body = body.push(
+                text(format!("\u{21B3} {}", overview::shorten(latest, 90)))
+                    .size(font_small - 1.0)
+                    .color(theme.text_secondary()),
+            );
+        }
+        if let Some(fan_out) = &coordinator.fan_out {
+            body = body.push(text(fan_out.clone()).size(10).color(text_muted).font(mono));
+        }
+        for child in coordinator.children.iter().take(CHILD_ROWS) {
+            let kind = match child.kind {
+                Some(chat_facts::ChildKind::Worker) => "worker",
+                Some(chat_facts::ChildKind::Review) => "review",
+                Some(chat_facts::ChildKind::Consult) => "consult",
+                Some(chat_facts::ChildKind::Subagent) => "subagent",
+                None => "chat",
+            };
+            body = body.push(
+                text(format!(
+                    "   {kind} \u{00B7} {} \u{00B7} {}",
+                    overview::shorten(&child.title, 50),
+                    chats::format_age(child.mtime)
+                ))
+                .size(10)
+                .color(text_muted),
+            );
+        }
+        if coordinator.children.len() > CHILD_ROWS {
+            body = body.push(
+                text(format!(
+                    "   \u{2026} {} more",
+                    coordinator.children.len() - CHILD_ROWS
+                ))
+                .size(10)
+                .color(text_muted),
+            );
+        }
+        let focus = button(body)
+            .width(Length::Fill)
+            .padding([5, 6])
+            .style(move |_, status| button::Style {
+                background: Some(
+                    if focused {
+                        surface0
+                    } else if matches!(status, button::Status::Hovered) {
+                        hover
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .on_press(Event::WorkspaceOverviewFocus(overview::Focus::Coordinator(
+                coordinator.id.clone(),
+            )));
+        let open = button(text("\u{2197}").size(font_small).color(theme.accent()))
+            .style(self.ghost_button_style())
+            .padding([4, 5])
+            .on_press(Event::WorkspaceOverviewOpenChat(coordinator.id.clone()));
+        row![focus, open]
+            .spacing(2)
+            .align_y(iced::Alignment::Start)
+            .into()
     }
 
     /// One owned checkout: branch and dirty count, then checkout, ahead and
@@ -38482,7 +38702,7 @@ fi
         ];
         match &view.base {
             Some(base) => {
-                let mut copy = format!("base {} ({})", base.reference, base.source_label());
+                let mut copy = format!("base {} ({})", base.reference, base.describe());
                 if let (overview::DiffSource::VsBase, Some(merge_base)) =
                     (view.source, &view.merge_base)
                 {
@@ -38490,8 +38710,10 @@ fi
                 }
                 facts.push(copy);
             }
-            None => facts
-                .push("no base: no task base, upstream default or local main/master".to_string()),
+            None => facts.push(
+                "no base: no task base, tracked branch, or develop/main/master/trunk here"
+                    .to_string(),
+            ),
         }
         if view.files > 0 {
             facts.push(format!(
