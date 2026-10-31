@@ -1,4 +1,4 @@
-# GitTerm V5 Browser Control Architecture
+# GitTerm V6 Browser Control Architecture
 
 ## Goal
 
@@ -19,7 +19,7 @@ Portal-specific Rust workflow.
 
 ## Product Boundary
 
-GitTerm V5 remains the host application and Codex remains the terminal agent.
+GitTerm V6 remains the host application and Codex remains the terminal agent.
 This work does not adopt T3 Code, depend on the Codex desktop application, or
 replace GitTerm's interface.
 
@@ -35,11 +35,11 @@ Codex CLI in a GitTerm terminal
               |
               | MCP
               v
-GitTerm V5 browser-control service
+GitTerm V6 browser-control service
               |
               | Chrome DevTools Protocol
               v
-Visible Chrome window using a dedicated GitTerm V5 profile
+Visible Chrome window using a dedicated GitTerm V6 profile
 ```
 
 GitTerm owns the browser lifecycle and connection state. The first version uses
@@ -152,7 +152,7 @@ it is not logged or written to a config file.
 
 Claude Code presets receive the same server through
 `browser_mcp::configure_claude_command` — a per-run `--mcp-config='{…}'`
-(bearer header expanded by Claude from `GITTERM_V5_BROWSER_MCP_TOKEN`) with the
+(bearer header expanded by Claude from `GITTERM_V6_BROWSER_MCP_TOKEN`) with the
 read-only inspection tools pre-approved via `--allowedTools`; mutating tools
 still prompt. pi attaches through the `gitterm-mcp` extension in
 `pi-extensions/`.

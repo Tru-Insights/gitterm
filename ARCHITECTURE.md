@@ -1,4 +1,4 @@
-# GitTerm V5 Architecture
+# GitTerm V6 Architecture
 
 This document describes the internal architecture of GitTerm for contributors and anyone looking to understand the codebase.
 
@@ -14,7 +14,7 @@ The entire application lives in a single crate (~3300 lines across 4 source file
 |--------|---------|
 | `src/main.rs` | Core application: UI layout, state management, event handling, git operations, terminal management |
 | `src/webview.rs` | Embedded WebView (via `wry`) for rendering markdown and Mermaid diagrams |
-| `src/log_server.rs` | HTTP server (via `warp`) in the V5-only `localhost:23030-24029` range |
+| `src/log_server.rs` | HTTP server (via `warp`) in the V6-only `localhost:33030-34029` range |
 | `src/markdown.rs` | Markdown-to-HTML renderer (via `pulldown-cmark`) with Mermaid diagram support |
 | `build.rs` | Windows-only build script for embedding the app icon via `winres` |
 
@@ -26,7 +26,7 @@ The app follows Iced's Elm-inspired architecture: **State → View → Event →
 
 - **`App`** holds global state: tabs, active tab index, theme, font sizes, sidebar width, config, and a handle to the log server's shared state.
 - **`TabState`** holds per-tab state: the terminal instance, git status (staged/unstaged/untracked files), branch name, diff lines, file explorer state, file viewer state, search state, and the terminal title.
-- **`Config`** is the persistent configuration, serialized to `~/.config/gitterm-v5/config.json`.
+- **`Config`** is the persistent configuration, serialized to `~/.config/gitterm-v6/config.json`.
 
 ### Event System
 
@@ -58,7 +58,7 @@ The terminal emulator is provided by a custom fork of [`iced_term`](https://gith
 
 GitTerm injects shell hooks so the terminal title reflects the current working directory:
 
-- **zsh**: Creates a custom `.zshrc` at `~/.config/gitterm-v5/zsh/.zshrc` that installs a `precmd`/`chpwd` hook via `add-zsh-hook`. The `ZDOTDIR` environment variable redirects zsh to load this file before sourcing the user's normal config.
+- **zsh**: Creates a custom `.zshrc` at `~/.config/gitterm-v6/zsh/.zshrc` that installs a `precmd`/`chpwd` hook via `add-zsh-hook`. The `ZDOTDIR` environment variable redirects zsh to load this file before sourcing the user's normal config.
 - **bash**: Sets `PROMPT_COMMAND` to emit an OSC title escape sequence with `$PWD`.
 - **Windows**: No directory sync hooks currently; shells (PowerShell/cmd) are launched with inherited environment.
 
@@ -100,7 +100,7 @@ The WebView is shown/hidden as the user navigates between markdown files and oth
 
 ## HTTP Log Server (`log_server.rs`)
 
-A `warp` HTTP server runs in the V5-only `localhost:23030-24029` range in a background Tokio task. The browser MCP separately reserves `localhost:24030-25029`, and `gitterm-v5-agent` defaults to `127.0.0.1:8787`. It serves three routes:
+A `warp` HTTP server runs in the V6-only `localhost:33030-34029` range in a background Tokio task. The browser MCP separately reserves `localhost:34030-35029`, and `gitterm-v6-agent` defaults to `127.0.0.1:8797`. It serves three routes:
 
 | Route | Content |
 |-------|---------|
@@ -110,9 +110,10 @@ A `warp` HTTP server runs in the V5-only `localhost:23030-24029` range in a back
 
 The server reads from `ServerState`, which holds `Arc<RwLock<HashMap>>` collections of terminal and file snapshots. The main app updates these snapshots on every tick (every 5 seconds). The browser pages include copy-to-clipboard, search, and refresh functionality.
 
-The remote helper uses the V5-only `gitterm.agent.v5.GitTermAgent` gRPC
-service namespace. V4 clients and helpers use a different service path, so
-cross-version session attach and stop requests are rejected before dispatch.
+The remote helper uses the V6-only `gitterm.agent.v6.GitTermAgent` gRPC
+service namespace. V5 and V4 clients and helpers use a different service path,
+so cross-version requests are rejected before dispatch; a V6 desktop reports
+"remote agent is V5 (or older); upgrade it to V6" when it meets an older agent.
 
 ## Markdown Rendering (`markdown.rs`)
 
