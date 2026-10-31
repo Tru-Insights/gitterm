@@ -1,12 +1,12 @@
 // TRU-140: prove a native `ClaudeSession` (the chat-tab adapter) reaches
 // GitTerm's task and browser MCP servers headless. Both servers run
-// in-process on their V5 loopback ranges, attached exactly as the chat tab
+// in-process on their V6 loopback ranges, attached exactly as the chat tab
 // attaches them (`claude_mcp_server()`), so the bearer tokens travel only
 // through the child environment. Claude must call `task_list` with every
 // permission prompt denied (it is pre-approved) and name the browser tools.
 // The wire log's `system/init` frame also lists both servers' status.
 //
-//   env -u GITTERM_V5_TASK_MCP_TOKEN cargo run --example claude_harness_mcp_smoke -- \
+//   env -u GITTERM_V6_TASK_MCP_TOKEN cargo run --example claude_harness_mcp_smoke -- \
 //       --workdir <empty dir> [--model haiku]
 //
 // Unset the task token first when running inside a GitTerm terminal:

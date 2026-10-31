@@ -1956,9 +1956,9 @@ mod tests {
 
     #[test]
     fn pr_base_branch_strips_remote_and_ref_prefixes() {
-        assert_eq!(pr_base_branch("v5"), "v5");
-        assert_eq!(pr_base_branch("origin/v5"), "v5");
-        assert_eq!(pr_base_branch("refs/heads/v5"), "v5");
-        assert_eq!(pr_base_branch("refs/remotes/origin/v5"), "v5");
+        assert_eq!(pr_base_branch("v6"), "v6");
+        assert_eq!(pr_base_branch("origin/v6"), "v6");
+        assert_eq!(pr_base_branch("refs/heads/v6"), "v6");
+        assert_eq!(pr_base_branch("refs/remotes/origin/v6"), "v6");
     }
 }

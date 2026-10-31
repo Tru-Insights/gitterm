@@ -1,10 +1,10 @@
 #!/bin/bash
-# Creates an isolated macOS .app bundle for GitTerm V5
+# Creates an isolated macOS .app bundle for GitTerm V6
 
 set -e
 
-APP_NAME="GitTerm V5"
-BUNDLE_ID="com.cree8.gitterm.v5"
+APP_NAME="GitTerm V6"
+BUNDLE_ID="com.cree8.gitterm.v6"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_DIR/target/release"
@@ -19,12 +19,12 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
 # Copy binary with a different name so the launcher script can call it directly
-cp "$BUILD_DIR/gitterm-v5" "$APP_DIR/Contents/MacOS/gitterm-v5-bin"
+cp "$BUILD_DIR/gitterm-v6" "$APP_DIR/Contents/MacOS/gitterm-v6-bin"
 
-# The app attaches to remote agent sessions by running gitterm-v5-agent from
+# The app attaches to remote agent sessions by running gitterm-v6-agent from
 # the directory of its own executable; without it beside the binary the tab
-# falls back to a bare `gitterm-v5-agent` that is not on a GUI app's PATH.
-cp "$BUILD_DIR/gitterm-v5-agent" "$APP_DIR/Contents/MacOS/gitterm-v5-agent"
+# falls back to a bare `gitterm-v6-agent` that is not on a GUI app's PATH.
+cp "$BUILD_DIR/gitterm-v6-agent" "$APP_DIR/Contents/MacOS/gitterm-v6-agent"
 
 # Create launcher script as the app executable — bypasses Launch Services
 # deduplication so each double-click spawns a fresh process
@@ -34,7 +34,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # Spawn binary detached so launcher exits immediately.
 # macOS then sees no running process for this bundle, allowing
 # subsequent double-clicks to spawn additional instances.
-nohup "$DIR/gitterm-v5-bin" "$@" >/dev/null 2>&1 &
+nohup "$DIR/gitterm-v6-bin" "$@" >/dev/null 2>&1 &
 disown
 exit 0
 LAUNCHER
@@ -56,9 +56,9 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>
-    <string>5.0.0</string>
+    <string>6.0.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>5.0.0</string>
+    <string>6.0.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
@@ -74,7 +74,7 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <key>LSMultipleInstancesProhibited</key>
     <false/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>GitTerm V5 uses the microphone for speech-to-text input to the terminal.</string>
+    <string>GitTerm V6 uses the microphone for speech-to-text input to the terminal.</string>
 </dict>
 </plist>
 EOF
