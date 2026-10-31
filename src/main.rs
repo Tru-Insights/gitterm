@@ -25528,7 +25528,8 @@ fi
 
     /// Synchronously show or hide the agent pages per
     /// `visible_webview_surface`. Never creates or replays: the active agent
-    /// tab's page is shown only when it is alive, otherwise all are hidden.
+    /// tab's page is shown when it is alive, and stays the shown page while
+    /// it is still being created; every other page is hidden.
     fn settle_agent_surface(&mut self) {
         self.prune_agent_pages();
         if let VisibleSurface::AgentChat(tab_id) = self.visible_webview_surface() {
@@ -25539,6 +25540,11 @@ fi
                 self.reveal_agent_page(tab_id);
                 return;
             }
+            // A page staged but not yet built (Make workspace opens the
+            // chat, then switches the sidebar) keeps its visible flag, so
+            // it appears when built instead of behind the placeholder.
+            webview::show_only_agent_page(Some(tab_id));
+            return;
         }
         webview::hide_agent_pages();
     }
