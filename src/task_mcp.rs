@@ -327,8 +327,9 @@ pub fn caller_endpoint(endpoint: &str, caller: Option<&str>) -> String {
     }
 }
 
-/// The caller named by a request URI's `caller` query, if any.
-fn caller_from_query(query: Option<&str>) -> Option<String> {
+/// The caller named by a request URI's `caller` query, if any. The browser
+/// MCP reads the same query (TRU-176).
+pub(crate) fn caller_from_query(query: Option<&str>) -> Option<String> {
     url::form_urlencoded::parse(query?.as_bytes())
         .find(|(key, _)| key == TASK_MCP_CALLER_QUERY)
         .map(|(_, value)| value.into_owned())

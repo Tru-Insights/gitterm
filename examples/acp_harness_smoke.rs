@@ -260,7 +260,10 @@ async fn main() {
         model: Some(model.clone()),
         mode: Some(agent.default_mode().to_string()),
         effort: None,
-        mcp_servers: vec![task.acp_mcp_server(Some(CALLER)), browser.acp_mcp_server()],
+        mcp_servers: vec![
+            task.acp_mcp_server(Some(CALLER)),
+            browser.acp_mcp_server(Some(CALLER)),
+        ],
         env: Vec::new(),
         support_dir: workdir.with_extension("support"),
         wire_log_dir: Some(workdir.with_extension("wire")),

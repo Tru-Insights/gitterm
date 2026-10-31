@@ -90,7 +90,7 @@ async fn main() {
         wire_log_dir: Some(workdir.with_extension("wire")),
         mcp_servers: vec![
             task.claude_mcp_server(Some(CALLER)),
-            browser.claude_mcp_server(),
+            browser.claude_mcp_server(Some(CALLER)),
         ],
         chrome: false,
     };
