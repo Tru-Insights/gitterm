@@ -66,6 +66,38 @@ pub fn instance_config_dir() -> PathBuf {
     global_config_dir().join(format!("instance-{}", instance_id()))
 }
 
+/// The gh account each GitHub owner's repos run as (TRU-173), in the shared
+/// config dir, not the per-instance `config.json`, so it survives restarts:
+///
+/// ```json
+/// { "acme": "acme-dev", "acme-labs": "dev-personal" }
+/// ```
+///
+/// The PR watch reads and the overview's Approve and Merge run with
+/// `GH_TOKEN="$(gh auth token --user <user>)"` for that command only. An
+/// owner with no entry uses gh's active account.
+pub const GITHUB_ACCOUNTS_FILE: &str = "github-accounts.json";
+
+pub fn load_github_accounts() -> BTreeMap<String, String> {
+    load_github_accounts_from(&global_config_dir())
+}
+
+fn load_github_accounts_from(dir: &Path) -> BTreeMap<String, String> {
+    let path = dir.join(GITHUB_ACCOUNTS_FILE);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(error) => {
+            eprintln!("[config] cannot read {}: {error}", path.display());
+            return BTreeMap::new();
+        }
+    };
+    serde_json::from_str(&contents).unwrap_or_else(|error| {
+        eprintln!("[config] ignoring {}: {error}", path.display());
+        BTreeMap::new()
+    })
+}
+
 /// Print instance info on startup
 pub fn print_instance_info() {
     eprintln!("{APP_NAME} instance: {}", instance_id());
@@ -80,22 +112,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_without_github_accounts_loads_and_writes_unchanged() {
-        let old = r#"{"theme":"dark"}"#;
-        let config: Config = serde_json::from_str(old).unwrap();
-        assert!(config.github_accounts.is_empty());
-        let written = serde_json::to_value(&config).unwrap();
-        assert!(written.get("github_accounts").is_none());
-
-        let mapped: Config =
-            serde_json::from_str(r#"{"theme":"dark","github_accounts":{"acme":"acme-dev"}}"#)
-                .unwrap();
-        assert_eq!(
-            mapped.github_accounts.get("acme").map(String::as_str),
-            Some("acme-dev")
-        );
-        let back: Config = serde_json::from_str(&serde_json::to_string(&mapped).unwrap()).unwrap();
-        assert_eq!(back.github_accounts, mapped.github_accounts);
+    fn github_accounts_file_parses_and_tolerates_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_github_accounts_from(dir.path()).is_empty());
+        std::fs::write(
+            dir.path().join(GITHUB_ACCOUNTS_FILE),
+            r#"{"acme":"acme-dev","acme-labs":"dev-personal"}"#,
+        )
+        .unwrap();
+        let accounts = load_github_accounts_from(dir.path());
+        assert_eq!(accounts.get("acme").map(String::as_str), Some("acme-dev"));
+        assert_eq!(accounts.len(), 2);
+        std::fs::write(dir.path().join(GITHUB_ACCOUNTS_FILE), "not json").unwrap();
+        assert!(load_github_accounts_from(dir.path()).is_empty());
     }
 
     #[test]
@@ -669,17 +698,6 @@ pub struct Config {
     /// macOS notifications (TRU-148).
     #[serde(default)]
     pub notifications: NotificationsConfig,
-    /// The gh account each GitHub owner's repos run as (TRU-173): the PR
-    /// watch reads and the overview's Approve and Merge run with
-    /// `GH_TOKEN="$(gh auth token --user <user>)"` for that command only.
-    /// An owner with no entry uses gh's active account. Edit it in
-    /// `config.json`:
-    ///
-    /// ```json
-    /// "github_accounts": { "acme": "acme-dev", "acme-labs": "dev-personal" }
-    /// ```
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub github_accounts: BTreeMap<String, String>,
 }
 
 /// Which macOS notifications GitTerm posts (TRU-148). Edit the
@@ -983,7 +1001,6 @@ impl Default for Config {
             policy: gitterm::workers::ModelPolicy::default(),
             usage: gitterm::usage::UsageConfig::default(),
             notifications: NotificationsConfig::default(),
-            github_accounts: BTreeMap::new(),
         }
     }
 }

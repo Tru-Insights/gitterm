@@ -6535,7 +6535,7 @@ struct App {
     /// PRs of the work (TRU-173): merge plans, the PR watch, the Approve /
     /// Merge confirmation and the Ready to merge list.
     prs: work_prs::PrsState,
-    /// `github_accounts` from config.json: gh account per GitHub owner.
+    /// `github-accounts.json` (shared config dir): gh account per GitHub owner.
     github_accounts: std::collections::BTreeMap<String, String>,
     /// Generation counter for branch diff loads.
     branch_diff_generation: u64,
@@ -7825,7 +7825,6 @@ impl App {
             policy: self.model_policy.clone(),
             usage: self.usage_config.clone(),
             notifications: self.notifications_config.clone(),
-            github_accounts: self.github_accounts.clone(),
         };
         config.save();
         let elapsed = started.elapsed();
@@ -15331,7 +15330,7 @@ impl App {
             park_sheet: None,
             parked_list_open: false,
             prs: work_prs::PrsState::load(&config::global_config_dir()),
-            github_accounts: config.github_accounts.clone(),
+            github_accounts: config::load_github_accounts(),
             branch_diff_generation: 0,
             chat_index_loading: false,
             chat_index_loaded_at: None,

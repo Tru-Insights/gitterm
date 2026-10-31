@@ -1617,7 +1617,7 @@ impl App {
                 format!("Runs as {user} (github_accounts maps {owner} to it)")
             }
             Some(user) => format!(
-                "github_accounts maps {owner} to {user:?}, which is not a GitHub login; fix config.json"
+                "github_accounts maps {owner} to {user:?}, which is not a GitHub login; fix github-accounts.json"
             ),
             None => match self.prs.logins.get(&None) {
                 Some(login) => format!(
