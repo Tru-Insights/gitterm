@@ -5932,8 +5932,11 @@ pub enum Event {
     WorkspaceOverviewRefresh,
     /// A background refresh finished: workspace dir, generation, result.
     WorkspaceOverviewRefreshed(PathBuf, u64, Box<overview::RefreshOutcome>),
-    /// Show a coordinator in the Chats panel.
+    /// Open a coordinator's conversation in the main area; the sidebar
+    /// stays on the overview.
     WorkspaceOverviewOpenChat(String),
+    /// The focus pick was written (or failed with this error).
+    WorkspaceOverviewFocusSaved(Option<String>),
     /// Read repos, branches and issues for another coordinator, or all.
     WorkspaceOverviewFocus(overview::Focus),
     WorkspaceOverviewToggleFocusMenu,
@@ -6297,6 +6300,8 @@ struct App {
     /// Workspace overviews (TRU-167) by workspace dir; built when the
     /// panel first opens in that workspace.
     workspace_overviews: HashMap<PathBuf, WorkspaceOverviewState>,
+    /// Hand-picked overview focus per workspace, kept across restarts.
+    overview_focus_picks: overview::FocusPicks,
     /// Generation counter for branch diff loads.
     branch_diff_generation: u64,
     chat_index_loading: bool,
@@ -11125,7 +11130,12 @@ impl App {
         self.active_workspace_idx
     }
 
-    fn resume_chat_as_tab(&mut self, chat: chats::ChatRef, recreate_dir: bool) -> Task<Event> {
+    fn resume_chat_as_tab(
+        &mut self,
+        chat: chats::ChatRef,
+        recreate_dir: bool,
+        into: Option<usize>,
+    ) -> Task<Event> {
         if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
@@ -11137,7 +11147,7 @@ impl App {
                     "[chats] {} is running on {remote_id}; opening its chat instead of a second process",
                     chat.id
                 );
-                return self.resume_chat_as_chat_tab(chat);
+                return self.resume_chat_as_chat_tab(chat, into);
             }
             return self.resume_remote_chat(chat.id, remote_id);
         }
@@ -11169,7 +11179,9 @@ impl App {
         }
 
         let mut tasks = Vec::new();
-        let ws_idx = self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name);
+        let ws_idx = into.unwrap_or_else(|| {
+            self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name)
+        });
         if ws_idx != self.active_workspace_idx {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
@@ -11196,7 +11208,11 @@ impl App {
     /// process spawns in the tab's `repo_path`), and carries the session id,
     /// so showing it reads the transcript back (`start_agent_history_load`)
     /// and its first prompt spawns Claude with `--resume`.
-    fn resume_chat_as_chat_tab(&mut self, chat: chats::ChatRef) -> Task<Event> {
+    fn resume_chat_as_chat_tab(
+        &mut self,
+        chat: chats::ChatRef,
+        into: Option<usize>,
+    ) -> Task<Event> {
         if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
@@ -11236,7 +11252,9 @@ impl App {
         }
 
         let mut tasks = Vec::new();
-        let ws_idx = self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name);
+        let ws_idx = into.unwrap_or_else(|| {
+            self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name)
+        });
         if ws_idx != self.active_workspace_idx {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
@@ -11566,6 +11584,41 @@ impl App {
         self.active_workspace().map(|ws| ws.dir.clone())
     }
 
+    /// Opens coordinator `id`'s conversation in the main area and keeps the
+    /// sidebar on the overview. A tab of this workspace already hosting the
+    /// chat is switched to; otherwise it is resumed into a new tab through
+    /// the Chats panel's own paths: as a native chat when that is allowed,
+    /// else as a terminal session.
+    fn open_overview_chat(&mut self, id: &str) -> Task<Event> {
+        let chat = chats::ChatRef::local(id);
+        let hosting = self.active_workspace().and_then(|ws| {
+            overview::hosting_tab(ws.tabs.iter().map(|tab| tab.chat_session_id.as_deref()), id)
+        });
+        let open = if let Some(tab_idx) = hosting {
+            self.update(Event::TabSelect(tab_idx))
+        } else {
+            let as_chat = self
+                .find_chat_entry(&chat)
+                .is_some_and(|entry| can_resume_as_chat(entry, ChatMachine::Local, false));
+            if as_chat {
+                self.resume_chat_as_chat_tab(chat, Some(self.active_workspace_idx))
+            } else {
+                self.resume_chat_as_tab(chat, false, Some(self.active_workspace_idx))
+            }
+        };
+        // The tab shown now may carry another sidebar mode (a new tab starts
+        // on Git): put it on the overview.
+        let overview_shown = self
+            .active_tab()
+            .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Workspace);
+        let mode = if overview_shown {
+            Task::none()
+        } else {
+            self.update(Event::SetSidebarMode(SidebarMode::Workspace))
+        };
+        Task::batch([open, mode])
+    }
+
     /// The active tab shows the Workspace overview.
     fn workspace_overview_visible(&self) -> bool {
         !self.sidebar_is_collapsed()
@@ -11587,7 +11640,7 @@ impl App {
             .workspace_overviews
             .get(dir)
             .map(|state| state.focus.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| self.overview_focus_picks.focus_for(dir));
         let summary = freeze_time!("workspace_overview_summary", {
             overview::WorkSummary::build(
                 &self.chat_index,
@@ -11600,7 +11653,10 @@ impl App {
         let state = self
             .workspace_overviews
             .entry(dir.to_path_buf())
-            .or_default();
+            .or_insert_with(|| WorkspaceOverviewState {
+                focus: focus.clone(),
+                ..Default::default()
+            });
         if state.summary.candidates != summary.candidates
             || state.summary.issue_keys != summary.issue_keys
             || state.summary.key_repos != summary.key_repos
@@ -13954,6 +14010,9 @@ impl App {
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
             workspace_overviews: HashMap::new(),
+            overview_focus_picks: overview::FocusPicks::load(&overview::FocusPicks::path_in(
+                &config::global_config_dir(),
+            )),
             branch_diff_generation: 0,
             chat_index_loading: false,
             chat_index_loaded_at: None,
@@ -16098,7 +16157,7 @@ fi
                 Some((tab_id, key)),
             ),
             NavTarget::OpenChat(chat) => {
-                let jump = self.resume_chat_as_chat_tab(chat.clone());
+                let jump = self.resume_chat_as_chat_tab(chat.clone(), None);
                 let arrived_at = self
                     .find_chat_tab(&chat)
                     .map(|(ws_idx, tab_idx)| self.workspaces[ws_idx].tabs[tab_idx].id);
@@ -22824,7 +22883,25 @@ fi
                 if state.focus == focus {
                     return Task::none();
                 }
-                state.focus = focus;
+                state.focus = focus.clone();
+                let save = if self.overview_focus_picks.set(&dir, &focus) {
+                    let picks = self.overview_focus_picks.clone();
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                picks.save(&overview::FocusPicks::path_in(
+                                    &config::global_config_dir(),
+                                ))
+                            })
+                            .await
+                            .map_err(|error| format!("focus save task failed: {error}"))
+                            .and_then(|result| result)
+                        },
+                        |result| Event::WorkspaceOverviewFocusSaved(result.err()),
+                    )
+                } else {
+                    Task::none()
+                };
                 // The rows on screen belong to the old focus: drop them and
                 // any read in flight for it, then read the new one.
                 state.generation += 1;
@@ -22834,7 +22911,14 @@ fi
                 state.last_full_refresh = None;
                 state.unchanged_streak = 0;
                 self.rebuild_workspace_overview(&dir);
-                return self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
+                let refresh =
+                    self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
+                return Task::batch([save, refresh]);
+            }
+            Event::WorkspaceOverviewFocusSaved(error) => {
+                if let Some(error) = error {
+                    eprintln!("[workspace-overview] could not save the focus pick: {error}");
+                }
             }
             Event::WorkspaceOverviewToggleFocusMenu => {
                 if let Some(state) = self
@@ -22853,9 +22937,7 @@ fi
                 }
             }
             Event::WorkspaceOverviewOpenChat(id) => {
-                let mode = self.update(Event::SetSidebarMode(SidebarMode::Chats));
-                let select = self.update(Event::SelectChat(chats::ChatRef::local(&id)));
-                return Task::batch([mode, select]);
+                return self.open_overview_chat(&id);
             }
             Event::BranchDiffOpen(checkout, source) => {
                 return self.open_branch_diff(checkout, source);
@@ -23017,13 +23099,13 @@ fi
                 self.chat_summary_reply_expanded = !self.chat_summary_reply_expanded;
             }
             Event::ResumeChatAsTab(chat) => {
-                return self.resume_chat_as_tab(chat, false);
+                return self.resume_chat_as_tab(chat, false, None);
             }
             Event::ResumeChatRecreateDir(chat) => {
-                return self.resume_chat_as_tab(chat, true);
+                return self.resume_chat_as_tab(chat, true, None);
             }
             Event::ResumeChatAsChat(chat) => {
-                return self.resume_chat_as_chat_tab(chat);
+                return self.resume_chat_as_chat_tab(chat, None);
             }
             Event::FocusChatTab(chat) => {
                 if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
@@ -30607,6 +30689,23 @@ fi
             content = content.push(chats);
         }
 
+        // Coordinators that live in another workspace but edited here.
+        if !summary.also_worked.is_empty() {
+            content = content.push(section(format!(
+                "ALSO WORKED HERE \u{00B7} {}",
+                summary.also_worked.len()
+            )));
+            let mut also = Column::new().spacing(2);
+            for item in summary.also_worked.iter().take(COORDINATOR_ROWS) {
+                also = also.push(self.view_overview_coordinator_row_with(
+                    &item.coordinator,
+                    summary.focused.contains(&item.coordinator.id),
+                    Some(item.edits_here),
+                ));
+            }
+            content = content.push(also);
+        }
+
         // Repos touched, each with the branches the work owns there.
         let mut groups: Vec<(&Path, Option<u64>, Vec<&overview::BranchStatus>)> = summary
             .repos
@@ -30730,13 +30829,33 @@ fi
     }
 
     /// One coordinator: title and age, latest line, fan-out and indexed
-    /// children. Clicking focuses it; the ↗ beside it shows it in Chats.
+    /// children. Clicking focuses it; the ↗ beside it opens the conversation in the
+    /// main area, and "open" marks one a tab already hosts.
     fn view_overview_coordinator_row<'a>(
         &'a self,
         coordinator: &'a overview::Coordinator,
         focused: bool,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
+        self.view_overview_coordinator_row_with(coordinator, focused, None)
+    }
+
+    /// As above; `edits_here` adds "n edits here" for a coordinator of
+    /// another workspace.
+    fn view_overview_coordinator_row_with<'a>(
+        &'a self,
+        coordinator: &'a overview::Coordinator,
+        focused: bool,
+        edits_here: Option<u64>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
         const CHILD_ROWS: usize = 4;
+        // A tab of this workspace hosts the conversation.
+        let is_open = self.active_workspace().is_some_and(|ws| {
+            overview::hosting_tab(
+                ws.tabs.iter().map(|tab| tab.chat_session_id.as_deref()),
+                &coordinator.id,
+            )
+            .is_some()
+        });
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
         let font_small = self.ui_font_small();
@@ -30750,6 +30869,9 @@ fi
                     .size(font_small)
                     .color(theme.text_primary())
                     .width(Length::Fill),
+                text(if is_open { "open" } else { "" })
+                    .size(10)
+                    .color(theme.green()),
                 text(chats::format_age(coordinator.active))
                     .size(10)
                     .color(text_muted)
@@ -30763,6 +30885,17 @@ fi
                 text(format!("\u{21B3} {}", overview::shorten(latest, 90)))
                     .size(font_small - 1.0)
                     .color(theme.text_secondary()),
+            );
+        }
+        if let Some(edits) = edits_here {
+            body = body.push(
+                text(format!(
+                    "{edits} edit{} here",
+                    if edits == 1 { "" } else { "s" }
+                ))
+                .size(10)
+                .color(theme.accent())
+                .font(mono),
             );
         }
         if let Some(fan_out) = &coordinator.fan_out {

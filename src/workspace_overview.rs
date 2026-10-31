@@ -185,6 +185,49 @@ pub fn coordinators(
     out
 }
 
+/// A recent coordinator that lives in another workspace but edited repos
+/// inside this one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlsoWorked {
+    pub coordinator: Coordinator,
+    /// Edits it made in repos inside this workspace's dir.
+    pub edits_here: u64,
+}
+
+/// Recent coordinators outside the workspace at `ws_dir` (their own cwd and
+/// repo are not in it) whose facts record edits in a repo inside it, most
+/// recently active first.
+pub fn also_worked_here(
+    entries: &[ChatIndexEntry],
+    ws_dir: &Path,
+    now: SystemTime,
+) -> Vec<AlsoWorked> {
+    let here: HashSet<&str> = work_chats(entries, ws_dir)
+        .into_iter()
+        .map(|entry| entry.id.as_str())
+        .collect();
+    let elsewhere: Vec<&ChatIndexEntry> = entries
+        .iter()
+        .filter(|entry| !here.contains(entry.id.as_str()))
+        .collect();
+    coordinators(&elsewhere, entries, now)
+        .into_iter()
+        .filter(|coordinator| coordinator.recent)
+        .filter_map(|coordinator| {
+            let under = chats_under(entries, std::slice::from_ref(&coordinator.id));
+            let edits_here = repos_touched(&under)
+                .iter()
+                .filter(|repo| repo.dir.starts_with(ws_dir))
+                .map(|repo| repo.edits)
+                .sum::<u64>();
+            (edits_here > 0).then_some(AlsoWorked {
+                coordinator,
+                edits_here,
+            })
+        })
+        .collect()
+}
+
 /// Which coordinators the repos, branches and issues are read for: the
 /// interim answer until a workspace owns its chats (design step 4).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -196,6 +239,129 @@ pub enum Focus {
     Coordinator(String),
     /// The union over the recent coordinators.
     AllRecent,
+}
+
+/// A focus the user picked by hand. `Latest` is the automatic default and
+/// is never stored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedFocus {
+    All,
+    Coordinator(String),
+}
+
+/// The focus picks per workspace directory, kept across restarts in
+/// `overview-focus.json` in the config dir. A missing or unreadable file
+/// reads as no picks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FocusPicks(std::collections::BTreeMap<String, PersistedFocus>);
+
+impl FocusPicks {
+    /// The file inside the config directory `dir`.
+    pub fn path_in(dir: &Path) -> PathBuf {
+        dir.join("overview-focus.json")
+    }
+
+    pub fn parse(json: &str) -> Self {
+        match serde_json::from_str(json) {
+            Ok(picks) => picks,
+            Err(error) => {
+                eprintln!("[workspace-overview] ignoring unreadable focus picks: {error}");
+                Self::default()
+            }
+        }
+    }
+
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(json) => Self::parse(&json),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(error) => {
+                eprintln!(
+                    "[workspace-overview] cannot read focus picks {}: {error}",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// The stored pick for `dir`, or the default.
+    pub fn focus_for(&self, dir: &Path) -> Focus {
+        match self.0.get(&dir.to_string_lossy().into_owned()) {
+            Some(PersistedFocus::All) => Focus::AllRecent,
+            Some(PersistedFocus::Coordinator(id)) => Focus::Coordinator(id.clone()),
+            None => Focus::Latest,
+        }
+    }
+
+    /// Records `focus` for `dir`; `Latest` clears the pick. Returns whether
+    /// anything changed.
+    pub fn set(&mut self, dir: &Path, focus: &Focus) -> bool {
+        let before = self.stored(dir);
+        let key = dir.to_string_lossy().into_owned();
+        match focus {
+            Focus::Latest => {
+                self.0.remove(&key);
+            }
+            Focus::AllRecent => {
+                self.0.insert(key, PersistedFocus::All);
+            }
+            Focus::Coordinator(id) => {
+                self.0.insert(key, PersistedFocus::Coordinator(id.clone()));
+            }
+        }
+        before != self.stored(dir)
+    }
+
+    fn stored(&self, dir: &Path) -> Option<PersistedFocus> {
+        self.0.get(&dir.to_string_lossy().into_owned()).cloned()
+    }
+
+    /// Writes the picks to `path` through a temporary file and an atomic
+    /// replace. Blocking: run it off the UI thread.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let context = |what: &str, error: &dyn std::fmt::Display| {
+            format!("{what} {}: {error}", path.display())
+        };
+        let json = serde_json::to_vec_pretty(self).map_err(|e| context("encode", &e))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| context("create the directory of", &e))?;
+        }
+        let temporary = path.with_extension(format!(
+            "json.tmp-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&json)?;
+            file.sync_all()?;
+            crate::tasks::replace_file_atomically(&temporary, path)
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(context("atomically write", &error));
+        }
+        Ok(())
+    }
+}
+
+/// The index of the tab hosting chat `id` among a workspace's tabs, given
+/// each tab's chat session id.
+pub fn hosting_tab<'a>(
+    tab_chat_ids: impl IntoIterator<Item = Option<&'a str>>,
+    id: &str,
+) -> Option<usize> {
+    tab_chat_ids
+        .into_iter()
+        .position(|tab_id| tab_id == Some(id))
 }
 
 /// The root ids `focus` reads, from `coordinators` (sorted, most recently
@@ -647,6 +813,8 @@ pub struct WorkSummary {
     /// Every coordinator of the workspace, most recently active first;
     /// `recent` ones are listed, the rest fold under "older".
     pub coordinators: Vec<Coordinator>,
+    /// Recent coordinators of other workspaces that edited here.
+    pub also_worked: Vec<AlsoWorked>,
     /// The focus asked for, and the roots it resolved to. Repos, branches
     /// and issues below are those of these roots and their children only.
     pub focus: Focus,
@@ -672,7 +840,16 @@ impl WorkSummary {
     ) -> Self {
         let all_work = work_chats(entries, ws_dir);
         let coordinators = coordinators(&all_work, entries, now);
-        let focused = focused_roots(focus, &coordinators);
+        let also_worked = also_worked_here(entries, ws_dir, now);
+        let focused = match focus {
+            Focus::Coordinator(id)
+                if !coordinators.iter().any(|c| &c.id == id)
+                    && also_worked.iter().any(|a| &a.coordinator.id == id) =>
+            {
+                vec![id.clone()]
+            }
+            _ => focused_roots(focus, &coordinators),
+        };
         let work = chats_under(entries, &focused);
         let repos = repos_touched(&work);
         let candidates = branch_candidates(&work, tasks);
@@ -701,6 +878,7 @@ impl WorkSummary {
         }
         Self {
             coordinators,
+            also_worked,
             focus: focus.clone(),
             focused,
             repos,
@@ -723,7 +901,12 @@ impl WorkSummary {
             _ => self
                 .focused
                 .first()
-                .and_then(|id| self.coordinators.iter().find(|c| &c.id == id))
+                .and_then(|id| {
+                    self.coordinators
+                        .iter()
+                        .chain(self.also_worked.iter().map(|a| &a.coordinator))
+                        .find(|c| &c.id == id)
+                })
                 .map(|c| c.title.clone())
                 .unwrap_or_else(|| "no chats".to_string()),
         }
@@ -2782,5 +2965,104 @@ mod tests {
         for error in &outcome.errors {
             println!("  repo error: {error}");
         }
+    }
+
+    #[test]
+    fn focus_picks_round_trip_through_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested").join("overview-focus.json");
+        let (a, b, c) = (Path::new("/w/a"), Path::new("/w/b"), Path::new("/w/c"));
+        let mut picks = FocusPicks::default();
+        assert!(picks.set(a, &Focus::Coordinator("one".into())));
+        assert!(picks.set(b, &Focus::AllRecent));
+        assert!(!picks.set(b, &Focus::AllRecent));
+        picks.save(&path).unwrap();
+        let loaded = FocusPicks::load(&path);
+        assert_eq!(loaded, picks);
+        assert_eq!(loaded.focus_for(a), Focus::Coordinator("one".into()));
+        assert_eq!(loaded.focus_for(b), Focus::AllRecent);
+        assert_eq!(loaded.focus_for(c), Focus::Latest);
+        // Back to the automatic default clears the pick.
+        let mut cleared = loaded;
+        assert!(cleared.set(a, &Focus::Latest));
+        assert_eq!(cleared.focus_for(a), Focus::Latest);
+        cleared.save(&path).unwrap();
+        assert_eq!(FocusPicks::load(&path).focus_for(a), Focus::Latest);
+        // No temporary files are left behind.
+        let leftovers = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1);
+    }
+
+    #[test]
+    fn focus_picks_missing_or_corrupt_file_reads_as_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("none.json");
+        assert_eq!(FocusPicks::load(&missing), FocusPicks::default());
+        let corrupt = temp.path().join("bad.json");
+        std::fs::write(&corrupt, "{ not json").unwrap();
+        assert_eq!(FocusPicks::load(&corrupt), FocusPicks::default());
+    }
+
+    #[test]
+    fn stored_unknown_coordinator_falls_back_to_latest() {
+        let picks = FocusPicks::parse(r#"{"/w":{"coordinator":"gone"}}"#);
+        let focus = picks.focus_for(Path::new("/w"));
+        assert_eq!(focus, Focus::Coordinator("gone".into()));
+        let roots = focused_roots(&focus, &[]);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn hosting_tab_finds_the_tab_with_the_chat() {
+        let tabs = [None, Some("a"), Some("b")];
+        assert_eq!(hosting_tab(tabs, "b"), Some(2));
+        assert_eq!(hosting_tab(tabs, "a"), Some(1));
+        assert_eq!(hosting_tab(tabs, "c"), None);
+        assert_eq!(hosting_tab([], "a"), None);
+    }
+
+    #[test]
+    fn also_worked_here_lists_recent_outside_coordinators_with_edits_inside() {
+        let now = SystemTime::now();
+        let edit = |dir: &str, edits: u64| ChatFacts {
+            repos_touched: vec![RepoTouch {
+                dir: dir.into(),
+                edits,
+            }],
+            ..ChatFacts::default()
+        };
+        // Home is another workspace, edited a repo here: listed.
+        let mut away = entry("away", "/other/app");
+        away.mtime = now;
+        away.facts = Some(edit("/w/api", 3));
+        // Same, but older than the recent window: not listed.
+        let mut stale = entry("stale", "/other/app");
+        stale.mtime = now - RECENT_WINDOW - Duration::from_secs(60);
+        stale.facts = Some(edit("/w/api", 3));
+        // Outside, edits only elsewhere or zero here: not listed.
+        let mut elsewhere = entry("elsewhere", "/other/app");
+        elsewhere.mtime = now;
+        elsewhere.facts = Some(edit("/other/lib", 9));
+        let mut zero = entry("zero", "/other/app");
+        zero.mtime = now;
+        zero.facts = Some(edit("/w/api", 0));
+        // Lives here: it is a coordinator of this workspace, not "also".
+        let mut home = entry("home", "/w/api");
+        home.mtime = now;
+        home.facts = Some(edit("/w/api", 4));
+        let entries = vec![away, stale, elsewhere, zero, home];
+        let also = also_worked_here(&entries, Path::new("/w"), now);
+        assert_eq!(also.len(), 1);
+        assert_eq!(also[0].coordinator.id, "away");
+        assert_eq!(also[0].edits_here, 3);
+        // A pick of such a coordinator is honoured, not replaced by Latest.
+        let summary = WorkSummary::build(
+            &entries,
+            Path::new("/w"),
+            &[],
+            &Focus::Coordinator("away".into()),
+            now,
+        );
+        assert_eq!(summary.focused, vec!["away".to_string()]);
     }
 }
