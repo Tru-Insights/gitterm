@@ -70,6 +70,9 @@ pub struct CodexRun {
     pub cwd: PathBuf,
     /// `-m <model>`; `None` keeps Codex's configured default.
     pub model: Option<String>,
+    /// GitTerm's change guidelines (TRU-174), passed as
+    /// `-c developer_instructions=…`; `None` adds nothing.
+    pub guidelines: Option<crate::guidelines::Guidelines>,
     /// JSONL log: stdout lines verbatim, stderr lines as
     /// `{"type":"gitterm.stderr","line":...}`. Codex writes the final message
     /// next to it with the extension `last.md`.
@@ -548,6 +551,13 @@ fn codex_args(run: &CodexRun, last_message_path: &Path) -> (Vec<OsString>, Optio
             args.extend(["--sandbox".into(), "read-only".into()]);
             stdin_text = Some(brief.clone());
         }
+    }
+    if let Some(guidelines) = &run.guidelines {
+        args.extend(
+            crate::guidelines::codex_args(guidelines)
+                .into_iter()
+                .map(OsString::from),
+        );
     }
     args.push("--json".into());
     args.push("-o".into());
@@ -1386,6 +1396,7 @@ mod tests {
             }),
             cwd: PathBuf::from("/repo"),
             model: None,
+            guidelines: None,
             log_path: PathBuf::from("/logs/d1.jsonl"),
         };
         let strings = |args: Vec<OsString>| -> Vec<String> {
@@ -1451,6 +1462,7 @@ mod tests {
             },
             cwd: PathBuf::from("/repo"),
             model: Some("gpt-6-astra".into()),
+            guidelines: None,
             log_path: PathBuf::from("/logs/d1.jsonl"),
         };
         let (args, stdin) = codex_args(&consult, last);
@@ -1469,6 +1481,29 @@ mod tests {
             ]
         );
         assert_eq!(stdin.as_deref(), Some("Why?"));
+
+        // The guidelines go in as one `-c` override before the output flags.
+        let guided = CodexRun {
+            guidelines: Some(crate::guidelines::Guidelines {
+                path: PathBuf::from("/cfg/agent-guidelines.md"),
+                text: "Be brief.\n".into(),
+            }),
+            ..review(ReviewTargetMode::Uncommitted, None)
+        };
+        let (args, _) = codex_args(&guided, last);
+        assert_eq!(
+            strings(args),
+            [
+                "exec",
+                "review",
+                "--uncommitted",
+                "-c",
+                r#"developer_instructions="Be brief.\n""#,
+                "--json",
+                "-o",
+                "/logs/d1.last.md"
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -1522,6 +1557,7 @@ mod tests {
                     kind,
                     cwd: self.repo.path().to_path_buf(),
                     model: None,
+                    guidelines: None,
                     log_path: self.dir.path().join("logs").join("d1.jsonl"),
                 }
             }

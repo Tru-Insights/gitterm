@@ -8,6 +8,7 @@ pub mod codex_review;
 pub mod codex_runner;
 pub mod delegations;
 pub mod gh_identity;
+pub mod guidelines;
 pub mod harness;
 pub mod jev;
 pub mod merge_plan;

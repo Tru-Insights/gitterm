@@ -590,11 +590,13 @@ fn hold_composer_dictation(held: &mut HashMap<usize, String>, tab_id: usize, tex
 /// passes); the replayed buffer's `ready` and `permission_mode_changed` events
 /// override it. `None` (pi tabs) hides the mode chip. `composer` carries the
 /// Claude tab's configured model and effort and its checkout chip state
-/// (`None` for pi tabs hides those chips).
+/// (`None` for pi tabs hides those chips). `guidelines` shows the change
+/// guidelines marker (TRU-174).
 fn set_agent_webview_tab_id(
     tab_id: usize,
     permission_mode: Option<&str>,
     composer: Option<&serde_json::Value>,
+    guidelines: bool,
 ) {
     let mode = serde_json::to_string(&permission_mode).unwrap_or_else(|e| {
         eprintln!("[agent-webview] tab {tab_id}: cannot encode mode {permission_mode:?}: {e}");
@@ -603,8 +605,41 @@ fn set_agent_webview_tab_id(
     let composer = composer.map_or_else(|| "null".to_string(), |c| c.to_string());
     webview::evaluate_script(
         WebviewSurface::Agent(tab_id),
-        &format!("window.__setTabId({tab_id}, {mode}, {composer})"),
+        &format!("window.__setTabId({tab_id}, {mode}, {composer}, {guidelines})"),
     );
+}
+
+/// Show or hide a chat page's change guidelines marker (TRU-174).
+fn push_guidelines_marker(tab_id: usize, on: bool) {
+    webview::evaluate_script(
+        WebviewSurface::Agent(tab_id),
+        &format!("window.__setGuidelines({on})"),
+    );
+}
+
+/// GitTerm's change guidelines for an agent starting now in `cwd`
+/// (TRU-174); `None` when switched off or unreadable (logged).
+fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guidelines::Guidelines> {
+    gitterm::guidelines::for_launch(&config::global_config_dir(), cwd, workspace_off)
+}
+
+/// A terminal startup command with the guidelines added when it starts
+/// `claude`, `pi` or `codex`. Other commands are not inspected, so they
+/// never read the guidelines file.
+fn terminal_command_with_guidelines(command: &str, cwd: &Path, workspace_off: bool) -> String {
+    // shortcut: the added option is POSIX-quoted, so Windows terminals
+    // (cmd, PowerShell) launch without the guidelines until the quoting is
+    // per-shell.
+    if cfg!(target_os = "windows") {
+        return command.to_string();
+    }
+    if !gitterm::guidelines::starts_a_harness(command) {
+        return command.to_string();
+    }
+    match launch_guidelines(cwd, workspace_off) {
+        Some(guidelines) => gitterm::guidelines::configure_terminal_command(command, &guidelines),
+        None => command.to_string(),
+    }
 }
 
 /// Update a chat page's checkout chip (choices, label, lock).
@@ -5422,6 +5457,8 @@ struct Workspace {
     /// started here joins `chats` even before it owns one. Runtime only;
     /// after a restart a workspace still without chats is folder-scoped.
     claims_new_chats: bool,
+    /// Agents started here get no change guidelines (TRU-174).
+    guidelines_off: bool,
 }
 
 impl Workspace {
@@ -5445,6 +5482,7 @@ impl Workspace {
             env: std::collections::HashMap::new(),
             chats: Vec::new(),
             claims_new_chats: false,
+            guidelines_off: false,
         }
     }
 
@@ -5471,6 +5509,7 @@ impl Workspace {
             env: std::collections::HashMap::new(),
             chats: Vec::new(),
             claims_new_chats: false,
+            guidelines_off: false,
         }
     }
 
@@ -5988,6 +6027,13 @@ pub enum Event {
     WorkspaceSettingsEnvRemove(String),
     WorkspaceSettingsColorChange(WorkspaceColor),
     WorkspaceSettingsApplyProfile(String),
+    /// Change guidelines (TRU-174), from the workspace settings modal:
+    /// on for every agent, on in this workspace, on in the active tab's
+    /// repo; and open the guidelines file.
+    GuidelinesEnabledToggled(bool),
+    GuidelinesWorkspaceToggled(bool),
+    GuidelinesRepoToggled(bool),
+    GuidelinesEdit,
     // Slide animation events
     SlideAnimationTick,
     // Edge peek events
@@ -6525,6 +6571,12 @@ struct App {
     workspace_settings_idx: usize,
     workspace_settings_new_key: String,
     workspace_settings_new_value: String,
+    /// `agent-guidelines.json` as of the modal opening (TRU-174); launches
+    /// read the file fresh.
+    guidelines_settings: gitterm::guidelines::GuidelinesSettings,
+    /// The modal's repo row: the active tab's repo (as `off_repos` stores
+    /// it) and whether the guidelines are off there.
+    guidelines_repo: Option<(PathBuf, bool)>,
     // Tab picker popup (Option+click on "+")
     tab_picker_visible: bool,
     /// The + menu shows the CLI presets instead of its top level.
@@ -7960,6 +8012,7 @@ impl App {
             chats: ws.chats.clone(),
             parked: None,
             done_at: None,
+            guidelines_off: ws.guidelines_off,
         }
     }
 
@@ -8915,7 +8968,10 @@ impl App {
         if session.harness.is_some() {
             return history;
         }
-        let Some(config) = session.claude_session_config(repo_path, Vec::new(), chrome) else {
+        // Attaching to a chat on another machine: its guidelines are out of
+        // TRU-174's scope.
+        let Some(config) = session.claude_session_config(repo_path, Vec::new(), chrome, None)
+        else {
             return history;
         };
         eprintln!(
@@ -9188,6 +9244,85 @@ impl App {
             "checkout": self.chat_checkout_state(tab_id)?,
             "harness": harness,
         }))
+    }
+
+    /// Whether the workspace named `name` switched the change guidelines
+    /// off (TRU-174); a workspace that is not open reads its saved entry.
+    fn workspace_guidelines_off(&self, name: &str) -> bool {
+        self.workspaces
+            .iter()
+            .find(|ws| ws.name == name)
+            .map(|ws| ws.guidelines_off)
+            .or_else(|| {
+                self.closed_workspace_configs
+                    .iter()
+                    .find(|cfg| cfg.name == name)
+                    .map(|cfg| cfg.guidelines_off)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether chat tab `tab_id`'s agent starts with the change guidelines
+    /// (TRU-174), for the page's marker: a Claude chat on this Mac or a pi
+    /// chat (pi always runs here) whose settings allow them and whose file
+    /// reads. ACP chats and remote Claude chats do not get them.
+    fn chat_guidelines_on(&self, tab_id: usize) -> bool {
+        let Some((ws, tab)) = self
+            .workspaces
+            .iter()
+            .find_map(|ws| ws.tabs.iter().find(|t| t.id == tab_id).map(|t| (ws, t)))
+        else {
+            return false;
+        };
+        let Some(session) = tab.agent_session() else {
+            return false;
+        };
+        let supported = match session.backend() {
+            tab::AgentBackend::Claude => self.remote_agent_id_for_workspace(ws).is_none(),
+            tab::AgentBackend::Pi => true,
+            tab::AgentBackend::Acp(_) => false,
+        };
+        supported && launch_guidelines(&tab.repo_path, ws.guidelines_off).is_some()
+    }
+
+    /// Re-mark every built chat page after a guidelines setting changed.
+    /// A running agent keeps what it started with; the marker shows what
+    /// the tab's next start gets.
+    fn refresh_guidelines_markers(&self) {
+        for &tab_id in &self.agent_pages {
+            push_guidelines_marker(tab_id, self.chat_guidelines_on(tab_id));
+        }
+    }
+
+    /// Reads `agent-guidelines.json` for the workspace settings modal, and
+    /// the repo of the workspace's active tab (local workspaces only).
+    fn load_guidelines_modal_state(&mut self) {
+        self.guidelines_settings = gitterm::guidelines::load_settings(&config::global_config_dir());
+        self.guidelines_repo = self
+            .workspaces
+            .get(self.workspace_settings_idx)
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .and_then(|ws| ws.active_tab())
+            .map(|tab| {
+                let repo = gitterm::guidelines::repo_key(&tab.repo_path);
+                let off = self.guidelines_settings.repo_is_off(&repo);
+                (repo, off)
+            });
+    }
+
+    /// Writes the modal's guidelines settings. A failed write is logged and
+    /// the modal re-reads the file, so it shows what launches will use.
+    fn save_guidelines_settings(&mut self) {
+        if let Err(error) = gitterm::guidelines::save_settings(
+            &config::global_config_dir(),
+            &self.guidelines_settings,
+        ) {
+            eprintln!("[guidelines] {error}");
+            self.load_guidelines_modal_state();
+        } else if let Some((repo, off)) = self.guidelines_repo.as_mut() {
+            *off = self.guidelines_settings.repo_is_off(repo);
+        }
+        self.refresh_guidelines_markers();
     }
 
     fn active_task_context_id(&self) -> Option<&str> {
@@ -11724,6 +11859,7 @@ impl App {
             ws.abbrev = cfg.abbrev.clone();
             ws.env = cfg.env.clone();
             ws.chats = cfg.chats.clone();
+            ws.guidelines_off = cfg.guidelines_off;
             if let Some(config::WorkspaceLocationConfig::RemoteAgent {
                 remote_id,
                 workspace_id,
@@ -13961,7 +14097,13 @@ impl App {
                 continue;
             };
             match gitterm::delegations::codex_run(delegation, &config_root) {
-                Ok(run) => runs.push((delegation_id, run)),
+                Ok(mut run) => {
+                    run.guidelines = launch_guidelines(
+                        &run.cwd,
+                        self.workspace_guidelines_off(&delegation.parent.workspace),
+                    );
+                    runs.push((delegation_id, run))
+                }
                 Err(error) => unrunnable.push((delegation_id, error)),
             }
         }
@@ -14816,6 +14958,7 @@ impl App {
         workspace.abbrev = ws_config.abbrev.clone();
         workspace.env = ws_config.env.clone();
         workspace.chats = ws_config.chats.clone();
+        workspace.guidelines_off = ws_config.guidelines_off;
         // Restore saved run command if present
         if let Some(cmd) = &ws_config.run_command {
             workspace.console.run_command = Some(cmd.clone());
@@ -15406,6 +15549,8 @@ impl App {
             workspace_settings_idx: 0,
             workspace_settings_new_key: String::new(),
             workspace_settings_new_value: String::new(),
+            guidelines_settings: gitterm::guidelines::GuidelinesSettings::default(),
+            guidelines_repo: None,
             tab_picker_visible: false,
             tab_picker_cli_open: false,
             task_handoff_copied: false,
@@ -16194,13 +16339,21 @@ fi
             .map(|s| s.to_string())
             .or_else(|| self.active_workspace().map(|ws| ws.name.clone()));
         let global_ws_path = config::global_config_dir().join("workspaces.json");
-        let mut extra_env: Vec<(String, String)> = ws_name
-            .and_then(|name| {
-                std::fs::read_to_string(&global_ws_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<WorkspacesFile>(&s).ok())
-                    .and_then(|f| f.workspaces.into_iter().find(|w| w.name == name))
-            })
+        let saved_ws = ws_name.as_deref().and_then(|name| {
+            std::fs::read_to_string(&global_ws_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<WorkspacesFile>(&s).ok())
+                .and_then(|f| f.workspaces.into_iter().find(|w| w.name == name))
+        });
+        // The open workspace's switch wins over its last save; during init
+        // the workspace is not open yet and the save is all there is.
+        let guidelines_off = ws_name
+            .as_deref()
+            .and_then(|name| self.workspaces.iter().find(|ws| ws.name == name))
+            .map(|ws| ws.guidelines_off)
+            .or_else(|| saved_ws.as_ref().map(|cfg| cfg.guidelines_off))
+            .unwrap_or(false);
+        let mut extra_env: Vec<(String, String)> = saved_ws
             .map(|cfg| cfg.env.into_iter().collect())
             .unwrap_or_default();
         if let Some(connection) = &self.browser_mcp {
@@ -16214,9 +16367,13 @@ fi
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
+        // Added at launch only: the stored startup command stays as given.
+        let launch_command = startup_command
+            .as_deref()
+            .map(|command| terminal_command_with_guidelines(command, &repo_path, guidelines_off));
         let settings = Self::build_terminal_settings(
             &repo_path,
-            startup_command.as_deref(),
+            launch_command.as_deref(),
             self.scrollback_lines,
             &self.theme,
             self.terminal_font_size,
@@ -16793,6 +16950,7 @@ fi
             workspace.dir = PathBuf::from(&saved.dir);
             workspace.env = saved.env.clone();
             workspace.chats = saved.chats.clone();
+            workspace.guidelines_off = saved.guidelines_off;
             if let Some(cmd) = &saved.run_command {
                 workspace.console.run_command = Some(cmd.clone());
                 workspace.console.status = ConsoleStatus::Stopped;
@@ -19453,6 +19611,7 @@ fi
                             .collect()
                     };
                 'outer_submit: for ws in &mut self.workspaces {
+                    let guidelines_off = ws.guidelines_off;
                     for t in &mut ws.tabs {
                         if t.id != tab_id {
                             continue;
@@ -19551,10 +19710,18 @@ fi
                                         session.session_id = None;
                                     }
                                 }
+                                // Remote chats start without the
+                                // guidelines (TRU-174 is local only).
+                                let guidelines_file = remote_chat
+                                    .is_none()
+                                    .then(|| launch_guidelines(&repo_path, guidelines_off))
+                                    .flatten()
+                                    .map(|guidelines| guidelines.path);
                                 let Some(config) = session.claude_session_config(
                                     repo_path,
                                     std::mem::take(&mut claude_mcp_servers),
                                     claude_in_chrome,
+                                    guidelines_file,
                                 ) else {
                                     return Task::none();
                                 };
@@ -19631,7 +19798,13 @@ fi
                             echo = tab::AgentEvent::user_prompt(&prompt.text);
                         }
                         if session.task_handle.is_none() {
-                            let handle = tab::spawn_agent_task(session.config.clone(), repo_path);
+                            let guidelines_file = launch_guidelines(&repo_path, guidelines_off)
+                                .map(|guidelines| guidelines.path);
+                            let handle = tab::spawn_agent_task(
+                                session.config.clone(),
+                                repo_path,
+                                guidelines_file,
+                            );
                             // Take the receiver up-front so this turn can wire
                             // it into a Task::run; it lives for the tab's lifetime.
                             bridge = handle.take_event_receiver();
@@ -20463,6 +20636,7 @@ fi
                     tab_id,
                     session.configured_permission_mode().as_deref(),
                     composer.as_ref(),
+                    self.chat_guidelines_on(tab_id),
                 );
                 let cards = self.delegation_cards_for_tab(tab_id);
                 replay_agent_conversation_in_webview(tab_id, &session.conversation, cards);
@@ -25615,6 +25789,7 @@ fi
                 if let Some(ref cfg) = saved {
                     workspace.abbrev = cfg.abbrev.clone();
                     workspace.env = cfg.env.clone();
+                    workspace.guidelines_off = cfg.guidelines_off;
                     if let Some(cmd) = &cfg.run_command {
                         workspace.console.run_command = Some(cmd.clone());
                         workspace.console.status = ConsoleStatus::Stopped;
@@ -25658,6 +25833,34 @@ fi
                 self.workspace_settings_idx = idx;
                 self.workspace_settings_new_key = String::new();
                 self.workspace_settings_new_value = String::new();
+                self.load_guidelines_modal_state();
+            }
+            Event::GuidelinesEnabledToggled(on) => {
+                self.guidelines_settings.enabled = on;
+                self.save_guidelines_settings();
+            }
+            Event::GuidelinesRepoToggled(on) => {
+                if let Some((repo, _)) = self.guidelines_repo.clone() {
+                    self.guidelines_settings.set_repo_off(&repo, !on);
+                    self.save_guidelines_settings();
+                }
+            }
+            Event::GuidelinesWorkspaceToggled(on) => {
+                if let Some(ws) = self.workspaces.get_mut(self.workspace_settings_idx) {
+                    ws.guidelines_off = !on;
+                    self.workspaces_dirty = true;
+                    self.next_workspace_save_at = Some(Instant::now());
+                }
+                self.refresh_guidelines_markers();
+            }
+            Event::GuidelinesEdit => {
+                match gitterm::guidelines::ensure_guidelines_file(&config::global_config_dir()) {
+                    Ok(path) => {
+                        self.workspace_settings_open = false;
+                        return Task::done(Event::ViewFile(SourcePath::Local(path)));
+                    }
+                    Err(error) => eprintln!("[guidelines] cannot open the guidelines: {error}"),
+                }
             }
             Event::WorkspaceSettingsClose => {
                 self.workspace_settings_open = false;
@@ -28937,6 +29140,62 @@ fi
             .size(11)
             .color(text_muted);
 
+        // --- Change guidelines (TRU-174) ---
+        let guidelines_check = |checked: bool, label: String, on_toggle: fn(bool) -> Event| {
+            checkbox(checked)
+                .label(label)
+                .on_toggle(on_toggle)
+                .size(14)
+                .text_size(12)
+                .style(move |_theme: &Theme, status: checkbox::Status| {
+                    let checked = matches!(
+                        status,
+                        checkbox::Status::Active { is_checked: true }
+                            | checkbox::Status::Hovered { is_checked: true }
+                            | checkbox::Status::Disabled { is_checked: true }
+                    );
+                    checkbox::Style {
+                        background: if checked { accent } else { bg_base }.into(),
+                        icon_color: bg_base,
+                        border: iced::Border {
+                            color: if checked { accent } else { border_color },
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        text_color: Some(text_primary),
+                    }
+                })
+        };
+        let mut guidelines_col = Column::new().spacing(6).push(
+            row![
+                text("Change Guidelines").size(12).color(accent).font(mono),
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("Edit guidelines").size(11).color(accent).font(mono))
+                    .style(self.ghost_button_style())
+                    .padding([2, 6])
+                    .on_press(Event::GuidelinesEdit),
+            ]
+            .align_y(iced::Alignment::Center),
+        );
+        guidelines_col = guidelines_col
+            .push(guidelines_check(
+                self.guidelines_settings.enabled,
+                "Add them to every agent GitTerm starts (all workspaces)".to_string(),
+                Event::GuidelinesEnabledToggled,
+            ))
+            .push(guidelines_check(
+                !ws.guidelines_off,
+                "Use them in this workspace".to_string(),
+                Event::GuidelinesWorkspaceToggled,
+            ));
+        if let Some((repo, off)) = &self.guidelines_repo {
+            guidelines_col = guidelines_col.push(guidelines_check(
+                !off,
+                format!("Use them in {}", repo.display()),
+                Event::GuidelinesRepoToggled,
+            ));
+        }
+
         // --- Compose card ---
         let card_content = column![
             title,
@@ -28944,6 +29203,8 @@ fi
             color_row,
             container(iced::widget::Space::new()).height(Length::Fixed(12.0)),
             profile_row,
+            container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
+            guidelines_col,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             section_label,
             gh_account_hint,
@@ -42986,7 +43247,7 @@ mod tests {
             ]
         );
         let config = session
-            .claude_session_config(PathBuf::from("/tmp"), Vec::new(), false)
+            .claude_session_config(PathBuf::from("/tmp"), Vec::new(), false, None)
             .expect("claude config");
         assert_eq!(config.model, None, "\"default\" defers to Claude settings");
         assert_eq!(config.permission_mode, "default");
@@ -44771,7 +45032,7 @@ mod tests {
         assert_eq!(session.history_to_load(), Some("3f2a"));
         // The first prompt spawns Claude with `--resume=<id>`.
         let spawn = session
-            .claude_session_config(PathBuf::from("/tmp/repo/sub"), Vec::new(), false)
+            .claude_session_config(PathBuf::from("/tmp/repo/sub"), Vec::new(), false, None)
             .expect("claude config");
         assert_eq!(spawn.resume.as_deref(), Some("3f2a"));
         assert_eq!(spawn.model.as_deref(), Some("opus"));
@@ -44901,6 +45162,7 @@ mod tests {
                 parked_at: at.to_string(),
             }),
             done_at: None,
+            guidelines_off: false,
         }
     }
 
