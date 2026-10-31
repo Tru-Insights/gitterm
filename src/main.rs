@@ -1186,6 +1186,53 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Characters a session strip label shows before it is cut with "…".
+const SESSION_TAB_LABEL_CHARS: usize = 20;
+
+/// The session strip's label for a tab (TRU-172). A chat tab whose
+/// conversation the chats index has titled reads as that title, so two
+/// chats in one folder no longer both read as the folder name. Without a
+/// title (a chat not indexed yet, a terminal tab) it is today's label:
+/// the shell or harness title, attention markers stripped, a path cut to
+/// its last component.
+fn session_tab_label(
+    chat_title: Option<&str>,
+    display_title: &str,
+    has_attention: bool,
+    workspace_is_remote: bool,
+) -> String {
+    if let Some(title) = chat_title.map(str::trim).filter(|title| !title.is_empty()) {
+        // Titles are free text (they may start with "/"), so no path
+        // shortening; cut on chars, not bytes.
+        if title.chars().count() > SESSION_TAB_LABEL_CHARS {
+            let cut: String = title.chars().take(SESSION_TAB_LABEL_CHARS - 1).collect();
+            return format!("{}…", cut.trim_end());
+        }
+        return title.to_string();
+    }
+    // Strip a leading "*" when attention (redundant with the visual
+    // indicator) and shorten path-like titles to their last component.
+    let display = if has_attention {
+        display_title.trim_start_matches(['*', '✳']).trim_start()
+    } else {
+        display_title
+    };
+    let display = if !workspace_is_remote && (display.starts_with('/') || display.starts_with('~'))
+    {
+        std::path::Path::new(display)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| display.to_string())
+    } else {
+        display.to_string()
+    };
+    if display.len() > SESSION_TAB_LABEL_CHARS {
+        format!("{}…", truncate_str(&display, SESSION_TAB_LABEL_CHARS - 1))
+    } else {
+        display
+    }
+}
+
 /// Percent-encode RFC 3986 reserved characters in a query-string value.
 /// Used for `?plan=<name>` so plan filenames with spaces or punctuation
 /// round-trip cleanly into the viewer's URL.
@@ -8178,6 +8225,16 @@ impl App {
             .find(|entry| entry.id == chat.id)
     }
 
+    /// The chats index title of a chat tab's conversation (TRU-172), on
+    /// the tab's machine (`remote_id` None = this Mac). None for terminal
+    /// tabs and for a chat the index has not seen yet.
+    fn chat_tab_title(&self, tab: &TabState, remote_id: Option<&str>) -> Option<&str> {
+        tab.agent_session()?;
+        let id = tab.chat_session_id.as_deref()?;
+        self.find_chat_entry(&chats::ChatRef::new(remote_id, id))
+            .map(|entry| entry.title.as_str())
+    }
+
     /// A conversation by id on whichever machine indexes it, this Mac
     /// first. Only for callers that hold a bare id (task records).
     fn find_chat_entry_any(&self, id: &str) -> Option<(Option<&str>, &chats::ChatIndexEntry)> {
@@ -11711,16 +11768,38 @@ impl App {
     /// unless loads are already in flight. Called when the Chats tab is
     /// opened.
     fn refresh_chat_index_if_stale(&mut self) -> Task<Event> {
-        const CHAT_INDEX_FRESH_SECS: u64 = 30;
         let remote = self.refresh_remote_chat_indexes();
+        Task::batch([self.refresh_local_chat_index_if_stale(), remote])
+    }
+
+    /// Refresh this Mac's chat index unless a load is in flight or the
+    /// last one is fresh.
+    fn refresh_local_chat_index_if_stale(&mut self) -> Task<Event> {
+        const CHAT_INDEX_FRESH_SECS: u64 = 30;
         let fresh = self
             .chat_index_loaded_at
             .is_some_and(|at| at.elapsed().as_secs() < CHAT_INDEX_FRESH_SECS);
         if self.chat_index_loading || fresh {
-            return remote;
+            return Task::none();
         }
         self.chat_index_loading = true;
-        Task::batch([self.request_chat_index(), remote])
+        self.request_chat_index()
+    }
+
+    /// Whether a chat tab on this Mac (`tab_id`, or any when None) owns a
+    /// conversation the local index has no entry for, so its strip label
+    /// is still the folder name (TRU-172).
+    fn local_chat_tab_untitled(&self, tab_id: Option<usize>) -> bool {
+        self.workspaces
+            .iter()
+            .filter(|ws| self.remote_agent_id_for_workspace(ws).is_none())
+            .flat_map(|ws| ws.tabs.iter())
+            .filter(|tab| tab_id.is_none_or(|id| tab.id == id))
+            .any(|tab| {
+                tab.agent_session().is_some()
+                    && tab.chat_session_id.is_some()
+                    && self.chat_tab_title(tab, None).is_none()
+            })
     }
 
     fn refresh_task_conversation_history(&mut self) -> Task<Event> {
@@ -15049,6 +15128,11 @@ impl App {
         }
         startup_tasks.push(app.ensure_active_remote_agent_connection(false));
         startup_tasks.push(app.refresh_files_for_active_tab());
+        // Restored chat tabs are labelled by their conversation titles,
+        // which come from the chats index (TRU-172).
+        if app.local_chat_tab_untitled(None) {
+            startup_tasks.push(app.refresh_local_chat_index_if_stale());
+        }
         if let Some(server) = browser_mcp_server {
             startup_tasks.push(Task::perform(server.run(), Event::BrowserMcpStopped));
             startup_tasks.push(Task::done(Event::BrowserStatusRefreshRequested));
@@ -20283,10 +20367,18 @@ fi
                     follow_task
                 };
                 if turn_ended {
+                    // A chat's first turn gives it a title; index it so
+                    // the strip can show it (TRU-172).
+                    let index = if self.local_chat_tab_untitled(Some(tab_id)) {
+                        self.refresh_local_chat_index_if_stale()
+                    } else {
+                        Task::none()
+                    };
                     return Task::batch([
                         self.flush_held_delegation(tab_id),
                         self.refresh_delegation_head(tab_id),
                         follow_task,
+                        index,
                     ]);
                 }
                 return follow_task;
@@ -29566,6 +29658,9 @@ fi
         let mut stamp_row = Row::new().spacing(2).align_y(iced::Alignment::Center);
         let mut tabs_row = Row::new().spacing(2);
 
+        let chat_remote_id = self
+            .active_workspace()
+            .and_then(|ws| self.remote_agent_id_for_workspace(ws));
         let (tabs, active_tab_idx, workspace_is_remote, visible_indices) =
             if let Some(ws) = self.active_workspace() {
                 let visible_indices = task_context_id.as_deref().map_or_else(
@@ -29750,27 +29845,18 @@ fi
             });
             let (icon_str, icon_color) = self.session_tab_icon(tab, is_active, display_title);
 
-            // Tab label - strip leading "*" when attention (redundant with visual indicator),
-            // shorten path-like titles to last component, truncate at 20 chars
-            let display = if has_attention {
-                display_title.trim_start_matches(['*', '✳']).trim_start()
-            } else {
-                display_title
-            };
-            let display =
-                if !workspace_is_remote && (display.starts_with('/') || display.starts_with('~')) {
-                    std::path::Path::new(display)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| display.to_string())
-                } else {
-                    display.to_string()
-                };
-            let base_title = if display.len() > 20 {
-                format!("{}…", truncate_str(&display, 19))
-            } else {
-                display
-            };
+            // A task session keeps its stable harness label; any other
+            // chat tab reads as its conversation's title once indexed.
+            let chat_title = task_session_label
+                .is_none()
+                .then(|| self.chat_tab_title(tab, chat_remote_id))
+                .flatten();
+            let base_title = session_tab_label(
+                chat_title,
+                display_title,
+                has_attention,
+                workspace_is_remote,
+            );
 
             let text_color = if is_active {
                 theme.text_primary()
@@ -43713,5 +43799,60 @@ mod tests {
             &session.config,
             tab::AgentBackendConfig::Claude { model, effort: None, .. } if model == "sonnet"
         ));
+    }
+
+    #[test]
+    fn session_tab_label_reads_a_chats_title_over_its_folder_name() {
+        // Two chats in one folder no longer read the same.
+        assert_eq!(
+            session_tab_label(Some("Fix PRJ-101 login"), "acme-portal", false, false),
+            "Fix PRJ-101 login"
+        );
+        // Long titles are cut to the strip's width, on chars.
+        let label = session_tab_label(
+            Some("Migrate the acme billing service to the new queue"),
+            "acme-portal",
+            false,
+            false,
+        );
+        assert_eq!(label, "Migrate the acme bi…");
+        assert_eq!(label.chars().count(), SESSION_TAB_LABEL_CHARS);
+        let accented = session_tab_label(Some("Résumé café thème naïve über"), "x", false, false);
+        assert_eq!(accented.chars().count(), SESSION_TAB_LABEL_CHARS);
+        // A title is free text: a leading "/" is not a path.
+        assert_eq!(
+            session_tab_label(Some("/review PRJ-101"), "acme-portal", false, false),
+            "/review PRJ-101"
+        );
+    }
+
+    #[test]
+    fn session_tab_label_keeps_todays_label_without_a_title() {
+        // Not indexed yet, or a blank title: the folder name as today.
+        assert_eq!(
+            session_tab_label(None, "acme-portal", false, false),
+            "acme-portal"
+        );
+        assert_eq!(
+            session_tab_label(Some("   "), "acme-portal", false, false),
+            "acme-portal"
+        );
+        // Terminal tabs: path shortening, attention markers and the cut.
+        assert_eq!(
+            session_tab_label(None, "/tmp/acme/portal", false, false),
+            "portal"
+        );
+        assert_eq!(
+            session_tab_label(None, "/tmp/acme/portal", false, true),
+            "/tmp/acme/portal"
+        );
+        assert_eq!(
+            session_tab_label(None, "* acme-portal", true, false),
+            "acme-portal"
+        );
+        assert_eq!(
+            session_tab_label(None, "a-very-long-terminal-title", false, false),
+            "a-very-long-termina…"
+        );
     }
 }
