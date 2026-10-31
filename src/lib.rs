@@ -17,4 +17,5 @@ pub mod task_worktree;
 pub mod tasks;
 pub mod usage;
 pub mod workers;
+pub mod workspace_overview;
 pub mod worktree_follow;
