@@ -39,6 +39,7 @@ mod chat_overview;
 mod chat_rank;
 mod chat_summary;
 mod config;
+mod config_import;
 mod events;
 mod tab;
 mod theme;
@@ -1246,7 +1247,7 @@ fn setup_menu_bar() {
     // Create native macOS menu bar
     let menu = Menu::new();
 
-    // App menu (GitTerm V5)
+    // App menu (GitTerm V6)
     let app_menu = Submenu::new(config::APP_NAME, true);
     app_menu
         .append_items(&[
@@ -1597,6 +1598,10 @@ fn stt_transcribe(
 }
 
 fn main() -> iced::Result {
+    // First launch: bring V5's workspaces, remotes and tokens across before
+    // anything creates the V6 config dir (TRU-168).
+    config_import::import_v5_config_on_first_launch();
+
     // Print instance information for multi-instance support
     config::print_instance_info();
 
@@ -6790,7 +6795,7 @@ fn remote_agent_id_slug(name: &str) -> String {
     }
 }
 
-/// Store a pasted token under ~/.config/gitterm-v5/tokens/<id>.token and
+/// Store a pasted token under ~/.config/gitterm-v6/tokens/<id>.token and
 /// return the path. Owner-only permissions on unix.
 fn write_remote_agent_token(remote_id: &str, token: &str) -> std::io::Result<PathBuf> {
     let dir = config::global_config_dir().join("tokens");
@@ -7718,7 +7723,7 @@ impl App {
         ws_file.save();
     }
 
-    /// Load workspace profiles from ~/.config/gitterm-v5/profiles.json
+    /// Load workspace profiles from ~/.config/gitterm-v6/profiles.json
     /// Returns a map of profile_name -> env vars
     fn load_profiles() -> Option<HashMap<String, HashMap<String, String>>> {
         let path = config::global_config_dir().join("profiles.json");
@@ -9229,7 +9234,7 @@ impl App {
         if let Err(error) =
             store.record_lifecycle_signal(task_id, target, detail, &chrono::Utc::now().to_rfc3339())
         {
-            eprintln!("GitTerm V5 dropped a task lifecycle signal: {error}");
+            eprintln!("GitTerm V6 dropped a task lifecycle signal: {error}");
         }
         // A worker card mirrors its task session's live state (S6).
         self.push_worker_cards(task_id);
@@ -9247,7 +9252,7 @@ impl App {
             return;
         }
         if let Err(error) = store.acknowledge_attention(task_id, &chrono::Utc::now().to_rfc3339()) {
-            eprintln!("GitTerm V5 dropped a task attention acknowledgement: {error}");
+            eprintln!("GitTerm V6 dropped a task attention acknowledgement: {error}");
         }
     }
 
@@ -9575,7 +9580,7 @@ impl App {
         };
         for (task_id, progress, changes) in updates {
             if let Err(error) = store.update_progress(&task_id, progress, changes, &timestamp) {
-                eprintln!("GitTerm V5 dropped a task progress update: {error}");
+                eprintln!("GitTerm V6 dropped a task progress update: {error}");
             }
         }
     }
@@ -9842,7 +9847,7 @@ impl App {
             if let Some(store) = self.task_store.as_mut() {
                 if let Err(error) = store.replace(task) {
                     let message = error.to_string();
-                    eprintln!("GitTerm V5 could not link task conversation history: {message}");
+                    eprintln!("GitTerm V6 could not link task conversation history: {message}");
                     self.task_store_error = Some(message);
                 }
             }
@@ -10180,7 +10185,7 @@ impl App {
                 store.record_resumable_error(task_id, detail, &chrono::Utc::now().to_rfc3339())
             {
                 let message = error.to_string();
-                eprintln!("GitTerm V5 could not persist the task error: {message}");
+                eprintln!("GitTerm V6 could not persist the task error: {message}");
                 self.task_store_error = Some(message);
             }
         }
@@ -10416,7 +10421,7 @@ impl App {
                             &timestamp,
                         ) {
                             eprintln!(
-                                "GitTerm V5 dropped a queued-launch failure signal: {store_error}"
+                                "GitTerm V6 dropped a queued-launch failure signal: {store_error}"
                             );
                         }
                     }
@@ -13692,14 +13697,14 @@ impl App {
             Ok((store, reconciled)) => {
                 if reconciled > 0 {
                     eprintln!(
-                        "GitTerm V5 marked {reconciled} local task execution(s) interrupted after restart"
+                        "GitTerm V6 marked {reconciled} local task execution(s) interrupted after restart"
                     );
                 }
                 (Some(store), None)
             }
             Err(error) => {
                 let message = error.to_string();
-                eprintln!("GitTerm V5 tasks are unavailable: {message}");
+                eprintln!("GitTerm V6 tasks are unavailable: {message}");
                 (None, Some(message))
             }
         };
@@ -13733,7 +13738,7 @@ impl App {
                 }
                 if let Err(error) = store.replace(task) {
                     eprintln!(
-                        "GitTerm V5 could not prune a phantom Claude conversation ref: {error}"
+                        "GitTerm V6 could not prune a phantom Claude conversation ref: {error}"
                     );
                 }
             }
@@ -13781,7 +13786,7 @@ impl App {
                     }
                     if let Err(error) = store.replace(task) {
                         eprintln!(
-                            "GitTerm V5 could not prune a subagent conversation record: {error}"
+                            "GitTerm V6 could not prune a subagent conversation record: {error}"
                         );
                     }
                 }
@@ -13829,16 +13834,16 @@ impl App {
             match browser_mcp::prepare(config::global_config_dir(), config::instance_id()) {
                 Ok((connection, server)) => {
                     eprintln!(
-                        "GitTerm V5 browser MCP reserved at {}",
+                        "GitTerm V6 browser MCP reserved at {}",
                         connection.endpoint()
                     );
                     (Some(connection), Some(server), None)
                 }
                 Err(error) => {
                     let message = format!(
-                        "failed to reserve the GitTerm V5 browser MCP loopback endpoint: {error}"
+                        "failed to reserve the GitTerm V6 browser MCP loopback endpoint: {error}"
                     );
-                    eprintln!("GitTerm V5 browser controls are unavailable: {message}");
+                    eprintln!("GitTerm V6 browser controls are unavailable: {message}");
                     (None, None, Some(message))
                 }
             };
@@ -13847,12 +13852,12 @@ impl App {
             task_commands,
         ) {
             Ok((connection, server)) => {
-                eprintln!("GitTerm V5 task MCP reserved at {}", connection.endpoint());
+                eprintln!("GitTerm V6 task MCP reserved at {}", connection.endpoint());
                 (Some(connection), Some(server))
             }
             Err(error) => {
                 eprintln!(
-                        "GitTerm V5 agent task controls are unavailable: failed to reserve the task MCP loopback endpoint: {error}"
+                        "GitTerm V6 agent task controls are unavailable: failed to reserve the task MCP loopback endpoint: {error}"
                     );
                 (None, None)
             }
@@ -14493,7 +14498,7 @@ impl App {
             let reconciled_workspaces = app.reconcile_managed_task_workspaces();
             if reconciled_workspaces > 0 {
                 eprintln!(
-                    "GitTerm V5 folded {reconciled_workspaces} managed task workspace(s) into their repository"
+                    "GitTerm V6 folded {reconciled_workspaces} managed task workspace(s) into their repository"
                 );
             }
             app.normalize_workspace_order();
@@ -14790,7 +14795,7 @@ impl App {
         )
     }
 
-    /// The local attach command for a remote session: the gitterm-v5-agent
+    /// The local attach command for a remote session: the gitterm-v6-agent
     /// binary next to the running executable (or on PATH) bridging stdio
     /// to the AttachTerminal stream.
     fn remote_session_attach_command(&self, session_id: &str) -> Option<String> {
@@ -14802,10 +14807,10 @@ impl App {
         };
         let agent_bin = std::env::current_exe()
             .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("gitterm-v5-agent")))
+            .and_then(|exe| exe.parent().map(|dir| dir.join("gitterm-v6-agent")))
             .filter(|path| path.exists())
             .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "gitterm-v5-agent".to_string());
+            .unwrap_or_else(|| "gitterm-v6-agent".to_string());
         Some(format!(
             "{} attach --endpoint {} --token-ref {} --session {}",
             shell_quote(&agent_bin),
@@ -16897,7 +16902,7 @@ fi
             Event::TaskMcpStopped(result) => {
                 let error = match result {
                     Ok(()) => {
-                        "GitTerm V5 task MCP server stopped before application shutdown".to_string()
+                        "GitTerm V6 task MCP server stopped before application shutdown".to_string()
                     }
                     Err(error) => error,
                 };
@@ -17151,7 +17156,7 @@ fi
             },
             Event::BrowserMcpStopped(result) => {
                 let error = match result {
-                    Ok(()) => "GitTerm V5 browser MCP server stopped before application shutdown"
+                    Ok(()) => "GitTerm V6 browser MCP server stopped before application shutdown"
                         .to_string(),
                     Err(error) => error,
                 };
@@ -19786,7 +19791,7 @@ fi
                 let model = std::env::var("PI_MODEL")
                     .unwrap_or_else(|_| "openai-codex/gpt-5.4".to_string());
                 let session_path =
-                    format!("/tmp/gitterm-v5-agent-debug-{}.jsonl", std::process::id());
+                    format!("/tmp/gitterm-v6-agent-debug-{}.jsonl", std::process::id());
                 let config = tab::AgentBackendConfig::Pi {
                     model,
                     session_path: Some(session_path),
@@ -21038,7 +21043,7 @@ fi
                         }
                         Some(Err(error)) => {
                             let message = error.to_string();
-                            eprintln!("GitTerm V5 could not save prepared task: {message}");
+                            eprintln!("GitTerm V6 could not save prepared task: {message}");
                             if let Some(reply) = &pending.control_reply {
                                 reply.send(Err(message.clone()));
                             }
@@ -22499,7 +22504,7 @@ fi
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| "preview".to_string());
                         let temp_path =
-                            temp_dir.join(format!("gitterm-v5-{}_preview.html", file_name));
+                            temp_dir.join(format!("gitterm-v6-{}_preview.html", file_name));
 
                         if std::fs::write(&temp_path, html).is_ok() {
                             // Open in default browser
@@ -25725,7 +25730,7 @@ fi
     }
 
     /// "Connect Remote Host" form: writes an entry into remote-agents.json
-    /// (token stored under ~/.config/gitterm-v5/tokens/) and shows live
+    /// (token stored under ~/.config/gitterm-v6/tokens/) and shows live
     /// handshake feedback after Connect.
     /// "Pair a phone" (TRU-151): the pairing QR code and URL, and the
     /// phones already paired with this agent, each with Revoke.
@@ -26055,7 +26060,7 @@ fi
             true,
         );
         let token_hint = text(
-            "Stored in ~/.config/gitterm-v5/tokens/. Or paste a ref: \
+            "Stored in ~/.config/gitterm-v6/tokens/. Or paste a ref: \
              env:VAR, file:~/path, keychain:service/account",
         )
         .size(10)
@@ -26135,7 +26140,7 @@ fi
 
         let card_content = column![
             text("Connect Remote Host").size(14).color(text_primary),
-            text("Adds a gitterm-v5-agent host to remote-agents.json")
+            text("Adds a gitterm-v6-agent host to remote-agents.json")
                 .size(11)
                 .color(text_muted),
             container(iced::widget::Space::new()).height(Length::Fixed(8.0)),
@@ -40073,18 +40078,18 @@ mod tests {
                 title: "Slot accounting".to_string(),
                 objective: "Only running local tasks hold a slot".to_string(),
                 workspace: TaskWorkspaceIdentity {
-                    name: "GitTerm V5".to_string(),
+                    name: "GitTerm V6".to_string(),
                     location: WorkspaceLocationIdentity::Local {
-                        directory: PathBuf::from("/repo/gitterm-v5"),
+                        directory: PathBuf::from("/repo/gitterm-v6"),
                     },
                 },
                 repository: RepositoryIdentity {
-                    common_dir: PathBuf::from("/repo/gitterm-v5/.git"),
+                    common_dir: PathBuf::from("/repo/gitterm-v6/.git"),
                     remote_url: None,
                 },
                 issue: None,
                 base: GitBase {
-                    reference: "v5".to_string(),
+                    reference: "v6".to_string(),
                     commit: "0123456789abcdef".to_string(),
                 },
                 branch: "task/task-slot".to_string(),
@@ -40146,7 +40151,7 @@ mod tests {
     fn test_browser_status(state: BrowserState) -> BrowserStatus {
         BrowserStatus {
             state,
-            profile_dir: PathBuf::from("/tmp/gitterm-v5/browser-profile"),
+            profile_dir: PathBuf::from("/tmp/gitterm-v6/browser-profile"),
             devtools_port: None,
             process_id: None,
             target_id: None,

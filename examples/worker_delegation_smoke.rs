@@ -13,7 +13,7 @@
 //! the bridge records the task session and writes the brief instead of
 //! opening a terminal tab. Spends one Claude turn (haiku by default).
 //!
-//!   env -u GITTERM_V5_TASK_MCP_TOKEN cargo run --example worker_delegation_smoke -- \
+//!   env -u GITTERM_V6_TASK_MCP_TOKEN cargo run --example worker_delegation_smoke -- \
 //!       --workdir <scratch dir> [--model haiku]
 //!
 //! Exits 0 only if every check passes.

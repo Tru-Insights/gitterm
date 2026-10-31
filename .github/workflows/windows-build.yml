@@ -2,7 +2,7 @@ name: Windows Build
 
 on:
   push:
-    branches: [ v5 ]
+    branches: [ v6 ]
   workflow_dispatch:
 
 jobs:
@@ -43,5 +43,5 @@ jobs:
     - name: Upload binary
       uses: actions/upload-artifact@v4
       with:
-        name: gitterm-v5-windows-x86_64
-        path: target/release/gitterm-v5.exe
+        name: gitterm-v6-windows-x86_64
+        path: target/release/gitterm-v6.exe

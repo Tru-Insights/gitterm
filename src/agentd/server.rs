@@ -12,8 +12,8 @@ use super::claude_chats::{
 };
 use super::phone_http::{PhoneServerConfig, PhoneState};
 use super::phones::{PhoneRegistry, PhoneScope};
-use super::protocol::v5::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
-use super::protocol::v5::{
+use super::protocol::v6::git_term_agent_server::{GitTermAgent, GitTermAgentServer};
+use super::protocol::v6::{
     claude_chat_client_message, terminal_input, terminal_output, ChatEntry, ChatPreviewMessage,
     ChatPreviewRequest, ChatPreviewResponse, ClaudeChatClientMessage, ClaudeChatHistoryRequest,
     ClaudeChatHistoryResponse, ClaudeChatInfo, ClaudeChatOpened, ClaudeChatServerMessage,
@@ -1005,10 +1005,10 @@ fn proto_session(info: super::sessions::SessionInfo) -> Session {
     }
 }
 
-fn proto_diff_line(line: super::git::FileDiffLine) -> super::protocol::v5::GitDiffLine {
+fn proto_diff_line(line: super::git::FileDiffLine) -> super::protocol::v6::GitDiffLine {
     use super::git::DiffLineKind;
-    use super::protocol::v5::GitDiffLineKind;
-    super::protocol::v5::GitDiffLine {
+    use super::protocol::v6::GitDiffLineKind;
+    super::protocol::v6::GitDiffLine {
         content: line.content,
         kind: match line.kind {
             DiffLineKind::Context => GitDiffLineKind::Context,
@@ -1021,8 +1021,8 @@ fn proto_diff_line(line: super::git::FileDiffLine) -> super::protocol::v5::GitDi
     }
 }
 
-fn proto_file_status(status: super::git::GitFileStatus) -> super::protocol::v5::GitFileStatus {
-    super::protocol::v5::GitFileStatus {
+fn proto_file_status(status: super::git::GitFileStatus) -> super::protocol::v6::GitFileStatus {
+    super::protocol::v6::GitFileStatus {
         path: status.path,
         status: status.status,
         is_staged: status.is_staged,
@@ -1261,7 +1261,7 @@ pub fn is_authorized_metadata(metadata: &MetadataMap, expected_token: &str) -> b
 
 #[cfg(test)]
 mod tests {
-    use super::super::protocol::v5::git_term_agent_client::GitTermAgentClient;
+    use super::super::protocol::v6::git_term_agent_client::GitTermAgentClient;
     use super::*;
     use tokio_stream::wrappers::TcpListenerStream;
 
@@ -1293,15 +1293,15 @@ mod tests {
     }
 
     #[test]
-    fn grpc_service_namespace_is_isolated_from_v4() {
+    fn grpc_service_namespace_is_isolated_from_v5() {
         type Server = GitTermAgentServer<GitTermAgentService>;
         assert_eq!(
             <Server as tonic::server::NamedService>::NAME,
-            "gitterm.agent.v5.GitTermAgent"
+            "gitterm.agent.v6.GitTermAgent"
         );
         assert_ne!(
             <Server as tonic::server::NamedService>::NAME,
-            "gitterm.agent.v1.GitTermAgent"
+            "gitterm.agent.v5.GitTermAgent"
         );
     }
 
@@ -1612,7 +1612,7 @@ mod tests {
     ) -> ClaudeChatClientMessage {
         ClaudeChatClientMessage {
             message: Some(claude_chat_client_message::Message::Attach(
-                super::super::protocol::v5::ClaudeChatAttach {
+                super::super::protocol::v6::ClaudeChatAttach {
                     chat_id: chat_id.to_string(),
                     after_seq,
                     start_json: start.to_string(),
