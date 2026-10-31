@@ -206,6 +206,17 @@ pub fn also_worked_here(
         .into_iter()
         .map(|entry| entry.id.as_str())
         .collect();
+    also_worked_outside(entries, &here, |dir| dir.starts_with(ws_dir), now)
+}
+
+/// Recent coordinators whose chats are not in `here` and whose facts
+/// record edits in a repo `inside` accepts, most recently active first.
+fn also_worked_outside(
+    entries: &[ChatIndexEntry],
+    here: &HashSet<&str>,
+    inside: impl Fn(&Path) -> bool,
+    now: SystemTime,
+) -> Vec<AlsoWorked> {
     let elsewhere: Vec<&ChatIndexEntry> = entries
         .iter()
         .filter(|entry| !here.contains(entry.id.as_str()))
@@ -217,7 +228,7 @@ pub fn also_worked_here(
             let under = chats_under(entries, std::slice::from_ref(&coordinator.id));
             let edits_here = repos_touched(&under)
                 .iter()
-                .filter(|repo| repo.dir.starts_with(ws_dir))
+                .filter(|repo| inside(&repo.dir))
                 .map(|repo| repo.edits)
                 .sum::<u64>();
             (edits_here > 0).then_some(AlsoWorked {
@@ -226,6 +237,153 @@ pub fn also_worked_here(
             })
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Owned chats (TRU-169): a workspace that owns its chats, not a folder.
+
+/// Which workspace owns a chat: the first of `owned` (each workspace's
+/// root chat ids) that lists the chat itself or its root. A chat belongs
+/// to at most one workspace, so the first match is the only one.
+pub fn owning_workspace<'a>(
+    owned: impl IntoIterator<Item = &'a [String]>,
+    id: &str,
+    root_id: Option<&str>,
+) -> Option<usize> {
+    owned.into_iter().position(|chats| {
+        chats
+            .iter()
+            .any(|owned| owned == id || Some(owned.as_str()) == root_id)
+    })
+}
+
+/// Puts root chat `root` in exactly one workspace's list: the one marked
+/// `true` gains it (once), every other list loses it. Returns whether any
+/// list changed.
+pub fn assign_chat<'a>(
+    lists: impl IntoIterator<Item = (bool, &'a mut Vec<String>)>,
+    root: &str,
+) -> bool {
+    let mut changed = false;
+    for (is_target, chats) in lists {
+        if is_target {
+            if !chats.iter().any(|id| id == root) {
+                chats.push(root.to_string());
+                changed = true;
+            }
+        } else {
+            let before = chats.len();
+            chats.retain(|id| id != root);
+            changed |= chats.len() != before;
+        }
+    }
+    changed
+}
+
+/// Where resuming a local chat lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeTarget {
+    /// The open workspace at this index owns the chat.
+    OwnerOpen(usize),
+    /// The closed workspace config at this index owns the chat: reopen it.
+    OwnerClosed(usize),
+    /// The caller named a workspace (the overview opening in place).
+    Into(usize),
+    /// Unowned: the deepest open folder, else reopen or create one.
+    ByFolder,
+}
+
+/// The resume target for a chat: its owning workspace wins (open, then
+/// closed), then the caller's `into`, then the folder rule. Ownership
+/// overrides the folder rule for owned chats only.
+pub fn resume_target<'a>(
+    open_owned: impl IntoIterator<Item = &'a [String]>,
+    closed_owned: impl IntoIterator<Item = &'a [String]>,
+    id: &str,
+    root_id: Option<&str>,
+    into: Option<usize>,
+) -> ResumeTarget {
+    if let Some(idx) = owning_workspace(open_owned, id, root_id) {
+        return ResumeTarget::OwnerOpen(idx);
+    }
+    if let Some(idx) = owning_workspace(closed_owned, id, root_id) {
+        return ResumeTarget::OwnerClosed(idx);
+    }
+    match into {
+        Some(idx) => ResumeTarget::Into(idx),
+        None => ResumeTarget::ByFolder,
+    }
+}
+
+/// A workspace name from a chat title: whitespace trimmed and collapsed,
+/// cut at [`WORKSPACE_NAME_MAX`] characters on a word boundary when one is
+/// near; "Workspace" for an empty title.
+pub fn workspace_name_from_title(title: &str) -> String {
+    let words: Vec<&str> = title.split_whitespace().collect();
+    let joined = words.join(" ");
+    if joined.chars().count() <= WORKSPACE_NAME_MAX {
+        return if joined.is_empty() {
+            "Workspace".to_string()
+        } else {
+            joined
+        };
+    }
+    let cut: String = joined.chars().take(WORKSPACE_NAME_MAX).collect();
+    let at_word = cut
+        .rfind(' ')
+        .filter(|at| *at >= WORKSPACE_NAME_MAX / 2)
+        .map(|at| cut[..at].to_string())
+        .unwrap_or(cut);
+    at_word.trim_end().to_string()
+}
+
+/// The longest workspace name made from a chat title; rename to taste.
+pub const WORKSPACE_NAME_MAX: usize = 40;
+
+/// The folder name for a new workspace called `name`: lowercase ASCII
+/// letters and digits, every other run of characters one `-`, no leading
+/// or trailing `-`; "workspace" when nothing is left.
+pub fn work_folder_slug(name: &str) -> String {
+    let mut slug = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        "workspace".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+/// Creates the home folder of a new workspace called `name` under `base`
+/// (made when missing): `<base>/<slug>`, else `<slug>-2`, `<slug>-3`, … for
+/// the first name nothing holds yet. Returns the created folder.
+pub fn create_work_folder(base: &Path, name: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(base)?;
+    let slug = work_folder_slug(name);
+    for n in 1u32.. {
+        let dir = if n == 1 {
+            base.join(&slug)
+        } else {
+            base.join(format!("{slug}-{n}"))
+        };
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("create {}: {error}", dir.display()),
+                ))
+            }
+        }
+    }
+    unreachable!("u32 suffixes exhausted under {}", base.display())
 }
 
 /// Which coordinators the repos, branches and issues are read for: the
@@ -828,6 +986,10 @@ pub struct WorkSummary {
     pub chat_count: usize,
     /// Any of the work's chats has a facts file.
     pub has_facts: bool,
+    /// Built for a workspace that owns its chats ([`WorkSummary::build_owned`]):
+    /// every coordinator is one of its roots, all of them are read, and
+    /// there is no focus to pick.
+    pub owned: bool,
 }
 
 impl WorkSummary {
@@ -850,6 +1012,48 @@ impl WorkSummary {
             }
             _ => focused_roots(focus, &coordinators),
         };
+        let mut summary = Self::for_roots(entries, focused, tasks);
+        summary.coordinators = coordinators;
+        summary.also_worked = also_worked;
+        summary.focus = focus.clone();
+        summary.chat_count = all_work.len();
+        summary.has_facts = all_work.iter().any(|entry| entry.facts.is_some());
+        summary
+    }
+
+    /// The overview of a workspace that owns its chats: the owned roots
+    /// and their children wherever they ran, every root listed (newest
+    /// first) and read; repos, branches and issues from those chats only.
+    /// "Also worked here": other recent coordinators that edited a repo
+    /// the owned work touched.
+    pub fn build_owned(
+        entries: &[ChatIndexEntry],
+        owned: &[String],
+        tasks: &[TaskInfo],
+        now: SystemTime,
+    ) -> Self {
+        let work = chats_under(entries, owned);
+        let coordinators = coordinators(&work, entries, now);
+        let here: HashSet<&str> = work.iter().map(|entry| entry.id.as_str()).collect();
+        let focused: Vec<String> = coordinators.iter().map(|c| c.id.clone()).collect();
+        let mut summary = Self::for_roots(entries, focused, tasks);
+        let touched: Vec<PathBuf> = summary.repos.iter().map(|r| r.dir.clone()).collect();
+        summary.also_worked = also_worked_outside(
+            entries,
+            &here,
+            |dir| touched.iter().any(|repo| dir.starts_with(repo)),
+            now,
+        );
+        summary.coordinators = coordinators;
+        summary.chat_count = work.len();
+        summary.has_facts = work.iter().any(|entry| entry.facts.is_some());
+        summary.owned = true;
+        summary
+    }
+
+    /// Repos, branch candidates, issue keys and key repos of `focused`
+    /// and their children; the caller fills the coordinator lists.
+    fn for_roots(entries: &[ChatIndexEntry], focused: Vec<String>, tasks: &[TaskInfo]) -> Self {
         let work = chats_under(entries, &focused);
         let repos = repos_touched(&work);
         let candidates = branch_candidates(&work, tasks);
@@ -877,16 +1081,12 @@ impl WorkSummary {
             }
         }
         Self {
-            coordinators,
-            also_worked,
-            focus: focus.clone(),
             focused,
             repos,
             issue_keys,
             candidates,
             key_repos,
-            chat_count: all_work.len(),
-            has_facts: all_work.iter().any(|entry| entry.facts.is_some()),
+            ..Self::default()
         }
     }
 
@@ -3064,5 +3264,267 @@ mod tests {
             now,
         );
         assert_eq!(summary.focused, vec!["away".to_string()]);
+    }
+
+    #[test]
+    fn owning_workspace_overview_reads_owned_roots_and_children_only() {
+        let now = SystemTime::now();
+        let ago = |hours: u64| now - Duration::from_secs(hours * 3600);
+        let edit = |dir: &str, edits: u64| ChatFacts {
+            repos_touched: vec![RepoTouch {
+                dir: dir.into(),
+                edits,
+            }],
+            ..ChatFacts::default()
+        };
+        // The coordinator started in a folder of repos; its worker ran in a
+        // task worktree elsewhere.
+        let mut root = entry("root", "/w/acme");
+        root.title = "Cloud migration".into();
+        root.mtime = ago(30);
+        root.facts = Some(edit("/w/acme/infra", 4));
+        let mut worker = entry("worker", "/tasks/api-server-prj-101");
+        worker.root_id = Some("root".into());
+        worker.mtime = ago(1);
+        worker.facts = Some(edit("/w/acme/api-server", 2));
+        // A second owned root, older than the recent window: still listed.
+        let mut second = entry("second", "/elsewhere/notes");
+        second.mtime = ago(24 * 20);
+        // Same folder, not owned: never part of this workspace.
+        let mut unrelated = entry("unrelated", "/w/acme");
+        unrelated.mtime = ago(2);
+        unrelated.facts = Some(edit("/w/acme/billing", 9));
+        // Another workspace's recent coordinator that edited a touched repo.
+        let mut visitor = entry("visitor", "/other/app");
+        visitor.mtime = ago(3);
+        visitor.facts = Some(edit("/w/acme/infra", 1));
+        let entries = vec![worker, unrelated, visitor, root, second];
+        let owned = keys(&["second", "root"]);
+
+        let summary = WorkSummary::build_owned(&entries, &owned, &[], now);
+        assert!(summary.owned);
+        let ids: Vec<&str> = summary.coordinators.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["root", "second"], "every owned root, newest first");
+        assert_eq!(summary.coordinators[0].children.len(), 1);
+        assert_eq!(summary.coordinators[0].children[0].id, "worker");
+        assert_eq!(summary.focused, ["root", "second"]);
+        assert_eq!(summary.chat_count, 3);
+        let dirs: Vec<&Path> = summary.repos.iter().map(|r| r.dir.as_path()).collect();
+        assert_eq!(
+            dirs,
+            [Path::new("/w/acme/infra"), Path::new("/w/acme/api-server")],
+            "repos from the owned chats only, the folder's other chat excluded"
+        );
+        let also: Vec<&str> = summary
+            .also_worked
+            .iter()
+            .map(|a| a.coordinator.id.as_str())
+            .collect();
+        assert_eq!(
+            also,
+            ["visitor"],
+            "only coordinators that edited a touched repo"
+        );
+        assert_eq!(summary.also_worked[0].edits_here, 1);
+
+        // The folder view of the same dir is unchanged by ownership.
+        let folder =
+            WorkSummary::build(&entries, Path::new("/w/acme"), &[], &Focus::AllRecent, now);
+        assert!(!folder.owned);
+        assert!(folder.coordinators.iter().any(|c| c.id == "unrelated"));
+    }
+
+    #[test]
+    fn a_chat_belongs_to_exactly_one_workspace() {
+        let mut a = keys(&["root-1", "root-2"]);
+        let mut b = keys(&["root-3"]);
+        let mut closed = keys(&["root-2"]);
+        // Adding root-2 to B takes it from A and from a closed workspace.
+        let changed = assign_chat(
+            [(false, &mut a), (true, &mut b), (false, &mut closed)],
+            "root-2",
+        );
+        assert!(changed);
+        assert_eq!(a, ["root-1"]);
+        assert_eq!(b, ["root-3", "root-2"]);
+        assert!(closed.is_empty());
+        // Adding it again changes nothing and never duplicates.
+        assert!(!assign_chat([(false, &mut a), (true, &mut b)], "root-2"));
+        assert_eq!(b, ["root-3", "root-2"]);
+        let lists: [&[String]; 2] = [&a, &b];
+        assert_eq!(owning_workspace(lists, "root-2", None), Some(1));
+        // A child is owned through its root.
+        assert_eq!(owning_workspace(lists, "worker", Some("root-1")), Some(0));
+        assert_eq!(owning_workspace(lists, "stray", None), None);
+    }
+
+    #[test]
+    fn owned_chats_resume_in_their_owner_and_others_by_folder() {
+        let open_a = keys(&[]);
+        let open_b = keys(&["root-1"]);
+        let closed_c = keys(&["root-9"]);
+        let open: [&[String]; 2] = [&open_a, &open_b];
+        let closed: [&[String]; 1] = [&closed_c];
+        let target = |id: &str, root: Option<&str>, into: Option<usize>| {
+            resume_target(open, closed, id, root, into)
+        };
+        assert_eq!(target("root-1", None, None), ResumeTarget::OwnerOpen(1));
+        // The owner wins over the caller's workspace and the folder rule.
+        assert_eq!(target("root-1", None, Some(0)), ResumeTarget::OwnerOpen(1));
+        assert_eq!(
+            target("worker", Some("root-1"), None),
+            ResumeTarget::OwnerOpen(1)
+        );
+        assert_eq!(
+            target("root-9", None, Some(0)),
+            ResumeTarget::OwnerClosed(0)
+        );
+        // Unowned: the caller's workspace, else the folder rule.
+        assert_eq!(target("free", None, Some(0)), ResumeTarget::Into(0));
+        assert_eq!(target("free", None, None), ResumeTarget::ByFolder);
+    }
+
+    #[test]
+    fn workspace_names_come_from_trimmed_titles() {
+        assert_eq!(
+            workspace_name_from_title("  Cloud   migration \n"),
+            "Cloud migration"
+        );
+        assert_eq!(workspace_name_from_title("   "), "Workspace");
+        let long = "Move the api-server and billing stacks to the new cloud account";
+        let name = workspace_name_from_title(long);
+        assert!(name.chars().count() <= WORKSPACE_NAME_MAX, "{name}");
+        assert_eq!(name, "Move the api-server and billing stacks");
+    }
+
+    #[test]
+    fn work_folder_slug_is_filesystem_safe() {
+        assert_eq!(work_folder_slug("Cloud migration"), "cloud-migration");
+        assert_eq!(
+            work_folder_slug("  PRJ-101: fix / ship!  "),
+            "prj-101-fix-ship"
+        );
+        assert_eq!(work_folder_slug("../etc"), "etc");
+        assert_eq!(work_folder_slug("Café déjà"), "caf-d-j");
+        assert_eq!(work_folder_slug("***"), "workspace");
+        assert_eq!(work_folder_slug(""), "workspace");
+    }
+
+    #[test]
+    fn work_folders_get_a_suffix_on_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("Work");
+        let first = create_work_folder(&base, "Cloud migration").unwrap();
+        assert_eq!(first, base.join("cloud-migration"));
+        assert!(first.is_dir());
+        let second = create_work_folder(&base, "cloud  MIGRATION").unwrap();
+        assert_eq!(second, base.join("cloud-migration-2"));
+        // A file in the way counts as taken too.
+        std::fs::write(base.join("cloud-migration-3"), "").unwrap();
+        let fourth = create_work_folder(&base, "Cloud migration").unwrap();
+        assert_eq!(fourth, base.join("cloud-migration-4"));
+        assert!(fourth.is_dir());
+    }
+
+    /// Prints the overview of a workspace owning one real chat. Read-only.
+    /// Run with `GITTERM_REAL_FACTS_DIR=<config>/chat-meta
+    /// GITTERM_REAL_CHAT_ID=<root session id> cargo test --lib
+    /// workspace_overview::tests::real_owning_workspace -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads GITTERM_REAL_FACTS_DIR and GITTERM_REAL_CHAT_ID"]
+    fn real_owning_workspace_overview() {
+        let (Ok(facts_dir), Ok(chat_id)) = (
+            std::env::var("GITTERM_REAL_FACTS_DIR"),
+            std::env::var("GITTERM_REAL_CHAT_ID"),
+        ) else {
+            panic!("set GITTERM_REAL_FACTS_DIR and GITTERM_REAL_CHAT_ID");
+        };
+        let facts_dir = PathBuf::from(facts_dir);
+        let store = facts_dir
+            .parent()
+            .map(crate::tasks::TaskStore::path_for_config_root)
+            .filter(|path| path.exists())
+            .map(|path| crate::tasks::TaskStore::load(path).expect("read tasks.json"));
+        let mut entries = chats::build_local_index();
+        chat_facts::attach_facts(&mut entries, &facts_dir);
+        let links = store
+            .as_ref()
+            .map(|store| {
+                let uid_to_chat: HashMap<String, String> = store
+                    .delegations()
+                    .iter()
+                    .filter_map(|d| {
+                        Some((
+                            d.parent.session_uid.clone(),
+                            d.parent.chat_session_id.clone()?,
+                        ))
+                    })
+                    .collect();
+                chat_facts::store_links(store.delegations(), store.tasks(), &uid_to_chat)
+            })
+            .unwrap_or_default();
+        chat_facts::resolve_tree(&mut entries, &links);
+        let tasks: Vec<TaskInfo> = store
+            .as_ref()
+            .map(|store| store.tasks().iter().map(TaskInfo::from).collect())
+            .unwrap_or_default();
+        let Some(chat) = entries.iter().find(|entry| entry.id == chat_id) else {
+            panic!("chat {chat_id} is not in this Mac's index");
+        };
+        let root = chat.root_id.clone().unwrap_or_else(|| chat.id.clone());
+        let name = workspace_name_from_title(&chat.title);
+        println!(
+            "WORKSPACE · {name} · home ~/Work/{} · owns {root}",
+            work_folder_slug(&name)
+        );
+        println!("  chat resumes from {}", chat.cwd.display());
+        let started = Instant::now();
+        let summary = WorkSummary::build_owned(&entries, &[root], &tasks, SystemTime::now());
+        println!(
+            "summary in {}ms: {} chats, facts: {}",
+            started.elapsed().as_millis(),
+            summary.chat_count,
+            summary.has_facts
+        );
+        println!("\nCHATS · {}", summary.coordinators.len());
+        for coordinator in &summary.coordinators {
+            println!(
+                "  {} · {} · {}",
+                shorten(&coordinator.title, 70),
+                chats::format_age(coordinator.active),
+                coordinator.id
+            );
+            if let Some(fan_out) = &coordinator.fan_out {
+                println!("      fan-out: {fan_out}");
+            }
+            for child in coordinator.children.iter().take(8) {
+                println!(
+                    "      \u{21b3} {:?} {}",
+                    child.kind,
+                    shorten(&child.title, 60)
+                );
+            }
+        }
+        println!("\nALSO WORKED HERE · {}", summary.also_worked.len());
+        for item in &summary.also_worked {
+            println!(
+                "  {} · {} edits here",
+                shorten(&item.coordinator.title, 70),
+                item.edits_here
+            );
+        }
+        println!("\nREPOS TOUCHED · {}", summary.repos.len());
+        for repo in &summary.repos {
+            println!("  {} · {} edits", repo.dir.display(), repo.edits);
+        }
+        println!("\nISSUES · {}", summary.issue_keys.join(" · "));
+        println!("\nBRANCH CANDIDATES · {}", summary.candidates.len());
+        for candidate in &summary.candidates {
+            println!(
+                "  {} · {}",
+                candidate.branch.as_deref().unwrap_or("(detached)"),
+                candidate.checkout.display()
+            );
+        }
     }
 }

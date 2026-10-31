@@ -1677,6 +1677,48 @@ pub struct BranchDiffPayload {
     merge_base: Option<String>,
 }
 
+/// Whose overview a state is. A folder-scoped workspace reads the chats in
+/// its folder, so workspaces on one folder share it (TRU-167). A workspace
+/// that owns its chats (TRU-169) has its own, keyed by its runtime uid.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OverviewKey {
+    Folder(PathBuf),
+    Owner(u64),
+}
+
+/// Where an inline workspace rename is edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameSite {
+    Chip,
+    Overview,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceRename {
+    uid: u64,
+    draft: String,
+    site: RenameSite,
+}
+
+/// Under the home directory: the home folders of workspaces that are a
+/// piece of work rather than a repo (TRU-169).
+const WORK_FOLDER: &str = "Work";
+
+/// "New workspace…": a piece of work that needs no repo.
+#[derive(Debug, Clone, Default)]
+struct NewWorkForm {
+    name: String,
+    error: Option<String>,
+}
+
+fn new_work_name_input_id() -> iced::widget::Id {
+    iced::widget::Id::new("new-work-name-input")
+}
+
+fn workspace_rename_input_id() -> iced::widget::Id {
+    iced::widget::Id::new("workspace-rename-input")
+}
+
 /// One workspace's overview (TRU-167): the summary from the chat index and
 /// tasks, and the owned branches' git state from the background poller.
 #[derive(Debug, Default)]
@@ -5210,8 +5252,17 @@ pub struct RemoteAgentHandshakeSnapshot {
     result: Result<RemoteAgentHandshake, String>,
 }
 
+/// Runtime identity of an open workspace: stable while it is open, never
+/// persisted. Indexes shift when workspaces open, close or reorder.
+static NEXT_WORKSPACE_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_workspace_uid() -> u64 {
+    NEXT_WORKSPACE_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 // Workspace groups tabs by project
 struct Workspace {
+    uid: u64,
     name: String,
     abbrev: String,
     dir: PathBuf,
@@ -5224,6 +5275,13 @@ struct Workspace {
     bottom_terminals: Vec<BottomTerminal>,
     active_bottom_tab: BottomPanelTab,
     env: std::collections::HashMap<String, String>,
+    /// Root chat session ids this workspace owns (TRU-169); empty for a
+    /// folder-scoped workspace. See `WorkspaceConfig::chats`.
+    chats: Vec<String>,
+    /// Made as a piece of work ("New workspace…", "Make workspace"): a chat
+    /// started here joins `chats` even before it owns one. Runtime only;
+    /// after a restart a workspace still without chats is folder-scoped.
+    claims_new_chats: bool,
 }
 
 impl Workspace {
@@ -5232,6 +5290,7 @@ impl Workspace {
         let run_command = detect_run_command(&dir);
         let console = ConsoleState::new(run_command);
         Self {
+            uid: next_workspace_uid(),
             name,
             abbrev,
             dir: dir.clone(),
@@ -5244,6 +5303,8 @@ impl Workspace {
             bottom_terminals: Vec::new(),
             active_bottom_tab: BottomPanelTab::Console,
             env: std::collections::HashMap::new(),
+            chats: Vec::new(),
+            claims_new_chats: false,
         }
     }
 
@@ -5252,6 +5313,7 @@ impl Workspace {
         let abbrev = Self::derive_abbrev(&name);
         let dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self {
+            uid: next_workspace_uid(),
             name,
             abbrev,
             dir,
@@ -5267,11 +5329,18 @@ impl Workspace {
             bottom_terminals: Vec::new(),
             active_bottom_tab: BottomPanelTab::Console,
             env: std::collections::HashMap::new(),
+            chats: Vec::new(),
+            claims_new_chats: false,
         }
     }
 
     fn derive_abbrev(name: &str) -> String {
         name.chars().take(2).collect::<String>().to_uppercase()
+    }
+
+    /// Owns its chats (TRU-169): a piece of work, not a folder.
+    fn owns_chats(&self) -> bool {
+        !self.chats.is_empty()
     }
 
     fn backend_ref(&self) -> WorkspaceBackendRef {
@@ -5936,7 +6005,7 @@ pub enum Event {
     /// Workspace overview (TRU-167): rebuild from the index and reread git.
     WorkspaceOverviewRefresh,
     /// A background refresh finished: workspace dir, generation, result.
-    WorkspaceOverviewRefreshed(PathBuf, u64, Box<overview::RefreshOutcome>),
+    WorkspaceOverviewRefreshed(OverviewKey, u64, Box<overview::RefreshOutcome>),
     /// Open a coordinator's conversation in the main area; the sidebar
     /// stays on the overview.
     WorkspaceOverviewOpenChat(String),
@@ -5946,6 +6015,26 @@ pub enum Event {
     WorkspaceOverviewFocus(overview::Focus),
     WorkspaceOverviewToggleFocusMenu,
     WorkspaceOverviewToggleOlder,
+    /// "Make workspace" on a coordinator: a workspace that owns this local
+    /// root chat (TRU-169).
+    WorkspaceFromChat(String),
+    /// "Go to <name>": the workspace that owns this local chat, with the
+    /// chat opened there.
+    WorkspaceGoToChatOwner(String),
+    ChatAddToWorkspaceToggle,
+    /// Adds root chat `.0` to the open workspace with uid `.1`, taking it
+    /// from any other owner.
+    ChatAddToWorkspace(String, u64),
+    /// Starts an inline rename of the workspace at this index.
+    WorkspaceRenameStart(usize, RenameSite),
+    WorkspaceRenameInput(String),
+    WorkspaceRenameSubmit,
+    WorkspaceRenameCancel,
+    /// "New workspace…" (no repo needed): open the name form.
+    NewWorkOpen,
+    NewWorkNameChanged(String),
+    NewWorkSubmit,
+    NewWorkCancel,
     /// Open the diff panel on an owned checkout.
     BranchDiffOpen(PathBuf, overview::DiffSource),
     BranchDiffLoaded(usize, u64, Result<BranchDiffPayload, String>),
@@ -6302,11 +6391,18 @@ struct App {
     // Chats panel (TRU-78): machine-wide conversation index + UI state.
     // App-level because the index spans workspaces; selection is per-tab.
     chat_index: Vec<chats::ChatIndexEntry>,
-    /// Workspace overviews (TRU-167) by workspace dir; built when the
-    /// panel first opens in that workspace.
-    workspace_overviews: HashMap<PathBuf, WorkspaceOverviewState>,
+    /// Workspace overviews (TRU-167) by workspace dir, or by workspace for
+    /// one that owns its chats (TRU-169); built when the panel first opens
+    /// in that workspace.
+    workspace_overviews: HashMap<OverviewKey, WorkspaceOverviewState>,
     /// Hand-picked overview focus per workspace, kept across restarts.
     overview_focus_picks: overview::FocusPicks,
+    /// An inline workspace rename in progress (TRU-169).
+    workspace_rename: Option<WorkspaceRename>,
+    /// The Chats preview's "Add to workspace…" picker is open.
+    chat_add_to_workspace_open: bool,
+    /// The "New workspace…" name form (TRU-169), when open.
+    new_work_form: Option<NewWorkForm>,
     /// Generation counter for branch diff loads.
     branch_diff_generation: u64,
     chat_index_loading: bool,
@@ -7655,13 +7751,18 @@ impl App {
                     .collect(),
                 env: ws.env.clone(),
                 active: true,
+                chats: ws.chats.clone(),
             })
             .collect();
 
         // Append closed workspace configs so their env/settings survive
-        // (skip any whose dir matches an active workspace — it was reopened)
+        // (skip any whose dir matches an active workspace — it was reopened).
+        // A workspace that owns chats is not its folder: one sharing a dir
+        // with another is a different workspace and is kept.
         for closed in &self.closed_workspace_configs {
-            let already_active = configs.iter().any(|c| c.dir == closed.dir);
+            let already_active = configs
+                .iter()
+                .any(|c| c.dir == closed.dir && c.chats.is_empty() && closed.chats.is_empty());
             if !already_active {
                 configs.push(closed.clone());
             }
@@ -10959,12 +11060,15 @@ impl App {
         let canonical_cwd = self.canonical_task_workspace_directory(cwd);
         let canonical_repo_root = self.canonical_task_workspace_directory(repo_root);
         // The deepest root wins, so a broad workspace (say one at
-        // ~/GitRepo) doesn't swallow chats whose repo has its own.
+        // ~/GitRepo) doesn't swallow chats whose repo has its own. A
+        // workspace that owns chats takes chats by membership, never by
+        // folder (TRU-169).
         self.workspaces
             .iter()
             .enumerate()
             .filter(|(_, ws)| {
                 matches!(ws.location, WorkspaceLocation::Local { .. })
+                    && !ws.owns_chats()
                     && (canonical_cwd.starts_with(&ws.dir)
                         || canonical_repo_root.starts_with(&ws.dir))
             })
@@ -10996,45 +11100,57 @@ impl App {
                 matches!(
                     cfg.location,
                     None | Some(config::WorkspaceLocationConfig::Local { .. })
-                ) && contains(Path::new(&cfg.dir))
+                ) && cfg.chats.is_empty()
+                    && contains(Path::new(&cfg.dir))
             })
             .max_by_key(|(_, cfg)| Path::new(&cfg.dir).components().count())
             .map(|(idx, _)| idx);
-        let workspace = if let Some(closed_idx) = closed_idx {
-            let cfg = self.closed_workspace_configs.remove(closed_idx);
-            let mut ws = Workspace::new(cfg.name.clone(), PathBuf::from(&cfg.dir), cfg.color);
-            ws.abbrev = cfg.abbrev.clone();
-            ws.env = cfg.env.clone();
-            if let Some(cmd) = &cfg.run_command {
-                ws.console.run_command = Some(cmd.clone());
-                ws.console.status = ConsoleStatus::Stopped;
-            }
-            ws
-        } else {
-            let used_colors: Vec<WorkspaceColor> =
-                self.workspaces.iter().map(|ws| ws.color).collect();
-            Workspace::new(
-                repo_name.to_string(),
-                repo_root.to_path_buf(),
-                WorkspaceColor::next_available(&used_colors),
-            )
-        };
-        let reopened_dir = workspace.dir.clone();
+        if let Some(closed_idx) = closed_idx {
+            return self.reopen_closed_local_workspace(closed_idx);
+        }
+        let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
+        let workspace = Workspace::new(
+            repo_name.to_string(),
+            repo_root.to_path_buf(),
+            WorkspaceColor::next_available(&used_colors),
+        );
+        self.push_and_activate_workspace(workspace)
+    }
+
+    /// Reopens the closed local workspace config at `closed_idx` (its
+    /// name, colour, env, run command and owned chats), activates it and
+    /// leaves it tabless; the caller adds the tab.
+    fn reopen_closed_local_workspace(&mut self, closed_idx: usize) -> usize {
+        let cfg = self.closed_workspace_configs.remove(closed_idx);
+        let mut ws = Workspace::new(cfg.name.clone(), PathBuf::from(&cfg.dir), cfg.color);
+        ws.abbrev = cfg.abbrev.clone();
+        ws.env = cfg.env.clone();
+        ws.chats = cfg.chats.clone();
+        if let Some(cmd) = &cfg.run_command {
+            ws.console.run_command = Some(cmd.clone());
+            ws.console.status = ConsoleStatus::Stopped;
+        }
+        self.push_and_activate_workspace(ws)
+    }
+
+    /// Adds `workspace` to the bar in machine order, makes it active and
+    /// returns its index.
+    fn push_and_activate_workspace(&mut self, workspace: Workspace) -> usize {
+        let uid = workspace.uid;
         self.workspaces.push(workspace);
         self.normalize_workspace_order();
         self.active_workspace_idx = self
-            .workspaces
-            .iter()
-            .position(|workspace| {
-                matches!(workspace.location, WorkspaceLocation::Local { .. })
-                    && paths_equal(&workspace.dir, &reopened_dir)
-            })
-            .expect("the just-opened local workspace remains after ordering");
+            .workspace_index_by_uid(uid)
+            .expect("the just-opened workspace remains after ordering");
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.sync_plans_dir();
         self.snap_slide_to_active_workspace();
         self.active_workspace_idx
+    }
+
+    fn workspace_index_by_uid(&self, uid: u64) -> Option<usize> {
+        self.workspaces.iter().position(|ws| ws.uid == uid)
     }
 
     /// Slice 5, remote form: open / reopen / create the workspace that
@@ -11083,6 +11199,7 @@ impl App {
             let mut ws = Workspace::new(cfg.name.clone(), PathBuf::from(&cfg.dir), cfg.color);
             ws.abbrev = cfg.abbrev.clone();
             ws.env = cfg.env.clone();
+            ws.chats = cfg.chats.clone();
             if let Some(config::WorkspaceLocationConfig::RemoteAgent {
                 remote_id,
                 workspace_id,
@@ -11135,6 +11252,36 @@ impl App {
         self.active_workspace_idx
     }
 
+    /// The workspace a local chat resumes into (TRU-169): its owning
+    /// workspace (reopened when closed), else `into`, else the deepest
+    /// folder rule of `ensure_local_workspace_for_chat`.
+    fn resume_workspace_for_local_chat(
+        &mut self,
+        id: &str,
+        root_id: Option<&str>,
+        into: Option<usize>,
+        cwd: &Path,
+        repo_root: Option<&Path>,
+        repo_name: &str,
+    ) -> usize {
+        let target = overview::resume_target(
+            self.workspaces.iter().map(|ws| ws.chats.as_slice()),
+            self.closed_workspace_configs
+                .iter()
+                .map(|cfg| cfg.chats.as_slice()),
+            id,
+            root_id,
+            into,
+        );
+        match target {
+            overview::ResumeTarget::OwnerOpen(idx) | overview::ResumeTarget::Into(idx) => idx,
+            overview::ResumeTarget::OwnerClosed(idx) => self.reopen_closed_local_workspace(idx),
+            overview::ResumeTarget::ByFolder => {
+                self.ensure_local_workspace_for_chat(cwd, repo_root, repo_name)
+            }
+        }
+    }
+
     fn resume_chat_as_tab(
         &mut self,
         chat: chats::ChatRef,
@@ -11165,6 +11312,7 @@ impl App {
         let command = entry.resume_command();
         let repo_root = entry.repo_root.clone();
         let repo_name = entry.group_name();
+        let root_id = entry.root_id.clone();
 
         if !cwd.exists() {
             if !recreate_dir {
@@ -11184,9 +11332,14 @@ impl App {
         }
 
         let mut tasks = Vec::new();
-        let ws_idx = into.unwrap_or_else(|| {
-            self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name)
-        });
+        let ws_idx = self.resume_workspace_for_local_chat(
+            &id,
+            root_id.as_deref(),
+            into,
+            &cwd,
+            repo_root.as_deref(),
+            &repo_name,
+        );
         if ws_idx != self.active_workspace_idx {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
@@ -11245,6 +11398,7 @@ impl App {
         let cwd = entry.cwd.clone();
         let repo_root = entry.repo_root.clone();
         let repo_name = entry.group_name();
+        let root_id = entry.root_id.clone();
         if let Some(remote_id) = chat.remote_id.clone() {
             return self.resume_remote_chat_as_chat_tab(id, remote_id, cwd, repo_root);
         }
@@ -11257,9 +11411,14 @@ impl App {
         }
 
         let mut tasks = Vec::new();
-        let ws_idx = into.unwrap_or_else(|| {
-            self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name)
-        });
+        let ws_idx = self.resume_workspace_for_local_chat(
+            &id,
+            root_id.as_deref(),
+            into,
+            &cwd,
+            repo_root.as_deref(),
+            &repo_name,
+        );
         if ws_idx != self.active_workspace_idx {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
@@ -11580,13 +11739,20 @@ impl App {
     // -----------------------------------------------------------------------
     // Workspace overview (TRU-167).
 
-    /// The active workspace's dir when its overview applies: it reads this
-    /// Mac's chat index and checkouts, so remote workspaces have none.
-    fn overview_workspace_dir(&self) -> Option<PathBuf> {
+    /// The active workspace's overview key when its overview applies: it
+    /// reads this Mac's chat index and checkouts, so remote workspaces have
+    /// none.
+    fn overview_key(&self) -> Option<OverviewKey> {
         if self.active_workspace_is_remote() {
             return None;
         }
-        self.active_workspace().map(|ws| ws.dir.clone())
+        self.active_workspace().map(|ws| {
+            if ws.owns_chats() {
+                OverviewKey::Owner(ws.uid)
+            } else {
+                OverviewKey::Folder(ws.dir.clone())
+            }
+        })
     }
 
     /// Opens coordinator `id`'s conversation in the main area and keeps the
@@ -11602,14 +11768,7 @@ impl App {
         let open = if let Some(tab_idx) = hosting {
             self.update(Event::TabSelect(tab_idx))
         } else {
-            let as_chat = self
-                .find_chat_entry(&chat)
-                .is_some_and(|entry| can_resume_as_chat(entry, ChatMachine::Local, false));
-            if as_chat {
-                self.resume_chat_as_chat_tab(chat, Some(self.active_workspace_idx))
-            } else {
-                self.resume_chat_as_tab(chat, false, Some(self.active_workspace_idx))
-            }
+            self.open_local_chat(chat, Some(self.active_workspace_idx))
         };
         // The tab shown now may carry another sidebar mode (a new tab starts
         // on Git): put it on the overview.
@@ -11624,6 +11783,336 @@ impl App {
         Task::batch([open, mode])
     }
 
+    /// Opens a local chat through the Chats panel's own paths: as a native
+    /// chat when that is allowed, else as a terminal session. An owned chat
+    /// lands in its owning workspace, else in `into`.
+    fn open_local_chat(&mut self, chat: chats::ChatRef, into: Option<usize>) -> Task<Event> {
+        let as_chat = self
+            .find_chat_entry(&chat)
+            .is_some_and(|entry| can_resume_as_chat(entry, ChatMachine::Local, false));
+        if as_chat {
+            self.resume_chat_as_chat_tab(chat, into)
+        } else {
+            self.resume_chat_as_tab(chat, false, into)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Owned chats (TRU-169): a workspace owns its chats, not a folder.
+
+    /// Where a local chat's owner is, open or closed, from the index entry's
+    /// root.
+    fn local_chat_owner(&self, id: &str) -> overview::ResumeTarget {
+        let root_id = self
+            .chat_index
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.root_id.clone());
+        overview::resume_target(
+            self.workspaces.iter().map(|ws| ws.chats.as_slice()),
+            self.closed_workspace_configs
+                .iter()
+                .map(|cfg| cfg.chats.as_slice()),
+            id,
+            root_id.as_deref(),
+            None,
+        )
+    }
+
+    /// The name and open index of the workspace owning local root chat
+    /// `id` (no index lookup: for view rows of coordinators). `None` index
+    /// when the owner is closed.
+    fn root_chat_owner(&self, id: &str) -> Option<(String, Option<usize>)> {
+        if let Some(idx) = overview::owning_workspace(
+            self.workspaces.iter().map(|ws| ws.chats.as_slice()),
+            id,
+            None,
+        ) {
+            return Some((self.workspaces[idx].name.clone(), Some(idx)));
+        }
+        overview::owning_workspace(
+            self.closed_workspace_configs
+                .iter()
+                .map(|cfg| cfg.chats.as_slice()),
+            id,
+            None,
+        )
+        .map(|idx| (self.closed_workspace_configs[idx].name.clone(), None))
+    }
+
+    /// "Make workspace": a workspace named after the coordinator's title,
+    /// homed at its recorded cwd, owning it. It joins the bar and becomes
+    /// active; a tab already hosting the chat moves into it, else the chat
+    /// is resumed into it; the overview shows and an inline rename starts.
+    /// A chat another workspace owns goes there instead.
+    fn make_workspace_from_chat(&mut self, id: &str) -> Task<Event> {
+        let Some(entry) = self.chat_index.iter().find(|entry| entry.id == id) else {
+            eprintln!("[workspace] cannot make a workspace from {id}: not in this Mac's index");
+            return Task::none();
+        };
+        if let Some(root) = &entry.root_id {
+            eprintln!(
+                "[workspace] cannot make a workspace from {id}: it folds under coordinator {root}"
+            );
+            return Task::none();
+        }
+        if !matches!(self.local_chat_owner(id), overview::ResumeTarget::ByFolder) {
+            return self.go_to_chat_owner(id);
+        }
+        let name = overview::workspace_name_from_title(&entry.title);
+        let (idx, uid) = match self.create_work_workspace(&name, vec![id.to_string()]) {
+            Ok(made) => made,
+            Err(error) => {
+                eprintln!("[workspace] cannot make a workspace from {id}: {error}");
+                return Task::none();
+            }
+        };
+        eprintln!("[workspace] made workspace uid={uid} owning chat {id}");
+
+        let mut tasks = Vec::new();
+        let hosting = self
+            .find_chat_tab(&chats::ChatRef::local(id))
+            .filter(|(ws_idx, _)| {
+                matches!(
+                    self.workspaces[*ws_idx].location,
+                    WorkspaceLocation::Local { .. }
+                )
+            });
+        if let Some((from, tab_idx)) = hosting {
+            self.move_tab_to_workspace(from, tab_idx, idx);
+            self.sync_visible_terminals();
+            tasks.push(self.scroll_to_active_tab());
+            tasks.push(self.present_active_tab_surfaces());
+        } else {
+            tasks.push(self.open_local_chat(chats::ChatRef::local(id), Some(idx)));
+        }
+        if let Some(idx) = self.workspace_index_by_uid(uid) {
+            self.ensure_workspace_has_tab(idx);
+        }
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        tasks.push(self.show_workspace_overview());
+        // Rename where it shows: the overview header, else the bar chip
+        // (a collapsed sidebar).
+        let site = if self.workspace_overview_visible() {
+            RenameSite::Overview
+        } else {
+            RenameSite::Chip
+        };
+        tasks.push(self.start_workspace_rename(uid, site));
+        Task::batch(tasks)
+    }
+
+    /// A workspace that is a piece of work, not a folder: named `name`,
+    /// homed in a new `~/Work/<slug>` folder (created here), owning
+    /// `chats`, claiming the chats started in it, on the bar and active.
+    /// Returns its index and uid.
+    fn create_work_workspace(
+        &mut self,
+        name: &str,
+        chats: Vec<String>,
+    ) -> Result<(usize, u64), String> {
+        let home = dirs::home_dir().ok_or("no home directory to put ~/Work in")?;
+        let base = home.join(WORK_FOLDER);
+        let dir = overview::create_work_folder(&base, name)
+            .map_err(|error| format!("cannot create a folder in {}: {error}", base.display()))?;
+        let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
+        let mut workspace = Workspace::new(
+            name.to_string(),
+            dir,
+            WorkspaceColor::next_available(&used_colors),
+        );
+        workspace.chats = chats;
+        workspace.claims_new_chats = true;
+        let uid = workspace.uid;
+        let idx = self.push_and_activate_workspace(workspace);
+        Ok((idx, uid))
+    }
+
+    /// "New workspace…" confirmed: the `~/Work/<slug>` folder is created
+    /// now, the workspace joins the bar and becomes active, and a new
+    /// Claude chat opens there; that chat joins the workspace's chats once
+    /// it has a session id. No repo is needed.
+    fn submit_new_work(&mut self) -> Task<Event> {
+        let Some(form) = self.new_work_form.as_mut() else {
+            return Task::none();
+        };
+        let name = form.name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            form.error = Some("Name the work, for example \"Cloud migration\".".to_string());
+            return Task::none();
+        }
+        let (_, uid) = match self.create_work_workspace(&name, Vec::new()) {
+            Ok(made) => made,
+            Err(error) => {
+                eprintln!("[workspace] new workspace {name:?}: {error}");
+                if let Some(form) = self.new_work_form.as_mut() {
+                    form.error = Some(error);
+                }
+                return Task::none();
+            }
+        };
+        eprintln!("[workspace] new workspace uid={uid} {name:?}");
+        self.new_work_form = None;
+        let chat = self.update(Event::NewClaudeChatTab);
+        Task::batch([chat, self.apply_webview_surfaces()])
+    }
+
+    /// "Go to <name>": switches to (or reopens) the workspace owning local
+    /// chat `id` and opens the chat there.
+    fn go_to_chat_owner(&mut self, id: &str) -> Task<Event> {
+        let idx = match self.local_chat_owner(id) {
+            overview::ResumeTarget::OwnerOpen(idx) => idx,
+            overview::ResumeTarget::OwnerClosed(closed) => {
+                let idx = self.reopen_closed_local_workspace(closed);
+                self.ensure_workspace_has_tab(idx);
+                idx
+            }
+            _ => {
+                eprintln!("[workspace] no workspace owns chat {id}");
+                return Task::none();
+            }
+        };
+        let select = if idx != self.active_workspace_idx {
+            self.update(Event::WorkspaceSelect(idx))
+        } else {
+            Task::none()
+        };
+        let open = self.open_local_chat(chats::ChatRef::local(id), Some(idx));
+        Task::batch([select, open])
+    }
+
+    /// Adds root chat `root` to the workspace with `uid`, removing it from
+    /// every other workspace, open or closed: a chat belongs to exactly one.
+    fn add_chat_to_workspace(&mut self, root: &str, uid: u64) -> Task<Event> {
+        self.chat_add_to_workspace_open = false;
+        let Some(target) = self.workspace_index_by_uid(uid) else {
+            eprintln!("[workspace] cannot add chat {root}: workspace uid={uid} is not open");
+            return Task::none();
+        };
+        if !matches!(
+            self.workspaces[target].location,
+            WorkspaceLocation::Local { .. }
+        ) {
+            eprintln!("[workspace] cannot add chat {root}: workspace uid={uid} is not on this Mac");
+            return Task::none();
+        }
+        let lists = self
+            .workspaces
+            .iter_mut()
+            .map(|ws| (ws.uid == uid, &mut ws.chats))
+            .chain(
+                self.closed_workspace_configs
+                    .iter_mut()
+                    .map(|cfg| (false, &mut cfg.chats)),
+            );
+        if !overview::assign_chat(lists, root) {
+            return Task::none();
+        }
+        self.mark_workspaces_dirty();
+        self.workspace_chats_changed()
+    }
+
+    /// Owned chats moved: rebuild every overview built so far and reread
+    /// the one on screen.
+    fn workspace_chats_changed(&mut self) -> Task<Event> {
+        let keys: Vec<OverviewKey> = self.workspace_overviews.keys().cloned().collect();
+        for key in &keys {
+            self.rebuild_workspace_overview(key);
+        }
+        if self.workspace_overview_visible() {
+            self.open_workspace_overview()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Puts the active tab's sidebar on the Workspace overview and builds it.
+    fn show_workspace_overview(&mut self) -> Task<Event> {
+        let shown = self
+            .active_tab()
+            .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Workspace);
+        if shown {
+            self.open_workspace_overview()
+        } else {
+            self.update(Event::SetSidebarMode(SidebarMode::Workspace))
+        }
+    }
+
+    /// Moves tab `tab_idx` of workspace `from` to the end of workspace `to`
+    /// and makes it active there; its process keeps running. A workspace
+    /// left without tabs gets a plain one first, as closing a task's last
+    /// tab does.
+    fn move_tab_to_workspace(&mut self, from: usize, tab_idx: usize, to: usize) {
+        if from == to || tab_idx >= self.workspaces[from].tabs.len() {
+            return;
+        }
+        if self.workspaces[from].tabs.len() == 1 {
+            let name = self.workspaces[from].name.clone();
+            let dir = self.workspaces[from].dir.clone();
+            let replacement = self.create_tab_for_workspace(dir, None, Some(&name));
+            self.workspaces[from].tabs.push(replacement);
+        }
+        let tab = self.workspaces[from].tabs.remove(tab_idx);
+        let source = &mut self.workspaces[from];
+        if source.active_tab > tab_idx {
+            source.active_tab -= 1;
+        }
+        source.active_tab = source.active_tab.min(source.tabs.len() - 1);
+        let target = &mut self.workspaces[to];
+        target.tabs.push(tab);
+        target.active_tab = target.tabs.len() - 1;
+    }
+
+    /// A workspace with no tabs (one reopened or made for a chat that
+    /// could not be opened) gets a plain tab in its home.
+    fn ensure_workspace_has_tab(&mut self, idx: usize) {
+        let Some(ws) = self.workspaces.get(idx) else {
+            return;
+        };
+        if !ws.tabs.is_empty() {
+            return;
+        }
+        let (name, dir) = (ws.name.clone(), ws.dir.clone());
+        let tab = self.create_tab_for_workspace(dir, None, Some(&name));
+        let ws = &mut self.workspaces[idx];
+        ws.tabs.push(tab);
+        ws.active_tab = 0;
+    }
+
+    fn start_workspace_rename(&mut self, uid: u64, site: RenameSite) -> Task<Event> {
+        let Some(ws) = self.workspaces.iter().find(|ws| ws.uid == uid) else {
+            return Task::none();
+        };
+        self.workspace_rename = Some(WorkspaceRename {
+            uid,
+            draft: ws.name.clone(),
+            site,
+        });
+        iced::widget::operation::focus(workspace_rename_input_id()).chain(
+            iced::widget::operation::select_all(workspace_rename_input_id()),
+        )
+    }
+
+    /// Commits the rename draft (trimmed; an empty one changes nothing)
+    /// through the debounced `workspaces.json` save.
+    fn submit_workspace_rename(&mut self) {
+        let Some(rename) = self.workspace_rename.take() else {
+            return;
+        };
+        let name = rename.draft.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(ws) = self.workspaces.iter_mut().find(|ws| ws.uid == rename.uid) {
+            if ws.name != name {
+                ws.name = name.to_string();
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
+            }
+        }
+    }
+
     /// The active tab shows the Workspace overview.
     fn workspace_overview_visible(&self) -> bool {
         !self.sidebar_is_collapsed()
@@ -11632,32 +12121,47 @@ impl App {
                 .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Workspace)
     }
 
-    /// Rebuilds `dir`'s summary from the chat index and tasks: one pass
+    /// Rebuilds `key`'s summary from the chat index and tasks: one pass
     /// over the index, no I/O. A changed branch claim asks for a full
-    /// refresh.
-    fn rebuild_workspace_overview(&mut self, dir: &Path) {
+    /// refresh. The overview of a workspace that closed is dropped.
+    fn rebuild_workspace_overview(&mut self, key: &OverviewKey) {
         let tasks: Vec<overview::TaskInfo> = self
             .task_store
             .as_ref()
             .map(|store| store.tasks().iter().map(overview::TaskInfo::from).collect())
             .unwrap_or_default();
-        let focus = self
-            .workspace_overviews
-            .get(dir)
-            .map(|state| state.focus.clone())
-            .unwrap_or_else(|| self.overview_focus_picks.focus_for(dir));
-        let summary = freeze_time!("workspace_overview_summary", {
-            overview::WorkSummary::build(
-                &self.chat_index,
-                dir,
-                &tasks,
-                &focus,
-                std::time::SystemTime::now(),
-            )
-        });
+        let now = std::time::SystemTime::now();
+        let (summary, focus) = match key {
+            OverviewKey::Folder(dir) => {
+                let focus = self
+                    .workspace_overviews
+                    .get(key)
+                    .map(|state| state.focus.clone())
+                    .unwrap_or_else(|| self.overview_focus_picks.focus_for(dir));
+                let summary = freeze_time!("workspace_overview_summary", {
+                    overview::WorkSummary::build(&self.chat_index, dir, &tasks, &focus, now)
+                });
+                (summary, focus)
+            }
+            OverviewKey::Owner(uid) => {
+                let Some(owned) = self
+                    .workspaces
+                    .iter()
+                    .find(|ws| ws.uid == *uid && ws.owns_chats())
+                    .map(|ws| ws.chats.clone())
+                else {
+                    self.workspace_overviews.remove(key);
+                    return;
+                };
+                let summary = freeze_time!("workspace_overview_summary", {
+                    overview::WorkSummary::build_owned(&self.chat_index, &owned, &tasks, now)
+                });
+                (summary, overview::Focus::Latest)
+            }
+        };
         let state = self
             .workspace_overviews
-            .entry(dir.to_path_buf())
+            .entry(key.clone())
             .or_insert_with(|| WorkspaceOverviewState {
                 focus: focus.clone(),
                 ..Default::default()
@@ -11676,10 +12180,10 @@ impl App {
     /// the summary changed since.
     fn start_workspace_overview_refresh(
         &mut self,
-        dir: &Path,
+        key: &OverviewKey,
         mode: overview::RefreshMode,
     ) -> Task<Event> {
-        let Some(state) = self.workspace_overviews.get_mut(dir) else {
+        let Some(state) = self.workspace_overviews.get_mut(key) else {
             return Task::none();
         };
         if state.in_flight {
@@ -11703,16 +12207,16 @@ impl App {
             key_repos: state.summary.key_repos.clone(),
             previous: state.branches.clone(),
         };
-        let dir = dir.to_path_buf();
+        let key = key.clone();
         Task::perform(overview::refresh(plan), move |outcome| {
-            Event::WorkspaceOverviewRefreshed(dir, generation, Box::new(outcome))
+            Event::WorkspaceOverviewRefreshed(key, generation, Box::new(outcome))
         })
     }
 
     /// Opening the panel: rebuild the summary, refresh the chat index if
     /// stale, and reread git unless that just happened.
     fn open_workspace_overview(&mut self) -> Task<Event> {
-        let Some(dir) = self.overview_workspace_dir() else {
+        let Some(dir) = self.overview_key() else {
             return Task::none();
         };
         self.rebuild_workspace_overview(&dir);
@@ -11736,7 +12240,7 @@ impl App {
     /// refresh every 60 s: a stat of each owned checkout's gitdir decides
     /// whether any git runs.
     fn poll_workspace_overview(&mut self) -> Task<Event> {
-        let Some(dir) = self.overview_workspace_dir() else {
+        let Some(dir) = self.overview_key() else {
             return Task::none();
         };
         let visible = self.workspace_overview_visible();
@@ -11769,7 +12273,7 @@ impl App {
     /// Opens the diff panel on an owned checkout of the active workspace's
     /// overview. The diff is read and shaped off the UI thread.
     fn open_branch_diff(&mut self, checkout: PathBuf, source: overview::DiffSource) -> Task<Event> {
-        let Some(row) = self.overview_workspace_dir().and_then(|dir| {
+        let Some(row) = self.overview_key().and_then(|dir| {
             self.workspace_overviews.get(&dir).and_then(|state| {
                 state
                     .branches
@@ -14018,6 +14522,9 @@ impl App {
             overview_focus_picks: overview::FocusPicks::load(&overview::FocusPicks::path_in(
                 &config::global_config_dir(),
             )),
+            workspace_rename: None,
+            chat_add_to_workspace_open: false,
+            new_work_form: None,
             branch_diff_generation: 0,
             chat_index_loading: false,
             chat_index_loaded_at: None,
@@ -14107,7 +14614,7 @@ impl App {
                 // If workspace dir is $HOME, name the workspace after its first tab's repo instead
                 let name = if remote_session.is_some() {
                     ws_config.name.clone()
-                } else if dir == Path::new(&home) {
+                } else if dir == Path::new(&home) && ws_config.chats.is_empty() {
                     ws_config
                         .tabs
                         .first()
@@ -14147,6 +14654,7 @@ impl App {
                 }
                 workspace.abbrev = ws_config.abbrev.clone();
                 workspace.env = ws_config.env.clone();
+                workspace.chats = ws_config.chats.clone();
                 // Restore saved run command if present
                 if let Some(cmd) = &ws_config.run_command {
                     workspace.console.run_command = Some(cmd.clone());
@@ -15707,6 +16215,7 @@ fi
             workspace.abbrev = saved.abbrev.clone();
             workspace.dir = PathBuf::from(&saved.dir);
             workspace.env = saved.env.clone();
+            workspace.chats = saved.chats.clone();
             if let Some(cmd) = &saved.run_command {
                 workspace.console.run_command = Some(cmd.clone());
                 workspace.console.status = ConsoleStatus::Stopped;
@@ -17376,6 +17885,7 @@ fi
                 // keystrokes into the focused PTY.
                 if self.task_switcher_open
                     || self.new_task_form.is_some()
+                    || self.new_work_form.is_some()
                     || self.task_tab_close_prompt.is_some()
                     || self.task_worktree_delete_prompt.is_some()
                     || self.task_publish_prompt.is_some()
@@ -19467,6 +19977,9 @@ fi
                 };
                 let mut progress_task: Option<String> = None;
                 let mut session_id_changed = false;
+                // A new chat in a workspace that owns its chats joins it
+                // (TRU-169): (workspace uid, session id).
+                let mut joins_workspace: Option<(u64, String)> = None;
                 let mut config_changed = false;
                 let mut chat_config_changed = false;
                 let mut task_signal: Option<(String, Option<TaskSessionOutcome>)> = None;
@@ -19476,6 +19989,8 @@ fi
                 let home = dirs::home_dir();
                 'outer_event: for ws in &mut self.workspaces {
                     let local_workspace = matches!(ws.location, WorkspaceLocation::Local { .. });
+                    let owning_workspace =
+                        (ws.owns_chats() || ws.claims_new_chats).then_some(ws.uid);
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
                             if t.task_id.is_some() {
@@ -19676,6 +20191,11 @@ fi
                                 session.record(ev);
                             }
                             if let Some(id) = new_session_id {
+                                // A task's sessions belong to the task, not
+                                // to the workspace's chats.
+                                if let (Some(uid), None) = (owning_workspace, &t.task_id) {
+                                    joins_workspace = Some((uid, id.clone()));
+                                }
                                 // The tab owns this conversation (Chats
                                 // registry) and resumes it after restart.
                                 t.chat_session_id = Some(id);
@@ -19729,6 +20249,26 @@ fi
                 }
                 if let Some((task_id, ended)) = task_signal {
                     self.apply_task_session_signal(&task_id, ended);
+                }
+                if let Some((uid, id)) = joins_workspace {
+                    let owned = overview::owning_workspace(
+                        self.workspaces.iter().map(|ws| ws.chats.as_slice()).chain(
+                            self.closed_workspace_configs
+                                .iter()
+                                .map(|cfg| cfg.chats.as_slice()),
+                        ),
+                        &id,
+                        None,
+                    )
+                    .is_some();
+                    if !owned {
+                        if let Some(ws) = self.workspaces.iter_mut().find(|ws| ws.uid == uid) {
+                            eprintln!(
+                                "[workspace] chat {id} joins workspace uid={uid} it started in"
+                            );
+                            ws.chats.push(id);
+                        }
+                    }
                 }
                 if session_id_changed || config_changed {
                     self.mark_workspaces_dirty();
@@ -20062,6 +20602,7 @@ fi
                 // Modal capture layers must never leak keystrokes into the PTY
                 if self.task_switcher_open
                     || self.new_task_form.is_some()
+                    || self.new_work_form.is_some()
                     || self.task_tab_close_prompt.is_some()
                     || self.task_worktree_delete_prompt.is_some()
                     || self.task_publish_prompt.is_some()
@@ -20353,6 +20894,20 @@ fi
                         _ => {}
                     }
                     return Task::none();
+                }
+
+                // New workspace form: Escape closes
+                if self.new_work_form.is_some()
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    return self.update(Event::NewWorkCancel);
+                }
+
+                // Inline workspace rename: Escape cancels
+                if self.workspace_rename.is_some()
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    return self.update(Event::WorkspaceRenameCancel);
                 }
 
                 // Workspace settings: Escape closes
@@ -22657,11 +23212,11 @@ fi
                 self.chat_index_loaded_at = Some(Instant::now());
                 self.sync_task_sessions_from_chat_index();
                 // Workspace overviews read the index (TRU-167).
-                let dirs: Vec<PathBuf> = self.workspace_overviews.keys().cloned().collect();
+                let dirs: Vec<OverviewKey> = self.workspace_overviews.keys().cloned().collect();
                 for dir in &dirs {
                     self.rebuild_workspace_overview(dir);
                 }
-                let overview_refresh = match self.overview_workspace_dir() {
+                let overview_refresh = match self.overview_key() {
                     Some(dir)
                         if self.workspace_overview_visible()
                             && self
@@ -22827,7 +23382,7 @@ fi
                 return self.request_chat_index();
             }
             Event::WorkspaceOverviewRefresh => {
-                let Some(dir) = self.overview_workspace_dir() else {
+                let Some(dir) = self.overview_key() else {
                     return Task::none();
                 };
                 self.rebuild_workspace_overview(&dir);
@@ -22850,8 +23405,8 @@ fi
                 }
                 let outcome = *outcome;
                 perf_log!(
-                    "workspace_overview dir={} mode={:?} rows={} git_runs={} unchanged={} took={}ms",
-                    dir.display(),
+                    "workspace_overview key={:?} mode={:?} rows={} git_runs={} unchanged={} took={}ms",
+                    dir,
                     outcome.mode,
                     outcome.branches.len(),
                     outcome.git_runs,
@@ -22859,7 +23414,7 @@ fi
                     outcome.took.as_millis()
                 );
                 for error in &outcome.errors {
-                    eprintln!("[workspace-overview] {}: {error}", dir.display());
+                    eprintln!("[workspace-overview] {dir:?}: {error}");
                 }
                 state.in_flight = false;
                 state.last_refresh = Some(Instant::now());
@@ -22880,16 +23435,19 @@ fi
                 }
             }
             Event::WorkspaceOverviewFocus(focus) => {
-                let Some(dir) = self.overview_workspace_dir() else {
+                // A workspace that owns its chats reads all of them: no
+                // focus to pick (TRU-169).
+                let Some(OverviewKey::Folder(folder)) = self.overview_key() else {
                     return Task::none();
                 };
+                let dir = OverviewKey::Folder(folder.clone());
                 let state = self.workspace_overviews.entry(dir.clone()).or_default();
                 state.focus_menu_open = false;
                 if state.focus == focus {
                     return Task::none();
                 }
                 state.focus = focus.clone();
-                let save = if self.overview_focus_picks.set(&dir, &focus) {
+                let save = if self.overview_focus_picks.set(&folder, &focus) {
                     let picks = self.overview_focus_picks.clone();
                     Task::perform(
                         async move {
@@ -22927,7 +23485,7 @@ fi
             }
             Event::WorkspaceOverviewToggleFocusMenu => {
                 if let Some(state) = self
-                    .overview_workspace_dir()
+                    .overview_key()
                     .and_then(|dir| self.workspace_overviews.get_mut(&dir))
                 {
                     state.focus_menu_open = !state.focus_menu_open;
@@ -22935,7 +23493,7 @@ fi
             }
             Event::WorkspaceOverviewToggleOlder => {
                 if let Some(state) = self
-                    .overview_workspace_dir()
+                    .overview_key()
                     .and_then(|dir| self.workspace_overviews.get_mut(&dir))
                 {
                     state.show_older = !state.show_older;
@@ -22943,6 +23501,61 @@ fi
             }
             Event::WorkspaceOverviewOpenChat(id) => {
                 return self.open_overview_chat(&id);
+            }
+            Event::WorkspaceFromChat(id) => {
+                return self.make_workspace_from_chat(&id);
+            }
+            Event::WorkspaceGoToChatOwner(id) => {
+                return self.go_to_chat_owner(&id);
+            }
+            Event::ChatAddToWorkspaceToggle => {
+                self.chat_add_to_workspace_open = !self.chat_add_to_workspace_open;
+            }
+            Event::ChatAddToWorkspace(root, uid) => {
+                return self.add_chat_to_workspace(&root, uid);
+            }
+            Event::WorkspaceRenameStart(idx, site) => {
+                let Some(uid) = self.workspaces.get(idx).map(|ws| ws.uid) else {
+                    return Task::none();
+                };
+                self.workspace_settings_open = false;
+                return self.start_workspace_rename(uid, site);
+            }
+            Event::WorkspaceRenameInput(draft) => {
+                if let Some(rename) = self.workspace_rename.as_mut() {
+                    rename.draft = draft;
+                }
+            }
+            Event::WorkspaceRenameSubmit => {
+                self.submit_workspace_rename();
+                return self.focus_main_terminal();
+            }
+            Event::WorkspaceRenameCancel => {
+                self.workspace_rename = None;
+                return self.focus_main_terminal();
+            }
+            Event::NewWorkOpen => {
+                self.machine_menu = None;
+                let close = self.close_folder_picker();
+                self.new_work_form = Some(NewWorkForm::default());
+                return Task::batch([
+                    close,
+                    self.apply_webview_surfaces(),
+                    iced::widget::operation::focus(new_work_name_input_id()),
+                ]);
+            }
+            Event::NewWorkNameChanged(name) => {
+                if let Some(form) = self.new_work_form.as_mut() {
+                    form.name = name;
+                    form.error = None;
+                }
+            }
+            Event::NewWorkSubmit => {
+                return self.submit_new_work();
+            }
+            Event::NewWorkCancel => {
+                self.new_work_form = None;
+                return Task::batch([self.apply_webview_surfaces(), self.focus_main_terminal()]);
             }
             Event::BranchDiffOpen(checkout, source) => {
                 return self.open_branch_diff(checkout, source);
@@ -23080,6 +23693,7 @@ fi
                 }
             }
             Event::SelectChat(chat) => {
+                self.chat_add_to_workspace_open = false;
                 let task = self.select_chat(chat);
                 self.settle_agent_surface();
                 return task;
@@ -23939,6 +24553,7 @@ fi
                         env: ws.env.clone(),
                         remote_session,
                         active: false,
+                        chats: ws.chats.clone(),
                     });
                     // Its tabs are discarded, so its remote chats stop too.
                     let tab_ids: Vec<usize> =
@@ -24298,10 +24913,12 @@ fi
 
                 // Check if there's a closed workspace config for this directory
                 // and restore its settings (env, color, name, etc.)
+                // A closed workspace that owns chats is a piece of work,
+                // not this folder: picking the folder never restores it.
                 let saved = self
                     .closed_workspace_configs
                     .iter()
-                    .position(|c| c.dir == dir_str)
+                    .position(|c| c.dir == dir_str && c.chats.is_empty())
                     .map(|i| self.closed_workspace_configs.remove(i));
 
                 let name = saved.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| {
@@ -24679,6 +25296,7 @@ fi
             || self.folder_picker.is_some()
             || self.phone_panel.is_some()
             || self.remote_connect_form.is_some()
+            || self.new_work_form.is_some()
     }
 
     fn visible_webview_surface(&self) -> VisibleSurface {
@@ -24915,7 +25533,8 @@ fi
 
     /// Synchronously show or hide the agent pages per
     /// `visible_webview_surface`. Never creates or replays: the active agent
-    /// tab's page is shown only when it is alive, otherwise all are hidden.
+    /// tab's page is shown when it is alive, and stays the shown page while
+    /// it is still being created; every other page is hidden.
     fn settle_agent_surface(&mut self) {
         self.prune_agent_pages();
         if let VisibleSurface::AgentChat(tab_id) = self.visible_webview_surface() {
@@ -24926,6 +25545,11 @@ fi
                 self.reveal_agent_page(tab_id);
                 return;
             }
+            // A page staged but not yet built (Make workspace opens the
+            // chat, then switches the sidebar) keeps its visible flag, so
+            // it appears when built instead of behind the placeholder.
+            webview::show_only_agent_page(Some(tab_id));
+            return;
         }
         webview::hide_agent_pages();
     }
@@ -25682,6 +26306,13 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
+        } else if self.new_work_form.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_new_work_modal())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
         } else if self.workspace_settings_open {
             Stack::new()
                 .push(main_view)
@@ -26381,6 +27012,15 @@ fi
                     .padding([6, 12])
                     .on_press(Event::FolderPickerNativeDialog),
             );
+            // A piece of work that needs no repo (TRU-169).
+            if picker.purpose == FolderPickerPurpose::NewWorkspace {
+                actions = actions.push(
+                    button(text("New workspace, no repo…").size(font_small))
+                        .style(button::text)
+                        .padding([6, 12])
+                        .on_press(Event::NewWorkOpen),
+                );
+            }
         }
         actions = actions
             .push(iced::widget::Space::new().width(Length::Fill))
@@ -27042,6 +27682,88 @@ fi
         .into()
     }
 
+    /// "New workspace…" (TRU-169): a name, the `~/Work/<slug>` folder it
+    /// will get, and Create. Nothing is created until Create.
+    fn view_new_work_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let Some(form) = &self.new_work_form else {
+            return iced::widget::Space::new().into();
+        };
+        let bg_surface = theme.bg_surface();
+        let border_color = theme.border();
+        let bg_crust = theme.bg_crust();
+        let slug = overview::work_folder_slug(&form.name);
+        let mut card = Column::new()
+            .spacing(10)
+            .width(Length::Fixed(440.0))
+            .push(text("New workspace").size(font).color(theme.text_primary()))
+            .push(
+                text("A piece of work, not a repo. Repos join as the work touches them.")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+            )
+            .push(
+                text_input("Cloud migration", &form.name)
+                    .id(new_work_name_input_id())
+                    .on_input(Event::NewWorkNameChanged)
+                    .on_submit(Event::NewWorkSubmit)
+                    .size(font_small)
+                    .padding([6, 8]),
+            )
+            .push(
+                text(format!(
+                    "Home: ~/{WORK_FOLDER}/{slug} (a -2, -3 suffix if taken), made on Create; a new Claude chat opens there."
+                ))
+                .size(font_small - 1.0)
+                .color(theme.text_muted()),
+            );
+        if let Some(error) = &form.error {
+            card = card.push(text(error.clone()).size(font_small).color(theme.danger()));
+        }
+        let can_create = !form.name.trim().is_empty();
+        card = card.push(
+            row![
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("Cancel").size(font_small))
+                    .style(button::text)
+                    .padding([6, 12])
+                    .on_press(Event::NewWorkCancel),
+                button(text("Create").size(font_small))
+                    .style(button::primary)
+                    .padding([6, 12])
+                    .on_press_maybe(can_create.then_some(Event::NewWorkSubmit)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        );
+        let card = container(card)
+            .padding([20, 24])
+            .style(move |_| container::Style {
+                background: Some(bg_surface.into()),
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+        let backdrop_color = iced::Color { a: 0.8, ..bg_crust };
+        container(
+            container(card)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(backdrop_color.into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
     fn view_workspace_settings_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let text_primary = theme.text_primary();
@@ -27066,10 +27788,18 @@ fi
             }
         };
 
-        // --- Title ---
-        let title = text(format!("Workspace: {}", ws.name))
-            .size(16)
-            .color(text_primary);
+        // --- Title --- (✎ renames inline on the bar chip, TRU-169)
+        let title = row![
+            text(format!("Workspace: {}", ws.name))
+                .size(16)
+                .color(text_primary),
+            button(text("\u{270E} Rename").size(12).color(accent))
+                .style(self.ghost_button_style())
+                .padding([2, 6])
+                .on_press(Event::WorkspaceRenameStart(idx, RenameSite::Chip)),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
 
         // --- Color swatches ---
         let mut color_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
@@ -27569,6 +28299,10 @@ fi
             card_col = card_col.push(item(
                 "New workspace on this mac…".to_string(),
                 Event::WorkspaceCreateLocal,
+            ));
+            card_col = card_col.push(item(
+                "New workspace, no repo…".to_string(),
+                Event::NewWorkOpen,
             ));
         } else if let Some(("agent", remote_id)) = key.split_once(':') {
             card_col = card_col.push(item(
@@ -28164,10 +28898,31 @@ fi
                     ..Default::default()
                 });
 
-            let label = text(&ws.name)
-                .size(11)
-                .color(text_color)
-                .font(iced::Font::with_name("Menlo"));
+            // Double-click the name to rename inline (TRU-169).
+            let label: Element<'_, Event, Theme, iced::Renderer> = match self
+                .workspace_rename
+                .as_ref()
+                .filter(|rename| rename.site == RenameSite::Chip && rename.uid == ws.uid)
+            {
+                Some(rename) => text_input("Workspace name", &rename.draft)
+                    .id(workspace_rename_input_id())
+                    .on_input(Event::WorkspaceRenameInput)
+                    .on_submit(Event::WorkspaceRenameSubmit)
+                    .size(11)
+                    .padding([1, 4])
+                    .width(Length::Fixed(160.0))
+                    .font(iced::Font::with_name("Menlo"))
+                    .into(),
+                None => iced::widget::mouse_area(
+                    text(&ws.name)
+                        .size(11)
+                        .color(text_color)
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .on_press(Event::WorkspaceSelect(idx))
+                .on_double_click(Event::WorkspaceRenameStart(idx, RenameSite::Chip))
+                .into(),
+            };
 
             let mut btn_content = row![dot, label].spacing(6).align_y(iced::Alignment::Center);
 
@@ -30474,7 +31229,7 @@ fi
             .map(|ws| ws.name.to_uppercase())
             .unwrap_or_else(|| "WORKSPACE".to_string());
         let state = self
-            .overview_workspace_dir()
+            .overview_key()
             .and_then(|dir| self.workspace_overviews.get(&dir));
         let reading = state.is_some_and(|state| state.in_flight);
         let mut refresh = button(
@@ -30492,15 +31247,51 @@ fi
         if state.is_some() && !reading {
             refresh = refresh.on_press(Event::WorkspaceOverviewRefresh);
         }
-        let header = row![
-            text(format!("WORKSPACE \u{00B7} {name}"))
-                .size(10)
-                .color(text_muted)
-                .font(mono),
-            iced::widget::Space::new().width(Length::Fill),
-            refresh,
-        ]
-        .align_y(iced::Alignment::Center);
+        // The name renames inline: double-click it or press ✎ (TRU-169).
+        let active_idx = self.active_workspace_idx;
+        let renaming = self.workspace_rename.as_ref().filter(|rename| {
+            rename.site == RenameSite::Overview
+                && self
+                    .active_workspace()
+                    .is_some_and(|ws| ws.uid == rename.uid)
+        });
+        let title: Element<'a, Event, Theme, iced::Renderer> = match renaming {
+            Some(rename) => text_input("Workspace name", &rename.draft)
+                .id(workspace_rename_input_id())
+                .on_input(Event::WorkspaceRenameInput)
+                .on_submit(Event::WorkspaceRenameSubmit)
+                .size(font_small)
+                .padding([3, 6])
+                .width(Length::Fill)
+                .into(),
+            None => row![
+                iced::widget::mouse_area(
+                    text(format!("WORKSPACE \u{00B7} {name}"))
+                        .size(10)
+                        .color(text_muted)
+                        .font(mono),
+                )
+                .on_double_click(Event::WorkspaceRenameStart(
+                    active_idx,
+                    RenameSite::Overview
+                )),
+                button(text("\u{270E}").size(10).color(text_muted))
+                    .style(self.ghost_button_style())
+                    .padding([2, 4])
+                    .on_press(Event::WorkspaceRenameStart(
+                        active_idx,
+                        RenameSite::Overview
+                    )),
+                iced::widget::Space::new().width(Length::Fill),
+            ]
+            .spacing(2)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill)
+            .into(),
+        };
+        let header = row![title, refresh]
+            .spacing(4)
+            .align_y(iced::Alignment::Center);
         let mut content = Column::new().spacing(8).padding([10, 8]).push(header);
         let finish = |content: Column<'a, Event, Theme, iced::Renderer>| {
             scrollable(content)
@@ -30556,8 +31347,25 @@ fi
             content = content.push(hint);
         }
 
+        // A workspace that owns its chats reads all of them: no focus.
+        if summary.owned {
+            let home = self
+                .active_workspace()
+                .map(|ws| overview::folder_name(&ws.dir))
+                .unwrap_or_default();
+            let roots = summary.coordinators.len();
+            content = content.push(
+                text(format!(
+                    "owns {roots} chat{} \u{00B7} new chats start in {home}",
+                    if roots == 1 { "" } else { "s" }
+                ))
+                .size(10)
+                .color(text_muted),
+            );
+        }
+
         // Focus: whose repos, branches and issues show below.
-        if !summary.coordinators.is_empty() {
+        if !summary.owned && !summary.coordinators.is_empty() {
             let focus_button = button(
                 row![
                     text("Focus:").size(10).color(text_muted).font(mono),
@@ -30627,9 +31435,22 @@ fi
             }
         }
 
+        // An owning workspace lists every root it owns, newest first.
+        if summary.owned && !summary.coordinators.is_empty() {
+            content = content.push(section(format!(
+                "CHATS \u{00B7} {}",
+                summary.coordinators.len()
+            )));
+            let mut chats = Column::new().spacing(2);
+            for coordinator in &summary.coordinators {
+                chats = chats.push(self.view_overview_coordinator_row(coordinator, false));
+            }
+            content = content.push(chats);
+        }
+
         // Chats: coordinators, their fan-out folded under them; the last 7
         // days listed, older ones folded.
-        if !summary.coordinators.is_empty() {
+        if !summary.owned && !summary.coordinators.is_empty() {
             let recent: Vec<&overview::Coordinator> =
                 summary.coordinators.iter().filter(|c| c.recent).collect();
             let older: Vec<&overview::Coordinator> =
@@ -30934,6 +31755,42 @@ fi
                 .color(text_muted),
             );
         }
+        // A workspace that owns its chats has no focus: a row opens its
+        // chat. Folder-scoped, a row focuses (TRU-167).
+        let owning = self.active_workspace().filter(|ws| ws.owns_chats());
+        let press = if owning.is_some() {
+            Event::WorkspaceOverviewOpenChat(coordinator.id.clone())
+        } else {
+            Event::WorkspaceOverviewFocus(overview::Focus::Coordinator(coordinator.id.clone()))
+        };
+        // "Make workspace", or "Go to <name>" when another workspace owns
+        // it (TRU-169): on the focused row of a folder-scoped overview, and
+        // on rows this owning workspace does not own.
+        let owner = self.root_chat_owner(&coordinator.id);
+        let owned_here = owning.is_some_and(|ws| ws.chats.contains(&coordinator.id));
+        let show_action = if owning.is_some() {
+            !owned_here
+        } else {
+            focused
+        };
+        if show_action {
+            let (label, event) = match &owner {
+                Some((name, _)) => (
+                    format!("\u{2192} Go to {}", overview::shorten(name, 30)),
+                    Event::WorkspaceGoToChatOwner(coordinator.id.clone()),
+                ),
+                None => (
+                    "\u{229E} Make workspace".to_string(),
+                    Event::WorkspaceFromChat(coordinator.id.clone()),
+                ),
+            };
+            body = body.push(
+                button(text(label).size(10).color(theme.accent()).font(mono))
+                    .style(self.ghost_button_style())
+                    .padding([1, 0])
+                    .on_press(event),
+            );
+        }
         let focus = button(body)
             .width(Length::Fill)
             .padding([5, 6])
@@ -30954,9 +31811,7 @@ fi
                 },
                 ..Default::default()
             })
-            .on_press(Event::WorkspaceOverviewFocus(overview::Focus::Coordinator(
-                coordinator.id.clone(),
-            )));
+            .on_press(press);
         let open = button(text("\u{2197}").size(font_small).color(theme.accent()))
             .style(self.ghost_button_style())
             .padding([4, 5])
@@ -35170,6 +36025,100 @@ fi
     /// Main-pane view of the conversation selected in the Chats panel: a
     /// header (title, where and what runs it, state, actions), its summary
     /// (TRU-155) and the raw preview tail folded under it.
+    /// The Chats preview's workspace line for a local chat (TRU-169): the
+    /// owning workspace with "Go to", else "Make workspace" on a
+    /// coordinator; and "Add to workspace…", a picker of the open local
+    /// workspaces that adds the chat's coordinator to one.
+    fn view_chat_workspace_actions<'a>(
+        &'a self,
+        entry: &chats::ChatIndexEntry,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let root = entry.root_id.clone().unwrap_or_else(|| entry.id.clone());
+        let owner = self.root_chat_owner(&root);
+        let small_button = |label: String, color: iced::Color, event: Event| {
+            button(text(label).size(font_small - 1.0).color(color))
+                .style(move |_theme, _status| button::Style {
+                    background: None,
+                    border: iced::Border {
+                        width: 1.0,
+                        color,
+                        radius: 5.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([3, 10])
+                .on_press(event)
+        };
+        let mut line = Row::new().spacing(10).align_y(iced::Alignment::Center);
+        match &owner {
+            Some((name, _)) => {
+                line = line
+                    .push(
+                        text(format!("in workspace {name}"))
+                            .size(font_small - 1.0)
+                            .color(theme.text_secondary()),
+                    )
+                    .push(small_button(
+                        format!("Go to {}", overview::shorten(name, 30)),
+                        theme.green(),
+                        Event::WorkspaceGoToChatOwner(entry.id.clone()),
+                    ));
+            }
+            None if entry.root_id.is_none() => {
+                line = line.push(small_button(
+                    "Make workspace".to_string(),
+                    theme.accent(),
+                    Event::WorkspaceFromChat(entry.id.clone()),
+                ));
+            }
+            None => {}
+        }
+        let owner_idx = owner.as_ref().and_then(|(_, idx)| *idx);
+        let targets: Vec<(usize, &Workspace)> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(idx, ws)| {
+                matches!(ws.location, WorkspaceLocation::Local { .. }) && Some(*idx) != owner_idx
+            })
+            .collect();
+        if !targets.is_empty() {
+            line = line.push(small_button(
+                if entry.root_id.is_some() {
+                    "Add its coordinator to workspace\u{2026}".to_string()
+                } else {
+                    "Add to workspace\u{2026}".to_string()
+                },
+                theme.text_secondary(),
+                Event::ChatAddToWorkspaceToggle,
+            ));
+        }
+        let mut block = Column::new().spacing(6).push(line);
+        if self.chat_add_to_workspace_open && !targets.is_empty() {
+            let mut picker = Row::new().spacing(6).align_y(iced::Alignment::Center);
+            for (_, ws) in targets {
+                let color = ws.color.color(theme);
+                picker = picker.push(small_button(
+                    ws.name.clone(),
+                    color,
+                    Event::ChatAddToWorkspace(root.clone(), ws.uid),
+                ));
+            }
+            block = block.push(
+                iced::widget::scrollable(picker).direction(
+                    iced::widget::scrollable::Direction::Horizontal(
+                        iced::widget::scrollable::Scrollbar::new()
+                            .width(4)
+                            .scroller_width(4),
+                    ),
+                ),
+            );
+        }
+        block.into()
+    }
+
     fn view_chat_preview<'a>(
         &'a self,
         tab: &'a TabState,
@@ -35472,6 +36421,9 @@ fi
             }
         }
 
+        // Which workspace owns it (TRU-169): local chats only.
+        let workspace_actions = (!is_remote).then(|| self.view_chat_workspace_actions(entry));
+
         let mut header_lines = column![
             text(entry.title.clone())
                 .size(font + 2.0)
@@ -35496,6 +36448,9 @@ fi
                 .color(cwd_color),
             )
             .push(actions);
+        if let Some(workspace_actions) = workspace_actions {
+            header_lines = header_lines.push(workspace_actions);
+        }
         let header = row![
             header_lines,
             button(text("✕").size(font).color(theme.text_secondary()))
