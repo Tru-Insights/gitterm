@@ -43,6 +43,7 @@ mod config_import;
 mod events;
 mod tab;
 mod theme;
+mod work_prs;
 
 use gitterm::agentd::client::{
     PairedPhoneInfo, PhonePairing, RemoteAgentBackend, RemoteAgentClientConfig,
@@ -89,6 +90,7 @@ use tab::{
     AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
 };
 use webview::WebviewSurface;
+use work_prs::PrEvent;
 
 // Start with just config for now to avoid conflicts
 use config::{
@@ -1780,7 +1782,7 @@ fn park_note_input_id() -> iced::widget::Id {
 /// A Parked list row's entry in `closed_workspace_configs`, by name and
 /// folder rather than position, so a click never lands on a neighbour
 /// after the list changed underneath it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParkedKey {
     name: String,
     dir: String,
@@ -6161,6 +6163,8 @@ pub enum Event {
     NewWorkNameChanged(String),
     NewWorkSubmit,
     NewWorkCancel,
+    /// PRs of the work: watch, merge plans, Approve / Merge (TRU-173).
+    Pr(PrEvent),
     /// Open the diff panel on an owned checkout.
     BranchDiffOpen(PathBuf, overview::DiffSource),
     BranchDiffLoaded(usize, u64, Result<BranchDiffPayload, String>),
@@ -6533,6 +6537,11 @@ struct App {
     park_sheet: Option<ParkSheet>,
     /// The Parked list `⏸ n parked` opens (TRU-171).
     parked_list_open: bool,
+    /// PRs of the work (TRU-173): merge plans, the PR watch, the Approve /
+    /// Merge confirmation and the Ready to merge list.
+    prs: work_prs::PrsState,
+    /// `github-accounts.json` (shared config dir): gh account per GitHub owner.
+    github_accounts: std::collections::BTreeMap<String, String>,
     /// Generation counter for branch diff loads.
     branch_diff_generation: u64,
     chat_index_loading: bool,
@@ -12011,6 +12020,10 @@ impl App {
         let Some(pending) = tab.chat_facts.take_due(Instant::now(), force) else {
             return Task::none();
         };
+        // PRs show in the overview before the index rereads the file.
+        if !pending.prs.is_empty() {
+            self.prs.note_live_prs(&session_id, &pending.prs);
+        }
         let children = chat_facts::links_for_parent(&self.chat_child_links(), &session_id);
         let dir = chat_facts::facts_dir(&config::global_config_dir());
         Task::perform(
@@ -15321,6 +15334,8 @@ impl App {
             new_work_form: None,
             park_sheet: None,
             parked_list_open: false,
+            prs: work_prs::PrsState::load(&config::global_config_dir()),
+            github_accounts: config::load_github_accounts(),
             branch_diff_generation: 0,
             chat_index_loading: false,
             chat_index_loaded_at: None,
@@ -18096,6 +18111,17 @@ fi
                         });
                     envelope.reply.send(result);
                 }
+                TaskControlOperation::MergePlanSet(request) => {
+                    return self.merge_plan_set(
+                        envelope.caller.as_deref(),
+                        request,
+                        envelope.reply,
+                    );
+                }
+                TaskControlOperation::MergePlanGet => {
+                    let result = self.merge_plan_get(envelope.caller.as_deref());
+                    envelope.reply.send(result);
+                }
             },
             Event::BrowserMcpStopped(result) => {
                 let error = match result {
@@ -18321,6 +18347,7 @@ fi
                     || self.new_task_form.is_some()
                     || self.new_work_form.is_some()
                     || self.park_sheet.is_some()
+                    || self.prs.action.is_some()
                     || self.task_tab_close_prompt.is_some()
                     || self.task_worktree_delete_prompt.is_some()
                     || self.task_publish_prompt.is_some()
@@ -18570,6 +18597,8 @@ fi
                 tasks.push(self.poll_overview_transcripts());
                 // Owned branches of the workspace overview (TRU-167).
                 tasks.push(self.poll_workspace_overview());
+                // The PR watch (TRU-173): one background poll when PRs are due.
+                tasks.push(self.poll_pr_watch());
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
@@ -21047,6 +21076,7 @@ fi
                     || self.new_task_form.is_some()
                     || self.new_work_form.is_some()
                     || self.park_sheet.is_some()
+                    || self.prs.action.is_some()
                     || self.task_tab_close_prompt.is_some()
                     || self.task_worktree_delete_prompt.is_some()
                     || self.task_publish_prompt.is_some()
@@ -21360,6 +21390,17 @@ fi
                 // Parked list: Escape closes
                 if self.parked_list_open && matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
                     return self.update(Event::ParkedListToggle);
+                }
+
+                // PR confirmation and Ready to merge list (TRU-173): Escape
+                // closes (a running command keeps the confirmation open).
+                if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
+                    if self.prs.action.is_some() {
+                        return self.update(Event::Pr(PrEvent::ActionClose));
+                    }
+                    if self.prs.ready_open {
+                        return self.update(Event::Pr(PrEvent::ReadyListToggle));
+                    }
                 }
 
                 // Inline workspace rename: Escape cancels
@@ -23671,6 +23712,8 @@ fi
                 self.chat_index_loaded_at = Some(Instant::now());
                 self.sync_task_sessions_from_chat_index();
                 self.refill_park_note();
+                // PR homes read the index's facts (TRU-173).
+                self.prs.homes_built = None;
                 // Workspace overviews read the index (TRU-167).
                 let dirs: Vec<OverviewKey> = self.workspace_overviews.keys().cloned().collect();
                 for dir in &dirs {
@@ -24020,6 +24063,7 @@ fi
             Event::BranchDiffOpen(checkout, source) => {
                 return self.open_branch_diff(checkout, source);
             }
+            Event::Pr(event) => return self.update_prs(event),
             Event::BranchDiffLoaded(tab_id, generation, result) => {
                 let Some(tab) = self
                     .workspaces
@@ -25729,6 +25773,8 @@ fi
             || self.new_work_form.is_some()
             || self.park_sheet.is_some()
             || self.parked_list_open
+            || self.prs.action.is_some()
+            || self.prs.ready_open
     }
 
     fn visible_webview_surface(&self) -> VisibleSurface {
@@ -26756,6 +26802,20 @@ fi
             Stack::new()
                 .push(main_view)
                 .push(self.view_parked_list())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.prs.action.is_some() {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_pr_action_confirm())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if self.prs.ready_open {
+            Stack::new()
+                .push(main_view)
+                .push(self.view_ready_list())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -28358,8 +28418,13 @@ fi
                     .color(theme.text_secondary()),
                 None => text("No note").size(font_small).color(theme.text_muted()),
             };
+            let mut lines = column![head, note_line].spacing(2).width(Length::Fill);
+            // PR news of the parked work (TRU-173).
+            if let Some((news, color)) = self.parked_pr_news(&key) {
+                lines = lines.push(text(news).size(font_small - 1.0).color(color));
+            }
             let row_content = row![
-                column![head, note_line].spacing(2).width(Length::Fill),
+                lines,
                 button(text("Resume").size(font_small))
                     .style(button::primary)
                     .padding([4, 10])
@@ -29644,6 +29709,16 @@ fi
                 );
             }
 
+            // PR news (TRU-173): the newest, e.g. "#841 checks failed".
+            if let Some((label, color)) = self.workspace_pr_badge(ws.uid) {
+                btn_content = btn_content.push(
+                    text(label)
+                        .size(9)
+                        .color(color)
+                        .font(iced::Font::with_name("Menlo")),
+                );
+            }
+
             // Active workspace: colored top accent line above the button
             if is_active {
                 let accent_line = container(iced::widget::Space::new().width(0).height(0))
@@ -29888,6 +29963,10 @@ fi
         });
 
         let mut bar_inner = row![scrollable_bar];
+        // `⇡ n to merge` opens Ready to merge (TRU-173); hidden at none.
+        if let Some(ready_btn) = self.view_ready_button() {
+            bar_inner = bar_inner.push(ready_btn);
+        }
         if let Some(parked_btn) = parked_btn {
             bar_inner = bar_inner.push(parked_btn);
         }
@@ -32195,6 +32274,11 @@ fi
                 ));
             }
             content = content.push(also);
+        }
+
+        // PRs of the work in merge order (TRU-173).
+        if let Some(prs) = self.view_overview_prs() {
+            content = content.push(prs);
         }
 
         // Repos touched, each with the branches the work owns there.
