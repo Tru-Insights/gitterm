@@ -1,13 +1,16 @@
-# GitTerm V5
+# GitTerm V6
 
 A Git status viewer with integrated terminal, built with Iced.
 
-![GitTerm V5](assets/icon.png)
+![GitTerm V6](assets/icon.png)
 
-GitTerm V5 is an isolated development lane for the next browser-aware GitTerm
+GitTerm V6 is an isolated development lane for the next browser-aware GitTerm
 architecture. It uses its own configuration, application identity, local port
-range, helper state, and Chrome profile so it can run alongside the V4 daily
-driver without reading or mutating V4 state.
+range, helper state, and Chrome profile so it can run alongside the V5 daily
+driver without mutating V5 state. On first launch, when `~/.config/gitterm-v6`
+does not exist yet, V6 copies V5's workspaces, remotes, remote agents, tokens,
+profiles and whisper models from `~/.config/gitterm-v5` (read-only; see
+`src/config_import.rs` for what is skipped and why).
 
 ## Features
 
@@ -28,12 +31,12 @@ Download the latest release or build from source:
 ```bash
 cargo build --release
 ./scripts/bundle.sh
-open "target/GitTerm V5.app"
+open "target/GitTerm V6.app"
 ```
 
 ### Features Overview
 
-#### HTTP Log Server (localhost:23030-24029, optional)
+#### HTTP Log Server (localhost:33030-34029, optional)
 - View all terminal logs in your browser
 - Perfect text selection and copy
 - Live search
@@ -91,7 +94,7 @@ Invoke-Expression (&starship init powershell)
 
 ### Agent Presets
 
-GitTerm V5 ships with configurable AI coding agent presets. Option+click the `+` tab button to pick from your configured agents, or click `+` to launch the default. Presets are stored in `~/.config/gitterm-v5/config.json`:
+GitTerm V6 ships with configurable AI coding agent presets. Option+click the `+` tab button to pick from your configured agents, or click `+` to launch the default. Presets are stored in `~/.config/gitterm-v6/config.json`:
 
 ```json
 {
@@ -144,11 +147,12 @@ cargo build --release
 ./scripts/bundle.sh
 ```
 
-V5 defaults to `~/.config/gitterm-v5`. Tests or temporary development
-instances can override that with an absolute `GITTERM_V5_CONFIG_DIR`; V4's
-`GITTERM_V4_CONFIG_DIR` and earlier `GITTERM_CONFIG_DIR` are intentionally
-ignored. The browser MCP reserves ports 24030-25029, the task-control MCP uses
-25030-26029, and the remote helper defaults to `127.0.0.1:8787`.
+V6 defaults to `~/.config/gitterm-v6`. Tests or temporary development
+instances can override that with an absolute `GITTERM_V6_CONFIG_DIR`; V5's
+`GITTERM_V5_CONFIG_DIR`, V4's `GITTERM_V4_CONFIG_DIR` and earlier `GITTERM_CONFIG_DIR` are intentionally
+ignored. The log server uses ports 33030-34029, the browser MCP reserves
+34030-35029, the task-control MCP uses 35030-36029, and the remote helper
+defaults to `127.0.0.1:8797`.
 
 ## License
 

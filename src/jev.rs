@@ -1051,7 +1051,7 @@ mod tests {
         ChatCandidate {
             id: format!("chat-{i}"),
             title: format!("Chat number {i}"),
-            cwd: PathBuf::from("/Users/dev/GitRepo/gitterm-v5"),
+            cwd: PathBuf::from("/Users/dev/GitRepo/gitterm-v6"),
             branch: Some("master".into()),
             age: format!("{i}m"),
             snippet: String::new(),
@@ -1107,7 +1107,7 @@ mod tests {
             ChatCandidate {
                 id: "1b0c".into(),
                 title: "Wire the Chats panel search".into(),
-                cwd: PathBuf::from("/home/dev/GitRepo/gitterm-v5"),
+                cwd: PathBuf::from("/home/dev/GitRepo/gitterm-v6"),
                 branch: Some("tracey/tru-78-chats".into()),
                 age: "2d".into(),
                 snippet:
@@ -1124,7 +1124,7 @@ mod tests {
             },
         ];
         let ctx = RankContext {
-            workspace_dir: PathBuf::from("/home/dev/GitRepo/gitterm-v5"),
+            workspace_dir: PathBuf::from("/home/dev/GitRepo/gitterm-v6"),
             branch: Some("tracey/tru-141-jev".into()),
             query: Some("chats search".into()),
             recent_prompt: None,
@@ -1145,7 +1145,7 @@ mod tests {
         assert!(label.ends_with('…'));
         assert!(!label.contains('\n'));
         // The title is cut at its own budget so the path still shows.
-        assert!(label.contains("| /Users/dev/GitRepo/gitterm-v5 @ master | 1m ago | "));
+        assert!(label.contains("| /Users/dev/GitRepo/gitterm-v6 @ master | 1m ago | "));
     }
 
     #[test]
@@ -1544,7 +1544,7 @@ mod tests {
         let client = JevClient::with_endpoint("test-key", &url).unwrap();
         let cands: Vec<ChatCandidate> = (0..300).map(candidate).collect();
         let ctx = RankContext {
-            workspace_dir: PathBuf::from("/Users/dev/GitRepo/gitterm-v5"),
+            workspace_dir: PathBuf::from("/Users/dev/GitRepo/gitterm-v6"),
             branch: Some("master".into()),
             query: Some("windows build".into()),
             recent_prompt: None,

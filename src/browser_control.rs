@@ -1,7 +1,7 @@
 //! Dedicated-profile Chrome control through the Chrome DevTools Protocol.
 //!
 //! This adapter deliberately has no dependency on GitTerm's singleton Wry
-//! webview. Callers provide the V5 global config directory so browser state is
+//! webview. Callers provide the V6 global config directory so browser state is
 //! always rooted in the same isolated configuration tree.
 
 use base64::Engine;
@@ -63,7 +63,7 @@ const MAX_FULL_PAGE_CAPTURE_PIXELS: f64 = 100_000_000.0;
 const MIN_VIEWPORT_DIMENSION: u32 = 200;
 const MAX_VIEWPORT_WIDTH: u32 = 7_680;
 const MAX_VIEWPORT_HEIGHT: u32 = 4_320;
-const BROWSER_PROFILE_NAME: &str = "GitTerm V5 Browser";
+const BROWSER_PROFILE_NAME: &str = "GitTerm V6 Browser";
 const DEFAULT_BROWSER_TARGET_NAME: &str = "primary";
 /// Longest owner label a chat-owned tab's title prefix shows (TRU-176).
 const MAX_OWNER_LABEL_CHARS: usize = 24;
@@ -72,7 +72,7 @@ const BROWSER_PROFILE_COLOR: i64 = -3_430_665;
 
 /// Optional explicit Chrome executable for installations outside standard
 /// platform locations.
-pub const CHROME_PATH_ENV: &str = "GITTERM_V5_CHROME_PATH";
+pub const CHROME_PATH_ENV: &str = "GITTERM_V6_CHROME_PATH";
 
 #[derive(Debug)]
 pub struct BrowserControlError {
@@ -894,7 +894,7 @@ impl BrowserTargetRegistry {
     }
 }
 
-/// Owns one visible Chrome process and its dedicated GitTerm V5 profile.
+/// Owns one visible Chrome process and its dedicated GitTerm V6 profile.
 ///
 /// Dropping the controller terminates the child process. Chrome is launched
 /// without headless flags and its DevTools listener is bound to loopback on a
@@ -917,9 +917,9 @@ pub struct BrowserController {
 }
 
 impl BrowserController {
-    pub fn new(v5_global_config_dir: impl AsRef<Path>) -> Self {
+    pub fn new(v6_global_config_dir: impl AsRef<Path>) -> Self {
         Self {
-            profile_dir: browser_profile_dir(v5_global_config_dir.as_ref()),
+            profile_dir: browser_profile_dir(v6_global_config_dir.as_ref()),
             child: None,
             endpoint: None,
             registry: BrowserTargetRegistry::default(),
@@ -942,7 +942,7 @@ impl BrowserController {
 
         std::fs::create_dir_all(&self.profile_dir).map_err(|error| {
             BrowserControlError::new(format!(
-                "failed to create V5 browser profile {}: {error}",
+                "failed to create V6 browser profile {}: {error}",
                 self.profile_dir.display()
             ))
         })?;
@@ -976,7 +976,7 @@ impl BrowserController {
 
         let mut child = command.spawn().map_err(|error| {
             BrowserControlError::new(format!(
-                "failed to launch Chrome at {} with V5 profile {}: {error}",
+                "failed to launch Chrome at {} with V6 profile {}: {error}",
                 executable.display(),
                 self.profile_dir.display()
             ))
@@ -1101,7 +1101,7 @@ impl BrowserController {
     }
 
     /// Refresh process state and adopt a live DevTools endpoint left by
-    /// another GitTerm V5 instance using the shared persistent profile.
+    /// another GitTerm V6 instance using the shared persistent profile.
     pub async fn status(&mut self) -> Result<BrowserStatus> {
         let _ = self.status_snapshot()?;
         if self.child.is_none() {
@@ -1790,7 +1790,7 @@ impl BrowserController {
         if let Some(mut child) = self.child.take() {
             child.start_kill().map_err(|error| {
                 BrowserControlError::new(format!(
-                    "failed to terminate Chrome using V5 profile {}: {error}",
+                    "failed to terminate Chrome using V6 profile {}: {error}",
                     self.profile_dir.display()
                 ))
             })?;
@@ -1798,14 +1798,14 @@ impl BrowserController {
                 .await
                 .map_err(|_| {
                     BrowserControlError::new(format!(
-                        "Chrome using V5 profile {} did not exit within {} seconds",
+                        "Chrome using V6 profile {} did not exit within {} seconds",
                         self.profile_dir.display(),
                         BROWSER_SHUTDOWN_TIMEOUT.as_secs()
                     ))
                 })?
                 .map_err(|error| {
                     BrowserControlError::new(format!(
-                        "failed while waiting for Chrome using V5 profile {} to exit: {error}",
+                        "failed while waiting for Chrome using V6 profile {} to exit: {error}",
                         self.profile_dir.display()
                     ))
                 })?;
@@ -1816,13 +1816,13 @@ impl BrowserController {
             );
             let session = CdpSession::connect(&websocket_url).await.map_err(|error| {
                 BrowserControlError::new(format!(
-                    "failed to connect to the existing V5 browser before disconnecting it: {error}"
+                    "failed to connect to the existing V6 browser before disconnecting it: {error}"
                 ))
             })?;
             if let Err(error) = session.command("Browser.close", json!({})).await {
                 if list_page_targets(endpoint.port).await.is_ok() {
                     return Err(BrowserControlError::new(format!(
-                        "failed to close the existing V5 browser on port {}: {error}",
+                        "failed to close the existing V6 browser on port {}: {error}",
                         endpoint.port
                     )));
                 }
@@ -1831,7 +1831,7 @@ impl BrowserController {
             while list_page_targets(endpoint.port).await.is_ok() {
                 if Instant::now() >= deadline {
                     return Err(BrowserControlError::new(format!(
-                        "existing V5 browser on port {} did not close within {} seconds",
+                        "existing V6 browser on port {} did not close within {} seconds",
                         endpoint.port,
                         BROWSER_SHUTDOWN_TIMEOUT.as_secs()
                     )));
@@ -1850,7 +1850,7 @@ impl BrowserController {
         let status = self.status_snapshot()?;
         if status.state != BrowserState::Running {
             return Err(BrowserControlError::new(format!(
-                "browser is not running for V5 profile {} (state: {:?})",
+                "browser is not running for V6 profile {} (state: {:?})",
                 self.profile_dir.display(),
                 status.state
             )));
@@ -2067,11 +2067,11 @@ pub struct BrowserControlService {
 }
 
 impl BrowserControlService {
-    pub fn new(v5_global_config_dir: impl AsRef<Path>) -> Self {
+    pub fn new(v6_global_config_dir: impl AsRef<Path>) -> Self {
         let (telemetry_revision, _) = watch::channel(0);
         Self {
             id: NEXT_BROWSER_CONTROL_SERVICE_ID.fetch_add(1, Ordering::Relaxed),
-            controller: Arc::new(Mutex::new(BrowserController::new(v5_global_config_dir))),
+            controller: Arc::new(Mutex::new(BrowserController::new(v6_global_config_dir))),
             telemetry: Arc::new(Mutex::new(BrowserTelemetryState::default())),
             telemetry_revision,
         }
@@ -3415,8 +3415,8 @@ fn push_bounded<T>(items: &mut VecDeque<T>, item: T, capacity: usize) {
     items.push_back(item);
 }
 
-fn browser_profile_dir(v5_global_config_dir: &Path) -> PathBuf {
-    v5_global_config_dir.join(PROFILE_DIR_NAME)
+fn browser_profile_dir(v6_global_config_dir: &Path) -> PathBuf {
+    v6_global_config_dir.join(PROFILE_DIR_NAME)
 }
 
 fn chrome_launch_args(profile_dir: &Path) -> Vec<String> {
@@ -3488,7 +3488,7 @@ fn ensure_browser_profile_branding(profile_dir: &Path) -> Result<()> {
     let default_profile_dir = profile_dir.join("Default");
     std::fs::create_dir_all(&default_profile_dir).map_err(|error| {
         BrowserControlError::new(format!(
-            "failed to create the branded V5 Chrome profile directory {}: {error}",
+            "failed to create the branded V6 Chrome profile directory {}: {error}",
             default_profile_dir.display()
         ))
     })?;
@@ -3496,21 +3496,21 @@ fn ensure_browser_profile_branding(profile_dir: &Path) -> Result<()> {
     let mut preferences = match std::fs::read(&preferences_path) {
         Ok(contents) => serde_json::from_slice::<Value>(&contents).map_err(|error| {
             BrowserControlError::new(format!(
-                "failed to parse V5 Chrome preferences {} before applying browser branding: {error}",
+                "failed to parse V6 Chrome preferences {} before applying browser branding: {error}",
                 preferences_path.display()
             ))
         })?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => {
             return Err(BrowserControlError::new(format!(
-                "failed to read V5 Chrome preferences {} before applying browser branding: {error}",
+                "failed to read V6 Chrome preferences {} before applying browser branding: {error}",
                 preferences_path.display()
             )))
         }
     };
     let root = preferences.as_object_mut().ok_or_else(|| {
         BrowserControlError::new(format!(
-            "V5 Chrome preferences {} must contain a JSON object",
+            "V6 Chrome preferences {} must contain a JSON object",
             preferences_path.display()
         ))
     })?;
@@ -3529,33 +3529,33 @@ fn ensure_browser_profile_branding(profile_dir: &Path) -> Result<()> {
         Value::String("user_color_theme_id".to_string()),
     );
 
-    let temporary_path = default_profile_dir.join("Preferences.gitterm-v5.tmp");
+    let temporary_path = default_profile_dir.join("Preferences.gitterm-v6.tmp");
     write_json_atomically(
         &preferences_path,
         &temporary_path,
         &preferences,
-        "branded V5 Chrome preferences",
+        "branded V6 Chrome preferences",
     )?;
 
     let local_state_path = profile_dir.join("Local State");
     let mut local_state = match std::fs::read(&local_state_path) {
         Ok(contents) => serde_json::from_slice::<Value>(&contents).map_err(|error| {
             BrowserControlError::new(format!(
-                "failed to parse V5 Chrome Local State {} before applying browser branding: {error}",
+                "failed to parse V6 Chrome Local State {} before applying browser branding: {error}",
                 local_state_path.display()
             ))
         })?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => {
             return Err(BrowserControlError::new(format!(
-                "failed to read V5 Chrome Local State {} before applying browser branding: {error}",
+                "failed to read V6 Chrome Local State {} before applying browser branding: {error}",
                 local_state_path.display()
             )))
         }
     };
     let root = local_state.as_object_mut().ok_or_else(|| {
         BrowserControlError::new(format!(
-            "V5 Chrome Local State {} must contain a JSON object",
+            "V6 Chrome Local State {} must contain a JSON object",
             local_state_path.display()
         ))
     })?;
@@ -3568,12 +3568,12 @@ fn ensure_browser_profile_branding(profile_dir: &Path) -> Result<()> {
         Value::String(BROWSER_PROFILE_NAME.to_string()),
     );
     default_profile.insert("is_using_default_name".to_string(), Value::Bool(false));
-    let temporary_local_state_path = profile_dir.join("Local State.gitterm-v5.tmp");
+    let temporary_local_state_path = profile_dir.join("Local State.gitterm-v6.tmp");
     write_json_atomically(
         &local_state_path,
         &temporary_local_state_path,
         &local_state,
-        "branded V5 Chrome Local State",
+        "branded V6 Chrome Local State",
     )?;
     Ok(())
 }
@@ -3624,7 +3624,7 @@ fn object_preference<'a>(
         .as_object_mut()
         .ok_or_else(|| {
             BrowserControlError::new(format!(
-                "V5 Chrome preference {key} must contain a JSON object"
+                "V6 Chrome preference {key} must contain a JSON object"
             ))
         })
 }
@@ -4143,7 +4143,7 @@ fn dom_outline_expression(target: &str) -> Result<String> {
         const maxField = __MAX_FIELD__;
         const maxClasses = __MAX_CLASSES__;
         const registryLimit = maxNodes * 4;
-        const registryKey = '__gittermV5DomInspectorRegistry';
+        const registryKey = '__gittermV6DomInspectorRegistry';
         const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
         const roleFor = (element) => {
             const explicit = element.getAttribute('role');
@@ -4282,7 +4282,7 @@ fn node_details_expression(target: &str, selector: &BrowserNodeSelector) -> Resu
         const maxAttributeValue = __MAX_ATTRIBUTE_VALUE__;
         const maxStyleValue = __MAX_STYLE_VALUE__;
         const maxOuterHtml = __MAX_OUTER_HTML__;
-        const registryKey = '__gittermV5DomInspectorRegistry';
+        const registryKey = '__gittermV6DomInspectorRegistry';
         const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
         const roleFor = (element) => {
             const explicit = element.getAttribute('role');
@@ -4564,11 +4564,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn browser_profile_is_nested_under_supplied_v5_config_root() {
-        let root = Path::new("/tmp/test-gitterm-v5");
+    fn browser_profile_is_nested_under_supplied_v6_config_root() {
+        let root = Path::new("/tmp/test-gitterm-v6");
         assert_eq!(
             browser_profile_dir(root),
-            PathBuf::from("/tmp/test-gitterm-v5/browser-profile")
+            PathBuf::from("/tmp/test-gitterm-v6/browser-profile")
         );
         assert_ne!(
             browser_profile_dir(root),
@@ -4578,7 +4578,7 @@ mod tests {
 
     #[test]
     fn launch_args_use_random_loopback_devtools_and_visible_dedicated_profile() {
-        let profile = Path::new("/tmp/gitterm-v5/browser-profile");
+        let profile = Path::new("/tmp/gitterm-v6/browser-profile");
         let args = chrome_launch_args(profile);
         assert!(args.contains(&format!("--user-data-dir={}", profile.display())));
         assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_string()));
@@ -5288,7 +5288,7 @@ mod tests {
         });
 
         let temp = tempdir().unwrap();
-        let config_root = temp.path().join("gitterm-v5");
+        let config_root = temp.path().join("gitterm-v6");
         let service = BrowserControlService::new(&config_root);
         let status = service
             .launch(BrowserLaunchOptions::default())

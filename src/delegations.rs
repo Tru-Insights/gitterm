@@ -1138,7 +1138,7 @@ pub(crate) fn test_task(task_id: &str, worktree: &Path) -> TaskRecord {
                 url: None,
             }),
             base: GitBase {
-                reference: "v5".to_string(),
+                reference: "v6".to_string(),
                 commit: "0123456789abcdef".to_string(),
             },
             branch: "tracey/tru-150-excalidraw-export".to_string(),
@@ -1205,7 +1205,7 @@ mod tests {
         );
 
         let mut base = review_request(ReviewTargetKind::Base);
-        base.base_ref = Some(" v5 ".into());
+        base.base_ref = Some(" v6 ".into());
         base.focus = Some("webview lifecycle".into());
         base.reviewer = Some("Codex".into());
         let new = review_delegation(&base, &caller(), Some("gpt-6-astra"), None).unwrap();
@@ -1213,11 +1213,11 @@ mod tests {
         assert_eq!(
             target.mode,
             ReviewTargetMode::Base {
-                reference: "v5".into()
+                reference: "v6".into()
             }
         );
         assert_eq!(target.focus.as_deref(), Some("webview lifecycle"));
-        assert!(new.brief.contains("against v5"), "{}", new.brief);
+        assert!(new.brief.contains("against v6"), "{}", new.brief);
         // The configured Codex model applies when the request names none.
         assert_eq!(
             new.child,

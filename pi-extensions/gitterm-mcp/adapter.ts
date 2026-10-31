@@ -8,14 +8,26 @@ import { createMcpAdapter } from "pi-mcp-adapter";
 // particular — gets the task-control tools without global pi configuration.
 // Outside GitTerm none of the variables exist and the extension is inert.
 
-const TASK_MCP_URL_ENV = "GITTERM_V5_TASK_MCP_URL";
-const TASK_MCP_TOKEN_ENV = "GITTERM_V5_TASK_MCP_TOKEN";
+// The extension is installed once globally and shared by every GitTerm
+// version running side by side, so it knows each version's names. The
+// newest comes first: a V6 launched from a V5 terminal inherits V5's
+// variables as well as setting its own.
+const TASK_MCP_ENVS = [
+  { url: "GITTERM_V6_TASK_MCP_URL", token: "GITTERM_V6_TASK_MCP_TOKEN" },
+  { url: "GITTERM_V5_TASK_MCP_URL", token: "GITTERM_V5_TASK_MCP_TOKEN" },
+];
 
-// V4 GitTerm is still in daily use; its browser server uses the V4 names.
 const BROWSER_MCP_ENVS = [
+  { url: "GITTERM_V6_BROWSER_MCP_URL", token: "GITTERM_V6_BROWSER_MCP_TOKEN" },
   { url: "GITTERM_V5_BROWSER_MCP_URL", token: "GITTERM_V5_BROWSER_MCP_TOKEN" },
   { url: "GITTERM_V4_BROWSER_MCP_URL", token: "GITTERM_V4_BROWSER_MCP_TOKEN" },
 ];
+
+function firstServerFromEnv(
+  names: { url: string; token: string }[],
+): HttpServer | undefined {
+  return names.map((pair) => serverFromEnv(pair.url, pair.token)).find((server) => server !== undefined);
+}
 
 interface HttpServer {
   url: string;
@@ -36,16 +48,14 @@ function serverFromEnv(urlEnv: string, tokenEnv: string): HttpServer | undefined
 export function registerGitTermMcp(pi: ExtensionAPI): void {
   const mcpServers: Record<string, HttpServer> = {};
 
-  const tasks = serverFromEnv(TASK_MCP_URL_ENV, TASK_MCP_TOKEN_ENV);
+  const tasks = firstServerFromEnv(TASK_MCP_ENVS);
   if (tasks) {
     // Matches the Codex `tool_timeout_sec=300`: task_launch_session and
     // task_create_batch can wait on worktree creation.
     mcpServers["gitterm-tasks"] = { ...tasks, requestTimeoutMs: 300_000 };
   }
 
-  const browser = BROWSER_MCP_ENVS.map((names) => serverFromEnv(names.url, names.token)).find(
-    (server) => server !== undefined,
-  );
+  const browser = firstServerFromEnv(BROWSER_MCP_ENVS);
   if (browser) mcpServers["gitterm-browser"] = browser;
 
   if (Object.keys(mcpServers).length === 0) return;
