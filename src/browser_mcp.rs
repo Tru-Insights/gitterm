@@ -1,22 +1,24 @@
 //! Authenticated loopback MCP exposure for the GitTerm-owned browser controller.
 
 use crate::browser_control::{
-    BrowserCaptureMode, BrowserControlService, BrowserKey, BrowserLaunchOptions, BrowserLocator,
-    BrowserNodeSelector, BrowserOperation, BrowserSnapshot, BrowserViewport, BrowserWaitCondition,
+    BrowserCaptureMode, BrowserControlError, BrowserControlService, BrowserKey,
+    BrowserLaunchOptions, BrowserLocator, BrowserNodeSelector, BrowserOperation, BrowserSnapshot,
+    BrowserViewport, BrowserWaitCondition,
 };
 use crate::harness::acp::AcpMcpServer;
 use crate::harness::claude::ClaudeMcpServer;
+use crate::task_mcp::{caller_endpoint, caller_from_query, TASK_MCP_CALLER_QUERY};
 use axum::{
     body::Body,
     extract::State,
-    http::{header, Request, StatusCode},
+    http::{header, request::Parts, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     Router,
 };
 use base64::Engine;
 use rmcp::{
-    handler::server::wrapper::Parameters,
+    handler::server::{tool::Extension, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
     transport::{
@@ -63,9 +65,17 @@ impl BrowserMcpConnection {
         &self.endpoint
     }
 
-    pub fn terminal_environment(&self) -> [(String, String); 2] {
+    /// The browser MCP variables for one terminal. Like the task server's,
+    /// the URL carries the tab's caller identity (`?caller=<session_uid>`,
+    /// TRU-176): browser targets belong to the chat that opened them, and a
+    /// call without a caller is refused. The token is the same for every
+    /// tab and lives only in the environment.
+    pub fn terminal_environment(&self, caller: Option<&str>) -> [(String, String); 2] {
         [
-            (BROWSER_MCP_URL_ENV.to_string(), self.endpoint.clone()),
+            (
+                BROWSER_MCP_URL_ENV.to_string(),
+                caller_endpoint(&self.endpoint, caller),
+            ),
             (BROWSER_MCP_TOKEN_ENV.to_string(), self.token.clone()),
         ]
     }
@@ -86,21 +96,22 @@ impl BrowserMcpConnection {
     /// The browser server for a natively spawned Claude session (chat
     /// tabs): the same config and read-only pre-approvals
     /// `configure_claude_command` injects into terminal launches, with the
-    /// token carried in the child environment.
-    pub fn claude_mcp_server(&self) -> ClaudeMcpServer {
+    /// token carried in the child environment. `caller` is the chat tab's
+    /// `session_uid`.
+    pub fn claude_mcp_server(&self, caller: Option<&str>) -> ClaudeMcpServer {
         ClaudeMcpServer {
-            config: claude_mcp_config(&self.endpoint),
+            config: claude_mcp_config(&caller_endpoint(&self.endpoint, caller)),
             allowed_tools: claude_allowed_tools(),
-            env: self.terminal_environment().into(),
+            env: self.terminal_environment(caller).into(),
         }
     }
 
     /// The browser server for an ACP chat (Gemini, OpenCode; TRU-153),
     /// with its bearer header carried literally in `session/new`.
-    pub fn acp_mcp_server(&self) -> AcpMcpServer {
+    pub fn acp_mcp_server(&self, caller: Option<&str>) -> AcpMcpServer {
         AcpMcpServer {
             name: "gitterm_browser".to_string(),
-            url: self.endpoint.clone(),
+            url: caller_endpoint(&self.endpoint, caller),
             headers: vec![(
                 "Authorization".to_string(),
                 format!("Bearer {}", self.token),
@@ -123,7 +134,15 @@ pub fn configure_codex_command(command: &str, endpoint: &str) -> String {
     let mut configured = executable.to_string();
     for value in codex_config_overrides(endpoint) {
         configured.push_str(" --config ");
-        configured.push_str(&value);
+        if value.contains(['?', '&', '*', '[']) {
+            // A per-tab URL carries `?caller=…`; unquoted, zsh treats `?`
+            // as a glob and aborts the launch with "no matches found".
+            configured.push('\'');
+            configured.push_str(&value);
+            configured.push('\'');
+        } else {
+            configured.push_str(&value);
+        }
     }
     configured.push_str(&trimmed[executable_end..]);
     configured
@@ -373,18 +392,26 @@ impl BrowserMcpTools {
         }
     }
 
+    /// Run one browser operation for the chat named on the HTTP request's
+    /// URL (rmcp injects the request `Parts` into every call). Operations
+    /// stay serialised across every caller; a call without a caller is
+    /// refused before it reaches the browser.
     async fn run_agent_operation<T, Run, Operation>(
         &self,
         operation: BrowserOperation,
+        parts: &Parts,
         run: Run,
     ) -> crate::browser_control::Result<T>
     where
-        Run: FnOnce(BrowserControlService) -> Operation,
+        Run: FnOnce(BrowserControlService, String) -> Operation,
         Operation: Future<Output = crate::browser_control::Result<T>>,
     {
+        let Some(caller) = caller_from_query(parts.uri.query()) else {
+            return Err(BrowserControlError::new(missing_browser_caller_error()));
+        };
         let _serial_operation = self.agent_operation_lock.lock().await;
         let activity_id = self.browser.begin_agent_operation(operation).await;
-        let result = run(self.browser.clone()).await;
+        let result = run(self.browser.clone(), caller).await;
         let error = result.as_ref().err().map(ToString::to_string);
         self.browser
             .finish_agent_operation(activity_id, error)
@@ -393,9 +420,18 @@ impl BrowserMcpTools {
     }
 }
 
+/// Why a browser tool refused a call that named no calling chat (TRU-176).
+pub fn missing_browser_caller_error() -> String {
+    format!(
+        "GitTerm's browser tools need the calling GitTerm tab's identity, and this call has none. \
+         Browser targets belong to the chat that opened them, so call them through the browser \
+         MCP URL GitTerm gave that tab (it ends in ?{TASK_MCP_CALLER_QUERY}=<session id>)."
+    )
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NavigateRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     /// An absolute HTTP or HTTPS URL.
     url: String,
@@ -403,7 +439,7 @@ struct NavigateRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LocatorRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     /// A strict semantic or CSS locator that must match exactly one visible element.
     locator: BrowserLocator,
@@ -411,7 +447,7 @@ struct LocatorRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TypeRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     /// A strict locator for one editable visible element.
     locator: BrowserLocator,
@@ -421,14 +457,14 @@ struct TypeRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PressRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     key: BrowserKey,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ScrollRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     #[serde(default)]
     delta_x: f64,
@@ -437,14 +473,14 @@ struct ScrollRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ResizeRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     viewport: BrowserViewport,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReloadRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     #[serde(default)]
     ignore_cache: bool,
@@ -452,7 +488,7 @@ struct ReloadRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WaitRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     condition: BrowserWaitCondition,
     /// Maximum wait in milliseconds. Defaults to 10000 and is capped at 60000.
@@ -474,7 +510,7 @@ struct TargetRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CaptureRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     /// Short evidence purpose shared across captures that should be compared.
     label: String,
@@ -485,13 +521,13 @@ struct CaptureRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DomOutlineRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NodeInspectRequest {
-    /// Named browser target. Omit to use the active target.
+    /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
     /// A document-scoped node reference from browser_dom_outline or a strict locator.
     selector: BrowserNodeSelector,
@@ -500,7 +536,7 @@ struct NodeInspectRequest {
 #[tool_router]
 impl BrowserMcpTools {
     #[tool(
-        description = "Report the GitTerm-owned browser process and controlled target status.",
+        description = "Report the GitTerm-owned browser process and this chat's active target.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -508,11 +544,13 @@ impl BrowserMcpTools {
             open_world_hint = false
         )
     )]
-    async fn browser_status(&self) -> CallToolResult {
+    async fn browser_status(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Status, |browser| async move {
-                browser.status().await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Status,
+                &parts,
+                |browser, caller| async move { browser.status_for(&caller).await },
+            )
             .await,
         )
     }
@@ -526,17 +564,22 @@ impl BrowserMcpTools {
             open_world_hint = true
         )
     )]
-    async fn browser_open(&self) -> CallToolResult {
+    async fn browser_open(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Open, |browser| async move {
-                browser.launch(BrowserLaunchOptions::default()).await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Open,
+                &parts,
+                |browser, caller| async move {
+                    browser.launch(BrowserLaunchOptions::default()).await?;
+                    browser.status_for(&caller).await
+                },
+            )
             .await,
         )
     }
 
     #[tool(
-        description = "List the arbitrary named page targets managed by GitTerm, including the active target.",
+        description = "List the named page targets this chat opened, including its active target. Other chats' targets and the user's own tabs are not listed and cannot be used.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -544,17 +587,19 @@ impl BrowserMcpTools {
             open_world_hint = false
         )
     )]
-    async fn browser_targets(&self) -> CallToolResult {
+    async fn browser_targets(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Targets, |browser| async move {
-                browser.targets().await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Targets,
+                &parts,
+                |browser, caller| async move { browser.targets(&caller).await },
+            )
             .await,
         )
     }
 
     #[tool(
-        description = "Open and name an independent page target for source/target, before/after, or other comparison workflows.",
+        description = "Open and name an independent page target, owned by this chat, for source/target, before/after, or other comparison workflows.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -565,17 +610,24 @@ impl BrowserMcpTools {
     async fn browser_target_open(
         &self,
         Parameters(request): Parameters<OpenTargetRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::TargetOpen, |browser| async move {
-                browser.open_target(&request.name, &request.url).await
-            })
+            self.run_agent_operation(
+                BrowserOperation::TargetOpen,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .open_target(&caller, &request.name, &request.url)
+                        .await
+                },
+            )
             .await,
         )
     }
 
     #[tool(
-        description = "Focus one named page target and make it the default for calls that omit target.",
+        description = "Focus one of this chat's named page targets and make it the default for this chat's calls that omit target.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -586,17 +638,18 @@ impl BrowserMcpTools {
     async fn browser_target_focus(
         &self,
         Parameters(request): Parameters<TargetRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::TargetFocus, |browser| async move {
-                browser.focus_target(&request.target).await
+            self.run_agent_operation(BrowserOperation::TargetFocus, &parts, |browser, caller| async move {
+                browser.focus_target(&caller, &request.target).await
             })
             .await,
         )
     }
 
     #[tool(
-        description = "Close one named page target without disconnecting the remaining GitTerm browser targets.",
+        description = "Close one of this chat's named page targets without disconnecting the remaining GitTerm browser targets.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -607,10 +660,11 @@ impl BrowserMcpTools {
     async fn browser_target_close(
         &self,
         Parameters(request): Parameters<TargetRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::TargetClose, |browser| async move {
-                browser.close_target(&request.target).await
+            self.run_agent_operation(BrowserOperation::TargetClose, &parts, |browser, caller| async move {
+                browser.close_target(&caller, &request.target).await
             })
             .await,
         )
@@ -628,13 +682,18 @@ impl BrowserMcpTools {
     async fn browser_navigate(
         &self,
         Parameters(request): Parameters<NavigateRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Navigate, |browser| async move {
-                browser
-                    .navigate_in(request.target.as_deref(), &request.url)
-                    .await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Navigate,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .navigate_in(&caller, request.target.as_deref(), &request.url)
+                        .await
+                },
+            )
             .await,
         )
     }
@@ -648,11 +707,13 @@ impl BrowserMcpTools {
             open_world_hint = true
         )
     )]
-    async fn browser_snapshot(&self) -> CallToolResult {
+    async fn browser_snapshot(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
         match self
-            .run_agent_operation(BrowserOperation::Snapshot, |browser| async move {
-                browser.snapshot().await
-            })
+            .run_agent_operation(
+                BrowserOperation::Snapshot,
+                &parts,
+                |browser, caller| async move { browser.snapshot(&caller).await },
+            )
             .await
         {
             Ok(snapshot) => snapshot_result(snapshot),
@@ -672,6 +733,7 @@ impl BrowserMcpTools {
     async fn browser_capture(
         &self,
         Parameters(request): Parameters<CaptureRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         let capture_mode = if request.full_page {
             BrowserCaptureMode::FullPage
@@ -679,11 +741,20 @@ impl BrowserMcpTools {
             BrowserCaptureMode::Viewport
         };
         match self
-            .run_agent_operation(BrowserOperation::Snapshot, |browser| async move {
-                browser
-                    .capture(request.target.as_deref(), &request.label, capture_mode)
-                    .await
-            })
+            .run_agent_operation(
+                BrowserOperation::Snapshot,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .capture(
+                            &caller,
+                            request.target.as_deref(),
+                            &request.label,
+                            capture_mode,
+                        )
+                        .await
+                },
+            )
             .await
         {
             Ok(snapshot) => snapshot_result(snapshot),
@@ -703,13 +774,18 @@ impl BrowserMcpTools {
     async fn browser_click(
         &self,
         Parameters(request): Parameters<LocatorRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Click, |browser| async move {
-                browser
-                    .click_in(request.target.as_deref(), &request.locator)
-                    .await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Click,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .click_in(&caller, request.target.as_deref(), &request.locator)
+                        .await
+                },
+            )
             .await,
         )
     }
@@ -723,13 +799,26 @@ impl BrowserMcpTools {
             open_world_hint = true
         )
     )]
-    async fn browser_type(&self, Parameters(request): Parameters<TypeRequest>) -> CallToolResult {
+    async fn browser_type(
+        &self,
+        Parameters(request): Parameters<TypeRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Type, |browser| async move {
-                browser
-                    .type_text_in(request.target.as_deref(), &request.locator, &request.text)
-                    .await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Type,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .type_text_in(
+                            &caller,
+                            request.target.as_deref(),
+                            &request.locator,
+                            &request.text,
+                        )
+                        .await
+                },
+            )
             .await,
         )
     }
@@ -743,13 +832,21 @@ impl BrowserMcpTools {
             open_world_hint = true
         )
     )]
-    async fn browser_press(&self, Parameters(request): Parameters<PressRequest>) -> CallToolResult {
+    async fn browser_press(
+        &self,
+        Parameters(request): Parameters<PressRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Press, |browser| async move {
-                browser
-                    .press_in(request.target.as_deref(), request.key)
-                    .await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Press,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .press_in(&caller, request.target.as_deref(), request.key)
+                        .await
+                },
+            )
             .await,
         )
     }
@@ -766,13 +863,23 @@ impl BrowserMcpTools {
     async fn browser_scroll(
         &self,
         Parameters(request): Parameters<ScrollRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Scroll, |browser| async move {
-                browser
-                    .scroll_in(request.target.as_deref(), request.delta_x, request.delta_y)
-                    .await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Scroll,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .scroll_in(
+                            &caller,
+                            request.target.as_deref(),
+                            request.delta_x,
+                            request.delta_y,
+                        )
+                        .await
+                },
+            )
             .await,
         )
     }
@@ -789,13 +896,18 @@ impl BrowserMcpTools {
     async fn browser_resize(
         &self,
         Parameters(request): Parameters<ResizeRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Resize, |browser| async move {
-                browser
-                    .resize_in(request.target.as_deref(), request.viewport)
-                    .await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Resize,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .resize_in(&caller, request.target.as_deref(), request.viewport)
+                        .await
+                },
+            )
             .await,
         )
     }
@@ -812,13 +924,18 @@ impl BrowserMcpTools {
     async fn browser_reload(
         &self,
         Parameters(request): Parameters<ReloadRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Reload, |browser| async move {
-                browser
-                    .reload_in(request.target.as_deref(), request.ignore_cache)
-                    .await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Reload,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .reload_in(&caller, request.target.as_deref(), request.ignore_cache)
+                        .await
+                },
+            )
             .await,
         )
     }
@@ -835,6 +952,7 @@ impl BrowserMcpTools {
     async fn browser_wait_for(
         &self,
         Parameters(request): Parameters<WaitRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
         if timeout_ms == 0 || timeout_ms > MAX_WAIT_TIMEOUT_MS {
@@ -843,15 +961,20 @@ impl BrowserMcpTools {
             ));
         }
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Wait, |browser| async move {
-                browser
-                    .wait_for_in(
-                        request.target.as_deref(),
-                        &request.condition,
-                        Duration::from_millis(timeout_ms),
-                    )
-                    .await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Wait,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .wait_for_in(
+                            &caller,
+                            request.target.as_deref(),
+                            &request.condition,
+                            Duration::from_millis(timeout_ms),
+                        )
+                        .await
+                },
+            )
             .await,
         )
     }
@@ -865,11 +988,13 @@ impl BrowserMcpTools {
             open_world_hint = true
         )
     )]
-    async fn browser_console(&self) -> CallToolResult {
+    async fn browser_console(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
         match self
-            .run_agent_operation(BrowserOperation::Console, |browser| async move {
-                browser.diagnostics().await
-            })
+            .run_agent_operation(
+                BrowserOperation::Console,
+                &parts,
+                |browser, caller| async move { browser.diagnostics_in(&caller, None).await },
+            )
             .await
         {
             Ok(diagnostics) => structured_value(diagnostics.console_errors),
@@ -886,11 +1011,13 @@ impl BrowserMcpTools {
             open_world_hint = true
         )
     )]
-    async fn browser_network(&self) -> CallToolResult {
+    async fn browser_network(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
         match self
-            .run_agent_operation(BrowserOperation::Network, |browser| async move {
-                browser.diagnostics().await
-            })
+            .run_agent_operation(
+                BrowserOperation::Network,
+                &parts,
+                |browser, caller| async move { browser.diagnostics_in(&caller, None).await },
+            )
             .await
         {
             Ok(diagnostics) => structured_value(diagnostics.failed_requests),
@@ -910,11 +1037,16 @@ impl BrowserMcpTools {
     async fn browser_target_diagnostics(
         &self,
         Parameters(request): Parameters<TargetRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Console, |browser| async move {
-                browser.diagnostics_in(Some(&request.target)).await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Console,
+                &parts,
+                |browser, caller| async move {
+                    browser.diagnostics_in(&caller, Some(&request.target)).await
+                },
+            )
             .await,
         )
     }
@@ -931,11 +1063,18 @@ impl BrowserMcpTools {
     async fn browser_dom_outline(
         &self,
         Parameters(request): Parameters<DomOutlineRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Dom, |browser| async move {
-                browser.dom_outline_in(request.target.as_deref()).await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Dom,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .dom_outline_in(&caller, request.target.as_deref())
+                        .await
+                },
+            )
             .await,
         )
     }
@@ -952,19 +1091,24 @@ impl BrowserMcpTools {
     async fn browser_node_inspect(
         &self,
         Parameters(request): Parameters<NodeInspectRequest>,
+        Extension(parts): Extension<Parts>,
     ) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Styles, |browser| async move {
-                browser
-                    .node_details_in(request.target.as_deref(), &request.selector)
-                    .await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Styles,
+                &parts,
+                |browser, caller| async move {
+                    browser
+                        .node_details_in(&caller, request.target.as_deref(), &request.selector)
+                        .await
+                },
+            )
             .await,
         )
     }
 
     #[tool(
-        description = "Immediately disconnect and terminate the GitTerm-owned visible Chrome process.",
+        description = "Disconnect this chat from the GitTerm browser: close this chat's own page targets and drop their sessions. Chrome keeps running, and other chats' targets and the user's own tabs stay open; only the user can stop the browser, from GitTerm.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -972,11 +1116,13 @@ impl BrowserMcpTools {
             open_world_hint = true
         )
     )]
-    async fn browser_disconnect(&self) -> CallToolResult {
+    async fn browser_disconnect(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
         structured_browser_result(
-            self.run_agent_operation(BrowserOperation::Disconnect, |browser| async move {
-                browser.disconnect().await
-            })
+            self.run_agent_operation(
+                BrowserOperation::Disconnect,
+                &parts,
+                |browser, caller| async move { browser.disconnect_owner(&caller).await },
+            )
             .await,
         )
     }
@@ -991,7 +1137,7 @@ impl ServerHandler for BrowserMcpTools {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V5. Call browser_open before page operations. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Use browser_dom_outline for bounded page structure, then browser_node_inspect with its document-scoped node_ref for layout and computed styles; node references become stale after navigation. Prefer semantic role or text locators; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
+                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V5. Call browser_open before page operations. Page targets belong to the chat that opened them: names are private to this chat, a call that omits target uses this chat's active target (opening its default target on first use), and other chats' targets and the user's own tabs are out of reach. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Use browser_dom_outline for bounded page structure, then browser_node_inspect with its document-scoped node_ref for layout and computed styles; node references become stale after navigation. Prefer semantic role or text locators; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
             )
     }
 }
@@ -1108,29 +1254,167 @@ mod tests {
             .unwrap();
         assert!((BROWSER_MCP_BASE_PORT..25_030).contains(&port));
         assert!(!(13_030..14_030).contains(&port));
-        let environment = connection.terminal_environment();
+        let caller = "7d1c2a4e-0b3f-4e8a-9c55-2f1e6d7a8b90";
+        let caller_url = format!("{}?caller={caller}", connection.endpoint());
+        let environment = connection.terminal_environment(Some(caller));
         assert_eq!(environment[0].0, BROWSER_MCP_URL_ENV);
-        assert_eq!(environment[0].1, connection.endpoint());
+        assert_eq!(environment[0].1, caller_url);
         assert_eq!(environment[1].0, BROWSER_MCP_TOKEN_ENV);
         assert_eq!(environment[1].1.len(), 64);
         assert!(!connection
             .codex_config_overrides()
             .iter()
             .any(|value| value.contains(&environment[1].1)));
+        // Bottom-panel terminals name no caller: the bare endpoint.
+        assert_eq!(
+            connection.terminal_environment(None)[0].1,
+            connection.endpoint()
+        );
 
         // Chat tabs get the terminal launch's config and pre-approvals, with
-        // the token only in the child environment.
-        let server = connection.claude_mcp_server();
+        // the caller on the URL and the token only in the child environment.
+        let server = connection.claude_mcp_server(Some(caller));
         let config = server.config.to_string();
         assert!(config.contains("\"gitterm_browser\""));
+        assert!(config.contains(&caller_url));
         assert!(!config.contains(&environment[1].1));
-        let terminal = configure_claude_command("claude", connection.endpoint());
+        let terminal = configure_claude_command("claude", &caller_url);
         assert!(terminal.contains(&format!("--mcp-config='{config}'")));
         assert!(terminal.contains(&format!(
             "--allowedTools={}",
             server.allowed_tools.join(",")
         )));
         assert_eq!(server.env, environment.to_vec());
+        let acp = connection.acp_mcp_server(Some(caller));
+        assert_eq!(acp.url, caller_url);
+
+        // Codex gets the per-tab URL quoted, or zsh would glob the `?`.
+        let codex = configure_codex_command("codex", &caller_url);
+        assert!(
+            codex.contains(&format!("'mcp_servers.gitterm_browser.url={caller_url}'")),
+            "{codex}"
+        );
+    }
+
+    fn request_parts(uri: &str) -> Parts {
+        Request::builder().uri(uri).body(()).unwrap().into_parts().0
+    }
+
+    fn error_text(result: &CallToolResult) -> String {
+        assert_eq!(result.is_error, Some(true), "expected a tool error");
+        result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn a_call_without_a_caller_is_refused_before_the_browser() {
+        let temp = tempdir().unwrap();
+        let browser = BrowserControlService::new(temp.path());
+        let tools = BrowserMcpTools::new(browser.clone());
+        for uri in ["/mcp", "/mcp?caller=", "/mcp?other=1"] {
+            let result = tools.browser_targets(Extension(request_parts(uri))).await;
+            assert_eq!(error_text(&result), missing_browser_caller_error(), "{uri}");
+        }
+        // Refused before it began: no agent activity was recorded.
+        let telemetry = browser.telemetry().await;
+        assert!(telemetry.last_agent_operation.is_none());
+        assert!(telemetry.active_agent_operation.is_none());
+    }
+
+    #[tokio::test]
+    async fn one_callers_disconnect_leaves_chrome_other_chats_and_the_users_tabs() {
+        let devtools = crate::browser_control::test_support::FakeDevTools::start(&[
+            "tab-a", "tab-b", "tab-user",
+        ])
+        .await;
+        let temp = tempdir().unwrap();
+        let browser = BrowserControlService::new(temp.path());
+        browser.attach_test_devtools(devtools.port).await;
+        browser
+            .insert_test_target("chat-a", "primary", "tab-a")
+            .await;
+        browser
+            .insert_test_target("chat-b", "primary", "tab-b")
+            .await;
+        let tools = BrowserMcpTools::new(browser);
+        let chat_a = || Extension(request_parts("/mcp?caller=chat-a"));
+        let chat_b = || Extension(request_parts("/mcp?caller=chat-b"));
+
+        let result = tools.browser_disconnect(chat_a()).await;
+        assert_eq!(result.is_error, Some(false));
+        let outcome = result.structured_content.unwrap();
+        assert_eq!(outcome["closed_targets"], serde_json::json!(["primary"]));
+        assert_eq!(outcome["browser_running"], true);
+        assert_eq!(
+            *devtools.calls.lock().unwrap(),
+            vec!["Target.closeTarget:tab-a".to_string()]
+        );
+        assert_eq!(
+            *devtools.pages.lock().unwrap(),
+            vec!["tab-b".to_string(), "tab-user".to_string()]
+        );
+
+        // chat-b still has its target; the user's tab is nobody's.
+        let listed = tools.browser_targets(chat_b()).await;
+        assert_eq!(listed.is_error, Some(false));
+        let listed = listed.structured_content.unwrap();
+        let listed = listed["result"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["targetId"], "tab-b");
+        assert_eq!(listed[0]["active"], true);
+    }
+
+    #[tokio::test]
+    async fn two_callers_cannot_reach_each_others_targets() {
+        let temp = tempdir().unwrap();
+        let browser = BrowserControlService::new(temp.path());
+        browser
+            .insert_test_target("chat-a", "design", "tab-1")
+            .await;
+        let tools = BrowserMcpTools::new(browser);
+        let chat_a = || Extension(request_parts("/mcp?caller=chat-a"));
+        let chat_b = || Extension(request_parts("/mcp?caller=chat-b"));
+        let design = || {
+            Parameters(TargetRequest {
+                target: "design".to_string(),
+            })
+        };
+        let not_found = "browser target 'design' does not exist";
+
+        // chat-b names chat-a's target: not found, as if it did not exist.
+        for result in [
+            tools.browser_target_close(design(), chat_b()).await,
+            tools.browser_target_focus(design(), chat_b()).await,
+            tools.browser_target_diagnostics(design(), chat_b()).await,
+            tools
+                .browser_navigate(
+                    Parameters(NavigateRequest {
+                        target: Some("design".to_string()),
+                        url: "https://example.com/".to_string(),
+                    }),
+                    chat_b(),
+                )
+                .await,
+        ] {
+            let error = error_text(&result);
+            assert!(error.starts_with(not_found), "{error}");
+        }
+
+        // chat-a reaches its own target; only the stopped browser fails it.
+        let error = error_text(&tools.browser_target_close(design(), chat_a()).await);
+        assert!(error.contains("browser is not running"), "{error}");
+
+        // Each caller's status reports only its own active target.
+        let status_a = tools.browser_status(chat_a()).await;
+        assert_eq!(status_a.is_error, Some(false));
+        let status_b = tools.browser_status(chat_b()).await;
+        let status_b = status_b.structured_content.unwrap();
+        assert_eq!(status_b["active_target"], serde_json::Value::Null);
+        assert_eq!(status_b["target_id"], serde_json::Value::Null);
     }
 
     #[test]
@@ -1281,7 +1565,9 @@ mod tests {
         let browser = BrowserControlService::new(temp.path());
         let tools = BrowserMcpTools::new(browser.clone());
 
-        let result = tools.browser_status().await;
+        let result = tools
+            .browser_status(Extension(request_parts("/mcp?caller=chat-a")))
+            .await;
         assert!(!result.is_error.unwrap_or(false));
         let telemetry = browser.telemetry().await;
         assert!(telemetry.active_agent_operation.is_none());
