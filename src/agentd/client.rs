@@ -917,6 +917,10 @@ fn chat_entry_from_proto(entry: ChatEntry) -> Option<crate::chats::ChatIndexEntr
         mtime: std::time::UNIX_EPOCH + Duration::from_secs(entry.mtime_unix_secs.max(0) as u64),
         size: entry.size_bytes,
         dead_cwd: entry.dead_cwd,
+        // Facts files live on each machine's own config dir and are not on
+        // the wire yet; remote rows show no keys, repos or fan-out.
+        facts: None,
+        root_id: None,
     })
 }
 

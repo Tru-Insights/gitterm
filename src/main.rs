@@ -52,6 +52,7 @@ use gitterm::browser_control::{
     BrowserStatus, BrowserTelemetrySnapshot,
 };
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
+use gitterm::chat_facts;
 use gitterm::chat_page::agent_chat_html;
 use gitterm::chats;
 use gitterm::gh_identity::GH_ACCOUNT_ENV_KEY;
@@ -4081,6 +4082,10 @@ struct TabState {
     // Files panels follow it (TRU-146). Derived from the tool stream; never
     // persisted. `repo_path` / `current_dir` stay on the workspace root.
     worktree_follow: WorktreeFollow,
+    // What this chat touches and starts, from the same tool stream, waiting
+    // for its debounced write to the chat's facts file (TRU-166). Claude
+    // chat tabs in local workspaces only.
+    chat_facts: chat_facts::LiveFacts,
     is_git_repo: bool,
 }
 
@@ -4145,6 +4150,7 @@ impl TabState {
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
             worktree_follow: WorktreeFollow::default(),
+            chat_facts: chat_facts::LiveFacts::default(),
             is_git_repo,
         }
     }
@@ -5852,6 +5858,13 @@ pub enum Event {
     // Chats panel (TRU-78)
     RefreshChatIndex,
     ChatIndexLoaded(Vec<chats::ChatIndexEntry>),
+    /// A chat tab's facts write landed (TRU-166).
+    ChatFactsFlushed(usize, Result<(), String>),
+    /// "Index older chats" in the Chats panel (TRU-166).
+    ChatFactsBackfill,
+    ChatFactsBackfilled(Result<chat_facts::BackfillReport, String>),
+    /// Fold or unfold a root chat's children in the Chats panel.
+    ToggleChatChildren(chats::ChatRef),
     ChatsQueryChanged(String),
     ChatsScopeChanged(chats::ChatScope),
     ChatsBackendFilterChanged(Option<chats::ChatBackend>),
@@ -6213,6 +6226,13 @@ struct App {
     /// remote id). Sections start collapsed so the machine list itself
     /// is scannable; an active search overrides collapse.
     chat_expanded_machines: std::collections::HashSet<String>,
+    /// Root chats whose children are unfolded (TRU-166); per app run. An
+    /// active search unfolds every root with a matching child.
+    chat_expanded_roots: std::collections::HashSet<chats::ChatRef>,
+    /// "Index older chats" is running.
+    chat_backfill_running: bool,
+    /// Result line of the last "Index older chats" run.
+    chat_backfill_note: Option<String>,
     /// The Chats panel's Open section is folded (TRU-148); per app run.
     chat_open_section_collapsed: bool,
     /// Workspace-bar machine groups the user folded (session-only).
@@ -6899,6 +6919,36 @@ fn folder_picker_start_dir(last_chosen: Option<&str>, home: Option<&str>) -> Str
         .find(|dir| !dir.is_empty())
         .unwrap_or("/")
         .to_string()
+}
+
+/// The Chats row's facts line (TRU-166): up to three issue keys, three
+/// repos touched (most edited first) and the fan-out counts, e.g.
+/// "PRJ-101 PRJ-102 · infra auth-service +12 · 38 subagents · 2 workers".
+fn chat_facts_line(facts: &chat_facts::ChatFacts) -> Option<String> {
+    fn capped(items: Vec<String>, max: usize) -> Option<String> {
+        if items.is_empty() {
+            return None;
+        }
+        let mut line = items
+            .iter()
+            .take(max)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if items.len() > max {
+            line.push_str(&format!(" +{}", items.len() - max));
+        }
+        Some(line)
+    }
+    let parts: Vec<String> = [
+        capped(facts.issue_keys.clone(), 3),
+        capped(facts.repo_names(), 3),
+        facts.fan_out_line(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// The picker's "Recent" list for one machine: distinct repo roots from
@@ -11247,10 +11297,137 @@ impl App {
         Task::batch(tasks)
     }
 
-    fn request_chat_index() -> Task<Event> {
+    /// Child sessions GitTerm's own records name (delegations, tasks a
+    /// coordinator created), keyed by parent chat (TRU-166). Tabs map a
+    /// caller `session_uid` to the chat it hosts.
+    fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let mut uid_to_chat: HashMap<String, String> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .filter_map(|tab| Some((tab.session_uid.clone(), tab.chat_session_id.clone()?)))
+            .collect();
+        for delegation in store.delegations() {
+            if let Some(chat) = &delegation.parent.chat_session_id {
+                uid_to_chat
+                    .entry(delegation.parent.session_uid.clone())
+                    .or_insert_with(|| chat.clone());
+            }
+        }
+        chat_facts::store_links(store.delegations(), store.tasks(), &uid_to_chat)
+    }
+
+    /// Write a chat tab's facts when they are due (TRU-166): debounced while
+    /// a turn runs, at once when `force` (the turn ended). The write runs
+    /// on a blocking thread; one per tab at a time.
+    fn flush_chat_facts(&mut self, tab_id: usize, force: bool) -> Task<Event> {
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|tab| tab.id == tab_id)
+        else {
+            return Task::none();
+        };
+        // Facts are named by the conversation; until the harness reports
+        // one, observations wait.
+        let Some(session_id) = tab.chat_session_id.clone() else {
+            return Task::none();
+        };
+        let Some(pending) = tab.chat_facts.take_due(Instant::now(), force) else {
+            return Task::none();
+        };
+        let children = chat_facts::links_for_parent(&self.chat_child_links(), &session_id);
+        let dir = chat_facts::facts_dir(&config::global_config_dir());
         Task::perform(
             async move {
-                match tokio::task::spawn_blocking(chats::build_local_index).await {
+                tokio::task::spawn_blocking(move || {
+                    chat_facts::flush_live(
+                        &dir,
+                        chats::ChatBackend::Claude,
+                        &session_id,
+                        pending,
+                        children,
+                    )
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("facts write task failed: {error}")))
+            },
+            move |result| Event::ChatFactsFlushed(tab_id, result),
+        )
+    }
+
+    /// "Index older chats" (TRU-166): derive facts for this Mac's Claude
+    /// chats that have none, from their transcripts, a bounded batch per
+    /// press, off the UI thread. Chats a tab hosts are left to that tab.
+    fn start_chat_facts_backfill(&mut self) -> Task<Event> {
+        if self.chat_backfill_running {
+            return Task::none();
+        }
+        let targets: Vec<chat_facts::BackfillTarget> = self
+            .chat_index
+            .iter()
+            .filter(|entry| entry.backend == chats::ChatBackend::Claude)
+            .map(|entry| chat_facts::BackfillTarget {
+                id: entry.id.clone(),
+                path: entry.path.clone(),
+                mtime: entry.mtime,
+            })
+            .collect();
+        // The facts writers: Claude chat tabs on this Mac. A CLI session in
+        // a terminal tab has no writer, so the backfill covers it.
+        let hosted: HashSet<String> = self
+            .workspaces
+            .iter()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|ws| ws.tabs.iter())
+            .filter(|tab| {
+                tab.agent_session()
+                    .is_some_and(|session| session.backend() == tab::AgentBackend::Claude)
+            })
+            .filter_map(|tab| tab.chat_session_id.clone())
+            .collect();
+        let links = self.chat_child_links();
+        let dir = chat_facts::facts_dir(&config::global_config_dir());
+        self.chat_backfill_running = true;
+        self.chat_backfill_note = None;
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let home = dirs::home_dir();
+                    chat_facts::backfill_claude(
+                        targets,
+                        &dir,
+                        &hosted,
+                        &links,
+                        chat_facts::BACKFILL_BATCH,
+                        home.as_deref(),
+                    )
+                })
+                .await
+                .map_err(|error| format!("backfill task failed: {error}"))
+            },
+            Event::ChatFactsBackfilled,
+        )
+    }
+
+    /// Build the local chat index off the UI thread, then merge the facts
+    /// files and fold children under their roots (TRU-166).
+    fn request_chat_index(&self) -> Task<Event> {
+        let facts_dir = chat_facts::facts_dir(&config::global_config_dir());
+        let links = self.chat_child_links();
+        Task::perform(
+            async move {
+                let build = move || {
+                    let mut entries = chats::build_local_index();
+                    chat_facts::attach_facts(&mut entries, &facts_dir);
+                    chat_facts::resolve_tree(&mut entries, &links);
+                    entries
+                };
+                match tokio::task::spawn_blocking(build).await {
                     Ok(entries) => entries,
                     Err(err) => {
                         eprintln!("[chats] index task failed: {err}");
@@ -11275,7 +11452,7 @@ impl App {
             return remote;
         }
         self.chat_index_loading = true;
-        Task::batch([Self::request_chat_index(), remote])
+        Task::batch([self.request_chat_index(), remote])
     }
 
     fn refresh_task_conversation_history(&mut self) -> Task<Event> {
@@ -11283,7 +11460,7 @@ impl App {
             return Task::none();
         }
         self.chat_index_loading = true;
-        Self::request_chat_index()
+        self.request_chat_index()
     }
 
     fn request_chat_preview(
@@ -13471,6 +13648,9 @@ impl App {
             chat_scope: chats::ChatScope::default(),
             chat_backend_filter: None,
             chat_expanded_machines: std::collections::HashSet::new(),
+            chat_expanded_roots: std::collections::HashSet::new(),
+            chat_backfill_running: false,
+            chat_backfill_note: None,
             chat_open_section_collapsed: false,
             collapsed_machine_groups: std::collections::HashSet::new(),
             machine_menu: None,
@@ -17657,6 +17837,20 @@ fi
                 // Claude gets every message with an id, so the CLI reports
                 // its queue state and a queued one can be withdrawn.
                 let mut prompt = prompt;
+                // Issue keys the human names feed the chat's facts (TRU-166);
+                // written with the turn's tool calls.
+                for ws in &mut self.workspaces {
+                    if !matches!(ws.location, WorkspaceLocation::Local { .. }) {
+                        continue;
+                    }
+                    if let Some(t) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if t.agent_session()
+                            .is_some_and(|session| session.backend() == tab::AgentBackend::Claude)
+                        {
+                            t.chat_facts.observe_user_text(&prompt.text);
+                        }
+                    }
+                }
                 let mut echo = tab::AgentEvent::submitted_prompt(&prompt, false);
                 // Images a non-Claude backend could not take (pi has no
                 // image input here); the chat says so instead of dropping
@@ -18863,6 +19057,15 @@ fi
                     &ev,
                     tab::AgentEvent::Harness(HarnessEvent::TurnCompleted { .. })
                 );
+                // A chat's facts are written at once when its turn or
+                // process ends, else debounced (TRU-166).
+                let facts_force = matches!(
+                    &ev,
+                    tab::AgentEvent::Harness(
+                        HarnessEvent::TurnCompleted { .. } | HarnessEvent::ProcessExited { .. }
+                    )
+                );
+                let mut facts_tab = false;
                 // Progress capture: what the session last said it was doing.
                 // Only meaningful events feed this — streaming deltas don't.
                 let progress_note: Option<(Option<String>, Option<String>)> = match &ev {
@@ -18914,6 +19117,18 @@ fi
                                         worktree_candidates =
                                             Some((t.repo_path.clone(), candidates));
                                     }
+                                }
+                            }
+                            // Chat facts (TRU-166): every Claude chat tab on
+                            // this Mac, task workers included.
+                            if let (tab::AgentEvent::Harness(harness_event), true) =
+                                (&ev, local_workspace)
+                            {
+                                if t.agent_session().is_some_and(|session| {
+                                    session.backend() == tab::AgentBackend::Claude
+                                }) {
+                                    t.chat_facts.observe(harness_event, home.as_deref());
+                                    facts_tab = true;
                                 }
                             }
                             // The agent session's own end states translate
@@ -19147,6 +19362,11 @@ fi
                         self.consider_worktree_candidates(tab_id, repo_root, candidates)
                     }
                     None => Task::none(),
+                };
+                let follow_task = if facts_tab {
+                    Task::batch([follow_task, self.flush_chat_facts(tab_id, facts_force)])
+                } else {
+                    follow_task
                 };
                 if turn_ended {
                     return Task::batch([
@@ -22042,7 +22262,7 @@ fi
             }
             Event::RefreshChatIndex => {
                 self.chat_index_loading = true;
-                return Self::request_chat_index();
+                return self.request_chat_index();
             }
             Event::ChatIndexLoaded(entries) => {
                 self.chat_index = entries;
@@ -22158,6 +22378,49 @@ fi
                 if !self.chat_expanded_machines.remove(&key) {
                     self.chat_expanded_machines.insert(key);
                 }
+            }
+            Event::ToggleChatChildren(chat) => {
+                if !self.chat_expanded_roots.remove(&chat) {
+                    self.chat_expanded_roots.insert(chat);
+                }
+            }
+            Event::ChatFactsFlushed(tab_id, result) => {
+                if let Err(error) = result {
+                    eprintln!("[chat-facts] tab {tab_id}: facts not written: {error}");
+                }
+                let tab = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id);
+                let Some(tab) = tab else {
+                    return Task::none();
+                };
+                tab.chat_facts.flush_done();
+                // What arrived during the write: at once when the turn has
+                // ended meanwhile, else on the debounce.
+                let idle = tab.agent_session().is_some_and(|session| {
+                    !matches!(session.state, tab::AgentSessionState::Streaming)
+                });
+                if tab.chat_facts.has_pending() {
+                    return self.flush_chat_facts(tab_id, idle);
+                }
+            }
+            Event::ChatFactsBackfill => return self.start_chat_facts_backfill(),
+            Event::ChatFactsBackfilled(result) => {
+                self.chat_backfill_running = false;
+                match result {
+                    Ok(report) => {
+                        eprintln!("[chat-facts] backfill: {report:?}");
+                        self.chat_backfill_note = Some(report.summary());
+                    }
+                    Err(error) => {
+                        eprintln!("[chat-facts] backfill failed: {error}");
+                        self.chat_backfill_note = Some(format!("Indexing failed: {error}"));
+                    }
+                }
+                self.chat_index_loading = true;
+                return self.request_chat_index();
             }
             Event::ToggleChatOpenSection => {
                 self.chat_open_section_collapsed = !self.chat_open_section_collapsed;
@@ -32525,8 +32788,6 @@ fi
                 })
             })
             .collect();
-        let selected_bg = theme.surface0();
-        let selected_border = theme.surface1();
         for (section_remote_id, section_entries) in &sections {
             // Machine section header (Everywhere only): a collapsible
             // row with count + status, so the machine list itself is
@@ -32580,28 +32841,28 @@ fi
                 continue;
             }
 
-            // Group by repo root, preserving most-recent-first order. In
-            // relevance order a group is a run of adjacent chats, so the
-            // ranking is never reshuffled by repo.
+            // Fold children under their root chat (TRU-166), then group
+            // the top-level rows by repo root, preserving most-recent-first
+            // order. In relevance order a group is a run of adjacent rows,
+            // so the ranking is never reshuffled by repo.
+            let machine_entries = self.chat_entries_for_machine(section_remote_id.as_deref());
+            let folded = chats::fold_under_roots(section_entries, machine_entries);
             let ranked_section = relevance_ordered && section_remote_id.is_none();
-            let mut groups: Vec<(&std::path::Path, Vec<&chats::ChatIndexEntry>)> = Vec::new();
-            for entry in section_entries {
+            let mut groups: Vec<(&std::path::Path, Vec<&chats::FoldedChat>)> = Vec::new();
+            for folded_chat in &folded {
+                let group_root = folded_chat.root.group_root();
                 let existing = if ranked_section {
-                    groups
-                        .last_mut()
-                        .filter(|(root, _)| *root == entry.group_root())
+                    groups.last_mut().filter(|(root, _)| *root == group_root)
                 } else {
-                    groups
-                        .iter_mut()
-                        .find(|(root, _)| *root == entry.group_root())
+                    groups.iter_mut().find(|(root, _)| *root == group_root)
                 };
                 match existing {
-                    Some((_, list)) => list.push(entry),
-                    None => groups.push((entry.group_root(), vec![entry])),
+                    Some((_, list)) => list.push(folded_chat),
+                    None => groups.push((group_root, vec![folded_chat])),
                 }
             }
 
-            for (root, entries) in groups {
+            for (root, rows) in groups {
                 let group_name = root
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -32611,104 +32872,146 @@ fi
                         text(group_name.to_uppercase())
                             .size(10)
                             .color(theme.text_muted()),
-                        text(format!("{}", entries.len()))
+                        text(format!("{}", rows.len()))
                             .size(10)
                             .color(theme.text_muted()),
                     ]
                     .spacing(6)
                     .padding([6, 2]),
                 );
-                for entry in entries {
-                    let chat_ref = chats::ChatRef::new(section_remote_id.as_deref(), &entry.id);
-                    let is_selected = tab.selected_chat.as_ref() == Some(&chat_ref);
-                    let mut meta = Row::new().spacing(8).push(
-                        text(chats::format_age(entry.mtime))
-                            .size(font_small - 1.0)
-                            .color(theme.text_muted()),
-                    );
-                    if let Some(branch) = &entry.branch {
-                        meta = meta.push(
-                            text(branch.clone())
-                                .size(font_small - 1.0)
-                                .color(theme.text_secondary()),
-                        );
+                for folded_chat in rows {
+                    let entry = folded_chat.root;
+                    let remote_id = section_remote_id.as_deref();
+                    let chat_ref = chats::ChatRef::new(remote_id, &entry.id);
+                    let has_children = entry
+                        .facts
+                        .as_ref()
+                        .is_some_and(|facts| !facts.children.is_empty())
+                        || !folded_chat.children.is_empty();
+                    // A search unfolds a root whose children matched.
+                    let searching = !query.is_empty();
+                    let expanded = has_children
+                        && (self.chat_expanded_roots.contains(&chat_ref)
+                            || (searching
+                                && (!folded_chat.children.is_empty()
+                                    || matches!(
+                                        entry.query_match(&query),
+                                        Some(chats::QueryMatch::Child(_))
+                                    ))));
+                    let fold = has_children.then_some((chat_ref.clone(), expanded));
+                    list = list.push(self.view_chat_row(
+                        entry,
+                        remote_id,
+                        tab.selected_chat.as_ref(),
+                        live_in.get(&(remote_id, entry.id.as_str())).copied(),
+                        &query,
+                        0.0,
+                        fold,
+                    ));
+                    if !expanded {
+                        continue;
                     }
-                    if let Some(ws_name) =
-                        live_in.get(&(section_remote_id.as_deref(), entry.id.as_str()))
-                    {
-                        meta = meta.push(
-                            button(
-                                text(format!("● open in {ws_name}"))
-                                    .size(font_small - 1.0)
-                                    .color(theme.green()),
-                            )
-                            .style(button::text)
-                            .padding(0)
-                            .on_press(Event::FocusChatTab(chat_ref.clone())),
-                        );
-                    } else if entry.possibly_running() {
-                        meta = meta.push(
-                            text("◐ possibly running")
-                                .size(font_small - 1.0)
-                                .color(theme.yellow()),
-                        );
-                    }
-                    if entry.is_worktree {
-                        meta =
-                            meta.push(text("worktree").size(font_small - 1.0).color(theme.mauve()));
-                    }
-                    if let Some(remote_id) = section_remote_id.as_deref() {
-                        meta = meta.push(
-                            text(format!("@ {}", self.chat_machine_name(Some(remote_id))))
-                                .size(font_small - 1.0)
-                                .color(theme.blue()),
-                        );
-                    }
-                    if entry.dead_cwd {
-                        meta =
-                            meta.push(text("⚠ dir gone").size(font_small - 1.0).color(theme.red()));
-                    }
-                    let mut content = Column::new().spacing(2).push(
-                        row![
-                            text("●")
-                                .size(8)
-                                .color(self.chat_backend_color(entry.backend)),
-                            text(entry.title.clone())
-                                .size(font_small)
-                                .color(theme.text_primary()),
-                        ]
-                        .spacing(6),
-                    );
-                    // A long-lived session keeps its opening title above;
-                    // this line says what it has become since (TRU-158).
-                    if let Some(latest) = &entry.latest {
-                        content = content.push(
-                            text(format!("↳ {latest}"))
-                                .size(font_small - 1.0)
-                                .color(theme.text_secondary()),
-                        );
-                    }
-                    let content = content.push(meta);
-                    let mut btn = button(content)
-                        .padding([6, 8])
-                        .width(Length::Fill)
-                        .on_press(Event::SelectChat(chat_ref));
-                    btn = if is_selected {
-                        btn.style(move |_theme, _status| button::Style {
-                            background: Some(selected_bg.into()),
-                            border: iced::Border {
-                                width: 1.0,
-                                color: selected_border,
-                                radius: 6.0.into(),
-                            },
-                            ..Default::default()
-                        })
+                    // Indexed children: while searching, the matching ones;
+                    // unfolded by hand, every child of this root.
+                    let children: Vec<&chats::ChatIndexEntry> = if searching {
+                        folded_chat.children.clone()
                     } else {
-                        btn.style(self.ghost_button_style())
+                        machine_entries
+                            .iter()
+                            .filter(|child| child.root_id.as_deref() == Some(entry.id.as_str()))
+                            .collect()
                     };
-                    list = list.push(btn);
+                    for child in &children {
+                        list = list.push(self.view_chat_row(
+                            child,
+                            remote_id,
+                            tab.selected_chat.as_ref(),
+                            live_in.get(&(remote_id, child.id.as_str())).copied(),
+                            &query,
+                            18.0,
+                            None,
+                        ));
+                    }
+                    // Children with no transcript of their own in the index
+                    // (Claude subagents, Codex review runs): their titles.
+                    if let Some(facts) = &entry.facts {
+                        let indexed: HashSet<&str> = machine_entries
+                            .iter()
+                            .filter(|child| child.root_id.as_deref() == Some(entry.id.as_str()))
+                            .map(|child| child.id.as_str())
+                            .collect();
+                        let others: Vec<&chat_facts::ChatChild> = facts
+                            .children
+                            .iter()
+                            .filter(|child| !indexed.contains(child.session_id.as_str()))
+                            .filter(|child| {
+                                !searching
+                                    || child
+                                        .title
+                                        .as_deref()
+                                        .is_some_and(|title| title.to_lowercase().contains(&query))
+                            })
+                            .collect();
+                        const CHILD_LINES: usize = 8;
+                        let mut lines = Column::new().spacing(1).padding(iced::Padding {
+                            top: 0.0,
+                            right: 8.0,
+                            bottom: 4.0,
+                            left: 26.0,
+                        });
+                        for child in others.iter().rev().take(CHILD_LINES) {
+                            let kind = match child.kind {
+                                chat_facts::ChildKind::Subagent => "subagent",
+                                chat_facts::ChildKind::Worker => "worker",
+                                chat_facts::ChildKind::Review => "review",
+                                chat_facts::ChildKind::Consult => "consult",
+                            };
+                            let title = child.title.as_deref().unwrap_or("untitled");
+                            lines = lines.push(
+                                text(format!("{kind} · {title}"))
+                                    .size(font_small - 1.0)
+                                    .color(theme.text_muted()),
+                            );
+                        }
+                        if others.len() > CHILD_LINES {
+                            lines = lines.push(
+                                text(format!("… {} more", others.len() - CHILD_LINES))
+                                    .size(font_small - 1.0)
+                                    .color(theme.text_muted()),
+                            );
+                        }
+                        if !others.is_empty() {
+                            list = list.push(lines);
+                        }
+                    }
                 }
             }
+        }
+
+        // "Index older chats" (TRU-166): facts for this Mac's chats from
+        // before chat tabs wrote them, and for CLI sessions in terminals.
+        let local_listed = everywhere || active_remote_id.is_none();
+        if local_listed && !self.chat_index.is_empty() {
+            let label = if self.chat_backfill_running {
+                "Indexing older chats…"
+            } else {
+                "Index older chats"
+            };
+            let mut backfill = button(text(label).size(font_small - 1.0).color(theme.accent()))
+                .style(self.ghost_button_style())
+                .padding([3, 8]);
+            if !self.chat_backfill_running {
+                backfill = backfill.on_press(Event::ChatFactsBackfill);
+            }
+            let mut footer = Column::new().spacing(2).padding([8, 8]).push(backfill);
+            if let Some(note) = &self.chat_backfill_note {
+                footer = footer.push(
+                    text(note.clone())
+                        .size(font_small - 1.0)
+                        .color(theme.text_muted()),
+                );
+            }
+            list = list.push(footer);
         }
 
         // Scoped search missed (or partially missed) — widen ring by ring.
@@ -32841,6 +33144,134 @@ fi
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// One chat row of the Chats panel: title, the TRU-158 latest line,
+    /// the facts line (issue keys, repos touched, fan-out; TRU-166), what a
+    /// search matched when it is not on the row, and the meta line.
+    /// `fold` is the root's (ref, unfolded) when it has children.
+    #[allow(clippy::too_many_arguments)]
+    fn view_chat_row(
+        &self,
+        entry: &chats::ChatIndexEntry,
+        remote_id: Option<&str>,
+        selected: Option<&chats::ChatRef>,
+        open_in: Option<&str>,
+        query: &str,
+        indent: f32,
+        fold: Option<(chats::ChatRef, bool)>,
+    ) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let chat_ref = chats::ChatRef::new(remote_id, &entry.id);
+        let is_selected = selected == Some(&chat_ref);
+        let mut meta = Row::new().spacing(8).push(
+            text(chats::format_age(entry.mtime))
+                .size(font_small - 1.0)
+                .color(theme.text_muted()),
+        );
+        if let Some(branch) = &entry.branch {
+            meta = meta.push(
+                text(branch.clone())
+                    .size(font_small - 1.0)
+                    .color(theme.text_secondary()),
+            );
+        }
+        if let Some(ws_name) = open_in {
+            meta = meta.push(
+                button(
+                    text(format!("● open in {ws_name}"))
+                        .size(font_small - 1.0)
+                        .color(theme.green()),
+                )
+                .style(button::text)
+                .padding(0)
+                .on_press(Event::FocusChatTab(chat_ref.clone())),
+            );
+        } else if entry.possibly_running() {
+            meta = meta.push(
+                text("◐ possibly running")
+                    .size(font_small - 1.0)
+                    .color(theme.yellow()),
+            );
+        }
+        if entry.is_worktree {
+            meta = meta.push(text("worktree").size(font_small - 1.0).color(theme.mauve()));
+        }
+        if let Some(remote_id) = remote_id {
+            meta = meta.push(
+                text(format!("@ {}", self.chat_machine_name(Some(remote_id))))
+                    .size(font_small - 1.0)
+                    .color(theme.blue()),
+            );
+        }
+        if entry.dead_cwd {
+            meta = meta.push(text("⚠ dir gone").size(font_small - 1.0).color(theme.red()));
+        }
+        let mut content = Column::new().spacing(2).push(
+            row![
+                text("●")
+                    .size(8)
+                    .color(self.chat_backend_color(entry.backend)),
+                text(entry.title.clone())
+                    .size(font_small)
+                    .color(theme.text_primary()),
+            ]
+            .spacing(6),
+        );
+        // A long-lived session keeps its opening title above; this line
+        // says what it has become since (TRU-158).
+        if let Some(latest) = &entry.latest {
+            content = content.push(
+                text(format!("↳ {latest}"))
+                    .size(font_small - 1.0)
+                    .color(theme.text_secondary()),
+            );
+        }
+        if let Some(label) = (!query.is_empty())
+            .then(|| entry.query_match(query))
+            .flatten()
+            .and_then(|matched| matched.label())
+        {
+            content = content.push(text(label).size(font_small - 1.0).color(theme.accent()));
+        }
+        if let Some(line) = entry.facts.as_ref().and_then(chat_facts_line) {
+            content = content.push(text(line).size(font_small - 1.0).color(theme.text_muted()));
+        }
+        let content = content.push(meta);
+        let mut btn = button(content)
+            .padding(iced::Padding {
+                top: 6.0,
+                right: 8.0,
+                bottom: 6.0,
+                left: 8.0 + indent,
+            })
+            .width(Length::Fill)
+            .on_press(Event::SelectChat(chat_ref));
+        btn = if is_selected {
+            let selected_bg = theme.surface0();
+            let selected_border = theme.surface1();
+            btn.style(move |_theme, _status| button::Style {
+                background: Some(selected_bg.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: selected_border,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+        } else {
+            btn.style(self.ghost_button_style())
+        };
+        let Some((root_ref, expanded)) = fold else {
+            return btn.into();
+        };
+        let chevron = if expanded { "▾" } else { "▸" };
+        let toggle = button(text(chevron).size(font_small).color(theme.text_secondary()))
+            .style(self.ghost_button_style())
+            .padding([6, 8])
+            .on_press(Event::ToggleChatChildren(root_ref));
+        row![btn, toggle].align_y(iced::Alignment::Start).into()
     }
 
     /// One Chats overview row: glyph, title, where it lives, what it is
@@ -40776,6 +41207,8 @@ mod tests {
             mtime: std::time::SystemTime::UNIX_EPOCH,
             size: 1,
             dead_cwd,
+            facts: None,
+            root_id: None,
         }
     }
 
@@ -40788,6 +41221,41 @@ mod tests {
             mtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
             ..chat_entry(chats::ChatBackend::Claude, false)
         }
+    }
+
+    #[test]
+    fn chat_facts_line_caps_keys_and_repos_and_counts_children() {
+        let mut facts = chat_facts::ChatFacts::default();
+        assert_eq!(chat_facts_line(&facts), None);
+        for key in ["PRJ-101", "PRJ-102", "PRJ-103", "OPS-1"] {
+            facts.add_issue_key(key);
+        }
+        for (dir, edits) in [("/r/auth-service", 32), ("/r/infra", 135), ("/r/socket", 0)] {
+            facts.repos_touched.push(chat_facts::RepoTouch {
+                dir: PathBuf::from(dir),
+                edits,
+            });
+        }
+        for (id, kind) in [
+            ("a", chat_facts::ChildKind::Subagent),
+            ("b", chat_facts::ChildKind::Subagent),
+            ("c", chat_facts::ChildKind::Worker),
+            ("d", chat_facts::ChildKind::Review),
+        ] {
+            facts.add_child(chat_facts::ChatChild {
+                session_id: id.to_string(),
+                kind,
+                delegation_id: None,
+                task_id: None,
+                title: None,
+            });
+        }
+        assert_eq!(
+            chat_facts_line(&facts).as_deref(),
+            Some(
+                "PRJ-101 PRJ-102 PRJ-103 +1 · infra auth-service socket · 2 subagents · 1 worker · 1 review"
+            )
+        );
     }
 
     #[test]

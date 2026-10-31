@@ -2089,12 +2089,12 @@ impl TaskStore {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn replace_file_atomically(temporary: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomically(temporary: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(temporary, destination)
 }
 
 #[cfg(target_os = "windows")]
-fn replace_file_atomically(temporary: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomically(temporary: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
 
