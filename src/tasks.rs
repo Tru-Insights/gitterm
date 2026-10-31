@@ -2552,13 +2552,13 @@ mod tests {
                 title: "Add durable tasks".to_string(),
                 objective: "Persist task state without opening a workspace".to_string(),
                 workspace: WorkspaceIdentity {
-                    name: "GitTerm V5".to_string(),
+                    name: "GitTerm V6".to_string(),
                     location: WorkspaceLocationIdentity::Local {
-                        directory: PathBuf::from("/repo with spaces/gitterm-v5"),
+                        directory: PathBuf::from("/repo with spaces/gitterm-v6"),
                     },
                 },
                 repository: RepositoryIdentity {
-                    common_dir: PathBuf::from("/repo with spaces/gitterm-v5/.git"),
+                    common_dir: PathBuf::from("/repo with spaces/gitterm-v6/.git"),
                     remote_url: Some("https://github.com/Tru-Insights/gitterm.git".to_string()),
                 },
                 issue: Some(IssueReference {
@@ -2567,7 +2567,7 @@ mod tests {
                     url: Some("https://linear.app/example/TRU-104".to_string()),
                 }),
                 base: GitBase {
-                    reference: "v5".to_string(),
+                    reference: "v6".to_string(),
                     commit: "0123456789abcdef".to_string(),
                 },
                 branch: format!("task/{task_id}-durable-tasks"),
@@ -2591,8 +2591,8 @@ mod tests {
                 parent: DelegationParent {
                     session_uid: session_uid.to_string(),
                     chat_session_id: Some("claude-session-1".to_string()),
-                    workspace: "GitTerm V5".to_string(),
-                    cwd: PathBuf::from("/repo with spaces/gitterm-v5"),
+                    workspace: "GitTerm V6".to_string(),
+                    cwd: PathBuf::from("/repo with spaces/gitterm-v6"),
                 },
                 child: DelegationChild::CodexReview {
                     thread_id: None,
@@ -2601,7 +2601,7 @@ mod tests {
                 brief: "Review the uncommitted changes".to_string(),
                 target: Some(ReviewTarget {
                     mode: ReviewTargetMode::Base {
-                        reference: "v5".to_string(),
+                        reference: "v6".to_string(),
                     },
                     focus: Some("error handling".to_string()),
                 }),
@@ -2639,7 +2639,7 @@ mod tests {
             reviewed: Some(ReviewedState {
                 head: "0123456789abcdef".to_string(),
                 dirty: true,
-                target_description: "changes against 'v5'".to_string(),
+                target_description: "changes against 'v6'".to_string(),
             }),
         }
     }
@@ -2726,7 +2726,7 @@ mod tests {
         assert_eq!(raw_review["child"]["runner"], "codex_review");
         assert_eq!(raw_review["status"]["state"], "completed");
         assert_eq!(raw_review["target"]["mode"]["type"], "base");
-        assert_eq!(raw_review["target"]["mode"]["reference"], "v5");
+        assert_eq!(raw_review["target"]["mode"]["reference"], "v6");
         assert_eq!(raw_review["result"]["findings"]["verdict"], "needs_changes");
         assert_eq!(
             raw_review["result"]["findings"]["findings"][0]["severity"],
@@ -3390,11 +3390,11 @@ mod tests {
                 "task-1",
                 CompletedWorktreePreparation {
                     repository: RepositoryIdentity {
-                        common_dir: PathBuf::from("/repo with spaces/gitterm-v5/.git"),
+                        common_dir: PathBuf::from("/repo with spaces/gitterm-v6/.git"),
                         remote_url: None,
                     },
                     base: GitBase {
-                        reference: "v5".to_string(),
+                        reference: "v6".to_string(),
                         commit: "0123456789abcdef".to_string(),
                     },
                     branch: "task/task-1-durable-tasks".to_string(),

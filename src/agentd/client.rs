@@ -6,13 +6,13 @@ use std::time::Duration;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Request;
 
-use super::protocol::v5::git_term_agent_client::GitTermAgentClient;
-use super::protocol::v5::GitDiffRequest;
-use super::protocol::v5::GitStatusRequest;
-use super::protocol::v5::HandshakeRequest;
-use super::protocol::v5::ListDirRequest;
-use super::protocol::v5::ReadFileRequest;
-use super::protocol::v5::{
+use super::protocol::v6::git_term_agent_client::GitTermAgentClient;
+use super::protocol::v6::GitDiffRequest;
+use super::protocol::v6::GitStatusRequest;
+use super::protocol::v6::HandshakeRequest;
+use super::protocol::v6::ListDirRequest;
+use super::protocol::v6::ReadFileRequest;
+use super::protocol::v6::{
     claude_chat_client_message, terminal_input, AttachRequest, ChatEntry, ChatPreviewRequest,
     ClaudeChatAttach, ClaudeChatClientMessage, ClaudeChatHistoryRequest, ClaudeChatState,
     CreatePhonePairingRequest, EnvVar, ListChatsRequest, ListClaudeChatsRequest, ListPhonesRequest,
@@ -242,7 +242,7 @@ impl RemoteAgentBackend {
         let channel = connect_channel(&self.config.endpoint).await?;
         let mut client = GitTermAgentClient::new(channel);
         let mut request = Request::new(HandshakeRequest {
-            client_name: "GitTerm V5 desktop".to_string(),
+            client_name: "GitTerm V6 desktop".to_string(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
         });
@@ -256,7 +256,7 @@ impl RemoteAgentBackend {
         let response = client
             .handshake(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("handshake failed: {err:?}")))?
+            .map_err(|err| rpc_failed("handshake", err))?
             .into_inner();
 
         Ok(RemoteAgentHandshake {
@@ -296,7 +296,7 @@ impl RemoteAgentBackend {
         let response = client
             .list_dir(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("list_dir failed: {err:?}")))?
+            .map_err(|err| rpc_failed("list_dir", err))?
             .into_inner();
 
         Ok(RemoteAgentDirectory {
@@ -343,15 +343,17 @@ impl RemoteAgentBackend {
         let mut stream = client
             .read_file(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("read_file failed: {err:?}")))?
+            .map_err(|err| rpc_failed("read_file", err))?
             .into_inner();
 
         let mut data = Vec::new();
         let mut total_size = 0u64;
         let mut truncated = false;
-        while let Some(chunk) = stream.message().await.map_err(|err| {
-            RemoteAgentClientError::new(format!("read_file stream failed: {err:?}"))
-        })? {
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|err| rpc_failed("read_file stream", err))?
+        {
             total_size = chunk.total_size;
             truncated = chunk.truncated;
             data.extend_from_slice(&chunk.data);
@@ -385,10 +387,10 @@ impl RemoteAgentBackend {
         let response = client
             .git_status(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("git_status failed: {err:?}")))?
+            .map_err(|err| rpc_failed("git_status", err))?
             .into_inner();
 
-        let map = |file: super::protocol::v5::GitFileStatus| RemoteAgentGitFile {
+        let map = |file: super::protocol::v6::GitFileStatus| RemoteAgentGitFile {
             path: file.path,
             status: file.status,
             is_staged: file.is_staged,
@@ -431,10 +433,10 @@ impl RemoteAgentBackend {
         let response = client
             .git_diff(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("git_diff failed: {err:?}")))?
+            .map_err(|err| rpc_failed("git_diff", err))?
             .into_inner();
 
-        use super::protocol::v5::GitDiffLineKind;
+        use super::protocol::v6::GitDiffLineKind;
         let lines = response
             .lines
             .into_iter()
@@ -471,7 +473,7 @@ impl RemoteAgentBackend {
         let response = GitTermAgentClient::new(channel)
             .list_chats(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("list_chats failed: {err:?}")))?
+            .map_err(|err| rpc_failed("list_chats", err))?
             .into_inner();
         Ok(response
             .chats
@@ -494,7 +496,7 @@ impl RemoteAgentBackend {
         let response = GitTermAgentClient::new(channel)
             .chat_preview(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("chat_preview failed: {err:?}")))?
+            .map_err(|err| rpc_failed("chat_preview", err))?
             .into_inner();
         Ok(crate::chats::ChatPreview {
             messages: response
@@ -519,7 +521,7 @@ impl RemoteAgentBackend {
         let response = GitTermAgentClient::new(channel)
             .list_sessions(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("list_sessions failed: {err:?}")))?
+            .map_err(|err| rpc_failed("list_sessions", err))?
             .into_inner();
         Ok(response
             .sessions
@@ -556,7 +558,7 @@ impl RemoteAgentBackend {
         let response = GitTermAgentClient::new(channel)
             .start_session(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("start_session failed: {err:?}")))?
+            .map_err(|err| rpc_failed("start_session", err))?
             .into_inner();
         Ok(session_from_proto(response))
     }
@@ -568,7 +570,7 @@ impl RemoteAgentBackend {
         let response = GitTermAgentClient::new(channel)
             .stop_session(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("stop_session failed: {err:?}")))?
+            .map_err(|err| rpc_failed("stop_session", err))?
             .into_inner();
         Ok(response.stopped)
     }
@@ -618,10 +620,10 @@ impl RemoteAgentBackend {
         let stream = GitTermAgentClient::new(channel)
             .attach_terminal(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("attach_terminal failed: {err:?}")))?
+            .map_err(|err| rpc_failed("attach_terminal", err))?
             .into_inner();
 
-        use super::protocol::v5::terminal_output;
+        use super::protocol::v6::terminal_output;
         let output = stream.map(|item| {
             item.map_err(|err| RemoteAgentClientError::new(format!("attach stream: {err:?}")))
                 .map(|out| match out.output {
@@ -666,7 +668,7 @@ impl RemoteAgentBackend {
         let stream = GitTermAgentClient::new(channel)
             .claude_chat(request)
             .await
-            .map_err(|err| RemoteAgentClientError::new(format!("claude_chat failed: {err:?}")))?
+            .map_err(|err| rpc_failed("claude_chat", err))?
             .into_inner();
         Ok(Box::pin(stream.map(|item| {
             item.map(|message| message.event_json)
@@ -720,11 +722,7 @@ impl RemoteAgentBackend {
                     status.message()
                 )))
             }
-            Err(err) => {
-                return Err(RemoteAgentClientError::new(format!(
-                    "claude_chat attach failed: {err:?}"
-                )))
-            }
+            Err(err) => return Err(rpc_failed("claude_chat attach", err)),
         };
         Ok(Box::pin(stream.map(|item| {
             item.map(|message| match message.opened {
@@ -755,9 +753,7 @@ impl RemoteAgentBackend {
         let response = GitTermAgentClient::new(channel)
             .list_claude_chats(request)
             .await
-            .map_err(|err| {
-                RemoteAgentClientError::new(format!("list_claude_chats failed: {err:?}"))
-            })?
+            .map_err(|err| rpc_failed("list_claude_chats", err))?
             .into_inner();
         response
             .chats
@@ -873,11 +869,7 @@ impl RemoteAgentBackend {
         {
             Ok(response) => response.into_inner(),
             Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
-            Err(err) => {
-                return Err(RemoteAgentClientError::new(format!(
-                    "claude_chat_history failed: {err:?}"
-                )))
-            }
+            Err(err) => return Err(rpc_failed("claude_chat_history", err)),
         };
         serde_json::from_str(&response.timeline_json)
             .map(Some)
@@ -920,7 +912,7 @@ fn chat_entry_from_proto(entry: ChatEntry) -> Option<crate::chats::ChatIndexEntr
     })
 }
 
-fn session_from_proto(session: super::protocol::v5::Session) -> RemoteAgentSession {
+fn session_from_proto(session: super::protocol::v6::Session) -> RemoteAgentSession {
     RemoteAgentSession {
         session_id: session.session_id,
         workspace_id: session.workspace_id,
@@ -1081,6 +1073,25 @@ pub struct RemoteAgentClientError {
     not_found: bool,
 }
 
+/// What an older agent answers a V6 desktop with: its gRPC router has no
+/// `gitterm.agent.v6.GitTermAgent` service, so every call comes back
+/// `Unimplemented`. Said plainly so the user knows to upgrade the agent.
+pub const OLDER_AGENT_MESSAGE: &str =
+    "remote agent is V5 (or older); upgrade it to V6 (gitterm-v6-agent)";
+
+/// Map a failed RPC to a client error. `Unimplemented` from a V6 agent
+/// cannot happen (it serves every method of this proto), so it means the
+/// agent speaks an older protocol package.
+fn rpc_failed(operation: &str, status: tonic::Status) -> RemoteAgentClientError {
+    if status.code() == tonic::Code::Unimplemented {
+        return RemoteAgentClientError::new(format!(
+            "{OLDER_AGENT_MESSAGE} ({operation} is unimplemented there: {})",
+            status.message()
+        ));
+    }
+    RemoteAgentClientError::new(format!("{operation} failed: {status:?}"))
+}
+
 impl RemoteAgentClientError {
     fn new(message: impl Into<String>) -> Self {
         Self {
@@ -1118,8 +1129,50 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
-    use super::super::protocol::v5::git_term_agent_server::GitTermAgentServer;
+    use super::super::protocol::v6::git_term_agent_server::GitTermAgentServer;
     use super::super::server::{is_authorized_metadata, GitTermAgentService};
+
+    #[test]
+    fn unimplemented_rpc_names_the_older_agent() {
+        let err = rpc_failed("handshake", tonic::Status::unimplemented("no such service"));
+        assert!(err.to_string().contains(OLDER_AGENT_MESSAGE), "{err}");
+        assert!(err.to_string().contains("handshake"), "{err}");
+
+        let err = rpc_failed("handshake", tonic::Status::unavailable("down"));
+        assert!(!err.to_string().contains(OLDER_AGENT_MESSAGE), "{err}");
+        assert!(err.to_string().starts_with("handshake failed"), "{err}");
+    }
+
+    /// An agent without the `gitterm.agent.v6` service (a V5 agent serves
+    /// only `gitterm.agent.v5`) answers `Unimplemented`; the handshake must
+    /// fail promptly with the upgrade message rather than hang or misparse.
+    #[tokio::test]
+    async fn handshake_against_an_agent_without_the_v6_service_says_upgrade() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        std::env::set_var("GITTERM_AGENT_OLDER_TEST_TOKEN", "older-secret");
+        let backend = RemoteAgentBackend::new(RemoteAgentClientConfig {
+            remote_id: "older".to_string(),
+            name: "Older".to_string(),
+            endpoint: format!("http://{addr}"),
+            token_ref: "env:GITTERM_AGENT_OLDER_TEST_TOKEN".to_string(),
+        });
+        let err = tokio::time::timeout(Duration::from_secs(10), backend.handshake())
+            .await
+            .expect("handshake against an older agent must not hang")
+            .unwrap_err();
+        assert!(err.to_string().contains(OLDER_AGENT_MESSAGE), "{err}");
+
+        server.abort();
+    }
 
     #[test]
     fn token_ref_rejects_empty_value() {

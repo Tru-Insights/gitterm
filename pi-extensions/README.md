@@ -3,8 +3,10 @@
 GitTerm attaches its MCP servers to Codex and Claude Code per process
 (`task_mcp::configure_task_command`). pi has no MCP client of its own, so it
 gets the same servers through the `gitterm-mcp` extension here, which reads
-the `GITTERM_V5_TASK_MCP_*` / `GITTERM_V5_BROWSER_MCP_*` variables GitTerm
+the `GITTERM_V6_TASK_MCP_*` / `GITTERM_V6_BROWSER_MCP_*` variables GitTerm
 exports into every terminal and registers the tools via `pi-mcp-adapter`.
+The install is global and shared by versions running side by side, so it
+also reads the V5 (and V4 browser) names, preferring the newest present.
 Outside GitTerm the variables are absent and the extension does nothing.
 
 ## Install (global, once)
