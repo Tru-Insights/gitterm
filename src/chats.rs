@@ -54,6 +54,8 @@ pub struct ChatIndexEntry {
     /// opening title for recognition; this line says what the session has
     /// become since (TRU-158). Claude backend only.
     pub latest: Option<String>,
+    /// When the chat was last worked in: its newest real message's
+    /// timestamp (Claude), else the file's modification time.
     pub mtime: SystemTime,
     pub size: u64,
     /// The recorded cwd no longer exists on disk.
@@ -257,6 +259,7 @@ struct LineMeta {
     message_count: Option<u64>,
     entrypoint: Option<String>,
     message: Option<Value>,
+    timestamp: Option<String>,
 }
 
 impl LineMeta {
@@ -401,6 +404,21 @@ fn claude_ai_title(lines: &[String]) -> Option<String> {
     })
 }
 
+/// When the newest real user or assistant message among `lines` was
+/// written. Reopening a chat appends bookkeeping lines (cost-state,
+/// bridge-session, pr-link), which move the file's modification time
+/// without anyone working in it, so recency comes from here (TRU-170).
+fn last_message_time(lines: &[String]) -> Option<SystemTime> {
+    lines.iter().rev().find_map(|line| {
+        let meta = serde_json::from_str::<LineMeta>(line).ok()?;
+        if !matches!(meta.kind.as_deref(), Some("user" | "assistant")) || !meta.is_real_message() {
+            return None;
+        }
+        let stamp = chrono::DateTime::parse_from_rfc3339(meta.timestamp.as_deref()?).ok()?;
+        Some(SystemTime::from(stamp))
+    })
+}
+
 /// The newest real user message among `lines`, title-formatted. Reuses
 /// the same tail read as [`claude_ai_title`], so finding it costs no
 /// extra I/O.
@@ -471,7 +489,7 @@ fn index_transcript(path: &Path, backend: ChatBackend) -> Option<ChatIndexEntry>
         branch: head.branch,
         title,
         latest,
-        mtime: meta.modified().ok()?,
+        mtime: last_message_time(&tail).or_else(|| meta.modified().ok())?,
         size: meta.len(),
         dead_cwd,
     })
@@ -978,6 +996,34 @@ mod tests {
             entry.latest.as_deref(),
             Some("now enforce verified org context in the api")
         );
+    }
+
+    #[test]
+    fn index_dates_a_chat_by_its_last_message_not_reopen_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let opener = r#"{"type":"user","cwd":"/tmp/x","timestamp":"2026-10-01T18:00:00.000Z","message":{"role":"user","content":"check the regions"}}"#;
+        let reply = r#"{"type":"assistant","timestamp":"2026-10-01T18:27:10.077Z","message":{"role":"assistant","content":"done"}}"#;
+        let worker = r#"{"type":"assistant","isSidechain":true,"timestamp":"2026-10-02T09:00:00.000Z","message":{"role":"assistant","content":"sub"}}"#;
+        // A later reopen writes bookkeeping only.
+        let reopen = r#"{"type":"pr-link","timestamp":"2026-10-26T14:45:07.793Z"}"#;
+        let path = write_transcript(
+            dir.path(),
+            "abc-901.jsonl",
+            &[opener, reply, worker, reopen, r#"{"type":"cost-state"}"#],
+        );
+        let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-10-01T18:27:10.077Z").unwrap();
+        assert_eq!(entry.mtime, SystemTime::from(expected));
+    }
+
+    #[test]
+    fn index_dates_a_chat_without_message_timestamps_by_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let only = user_line("/tmp/x", "main", "no timestamps here");
+        let path = write_transcript(dir.path(), "abc-902.jsonl", &[only.as_str()]);
+        let entry = index_transcript(&path, ChatBackend::Claude).unwrap();
+        let file_time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(entry.mtime, file_time);
     }
 
     #[test]
