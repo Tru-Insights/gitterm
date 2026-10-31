@@ -53,6 +53,7 @@ use gitterm::browser_control::{
     BrowserStatus, BrowserTelemetrySnapshot,
 };
 use gitterm::browser_mcp::{self, BrowserMcpConnection};
+use gitterm::chat_facts;
 use gitterm::chat_page::agent_chat_html;
 use gitterm::chats;
 use gitterm::gh_identity::GH_ACCOUNT_ENV_KEY;
@@ -79,6 +80,7 @@ use gitterm::tasks::{
     TaskRecord, TaskSessionRecord, TaskStore, TaskStoreError, TaskWorktree, TaskWorktreeState,
     VerificationState, WorkspaceIdentity as TaskWorkspaceIdentity, WorkspaceLocationIdentity,
 };
+use gitterm::workspace_overview as overview;
 use gitterm::worktree_follow::{
     self, CacheLookup, WorktreeFollow, WorktreeInfo, WorktreeListCache,
 };
@@ -1647,6 +1649,60 @@ pub enum GitViewMode {
 enum GitSelection {
     Worktree(PathBuf),
     Branch(String),
+}
+
+/// A whole-checkout diff opened from a Workspace overview branch row
+/// (TRU-167). Shown by the diff panel, its lines in the tab's `diff_lines`.
+#[derive(Debug, Clone)]
+struct BranchDiffView {
+    checkout: PathBuf,
+    repo_name: String,
+    branch: String,
+    owner: String,
+    base: Option<overview::BaseChoice>,
+    source: overview::DiffSource,
+    generation: u64,
+    files: usize,
+    truncated: bool,
+    merge_base: Option<String>,
+    error: Option<String>,
+}
+
+/// A loaded branch diff, already shaped for the diff panel.
+#[derive(Debug, Clone)]
+pub struct BranchDiffPayload {
+    lines: Vec<DiffLine>,
+    files: usize,
+    truncated: bool,
+    merge_base: Option<String>,
+}
+
+/// One workspace's overview (TRU-167): the summary from the chat index and
+/// tasks, and the owned branches' git state from the background poller.
+#[derive(Debug, Default)]
+struct WorkspaceOverviewState {
+    summary: overview::WorkSummary,
+    branches: Vec<overview::BranchStatus>,
+    /// Repo-level read failures of the last full refresh.
+    errors: Vec<String>,
+    /// A refresh is running; at most one per workspace.
+    in_flight: bool,
+    /// Bumped per refresh so a stale result is dropped.
+    generation: u64,
+    last_refresh: Option<Instant>,
+    last_full_refresh: Option<Instant>,
+    /// The summary changed since the last full refresh.
+    needs_full: bool,
+    /// Visible refreshes in a row that changed no number; two or more
+    /// stretch the visible tier from 15 s to 30 s.
+    unchanged_streak: u32,
+    /// Whose repos, branches and issues show (default: the most recently
+    /// active coordinator).
+    focus: overview::Focus,
+    /// The "▸ n older" coordinators are unfolded.
+    show_older: bool,
+    /// The "Focus ▾" picker is open.
+    focus_menu_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4037,6 +4093,9 @@ struct TabState {
     diff_load_started_at: Option<Instant>,
     diff_syntax_lines: Option<Vec<Vec<SyntaxHighlightSegment>>>,
     diff_syntax_notice: Option<String>,
+    /// Workspace overview branch diff on screen (TRU-167); `selected_file`
+    /// is then None.
+    branch_diff: Option<BranchDiffView>,
     // For keyboard navigation
     file_index: i32,
     // Track when tab was created for delayed terminal display
@@ -4086,6 +4145,10 @@ struct TabState {
     // Files panels follow it (TRU-146). Derived from the tool stream; never
     // persisted. `repo_path` / `current_dir` stay on the workspace root.
     worktree_follow: WorktreeFollow,
+    // What this chat touches and starts, from the same tool stream, waiting
+    // for its debounced write to the chat's facts file (TRU-166). Claude
+    // chat tabs in local workspaces only.
+    chat_facts: chat_facts::LiveFacts,
     is_git_repo: bool,
 }
 
@@ -4132,6 +4195,7 @@ impl TabState {
             diff_load_started_at: None,
             diff_syntax_lines: None,
             diff_syntax_notice: None,
+            branch_diff: None,
             file_index: -1,
             created_at: Instant::now(),
             sidebar_mode: SidebarMode::Git,
@@ -4150,6 +4214,7 @@ impl TabState {
             claude_config: ClaudeConfig::default(),
             agent_sidebar: AgentActivityState::default(),
             worktree_follow: WorktreeFollow::default(),
+            chat_facts: chat_facts::LiveFacts::default(),
             is_git_repo,
         }
     }
@@ -4306,6 +4371,12 @@ impl TabState {
     /// Chats overview (TRU-154).
     fn chats_overview_open(&self) -> bool {
         self.sidebar_mode == SidebarMode::Chats && self.selected_chat.is_none()
+    }
+
+    /// The diff panel covers the main pane: a Git file diff or a Workspace
+    /// overview branch diff (TRU-167).
+    fn diff_panel_open(&self) -> bool {
+        self.selected_file.is_some() || self.branch_diff.is_some()
     }
 
     fn viewing_file_path(&self) -> Option<&Path> {
@@ -5857,6 +5928,29 @@ pub enum Event {
     // Chats panel (TRU-78)
     RefreshChatIndex,
     ChatIndexLoaded(Vec<chats::ChatIndexEntry>),
+    /// A chat tab's facts write landed (TRU-166).
+    ChatFactsFlushed(usize, Result<(), String>),
+    /// "Index older chats" in the Chats panel (TRU-166).
+    ChatFactsBackfill,
+    ChatFactsBackfilled(Result<chat_facts::BackfillReport, String>),
+    /// Workspace overview (TRU-167): rebuild from the index and reread git.
+    WorkspaceOverviewRefresh,
+    /// A background refresh finished: workspace dir, generation, result.
+    WorkspaceOverviewRefreshed(PathBuf, u64, Box<overview::RefreshOutcome>),
+    /// Open a coordinator's conversation in the main area; the sidebar
+    /// stays on the overview.
+    WorkspaceOverviewOpenChat(String),
+    /// The focus pick was written (or failed with this error).
+    WorkspaceOverviewFocusSaved(Option<String>),
+    /// Read repos, branches and issues for another coordinator, or all.
+    WorkspaceOverviewFocus(overview::Focus),
+    WorkspaceOverviewToggleFocusMenu,
+    WorkspaceOverviewToggleOlder,
+    /// Open the diff panel on an owned checkout.
+    BranchDiffOpen(PathBuf, overview::DiffSource),
+    BranchDiffLoaded(usize, u64, Result<BranchDiffPayload, String>),
+    /// Fold or unfold a root chat's children in the Chats panel.
+    ToggleChatChildren(chats::ChatRef),
     ChatsQueryChanged(String),
     ChatsScopeChanged(chats::ChatScope),
     ChatsBackendFilterChanged(Option<chats::ChatBackend>),
@@ -6208,6 +6302,13 @@ struct App {
     // Chats panel (TRU-78): machine-wide conversation index + UI state.
     // App-level because the index spans workspaces; selection is per-tab.
     chat_index: Vec<chats::ChatIndexEntry>,
+    /// Workspace overviews (TRU-167) by workspace dir; built when the
+    /// panel first opens in that workspace.
+    workspace_overviews: HashMap<PathBuf, WorkspaceOverviewState>,
+    /// Hand-picked overview focus per workspace, kept across restarts.
+    overview_focus_picks: overview::FocusPicks,
+    /// Generation counter for branch diff loads.
+    branch_diff_generation: u64,
     chat_index_loading: bool,
     chat_index_loaded_at: Option<Instant>,
     chat_query: String,
@@ -6218,6 +6319,13 @@ struct App {
     /// remote id). Sections start collapsed so the machine list itself
     /// is scannable; an active search overrides collapse.
     chat_expanded_machines: std::collections::HashSet<String>,
+    /// Root chats whose children are unfolded (TRU-166); per app run. An
+    /// active search unfolds every root with a matching child.
+    chat_expanded_roots: std::collections::HashSet<chats::ChatRef>,
+    /// "Index older chats" is running.
+    chat_backfill_running: bool,
+    /// Result line of the last "Index older chats" run.
+    chat_backfill_note: Option<String>,
     /// The Chats panel's Open section is folded (TRU-148); per app run.
     chat_open_section_collapsed: bool,
     /// Workspace-bar machine groups the user folded (session-only).
@@ -6532,6 +6640,14 @@ const GIT_POLL_SLOW_INTERVAL_MS: u64 = 15000;
 const GIT_POLL_IDLE_INTERVAL_MS: u64 = 30000;
 const GIT_POLL_NON_REPO_INTERVAL_MS: u64 = 20000;
 const GIT_WORKTREES_POLL_INTERVAL_MS: u64 = 15000;
+// Workspace overview polling (TRU-167, design decision 16): the panel on
+// screen rereads every owned checkout on the slow tier; hidden, a stat of
+// each checkout's gitdir gates git on a longer one.
+const OVERVIEW_VISIBLE_POLL: Duration = Duration::from_secs(15);
+const OVERVIEW_VISIBLE_SLOW_POLL: Duration = Duration::from_secs(30);
+const OVERVIEW_HIDDEN_POLL: Duration = Duration::from_secs(60);
+/// Reopening the panel within this of a full read does not read again.
+const OVERVIEW_REOPEN_FRESH: Duration = Duration::from_secs(5);
 // An active task whose session has been quiet this long stops implying
 // progress and shows "no activity since …" instead.
 const TASK_PROGRESS_STALE_SECS: i64 = 120;
@@ -6904,6 +7020,36 @@ fn folder_picker_start_dir(last_chosen: Option<&str>, home: Option<&str>) -> Str
         .find(|dir| !dir.is_empty())
         .unwrap_or("/")
         .to_string()
+}
+
+/// The Chats row's facts line (TRU-166): up to three issue keys, three
+/// repos touched (most edited first) and the fan-out counts, e.g.
+/// "PRJ-101 PRJ-102 · infra auth-service +12 · 38 subagents · 2 workers".
+fn chat_facts_line(facts: &chat_facts::ChatFacts) -> Option<String> {
+    fn capped(items: Vec<String>, max: usize) -> Option<String> {
+        if items.is_empty() {
+            return None;
+        }
+        let mut line = items
+            .iter()
+            .take(max)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if items.len() > max {
+            line.push_str(&format!(" +{}", items.len() - max));
+        }
+        Some(line)
+    }
+    let parts: Vec<String> = [
+        capped(facts.issue_keys.clone(), 3),
+        capped(facts.repo_names(), 3),
+        facts.fan_out_line(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// The picker's "Recent" list for one machine: distinct repo roots from
@@ -10989,7 +11135,12 @@ impl App {
         self.active_workspace_idx
     }
 
-    fn resume_chat_as_tab(&mut self, chat: chats::ChatRef, recreate_dir: bool) -> Task<Event> {
+    fn resume_chat_as_tab(
+        &mut self,
+        chat: chats::ChatRef,
+        recreate_dir: bool,
+        into: Option<usize>,
+    ) -> Task<Event> {
         if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
@@ -11001,7 +11152,7 @@ impl App {
                     "[chats] {} is running on {remote_id}; opening its chat instead of a second process",
                     chat.id
                 );
-                return self.resume_chat_as_chat_tab(chat);
+                return self.resume_chat_as_chat_tab(chat, into);
             }
             return self.resume_remote_chat(chat.id, remote_id);
         }
@@ -11033,7 +11184,9 @@ impl App {
         }
 
         let mut tasks = Vec::new();
-        let ws_idx = self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name);
+        let ws_idx = into.unwrap_or_else(|| {
+            self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name)
+        });
         if ws_idx != self.active_workspace_idx {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
@@ -11060,7 +11213,11 @@ impl App {
     /// process spawns in the tab's `repo_path`), and carries the session id,
     /// so showing it reads the transcript back (`start_agent_history_load`)
     /// and its first prompt spawns Claude with `--resume`.
-    fn resume_chat_as_chat_tab(&mut self, chat: chats::ChatRef) -> Task<Event> {
+    fn resume_chat_as_chat_tab(
+        &mut self,
+        chat: chats::ChatRef,
+        into: Option<usize>,
+    ) -> Task<Event> {
         if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
             return self.focus_workspace_tab(ws_idx, tab_idx);
         }
@@ -11100,7 +11257,9 @@ impl App {
         }
 
         let mut tasks = Vec::new();
-        let ws_idx = self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name);
+        let ws_idx = into.unwrap_or_else(|| {
+            self.ensure_local_workspace_for_chat(&cwd, repo_root.as_deref(), &repo_name)
+        });
         if ws_idx != self.active_workspace_idx {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
@@ -11252,10 +11411,137 @@ impl App {
         Task::batch(tasks)
     }
 
-    fn request_chat_index() -> Task<Event> {
+    /// Child sessions GitTerm's own records name (delegations, tasks a
+    /// coordinator created), keyed by parent chat (TRU-166). Tabs map a
+    /// caller `session_uid` to the chat it hosts.
+    fn chat_child_links(&self) -> Vec<chat_facts::ChildLink> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Vec::new();
+        };
+        let mut uid_to_chat: HashMap<String, String> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .filter_map(|tab| Some((tab.session_uid.clone(), tab.chat_session_id.clone()?)))
+            .collect();
+        for delegation in store.delegations() {
+            if let Some(chat) = &delegation.parent.chat_session_id {
+                uid_to_chat
+                    .entry(delegation.parent.session_uid.clone())
+                    .or_insert_with(|| chat.clone());
+            }
+        }
+        chat_facts::store_links(store.delegations(), store.tasks(), &uid_to_chat)
+    }
+
+    /// Write a chat tab's facts when they are due (TRU-166): debounced while
+    /// a turn runs, at once when `force` (the turn ended). The write runs
+    /// on a blocking thread; one per tab at a time.
+    fn flush_chat_facts(&mut self, tab_id: usize, force: bool) -> Task<Event> {
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|tab| tab.id == tab_id)
+        else {
+            return Task::none();
+        };
+        // Facts are named by the conversation; until the harness reports
+        // one, observations wait.
+        let Some(session_id) = tab.chat_session_id.clone() else {
+            return Task::none();
+        };
+        let Some(pending) = tab.chat_facts.take_due(Instant::now(), force) else {
+            return Task::none();
+        };
+        let children = chat_facts::links_for_parent(&self.chat_child_links(), &session_id);
+        let dir = chat_facts::facts_dir(&config::global_config_dir());
         Task::perform(
             async move {
-                match tokio::task::spawn_blocking(chats::build_local_index).await {
+                tokio::task::spawn_blocking(move || {
+                    chat_facts::flush_live(
+                        &dir,
+                        chats::ChatBackend::Claude,
+                        &session_id,
+                        pending,
+                        children,
+                    )
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("facts write task failed: {error}")))
+            },
+            move |result| Event::ChatFactsFlushed(tab_id, result),
+        )
+    }
+
+    /// "Index older chats" (TRU-166): derive facts for this Mac's Claude
+    /// chats that have none, from their transcripts, a bounded batch per
+    /// press, off the UI thread. Chats a tab hosts are left to that tab.
+    fn start_chat_facts_backfill(&mut self) -> Task<Event> {
+        if self.chat_backfill_running {
+            return Task::none();
+        }
+        let targets: Vec<chat_facts::BackfillTarget> = self
+            .chat_index
+            .iter()
+            .filter(|entry| entry.backend == chats::ChatBackend::Claude)
+            .map(|entry| chat_facts::BackfillTarget {
+                id: entry.id.clone(),
+                path: entry.path.clone(),
+                mtime: entry.mtime,
+            })
+            .collect();
+        // The facts writers: Claude chat tabs on this Mac. A CLI session in
+        // a terminal tab has no writer, so the backfill covers it.
+        let hosted: HashSet<String> = self
+            .workspaces
+            .iter()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|ws| ws.tabs.iter())
+            .filter(|tab| {
+                tab.agent_session()
+                    .is_some_and(|session| session.backend() == tab::AgentBackend::Claude)
+            })
+            .filter_map(|tab| tab.chat_session_id.clone())
+            .collect();
+        let links = self.chat_child_links();
+        let dir = chat_facts::facts_dir(&config::global_config_dir());
+        self.chat_backfill_running = true;
+        self.chat_backfill_note = None;
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let home = dirs::home_dir();
+                    chat_facts::backfill_claude(
+                        targets,
+                        &dir,
+                        &hosted,
+                        &links,
+                        chat_facts::BACKFILL_BATCH,
+                        home.as_deref(),
+                    )
+                })
+                .await
+                .map_err(|error| format!("backfill task failed: {error}"))
+            },
+            Event::ChatFactsBackfilled,
+        )
+    }
+
+    /// Build the local chat index off the UI thread, then merge the facts
+    /// files and fold children under their roots (TRU-166).
+    fn request_chat_index(&self) -> Task<Event> {
+        let facts_dir = chat_facts::facts_dir(&config::global_config_dir());
+        let links = self.chat_child_links();
+        Task::perform(
+            async move {
+                let build = move || {
+                    let mut entries = chats::build_local_index();
+                    chat_facts::attach_facts(&mut entries, &facts_dir);
+                    chat_facts::resolve_tree(&mut entries, &links);
+                    entries
+                };
+                match tokio::task::spawn_blocking(build).await {
                     Ok(entries) => entries,
                     Err(err) => {
                         eprintln!("[chats] index task failed: {err}");
@@ -11280,7 +11566,7 @@ impl App {
             return remote;
         }
         self.chat_index_loading = true;
-        Task::batch([Self::request_chat_index(), remote])
+        Task::batch([self.request_chat_index(), remote])
     }
 
     fn refresh_task_conversation_history(&mut self) -> Task<Event> {
@@ -11288,7 +11574,265 @@ impl App {
             return Task::none();
         }
         self.chat_index_loading = true;
-        Self::request_chat_index()
+        self.request_chat_index()
+    }
+
+    // -----------------------------------------------------------------------
+    // Workspace overview (TRU-167).
+
+    /// The active workspace's dir when its overview applies: it reads this
+    /// Mac's chat index and checkouts, so remote workspaces have none.
+    fn overview_workspace_dir(&self) -> Option<PathBuf> {
+        if self.active_workspace_is_remote() {
+            return None;
+        }
+        self.active_workspace().map(|ws| ws.dir.clone())
+    }
+
+    /// Opens coordinator `id`'s conversation in the main area and keeps the
+    /// sidebar on the overview. A tab of this workspace already hosting the
+    /// chat is switched to; otherwise it is resumed into a new tab through
+    /// the Chats panel's own paths: as a native chat when that is allowed,
+    /// else as a terminal session.
+    fn open_overview_chat(&mut self, id: &str) -> Task<Event> {
+        let chat = chats::ChatRef::local(id);
+        let hosting = self.active_workspace().and_then(|ws| {
+            overview::hosting_tab(ws.tabs.iter().map(|tab| tab.chat_session_id.as_deref()), id)
+        });
+        let open = if let Some(tab_idx) = hosting {
+            self.update(Event::TabSelect(tab_idx))
+        } else {
+            let as_chat = self
+                .find_chat_entry(&chat)
+                .is_some_and(|entry| can_resume_as_chat(entry, ChatMachine::Local, false));
+            if as_chat {
+                self.resume_chat_as_chat_tab(chat, Some(self.active_workspace_idx))
+            } else {
+                self.resume_chat_as_tab(chat, false, Some(self.active_workspace_idx))
+            }
+        };
+        // The tab shown now may carry another sidebar mode (a new tab starts
+        // on Git): put it on the overview.
+        let overview_shown = self
+            .active_tab()
+            .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Workspace);
+        let mode = if overview_shown {
+            Task::none()
+        } else {
+            self.update(Event::SetSidebarMode(SidebarMode::Workspace))
+        };
+        Task::batch([open, mode])
+    }
+
+    /// The active tab shows the Workspace overview.
+    fn workspace_overview_visible(&self) -> bool {
+        !self.sidebar_is_collapsed()
+            && self
+                .active_tab()
+                .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Workspace)
+    }
+
+    /// Rebuilds `dir`'s summary from the chat index and tasks: one pass
+    /// over the index, no I/O. A changed branch claim asks for a full
+    /// refresh.
+    fn rebuild_workspace_overview(&mut self, dir: &Path) {
+        let tasks: Vec<overview::TaskInfo> = self
+            .task_store
+            .as_ref()
+            .map(|store| store.tasks().iter().map(overview::TaskInfo::from).collect())
+            .unwrap_or_default();
+        let focus = self
+            .workspace_overviews
+            .get(dir)
+            .map(|state| state.focus.clone())
+            .unwrap_or_else(|| self.overview_focus_picks.focus_for(dir));
+        let summary = freeze_time!("workspace_overview_summary", {
+            overview::WorkSummary::build(
+                &self.chat_index,
+                dir,
+                &tasks,
+                &focus,
+                std::time::SystemTime::now(),
+            )
+        });
+        let state = self
+            .workspace_overviews
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| WorkspaceOverviewState {
+                focus: focus.clone(),
+                ..Default::default()
+            });
+        if state.summary.candidates != summary.candidates
+            || state.summary.issue_keys != summary.issue_keys
+            || state.summary.key_repos != summary.key_repos
+        {
+            state.needs_full = true;
+        }
+        state.summary = summary;
+    }
+
+    /// Starts a background refresh of `dir`'s overview unless one runs.
+    /// A gated refresh becomes full when owned branches were never read or
+    /// the summary changed since.
+    fn start_workspace_overview_refresh(
+        &mut self,
+        dir: &Path,
+        mode: overview::RefreshMode,
+    ) -> Task<Event> {
+        let Some(state) = self.workspace_overviews.get_mut(dir) else {
+            return Task::none();
+        };
+        if state.in_flight {
+            return Task::none();
+        }
+        let mode = if state.last_full_refresh.is_none() || state.needs_full {
+            overview::RefreshMode::Full
+        } else {
+            mode
+        };
+        if mode == overview::RefreshMode::Full {
+            state.needs_full = false;
+        }
+        state.in_flight = true;
+        state.generation += 1;
+        let generation = state.generation;
+        let plan = overview::RefreshPlan {
+            mode,
+            candidates: state.summary.candidates.clone(),
+            issue_keys: state.summary.issue_keys.clone(),
+            key_repos: state.summary.key_repos.clone(),
+            previous: state.branches.clone(),
+        };
+        let dir = dir.to_path_buf();
+        Task::perform(overview::refresh(plan), move |outcome| {
+            Event::WorkspaceOverviewRefreshed(dir, generation, Box::new(outcome))
+        })
+    }
+
+    /// Opening the panel: rebuild the summary, refresh the chat index if
+    /// stale, and reread git unless that just happened.
+    fn open_workspace_overview(&mut self) -> Task<Event> {
+        let Some(dir) = self.overview_workspace_dir() else {
+            return Task::none();
+        };
+        self.rebuild_workspace_overview(&dir);
+        let index = self.refresh_chat_index_if_stale();
+        let recent = self
+            .workspace_overviews
+            .get(&dir)
+            .and_then(|state| state.last_full_refresh)
+            .is_some_and(|at| at.elapsed() < OVERVIEW_REOPEN_FRESH);
+        let refresh = if recent {
+            Task::none()
+        } else {
+            self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full)
+        };
+        Task::batch([index, refresh])
+    }
+
+    /// Tick-driven polling (design decision 16). While the panel shows, a
+    /// full refresh every 15 s, stretched to 30 s while nothing changes.
+    /// Hidden, the active workspace's overview (once opened) gets a gated
+    /// refresh every 60 s: a stat of each owned checkout's gitdir decides
+    /// whether any git runs.
+    fn poll_workspace_overview(&mut self) -> Task<Event> {
+        let Some(dir) = self.overview_workspace_dir() else {
+            return Task::none();
+        };
+        let visible = self.workspace_overview_visible();
+        let Some(state) = self.workspace_overviews.get(&dir) else {
+            // Shown in a workspace reached without opening the panel there
+            // (a switch path that does not build it): build it now.
+            return if visible {
+                self.open_workspace_overview()
+            } else {
+                Task::none()
+            };
+        };
+        let (interval, mode) = if visible {
+            let interval = if state.unchanged_streak >= 2 {
+                OVERVIEW_VISIBLE_SLOW_POLL
+            } else {
+                OVERVIEW_VISIBLE_POLL
+            };
+            (interval, overview::RefreshMode::Full)
+        } else {
+            (OVERVIEW_HIDDEN_POLL, overview::RefreshMode::Gated)
+        };
+        let due = state.last_refresh.is_none_or(|at| at.elapsed() >= interval);
+        if !due {
+            return Task::none();
+        }
+        self.start_workspace_overview_refresh(&dir, mode)
+    }
+
+    /// Opens the diff panel on an owned checkout of the active workspace's
+    /// overview. The diff is read and shaped off the UI thread.
+    fn open_branch_diff(&mut self, checkout: PathBuf, source: overview::DiffSource) -> Task<Event> {
+        let Some(row) = self.overview_workspace_dir().and_then(|dir| {
+            self.workspace_overviews.get(&dir).and_then(|state| {
+                state
+                    .branches
+                    .iter()
+                    .find(|row| row.owned.checkout == checkout && !row.owned.gone)
+                    .cloned()
+            })
+        }) else {
+            return Task::none();
+        };
+        self.dismiss_viewer_surface();
+        self.branch_diff_generation += 1;
+        let generation = self.branch_diff_generation;
+        let Some(tab) = self.active_tab_mut() else {
+            return Task::none();
+        };
+        tab.close_file_viewer();
+        tab.selected_file = None;
+        tab.file_index = -1;
+        tab.diff_lines.clear();
+        tab.diff_syntax_lines = None;
+        tab.diff_syntax_notice = None;
+        tab.diff_load_in_progress = true;
+        tab.diff_load_started_at = Some(Instant::now());
+        tab.branch_diff = Some(BranchDiffView {
+            checkout: checkout.clone(),
+            repo_name: overview::folder_name(&row.owned.repo),
+            branch: row
+                .owned
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".to_string()),
+            owner: row.owner_label(),
+            base: row.base.clone(),
+            source,
+            generation,
+            files: 0,
+            truncated: false,
+            merge_base: None,
+            error: None,
+        });
+        let tab_id = tab.id;
+        self.settle_agent_surface();
+        let base = row.base.map(|base| base.reference);
+        Task::perform(
+            async move {
+                let diff = overview::load_branch_diff(checkout, source, base).await?;
+                tokio::task::spawn_blocking(move || {
+                    let mut lines: Vec<DiffLine> =
+                        diff.lines.into_iter().map(services::diff_line).collect();
+                    add_word_diffs_to_lines(&mut lines);
+                    BranchDiffPayload {
+                        lines,
+                        files: diff.files,
+                        truncated: diff.truncated,
+                        merge_base: diff.merge_base,
+                    }
+                })
+                .await
+                .map_err(|error| format!("shaping the diff failed: {error}"))
+            },
+            move |result| Event::BranchDiffLoaded(tab_id, generation, result),
+        )
     }
 
     fn request_chat_preview(
@@ -13470,12 +14014,20 @@ impl App {
             viewer_webview: ViewerWebview::None,
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
+            workspace_overviews: HashMap::new(),
+            overview_focus_picks: overview::FocusPicks::load(&overview::FocusPicks::path_in(
+                &config::global_config_dir(),
+            )),
+            branch_diff_generation: 0,
             chat_index_loading: false,
             chat_index_loaded_at: None,
             chat_query: String::new(),
             chat_scope: chats::ChatScope::default(),
             chat_backend_filter: None,
             chat_expanded_machines: std::collections::HashSet::new(),
+            chat_expanded_roots: std::collections::HashSet::new(),
+            chat_backfill_running: false,
+            chat_backfill_note: None,
             chat_open_section_collapsed: false,
             collapsed_machine_groups: std::collections::HashSet::new(),
             machine_menu: None,
@@ -15490,7 +16042,7 @@ fi
             && self.active_tab().is_some_and(|tab| {
                 tab.chats_overview_open()
                     && !(matches!(tab.kind, TabKind::Agent(_))
-                        && (tab.viewing_file_path().is_some() || tab.selected_file.is_some()))
+                        && (tab.viewing_file_path().is_some() || tab.diff_panel_open()))
             })
     }
 
@@ -15610,7 +16162,7 @@ fi
                 Some((tab_id, key)),
             ),
             NavTarget::OpenChat(chat) => {
-                let jump = self.resume_chat_as_chat_tab(chat.clone());
+                let jump = self.resume_chat_as_chat_tab(chat.clone(), None);
                 let arrived_at = self
                     .find_chat_tab(&chat)
                     .map(|(ws_idx, tab_idx)| self.workspaces[ws_idx].tabs[tab_idx].id);
@@ -17071,6 +17623,8 @@ fi
                 // Chats overview shows.
                 tasks.push(self.poll_overview_remote_chats());
                 tasks.push(self.poll_overview_transcripts());
+                // Owned branches of the workspace overview (TRU-167).
+                tasks.push(self.poll_workspace_overview());
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
@@ -17662,6 +18216,20 @@ fi
                 // Claude gets every message with an id, so the CLI reports
                 // its queue state and a queued one can be withdrawn.
                 let mut prompt = prompt;
+                // Issue keys the human names feed the chat's facts (TRU-166);
+                // written with the turn's tool calls.
+                for ws in &mut self.workspaces {
+                    if !matches!(ws.location, WorkspaceLocation::Local { .. }) {
+                        continue;
+                    }
+                    if let Some(t) = ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if t.agent_session()
+                            .is_some_and(|session| session.backend() == tab::AgentBackend::Claude)
+                        {
+                            t.chat_facts.observe_user_text(&prompt.text);
+                        }
+                    }
+                }
                 let mut echo = tab::AgentEvent::submitted_prompt(&prompt, false);
                 // Images a non-Claude backend could not take (pi has no
                 // image input here); the chat says so instead of dropping
@@ -18868,6 +19436,15 @@ fi
                     &ev,
                     tab::AgentEvent::Harness(HarnessEvent::TurnCompleted { .. })
                 );
+                // A chat's facts are written at once when its turn or
+                // process ends, else debounced (TRU-166).
+                let facts_force = matches!(
+                    &ev,
+                    tab::AgentEvent::Harness(
+                        HarnessEvent::TurnCompleted { .. } | HarnessEvent::ProcessExited { .. }
+                    )
+                );
+                let mut facts_tab = false;
                 // Progress capture: what the session last said it was doing.
                 // Only meaningful events feed this — streaming deltas don't.
                 let progress_note: Option<(Option<String>, Option<String>)> = match &ev {
@@ -18919,6 +19496,18 @@ fi
                                         worktree_candidates =
                                             Some((t.repo_path.clone(), candidates));
                                     }
+                                }
+                            }
+                            // Chat facts (TRU-166): every Claude chat tab on
+                            // this Mac, task workers included.
+                            if let (tab::AgentEvent::Harness(harness_event), true) =
+                                (&ev, local_workspace)
+                            {
+                                if t.agent_session().is_some_and(|session| {
+                                    session.backend() == tab::AgentBackend::Claude
+                                }) {
+                                    t.chat_facts.observe(harness_event, home.as_deref());
+                                    facts_tab = true;
                                 }
                             }
                             // The agent session's own end states translate
@@ -19152,6 +19741,11 @@ fi
                         self.consider_worktree_candidates(tab_id, repo_root, candidates)
                     }
                     None => Task::none(),
+                };
+                let follow_task = if facts_tab {
+                    Task::batch([follow_task, self.flush_chat_facts(tab_id, facts_force)])
+                } else {
+                    follow_task
                 };
                 if turn_ended {
                     return Task::batch([
@@ -19686,6 +20280,7 @@ fi
             Event::ClearSelection => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.selected_file = None;
+                    tab.branch_diff = None;
                     tab.file_index = -1;
                     tab.diff_lines.clear();
                     tab.diff_load_in_progress = false;
@@ -19982,6 +20577,13 @@ fi
                     if tab.sidebar_mode == SidebarMode::Chats && tab.selected_chat.is_some() {
                         if let Key::Named(key::Named::Escape) = key.as_ref() {
                             return Task::done(Event::CloseChatPreview);
+                        }
+                    }
+
+                    // Escape closes a Workspace overview branch diff.
+                    if tab.branch_diff.is_some() {
+                        if let Key::Named(key::Named::Escape) = key.as_ref() {
+                            return Task::done(Event::ClearSelection);
                         }
                     }
 
@@ -22047,14 +22649,31 @@ fi
             }
             Event::RefreshChatIndex => {
                 self.chat_index_loading = true;
-                return Self::request_chat_index();
+                return self.request_chat_index();
             }
             Event::ChatIndexLoaded(entries) => {
                 self.chat_index = entries;
                 self.chat_index_loading = false;
                 self.chat_index_loaded_at = Some(Instant::now());
                 self.sync_task_sessions_from_chat_index();
-                return self.request_chat_rank();
+                // Workspace overviews read the index (TRU-167).
+                let dirs: Vec<PathBuf> = self.workspace_overviews.keys().cloned().collect();
+                for dir in &dirs {
+                    self.rebuild_workspace_overview(dir);
+                }
+                let overview_refresh = match self.overview_workspace_dir() {
+                    Some(dir)
+                        if self.workspace_overview_visible()
+                            && self
+                                .workspace_overviews
+                                .get(&dir)
+                                .is_some_and(|state| state.needs_full) =>
+                    {
+                        self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full)
+                    }
+                    _ => Task::none(),
+                };
+                return Task::batch([self.request_chat_rank(), overview_refresh]);
             }
             Event::ChatsQueryChanged(query) => {
                 self.chat_query = query;
@@ -22162,6 +22781,203 @@ fi
             Event::ToggleChatMachine(key) => {
                 if !self.chat_expanded_machines.remove(&key) {
                     self.chat_expanded_machines.insert(key);
+                }
+            }
+            Event::ToggleChatChildren(chat) => {
+                if !self.chat_expanded_roots.remove(&chat) {
+                    self.chat_expanded_roots.insert(chat);
+                }
+            }
+            Event::ChatFactsFlushed(tab_id, result) => {
+                if let Err(error) = result {
+                    eprintln!("[chat-facts] tab {tab_id}: facts not written: {error}");
+                }
+                let tab = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id);
+                let Some(tab) = tab else {
+                    return Task::none();
+                };
+                tab.chat_facts.flush_done();
+                // What arrived during the write: at once when the turn has
+                // ended meanwhile, else on the debounce.
+                let idle = tab.agent_session().is_some_and(|session| {
+                    !matches!(session.state, tab::AgentSessionState::Streaming)
+                });
+                if tab.chat_facts.has_pending() {
+                    return self.flush_chat_facts(tab_id, idle);
+                }
+            }
+            Event::ChatFactsBackfill => return self.start_chat_facts_backfill(),
+            Event::ChatFactsBackfilled(result) => {
+                self.chat_backfill_running = false;
+                match result {
+                    Ok(report) => {
+                        eprintln!("[chat-facts] backfill: {report:?}");
+                        self.chat_backfill_note = Some(report.summary());
+                    }
+                    Err(error) => {
+                        eprintln!("[chat-facts] backfill failed: {error}");
+                        self.chat_backfill_note = Some(format!("Indexing failed: {error}"));
+                    }
+                }
+                self.chat_index_loading = true;
+                return self.request_chat_index();
+            }
+            Event::WorkspaceOverviewRefresh => {
+                let Some(dir) = self.overview_workspace_dir() else {
+                    return Task::none();
+                };
+                self.rebuild_workspace_overview(&dir);
+                let index = if self.chat_index_loading {
+                    Task::none()
+                } else {
+                    self.chat_index_loading = true;
+                    self.request_chat_index()
+                };
+                let refresh =
+                    self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
+                return Task::batch([index, refresh]);
+            }
+            Event::WorkspaceOverviewRefreshed(dir, generation, outcome) => {
+                let Some(state) = self.workspace_overviews.get_mut(&dir) else {
+                    return Task::none();
+                };
+                if state.generation != generation {
+                    return Task::none();
+                }
+                let outcome = *outcome;
+                perf_log!(
+                    "workspace_overview dir={} mode={:?} rows={} git_runs={} unchanged={} took={}ms",
+                    dir.display(),
+                    outcome.mode,
+                    outcome.branches.len(),
+                    outcome.git_runs,
+                    outcome.skipped_unchanged,
+                    outcome.took.as_millis()
+                );
+                for error in &outcome.errors {
+                    eprintln!("[workspace-overview] {}: {error}", dir.display());
+                }
+                state.in_flight = false;
+                state.last_refresh = Some(Instant::now());
+                if outcome.changed_from(&state.branches) {
+                    state.unchanged_streak = 0;
+                } else {
+                    state.unchanged_streak = state.unchanged_streak.saturating_add(1);
+                }
+                if outcome.mode == overview::RefreshMode::Full {
+                    state.last_full_refresh = state.last_refresh;
+                    state.errors = outcome.errors;
+                }
+                state.branches = outcome.branches;
+                // The summary changed while this one ran: read again.
+                if state.needs_full && self.workspace_overview_visible() {
+                    return self
+                        .start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
+                }
+            }
+            Event::WorkspaceOverviewFocus(focus) => {
+                let Some(dir) = self.overview_workspace_dir() else {
+                    return Task::none();
+                };
+                let state = self.workspace_overviews.entry(dir.clone()).or_default();
+                state.focus_menu_open = false;
+                if state.focus == focus {
+                    return Task::none();
+                }
+                state.focus = focus.clone();
+                let save = if self.overview_focus_picks.set(&dir, &focus) {
+                    let picks = self.overview_focus_picks.clone();
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                picks.save(&overview::FocusPicks::path_in(
+                                    &config::global_config_dir(),
+                                ))
+                            })
+                            .await
+                            .map_err(|error| format!("focus save task failed: {error}"))
+                            .and_then(|result| result)
+                        },
+                        |result| Event::WorkspaceOverviewFocusSaved(result.err()),
+                    )
+                } else {
+                    Task::none()
+                };
+                // The rows on screen belong to the old focus: drop them and
+                // any read in flight for it, then read the new one.
+                state.generation += 1;
+                state.in_flight = false;
+                state.branches.clear();
+                state.errors.clear();
+                state.last_full_refresh = None;
+                state.unchanged_streak = 0;
+                self.rebuild_workspace_overview(&dir);
+                let refresh =
+                    self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
+                return Task::batch([save, refresh]);
+            }
+            Event::WorkspaceOverviewFocusSaved(error) => {
+                if let Some(error) = error {
+                    eprintln!("[workspace-overview] could not save the focus pick: {error}");
+                }
+            }
+            Event::WorkspaceOverviewToggleFocusMenu => {
+                if let Some(state) = self
+                    .overview_workspace_dir()
+                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
+                {
+                    state.focus_menu_open = !state.focus_menu_open;
+                }
+            }
+            Event::WorkspaceOverviewToggleOlder => {
+                if let Some(state) = self
+                    .overview_workspace_dir()
+                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
+                {
+                    state.show_older = !state.show_older;
+                }
+            }
+            Event::WorkspaceOverviewOpenChat(id) => {
+                return self.open_overview_chat(&id);
+            }
+            Event::BranchDiffOpen(checkout, source) => {
+                return self.open_branch_diff(checkout, source);
+            }
+            Event::BranchDiffLoaded(tab_id, generation, result) => {
+                let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id)
+                else {
+                    return Task::none();
+                };
+                let Some(view) = tab
+                    .branch_diff
+                    .as_mut()
+                    .filter(|view| view.generation == generation)
+                else {
+                    return Task::none();
+                };
+                tab.diff_load_in_progress = false;
+                tab.diff_load_started_at = None;
+                match result {
+                    Ok(payload) => {
+                        view.files = payload.files;
+                        view.truncated = payload.truncated;
+                        view.merge_base = payload.merge_base;
+                        view.error = None;
+                        tab.diff_lines = payload.lines;
+                    }
+                    Err(error) => {
+                        eprintln!("[workspace-overview] branch diff: {error}");
+                        view.error = Some(error);
+                        tab.diff_lines.clear();
+                    }
                 }
             }
             Event::ToggleChatOpenSection => {
@@ -22288,13 +23104,13 @@ fi
                 self.chat_summary_reply_expanded = !self.chat_summary_reply_expanded;
             }
             Event::ResumeChatAsTab(chat) => {
-                return self.resume_chat_as_tab(chat, false);
+                return self.resume_chat_as_tab(chat, false, None);
             }
             Event::ResumeChatRecreateDir(chat) => {
-                return self.resume_chat_as_tab(chat, true);
+                return self.resume_chat_as_tab(chat, true, None);
             }
             Event::ResumeChatAsChat(chat) => {
-                return self.resume_chat_as_chat_tab(chat);
+                return self.resume_chat_as_chat_tab(chat, None);
             }
             Event::FocusChatTab(chat) => {
                 if let Some((ws_idx, tab_idx)) = self.find_chat_tab(&chat) {
@@ -22985,6 +23801,11 @@ fi
                     let refresh_worktrees_task = self.refresh_worktrees_for_active_tab();
                     let refresh_files_task = self.refresh_files_for_active_tab();
                     let remote_agent_task = self.ensure_active_remote_agent_connection(false);
+                    let overview_task = if self.workspace_overview_visible() {
+                        self.open_workspace_overview()
+                    } else {
+                        Task::none()
+                    };
 
                     // Set scrollable to starting position for the animation
                     let slide_task = iced::advanced::widget::operate(
@@ -23003,6 +23824,7 @@ fi
                         refresh_worktrees_task,
                         refresh_files_task,
                         remote_agent_task,
+                        overview_task,
                         self.present_active_tab_surfaces(),
                     ]);
                 }
@@ -23834,7 +24656,7 @@ fi
         match self.active_tab() {
             Some(tab) if matches!(tab.kind, TabKind::Agent(_)) => {
                 if tab.file_viewer().is_some()
-                    || tab.selected_file.is_some()
+                    || tab.diff_panel_open()
                     || tab.chat_preview_open()
                     || tab.chats_overview_open()
                 {
@@ -23918,6 +24740,12 @@ fi
             if tab.sidebar_mode != mode {
                 if mode == SidebarMode::Chats {
                     tab.sidebar_mode_before_chats = tab.sidebar_mode;
+                }
+                // A branch diff belongs to the Workspace overview.
+                if tab.branch_diff.take().is_some() {
+                    tab.diff_lines.clear();
+                    tab.diff_load_in_progress = false;
+                    tab.diff_load_started_at = None;
                 }
                 if active_workspace_is_remote
                     && !active_workspace_is_remote_agent
@@ -24064,6 +24892,19 @@ fi
                         tab.diff_syntax_notice = None;
                         tab.sidebar_mode = mode;
                         return self.refresh_remote_sessions();
+                    }
+                    SidebarMode::Workspace => {
+                        tab.agent_sidebar.selected_capture_idx = None;
+                        tab.agent_sidebar.conversation = None;
+                        tab.close_file_viewer();
+                        tab.selected_file = None;
+                        tab.diff_lines.clear();
+                        tab.diff_load_in_progress = false;
+                        tab.diff_load_started_at = None;
+                        tab.diff_syntax_lines = None;
+                        tab.diff_syntax_notice = None;
+                        tab.sidebar_mode = mode;
+                        return self.open_workspace_overview();
                     }
                 }
                 tab.sidebar_mode = mode;
@@ -28548,7 +29389,7 @@ fi
                     // Same overlay as terminal tabs; the Agent surface is
                     // hidden underneath (markdown/HTML use the Viewer surface).
                     freeze_time!("view_file_content", { self.view_file_content(tab) })
-                } else if tab.selected_file.is_some() {
+                } else if tab.diff_panel_open() {
                     // Git diff for a selected file covers the chat the same
                     // way it covers a terminal; the Agent surface is hidden.
                     freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
@@ -28577,7 +29418,7 @@ fi
                 freeze_time!("view_chat_preview", { self.view_chats_pane(tab) })
             } else if tab.viewing_file_path().is_some() {
                 freeze_time!("view_file_content", { self.view_file_content(tab) })
-            } else if tab.selected_file.is_some() {
+            } else if tab.diff_panel_open() {
                 freeze_time!("view_diff_panel", { self.view_diff_panel(tab) })
             } else if tab.task_id.is_none() && self.active_task_context_id().is_some() {
                 // In task context the host tab's canvas is the task Overview,
@@ -29238,6 +30079,23 @@ fi
             Event::SetSidebarMode(SidebarMode::Chats),
         );
 
+        // Workspace overview (TRU-167): a glyph, as the spine shows it, so
+        // the text row keeps its width.
+        let workspace_active = tab.sidebar_mode == SidebarMode::Workspace;
+        let workspace_text_color = if workspace_active {
+            theme.text_primary()
+        } else {
+            theme.subtext0()
+        };
+        let workspace_tab = self.view_sidebar_tab(
+            text("\u{25A6}")
+                .size(font)
+                .color(workspace_text_color)
+                .into(),
+            workspace_active,
+            Event::SetSidebarMode(SidebarMode::Workspace),
+        );
+
         let mut tabs = Row::new()
             .spacing(0)
             .push(git_tab)
@@ -29245,7 +30103,8 @@ fi
             .push(tasks_tab)
             .push(agent_tab)
             .push(chats_tab)
-            .push(plans_tab);
+            .push(plans_tab)
+            .push(workspace_tab);
 
         if workspace_is_remote {
             let remote_text_color = if remote_active {
@@ -29339,6 +30198,11 @@ fi
             }
             SidebarMode::Remote => {
                 freeze_time!("view_remote_sidebar", { self.view_remote_sidebar() })
+            }
+            SidebarMode::Workspace => {
+                freeze_time!("view_workspace_overview", {
+                    self.view_workspace_overview(tab)
+                })
             }
         };
 
@@ -29446,12 +30310,13 @@ fi
         task_dots.truncate(3);
 
         let mut modes = vec![
-            ("\u{2387}", SidebarMode::Git),    // ⎇ branch symbol
-            ("\u{1F4C1}", SidebarMode::Files), // 📁 folder
-            ("\u{25C8}", SidebarMode::Tasks),  // ◈ task dispatch
-            ("\u{2726}", SidebarMode::Claude), // ✦ sparkle
-            ("\u{224B}", SidebarMode::Chats),  // ≋ conversation history
-            ("\u{25A4}", SidebarMode::Plans),  // ▤ plans
+            ("\u{2387}", SidebarMode::Git),       // ⎇ branch symbol
+            ("\u{1F4C1}", SidebarMode::Files),    // 📁 folder
+            ("\u{25C8}", SidebarMode::Tasks),     // ◈ task dispatch
+            ("\u{2726}", SidebarMode::Claude),    // ✦ sparkle
+            ("\u{224B}", SidebarMode::Chats),     // ≋ conversation history
+            ("\u{25A4}", SidebarMode::Plans),     // ▤ plans
+            ("\u{25A6}", SidebarMode::Workspace), // ▦ workspace overview
         ];
         if workspace_is_remote {
             modes.push(("\u{2601}", SidebarMode::Remote)); // cloud
@@ -29582,6 +30447,606 @@ fi
                 background: Some(bg.into()),
                 ..Default::default()
             })
+            .into()
+    }
+
+    /// The Workspace overview (TRU-167; mockups screen b's sidebar with
+    /// screen h's branch rows): the workspace's coordinators and fan-out,
+    /// the repos it edited with the branches it owns, and its issue keys.
+    /// A pure render over `workspace_overviews`; git is read by the poller.
+    fn view_workspace_overview<'a>(
+        &'a self,
+        tab: &'a TabState,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        const COORDINATOR_ROWS: usize = 12;
+        const OLDER_ROWS: usize = 20;
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let font_small = self.ui_font_small();
+        let text_primary = theme.text_primary();
+        let text_secondary = theme.text_secondary();
+        let text_muted = theme.text_muted();
+        let hover = theme.bg_overlay();
+        let surface0 = theme.surface0();
+        let section = |label: String| text(label).size(10).color(text_muted).font(mono);
+        let name = self
+            .active_workspace()
+            .map(|ws| ws.name.to_uppercase())
+            .unwrap_or_else(|| "WORKSPACE".to_string());
+        let state = self
+            .overview_workspace_dir()
+            .and_then(|dir| self.workspace_overviews.get(&dir));
+        let reading = state.is_some_and(|state| state.in_flight);
+        let mut refresh = button(
+            text(if reading {
+                "reading\u{2026}"
+            } else {
+                "\u{21BB} Refresh"
+            })
+            .size(11)
+            .color(theme.blue())
+            .font(mono),
+        )
+        .style(self.ghost_button_style())
+        .padding([4, 5]);
+        if state.is_some() && !reading {
+            refresh = refresh.on_press(Event::WorkspaceOverviewRefresh);
+        }
+        let header = row![
+            text(format!("WORKSPACE \u{00B7} {name}"))
+                .size(10)
+                .color(text_muted)
+                .font(mono),
+            iced::widget::Space::new().width(Length::Fill),
+            refresh,
+        ]
+        .align_y(iced::Alignment::Center);
+        let mut content = Column::new().spacing(8).padding([10, 8]).push(header);
+        let finish = |content: Column<'a, Event, Theme, iced::Renderer>| {
+            scrollable(content)
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .into()
+        };
+
+        if self.active_workspace_is_remote() {
+            return finish(
+                content.push(
+                    text("The overview reads this Mac's chats and checkouts; this workspace is on another machine.")
+                        .size(font_small)
+                        .color(text_secondary),
+                ),
+            );
+        }
+        let Some(state) = state else {
+            return finish(
+                content.push(text("Loading\u{2026}").size(font_small).color(text_muted)),
+            );
+        };
+        let summary = &state.summary;
+
+        if !summary.has_facts {
+            let mut hint = Column::new().spacing(6).push(
+                text(if self.chat_index_loading && self.chat_index.is_empty() {
+                    "Loading chats\u{2026}".to_string()
+                } else {
+                    format!(
+                        "No chat facts for this workspace yet ({} chats). Chat tabs record what they touch as they run; for older chats, run Index older chats.",
+                        summary.chat_count
+                    )
+                })
+                .size(font_small)
+                .color(text_secondary),
+            );
+            let label = if self.chat_backfill_running {
+                "Indexing older chats\u{2026}"
+            } else {
+                "Index older chats"
+            };
+            let mut backfill = button(text(label).size(font_small - 1.0).color(theme.accent()))
+                .style(self.ghost_button_style())
+                .padding([3, 8]);
+            if !self.chat_backfill_running && !self.chat_index.is_empty() {
+                backfill = backfill.on_press(Event::ChatFactsBackfill);
+            }
+            hint = hint.push(backfill);
+            if let Some(note) = &self.chat_backfill_note {
+                hint = hint.push(text(note.clone()).size(font_small - 1.0).color(text_muted));
+            }
+            content = content.push(hint);
+        }
+
+        // Focus: whose repos, branches and issues show below.
+        if !summary.coordinators.is_empty() {
+            let focus_button = button(
+                row![
+                    text("Focus:").size(10).color(text_muted).font(mono),
+                    text(overview::shorten(&summary.focus_label(), 46))
+                        .size(font_small)
+                        .color(text_primary)
+                        .width(Length::Fill),
+                    text(if state.focus_menu_open {
+                        "\u{25B4}"
+                    } else {
+                        "\u{25BE}"
+                    })
+                    .size(font_small)
+                    .color(text_muted),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([5, 6])
+            .style(move |_, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        hover
+                    } else {
+                        surface0
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .on_press(Event::WorkspaceOverviewToggleFocusMenu);
+            content = content.push(focus_button);
+            if state.focus_menu_open {
+                let option = |label: String, focus: overview::Focus| {
+                    let active = summary.focus == focus;
+                    button(text(label).size(font_small - 1.0).color(if active {
+                        theme.accent()
+                    } else {
+                        text_primary
+                    }))
+                    .style(self.ghost_button_style())
+                    .padding([3, 8])
+                    .width(Length::Fill)
+                    .on_press(Event::WorkspaceOverviewFocus(focus))
+                };
+                content = content.push(
+                    Column::new()
+                        .spacing(1)
+                        .push(option(
+                            "Most recently active chat".to_string(),
+                            overview::Focus::Latest,
+                        ))
+                        .push(option(
+                            format!(
+                                "All recent work \u{00B7} {} chats, last 7 days",
+                                summary.recent_count()
+                            ),
+                            overview::Focus::AllRecent,
+                        ))
+                        .push(text("or pick a chat below").size(10).color(text_muted)),
+                );
+            }
+        }
+
+        // Chats: coordinators, their fan-out folded under them; the last 7
+        // days listed, older ones folded.
+        if !summary.coordinators.is_empty() {
+            let recent: Vec<&overview::Coordinator> =
+                summary.coordinators.iter().filter(|c| c.recent).collect();
+            let older: Vec<&overview::Coordinator> =
+                summary.coordinators.iter().filter(|c| !c.recent).collect();
+            content = content.push(section(if recent.is_empty() {
+                "CHATS \u{00B7} none in the last 7 days".to_string()
+            } else {
+                format!("CHATS \u{00B7} {} in the last 7 days", recent.len())
+            }));
+            let mut chats = Column::new().spacing(2);
+            for coordinator in recent.iter().take(COORDINATOR_ROWS) {
+                chats = chats.push(self.view_overview_coordinator_row(
+                    coordinator,
+                    summary.focused.contains(&coordinator.id),
+                ));
+            }
+            let more_in_chats = |count: usize| {
+                button(
+                    text(format!("\u{2026} {count} more in Chats"))
+                        .size(10)
+                        .color(theme.accent()),
+                )
+                .style(self.ghost_button_style())
+                .padding([2, 6])
+                .on_press(Event::SetSidebarMode(SidebarMode::Chats))
+            };
+            if recent.len() > COORDINATOR_ROWS {
+                chats = chats.push(more_in_chats(recent.len() - COORDINATOR_ROWS));
+            }
+            if !older.is_empty() {
+                chats = chats.push(
+                    button(
+                        text(format!(
+                            "{} {} older",
+                            if state.show_older {
+                                "\u{25BE}"
+                            } else {
+                                "\u{25B8}"
+                            },
+                            older.len()
+                        ))
+                        .size(10)
+                        .color(text_muted)
+                        .font(mono),
+                    )
+                    .style(self.ghost_button_style())
+                    .padding([2, 6])
+                    .on_press(Event::WorkspaceOverviewToggleOlder),
+                );
+                if state.show_older {
+                    for coordinator in older.iter().take(OLDER_ROWS) {
+                        chats = chats.push(self.view_overview_coordinator_row(
+                            coordinator,
+                            summary.focused.contains(&coordinator.id),
+                        ));
+                    }
+                    if older.len() > OLDER_ROWS {
+                        chats = chats.push(more_in_chats(older.len() - OLDER_ROWS));
+                    }
+                }
+            }
+            content = content.push(chats);
+        }
+
+        // Coordinators that live in another workspace but edited here.
+        if !summary.also_worked.is_empty() {
+            content = content.push(section(format!(
+                "ALSO WORKED HERE \u{00B7} {}",
+                summary.also_worked.len()
+            )));
+            let mut also = Column::new().spacing(2);
+            for item in summary.also_worked.iter().take(COORDINATOR_ROWS) {
+                also = also.push(self.view_overview_coordinator_row_with(
+                    &item.coordinator,
+                    summary.focused.contains(&item.coordinator.id),
+                    Some(item.edits_here),
+                ));
+            }
+            content = content.push(also);
+        }
+
+        // Repos touched, each with the branches the work owns there.
+        let mut groups: Vec<(&Path, Option<u64>, Vec<&overview::BranchStatus>)> = summary
+            .repos
+            .iter()
+            .map(|repo| (repo.dir.as_path(), Some(repo.edits), Vec::new()))
+            .collect();
+        for row in &state.branches {
+            match groups
+                .iter_mut()
+                .find(|(repo, _, _)| *repo == row.owned.repo.as_path())
+            {
+                Some((_, _, rows)) => rows.push(row),
+                None => groups.push((row.owned.repo.as_path(), None, vec![row])),
+            }
+        }
+        if !groups.is_empty() {
+            let owned_count: usize = groups
+                .iter()
+                .map(|(_, _, rows)| rows.iter().filter(|row| !row.owned.gone).count())
+                .sum();
+            content = content.push(section(format!(
+                "REPOS \u{00B7} {} \u{00B7} BRANCHES \u{00B7} {owned_count}",
+                groups.len()
+            )));
+            let home = dirs::home_dir();
+            let selected = tab.branch_diff.as_ref().map(|view| view.checkout.as_path());
+            let mut repos = Column::new().spacing(6);
+            for (repo, edits, rows) in groups {
+                // Worktrees git still lists whose folder is gone: one dim
+                // line per repo, never read.
+                let (gone, rows): (Vec<_>, Vec<_>) =
+                    rows.into_iter().partition(|row| row.owned.gone);
+                let oldest = rows.iter().map(|row| row.checked_at).min();
+                let mut head = row![text(overview::folder_name(repo))
+                    .size(font_small)
+                    .color(text_primary)
+                    .font(mono)]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
+                if let Some(edits) = edits {
+                    head = head.push(
+                        text(format!("{edits} edits"))
+                            .size(10)
+                            .color(text_muted)
+                            .font(mono),
+                    );
+                }
+                head = head.push(iced::widget::Space::new().width(Length::Fill));
+                if let Some(oldest) = oldest {
+                    head = head.push(
+                        text(overview::age_label(oldest))
+                            .size(10)
+                            .color(text_muted)
+                            .font(mono),
+                    );
+                }
+                let mut group = Column::new().spacing(2).push(head);
+                if rows.is_empty() && gone.is_empty() {
+                    let note = if state.last_full_refresh.is_none() {
+                        "reading\u{2026}"
+                    } else {
+                        "no live checkout of this work"
+                    };
+                    group = group.push(text(note).size(10).color(text_muted));
+                }
+                for row in rows {
+                    group = group.push(self.view_overview_branch_row(
+                        row,
+                        home.as_deref(),
+                        selected == Some(row.owned.checkout.as_path()),
+                    ));
+                }
+                if !gone.is_empty() {
+                    let names: Vec<&str> = gone
+                        .iter()
+                        .map(|row| row.owned.branch.as_deref().unwrap_or("(detached)"))
+                        .collect();
+                    group = group.push(
+                        text(format!(
+                            "\u{25B8} {} folder{} gone \u{00B7} {}",
+                            gone.len(),
+                            if gone.len() == 1 { "" } else { "s" },
+                            overview::shorten(&names.join(", "), 60)
+                        ))
+                        .size(10)
+                        .color(theme.overlay0()),
+                    );
+                }
+                repos = repos.push(group);
+            }
+            content = content.push(repos);
+        } else if summary.has_facts {
+            content = content.push(
+                text("No repo edits recorded for this workspace's chats.")
+                    .size(font_small)
+                    .color(text_muted),
+            );
+        }
+
+        if !summary.issue_keys.is_empty() {
+            content = content
+                .push(section(format!(
+                    "ISSUES \u{00B7} {}",
+                    summary.issue_keys.len()
+                )))
+                .push(
+                    text(summary.issue_keys.join(" \u{00B7} "))
+                        .size(font_small)
+                        .color(text_secondary)
+                        .font(mono),
+                );
+        }
+        for error in &state.errors {
+            content = content.push(
+                text(overview::shorten(error, 200))
+                    .size(10)
+                    .color(theme.danger()),
+            );
+        }
+        finish(content)
+    }
+
+    /// One coordinator: title and age, latest line, fan-out and indexed
+    /// children. Clicking focuses it; the ↗ beside it opens the conversation in the
+    /// main area, and "open" marks one a tab already hosts.
+    fn view_overview_coordinator_row<'a>(
+        &'a self,
+        coordinator: &'a overview::Coordinator,
+        focused: bool,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        self.view_overview_coordinator_row_with(coordinator, focused, None)
+    }
+
+    /// As above; `edits_here` adds "n edits here" for a coordinator of
+    /// another workspace.
+    fn view_overview_coordinator_row_with<'a>(
+        &'a self,
+        coordinator: &'a overview::Coordinator,
+        focused: bool,
+        edits_here: Option<u64>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        const CHILD_ROWS: usize = 4;
+        // A tab of this workspace hosts the conversation.
+        let is_open = self.active_workspace().is_some_and(|ws| {
+            overview::hosting_tab(
+                ws.tabs.iter().map(|tab| tab.chat_session_id.as_deref()),
+                &coordinator.id,
+            )
+            .is_some()
+        });
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let font_small = self.ui_font_small();
+        let text_muted = theme.text_muted();
+        let surface0 = theme.surface0();
+        let hover = theme.bg_overlay();
+        let mut body = Column::new().spacing(2).push(
+            row![
+                text("\u{2726}").size(font_small).color(theme.mauve()),
+                text(overview::shorten(&coordinator.title, 70))
+                    .size(font_small)
+                    .color(theme.text_primary())
+                    .width(Length::Fill),
+                text(if is_open { "open" } else { "" })
+                    .size(10)
+                    .color(theme.green()),
+                text(chats::format_age(coordinator.active))
+                    .size(10)
+                    .color(text_muted)
+                    .font(mono),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
+        if let Some(latest) = &coordinator.latest {
+            body = body.push(
+                text(format!("\u{21B3} {}", overview::shorten(latest, 90)))
+                    .size(font_small - 1.0)
+                    .color(theme.text_secondary()),
+            );
+        }
+        if let Some(edits) = edits_here {
+            body = body.push(
+                text(format!(
+                    "{edits} edit{} here",
+                    if edits == 1 { "" } else { "s" }
+                ))
+                .size(10)
+                .color(theme.accent())
+                .font(mono),
+            );
+        }
+        if let Some(fan_out) = &coordinator.fan_out {
+            body = body.push(text(fan_out.clone()).size(10).color(text_muted).font(mono));
+        }
+        for child in coordinator.children.iter().take(CHILD_ROWS) {
+            let kind = match child.kind {
+                Some(chat_facts::ChildKind::Worker) => "worker",
+                Some(chat_facts::ChildKind::Review) => "review",
+                Some(chat_facts::ChildKind::Consult) => "consult",
+                Some(chat_facts::ChildKind::Subagent) => "subagent",
+                None => "chat",
+            };
+            body = body.push(
+                text(format!(
+                    "   {kind} \u{00B7} {} \u{00B7} {}",
+                    overview::shorten(&child.title, 50),
+                    chats::format_age(child.mtime)
+                ))
+                .size(10)
+                .color(text_muted),
+            );
+        }
+        if coordinator.children.len() > CHILD_ROWS {
+            body = body.push(
+                text(format!(
+                    "   \u{2026} {} more",
+                    coordinator.children.len() - CHILD_ROWS
+                ))
+                .size(10)
+                .color(text_muted),
+            );
+        }
+        let focus = button(body)
+            .width(Length::Fill)
+            .padding([5, 6])
+            .style(move |_, status| button::Style {
+                background: Some(
+                    if focused {
+                        surface0
+                    } else if matches!(status, button::Status::Hovered) {
+                        hover
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .on_press(Event::WorkspaceOverviewFocus(overview::Focus::Coordinator(
+                coordinator.id.clone(),
+            )));
+        let open = button(text("\u{2197}").size(font_small).color(theme.accent()))
+            .style(self.ghost_button_style())
+            .padding([4, 5])
+            .on_press(Event::WorkspaceOverviewOpenChat(coordinator.id.clone()));
+        row![focus, open]
+            .spacing(2)
+            .align_y(iced::Alignment::Start)
+            .into()
+    }
+
+    /// One owned checkout: branch and dirty count, then checkout, ahead and
+    /// behind its base, push state, PR when known, owner and last activity.
+    /// Opens the branch diff: Uncommitted when dirty, else vs base.
+    fn view_overview_branch_row<'a>(
+        &'a self,
+        row: &'a overview::BranchStatus,
+        home: Option<&Path>,
+        selected: bool,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let font_small = self.ui_font_small();
+        let text_muted = theme.text_muted();
+        let surface0 = theme.surface0();
+        let hover = theme.bg_overlay();
+        let branch = row.owned.branch.as_deref().unwrap_or("(detached)");
+        let (dirty, dirty_color) = match &row.status {
+            Some(status) if status.files > 0 => (status.dirty_label(), theme.warning()),
+            Some(status) => (status.dirty_label(), text_muted),
+            None => ("\u{2014}".to_string(), text_muted),
+        };
+        let mut parts = vec![overview::short_checkout(&row.owned, home)];
+        match (overview::vs_base_label(row), &row.base) {
+            (Some(label), _) => parts.push(label),
+            (None, None) => parts.push("no base".to_string()),
+            (None, Some(_)) => {}
+        }
+        if let Some(status) = &row.status {
+            parts.push(overview::push_label(status.push_state()));
+        }
+        parts.extend(row.pr_label());
+        parts.push(row.owner_label());
+        if let Some(at) = row.last_activity() {
+            parts.push(chats::format_age(at));
+        }
+        let mut body = Column::new().spacing(1).push(
+            row![
+                text(overview::shorten(branch, 40))
+                    .size(font_small)
+                    .color(theme.text_primary())
+                    .font(mono)
+                    .width(Length::Fill),
+                text(dirty).size(10).color(dirty_color).font(mono),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
+        body = body.push(text(parts.join(" \u{00B7} ")).size(10).color(text_muted));
+        if let Some(error) = &row.error {
+            body = body.push(
+                text(overview::shorten(error, 160))
+                    .size(10)
+                    .color(theme.danger()),
+            );
+        }
+        let source = match (&row.status, &row.base) {
+            (Some(status), Some(_)) if status.files == 0 => overview::DiffSource::VsBase,
+            _ => overview::DiffSource::Uncommitted,
+        };
+        button(body)
+            .width(Length::Fill)
+            .padding([4, 8])
+            .style(move |_, status| button::Style {
+                background: Some(
+                    if selected {
+                        surface0
+                    } else if matches!(status, button::Status::Hovered) {
+                        hover
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .on_press(Event::BranchDiffOpen(row.owned.checkout.clone(), source))
             .into()
     }
 
@@ -32530,8 +33995,6 @@ fi
                 })
             })
             .collect();
-        let selected_bg = theme.surface0();
-        let selected_border = theme.surface1();
         for (section_remote_id, section_entries) in &sections {
             // Machine section header (Everywhere only): a collapsible
             // row with count + status, so the machine list itself is
@@ -32585,28 +34048,28 @@ fi
                 continue;
             }
 
-            // Group by repo root, preserving most-recent-first order. In
-            // relevance order a group is a run of adjacent chats, so the
-            // ranking is never reshuffled by repo.
+            // Fold children under their root chat (TRU-166), then group
+            // the top-level rows by repo root, preserving most-recent-first
+            // order. In relevance order a group is a run of adjacent rows,
+            // so the ranking is never reshuffled by repo.
+            let machine_entries = self.chat_entries_for_machine(section_remote_id.as_deref());
+            let folded = chats::fold_under_roots(section_entries, machine_entries);
             let ranked_section = relevance_ordered && section_remote_id.is_none();
-            let mut groups: Vec<(&std::path::Path, Vec<&chats::ChatIndexEntry>)> = Vec::new();
-            for entry in section_entries {
+            let mut groups: Vec<(&std::path::Path, Vec<&chats::FoldedChat>)> = Vec::new();
+            for folded_chat in &folded {
+                let group_root = folded_chat.root.group_root();
                 let existing = if ranked_section {
-                    groups
-                        .last_mut()
-                        .filter(|(root, _)| *root == entry.group_root())
+                    groups.last_mut().filter(|(root, _)| *root == group_root)
                 } else {
-                    groups
-                        .iter_mut()
-                        .find(|(root, _)| *root == entry.group_root())
+                    groups.iter_mut().find(|(root, _)| *root == group_root)
                 };
                 match existing {
-                    Some((_, list)) => list.push(entry),
-                    None => groups.push((entry.group_root(), vec![entry])),
+                    Some((_, list)) => list.push(folded_chat),
+                    None => groups.push((group_root, vec![folded_chat])),
                 }
             }
 
-            for (root, entries) in groups {
+            for (root, rows) in groups {
                 let group_name = root
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -32616,104 +34079,146 @@ fi
                         text(group_name.to_uppercase())
                             .size(10)
                             .color(theme.text_muted()),
-                        text(format!("{}", entries.len()))
+                        text(format!("{}", rows.len()))
                             .size(10)
                             .color(theme.text_muted()),
                     ]
                     .spacing(6)
                     .padding([6, 2]),
                 );
-                for entry in entries {
-                    let chat_ref = chats::ChatRef::new(section_remote_id.as_deref(), &entry.id);
-                    let is_selected = tab.selected_chat.as_ref() == Some(&chat_ref);
-                    let mut meta = Row::new().spacing(8).push(
-                        text(chats::format_age(entry.mtime))
-                            .size(font_small - 1.0)
-                            .color(theme.text_muted()),
-                    );
-                    if let Some(branch) = &entry.branch {
-                        meta = meta.push(
-                            text(branch.clone())
-                                .size(font_small - 1.0)
-                                .color(theme.text_secondary()),
-                        );
+                for folded_chat in rows {
+                    let entry = folded_chat.root;
+                    let remote_id = section_remote_id.as_deref();
+                    let chat_ref = chats::ChatRef::new(remote_id, &entry.id);
+                    let has_children = entry
+                        .facts
+                        .as_ref()
+                        .is_some_and(|facts| !facts.children.is_empty())
+                        || !folded_chat.children.is_empty();
+                    // A search unfolds a root whose children matched.
+                    let searching = !query.is_empty();
+                    let expanded = has_children
+                        && (self.chat_expanded_roots.contains(&chat_ref)
+                            || (searching
+                                && (!folded_chat.children.is_empty()
+                                    || matches!(
+                                        entry.query_match(&query),
+                                        Some(chats::QueryMatch::Child(_))
+                                    ))));
+                    let fold = has_children.then_some((chat_ref.clone(), expanded));
+                    list = list.push(self.view_chat_row(
+                        entry,
+                        remote_id,
+                        tab.selected_chat.as_ref(),
+                        live_in.get(&(remote_id, entry.id.as_str())).copied(),
+                        &query,
+                        0.0,
+                        fold,
+                    ));
+                    if !expanded {
+                        continue;
                     }
-                    if let Some(ws_name) =
-                        live_in.get(&(section_remote_id.as_deref(), entry.id.as_str()))
-                    {
-                        meta = meta.push(
-                            button(
-                                text(format!("● open in {ws_name}"))
-                                    .size(font_small - 1.0)
-                                    .color(theme.green()),
-                            )
-                            .style(button::text)
-                            .padding(0)
-                            .on_press(Event::FocusChatTab(chat_ref.clone())),
-                        );
-                    } else if entry.possibly_running() {
-                        meta = meta.push(
-                            text("◐ possibly running")
-                                .size(font_small - 1.0)
-                                .color(theme.yellow()),
-                        );
-                    }
-                    if entry.is_worktree {
-                        meta =
-                            meta.push(text("worktree").size(font_small - 1.0).color(theme.mauve()));
-                    }
-                    if let Some(remote_id) = section_remote_id.as_deref() {
-                        meta = meta.push(
-                            text(format!("@ {}", self.chat_machine_name(Some(remote_id))))
-                                .size(font_small - 1.0)
-                                .color(theme.blue()),
-                        );
-                    }
-                    if entry.dead_cwd {
-                        meta =
-                            meta.push(text("⚠ dir gone").size(font_small - 1.0).color(theme.red()));
-                    }
-                    let mut content = Column::new().spacing(2).push(
-                        row![
-                            text("●")
-                                .size(8)
-                                .color(self.chat_backend_color(entry.backend)),
-                            text(entry.title.clone())
-                                .size(font_small)
-                                .color(theme.text_primary()),
-                        ]
-                        .spacing(6),
-                    );
-                    // A long-lived session keeps its opening title above;
-                    // this line says what it has become since (TRU-158).
-                    if let Some(latest) = &entry.latest {
-                        content = content.push(
-                            text(format!("↳ {latest}"))
-                                .size(font_small - 1.0)
-                                .color(theme.text_secondary()),
-                        );
-                    }
-                    let content = content.push(meta);
-                    let mut btn = button(content)
-                        .padding([6, 8])
-                        .width(Length::Fill)
-                        .on_press(Event::SelectChat(chat_ref));
-                    btn = if is_selected {
-                        btn.style(move |_theme, _status| button::Style {
-                            background: Some(selected_bg.into()),
-                            border: iced::Border {
-                                width: 1.0,
-                                color: selected_border,
-                                radius: 6.0.into(),
-                            },
-                            ..Default::default()
-                        })
+                    // Indexed children: while searching, the matching ones;
+                    // unfolded by hand, every child of this root.
+                    let children: Vec<&chats::ChatIndexEntry> = if searching {
+                        folded_chat.children.clone()
                     } else {
-                        btn.style(self.ghost_button_style())
+                        machine_entries
+                            .iter()
+                            .filter(|child| child.root_id.as_deref() == Some(entry.id.as_str()))
+                            .collect()
                     };
-                    list = list.push(btn);
+                    for child in &children {
+                        list = list.push(self.view_chat_row(
+                            child,
+                            remote_id,
+                            tab.selected_chat.as_ref(),
+                            live_in.get(&(remote_id, child.id.as_str())).copied(),
+                            &query,
+                            18.0,
+                            None,
+                        ));
+                    }
+                    // Children with no transcript of their own in the index
+                    // (Claude subagents, Codex review runs): their titles.
+                    if let Some(facts) = &entry.facts {
+                        let indexed: HashSet<&str> = machine_entries
+                            .iter()
+                            .filter(|child| child.root_id.as_deref() == Some(entry.id.as_str()))
+                            .map(|child| child.id.as_str())
+                            .collect();
+                        let others: Vec<&chat_facts::ChatChild> = facts
+                            .children
+                            .iter()
+                            .filter(|child| !indexed.contains(child.session_id.as_str()))
+                            .filter(|child| {
+                                !searching
+                                    || child
+                                        .title
+                                        .as_deref()
+                                        .is_some_and(|title| title.to_lowercase().contains(&query))
+                            })
+                            .collect();
+                        const CHILD_LINES: usize = 8;
+                        let mut lines = Column::new().spacing(1).padding(iced::Padding {
+                            top: 0.0,
+                            right: 8.0,
+                            bottom: 4.0,
+                            left: 26.0,
+                        });
+                        for child in others.iter().rev().take(CHILD_LINES) {
+                            let kind = match child.kind {
+                                chat_facts::ChildKind::Subagent => "subagent",
+                                chat_facts::ChildKind::Worker => "worker",
+                                chat_facts::ChildKind::Review => "review",
+                                chat_facts::ChildKind::Consult => "consult",
+                            };
+                            let title = child.title.as_deref().unwrap_or("untitled");
+                            lines = lines.push(
+                                text(format!("{kind} · {title}"))
+                                    .size(font_small - 1.0)
+                                    .color(theme.text_muted()),
+                            );
+                        }
+                        if others.len() > CHILD_LINES {
+                            lines = lines.push(
+                                text(format!("… {} more", others.len() - CHILD_LINES))
+                                    .size(font_small - 1.0)
+                                    .color(theme.text_muted()),
+                            );
+                        }
+                        if !others.is_empty() {
+                            list = list.push(lines);
+                        }
+                    }
                 }
             }
+        }
+
+        // "Index older chats" (TRU-166): facts for this Mac's chats from
+        // before chat tabs wrote them, and for CLI sessions in terminals.
+        let local_listed = everywhere || active_remote_id.is_none();
+        if local_listed && !self.chat_index.is_empty() {
+            let label = if self.chat_backfill_running {
+                "Indexing older chats…"
+            } else {
+                "Index older chats"
+            };
+            let mut backfill = button(text(label).size(font_small - 1.0).color(theme.accent()))
+                .style(self.ghost_button_style())
+                .padding([3, 8]);
+            if !self.chat_backfill_running {
+                backfill = backfill.on_press(Event::ChatFactsBackfill);
+            }
+            let mut footer = Column::new().spacing(2).padding([8, 8]).push(backfill);
+            if let Some(note) = &self.chat_backfill_note {
+                footer = footer.push(
+                    text(note.clone())
+                        .size(font_small - 1.0)
+                        .color(theme.text_muted()),
+                );
+            }
+            list = list.push(footer);
         }
 
         // Scoped search missed (or partially missed) — widen ring by ring.
@@ -32846,6 +34351,134 @@ fi
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// One chat row of the Chats panel: title, the TRU-158 latest line,
+    /// the facts line (issue keys, repos touched, fan-out; TRU-166), what a
+    /// search matched when it is not on the row, and the meta line.
+    /// `fold` is the root's (ref, unfolded) when it has children.
+    #[allow(clippy::too_many_arguments)]
+    fn view_chat_row(
+        &self,
+        entry: &chats::ChatIndexEntry,
+        remote_id: Option<&str>,
+        selected: Option<&chats::ChatRef>,
+        open_in: Option<&str>,
+        query: &str,
+        indent: f32,
+        fold: Option<(chats::ChatRef, bool)>,
+    ) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let chat_ref = chats::ChatRef::new(remote_id, &entry.id);
+        let is_selected = selected == Some(&chat_ref);
+        let mut meta = Row::new().spacing(8).push(
+            text(chats::format_age(entry.mtime))
+                .size(font_small - 1.0)
+                .color(theme.text_muted()),
+        );
+        if let Some(branch) = &entry.branch {
+            meta = meta.push(
+                text(branch.clone())
+                    .size(font_small - 1.0)
+                    .color(theme.text_secondary()),
+            );
+        }
+        if let Some(ws_name) = open_in {
+            meta = meta.push(
+                button(
+                    text(format!("● open in {ws_name}"))
+                        .size(font_small - 1.0)
+                        .color(theme.green()),
+                )
+                .style(button::text)
+                .padding(0)
+                .on_press(Event::FocusChatTab(chat_ref.clone())),
+            );
+        } else if entry.possibly_running() {
+            meta = meta.push(
+                text("◐ possibly running")
+                    .size(font_small - 1.0)
+                    .color(theme.yellow()),
+            );
+        }
+        if entry.is_worktree {
+            meta = meta.push(text("worktree").size(font_small - 1.0).color(theme.mauve()));
+        }
+        if let Some(remote_id) = remote_id {
+            meta = meta.push(
+                text(format!("@ {}", self.chat_machine_name(Some(remote_id))))
+                    .size(font_small - 1.0)
+                    .color(theme.blue()),
+            );
+        }
+        if entry.dead_cwd {
+            meta = meta.push(text("⚠ dir gone").size(font_small - 1.0).color(theme.red()));
+        }
+        let mut content = Column::new().spacing(2).push(
+            row![
+                text("●")
+                    .size(8)
+                    .color(self.chat_backend_color(entry.backend)),
+                text(entry.title.clone())
+                    .size(font_small)
+                    .color(theme.text_primary()),
+            ]
+            .spacing(6),
+        );
+        // A long-lived session keeps its opening title above; this line
+        // says what it has become since (TRU-158).
+        if let Some(latest) = &entry.latest {
+            content = content.push(
+                text(format!("↳ {latest}"))
+                    .size(font_small - 1.0)
+                    .color(theme.text_secondary()),
+            );
+        }
+        if let Some(label) = (!query.is_empty())
+            .then(|| entry.query_match(query))
+            .flatten()
+            .and_then(|matched| matched.label())
+        {
+            content = content.push(text(label).size(font_small - 1.0).color(theme.accent()));
+        }
+        if let Some(line) = entry.facts.as_ref().and_then(chat_facts_line) {
+            content = content.push(text(line).size(font_small - 1.0).color(theme.text_muted()));
+        }
+        let content = content.push(meta);
+        let mut btn = button(content)
+            .padding(iced::Padding {
+                top: 6.0,
+                right: 8.0,
+                bottom: 6.0,
+                left: 8.0 + indent,
+            })
+            .width(Length::Fill)
+            .on_press(Event::SelectChat(chat_ref));
+        btn = if is_selected {
+            let selected_bg = theme.surface0();
+            let selected_border = theme.surface1();
+            btn.style(move |_theme, _status| button::Style {
+                background: Some(selected_bg.into()),
+                border: iced::Border {
+                    width: 1.0,
+                    color: selected_border,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+        } else {
+            btn.style(self.ghost_button_style())
+        };
+        let Some((root_ref, expanded)) = fold else {
+            return btn.into();
+        };
+        let chevron = if expanded { "▾" } else { "▸" };
+        let toggle = button(text(chevron).size(font_small).color(theme.text_secondary()))
+            .style(self.ghost_button_style())
+            .padding([6, 8])
+            .on_press(Event::ToggleChatChildren(root_ref));
+        row![btn, toggle].align_y(iced::Alignment::Start).into()
     }
 
     /// One Chats overview row: glyph, title, where it lives, what it is
@@ -36984,22 +38617,26 @@ fi
 
         // Header
         let header_bg = theme.bg_overlay();
-        let header = row![
-            text(tab.selected_file.as_deref().unwrap_or(""))
-                .size(font)
-                .color(theme.text_primary()),
-            iced::widget::Space::new().width(Length::Fill),
-            text("j/k: navigate  Esc: back")
-                .size(font_small)
-                .color(theme.text_secondary()),
-            iced::widget::Space::new().width(Length::Fixed(16.0)),
-            button(text("Back to Terminal").size(font))
-                .style(self.ghost_button_style())
-                .padding([4, 12])
-                .on_press(Event::ClearSelection),
-        ]
-        .padding(8)
-        .spacing(8);
+        let header: Element<'_, Event, Theme, iced::Renderer> = match &tab.branch_diff {
+            Some(view) => self.view_branch_diff_header(view),
+            None => row![
+                text(tab.selected_file.as_deref().unwrap_or(""))
+                    .size(font)
+                    .color(theme.text_primary()),
+                iced::widget::Space::new().width(Length::Fill),
+                text("j/k: navigate  Esc: back")
+                    .size(font_small)
+                    .color(theme.text_secondary()),
+                iced::widget::Space::new().width(Length::Fixed(16.0)),
+                button(text("Back to Terminal").size(font))
+                    .style(self.ghost_button_style())
+                    .padding([4, 12])
+                    .on_press(Event::ClearSelection),
+            ]
+            .padding(8)
+            .spacing(8)
+            .into(),
+        };
 
         content =
             content.push(
@@ -37026,13 +38663,35 @@ fi
                         .color(theme.text_secondary()),
                 );
             }
+        } else if let Some(error) = tab
+            .branch_diff
+            .as_ref()
+            .and_then(|view| view.error.as_ref())
+        {
+            diff_column = diff_column.push(text(error.clone()).size(font).color(theme.danger()));
         } else if tab.diff_lines.is_empty() {
-            diff_column = diff_column.push(
-                text("No diff available")
-                    .size(font)
-                    .color(theme.text_secondary()),
-            );
+            let empty = match tab.branch_diff.as_ref() {
+                Some(view) => match (view.source, &view.base) {
+                    (overview::DiffSource::Uncommitted, _) => "No uncommitted changes".to_string(),
+                    (overview::DiffSource::VsBase, Some(base)) => {
+                        format!("No changes against {}", base.reference)
+                    }
+                    (overview::DiffSource::VsBase, None) => "No base branch".to_string(),
+                },
+                None => "No diff available".to_string(),
+            };
+            diff_column = diff_column.push(text(empty).size(font).color(theme.text_secondary()));
         } else {
+            if tab.branch_diff.as_ref().is_some_and(|view| view.truncated) {
+                diff_column = diff_column.push(
+                    text(format!(
+                        "Diff cut at its first {} lines.",
+                        overview::DIFF_LINE_CAP
+                    ))
+                    .size(font_small)
+                    .color(theme.warning()),
+                );
+            }
             let total_lines = tab.diff_lines.len();
             let rendered_lines = total_lines.min(MAX_DIFF_VIEW_RENDER_LINES);
             if total_lines > rendered_lines {
@@ -37099,6 +38758,117 @@ fi
                 ..Default::default()
             })
             .into()
+    }
+
+    /// Diff panel header for a Workspace overview branch diff (TRU-167):
+    /// branch and repo, the two sources, owner and the base with where it
+    /// came from, so the comparison is never a guess.
+    fn view_branch_diff_header<'a>(
+        &'a self,
+        view: &'a BranchDiffView,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let mono = iced::Font::with_name("Menlo");
+        let surface0 = theme.surface0();
+        let hover = theme.bg_crust();
+        let border = theme.border();
+        let text_primary = theme.text_primary();
+        let text_muted = theme.text_muted();
+        let source_button = |label: String, source: overview::DiffSource, enabled: bool| {
+            let active = view.source == source;
+            let mut btn = button(text(label).size(font_small).font(mono))
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if active {
+                            surface0
+                        } else if matches!(status, button::Status::Hovered) {
+                            hover
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: if active { text_primary } else { text_muted },
+                    border: iced::Border {
+                        color: border,
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .padding([3, 8]);
+            if enabled && !active {
+                btn = btn.on_press(Event::BranchDiffOpen(view.checkout.clone(), source));
+            }
+            btn
+        };
+        let vs_label = match &view.base {
+            Some(base) => format!("vs {}", base.reference),
+            None => "vs base".to_string(),
+        };
+        let top = row![
+            text(format!("\u{2387} {}", view.branch))
+                .size(font)
+                .color(text_primary)
+                .font(mono),
+            text(format!("\u{00B7} {}", view.repo_name))
+                .size(font_small)
+                .color(text_muted),
+            iced::widget::Space::new().width(Length::Fill),
+            source_button(
+                "Uncommitted".to_string(),
+                overview::DiffSource::Uncommitted,
+                true
+            ),
+            source_button(vs_label, overview::DiffSource::VsBase, view.base.is_some()),
+            iced::widget::Space::new().width(Length::Fixed(12.0)),
+            text("Esc: back")
+                .size(font_small)
+                .color(theme.text_secondary()),
+            button(text("Back").size(font))
+                .style(self.ghost_button_style())
+                .padding([4, 12])
+                .on_press(Event::ClearSelection),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        let mut facts = vec![
+            view.checkout.display().to_string(),
+            format!("owner: {}", view.owner),
+        ];
+        match &view.base {
+            Some(base) => {
+                let mut copy = format!("base {} ({})", base.reference, base.describe());
+                if let (overview::DiffSource::VsBase, Some(merge_base)) =
+                    (view.source, &view.merge_base)
+                {
+                    copy.push_str(&format!(" @ {merge_base} (merge-base)"));
+                }
+                facts.push(copy);
+            }
+            None => facts.push(
+                "no base: no task base, tracked branch, or develop/main/master/trunk here"
+                    .to_string(),
+            ),
+        }
+        if view.files > 0 {
+            facts.push(format!(
+                "{} file{}",
+                view.files,
+                if view.files == 1 { "" } else { "s" }
+            ));
+        }
+        column![
+            top,
+            text(facts.join(" \u{00B7} "))
+                .size(font_small - 1.0)
+                .color(text_muted),
+        ]
+        .spacing(4)
+        .padding(8)
+        .into()
     }
 
     fn view_diff_line<'a>(
@@ -40781,6 +42551,8 @@ mod tests {
             mtime: std::time::SystemTime::UNIX_EPOCH,
             size: 1,
             dead_cwd,
+            facts: None,
+            root_id: None,
         }
     }
 
@@ -40793,6 +42565,41 @@ mod tests {
             mtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
             ..chat_entry(chats::ChatBackend::Claude, false)
         }
+    }
+
+    #[test]
+    fn chat_facts_line_caps_keys_and_repos_and_counts_children() {
+        let mut facts = chat_facts::ChatFacts::default();
+        assert_eq!(chat_facts_line(&facts), None);
+        for key in ["PRJ-101", "PRJ-102", "PRJ-103", "OPS-1"] {
+            facts.add_issue_key(key);
+        }
+        for (dir, edits) in [("/r/auth-service", 32), ("/r/infra", 135), ("/r/socket", 0)] {
+            facts.repos_touched.push(chat_facts::RepoTouch {
+                dir: PathBuf::from(dir),
+                edits,
+            });
+        }
+        for (id, kind) in [
+            ("a", chat_facts::ChildKind::Subagent),
+            ("b", chat_facts::ChildKind::Subagent),
+            ("c", chat_facts::ChildKind::Worker),
+            ("d", chat_facts::ChildKind::Review),
+        ] {
+            facts.add_child(chat_facts::ChatChild {
+                session_id: id.to_string(),
+                kind,
+                delegation_id: None,
+                task_id: None,
+                title: None,
+            });
+        }
+        assert_eq!(
+            chat_facts_line(&facts).as_deref(),
+            Some(
+                "PRJ-101 PRJ-102 PRJ-103 +1 · infra auth-service socket · 2 subagents · 1 worker · 1 review"
+            )
+        );
     }
 
     #[test]

@@ -406,6 +406,8 @@ mod tests {
             mtime: SystemTime::now() - Duration::from_secs(mins_ago * 60 + 5),
             size: 10,
             dead_cwd: false,
+            facts: None,
+            root_id: None,
         }
     }
 

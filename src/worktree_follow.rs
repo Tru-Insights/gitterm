@@ -348,21 +348,45 @@ struct PendingCall {
     json: String,
 }
 
+/// One tool call whose input is complete.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletedToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
+}
+
 impl ToolInputTracker {
     /// Feeds one harness event; returns candidate paths of a tool call whose
     /// input became complete with it.
     pub fn observe(&mut self, event: &HarnessEvent, home: Option<&Path>) -> Vec<PathBuf> {
+        self.observe_calls(event, is_watched_tool)
+            .map(|call| tool_call_candidates(&call.name, &call.input, home))
+            .unwrap_or_default()
+    }
+
+    /// Feeds one harness event; returns the call of a tool `watch` accepts
+    /// whose input became complete with it. Other tools are never buffered.
+    pub fn observe_calls(
+        &mut self,
+        event: &HarnessEvent,
+        watch: impl Fn(&str) -> bool,
+    ) -> Option<CompletedToolCall> {
         match event {
-            HarnessEvent::SubagentEvent { event, .. } => self.observe(event, home),
+            HarnessEvent::SubagentEvent { event, .. } => self.observe_calls(event, watch),
             HarnessEvent::ItemStarted {
                 id,
                 kind: ItemKind::ToolCall { name, input },
             } => {
-                if !is_watched_tool(name) {
-                    return Vec::new();
+                if !watch(name) {
+                    return None;
                 }
                 if input.as_object().is_some_and(|object| !object.is_empty()) {
-                    return tool_call_candidates(name, input, home);
+                    return Some(CompletedToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
                 }
                 self.pending.insert(
                     id.clone(),
@@ -371,37 +395,39 @@ impl ToolInputTracker {
                         json: String::new(),
                     },
                 );
-                Vec::new()
+                None
             }
             HarnessEvent::ItemInputDelta { id, partial_json } => {
                 if let Some(call) = self.pending.get_mut(id) {
                     call.json.push_str(partial_json);
                 }
-                Vec::new()
+                None
             }
             HarnessEvent::ItemCompleted { id, .. } => {
-                let Some(call) = self.pending.remove(id) else {
-                    return Vec::new();
-                };
+                let call = self.pending.remove(id)?;
                 if call.json.is_empty() {
-                    return Vec::new();
+                    return None;
                 }
                 match serde_json::from_str::<Value>(&call.json) {
-                    Ok(input) => tool_call_candidates(&call.name, &input, home),
+                    Ok(input) => Some(CompletedToolCall {
+                        id: id.clone(),
+                        name: call.name,
+                        input,
+                    }),
                     Err(error) => {
                         eprintln!(
                             "[worktree-follow] {} call {id}: streamed input is not JSON ({error}); skipped",
                             call.name
                         );
-                        Vec::new()
+                        None
                     }
                 }
             }
             HarnessEvent::TurnCompleted { .. } | HarnessEvent::ProcessExited { .. } => {
                 self.pending.clear();
-                Vec::new()
+                None
             }
-            _ => Vec::new(),
+            _ => None,
         }
     }
 }

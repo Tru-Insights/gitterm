@@ -1,6 +1,7 @@
 pub mod agentd;
 pub mod browser_control;
 pub mod browser_mcp;
+pub mod chat_facts;
 pub mod chat_page;
 pub mod chats;
 pub mod codex_review;
@@ -16,4 +17,5 @@ pub mod task_worktree;
 pub mod tasks;
 pub mod usage;
 pub mod workers;
+pub mod workspace_overview;
 pub mod worktree_follow;

@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GitTerm V5 — the workspace is the piece of work</title>
+<style>
+  :root {
+    --base:#1e1e2e; --mantle:#181825; --crust:#11111b;
+    --s0:#313244; --s1:#45475a; --s2:#585b70;
+    --text:#cdd6f4; --sub1:#bac2de; --sub0:#a6adc8;
+    --ov2:#9399b2; --ov1:#7f849c; --ov0:#6c7086;
+    --blue:#89b4fa; --lavender:#b4befe; --sapphire:#74c7ec; --sky:#89dceb;
+    --teal:#94e2d5; --green:#a6e3a1; --yellow:#f9e2af; --peach:#fab387;
+    --maroon:#eba0ac; --red:#f38ba8; --mauve:#cba6f7; --pink:#f5c2e7;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--crust); color:var(--text);
+         font:12px/1.45 Menlo,"SF Mono",Monaco,Consolas,monospace; }
+  header { padding:18px 28px 10px; border-bottom:1px solid var(--s0); background:var(--mantle); }
+  header h1 { margin:0 0 4px; font-size:16px; font-weight:600; }
+  header p { margin:0; color:var(--sub0); }
+  nav { display:flex; gap:4px; padding:10px 28px 0; background:var(--mantle); border-bottom:1px solid var(--s0); }
+  nav button { background:transparent; border:1px solid transparent; border-bottom:none; color:var(--sub0);
+               font:inherit; font-size:11.5px; padding:7px 9px; border-radius:6px 6px 0 0; cursor:pointer; white-space:nowrap; }
+  nav button.on { background:var(--base); color:var(--text); border-color:var(--s0); }
+  section.screen { display:none; padding:22px 28px 60px; max-width:1240px; }
+  section.screen.on { display:block; }
+  h2 { font-size:14px; margin:0 0 6px; }
+  h3 { font-size:12px; margin:18px 0 8px; color:var(--sub1); text-transform:uppercase; letter-spacing:.06em; }
+  p.lead { color:var(--sub0); margin:0 0 16px; max-width:860px; }
+  .legend { display:flex; gap:18px; color:var(--sub0); margin:10px 0 18px; flex-wrap:wrap; }
+  .legend span { display:inline-flex; align-items:center; gap:6px; }
+  .new { border-bottom:1px dashed var(--mauve); }
+  .tag-new { font-size:9px; color:var(--mauve); border:1px dashed var(--mauve); border-radius:3px; padding:0 3px; margin-left:4px; vertical-align:middle; }
+  .cmp { display:grid; grid-template-columns:1fr 1fr; gap:22px; align-items:start; }
+  .cmp > * { min-width:0; }
+  .cap { color:var(--sub0); margin:6px 0 0; font-size:11px; }
+  .cap b { color:var(--sub1); font-weight:600; }
+  .label { font-size:10px; letter-spacing:.08em; text-transform:uppercase; color:var(--ov1); margin:0 0 6px; }
+  .label.today { color:var(--peach); } .label.proposed { color:var(--green); }
+
+  .app { background:var(--base); border:1px solid var(--s1); border-radius:8px; overflow:hidden; box-shadow:0 10px 30px rgba(0,0,0,.45); }
+  .app .titlebar { height:26px; background:var(--mantle); display:flex; align-items:center; padding:0 10px; gap:6px; color:var(--ov1); font-size:11px; border-bottom:1px solid var(--s0); }
+  .app .titlebar i { width:10px; height:10px; border-radius:50%; background:var(--s1); display:inline-block; }
+  .app .titlebar span { margin-left:8px; }
+  .strip { height:33px; display:flex; align-items:center; padding:0 8px; gap:4px; background:var(--mantle); border-bottom:1px solid var(--s0); }
+  .stamp { display:flex; flex-direction:column; line-height:1.05; margin-right:10px; padding-right:10px; border-right:1px solid var(--s0); }
+  .stamp .k { font-size:9px; color:var(--ov1); letter-spacing:.08em; }
+  .stamp .v { font-size:12px; color:var(--text); }
+  .tab { padding:4px 9px; border-radius:5px; color:var(--sub0); white-space:nowrap; }
+  .tab.on { background:var(--base); color:var(--text); border:1px solid var(--s1); }
+  .tab .key { color:var(--ov0); margin-left:6px; font-size:10px; }
+  .tab .g { margin-right:5px; }
+  .body { display:grid; grid-template-columns:34px 256px 1fr; min-height:300px; }
+  .spine { background:var(--mantle); border-right:1px solid var(--s0); display:flex; flex-direction:column; align-items:center; padding-top:8px; gap:10px; color:var(--ov1); }
+  .spine b { color:var(--text); position:relative; }
+  .rail { background:var(--mantle); border-right:1px solid var(--s0); padding:8px 0; overflow:hidden; }
+  .rail .hd { display:flex; justify-content:space-between; align-items:center; padding:2px 10px 6px; color:var(--text); font-weight:600; }
+  .rail .hd small { color:var(--ov1); font-weight:400; }
+  .rail .sec { padding:8px 10px 3px; font-size:9.5px; letter-spacing:.08em; color:var(--ov1); text-transform:uppercase; display:flex; justify-content:space-between; }
+  .row { padding:5px 10px; display:grid; grid-template-columns:14px 1fr auto; column-gap:6px; align-items:start; }
+  .row:hover, .row.sel { background:var(--s0); }
+  .row .t { color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .m { grid-column:2; color:var(--ov1); font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .r { color:var(--ov0); font-size:10.5px; }
+  .row.child { padding-left:26px; } .row.child .t { color:var(--sub0); }
+  .dot { width:7px; height:7px; border-radius:50%; display:inline-block; margin-top:4px; }
+  .canvas { background:var(--base); padding:14px 18px; min-width:0; }
+  .msg { max-width:640px; margin:0 0 12px; }
+  .msg .who { font-size:10px; color:var(--ov1); margin-bottom:2px; letter-spacing:.06em; }
+  .msg .txt { color:var(--sub1); } .msg.user .txt { color:var(--text); }
+  .card { border:1px solid var(--s1); border-radius:6px; background:var(--mantle); padding:7px 10px; margin:6px 0; max-width:640px; }
+  .card .h { display:flex; justify-content:space-between; color:var(--text); } .card .h small { color:var(--ov1); }
+  .card .b { color:var(--sub0); font-size:11px; margin-top:3px; }
+  .fold { display:flex; gap:8px; align-items:center; color:var(--sub0); padding:3px 10px; border-left:2px solid var(--s1); margin:4px 0 4px 2px; font-size:11px; }
+  .fold .st { color:var(--ov0); margin-left:auto; }
+  .bottom { border-top:1px solid var(--s0); background:var(--mantle); }
+  .bottom .tabs { display:flex; gap:2px; padding:4px 8px 0; }
+  .bottom .tabs span { padding:3px 9px; color:var(--sub0); border-radius:4px 4px 0 0; }
+  .bottom .tabs span.on { background:var(--base); color:var(--text); }
+  .bottom .tabs span .dot { width:6px; height:6px; margin:0 5px 1px 0; vertical-align:middle; }
+  .bottom pre { margin:0; padding:6px 10px; background:var(--base); color:var(--ov2); font-size:11px; height:56px; overflow:hidden; }
+
+  .bar { height:30px; display:flex; align-items:center; padding:0 6px; gap:2px; background:var(--mantle); border-top:1px solid var(--s0); white-space:nowrap; overflow:hidden; }
+  .bar .grp { font-size:9px; letter-spacing:.08em; color:var(--ov1); padding:0 6px; text-transform:uppercase; }
+  .bar .sep { width:1px; height:16px; background:var(--s1); margin:0 4px; }
+  .chip { display:inline-flex; align-items:center; gap:5px; padding:3px 8px; border-radius:4px; color:var(--sub0); font-size:11px; }
+  .chip.on { background:var(--base); color:var(--text); border:1px solid var(--s1); }
+  .chip i { width:7px; height:7px; border-radius:50%; display:inline-block; }
+  .chip .n { color:var(--ov0); font-size:9px; margin-left:2px; }
+  .chip.plus { color:var(--ov1); padding:3px 6px; }
+  .chip.park { color:var(--sub0); background:transparent; border:1px dashed var(--s2); }
+  .chip.woke i { box-shadow:0 0 0 2px rgba(250,179,135,.35); }
+  .c-peach{background:var(--peach)} .c-red{background:var(--red)} .c-blue{background:var(--blue)} .c-green{background:var(--green)}
+  .c-lav{background:var(--lavender)} .c-teal{background:var(--teal)} .c-pink{background:var(--pink)} .c-mauve{background:var(--mauve)}
+  .c-yellow{background:var(--yellow)} .c-sky{background:var(--sky)} .c-s2{background:var(--s2)} .c-ov0{background:var(--ov0)}
+
+  .panel { background:var(--mantle); border:1px solid var(--s1); border-radius:8px; width:100%; overflow:hidden; }
+  .panel .ph { padding:8px 10px; border-bottom:1px solid var(--s0); display:flex; flex-direction:column; gap:6px; }
+  .search { background:var(--base); border:1px solid var(--s1); border-radius:4px; padding:4px 8px; color:var(--text); display:flex; gap:6px; }
+  .search .ph2 { color:var(--ov0); } .search .cur { border-left:1px solid var(--text); margin-left:1px; }
+  .scope { display:flex; gap:4px; } .scope span { padding:2px 7px; border-radius:3px; color:var(--sub0); font-size:10.5px; }
+  .scope span.on { background:var(--s0); color:var(--text); } .scope span.right { margin-left:auto; }
+  .list { padding:4px 0; }
+  .crow { padding:5px 10px; display:grid; grid-template-columns:14px 1fr auto; column-gap:6px; }
+  .crow:hover { background:var(--s0); }
+  .crow .t { color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .crow .l { grid-column:2; color:var(--sub0); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .crow .m { grid-column:2; color:var(--ov1); font-size:10.5px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .crow .r { color:var(--ov0); font-size:10.5px; text-align:right; }
+  .crow.child { padding-left:28px; } .crow.child .t { color:var(--sub0); } .crow.dim .t { color:var(--ov1); }
+  .ik { color:var(--sapphire); } .rk { color:var(--teal); }
+  .hl { background:rgba(249,226,175,.22); color:var(--yellow); border-radius:2px; padding:0 2px; }
+  .badge { font-size:9.5px; padding:0 5px; border-radius:3px; border:1px solid var(--s2); color:var(--sub0); }
+  .badge.open { color:var(--green); border-color:var(--green); } .badge.park { color:var(--peach); border-color:var(--peach); }
+  .badge.woke { color:var(--peach); background:rgba(250,179,135,.15); border-color:var(--peach); } .badge.done { color:var(--ov1); }
+  .more { padding:4px 10px; color:var(--ov1); font-size:11px; } .empty { padding:12px 10px; color:var(--ov1); font-size:11px; }
+  .note { background:rgba(203,166,247,.08); border-left:2px solid var(--mauve); padding:6px 10px; margin:12px 0; color:var(--sub1); max-width:860px; }
+
+  .pop { background:var(--mantle); border:1px solid var(--s2); border-radius:8px; padding:12px 14px; width:440px; box-shadow:0 12px 30px rgba(0,0,0,.5); }
+  .pop h4 { margin:0 0 8px; font-size:12px; }
+  .pop .f { margin:8px 0; } .pop .f .k { font-size:10px; color:var(--ov1); letter-spacing:.06em; text-transform:uppercase; margin-bottom:3px; }
+  .inp { background:var(--base); border:1px solid var(--s1); border-radius:4px; padding:5px 8px; color:var(--text); min-height:26px; }
+  .inp.ta { min-height:58px; color:var(--sub1); } .inp .ph2 { color:var(--ov0); }
+  .chips { display:flex; gap:4px; flex-wrap:wrap; }
+  .chips span { padding:2px 7px; border:1px solid var(--s2); border-radius:3px; color:var(--sub0); font-size:10.5px; }
+  .chips span.on { background:var(--s0); color:var(--text); } .chips span.i { color:var(--sapphire); } .chips span.rp { color:var(--teal); }
+  .btns { display:flex; gap:6px; justify-content:flex-end; margin-top:10px; }
+  .btn { padding:4px 10px; border-radius:4px; border:1px solid var(--s2); color:var(--sub0); white-space:nowrap; }
+  .btn.pri { background:var(--blue); color:var(--crust); border-color:var(--blue); font-weight:600; }
+  .steps { display:flex; gap:10px; align-items:stretch; }
+  .steps .st { flex:1; background:var(--mantle); border:1px solid var(--s0); border-radius:6px; padding:8px 10px; color:var(--sub0); }
+  .steps .st b { display:block; color:var(--text); font-weight:600; margin-bottom:3px; } .steps .arrow { align-self:center; color:var(--ov0); }
+  .dialog { background:var(--s0); border:1px solid var(--s2); border-radius:8px; padding:12px; width:360px; color:var(--sub0); }
+  .dialog .files { background:var(--base); border-radius:4px; padding:6px 8px; margin:6px 0; height:92px; overflow:hidden; color:var(--sub0); }
+  .dialog .files div.on { color:var(--text); background:var(--s1); margin:0 -8px; padding:0 8px; }
+  .toast { display:flex; align-items:center; gap:10px; background:var(--s0); border:1px solid var(--s2); border-left:3px solid var(--mauve); border-radius:6px; padding:7px 10px; max-width:640px; color:var(--sub1); }
+  .toast .tx { flex:1; } .toast .btn { padding:2px 8px; } .toast .x { margin-left:auto; color:var(--ov0); }
+  .tip { display:inline-block; background:var(--s0); border:1px solid var(--s2); border-radius:6px; padding:6px 10px; color:var(--sub0); font-size:11px; box-shadow:0 6px 18px rgba(0,0,0,.4); }
+  .tip .t { color:var(--text); margin-bottom:3px; } .tip div { display:flex; gap:6px; align-items:center; }
+  .menu { display:inline-block; background:var(--s0); border:1px solid var(--s2); border-radius:6px; padding:4px 0; min-width:220px; box-shadow:0 6px 18px rgba(0,0,0,.4); }
+  .menu div { padding:4px 12px; color:var(--sub1); } .menu div.on { background:var(--s1); color:var(--text); } .menu div.dim { color:var(--ov0); }
+  .menu hr { border:0; border-top:1px solid var(--s2); margin:4px 0; }
+  .wk { display:grid; grid-template-columns:16px 1fr auto; column-gap:8px; padding:7px 10px; border:1px solid var(--s0); border-radius:6px; margin:4px 0; background:var(--mantle); }
+  .wk .t { color:var(--text); } .wk .m { grid-column:2; color:var(--ov1); font-size:11px; }
+  .wk .r { color:var(--sub0); font-size:11px; display:flex; gap:6px; align-items:center; }
+  .composer { border:1px solid var(--s1); border-radius:6px; background:var(--mantle); padding:6px 10px; color:var(--ov0); max-width:640px; margin-top:8px; }
+  .hdr { display:flex; justify-content:space-between; align-items:center; padding:5px 10px; background:var(--mantle); border-bottom:1px solid var(--s0); color:var(--sub0); font-size:11px; }
+  .hdr .x { color:var(--ov1); border:1px solid var(--s2); border-radius:3px; padding:0 5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GitTerm V5 — the workspace is the piece of work</h1>
+  <p>Mockups for <code>.plans/work-first-ux/design.md</code> (fifth revision: branches and worktrees added as screen h). Catppuccin Mocha, Menlo. Real content: the Cloud migration in <code>acme</code>, the ops-platform workbench, the data-pipeline bookmark. Dashed mauve = data GitTerm does not hold yet. No new words: a <b>workspace</b> is a piece of work with a list of repos; a <b>repo</b> is a repo.</p>
+</header>
+<nav>
+  <button class="on" data-s="a">a · Bar</button>
+  <button data-s="b">b · Inside a workspace</button>
+  <button data-s="c">c · Chat history</button>
+  <button data-s="d">d · Park / done</button>
+  <button data-s="e">e · New workspace</button>
+  <button data-s="f">f · Growing</button>
+  <button data-s="g">g · Opening a repo</button>
+  <button data-s="h">h · Changes across the work</button>
+</nav>
+
+<!-- ============================================================ a -->
+<section class="screen on" id="s-a">
+  <h2>a · The bar: same bar, chips are now pieces of work</h2>
+  <p class="lead">Nothing structural changes in the bar. What changes is what a chip means: a workspace with a name, a colour, and a list of repos. <code>acme</code> is renamed "Cloud migration" by her (inline rename); <code>data-pipeline</code> is parked instead of holding a slot; the closed-workspaces menu behind "+" becomes the parked list. <code>⌃1–9</code>, machine groups and the per-machine "+" are the shipped slice-4b behaviour.</p>
+  <div class="legend"><span><i class="dot c-green"></i> done / result ready</span><span><i class="dot c-peach"></i> needs you</span><span><i class="dot c-s2"></i> idle</span><span><span class="new">dashed</span> = new data</span></div>
+
+  <p class="label today">Today</p>
+  <div class="app"><div class="bar">
+    <span class="grp">This Mac ▾</span>
+    <span class="chip"><i class="c-peach"></i>core-api<span class="n">⌃1</span></span>
+    <span class="chip on"><i class="c-red"></i>gitterm-v5<span class="n">⌃2</span></span>
+    <span class="chip"><i class="c-blue"></i>data-pipeline<span class="n">⌃3</span></span>
+    <span class="chip"><i class="c-peach" style="box-shadow:0 0 0 2px rgba(250,179,135,.3)"></i>ops-platform<span class="n">⌃4</span></span>
+    <span class="chip"><i class="c-lav"></i>web-portal<span class="n">⌃5</span></span>
+    <span class="chip"><i class="c-red"></i>video-editor<span class="n">⌃6</span></span>
+    <span class="chip"><i class="c-green"></i>acme<span class="n">⌃7</span></span>
+    <span class="chip"><i class="c-pink"></i>watch alert app<span class="n">⌃8</span></span>
+    <span class="chip plus">+</span><span class="sep"></span>
+    <span class="grp">Mac Mini ▾</span><span class="chip"><i class="c-peach"></i>remote<span class="n">⌃9</span></span><span class="chip plus">+</span>
+  </div></div>
+  <p class="cap"><b>What the chips mean to her:</b> data-pipeline is open for weeks only so she can find the chat she stopped in; acme is the Cloud migration although it edited seven other repos; ops-platform is a week-old workbench of ~20 issues; "+" hides 17 closed workspaces whose tabs were discarded on close.</p>
+
+  <p class="label proposed" style="margin-top:22px">Proposed</p>
+  <div class="app"><div class="bar">
+    <span class="grp">This Mac ▾</span>
+    <span class="chip on"><i class="c-teal"></i>Cloud migration<span class="n">⌃1</span></span>
+    <span class="chip"><i class="c-red"></i>gitterm-v5<span class="n">⌃2</span></span>
+    <span class="chip"><i class="c-peach" style="box-shadow:0 0 0 2px rgba(250,179,135,.3)"></i>Ops platform<span class="n">⌃3</span></span>
+    <span class="chip"><i class="c-peach"></i>core-api<span class="n">⌃4</span></span>
+    <span class="chip"><i class="c-lav"></i>web-portal<span class="n">⌃5</span></span>
+    <span class="chip"><i class="c-red"></i>video-editor<span class="n">⌃6</span></span>
+    <span class="chip"><i class="c-pink"></i>watch alert app<span class="n">⌃7</span></span>
+    <span class="chip park">⏸ 5 parked</span>
+    <span class="chip plus">+</span><span class="sep"></span>
+    <span class="grp">Mac Mini ▾</span><span class="chip"><i class="c-peach"></i>remote<span class="n">⌃8</span></span><span class="chip plus">+</span>
+  </div></div>
+  <div style="margin:6px 0 0 40px"><span class="tip"><div class="t">Cloud migration · home ~/GitRepo/acme · since Oct 21</div><div><span class="new">8 repos:</span> infra · api-server · web-portal · auth-service · image-pipeline · blobfs · blobfs-gateway · ws-service</div><div>PRJ-101 · PRJ-102 · 38 subagents · 2 workers · 1 review</div></span></div>
+  <p class="cap"><b>Reading it:</b> seven chips instead of eight because the bookmark is parked. Hovering a chip lists the workspace's repos and issue keys <span class="tag-new">new</span>. The attention ring is the shipped one. "⏸ 5 parked" is the old closed list with notes (screen d). Chips stay plain: no repo dots, no folding, no second zone. A workspace's bar group is its home folder's machine, even if it lists a repo on the Mac Mini.</p>
+</section>
+
+<!-- ============================================================ b -->
+<section class="screen" id="s-b">
+  <h2>b · Inside a workspace: "Cloud migration"</h2>
+  <p class="lead">The coordinator chat is the canvas. The sidebar's Workspace perspective lists its chats (fan-out folded under each coordinator), its repos with console or dev-server state, and the issue keys it carries. The bottom panel shows the consoles and terminals of all its repos together, labelled by repo. The real session: started in <code>~/GitRepo/acme</code> (a folder of 112 repos), 190 edits in infra, worktrees named for PRJ-101 and PRJ-102.</p>
+
+  <div class="app">
+    <div class="titlebar"><i></i><i></i><i></i><span>GitTerm V5 — Cloud migration</span></div>
+    <div class="strip">
+      <div class="stamp"><span class="k">WORKSPACE · home acme</span><span class="v">Cloud migration</span></div>
+      <span class="tab on"><span class="g">✦</span>Coordinator<span class="key">⌘1</span></span>
+      <span class="tab"><span class="g">⌁</span>Worker · PRJ-101<span class="key">⌘2</span></span>
+      <span class="tab"><span class="g">$</span>infra<span class="key">⌘3</span></span>
+      <span class="tab"><span class="g">$</span>web-portal<span class="key">⌘4</span></span>
+      <span class="tab" style="color:var(--ov1)">+ ▾</span>
+      <span style="margin-left:auto;color:var(--ov1);font-size:11px">web-portal · tracey/prj-102-portal-storage</span>
+      <span class="hdr" style="padding:0 0 0 10px;background:none;border:0"><span class="x">×</span></span>
+    </div>
+    <div class="body">
+      <div class="spine"><span>⎇</span><span>▤</span><b>◈</b><span>✦</span><span>☰</span><span>▦</span></div>
+      <div class="rail">
+        <div class="hd">Cloud migration <small>since Oct 21</small></div>
+        <div class="sec"><span>Chats · 2</span><span>▾</span></div>
+        <div class="row sel"><i class="dot c-green"></i><span class="t">✦ Cloud migration</span><span class="r">● open · 2m</span>
+          <span class="m">↳ point blobfs-gateway at the new storage account</span></div>
+        <div class="row child"><i class="dot c-peach"></i><span class="t">Worker · PRJ-101</span><span class="r">needs you</span>
+          <span class="m">Codex · api-server wt · blocked: cluster ingress</span></div>
+        <div class="row child"><i class="dot c-green"></i><span class="t">Worker · PRJ-102</span><span class="r">done</span>
+          <span class="m">Claude · web-portal wt · handoff: 3 next steps</span></div>
+        <div class="row child"><i class="dot c-green"></i><span class="t">Review · infra vs main</span><span class="r">3 findings</span>
+          <span class="m">Codex · 1 P1 · reviewed at 7c1e2a0</span></div>
+        <div class="row child"><i></i><span class="t">35 subagents ▸</span><span class="r">all done</span></div>
+        <div class="row"><i class="dot c-s2"></i><span class="t">✦ Which images still reference object storage</span><span class="r">Oct 22</span>
+          <span class="m">no fan-out</span></div>
+        <div class="sec"><span>Repos · <span class="new">8</span></span><span>+ add</span></div>
+        <div class="row"><i class="dot c-teal"></i><span class="t">acme <span class="badge">home</span></span><span class="r">folder</span>
+          <span class="m">no git · 1 terminal</span></div>
+        <div class="row"><i class="dot c-yellow"></i><span class="t">infra</span><span class="r">190 edits</span>
+          <span class="m">console ■ idle · main</span></div>
+        <div class="row"><i class="dot c-red"></i><span class="t">api-server <span class="badge">wt</span></span><span class="r">● :8080</span>
+          <span class="m">docker compose up · running</span></div>
+        <div class="row sel"><i class="dot c-lav"></i><span class="t">web-portal <span class="badge">wt</span></span><span class="r">● :3000</span>
+          <span class="m">pnpm run dev · running · current</span></div>
+        <div class="row"><i class="dot c-sky"></i><span class="t">auth-service</span><span class="r"></span>
+          <span class="m">npm run dev · not started</span></div>
+        <div class="row"><i class="dot c-ov0"></i><span class="t">image-pipeline · blobfs · blobfs-gateway · ws-service</span><span class="r"></span>
+          <span class="m">no console yet · added by edits</span></div>
+        <div class="sec"><span>Branches · <span class="new">10</span></span><span>⎇ open ▸</span></div>
+        <div class="row"><i class="dot c-peach"></i><span class="t">3 dirty · 61 ahead · 1 unpushed</span><span class="r">15m</span>
+          <span class="m">image-pipeline prj-102 · 109 uncommitted</span></div>
+        <div class="sec"><span>Issues · <span class="new">2</span></span></div>
+        <div class="row"><i></i><span class="t"><span class="ik">PRJ-101</span> cluster control plane · <span class="ik">PRJ-102</span> web-portal storage</span><span class="r"></span></div>
+      </div>
+      <div class="canvas">
+        <div class="msg user"><div class="who">YOU · 14:02</div><div class="txt">infra is through review. Next: move the web-portal's uploads from object storage to the new storage account and keep blobfs-gateway unchanged.</div></div>
+        <div class="msg"><div class="who">CLAUDE · OPUS</div><div class="txt">Scoping it across web-portal and blobfs-gateway. Fanning out:</div></div>
+        <div class="fold">✦ Subagent · Sonnet · "list every object storage call in web-portal/src"<span class="st">done · 1m 12s · 4.1k tok</span></div>
+        <div class="fold">✦ Subagent · Sonnet · "which blobfs-gateway env vars name a bucket"<span class="st">done · 41s · 2.3k tok</span></div>
+        <div class="fold">✦ Subagent · Opus · "audit image-pipeline for old-cloud SDK calls"<span class="st">done · 3m 05s · 11k tok</span></div>
+        <div class="card"><div class="h"><span>⌁ Worker · Codex · gpt-6-luna · scoped · PRJ-102 web-portal storage</span><small>done · 18m</small></div>
+          <div class="b">web-portal wt <code>tracey/prj-102-portal-storage</code> · handoff: swapped the object storage client for the new storage SDK; 3 next steps; 0 blockers. <b>Send to Claude</b> · Open worker tab · Dismiss</div></div>
+        <div class="msg"><div class="who">CLAUDE · OPUS</div><div class="txt">Worker PRJ-102 reports done. blobfs-gateway needs no change: its bucket comes from <code>JFS_BUCKET</code>, which the new infra sets. Remaining: point the gateway at the new storage account in infra and run the web-portal dev server against it.</div></div>
+        <div class="msg user"><div class="who">YOU · 14:31</div><div class="txt">yes, and start the web-portal dev server</div></div>
+      </div>
+    </div>
+    <div class="bottom">
+      <div class="tabs"><span class="on"><i class="dot c-lav"></i>Console · web-portal ● :3000</span><span><i class="dot c-red"></i>Console · api-server ● :8080</span><span><i class="dot c-yellow"></i>Console · infra ■</span><span><i class="dot c-teal"></i>zsh · acme</span><span><i class="dot c-yellow"></i>zsh · infra</span><span style="color:var(--ov1)">+ ▾</span></div>
+      <pre>  ▲ Next.js 15.2  ready on http://localhost:3000
+  ○ compiling /uploads … done in 1.4s
+  GET /uploads 200 · STORAGE_ACCOUNT=acmeportal</pre>
+    </div>
+    <div class="bar">
+      <span class="grp">This Mac ▾</span>
+      <span class="chip on"><i class="c-teal"></i>Cloud migration<span class="n">⌃1</span></span>
+      <span class="chip"><i class="c-red"></i>gitterm-v5<span class="n">⌃2</span></span>
+      <span class="chip"><i class="c-peach" style="box-shadow:0 0 0 2px rgba(250,179,135,.3)"></i>Ops platform<span class="n">⌃3</span></span>
+      <span class="chip"><i class="c-peach"></i>core-api<span class="n">⌃4</span></span>
+      <span class="chip"><i class="c-lav"></i>web-portal<span class="n">⌃5</span></span>
+      <span class="chip"><i class="c-red"></i>video-editor<span class="n">⌃6</span></span>
+      <span class="chip"><i class="c-pink"></i>watch alert app<span class="n">⌃7</span></span>
+      <span class="chip park">⏸ 5 parked</span><span class="chip plus">+</span>
+    </div>
+  </div>
+  <div class="cmp" style="margin-top:10px">
+    <div>
+      <p class="label">The bottom panel's "+ ▾" picker</p>
+      <div class="menu">
+        <div class="on">New terminal in web-portal <small style="color:var(--ov1)">· current</small></div>
+        <div>api-server · ops-494 wt</div><div>infra</div><div>auth-service</div><div>acme (home)</div>
+        <hr><div class="dim">image-pipeline · no console yet</div><div class="dim">blobfs · blobfs-gateway · ws-service</div>
+        <hr><div class="dim">Mac Mini:web-portal · remote, no local terminal</div>
+      </div>
+    </div>
+    <p class="cap" style="margin-top:18px"><b>Bottom panel:</b> every repo in the list contributes its console and bottom terminals; tabs are labelled and coloured by repo. Ownership is the repo's (<code>ConsoleState</code>, <code>bottom_terminals</code>, which already record <code>cwd</code>); the workspace aggregates. Two workspaces listing web-portal share the one web-portal console, one dev server per repo. A repo with no console yet simply starts one when picked. A remote repo contributes no local terminal (bottom terminals are local PTYs today). <b>Repos section:</b> the home first, then join order; "added by edits" rows came from the auto-add in screen f; the git panel and strip terminals follow the <i>current</i> repo (web-portal here, selected in the rail). <b>Reused:</b> strip and stamp, the Tasks rail layout, R1 subagent rows folded to one line, the S6 worker card, consoles and bottom terminals as they are. <b>New:</b> the repo list on the workspace, the facts behind the chats section, the aggregation.</p>
+  </div>
+</section>
+
+<!-- ============================================================ c -->
+<section class="screen" id="s-c">
+  <h2>c · Chat history for a workspace</h2>
+  <p class="lead">Left: today's Chats panel scoped to ops-platform: 170 sessions in 30 days under ops-platform and bun-api, most of them coordinator children, one flat list keyed by folder; searching PRJ-102 or blobfs finds nothing because <code>matches_query</code> sees title, folder and branch only. Right: the same scope with coordinators only, children folded, issue keys and repos touched on the row, and search over them. The workspace scope now spans the workspace's repo list, so the new cloud work is found from any of its eight repos.</p>
+  <div class="cmp">
+    <div>
+      <p class="label today">Today · This workspace (ops-platform)</p>
+      <div class="panel">
+        <div class="ph"><div class="search">⌕ <span class="ph2">Search chats…</span></div>
+          <div class="scope"><span class="on">This workspace</span><span>This machine</span><span>Everywhere</span><span class="right">Relevant</span></div></div>
+        <div class="list">
+          <div class="more" style="color:var(--ov0)">OPEN</div>
+          <div class="crow"><i class="dot c-green"></i><span class="t">payments vendor integration feasibility</span><span class="r">● open · 2h</span><span class="m">ops-platform · main</span></div>
+          <div class="more" style="color:var(--ov0)">OPS-PLATFORM · 170</div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Implement OPS-847 payment status webhook retry</span><span class="r">3h</span><span class="m">wt tracey/ops-847 · worktree</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Review branch vs develop, focus on webhook idempotency</span><span class="r">4h</span><span class="m">ops-platform · main</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Implement OPS-843 vendor sync pagination</span><span class="r">5h</span><span class="m">wt tracey/ops-843 · worktree</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Implement OPS-841 bill approval audit log</span><span class="r">7h</span><span class="m">wt tracey/ops-841 · worktree</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Find every caller of syncVendor in bun-api</span><span class="r">7h</span><span class="m">core-api · develop</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Implement OPS-836 invoice PDF regen</span><span class="r">1d</span><span class="m">wt tracey/ops-836 · worktree</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Implement OPS-835 ledger export csv</span><span class="r">1d</span><span class="m">wt tracey/ops-835 · worktree</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Review branch vs develop (OPS-828)</span><span class="r">2d</span><span class="m">ops-platform · main</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Implement OPS-828 vendor dedupe on import</span><span class="r">2d</span><span class="m">wt tracey/ops-828 · worktree</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Consult: should bill sync be a queue or a cron</span><span class="r">3d</span><span class="m">ops-platform · main</span></div>
+          <div class="crow dim"><i class="dot c-s2"></i><span class="t">Fix type error in vendorSync.test.ts</span><span class="r">3d</span><span class="m">ops-platform · main</span></div>
+          <div class="more">… 158 more</div>
+        </div>
+      </div>
+      <div class="panel" style="margin-top:8px">
+        <div class="ph"><div class="search">⌕ PRJ-102<span class="cur"></span></div>
+          <div class="scope"><span>This workspace</span><span>This machine</span><span class="on">Everywhere</span></div></div>
+        <div class="empty">No chats match "PRJ-102".</div>
+      </div>
+    </div>
+    <div>
+      <p class="label proposed">Proposed · This workspace (Ops platform · ops-platform, bun-api)</p>
+      <div class="panel">
+        <div class="ph"><div class="search">⌕ <span class="ph2">Search title, issue key, repo, branch…</span></div>
+          <div class="scope"><span class="on">This workspace</span><span>This machine</span><span>Everywhere</span><span class="right">Relevant</span></div></div>
+        <div class="list">
+          <div class="more" style="color:var(--ov0)">COORDINATORS · 3</div>
+          <div class="crow"><i class="dot c-green"></i><span class="t">payments vendor integration feasibility</span><span class="r"><span class="badge open">● open</span> 2h</span>
+            <span class="l">↳ OPS-847: wire payment status webhook retry</span>
+            <span class="m"><span class="new"><span class="ik">OPS-841</span> <span class="ik">OPS-847</span> <span class="ik">OPS-843</span> +17</span> · <span class="new"><span class="rk">ops-platform</span> <span class="rk">bun-api</span></span> · <span class="new">45 subagents · 6 workers · 4 reviews</span> ▸</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Dedupe vendor import path</span><span class="r">9d</span>
+            <span class="l">↳ merged; close OPS-733 after the Friday deploy</span>
+            <span class="m"><span class="ik">OPS-733</span> <span class="ik">OPS-798</span> · <span class="rk">ops-platform</span> · 8 subagents · 1 worker ▸</span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Fix type error in vendorSync.test.ts</span><span class="r">3d</span><span class="m">main · no fan-out</span></div>
+          <div class="more" style="color:var(--ov0)">ALSO TOUCHED THESE REPOS · from other workspaces <span class="tag-new">new</span></div>
+          <div class="crow"><i class="dot c-peach"></i><span class="t">Bun API rate limits</span><span class="r"><span class="badge park">⏸ parked</span> 6d</span>
+            <span class="l">workspace "Bun API rate limits" · 12 edits in ops-platform · stopped at: middleware done, caller untested</span>
+            <span class="m"><span class="ik">PRJ-104</span> · <span class="rk">bun-api</span> <span class="rk">ops-platform</span></span></div>
+        </div>
+      </div>
+      <p class="label proposed" style="margin-top:18px">Proposed · a search hit, Everywhere</p>
+      <div class="panel">
+        <div class="ph"><div class="search">⌕ blobfs<span class="cur"></span></div>
+          <div class="scope"><span>This workspace</span><span>This machine</span><span class="on">Everywhere</span></div></div>
+        <div class="list">
+          <div class="crow"><i class="dot c-green"></i><span class="t">Cloud migration</span><span class="r"><span class="badge open">● open</span> 2m</span>
+            <span class="l">↳ point blobfs-gateway at the new storage account</span>
+            <span class="m">matched repo <span class="hl">blobfs</span>, <span class="hl">blobfs-gateway</span> · workspace Cloud migration · <span class="ik">PRJ-101</span> <span class="ik">PRJ-102</span> · 38 subagents · 2 workers · 1 review ▾</span></div>
+          <div class="crow child"><i class="dot c-peach"></i><span class="t">Worker · Codex · PRJ-101 cluster control plane</span><span class="r">needs you · 1h</span><span class="m">api-server wt</span></div>
+          <div class="crow child"><i class="dot c-green"></i><span class="t">Worker · Claude · PRJ-102 web-portal storage</span><span class="r">done · 18m</span><span class="m">web-portal wt</span></div>
+          <div class="crow child"><i class="dot c-green"></i><span class="t">Review · Codex · infra vs main</span><span class="r">3 findings · 3h</span><span class="m"></span></div>
+          <div class="crow child dim"><i></i><span class="t">35 subagents · all done ▸</span><span class="r"></span></div>
+          <div class="crow"><i class="dot c-s2"></i><span class="t">Dedupe pipeline backfill</span><span class="r"><span class="badge park">⏸ parked</span> 3w</span>
+            <span class="l">matched repo <span class="hl">blobfs</span> · workspace data-pipeline</span></div>
+        </div>
+      </div>
+      <p class="cap"><b>Row anatomy:</b> title, the TRU-158 latest line (↳), then issue keys, repos touched and fan-out counts from the chat's facts file <span class="tag-new">new</span>. A row is a coordinator when no delegation or facts file names its session as a child. "This workspace" = chats started in this workspace plus older transcripts whose cwd is under any of its repos. Search adds issue keys, repos touched and children's titles to <code>matches_query</code> and says which field matched.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ d -->
+<section class="screen" id="s-d">
+  <h2>d · × parks the workspace; done is deliberate</h2>
+  <p class="lead">Today the × in the workspace header (<code>Event::WorkspaceClose</code>) discards the tabs and leaves a bare name in the closed list. Proposed: × keeps the tabs and chat session ids, takes a note prefilled from the latest line, and the workspace leaves the bar. Reopening restores the tabs. The closed list becomes the parked list, with notes. "Done" is a separate action; done workspaces stay findable.</p>
+
+  <h3>1 · Pressing × on "Ops platform"</h3>
+  <div class="cmp">
+    <div class="pop">
+      <h4>Park "Ops platform"</h4>
+      <div class="f"><div class="k">Stopped at <span class="tag-new">new</span></div>
+        <div class="inp ta">OPS-847 webhook retry is wired and tested; waiting on payments vendor sandbox creds before the end-to-end run. OPS-843 pagination still open.</div>
+        <div class="cap">Prefilled from the latest line and the last handoff; edit freely.</div></div>
+      <div class="f"><div class="k">Wake <span class="tag-new">new</span></div>
+        <div class="chips"><span class="on">No wake · manual</span><span>Tomorrow 09:00</span><span>Mon 3 Nov</span><span>Custom date…</span></div></div>
+      <div class="f"><div class="k">Keeps running</div>
+        <div class="cap" style="margin:0">1 worker (OPS-843, Codex) and the bun-api dev server stay up; 5 idle tabs are released and come back on resume. The chip shows "1 running" in the parked list until the worker reports.</div></div>
+      <div class="btns"><span class="btn">Cancel</span><span class="btn">Mark done instead</span><span class="btn pri">Park ↵</span></div>
+    </div>
+    <div>
+      <p class="label">After parking · bar</p>
+      <div class="app"><div class="bar">
+        <span class="grp">This Mac ▾</span>
+        <span class="chip on"><i class="c-teal"></i>Cloud migration<span class="n">⌃1</span></span>
+        <span class="chip"><i class="c-red"></i>gitterm-v5<span class="n">⌃2</span></span>
+        <span class="chip"><i class="c-peach"></i>core-api<span class="n">⌃3</span></span>
+        <span class="chip" style="color:var(--ov1)">… ⌃4–6</span>
+        <span class="chip park">⏸ 6 parked · 1 running</span><span class="chip plus">+</span>
+      </div></div>
+      <p class="cap">The chip is gone and the numbers shift, exactly as closing does today. The bun-api console keeps running because core-api is also an open workspace listing that repo; it would keep running anyway while the parked worker needs it.</p>
+      <p class="label" style="margin-top:14px">When a wake date arrives, or the parked worker reports</p>
+      <div class="app"><div class="bar">
+        <span class="grp">This Mac ▾</span>
+        <span class="chip on"><i class="c-teal"></i>Cloud migration<span class="n">⌃1</span></span>
+        <span class="chip"><i class="c-red"></i>gitterm-v5<span class="n">⌃2</span></span>
+        <span class="chip woke"><i class="c-peach"></i>Ops platform <span class="badge woke">worker done</span></span>
+        <span class="chip" style="color:var(--ov1)">…</span>
+        <span class="chip park">⏸ 5 parked</span>
+      </div></div>
+      <p class="cap">A woken workspace returns as a chip with the attention ring and no restored tabs until she clicks it; clicking shows the note and <b>Resume</b>. Dismissing parks it again with no wake.</p>
+    </div>
+  </div>
+
+  <h3>2 · The parked list (⏸ chip, and the "+" menu where closed workspaces were)</h3>
+  <div class="cmp">
+    <div class="panel">
+      <div class="ph"><div class="search">⌕ <span class="ph2">Search parked…</span></div>
+        <div class="scope"><span class="on">Parked · 6</span><span>Done · 4</span><span>All · 27</span></div></div>
+      <div class="list">
+        <div class="crow"><i class="dot c-peach"></i><span class="t">Ops platform</span><span class="r">just now · 1 running</span>
+          <span class="l">stopped at: OPS-847 wired and tested; waiting on payments vendor sandbox creds…</span>
+          <span class="m"><span class="rk">ops-platform</span> <span class="rk">bun-api</span> · <span class="ik">OPS-847</span> +19 · 5 tabs kept</span></div>
+        <div class="crow"><i class="dot c-s2"></i><span class="t">Bun API rate limits</span><span class="r">6d</span>
+          <span class="l">stopped at: middleware done, ops-platform caller untested</span>
+          <span class="m"><span class="rk">bun-api</span> <span class="rk">ops-platform</span> · <span class="ik">PRJ-104</span> · 3 tabs kept</span></div>
+        <div class="crow"><i class="dot c-s2"></i><span class="t">data-pipeline</span><span class="r">3w</span>
+          <span class="l">stopped at: backfill script written, not yet run against prod</span>
+          <span class="m"><span class="rk">data-pipeline</span> · <span class="ik">OPS-706</span> · 5 tabs kept</span></div>
+        <div class="crow"><i class="dot c-s2"></i><span class="t">api-server-ops-494</span><span class="r">5w</span>
+          <span class="l">no note · parked before notes existed</span>
+          <span class="m"><span class="rk">api-server · ops-494 wt</span></span></div>
+        <div class="crow dim"><i class="dot c-s2"></i><span class="t">core-api-msa-revisions</span><span class="r">2mo</span>
+          <span class="l">folder gone · recreate on resume, or mark done</span></div>
+        <div class="more">… 1 more</div>
+      </div>
+    </div>
+    <div>
+      <p class="label">Selecting a parked row · preview</p>
+      <div class="pop" style="width:100%">
+        <h4>data-pipeline <span class="badge park">⏸ parked 3w</span></h4>
+        <div class="f"><div class="k">Stopped at</div><div class="inp ta" style="min-height:auto">backfill script written, not yet run against prod</div></div>
+        <div class="f"><div class="k">Tabs kept</div><div class="cap" style="margin:0">✦ Dedupe pipeline backfill (coordinator) · ✦ Why is the dedupe key nullable · $ zsh ×3</div></div>
+        <div class="f"><div class="k">Last messages</div><div class="cap" style="margin:0">YOU: don't run it yet, I want to check the dedupe key with Sam first<br>CLAUDE: Understood. The script is at scripts/backfill_dedupe.ts; dry-run flag is --plan. I'll wait.</div></div>
+        <div class="btns"><span class="btn">Mark done</span><span class="btn">Edit note</span><span class="btn pri">Resume · restores 5 tabs</span></div>
+      </div>
+      <p class="cap"><b>Resume</b> is the startup restore path applied to one workspace: chat tabs come back on their session ids in their recorded dirs, terminals as fresh shells in their dirs. <b>Mark done</b> moves the row to the Done filter; the entry stays in <code>workspaces.json</code> and in Chats Everywhere, and shows folded under "Workspaces touching this repo" (screen g). Delete is a separate guarded verb, never implied.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ e -->
+<section class="screen" id="s-e">
+  <h2>e · New workspace: goal first, folder defaulted</h2>
+  <p class="lead">Today a workspace starts from a folder: "+" → folder picker → new tab → <code>claude</code>. That path stays ("Open folder…") and gives a one-repo workspace, which is exactly today. The addition: "New workspace" starts from the goal; repos and issue keys are detected, the home folder is defaulted, and Start creates the workspace with those repos and opens the chat.</p>
+  <div class="cmp">
+    <div>
+      <p class="label today">Today (kept as "Open folder…")</p>
+      <div class="steps">
+        <div class="st"><b>1 · bar "+"</b>Open folder, or one of 17 closed workspaces.</div><span class="arrow">→</span>
+        <div class="st"><b>2 · folder picker</b>One repo, even when the work will span three.</div><span class="arrow">→</span>
+        <div class="st"><b>3 · new tab</b>Terminal or chat in that folder, then type the goal.</div>
+      </div>
+      <div class="dialog" style="margin-top:14px">
+        <div>Select Workspace Folder</div>
+        <div class="files"><div>core-api</div><div>data-pipeline</div><div class="on">acme</div><div>ops-platform</div><div>web-portal</div></div>
+        <div class="btns"><span class="btn">Cancel</span><span class="btn pri">Open</span></div>
+      </div>
+    </div>
+    <div>
+      <p class="label proposed">Proposed · "+" → New workspace</p>
+      <div class="pop" style="width:100%">
+        <h4>New workspace</h4>
+        <div class="f"><div class="k">What are we doing?</div>
+          <div class="inp ta" style="color:var(--text)">Move image-pipeline off old-cloud CodeBuild onto new-cloud DevOps. Reuse the infra modules from the Cloud migration; blobfs-gateway stays as is. PRJ-105.<span class="cur"></span></div></div>
+        <div class="f"><div class="k">Detected <span class="tag-new">new</span></div>
+          <div class="chips"><span class="i">PRJ-105</span><span class="rp">image-pipeline</span><span class="rp">infra</span><span class="rp">blobfs-gateway</span><span style="color:var(--ov1)">related: Cloud migration</span></div>
+          <div class="cap">Issue keys by the repo's key pattern; repos by name against known repos and the folders under known homes. × removes a guess.</div></div>
+        <div class="f"><div class="k">Name · colour · home</div>
+          <div class="chips"><span class="on">image-pipeline to new-cloud DevOps</span><span class="on">● sky</span><span class="on">~/GitRepo/acme <small style="color:var(--ov1)">· common parent</small></span><span>Choose…</span></div></div>
+        <div class="f"><div class="k">Agent</div>
+          <div class="chips"><span class="on">✦ Claude · Opus</span><span>Sonnet</span><span>Fable</span><span style="color:var(--ov1)">permission: default ▾</span></div></div>
+        <div class="btns"><span class="btn">Open folder… instead</span><span class="btn pri">Start ↵</span></div>
+      </div>
+      <p class="cap"><b>Then:</b> a workspace "image-pipeline to new-cloud DevOps" with repos [acme (home), image-pipeline, infra, blobfs-gateway] appears on the bar, and a chat opens in the home with the goal as its first message (existing <code>AgentSubmitPrompt</code> path). The name is Claude's title if she leaves it blank. A plain question with no repos detected gives a one-repo workspace in the chosen folder.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ f -->
+<section class="screen" id="s-f">
+  <h2>f · Growing: repos join, chats continue, work splits off</h2>
+  <p class="lead">Her real case: she opens ops-platform, starts something, and it grows across front end, back end and migrations. The workspace is already the piece of work; it only needs to learn its repos. And a long workbench chat needs to shed topics into their own workspaces.</p>
+
+  <h3>1 · A repo joins when the work touches it (auto, with undo)</h3>
+  <div class="cmp">
+    <div class="app" style="max-width:700px">
+      <div class="strip"><div class="stamp"><span class="k">WORKSPACE</span><span class="v">ops-platform</span></div><span class="tab on"><span class="g">✦</span>Vendor approval flow<span class="key">⌘1</span></span><span class="tab"><span class="g">$</span>zsh<span class="key">⌘2</span></span></div>
+      <div class="canvas" style="min-height:0">
+        <div class="msg"><div class="who">CLAUDE · OPUS</div><div class="txt">The approval UI needs a new <code>approved_by</code> column, so I've started a worker in core-api for the endpoint and will add the migration in data-pipeline next.</div></div>
+        <div class="card"><div class="h"><span>⌁ Worker · Codex · scoped · approval endpoint</span><small>running · 2m</small></div><div class="b">core-api wt <code>tracey/approval-endpoint</code></div></div>
+        <div class="toast" style="margin-top:10px"><span class="tx">◈ <b>core-api</b> added to this workspace's repos (worker started there). Its console and env are the shared ones.</span><span class="btn">Remove</span><span class="btn">Rename workspace…</span><span class="x">×</span></div>
+        <div class="composer">Message Claude…</div>
+      </div>
+    </div>
+    <p class="cap" style="margin-top:0"><b>Rule:</b> a write (Edit/Write) or a worker launch in a folder outside the workspace's repos adds that folder; reads never do. Adding spawns nothing: no console, no shell, no env change for existing tabs. The toast is the undo; "Rename workspace…" is there because a workspace that just grew past its folder usually deserves a name ("acme" became "Cloud migration" this way). The chat's facts file records the touch either way, so even a removed repo still finds the chat in search. Why auto rather than confirm: the touch is already true, and a wrong add costs one tap to undo, while a missed confirm costs the whole "where did this work go" loop.</p>
+  </div>
+
+  <h3>2 · A new chat in the same workspace, optionally seeded</h3>
+  <div class="cmp">
+    <div>
+      <div class="menu">
+        <div class="on">✦ New chat · Claude Opus</div>
+        <div>✦ New chat · seed from "Cloud migration" ▸</div>
+        <div>$ Terminal in web-portal (current)</div>
+        <div>⌁ Agent preset… ⌥⇧1–9</div>
+      </div>
+      <p class="cap">The strip's "+ ▾". A new chat belongs to the workspace it is started in (its facts file records the workspace id); nothing to join. Claude Code compaction keeps the session id, so compaction never needs this. The seed is for tomorrow, after a <code>/clear</code>, or when a coordinator has grown too long.</p>
+    </div>
+    <div class="pop" style="width:100%">
+      <h4>Seed from "Cloud migration"</h4>
+      <div class="inp ta" style="min-height:auto;color:var(--sub1)">Workspace: Cloud migration · PRJ-101, PRJ-102 · repos: infra, api-server, web-portal, auth-service, image-pipeline, blobfs, blobfs-gateway, ws-service<br>Previous chat (Oct 21 → Oct 30): infra through review (Codex: 3 findings fixed); PRJ-102 web-portal storage done, handoff: 3 next steps; PRJ-101 cluster ingress class still blocked.<br>Stopped at: point blobfs-gateway at the new storage account.<br>Detail: resume the previous chat (session 11111111…) if you need it; do not re-read its transcript.</div>
+      <div class="cap">Composed from the workspace entry, the last chat's park note or handoff, and its digest (TRU-155). A summary, never a transcript. Edit before sending.</div>
+      <div class="btns"><span class="btn">Resume previous instead</span><span class="btn pri">Start chat ↵</span></div>
+    </div>
+  </div>
+
+  <h3>3 · New workspace from this chat: one topic leaves the workbench</h3>
+  <div class="cmp">
+    <div class="pop" style="width:100%">
+      <h4>New workspace from "payments vendor integration feasibility"</h4>
+      <div class="f"><div class="k">Name · colour</div><div class="chips"><span class="on">Payment status webhook retry</span><span class="on">● sky</span></div></div>
+      <div class="f"><div class="k">Topic · issue keys from the last turns</div>
+        <div class="chips"><span class="on i">OPS-847</span><span class="on i">OPS-843</span><span class="i">OPS-841</span><span class="i">OPS-836</span><span style="color:var(--ov1)">+16 older</span></div></div>
+      <div class="f"><div class="k">Repos</div><div class="chips"><span class="on rp">ops-platform (home)</span><span class="on rp">bun-api</span></div><div class="cap">The repos those keys touched; shared with the workbench, one console each.</div></div>
+      <div class="f"><div class="k">Summary for the new chat <span class="tag-new">new</span></div>
+        <div class="inp ta" style="color:var(--sub1)">OPS-847: webhook retry wired in ops-platform (<code>src/billing/webhookRetry.ts</code>), tests green; end-to-end blocked on payments vendor sandbox creds. OPS-843: vendor sync pagination, worker done, review had 1 P2 open. Next: run e2e once creds land, then PR both against develop.</div>
+        <div class="cap">Prefilled from the chat digest filtered to the chosen keys. <span class="btn" style="font-size:10.5px">Ask the coordinator to draft it</span> posts one bounded prompt and fills this box from the reply.</div></div>
+      <div class="f"><div class="k">Also move</div>
+        <div class="chips"><span class="on">⌁ Worker · OPS-847 · done</span><span class="on">Review · OPS-843 · 1 P2</span><span>⌁ Worker · OPS-843 · done</span></div></div>
+      <div class="btns"><span class="btn">Cancel</span><span class="btn pri">Create &amp; start chat ↵</span></div>
+    </div>
+    <div>
+      <p class="label">Afterwards · in the workbench chat</p>
+      <div class="card" style="max-width:none"><div class="h"><span>◈ Moved to workspace · <span style="color:var(--sky)">Payment status webhook retry</span></span><small>just now</small></div>
+        <div class="b">OPS-847, OPS-843 · 2 children moved · <b>Go</b> · this chat carries on here.</div></div>
+      <p class="label" style="margin-top:14px">Afterwards · bar</p>
+      <div class="app"><div class="bar">
+        <span class="grp">This Mac ▾</span>
+        <span class="chip"><i class="c-teal"></i>Cloud migration<span class="n">⌃1</span></span>
+        <span class="chip"><i class="c-red"></i>gitterm-v5<span class="n">⌃2</span></span>
+        <span class="chip"><i class="c-peach"></i>Ops platform<span class="n">⌃3</span></span>
+        <span class="chip on"><i class="c-sky"></i>Webhook retry<span class="n">⌃4</span></span>
+        <span class="chip"><i class="c-peach"></i>core-api<span class="n">⌃5</span></span>
+        <span class="chip park">⏸ 5 parked</span>
+      </div></div>
+      <p class="cap"><b>What stays linked:</b> the new workspace records where it came from (workbench workspace, chat session, time) and the workbench records it under Related; both show the link in the rail and on Chats rows. Moved children re-parent in the facts files only; delegation records and transcripts are untouched. The workbench chat keeps its full history and its keys, so searching OPS-847 finds both, the new workspace first. <b>Move to workspace…</b> on a chat row is the same mechanism for a whole chat: it rewrites the chat's workspace id, its tab moves, its children follow.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ g -->
+<section class="screen" id="s-g">
+  <h2>g · Opening a repo: the workspaces touching it come first</h2>
+  <p class="lead">She picks a folder ("+" → Open folder…, or a resume lands her there). If any workspace, open, parked or done, lists that folder, GitTerm shows them before offering a fresh one-repo workspace. A repo never exists without a workspace: "open a repo alone" is a one-repo workspace, which is today's behaviour unchanged.</p>
+  <div class="cmp">
+    <div class="pop" style="width:100%">
+      <h4>ops-platform · 4 workspaces list this repo <span class="tag-new">new</span></h4>
+      <div class="wk"><i class="dot c-peach"></i><span class="t">Ops platform <span class="badge park">⏸ parked</span></span><span class="r">just now · <span class="btn pri">Resume</span></span>
+        <span class="m">stopped at: OPS-847 wired and tested; waiting on payments vendor sandbox creds… · also bun-api · 1 worker running</span></div>
+      <div class="wk"><i class="dot c-sky"></i><span class="t">Webhook retry <span class="badge open">● open</span></span><span class="r">2h · <span class="btn">Go</span></span>
+        <span class="m">↙ from Ops platform · OPS-847 OPS-843 · repos ops-platform, bun-api</span></div>
+      <div class="wk"><i class="dot c-s2"></i><span class="t">Bun API rate limits <span class="badge park">⏸ parked</span></span><span class="r">6d · <span class="btn pri">Resume</span></span>
+        <span class="m">stopped at: middleware done, ops-platform caller untested · home bun-api · PRJ-104</span></div>
+      <div class="more">done · 1 ▸ <span style="color:var(--ov0)">Vendor dedupe on import · done Oct 24</span></div>
+      <div class="btns"><span class="btn">Cancel</span><span class="btn">New workspace here</span></div>
+    </div>
+    <div>
+      <p class="cap" style="margin-top:0"><b>Why a sheet, not a page:</b> opening a folder is a moment of intent ("I want to work on ops-platform"); the question is which piece of work. Rows are the workspace entries whose <code>repos</code> list contains this folder (or a worktree of the same repo), ordered open, parked, done. Resume on a parked row is the restore path from screen d; Go focuses the open one; "New workspace here" is exactly today's open-folder result.</p>
+      <p class="cap"><b>Also in the Chats panel:</b> "This workspace" for a one-repo workspace reads as today; the "Also touched these repos" section (screen c) is the same list of other workspaces, so the answer exists in both places without a new surface.</p>
+      <div class="note" style="margin-top:14px">Overlap rules: a repo is shared by any number of workspaces (three list ops-platform; two also list bun-api; both see the one bun-api console and dev server). A chat belongs to exactly one workspace. A worktree is its repo's execution dir: a task worktree is the task's business and never a repo here; a workspace whose home is a worktree checkout (gitterm-v5 is one) is a repo entry grouped under its main repo for this list. A remote repo (Mac Mini) is an entry with its machine; it shows here like any other, with no local terminal.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ h -->
+<section class="screen" id="s-h">
+  <h2>h · Changes across the work: every branch and worktree the workspace touches</h2>
+  <p class="lead">Her biggest issue: work produces worktrees and branches she cannot see. Real state right now: api-server has 15 worktrees of which 3 are new cloud; auth-service has 11 with 3 new cloud; image-pipeline's new cloud worktree has 109 uncommitted files from 15 minutes ago while its main checkout sits 11 months old with 249 dirty files. The Git sidebar gains a scope, <b>This checkout | Workspace</b>. In Workspace scope, <b>Changes</b> lists, per repo, only the branches the work owns; <b>Worktrees</b> lists every worktree per repo with the work's first and the rest folded, flagged for hygiene. Both reuse the shipped modes, rows and diff panel.</p>
+
+  <h3>1 · Git sidebar · Workspace scope · Changes</h3>
+    <div class="app" style="max-width:none">
+      <div class="body" style="grid-template-columns:34px 300px 1fr;min-height:0">
+        <div class="spine"><b>⎇</b><span>▤</span><span>◈</span><span>✦</span><span>☰</span><span>▦</span></div>
+        <div class="rail">
+          <div class="hd">Git <small>Cloud migration</small></div>
+          <div class="scope" style="padding:0 10px 6px"><span>This checkout</span><span class="on">Workspace</span><span class="right"></span><span class="on">Changes</span><span>Worktrees</span></div>
+          <div class="sec"><span><i class="dot c-yellow" style="margin:0 4px 0 0"></i>infra · 2</span><span>12s ago</span></div>
+          <div class="row"><i class="dot c-peach"></i><span class="t">control-plane-dev <span class="badge">main checkout</span></span><span class="r">2 dirty</span>
+            <span class="m">↑3 vs main · pushed · PR #612 ✓ CI · coordinator · 2h</span></div>
+          <div class="row"><i class="dot c-green"></i><span class="t">prj-102-region-cloud-decisions</span><span class="r">clean</span>
+            <span class="m">.worktrees/…-prj-102-region · ↑11 vs main · pushed · subagent · 3h</span></div>
+          <div class="sec"><span><i class="dot c-red" style="margin:0 4px 0 0"></i>api-server · 3 <span style="color:var(--ov0)">of 15</span></span><span>14s ago</span></div>
+          <div class="row"><i class="dot c-s2"></i><span class="t">prj-101-cloud-standby</span><span class="r">clean</span>
+            <span class="m">.worktrees/…-prj-101 · ↑1 vs main · pushed · worker PRJ-101 · 1d</span></div>
+          <div class="row sel"><i class="dot c-green"></i><span class="t">prj-102-cloud-vm-control</span><span class="r">clean</span>
+            <span class="m">.worktrees/…-prj-102-vmcontrol · ↑7 vs main · pushed · worker PRJ-102 · 4h</span></div>
+          <div class="row"><i class="dot c-s2"></i><span class="t">live-pipeline-standby</span><span class="r">clean</span>
+            <span class="m">.worktrees/…-pr587 · ↑4 vs main · pushed · <span class="new">edited by this chat Oct 24</span> · 6d</span></div>
+          <div class="sec"><span><i class="dot c-sky" style="margin:0 4px 0 0"></i>auth-service · 3 <span style="color:var(--ov0)">of 11</span></span><span>14s ago</span></div>
+          <div class="row"><i class="dot c-s2"></i><span class="t">prj-101-cloud-standby</span><span class="r">clean</span><span class="m">↑2 vs main · pushed · 2d</span></div>
+          <div class="row"><i class="dot c-green"></i><span class="t">prj-102-cloud-attestation</span><span class="r">clean</span><span class="m">↑11 vs main · pushed · 5h</span></div>
+          <div class="row"><i class="dot c-s2"></i><span class="t">prj-102-blobfs-cloud</span><span class="r">clean</span><span class="m">↑8 vs main · <span style="color:var(--peach)">not pushed</span> · 1d</span></div>
+          <div class="sec"><span><i class="dot c-ov0" style="margin:0 4px 0 0"></i>image-pipeline · 1</span><span>9s ago</span></div>
+          <div class="row"><i class="dot c-peach"></i><span class="t">prj-102-cloud-images</span><span class="r"><b style="color:var(--peach)">109 dirty</b></span>
+            <span class="m">.worktrees/…-prj-102 · ↑4 vs main · pushed · worker PRJ-102 · 15m</span></div>
+          <div class="sec"><span><i class="dot c-ov0" style="margin:0 4px 0 0"></i>blobfs-gateway · 1</span><span>20s ago</span></div>
+          <div class="row"><i class="dot c-s2"></i><span class="t">prj-102-cloud-backend</span><span class="r">clean</span><span class="m">↑1 vs main · pushed · 2d</span></div>
+          <div class="sec"><span>Maybe · 1 <span class="tag-new">new</span></span><span>▸</span></div>
+          <div class="row"><i></i><span class="t" style="color:var(--sub0)">web-portal · feat/cloud-upload-ui</span><span class="r"><span class="btn" style="padding:0 6px">Add</span> <span class="btn" style="padding:0 6px">Ignore</span></span>
+            <span class="m">branch name matches "new cloud" · no edit recorded</span></div>
+        </div>
+        <div class="canvas" style="padding:0">
+          <div class="hdr"><span>⎇ prj-102-cloud-vm-control · api-server · .worktrees/api-server-prj-102-vmcontrol</span><span class="scope"><span>Uncommitted · 0</span><span class="on">vs main · 7 commits · 14 files</span></span></div>
+          <div style="padding:10px 14px;color:var(--sub0);font-size:11px">
+            <div style="color:var(--text);margin-bottom:4px">src/vm/control.ts <span style="color:var(--green)">+212</span> <span style="color:var(--red)">−48</span></div>
+            <pre style="margin:0 0 10px;color:var(--ov2);background:var(--mantle);padding:6px 8px;border-radius:4px">@@ -41,7 +41,19 @@ export async function startStandby(vm: VmRef) {
+-  const client = new VmClient({ region });
++  const client = new ComputeManagementClient(credential, subscriptionId);
++  const vmName = cloudVmName(vm);
++  await client.virtualMachines.beginStartAndWait(resourceGroup, vmName);</pre>
+            <div>src/vm/cloudNames.ts <span style="color:var(--green)">+64</span> · src/vm/control.test.ts <span style="color:var(--green)">+118</span> <span style="color:var(--red)">−12</span> · … 11 more files</div>
+            <div style="margin-top:10px;color:var(--ov1)">Owner: worker PRJ-102 (Codex) · base main @ 3b91f04 (merge-base) · Open worker tab · Open in terminal · Request review…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  <div class="cmp" style="margin-top:10px">
+      <p class="cap" style="margin-top:0"><b>Which branches belong to the work</b> <span class="tag-new">new</span>: (1) checkouts a chat edited or launched a worker in, from the per-chat facts, which now record <code>(repo, checkout dir, branch)</code> per touch using the TRU-146 worktree resolution; this is what catches <code>live-pipeline-standby</code>, which has no issue key; (2) task worktrees created by the workspace's chats (tasks.json <code>created_by</code>); (3) any worktree in a workspace repo whose branch name contains one of the workspace's issue keys, so worktrees made by hand or in a terminal still show; (4) manual Add and Remove, persisted on the workspace. "Maybe" is a word match against the workspace name, shown once per branch and never counted until she adds it. api-server's other 12 worktrees never appear here.</p>
+      <p class="cap"><b>Row:</b> branch, checkout (main checkout or worktree path), uncommitted count, ahead/behind the base, pushed or not, PR and CI only when the existing discovery already has them (never fetched by this panel), owner (coordinator, subagent, worker, or "edited by this chat") and last activity. The repo header shows how old the numbers are. <b>Click</b> opens the shipped diff panel with two sources: <b>Uncommitted</b> (today's) and <b>vs base</b>, the branch against its merge-base with the base branch (the task's base, else the upstream's merge-base, else the repo default). The strip and Files panel follow the selected checkout, as TRU-146 does for a chat's worktree.</p>
+  </div>
+
+  <h3>2 · Git sidebar · Workspace scope · Worktrees (hygiene lives here, per repo)</h3>
+  <div class="cmp">
+    <div class="panel" style="max-width:520px">
+      <div class="ph"><div class="scope"><span>This checkout</span><span class="on">Workspace</span><span class="right"></span><span>Changes</span><span class="on">Worktrees</span></div></div>
+      <div class="list">
+        <div class="more" style="color:var(--ov0)"><i class="dot c-red" style="margin:0 4px 0 0"></i>API-SERVER · 15 worktrees · 3 in this work</div>
+        <div class="crow"><i class="dot c-s2"></i><span class="t">prj-101-cloud-standby</span><span class="r">↑1 · 1d</span><span class="m">.worktrees/api-server-prj-101 · worker PRJ-101</span></div>
+        <div class="crow"><i class="dot c-green"></i><span class="t">prj-102-cloud-vm-control</span><span class="r">↑7 · 4h</span><span class="m">.worktrees/api-server-prj-102-vmcontrol · worker PRJ-102</span></div>
+        <div class="crow"><i class="dot c-s2"></i><span class="t">live-pipeline-standby</span><span class="r">↑4 · 6d</span><span class="m">.worktrees/api-server-pr587 · edited by this chat</span></div>
+        <div class="crow dim"><i class="dot c-peach"></i><span class="t">main checkout · fix/ops-201-retry <span class="badge" style="color:var(--peach);border-color:var(--peach)">dirty · 3mo old</span></span><span class="r">5 dirty</span><span class="m">~/GitRepo/acme/api-server · not in this work</span></div>
+        <div class="more">others · 11 ▾ <span class="tag-new">new</span></div>
+        <div class="crow dim child"><i class="dot c-s2"></i><span class="t">ops-331-vendor-sync <span class="badge">merged</span> <span class="badge">stale 5mo</span></span><span class="r"></span><span class="m">../api-server-ops-331 · clean</span></div>
+        <div class="crow dim child"><i class="dot c-s2"></i><span class="t">ops-659-payment-public-route <span class="badge">/tmp</span></span><span class="r">↑2 · 3mo</span><span class="m">/private/tmp/api-server-ops-659 · 1 dirty</span></div>
+        <div class="crow dim child"><i class="dot c-s2"></i><span class="t">task · OPS-733 dedupe <span class="badge">task · done</span></span><span class="r">1mo</span><span class="m">~/.config/gitterm-v5/worktrees/api-server/… · Open task</span></div>
+        <div class="crow dim child"><i class="dot c-red"></i><span class="t">feat/old-ingest <span class="badge" style="color:var(--red);border-color:var(--red)">folder gone</span></span><span class="r">6mo</span><span class="m">acme-local-worktrees/api-server-ingest · prunable</span></div>
+        <div class="more">… 7 more · <span class="btn" style="padding:0 6px">Prune gone (1)…</span> <span class="btn" style="padding:0 6px">Remove merged &amp; clean (3)…</span></div>
+      </div>
+    </div>
+    <div>
+      <p class="cap" style="margin-top:0"><b>Hygiene is a secondary view, per repo, under the fold.</b> Flags: <b>stale</b> (no commit for 30 days and clean), <b>merged</b> (branch merged into the default, from one <code>git branch --merged</code> per repo, computed when the fold opens), <b>folder gone</b> (prunable, already known), <b>/tmp</b>, <b>task</b> (owned by tasks.json; its only action is Open task, because the task flow owns delete), and a <b>dirty main checkout on an old branch</b>. Actions are batched and always confirmed by a sheet that lists exactly what will run (<code>git worktree prune</code>; <code>git worktree remove</code> only for clean, merged, non-task worktrees; never <code>--force</code>, never a dirty tree). Nothing is deleted without that confirmation. The same list in <b>This checkout</b> scope is today's Worktrees mode unchanged.</p>
+      <p class="cap"><b>Performance</b> (freeze history respected): only the work's checkouts are polled, not all 15. Per refresh, per repo one <code>git worktree list --porcelain</code> (already run), then per owned checkout one <code>git status --porcelain=v2 --branch</code> (dirty counts and upstream ahead/behind in one call) and one <code>git rev-list --left-right --count base...HEAD</code>; ~36 short processes for this workspace, run sequentially per repo in one background <code>Task</code> with a timeout, results applied by event. Schedule: the current checkout keeps today's adaptive tier (5–30 s); the other owned checkouts sit on the slow tier (15–30 s) and only while the Git sidebar is visible in Workspace scope; otherwise a stat of <code>index</code>, <code>HEAD</code> and <code>logs/HEAD</code> under the checkout's gitdir decides whether git runs at all. Status output over a cap (e.g. 500 lines, the 249-dirty main) is counted, not stored. Rows show the age of their numbers. PR and CI are never fetched here.</p>
+    </div>
+  </div>
+</section>
+
+<script>
+  document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+    document.querySelectorAll('section.screen').forEach(s => s.classList.toggle('on', s.id === 's-' + b.dataset.s));
+    history.replaceState(null, '', '#' + b.dataset.s);
+  }));
+  const h = location.hash.slice(1);
+  if (h) { const b = document.querySelector('nav button[data-s="' + h + '"]'); if (b) b.click(); }
+</script>
+</body>
+</html>

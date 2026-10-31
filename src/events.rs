@@ -18,4 +18,8 @@ pub enum SidebarMode {
     Tasks,
     /// Lists persistent remote tmux sessions reachable over SSH.
     Remote,
+    /// The workspace read as one piece of work: coordinators and fan-out,
+    /// repos touched, owned branches with live git state, issue keys
+    /// (TRU-167, `workspace_overview`).
+    Workspace,
 }
