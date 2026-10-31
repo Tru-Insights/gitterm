@@ -43,6 +43,7 @@ mod events;
 mod tab;
 mod theme;
 mod work_prs;
+mod workspace_bar;
 
 use gitterm::agentd::client::{
     PairedPhoneInfo, PhonePairing, RemoteAgentBackend, RemoteAgentClientConfig,
@@ -5458,6 +5459,12 @@ impl Workspace {
         !self.chats.is_empty()
     }
 
+    /// Sits in the bar's work zone (TRU-175): owns chats, or was made as a
+    /// piece of work and claims the chats started in it.
+    fn is_work(&self) -> bool {
+        self.owns_chats() || self.claims_new_chats
+    }
+
     fn backend_ref(&self) -> WorkspaceBackendRef {
         WorkspaceBackendRef::from_location(&self.location)
     }
@@ -6205,6 +6212,8 @@ pub enum Event {
     ToggleChatOverviewIdle,
     /// Fold/unfold one machine group in the workspace bar.
     ToggleMachineGroup(String),
+    /// The bar's `Repos` toggle of a machine group (TRU-175).
+    ToggleReposZone(String),
     /// Open/close the machine label menu in the workspace bar.
     MachineMenuOpen(String),
     MachineMenuClose,
@@ -6464,6 +6473,10 @@ struct App {
     slide_animating: bool,
     slide_start_time: Option<Instant>,
     slide_start_offset: f32,
+    /// The workspace (uid) a slide or swipe started from: its panel stays
+    /// in the slide until the slide settles, though the bar may hide it
+    /// (TRU-175).
+    slide_from: Option<u64>,
     // User scroll tracking (for swipe debounce)
     last_user_scroll: Option<Instant>,
     // Edge peek state
@@ -6560,6 +6573,9 @@ struct App {
     chat_open_section_collapsed: bool,
     /// Workspace-bar machine groups the user folded (session-only).
     collapsed_machine_groups: std::collections::HashSet<String>,
+    /// Machine groups whose `Repos` zone on the bar is collapsed (TRU-175);
+    /// persisted in workspaces.json.
+    collapsed_repo_groups: std::collections::HashSet<String>,
     /// Machine label menu open in the workspace bar (group key).
     machine_menu: Option<String>,
     /// Per-remote chat indexes (TRU-78 slice 4), keyed by remote id.
@@ -7786,7 +7802,13 @@ impl App {
     }
 
     fn scroll_to_active_workspace_bar(&self) -> Task<Event> {
-        let target_x = (self.active_workspace_idx as f32 * ESTIMATED_WS_BTN_WIDTH).max(0.0);
+        // The chip's place in the bar, not its Vec index (TRU-175).
+        let position = self
+            .visible_workspace_order()
+            .iter()
+            .position(|&idx| idx == self.active_workspace_idx)
+            .unwrap_or(0);
+        let target_x = (position as f32 * ESTIMATED_WS_BTN_WIDTH).max(0.0);
         iced::advanced::widget::operate(iced::advanced::widget::operation::scrollable::scroll_to(
             workspace_bar_scrollable_id(),
             scrollable::AbsoluteOffset {
@@ -7966,6 +7988,11 @@ impl App {
             active_workspace: self.active_workspace_idx,
             remote_sessions,
             remote_agents: remote_agent_defs,
+            collapsed_repo_groups: {
+                let mut keys: Vec<String> = self.collapsed_repo_groups.iter().cloned().collect();
+                keys.sort();
+                keys
+            },
         };
         ws_file.save();
     }
@@ -11033,10 +11060,91 @@ impl App {
         }
     }
 
+    /// What the bar layout reads of each workspace, in Vec order.
+    fn workspace_bar_chips(&self) -> Vec<workspace_bar::BarChip> {
+        self.workspaces
+            .iter()
+            .map(|ws| workspace_bar::BarChip {
+                group: self.machine_group_key(ws),
+                work: ws.is_work(),
+            })
+            .collect()
+    }
+
+    /// The bar's machine groups and chips in display order (TRU-175).
+    fn workspace_bar_layout(&self) -> Vec<workspace_bar::BarGroup> {
+        workspace_bar::bar_layout(
+            &self.workspace_bar_chips(),
+            self.active_workspace_idx,
+            &self.collapsed_machine_groups,
+            &self.collapsed_repo_groups,
+        )
+    }
+
+    /// The visible workspace chips left to right, as indices.
+    fn visible_workspace_order(&self) -> Vec<usize> {
+        workspace_bar::visible_order(&self.workspace_bar_layout())
+    }
+
+    /// The workspace Ctrl+`num` selects (1-based): the nth visible chip.
+    fn visible_workspace_at(&self, num: usize) -> Option<usize> {
+        num.checked_sub(1)
+            .and_then(|n| self.visible_workspace_order().get(n).copied())
+    }
+
+    /// The content slide's panels left to right (TRU-175): the bar's
+    /// visible order, plus the workspace a slide started from until it
+    /// settles.
+    fn slide_order(&self) -> Vec<usize> {
+        let from = self
+            .slide_from
+            .and_then(|uid| self.workspace_index_by_uid(uid));
+        workspace_bar::slide_order(
+            &self.workspace_bar_chips(),
+            self.active_workspace_idx,
+            from,
+            &self.collapsed_machine_groups,
+            &self.collapsed_repo_groups,
+        )
+    }
+
+    /// Where workspace `idx`'s panel starts in the content slide.
+    fn slide_offset_of(&self, idx: usize) -> f32 {
+        let position = self
+            .slide_order()
+            .iter()
+            .position(|&i| i == idx)
+            .unwrap_or(0);
+        position as f32 * self.content_viewport_width()
+    }
+
+    /// Makes `idx` active and animates the content slide to it. A settled
+    /// slide starts from the active workspace's panel, which stays in the
+    /// slide until it settles.
+    fn begin_slide_to(&mut self, idx: usize) {
+        let settled = !self.slide_animating && self.last_user_scroll.is_none();
+        if settled || self.slide_from.is_none() {
+            self.slide_from = self
+                .workspaces
+                .get(self.active_workspace_idx)
+                .map(|ws| ws.uid);
+        }
+        let from = self.active_workspace_idx;
+        self.active_workspace_idx = idx;
+        if settled {
+            self.slide_offset = self.slide_offset_of(from);
+        }
+        self.slide_start_offset = self.slide_offset;
+        self.slide_target = self.slide_offset_of(idx);
+        self.slide_start_time = Some(Instant::now());
+        self.slide_animating = true;
+    }
+
     /// Keep the workspace Vec grouped by machine (local first, then each
     /// configured remote in remote-agents order, legacy ssh last), stable
-    /// within a group. Display order, Ctrl+1-9 order, and the slide
-    /// animation all follow Vec order, so the invariant lives here.
+    /// within a group. The bar's machine groups, Ctrl+1-9 and the slide
+    /// animation follow Vec order, so the invariant lives here; within a
+    /// group the bar puts work before folders (`workspace_bar_layout`).
     fn normalize_workspace_order(&mut self) {
         let def_rank: HashMap<&str, usize> = self
             .remote_agent_defs
@@ -11196,8 +11304,8 @@ impl App {
     }
 
     fn snap_slide_to_active_workspace(&mut self) {
-        let viewport_width = self.content_viewport_width();
-        let new_target = self.active_workspace_idx as f32 * viewport_width;
+        self.slide_from = None;
+        let new_target = self.slide_offset_of(self.active_workspace_idx);
         self.slide_offset = new_target;
         self.slide_target = new_target;
         self.slide_animating = false;
@@ -11441,12 +11549,8 @@ impl App {
         self.sync_plans_dir();
 
         // Snap slide to new active workspace (no animation)
-        let viewport_width = self.content_viewport_width();
-        let new_target = self.active_workspace_idx as f32 * viewport_width;
-        self.slide_offset = new_target;
-        self.slide_target = new_target;
-        self.slide_animating = false;
-        self.slide_start_time = None;
+        self.snap_slide_to_active_workspace();
+        let new_target = self.slide_target;
 
         let scroll_task = iced::advanced::widget::operate(
             iced::advanced::widget::operation::scrollable::scroll_to(
@@ -15260,6 +15364,7 @@ impl App {
             slide_animating: false,
             slide_start_time: None,
             slide_start_offset: 0.0,
+            slide_from: None,
             last_user_scroll: None,
             edge_peek_left: false,
             edge_peek_right: false,
@@ -15343,6 +15448,7 @@ impl App {
             chat_backfill_note: None,
             chat_open_section_collapsed: false,
             collapsed_machine_groups: std::collections::HashSet::new(),
+            collapsed_repo_groups: std::collections::HashSet::new(),
             machine_menu: None,
             remote_chat_indexes: HashMap::new(),
             remote_running_chats: HashMap::new(),
@@ -15386,6 +15492,7 @@ impl App {
 
         // Try to restore workspaces from saved config
         if let Some(ws_file) = WorkspacesFile::load() {
+            app.collapsed_repo_groups = ws_file.collapsed_repo_groups.iter().cloned().collect();
             for agent in &ws_file.remote_agents {
                 push_remote_agent_config(&mut app.remote_agent_defs, agent.clone());
             }
@@ -15470,8 +15577,7 @@ impl App {
         app.register_remote_agent_connection_defaults();
 
         // Set initial slide position for active workspace
-        let viewport_width = app.content_viewport_width();
-        let initial_offset = app.active_workspace_idx as f32 * viewport_width;
+        let initial_offset = app.slide_offset_of(app.active_workspace_idx);
         app.slide_offset = initial_offset;
         app.slide_target = initial_offset;
 
@@ -16598,12 +16704,7 @@ fi
             self.sync_visible_terminals();
             self.mark_workspaces_dirty();
             self.sync_plans_dir();
-            let viewport_width = self.content_viewport_width();
-            let target = self.active_workspace_idx as f32 * viewport_width;
-            self.slide_offset = target;
-            self.slide_target = target;
-            self.slide_animating = false;
-            self.slide_start_time = None;
+            self.snap_slide_to_active_workspace();
             let remote_agent_workspace = self
                 .active_workspace()
                 .is_some_and(|workspace| self.remote_agent_id_for_workspace(workspace).is_some());
@@ -16691,12 +16792,7 @@ fi
         self.mark_log_server_dirty();
         self.sync_plans_dir();
 
-        let viewport_width = self.content_viewport_width();
-        let target = self.active_workspace_idx as f32 * viewport_width;
-        self.slide_offset = target;
-        self.slide_target = target;
-        self.slide_animating = false;
-        self.slide_start_time = None;
+        self.snap_slide_to_active_workspace();
 
         Task::batch([
             self.scroll_to_active_workspace_bar(),
@@ -21355,10 +21451,10 @@ fi
                         Some(GlobalShortcut::ChatsOverview) => {
                             return self.update(Event::ChatsOverviewOpen);
                         }
-                        Some(GlobalShortcut::SelectWorkspace(num))
-                            if num <= self.workspaces.len() =>
-                        {
-                            return Task::done(Event::WorkspaceSelect(num - 1));
+                        Some(GlobalShortcut::SelectWorkspace(num)) => {
+                            if let Some(idx) = self.visible_workspace_at(num) {
+                                return Task::done(Event::WorkspaceSelect(idx));
+                            }
                         }
                         _ => {}
                     }
@@ -21704,11 +21800,12 @@ fi
                     }
                 }
 
-                // Workspace switching with Ctrl+1-9
+                // Workspace switching with Ctrl+1-9, in the bar's visible
+                // order (TRU-175).
                 if let Some(GlobalShortcut::SelectWorkspace(num)) = global_shortcut(&key, modifiers)
                 {
-                    if num <= self.workspaces.len() {
-                        return Task::done(Event::WorkspaceSelect(num - 1));
+                    if let Some(idx) = self.visible_workspace_at(num) {
+                        return Task::done(Event::WorkspaceSelect(idx));
                     }
                 }
 
@@ -23221,8 +23318,13 @@ fi
                 if !self.dragging_divider && !self.dragging_console_divider {
                     let content_x = x - SPINE_WIDTH; // x relative to content area
                     let content_width = self.content_viewport_width();
-                    let has_left = self.active_workspace_idx > 0;
-                    let has_right = self.active_workspace_idx + 1 < self.workspaces.len();
+                    let order = self.slide_order();
+                    let position = order
+                        .iter()
+                        .position(|&idx| idx == self.active_workspace_idx)
+                        .unwrap_or(0);
+                    let has_left = position > 0;
+                    let has_right = position + 1 < order.len();
 
                     let near_left = has_left && (0.0..EDGE_PEEK_ZONE).contains(&content_x);
                     let near_right = has_right
@@ -23675,12 +23777,8 @@ fi
                 self.console_height = self.console_height.clamp(32.0, (height - 140.0).max(32.0));
 
                 // Recalculate slide position for new viewport width (snap, no animation)
-                let viewport_width = self.content_viewport_width();
-                let new_target = self.active_workspace_idx as f32 * viewport_width;
-                self.slide_offset = new_target;
-                self.slide_target = new_target;
-                self.slide_animating = false;
-                self.slide_start_time = None;
+                self.snap_slide_to_active_workspace();
+                let new_target = self.slide_target;
 
                 let scroll_task = iced::advanced::widget::operate(
                     iced::advanced::widget::operation::scrollable::scroll_to(
@@ -23801,6 +23899,13 @@ fi
                 if !self.collapsed_machine_groups.remove(&key) {
                     self.collapsed_machine_groups.insert(key);
                 }
+            }
+            Event::ToggleReposZone(key) => {
+                if !self.collapsed_repo_groups.remove(&key) {
+                    self.collapsed_repo_groups.insert(key);
+                }
+                self.mark_workspaces_dirty();
+                return self.scroll_to_active_workspace_bar();
             }
             Event::MachineMenuOpen(key) => {
                 self.machine_menu = if self.machine_menu.as_deref() == Some(key.as_str()) {
@@ -24874,17 +24979,9 @@ fi
                     }
                 }
                 if idx < self.workspaces.len() && idx != self.active_workspace_idx {
-                    let viewport_width = self.content_viewport_width();
-                    let target = idx as f32 * viewport_width;
-
-                    // Start animation from current position
-                    self.slide_start_offset = self.slide_offset;
-                    self.slide_target = target;
-                    self.slide_start_time = Some(Instant::now());
-                    self.slide_animating = true;
-
-                    // Update active workspace immediately (tab bar + console switch instantly)
-                    self.active_workspace_idx = idx;
+                    // Start the slide and update the active workspace
+                    // immediately (tab bar + console switch instantly).
+                    self.begin_slide_to(idx);
                     let selected_task_is_in_workspace = self
                         .selected_task_id
                         .as_deref()
@@ -24949,13 +25046,14 @@ fi
                     if let Some(last_scroll) = self.last_user_scroll {
                         if last_scroll.elapsed().as_millis() >= SWIPE_DEBOUNCE_MS as u128 {
                             self.last_user_scroll = None;
-                            let viewport_width = self.content_viewport_width();
-                            let target = self.active_workspace_idx as f32 * viewport_width;
+                            let target = self.slide_offset_of(self.active_workspace_idx);
                             if (self.slide_offset - target).abs() > 1.0 {
                                 self.slide_start_offset = self.slide_offset;
                                 self.slide_target = target;
                                 self.slide_start_time = Some(Instant::now());
                                 self.slide_animating = true;
+                            } else {
+                                self.snap_slide_to_active_workspace();
                             }
                         }
                     }
@@ -24974,6 +25072,10 @@ fi
                         self.slide_offset = self.slide_target;
                         self.slide_animating = false;
                         self.slide_start_time = None;
+                        // Settled: the starting panel leaves the slide.
+                        if self.last_user_scroll.is_none() {
+                            self.snap_slide_to_active_workspace();
+                        }
                     }
 
                     let offset_x = self.slide_offset;
@@ -25007,10 +25109,18 @@ fi
                         let offset = viewport.absolute_offset().x;
                         self.slide_offset = offset;
                         self.last_user_scroll = Some(Instant::now());
+                        if self.slide_from.is_none() {
+                            self.slide_from = self.active_workspace().map(|ws| ws.uid);
+                        }
 
-                        // Update active workspace based on current scroll position
-                        let nearest = ((offset + viewport_width * 0.5) / viewport_width) as usize;
-                        let nearest = nearest.min(self.workspaces.len().saturating_sub(1));
+                        // Update active workspace based on current scroll
+                        // position, in the slide's order (TRU-175).
+                        let order = self.slide_order();
+                        let position = ((offset + viewport_width * 0.5) / viewport_width) as usize;
+                        let nearest = order
+                            .get(position.min(order.len().saturating_sub(1)))
+                            .copied()
+                            .unwrap_or(self.active_workspace_idx);
                         if nearest != self.active_workspace_idx {
                             self.active_workspace_idx = nearest;
                             self.sync_visible_terminals();
@@ -25425,12 +25535,7 @@ fi
 
                 // Snap slide state to new workspace position
                 // (no scroll_to needed — view renders active workspace directly when not animating)
-                let viewport_width = self.content_viewport_width();
-                let new_target = self.active_workspace_idx as f32 * viewport_width;
-                self.slide_offset = new_target;
-                self.slide_target = new_target;
-                self.slide_animating = false;
-                self.slide_start_time = None;
+                self.snap_slide_to_active_workspace();
                 let refresh_target = {
                     if let Some(tab) = self.active_tab_mut() {
                         tab.git_status_loading = true;
@@ -25664,41 +25769,25 @@ fi
                     .map(|ws| ws.active_tab)
                     .unwrap_or(0);
 
-                // Search from (current_ws, current_tab + 1), wrapping around all workspaces/tabs
-                let mut ws_idx = start_ws;
-                let mut tab_idx = start_tab + 1;
-                for _ in 0..(ws_count * 100) {
-                    // upper bound to prevent infinite loop
-                    if let Some(ws) = self.workspaces.get(ws_idx) {
-                        if tab_idx < ws.tabs.len() {
-                            if ws.tabs[tab_idx].needs_attention() {
-                                // Found one — switch to it
-                                if ws_idx != self.active_workspace_idx {
-                                    // Animate workspace switch
-                                    let viewport_width = self.content_viewport_width();
-                                    let target = ws_idx as f32 * viewport_width;
-                                    self.slide_start_offset = self.slide_offset;
-                                    self.slide_target = target;
-                                    self.slide_start_time = Some(Instant::now());
-                                    self.slide_animating = true;
-                                    self.active_workspace_idx = ws_idx;
-                                    self.sync_plans_dir();
-                                }
-                                // Route through TabSelect so task context,
-                                // rail state, and the webview stay in sync.
-                                return self.update(Event::TabSelect(tab_idx));
-                            }
-                            tab_idx += 1;
-                            continue;
-                        }
+                // Search from (current_ws, current_tab + 1), wrapping around
+                // the workspaces in the bar's visible order (TRU-175).
+                let order = self.visible_workspace_order();
+                let found = workspace_bar::next_attention(
+                    &order,
+                    start_ws,
+                    start_tab,
+                    |ws| self.workspaces.get(ws).map_or(0, |ws| ws.tabs.len()),
+                    |ws, tab| self.workspaces[ws].tabs[tab].needs_attention(),
+                );
+                if let Some((ws_idx, tab_idx)) = found {
+                    if ws_idx != self.active_workspace_idx {
+                        // Animate workspace switch
+                        self.begin_slide_to(ws_idx);
+                        self.sync_plans_dir();
                     }
-                    // Move to next workspace, first tab
-                    ws_idx = (ws_idx + 1) % ws_count;
-                    tab_idx = 0;
-                    // If we've wrapped back to start and checked past current tab, we're done
-                    if ws_idx == start_ws && tab_idx > start_tab {
-                        break;
-                    }
+                    // Route through TabSelect so task context,
+                    // rail state, and the webview stay in sync.
+                    return self.update(Event::TabSelect(tab_idx));
                 }
                 // No session tab needs attention — extend the jump to tasks
                 // whose attention lives only on the rail (a WaitingForInput
@@ -29514,275 +29603,336 @@ fi
             .into()
     }
 
+    /// One workspace chip on the bar: dot, name (double-click renames),
+    /// the active one's gear, attention and PR news.
+    fn view_workspace_chip(&self, idx: usize) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let pulse_bright = self.attention_pulse_bright;
+        let ws = &self.workspaces[idx];
+        let is_active = idx == self.active_workspace_idx;
+        let ws_color = ws.color.color(theme);
+        let text_color = if is_active {
+            ws_color
+        } else {
+            theme.subtext0()
+        };
+        let active_bg = theme.bg_base();
+        let hover_bg = theme.surface0();
+
+        let attn_count = ws.attention_count();
+        let has_attention = attn_count > 0;
+        let attention_reason = ws.highest_priority_attention();
+        let has_error = ws.console.status == ConsoleStatus::Error;
+
+        // Colored dot before name — override for attention/error
+        let dot_color = if has_error
+            || matches!(
+                attention_reason,
+                Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))
+            ) {
+            theme.danger()
+        } else if matches!(
+            attention_reason,
+            Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_))
+        ) {
+            theme.success()
+        } else if has_attention && pulse_bright {
+            theme.peach()
+        } else if has_attention {
+            theme.warning()
+        } else if is_active {
+            ws_color
+        } else {
+            theme.surface2()
+        };
+        let dot = container(iced::widget::Space::new().width(0).height(0))
+            .width(Length::Fixed(6.0))
+            .height(Length::Fixed(6.0))
+            .style(move |_| container::Style {
+                background: Some(dot_color.into()),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        // Double-click the name to rename inline (TRU-169).
+        let label: Element<'_, Event, Theme, iced::Renderer> = match self
+            .workspace_rename
+            .as_ref()
+            .filter(|rename| rename.site == RenameSite::Chip && rename.uid == ws.uid)
+        {
+            Some(rename) => text_input("Workspace name", &rename.draft)
+                .id(workspace_rename_input_id())
+                .on_input(Event::WorkspaceRenameInput)
+                .on_submit(Event::WorkspaceRenameSubmit)
+                .size(11)
+                .padding([1, 4])
+                .width(Length::Fixed(160.0))
+                .font(iced::Font::with_name("Menlo"))
+                .into(),
+            None => iced::widget::mouse_area(
+                text(&ws.name)
+                    .size(11)
+                    .color(text_color)
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .on_press(Event::WorkspaceSelect(idx))
+            .on_double_click(Event::WorkspaceRenameStart(idx, RenameSite::Chip))
+            .into(),
+        };
+
+        let mut btn_content = row![dot, label].spacing(6).align_y(iced::Alignment::Center);
+
+        // Gear icon button for active workspace settings
+        if is_active {
+            let gear_color = theme.text_muted();
+            let gear_hover = theme.text_secondary();
+            let gear_btn = button(
+                text("⚙")
+                    .size(10)
+                    .color(gear_color)
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .style(move |_theme, status| button::Style {
+                background: Some(iced::Color::TRANSPARENT.into()),
+                text_color: if matches!(status, button::Status::Hovered) {
+                    gear_hover
+                } else {
+                    gear_color
+                },
+                border: iced::Border::default(),
+                ..Default::default()
+            })
+            .padding([0, 4])
+            .on_press(Event::WorkspaceSettingsOpen(idx));
+            btn_content = btn_content.push(gear_btn);
+        }
+
+        // Attention/error badge
+        if has_error {
+            let badge_bg = theme.danger();
+            let badge_text_color = theme.bg_crust();
+            btn_content = btn_content.push(
+                container(
+                    text("!")
+                        .size(9)
+                        .color(badge_text_color)
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .padding([0, 4])
+                .style(move |_| container::Style {
+                    background: Some(badge_bg.into()),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            );
+        } else if has_attention {
+            let badge_bg = match attention_reason {
+                Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)) => {
+                    theme.danger()
+                }
+                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_)) => {
+                    theme.success()
+                }
+                _ => theme.peach(),
+            };
+            let badge_text_color = theme.bg_crust();
+            btn_content = btn_content.push(
+                container(
+                    text(format!("{}", attn_count))
+                        .size(9)
+                        .color(badge_text_color)
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .padding([0, 4])
+                .style(move |_| container::Style {
+                    background: Some(badge_bg.into()),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            );
+        }
+
+        // PR news (TRU-173): the newest, e.g. "#841 checks failed".
+        if let Some((label, color)) = self.workspace_pr_badge(ws.uid) {
+            btn_content = btn_content.push(
+                text(label)
+                    .size(9)
+                    .color(color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+
+        // Active workspace: colored top accent line above the button
+        if is_active {
+            let accent_line = container(iced::widget::Space::new().width(0).height(0))
+                .width(Length::Fill)
+                .height(Length::Fixed(2.0))
+                .style(move |_| container::Style {
+                    background: Some(ws_color.into()),
+                    ..Default::default()
+                });
+
+            let ws_btn = button(btn_content)
+                .style(move |_theme, _status| button::Style {
+                    background: Some(active_bg.into()),
+                    text_color: iced::Color::WHITE,
+                    border: iced::Border::default(),
+                    ..Default::default()
+                })
+                .padding([4, 12])
+                .on_press(Event::WorkspaceSelect(idx));
+
+            column![accent_line, ws_btn].spacing(0).into()
+        } else {
+            let ws_btn = button(btn_content)
+                .style(move |_theme, status| {
+                    let bg = if matches!(status, button::Status::Hovered) {
+                        hover_bg
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    button::Style {
+                        background: Some(bg.into()),
+                        text_color: iced::Color::WHITE,
+                        border: iced::Border::default(),
+                        ..Default::default()
+                    }
+                })
+                .padding([6, 12])
+                .on_press(Event::WorkspaceSelect(idx));
+            ws_btn.into()
+        }
+    }
+
+    /// The `Repos ▸ n` / `Repos ▾` toggle of a machine group's folder
+    /// workspaces (TRU-175). Collapsed, a dot says a hidden chip has
+    /// attention, an error or PR news.
+    fn view_repos_toggle(
+        &self,
+        key: &str,
+        toggle: &workspace_bar::ReposToggle,
+    ) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let label = if toggle.collapsed {
+            format!("Repos \u{25B8} {}", toggle.count)
+        } else {
+            "Repos \u{25BE}".to_string()
+        };
+        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center);
+        content = content.push(text(label).size(11).font(iced::Font::with_name("Menlo")));
+        let hidden_news = toggle.hidden.iter().any(|&idx| {
+            self.workspaces.get(idx).is_some_and(|ws| {
+                ws.attention_count() > 0
+                    || ws.console.status == ConsoleStatus::Error
+                    || self.workspace_pr_badge(ws.uid).is_some()
+            })
+        });
+        if hidden_news {
+            let dot_color = theme.peach();
+            content = content.push(
+                container(iced::widget::Space::new().width(0).height(0))
+                    .width(Length::Fixed(6.0))
+                    .height(Length::Fixed(6.0))
+                    .style(move |_| container::Style {
+                        background: Some(dot_color.into()),
+                        border: iced::Border {
+                            radius: 3.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+        let color = theme.text_muted();
+        let hover = theme.text_secondary();
+        let hover_bg = theme.surface0();
+        button(content)
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: Some(
+                        if hovered {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: if hovered { hover } else { color },
+                    border: iced::Border::default(),
+                    ..Default::default()
+                }
+            })
+            .padding([6, 12])
+            .on_press(Event::ToggleReposZone(key.to_string()))
+            .into()
+    }
+
     fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mut bar_row = Row::new().spacing(0).align_y(iced::Alignment::Center);
 
-        let pulse_bright = self.attention_pulse_bright;
-
-        // 4b: the Vec is machine-normalized, so groups are contiguous.
-        let group_keys: Vec<String> = self
-            .workspaces
-            .iter()
-            .map(|ws| self.machine_group_key(ws))
-            .collect();
-        let group_size = |key: &str| group_keys.iter().filter(|k| *k == key).count();
-        let mut prev_group: Option<String> = None;
-
-        for (idx, ws) in self.workspaces.iter().enumerate() {
-            let is_active = idx == self.active_workspace_idx;
-            let group_key = group_keys[idx].clone();
-            let group_collapsed = self.collapsed_machine_groups.contains(&group_key);
-            if prev_group.as_deref() != Some(group_key.as_str()) {
-                // Close the previous group with its machine-scoped "+".
-                if let Some(prev) = &prev_group {
-                    if let Some(plus) = self.machine_group_plus(prev) {
-                        bar_row = bar_row.push(plus);
-                    }
-                    bar_row = bar_row.push(self.machine_group_separator());
-                }
-                bar_row = bar_row.push(self.machine_group_label(
-                    &group_key,
-                    group_size(&group_key),
-                    group_collapsed,
-                ));
-                prev_group = Some(group_key.clone());
+        // 4b: the Vec is machine-normalized, so groups are contiguous;
+        // within a group work comes first, then the Repos zone (TRU-175).
+        let groups = self.workspace_bar_layout();
+        for (group_idx, group) in groups.iter().enumerate() {
+            if group_idx > 0 {
+                bar_row = bar_row.push(self.machine_group_separator());
             }
+            bar_row = bar_row.push(self.machine_group_label(&group.key, group.size, group.folded));
             // Folded groups hide their chips — except the active one,
             // which never disappears out from under the user.
-            if group_collapsed && !is_active {
-                continue;
+            let mut items: Vec<Element<'_, Event, Theme, iced::Renderer>> = group
+                .work
+                .iter()
+                .map(|&idx| self.view_workspace_chip(idx))
+                .collect();
+            if let Some(toggle) = &group.repos {
+                items.push(self.view_repos_toggle(&group.key, toggle));
             }
-            let ws_color = ws.color.color(theme);
-            let text_color = if is_active {
-                ws_color
-            } else {
-                theme.subtext0()
-            };
-            let active_bg = theme.bg_base();
-            let hover_bg = theme.surface0();
-
-            let attn_count = ws.attention_count();
-            let has_attention = attn_count > 0;
-            let attention_reason = ws.highest_priority_attention();
-            let has_error = ws.console.status == ConsoleStatus::Error;
-
-            // Colored dot before name — override for attention/error
-            let dot_color = if has_error
-                || matches!(
-                    attention_reason,
-                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))
-                ) {
-                theme.danger()
-            } else if matches!(
-                attention_reason,
-                Some(AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_))
-            ) {
-                theme.success()
-            } else if has_attention && pulse_bright {
-                theme.peach()
-            } else if has_attention {
-                theme.warning()
-            } else if is_active {
-                ws_color
-            } else {
-                theme.surface2()
-            };
-            let dot = container(iced::widget::Space::new().width(0).height(0))
-                .width(Length::Fixed(6.0))
-                .height(Length::Fixed(6.0))
-                .style(move |_| container::Style {
-                    background: Some(dot_color.into()),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                });
-
-            // Double-click the name to rename inline (TRU-169).
-            let label: Element<'_, Event, Theme, iced::Renderer> = match self
-                .workspace_rename
-                .as_ref()
-                .filter(|rename| rename.site == RenameSite::Chip && rename.uid == ws.uid)
-            {
-                Some(rename) => text_input("Workspace name", &rename.draft)
-                    .id(workspace_rename_input_id())
-                    .on_input(Event::WorkspaceRenameInput)
-                    .on_submit(Event::WorkspaceRenameSubmit)
-                    .size(11)
-                    .padding([1, 4])
-                    .width(Length::Fixed(160.0))
-                    .font(iced::Font::with_name("Menlo"))
-                    .into(),
-                None => iced::widget::mouse_area(
-                    text(&ws.name)
-                        .size(11)
-                        .color(text_color)
-                        .font(iced::Font::with_name("Menlo")),
-                )
-                .on_press(Event::WorkspaceSelect(idx))
-                .on_double_click(Event::WorkspaceRenameStart(idx, RenameSite::Chip))
-                .into(),
-            };
-
-            let mut btn_content = row![dot, label].spacing(6).align_y(iced::Alignment::Center);
-
-            // Gear icon button for active workspace settings
-            if is_active {
-                let gear_color = theme.text_muted();
-                let gear_hover = theme.text_secondary();
-                let gear_btn = button(
-                    text("⚙")
-                        .size(10)
-                        .color(gear_color)
-                        .font(iced::Font::with_name("Menlo")),
-                )
-                .style(move |_theme, status| button::Style {
-                    background: Some(iced::Color::TRANSPARENT.into()),
-                    text_color: if matches!(status, button::Status::Hovered) {
-                        gear_hover
-                    } else {
-                        gear_color
-                    },
-                    border: iced::Border::default(),
-                    ..Default::default()
-                })
-                .padding([0, 4])
-                .on_press(Event::WorkspaceSettingsOpen(idx));
-                btn_content = btn_content.push(gear_btn);
+            items.extend(
+                group
+                    .folders
+                    .iter()
+                    .map(|&idx| self.view_workspace_chip(idx)),
+            );
+            for (item_idx, item) in items.into_iter().enumerate() {
+                // Separator between chips of the same machine group
+                if item_idx > 0 {
+                    let sep_color = theme.surface0();
+                    bar_row = bar_row.push(
+                        container(iced::widget::Space::new().width(0).height(0))
+                            .width(Length::Fixed(1.0))
+                            .height(Length::Fixed(14.0))
+                            .style(move |_| container::Style {
+                                background: Some(sep_color.into()),
+                                ..Default::default()
+                            }),
+                    );
+                }
+                bar_row = bar_row.push(item);
             }
-
-            // Attention/error badge
-            if has_error {
-                let badge_bg = theme.danger();
-                let badge_text_color = theme.bg_crust();
-                btn_content = btn_content.push(
-                    container(
-                        text("!")
-                            .size(9)
-                            .color(badge_text_color)
-                            .font(iced::Font::with_name("Menlo")),
-                    )
-                    .padding([0, 4])
-                    .style(move |_| container::Style {
-                        background: Some(badge_bg.into()),
-                        border: iced::Border {
-                            radius: 6.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            } else if has_attention {
-                let badge_bg = match attention_reason {
-                    Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)) => {
-                        theme.danger()
-                    }
-                    Some(
-                        AttentionReason::CompletedUnread | AttentionReason::DelegationReady(_),
-                    ) => theme.success(),
-                    _ => theme.peach(),
-                };
-                let badge_text_color = theme.bg_crust();
-                btn_content = btn_content.push(
-                    container(
-                        text(format!("{}", attn_count))
-                            .size(9)
-                            .color(badge_text_color)
-                            .font(iced::Font::with_name("Menlo")),
-                    )
-                    .padding([0, 4])
-                    .style(move |_| container::Style {
-                        background: Some(badge_bg.into()),
-                        border: iced::Border {
-                            radius: 6.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-
-            // PR news (TRU-173): the newest, e.g. "#841 checks failed".
-            if let Some((label, color)) = self.workspace_pr_badge(ws.uid) {
-                btn_content = btn_content.push(
-                    text(label)
-                        .size(9)
-                        .color(color)
-                        .font(iced::Font::with_name("Menlo")),
-                );
-            }
-
-            // Active workspace: colored top accent line above the button
-            if is_active {
-                let accent_line = container(iced::widget::Space::new().width(0).height(0))
-                    .width(Length::Fill)
-                    .height(Length::Fixed(2.0))
-                    .style(move |_| container::Style {
-                        background: Some(ws_color.into()),
-                        ..Default::default()
-                    });
-
-                let ws_btn = button(btn_content)
-                    .style(move |_theme, _status| button::Style {
-                        background: Some(active_bg.into()),
-                        text_color: iced::Color::WHITE,
-                        border: iced::Border::default(),
-                        ..Default::default()
-                    })
-                    .padding([4, 12])
-                    .on_press(Event::WorkspaceSelect(idx));
-
-                let stacked = column![accent_line, ws_btn].spacing(0);
-                bar_row = bar_row.push(stacked);
-            } else {
-                let ws_btn = button(btn_content)
-                    .style(move |_theme, status| {
-                        let bg = if matches!(status, button::Status::Hovered) {
-                            hover_bg
-                        } else {
-                            iced::Color::TRANSPARENT
-                        };
-                        button::Style {
-                            background: Some(bg.into()),
-                            text_color: iced::Color::WHITE,
-                            border: iced::Border::default(),
-                            ..Default::default()
-                        }
-                    })
-                    .padding([6, 12])
-                    .on_press(Event::WorkspaceSelect(idx));
-
-                bar_row = bar_row.push(ws_btn);
-            }
-
-            // Separator between workspaces of the same machine group
-            if idx + 1 < self.workspaces.len() && group_keys[idx + 1] == group_key {
-                let sep_color = theme.surface0();
-                bar_row = bar_row.push(
-                    container(iced::widget::Space::new().width(0).height(0))
-                        .width(Length::Fixed(1.0))
-                        .height(Length::Fixed(14.0))
-                        .style(move |_| container::Style {
-                            background: Some(sep_color.into()),
-                            ..Default::default()
-                        }),
-                );
-            }
-        }
-        // Close the final group's "+".
-        if let Some(prev) = &prev_group {
-            if let Some(plus) = self.machine_group_plus(prev) {
+            // Close the group with its machine-scoped "+".
+            if let Some(plus) = self.machine_group_plus(&group.key) {
                 bar_row = bar_row.push(plus);
             }
         }
+        let group_keys: Vec<&str> = groups.iter().map(|group| group.key.as_str()).collect();
 
         // Configured remotes with no open workspace stay visible: label
         // plus a "+" to open their first one (the always-visible rule).
         for def in &self.remote_agent_defs {
             let key = format!("agent:{}", def.id);
-            if group_keys.contains(&key) {
+            if group_keys.contains(&key.as_str()) {
                 continue;
             }
             bar_row = bar_row.push(self.machine_group_separator());
@@ -30163,7 +30313,11 @@ fi
         let mut dots = Column::new().spacing(8).align_x(iced::Alignment::Center);
         let items = self.attention_items();
 
-        for (idx, ws) in self.workspaces.iter().enumerate() {
+        // The bar's visible order, so the nth dot is the nth chip (TRU-175).
+        for idx in self.visible_workspace_order() {
+            let Some(ws) = self.workspaces.get(idx) else {
+                continue;
+            };
             let is_active = idx == self.active_workspace_idx;
             let ws_color = ws.color.color(theme);
             let inactive_color = theme.surface2();
@@ -31336,23 +31490,30 @@ fi
 
         let mut panels = Row::new().spacing(0);
 
-        for (idx, ws) in self.workspaces.iter().enumerate() {
+        // Panels in the slide's order, the bar's visible order (TRU-175).
+        let order = self.slide_order();
+        let active_pos = order.iter().position(|&idx| idx == active_idx).unwrap_or(0);
+        for (pos, ws) in order
+            .iter()
+            .filter_map(|&idx| self.workspaces.get(idx))
+            .enumerate()
+        {
             // Only render full content for active workspace and immediate neighbors
-            let panel: Element<'_, Event, Theme, iced::Renderer> =
-                if (idx as i32 - active_idx as i32).unsigned_abs() <= 1 {
-                    self.view_workspace_content(ws)
-                } else {
-                    // Distant workspace: render colored placeholder
-                    let bg = theme.bg_base();
-                    container(iced::widget::Space::new())
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .style(move |_| container::Style {
-                            background: Some(bg.into()),
-                            ..Default::default()
-                        })
-                        .into()
-                };
+            let panel: Element<'_, Event, Theme, iced::Renderer> = if pos.abs_diff(active_pos) <= 1
+            {
+                self.view_workspace_content(ws)
+            } else {
+                // Distant workspace: render colored placeholder
+                let bg = theme.bg_base();
+                container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(bg.into()),
+                        ..Default::default()
+                    })
+                    .into()
+            };
 
             let panel_container = container(panel)
                 .width(Length::Fixed(viewport_width))
