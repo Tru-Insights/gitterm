@@ -674,7 +674,7 @@ fn config_document_places(cfg: &WorkspaceConfig) -> Option<gitterm::guidelines::
         !cfg.chats.is_empty(),
         local,
         Path::new(cfg.home_dir()),
-        None,
+        cfg.decisions_repo.as_deref().map(Path::new),
     )
 }
 
@@ -1886,6 +1886,29 @@ struct ReviewPaneState {
 pub enum OverviewKey {
     Folder(PathBuf),
     Owner(u64),
+}
+
+/// One option of the ⚙ modal's "Decisions repo" picker (TRU-191): none,
+/// or one of the workspace's listed local repos.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionsRepoChoice {
+    dir: Option<PathBuf>,
+    label: String,
+}
+
+impl DecisionsRepoChoice {
+    fn none() -> Self {
+        Self {
+            dir: None,
+            label: "None".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for DecisionsRepoChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
 }
 
 /// Where an inline workspace rename is edited.
@@ -6276,6 +6299,8 @@ pub enum Event {
     GuidelinesEdit,
     /// The workspace settings modal's Claude in Chrome switch (TRU-181).
     ClaudeInChromeToggled(bool),
+    /// The ⚙ modal's "Decisions repo" picker (TRU-191).
+    DecisionsRepoPicked(DecisionsRepoChoice),
     // Slide animation events
     SlideAnimationTick,
     // Edge peek events
@@ -8359,6 +8384,10 @@ impl App {
             done_at: None,
             guidelines_off: ws.guidelines_off,
             claude_in_chrome: ws.claude_in_chrome,
+            decisions_repo: ws
+                .decisions_repo
+                .as_ref()
+                .map(|dir| dir.to_string_lossy().into_owned()),
             repos: ws
                 .repos
                 .iter()
@@ -12764,6 +12793,7 @@ impl App {
             ws.chats = cfg.chats.clone();
             ws.guidelines_off = cfg.guidelines_off;
             ws.claude_in_chrome = cfg.claude_in_chrome;
+            ws.decisions_repo = cfg.decisions_repo.as_ref().map(PathBuf::from);
             if let Some(config::WorkspaceLocationConfig::RemoteAgent {
                 remote_id,
                 workspace_id,
@@ -16140,6 +16170,7 @@ impl App {
         workspace.chats = ws_config.chats.clone();
         workspace.guidelines_off = ws_config.guidelines_off;
         workspace.claude_in_chrome = ws_config.claude_in_chrome;
+        workspace.decisions_repo = ws_config.decisions_repo.as_ref().map(PathBuf::from);
         // The home repo's saved env and run command (TRU-180).
         self.seed_from_saved(&mut workspace, ws_config);
 
@@ -18209,6 +18240,7 @@ fi
             workspace.chats = saved.chats.clone();
             workspace.guidelines_off = saved.guidelines_off;
             workspace.claude_in_chrome = saved.claude_in_chrome;
+            workspace.decisions_repo = saved.decisions_repo.as_ref().map(PathBuf::from);
             self.seed_from_saved(&mut workspace, saved);
             workspace
         } else {
@@ -27007,6 +27039,7 @@ fi
                     workspace.abbrev = cfg.abbrev.clone();
                     workspace.guidelines_off = cfg.guidelines_off;
                     workspace.claude_in_chrome = cfg.claude_in_chrome;
+                    workspace.decisions_repo = cfg.decisions_repo.as_ref().map(PathBuf::from);
                     self.seed_from_saved(&mut workspace, cfg);
                 }
                 self.add_tab_to_workspace_with_command(
@@ -27073,6 +27106,17 @@ fi
                     ws.claude_in_chrome = on;
                     self.workspaces_dirty = true;
                     self.next_workspace_save_at = Some(Instant::now());
+                }
+            }
+            Event::DecisionsRepoPicked(choice) => {
+                // Named to agents started from now on; running ones keep
+                // what they started with.
+                if let Some(ws) = self.workspaces.get_mut(self.workspace_settings_idx) {
+                    if ws.decisions_repo != choice.dir {
+                        ws.decisions_repo = choice.dir;
+                        self.workspaces_dirty = true;
+                        self.next_workspace_save_at = Some(Instant::now());
+                    }
                 }
             }
             Event::GuidelinesEdit => {
@@ -30483,6 +30527,83 @@ fi
         ]
         .spacing(6);
 
+        // --- Decisions repo (TRU-191) ---
+        let repo_choice = |dir: &Path| DecisionsRepoChoice {
+            dir: Some(dir.to_path_buf()),
+            label: format!(
+                "{} \u{00B7} {}",
+                gitterm::workspace_repos::repo_name(dir),
+                dir.display()
+            ),
+        };
+        let mut decisions_choices = vec![DecisionsRepoChoice::none()];
+        decisions_choices.extend(
+            self.local_repos(ws)
+                .into_iter()
+                .map(|repo| repo_choice(&repo.dir)),
+        );
+        let decisions_selected = match &ws.decisions_repo {
+            None => DecisionsRepoChoice::none(),
+            Some(dir) => match decisions_choices
+                .iter()
+                .find(|choice| choice.dir.as_deref() == Some(dir.as_path()))
+            {
+                Some(choice) => choice.clone(),
+                // Saved, but no longer listed: still shown, still told.
+                None => {
+                    let mut choice = repo_choice(dir);
+                    choice.label.push_str(" (not listed)");
+                    decisions_choices.push(choice.clone());
+                    choice
+                }
+            },
+        };
+        let decisions_col = column![
+            row![
+                text("Decisions repo:")
+                    .size(12)
+                    .color(text_secondary)
+                    .font(mono),
+                pick_list(
+                    decisions_choices,
+                    Some(decisions_selected),
+                    Event::DecisionsRepoPicked,
+                )
+                .width(Length::Fill)
+                .padding([4, 8])
+                .text_size(12)
+                .font(mono)
+                .style(move |_, status| pick_list::Style {
+                    text_color: text_primary,
+                    placeholder_color: text_muted,
+                    handle_color: if matches!(status, pick_list::Status::Hovered) {
+                        accent
+                    } else {
+                        text_muted
+                    },
+                    background: bg_base.into(),
+                    border: iced::Border {
+                        color: if matches!(status, pick_list::Status::Opened { .. }) {
+                            accent
+                        } else {
+                            border_color
+                        },
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                }),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+            text(
+                "Agents started in this work are told its docs folder for working \
+                 notes and this repo for decisions the team should see (through a PR)."
+            )
+            .size(11)
+            .color(text_muted),
+        ]
+        .spacing(6);
+
         // --- Compose card ---
         let card_content = column![
             title,
@@ -30494,6 +30615,8 @@ fi
             guidelines_col,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             chrome_col,
+            container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
+            decisions_col,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             section_label,
             gh_account_hint,
@@ -46399,6 +46522,7 @@ mod tests {
             done_at: None,
             guidelines_off: false,
             claude_in_chrome: false,
+            decisions_repo: None,
             repos: vec![format!("/tmp/{name}")],
             home: None,
             env_overrides: HashMap::new(),
