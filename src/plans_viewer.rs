@@ -172,10 +172,16 @@ pub fn routes(state: ServerState) -> BoxedFilter<(warp::reply::Response,)> {
 
 async fn handle_viewer() -> Result<warp::reply::Response, Rejection> {
     use warp::Reply;
-    Ok(
-        warp::reply::with_header(VIEWER_HTML, "content-type", "text/html; charset=utf-8")
-            .into_response(),
+    Ok(warp::reply::with_header(
+        VIEWER_HTML.replacen(
+            gitterm::chat_page::BAR_HINT_SLOT,
+            &gitterm::chat_page::bar_hint_script("var(--text)", "var(--bg)"),
+            1,
+        ),
+        "content-type",
+        "text/html; charset=utf-8",
     )
+    .into_response())
 }
 
 async fn handle_list(

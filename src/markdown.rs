@@ -331,11 +331,13 @@ fn build_html_document(
         }}
     </style>
     {mermaid_script}
+    <script>{bar_hint_script}</script>
 </head>
 <body>
 {content}
 </body>
 </html>"#,
+        bar_hint_script = gitterm::chat_page::bar_hint_script(&theme.text_primary, &theme.bg_base),
         text_primary = theme.text_primary,
         bg_base = theme.bg_base,
         border = theme.border,
