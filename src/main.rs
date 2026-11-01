@@ -1836,12 +1836,128 @@ fn new_work_name_input_id() -> iced::widget::Id {
 /// × on a workspace (TRU-171): park it with a note to come back to.
 #[derive(Debug, Clone)]
 struct ParkSheet {
-    /// The workspace being parked.
+    /// The workspace being parked or closed.
     uid: u64,
+    kind: CloseSheetKind,
     note: String,
     /// The note as prefilled; while `note` still equals it, a chat index
     /// that lands later may refill it.
     prefilled: String,
+}
+
+/// Which sheet × opens (TRU-190). A work workspace parks with a note; a
+/// folder workspace offers Cancel, Park and Close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseSheetKind {
+    Park,
+    Close,
+}
+
+impl CloseSheetKind {
+    fn for_workspace(owns_chats: bool) -> Self {
+        if owns_chats {
+            Self::Park
+        } else {
+            Self::Close
+        }
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// What closing a folder workspace stops, from its real tab counts.
+fn close_stops_line(terminals: usize, chats: usize) -> String {
+    match (terminals, chats) {
+        (0, 0) => "Nothing is running in it.".to_string(),
+        (t, 0) => format!(
+            "Its {} {}.",
+            plural(t, "terminal", "terminals"),
+            if t == 1 { "stops" } else { "stop" }
+        ),
+        (0, c) => format!(
+            "Its {} {}.",
+            plural(c, "chat", "chats"),
+            if c == 1 { "stops" } else { "stop" }
+        ),
+        (t, c) => format!(
+            "Its {} and {} stop.",
+            plural(t, "terminal", "terminals"),
+            plural(c, "chat", "chats")
+        ),
+    }
+}
+
+/// What keeps running: other workspaces' chats (when there are any) and
+/// each repo another open workspace still lists. `shared` is
+/// `(repo label, other workspace name)`.
+fn close_keeps_lines(others_have_chats: bool, shared: &[(String, String)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    if others_have_chats {
+        lines.push("Chats in other workspaces keep running.".to_string());
+    }
+    for (repo, workspace) in shared {
+        lines.push(format!("{repo} stays open in {workspace}."));
+    }
+    lines
+}
+
+/// The `(repo, other workspace)` pairs for the repos `own` lists that
+/// another open workspace also lists; the first such workspace names it.
+fn shared_repos(
+    own: &[(RepoId, String)],
+    others: &[(String, Vec<RepoId>)],
+) -> Vec<(String, String)> {
+    own.iter()
+        .filter_map(|(id, label)| {
+            others
+                .iter()
+                .find(|(_, repos)| repos.contains(id))
+                .map(|(name, _)| (label.clone(), name.clone()))
+        })
+        .collect()
+}
+
+/// The chats the Park note may come from: the workspace's owned roots and
+/// their children, else (a folder) the chats hosted in its own tabs. A
+/// chat another workspace owns is never one of them.
+fn park_note_chats<'a>(
+    entries: &'a [chats::ChatIndexEntry],
+    own_roots: &[String],
+    own_tab_chat_ids: &[String],
+    other_roots: &[String],
+) -> Vec<&'a chats::ChatIndexEntry> {
+    let roots = if own_roots.is_empty() {
+        own_tab_chat_ids
+    } else {
+        own_roots
+    };
+    let mut chats = overview::chats_under(entries, roots);
+    let others: HashSet<&str> = other_roots.iter().map(String::as_str).collect();
+    chats.retain(|entry| {
+        !others.contains(entry.id.as_str())
+            && !entry
+                .root_id
+                .as_deref()
+                .is_some_and(|root| others.contains(root))
+    });
+    chats
+}
+
+/// Done (TRU-171): takes the parked entry matching `key` off the Parked
+/// list. Close (TRU-190) parks, then ends here.
+fn finish_parked(configs: &mut [WorkspaceConfig], key: &ParkedKey, stamp: String) -> bool {
+    match configs
+        .iter_mut()
+        .find(|cfg| cfg.is_parked() && key.matches(cfg))
+    {
+        Some(cfg) => {
+            cfg.done_at = Some(stamp);
+            true
+        }
+        None => false,
+    }
 }
 
 fn park_note_input_id() -> iced::widget::Id {
@@ -5994,6 +6110,8 @@ pub enum Event {
     ParkedListToggle,
     ParkedResume(ParkedKey),
     ParkedDone(ParkedKey),
+    /// Close on the folder workspace's sheet (TRU-190).
+    CloseConfirm,
     WorkspaceCreate,
     WorkspaceCreateLocal,
     WorkspaceCreated(Option<PathBuf>),
@@ -11769,8 +11887,8 @@ impl App {
         cfg.active_tab = kept_active;
     }
 
-    /// The chats a workspace's note and overview read: its owned roots and
-    /// their children, else every chat in its folder.
+    /// The chats a workspace's overview reads: its owned roots and their
+    /// children, else every chat in its folder.
     fn workspace_chat_entries(&self, ws: &Workspace) -> Vec<&chats::ChatIndexEntry> {
         let entries = self.chat_entries_for_machine(self.remote_agent_id_for_workspace(ws));
         if ws.owns_chats() {
@@ -11778,6 +11896,58 @@ impl App {
         } else {
             overview::work_chats(entries, &ws.dir)
         }
+    }
+
+    /// The chats the Park note may come from (`park_note_chats`).
+    fn park_note_entries(&self, ws: &Workspace) -> Vec<&chats::ChatIndexEntry> {
+        let entries = self.chat_entries_for_machine(self.remote_agent_id_for_workspace(ws));
+        let own_tab_chat_ids: Vec<String> = ws
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.agent_session()?.session_id.clone())
+            .collect();
+        let other_roots: Vec<String> = self
+            .workspaces
+            .iter()
+            .filter(|other| other.uid != ws.uid)
+            .flat_map(|other| other.chats.iter().cloned())
+            .collect();
+        park_note_chats(entries, &ws.chats, &own_tab_chat_ids, &other_roots)
+    }
+
+    /// The Close sheet's "stops" and "keeps running" lines for `ws`.
+    fn close_sheet_lines(&self, ws: &Workspace) -> (String, Vec<String>) {
+        let chat_tabs = ws
+            .tabs
+            .iter()
+            .filter(|tab| tab.agent_session().is_some())
+            .count();
+        let terminals = ws.tabs.len() - chat_tabs + ws.bottom_terminals.len();
+        let others: Vec<&Workspace> = self.workspaces.iter().filter(|o| o.uid != ws.uid).collect();
+        let others_have_chats = others
+            .iter()
+            .any(|o| o.owns_chats() || o.tabs.iter().any(|tab| tab.agent_session().is_some()));
+        let own: Vec<(RepoId, String)> = ws
+            .repos
+            .iter()
+            .filter_map(|id| {
+                let repo = self.repo(*id)?;
+                let label = repo
+                    .dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| repo.dir.display().to_string());
+                Some((*id, label))
+            })
+            .collect();
+        let other_repos: Vec<(String, Vec<RepoId>)> = others
+            .iter()
+            .map(|o| (o.name.clone(), o.repos.clone()))
+            .collect();
+        (
+            close_stops_line(terminals, chat_tabs),
+            close_keeps_lines(others_have_chats, &shared_repos(&own, &other_repos)),
+        )
     }
 
     /// × on workspace `idx`: the Park sheet, its note prefilled from the
@@ -11790,11 +11960,17 @@ impl App {
         let ws = &self.workspaces[idx];
         let uid = ws.uid;
         let remote = self.remote_agent_id_for_workspace(ws).is_some();
-        let note = park_note_prefill(&self.workspace_chat_entries(ws));
+        let kind = CloseSheetKind::for_workspace(ws.owns_chats());
+        let note = if kind == CloseSheetKind::Park {
+            park_note_prefill(&self.park_note_entries(ws))
+        } else {
+            String::new()
+        };
         self.machine_menu = None;
         self.parked_list_open = false;
         self.park_sheet = Some(ParkSheet {
             uid,
+            kind,
             note: note.clone(),
             prefilled: note,
         });
@@ -11815,13 +11991,17 @@ impl App {
     /// A chat index landed while the Park sheet is open: refill a note the
     /// user has not edited.
     fn refill_park_note(&mut self) {
-        let Some(uid) = self.park_sheet.as_ref().map(|sheet| sheet.uid) else {
+        let Some((uid, CloseSheetKind::Park)) = self
+            .park_sheet
+            .as_ref()
+            .map(|sheet| (sheet.uid, sheet.kind))
+        else {
             return;
         };
         let Some(ws) = self.workspaces.iter().find(|ws| ws.uid == uid) else {
             return;
         };
-        let note = park_note_prefill(&self.workspace_chat_entries(ws));
+        let note = park_note_prefill(&self.park_note_entries(ws));
         if let Some(sheet) = self.park_sheet.as_mut() {
             if sheet.note == sheet.prefilled {
                 sheet.note = note.clone();
@@ -11944,20 +12124,36 @@ impl App {
 
     /// Done: the entry leaves the Parked list and stays in the file.
     fn mark_parked_done(&mut self, key: &ParkedKey) {
-        let Some(cfg) = self
-            .closed_workspace_configs
-            .iter_mut()
-            .find(|cfg| cfg.is_parked() && key.matches(cfg))
-        else {
+        if finish_parked(
+            &mut self.closed_workspace_configs,
+            key,
+            chrono::Utc::now().to_rfc3339(),
+        ) {
+            eprintln!("[workspace] {:?} marked done", key.name);
+            self.mark_workspaces_dirty();
+        } else {
             eprintln!(
                 "[workspace] cannot mark {:?} ({}) done: not parked",
                 key.name, key.dir
             );
-            return;
+        }
+    }
+
+    /// Close (TRU-190): park the workspace, then mark that entry done, the
+    /// same as Done in the Parked list.
+    fn close_workspace(&mut self, uid: u64) -> Task<Event> {
+        let Some(idx) = self.workspace_index_by_uid(uid) else {
+            eprintln!("[workspace] cannot close uid={uid}: no longer open");
+            return self.apply_webview_surfaces();
         };
-        cfg.done_at = Some(chrono::Utc::now().to_rfc3339());
-        eprintln!("[workspace] {:?} marked done", cfg.name);
-        self.mark_workspaces_dirty();
+        let cfg = self.workspace_config(&self.workspaces[idx]);
+        let key = ParkedKey::of(&cfg);
+        let before = self.closed_workspace_configs.len();
+        let task = self.park_workspace(uid, "");
+        if self.closed_workspace_configs.len() > before {
+            self.mark_parked_done(&key);
+        }
+        task
     }
 
     // -----------------------------------------------------------------------
@@ -22625,7 +22821,12 @@ fi
                 if self.park_sheet.is_some() {
                     match key.as_ref() {
                         Key::Named(key::Named::Escape) => return self.update(Event::ParkCancel),
-                        Key::Named(key::Named::Enter) => return self.update(Event::ParkSubmit),
+                        Key::Named(key::Named::Enter)
+                            if self.park_sheet.as_ref().map(|s| s.kind)
+                                == Some(CloseSheetKind::Park) =>
+                        {
+                            return self.update(Event::ParkSubmit)
+                        }
                         _ => {}
                     }
                 }
@@ -26266,6 +26467,12 @@ fi
                 };
                 return self.park_workspace(sheet.uid, &sheet.note);
             }
+            Event::CloseConfirm => {
+                let Some(sheet) = self.park_sheet.take() else {
+                    return Task::none();
+                };
+                return self.close_workspace(sheet.uid);
+            }
             Event::ParkCancel => {
                 self.park_sheet = None;
                 return Task::batch([self.apply_webview_surfaces(), self.focus_main_terminal()]);
@@ -29564,6 +29771,46 @@ fi
         let Some(ws) = self.workspaces.iter().find(|ws| ws.uid == sheet.uid) else {
             return iced::widget::Space::new().into();
         };
+        if sheet.kind == CloseSheetKind::Close {
+            let (stops, keeps) = self.close_sheet_lines(ws);
+            let mut card = Column::new()
+                .spacing(10)
+                .width(Length::Fixed(440.0))
+                .push(
+                    text(format!("Close {}?", ws.name))
+                        .size(font)
+                        .color(theme.text_primary()),
+                )
+                .push(text(stops).size(font_small).color(theme.text_secondary()));
+            for line in keeps {
+                card = card.push(text(line).size(font_small).color(theme.text_secondary()));
+            }
+            card = card.push(
+                text("Park keeps its tabs to come back to; Close removes it for good.")
+                    .size(font_small)
+                    .color(theme.text_muted()),
+            );
+            card = card.push(
+                row![
+                    iced::widget::Space::new().width(Length::Fill),
+                    button(text("Cancel").size(font_small))
+                        .style(button::secondary)
+                        .padding([6, 12])
+                        .on_press(Event::ParkCancel),
+                    button(text("Park").size(font_small))
+                        .style(button::secondary)
+                        .padding([6, 12])
+                        .on_press(Event::ParkSubmit),
+                    button(text("Close").size(font_small))
+                        .style(button::primary)
+                        .padding([6, 12])
+                        .on_press(Event::CloseConfirm),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
+            return self.view_sheet_card(card);
+        }
         let mut card = Column::new()
             .spacing(10)
             .width(Length::Fixed(440.0))
@@ -29596,7 +29843,7 @@ fi
             row![
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("Cancel").size(font_small))
-                    .style(button::text)
+                    .style(button::secondary)
                     .padding([6, 12])
                     .on_press(Event::ParkCancel),
                 button(text("Park").size(font_small))
@@ -45644,6 +45891,88 @@ mod tests {
 
         // No chats: an empty note.
         assert_eq!(park_note_prefill(&[]), "");
+    }
+
+    #[test]
+    fn close_sheet_kind_follows_chat_ownership() {
+        assert_eq!(CloseSheetKind::for_workspace(true), CloseSheetKind::Park);
+        assert_eq!(CloseSheetKind::for_workspace(false), CloseSheetKind::Close);
+    }
+
+    #[test]
+    fn close_sheet_lines_state_what_stops_and_what_keeps_running() {
+        assert_eq!(close_stops_line(5, 0), "Its 5 terminals stop.");
+        assert_eq!(close_stops_line(1, 0), "Its 1 terminal stops.");
+        assert_eq!(close_stops_line(0, 2), "Its 2 chats stop.");
+        assert_eq!(close_stops_line(2, 1), "Its 2 terminals and 1 chat stop.");
+        assert_eq!(close_stops_line(0, 0), "Nothing is running in it.");
+
+        assert!(close_keeps_lines(false, &[]).is_empty());
+        let shared = [("acme-api".to_string(), "Billing".to_string())];
+        assert_eq!(
+            close_keeps_lines(true, &shared),
+            vec![
+                "Chats in other workspaces keep running.".to_string(),
+                "acme-api stays open in Billing.".to_string(),
+            ]
+        );
+
+        let own = [
+            (RepoId(1), "acme-api".to_string()),
+            (RepoId(2), "acme-web".to_string()),
+        ];
+        let others = [
+            ("Docs".to_string(), vec![RepoId(3)]),
+            ("Billing".to_string(), vec![RepoId(1), RepoId(3)]),
+        ];
+        assert_eq!(
+            shared_repos(&own, &others),
+            vec![("acme-api".to_string(), "Billing".to_string())]
+        );
+    }
+
+    #[test]
+    fn park_note_never_comes_from_a_chat_another_workspace_owns() {
+        let mine = note_chat("a", "Mine", Some("my line"), 100);
+        let theirs = note_chat("b", "Theirs", Some("their line"), 900);
+        let mut their_child = note_chat("c", "Their worker", None, 950);
+        their_child.root_id = Some("b".to_string());
+        let entries = vec![mine, theirs, their_child];
+        let none: Vec<String> = Vec::new();
+
+        // A folder with no chat of its own: empty note.
+        let chats = park_note_chats(&entries, &none, &none, &["b".to_string()]);
+        assert_eq!(park_note_prefill(&chats), "");
+
+        // A folder hosting chat "a" in its own tab: that chat only.
+        let chats = park_note_chats(&entries, &none, &["a".to_string()], &["b".to_string()]);
+        assert_eq!(park_note_prefill(&chats), "my line");
+
+        // Even if a tab hosts another workspace's chat, it is excluded.
+        let chats = park_note_chats(&entries, &none, &["b".to_string()], &["b".to_string()]);
+        assert_eq!(park_note_prefill(&chats), "");
+
+        // A work workspace: its roots and children.
+        let chats = park_note_chats(&entries, &["b".to_string()], &none, &["a".to_string()]);
+        assert_eq!(park_note_prefill(&chats), "their line");
+    }
+
+    #[test]
+    fn close_ends_a_parked_entry_the_way_done_does() {
+        let mut parked = closed_config("Docs", Some("2026-01-01T00:00:00Z"));
+        parked.done_at = None;
+        let key = ParkedKey::of(&parked);
+        let mut configs = vec![parked];
+        assert!(configs[0].is_parked());
+        assert!(finish_parked(
+            &mut configs,
+            &key,
+            "2026-01-02T00:00:00Z".into()
+        ));
+        assert!(!configs[0].is_parked());
+        assert_eq!(configs[0].done_at.as_deref(), Some("2026-01-02T00:00:00Z"));
+        // Already done: nothing to finish.
+        assert!(!finish_parked(&mut configs, &key, "later".into()));
     }
 
     fn closed_config(name: &str, parked_at: Option<&str>) -> WorkspaceConfig {
