@@ -382,9 +382,9 @@ mod tests {
         assert_eq!(api.env["LINEAR_TEAM"], "PRJ");
         assert_eq!(api.run_command, None);
         // The env a tab gets is unchanged.
-        assert_eq!(file.workspace_env("api-server")["LINEAR_TEAM"], "PRJ");
-        assert!(file.workspace_env("acme").is_empty());
-        assert!(file.workspace_env("unknown").is_empty());
+        assert_eq!(file.workspace_env("api-server", None)["LINEAR_TEAM"], "PRJ");
+        assert!(file.workspace_env("acme", None).is_empty());
+        assert!(file.workspace_env("unknown", None).is_empty());
 
         // Written and read back: the repo model survives, the old fields
         // are still there for an older build, and normalizing again
@@ -458,10 +458,51 @@ mod tests {
         // The second's differing env became its overrides; each tab env
         // keeps what its workspace had (plus keys the repo adds).
         assert_eq!(file.workspaces[2].env_overrides["TEAM"], "OPS");
-        assert_eq!(file.workspace_env("first")["TEAM"], "PRJ");
-        assert_eq!(file.workspace_env("second")["TEAM"], "OPS");
-        assert_eq!(file.workspace_env("parked")["TEAM"], "PARKED");
-        assert_eq!(file.workspace_env("second")["ONLY_FIRST"], "1");
+        assert_eq!(file.workspace_env("first", None)["TEAM"], "PRJ");
+        assert_eq!(file.workspace_env("second", None)["TEAM"], "OPS");
+        assert_eq!(file.workspace_env("parked", None)["TEAM"], "PARKED");
+        assert_eq!(file.workspace_env("second", None)["ONLY_FIRST"], "1");
+    }
+
+    #[test]
+    fn a_tab_gets_the_env_of_the_repo_holding_its_cwd_then_overrides() {
+        let json = r#"{
+          "workspaces": [
+            { "name": "work", "abbrev": "WO", "dir": "/w/work", "color": "blue",
+              "tabs": [], "home": "/w/work",
+              "repos": ["/w/work", "/w/org-a/api", "/w/org-b/web", "/w/new"],
+              "env": { "GH_TOKEN": "fake-home" },
+              "env_overrides": { "LINEAR_TEAM": "PRJ" },
+              "repos_added": ["/w/new"],
+              "repos_removed": ["/w/gone"] }
+          ],
+          "repos": [
+            { "dir": "/w/work", "env": { "GH_TOKEN": "fake-home" } },
+            { "dir": "/w/org-a/api", "env": { "GH_TOKEN": "fake-a" } },
+            { "dir": "/w/org-b/web", "env": { "GH_TOKEN": "fake-b", "LINEAR_TEAM": "OPS" } }
+          ],
+          "active_workspace": 0
+        }"#;
+        let mut file: WorkspacesFile = serde_json::from_str(json).unwrap();
+        file.normalize_repos();
+        let env = |cwd: &str| file.workspace_env("work", Some(Path::new(cwd)));
+        assert_eq!(env("/w/org-a/api/src")["GH_TOKEN"], "fake-a");
+        assert_eq!(env("/w/org-b/web")["GH_TOKEN"], "fake-b");
+        // Overrides apply on top of every repo.
+        assert_eq!(env("/w/org-b/web")["LINEAR_TEAM"], "PRJ");
+        // Outside every listed repo: the home repo's env, as before repos.
+        assert_eq!(env("/elsewhere")["GH_TOKEN"], "fake-home");
+        assert_eq!(env("/w/work/notes")["GH_TOKEN"], "fake-home");
+        // A listed repo with nothing stored has only the overrides.
+        assert!(!env("/w/new/x").contains_key("GH_TOKEN"));
+        assert_eq!(env("/w/new/x")["LINEAR_TEAM"], "PRJ");
+
+        // Manual adds and removes round trip.
+        let read: WorkspacesFile =
+            serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!(read.workspaces[0].repos_added, ["/w/new"]);
+        assert_eq!(read.workspaces[0].repos_removed, ["/w/gone"]);
+        assert_eq!(read.workspaces[0].repos[1], "/w/org-a/api");
     }
 
     #[test]
@@ -494,7 +535,9 @@ mod tests {
             [("api-server".to_string(), vec!["FAKE_TOKEN".to_string()])]
         );
         // The repo's env is what tabs get.
-        assert!(!file.workspace_env("api-server").contains_key("FAKE_TOKEN"));
+        assert!(!file
+            .workspace_env("api-server", None)
+            .contains_key("FAKE_TOKEN"));
     }
 
     #[test]
@@ -529,7 +572,7 @@ mod tests {
         file.normalize_repos();
         // Never stored as a repo; its own env stays its source.
         assert!(file.repos.is_empty());
-        assert_eq!(file.workspace_env("box:app")["K"], "v");
+        assert_eq!(file.workspace_env("box:app", None)["K"], "v");
     }
 
     #[test]
@@ -1330,6 +1373,11 @@ impl RepoKey {
             Some(WorkspaceLocationConfig::Local { .. }) | None => RepoKey::local(Path::new(dir)),
         }
     }
+
+    /// A checkout on this Mac.
+    pub fn is_local(&self) -> bool {
+        matches!(self, RepoKey::Local(_))
+    }
 }
 
 /// `env` with `overrides` on top: what a tab, terminal or console in a
@@ -1483,6 +1531,13 @@ pub struct WorkspaceConfig {
     /// (env with these applied), so a build before TRU-180 reads them.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env_overrides: HashMap<String, String>,
+    /// Repos added by hand ("+ add repo"); listed whatever the chats touch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_added: Vec<String>,
+    /// Repos removed by hand (×, or undoing an auto-add); never listed
+    /// again by the chats touching them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_removed: Vec<String>,
 }
 
 /// Why and when a workspace was parked (TRU-171).
@@ -1630,19 +1685,40 @@ impl WorkspacesFile {
         self.repos.iter().find(|repo| repo.key() == *key)
     }
 
-    /// The env a tab or terminal of workspace `name` gets (TRU-180): its
-    /// home repo's env with the workspace's overrides on top. A legacy
+    /// The env a tab or terminal of workspace `name` running in `cwd`
+    /// gets (TRU-180): the env of the deepest repo it lists containing
+    /// `cwd`, else of its home repo (every tab got the workspace's env
+    /// before repos), with the workspace's overrides on top. A legacy
     /// remote workspace, or a home with no stored repo, uses the
     /// workspace's own `env`. An unknown workspace gets none, as before.
-    pub fn workspace_env(&self, name: &str) -> HashMap<String, String> {
+    pub fn workspace_env(&self, name: &str, cwd: Option<&Path>) -> HashMap<String, String> {
         let Some(ws) = self.workspaces.iter().find(|ws| ws.name == name) else {
             return HashMap::new();
         };
-        let base = ws
-            .repo_key(ws.home_dir())
-            .and_then(|key| self.repo(&key))
-            .map(|repo| &repo.env)
-            .unwrap_or(&ws.env);
+        let home = ws.home_dir();
+        let dir = cwd
+            .filter(|_| !ws.is_legacy_remote())
+            .and_then(|cwd| {
+                let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+                ws.repos
+                    .iter()
+                    .filter(|dir| {
+                        let dir = Path::new(dir.as_str());
+                        let canonical =
+                            std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                        cwd.starts_with(&canonical) || cwd.starts_with(dir)
+                    })
+                    .max_by_key(|dir| Path::new(dir.as_str()).components().count())
+            })
+            .map(String::as_str)
+            .unwrap_or(home);
+        let stored = |dir: &str| ws.repo_key(dir).and_then(|key| self.repo(&key));
+        let base = match stored(dir) {
+            Some(repo) => &repo.env,
+            // A listed repo with nothing stored yet has no env of its own.
+            None if dir != home => return ws.env_overrides.clone(),
+            None => &ws.env,
+        };
         layered_env(base, &ws.env_overrides)
     }
 

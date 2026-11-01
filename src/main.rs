@@ -5470,7 +5470,7 @@ fn next_workspace_uid() -> u64 {
 
 /// Runtime identity of a repo in `App::repos` (TRU-180); never persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct RepoId(u64);
+pub struct RepoId(u64);
 
 impl RepoId {
     /// A workspace's ids before `App::open_workspace` registers its home.
@@ -5636,9 +5636,22 @@ struct Workspace {
     home: RepoId,
     /// The repos this workspace lists, home first, in join order.
     repos: Vec<RepoId>,
-    /// The selected repo: default for new bottom terminals and the one
-    /// the Git sidebar shows.
+    /// The selected repo (the overview's Repos rows): where new bottom
+    /// terminals open.
     current: RepoId,
+    /// The repo whose console or terminal the bottom panel has selected;
+    /// that repo's `active_bottom_tab` says which.
+    bottom_repo: RepoId,
+    /// Repos added and removed by hand (TRU-180), persisted; the chats'
+    /// touches never re-add a removed one.
+    repos_added: Vec<PathBuf>,
+    repos_removed: Vec<PathBuf>,
+    /// Repos to list beside the home when the workspace opens (restored
+    /// from `workspaces.json`); empty once open.
+    pending_repos: Vec<PathBuf>,
+    /// Repos that joined automatically and have not been acknowledged:
+    /// the overview's undo note. Runtime only.
+    joined_note: Vec<RepoId>,
     /// Env on top of each repo's env for this workspace's tabs, terminals
     /// and console (TRU-180).
     env_overrides: HashMap<String, String>,
@@ -5672,6 +5685,11 @@ impl Workspace {
             home: RepoId::UNREGISTERED,
             repos: Vec::new(),
             current: RepoId::UNREGISTERED,
+            bottom_repo: RepoId::UNREGISTERED,
+            repos_added: Vec::new(),
+            repos_removed: Vec::new(),
+            pending_repos: Vec::new(),
+            joined_note: Vec::new(),
             env_overrides: HashMap::new(),
             seed: Some(RepoSeed::new(run_command)),
             chats: Vec::new(),
@@ -5700,6 +5718,11 @@ impl Workspace {
             home: RepoId::UNREGISTERED,
             repos: Vec::new(),
             current: RepoId::UNREGISTERED,
+            bottom_repo: RepoId::UNREGISTERED,
+            repos_added: Vec::new(),
+            repos_removed: Vec::new(),
+            pending_repos: Vec::new(),
+            joined_note: Vec::new(),
             env_overrides: HashMap::new(),
             seed: Some(RepoSeed::new(None)),
             chats: Vec::new(),
@@ -6372,9 +6395,21 @@ pub enum Event {
     ToggleClaudeSection(String),
     ClaudeItemSelect(String, usize),
     // Bottom panel tabs
-    BottomTabSelect(BottomPanelTab),
+    /// A bottom panel tab of one of the workspace's repos (TRU-180).
+    BottomTabSelect(RepoId, BottomPanelTab),
+    /// A bottom terminal in the current repo (`+`).
     BottomTerminalAdd,
-    BottomTerminalClose(usize),
+    /// A bottom terminal in another of the workspace's repos (`+ ▾`).
+    BottomTerminalAddIn(RepoId),
+    BottomRepoPickerToggle,
+    BottomTerminalClose(RepoId, usize),
+    /// Overview Repos rows (TRU-180), by workspace uid.
+    WorkspaceRepoSelect(u64, RepoId),
+    WorkspaceRepoRemove(u64, RepoId),
+    WorkspaceRepoAdd(u64),
+    /// The auto-add note: undo removes the repos that just joined.
+    WorkspaceRepoJoinedUndo(u64),
+    WorkspaceRepoJoinedDismiss(u64),
     BottomTerminalEvent(usize, iced_term::Event),
     TerminalRedrawTick,
     // Console editor (selectable output)
@@ -6389,7 +6424,7 @@ pub enum Event {
     ToggleHelp,
     // Terminal focus click events
     MainTerminalClicked,
-    BottomTerminalClicked(usize),
+    BottomTerminalClicked(RepoId, usize),
     GitStatusLoaded(GitStatusSnapshot),
     GitWorktreesLoaded(GitWorktreesSnapshot),
     /// A repository's worktree list for chat-tab worktree following
@@ -6659,6 +6694,8 @@ struct App {
     /// Settings of repos no open workspace lists, as `workspaces.json`
     /// stores them: loaded at startup, updated when a repo stops.
     stored_repos: Vec<config::RepoConfig>,
+    /// The bottom panel's `+ ▾` repo picker is open (TRU-180).
+    bottom_repo_picker_open: bool,
     active_workspace_idx: usize,
     next_tab_id: usize,
     // Durable task registry and cross-workspace Tasks UI state.
@@ -7516,6 +7553,25 @@ fn workspace_config_dir(workspace: &Workspace) -> String {
     }
 }
 
+/// A repo's colour on bottom panel tabs and overview rows (TRU-180):
+/// a workspace colour picked by its dir, the same everywhere.
+fn repo_tab_color(dir: &Path, theme: &AppTheme) -> iced::Color {
+    WorkspaceColor::from_index(gitterm::workspace_repos::palette_index(dir, 8)).color(theme)
+}
+
+fn path_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The main checkout of a task's repository from its git common dir
+/// (`<checkout>/.git`); `None` for a bare or otherwise laid-out repo.
+fn task_main_checkout(common_dir: &Path) -> Option<PathBuf> {
+    (common_dir.file_name()? == ".git").then(|| common_dir.parent().map(Path::to_path_buf))?
+}
+
 /// A repo's dir as `workspaces.json` writes it (see `workspace_config_dir`).
 fn repo_config_dir(repo: &RepoState) -> String {
     match &repo.location {
@@ -7595,6 +7651,9 @@ pub enum FolderPickerPurpose {
     /// Open Folder (Cmd+O, Option+Shift+T, the empty-state button): add a
     /// tab for the folder, in a workspace on the chosen machine.
     OpenFolder,
+    /// "+ add repo" in a workspace's overview (TRU-180): list the folder
+    /// in the open workspace with this uid. This Mac only.
+    AddRepo(u64),
 }
 
 /// The in-app folder picker (TRU-149), one for every machine. Listings
@@ -8052,9 +8111,11 @@ impl App {
         Task::none()
     }
 
-    /// Focus a bottom panel terminal (unfocusing main tab terminal)
-    fn focus_bottom_terminal(&mut self, idx: usize) -> Task<Event> {
+    /// Focus bottom terminal `idx` of repo `repo` (unfocusing the main tab
+    /// terminal); the panel selects that repo.
+    fn focus_bottom_terminal(&mut self, repo: RepoId, idx: usize) -> Task<Event> {
         self.bottom_panel_focused = true;
+        self.select_bottom_repo(repo);
         if let Some(bt) = self
             .active_bottom_repo_mut()
             .and_then(|repo| repo.bottom_terminals.get_mut(idx))
@@ -8307,6 +8368,8 @@ impl App {
                 .collect(),
             home: Some(workspace_config_dir(ws)),
             env_overrides: ws.env_overrides.clone(),
+            repos_added: path_strings(&ws.repos_added),
+            repos_removed: path_strings(&ws.repos_removed),
         }
     }
 
@@ -10991,7 +11054,12 @@ impl App {
             .iter()
             .find(|workspace| self.task_belongs_to_workspace(task, workspace))
             .and_then(|workspace| {
-                self.workspace_repo_env(workspace, workspace.home)
+                // The env of the repo the task is in (TRU-180), else home.
+                let repo = task_main_checkout(&task.repository.common_dir)
+                    .map_or(workspace.home, |dir| {
+                        self.workspace_repo_for_path(workspace, &dir)
+                    });
+                self.workspace_repo_env(workspace, repo)
                     .remove(GH_ACCOUNT_ENV_KEY)
             })
             .map(|account| account.trim().to_string())
@@ -12115,14 +12183,62 @@ impl App {
         self.repos.get_mut(id)
     }
 
+    /// The repo of `ws` whose console or terminal the bottom panel has
+    /// selected: `bottom_repo` while `ws` lists it, else its home.
+    fn bottom_repo_id(ws: &Workspace) -> RepoId {
+        if ws.repos.contains(&ws.bottom_repo) {
+            ws.bottom_repo
+        } else {
+            ws.home
+        }
+    }
+
     /// The repo whose console and terminals the bottom panel shows.
     fn active_bottom_repo(&self) -> Option<&RepoState> {
-        self.active_workspace().and_then(|ws| self.repo(ws.home))
+        self.active_workspace()
+            .and_then(|ws| self.repo(Self::bottom_repo_id(ws)))
     }
 
     fn active_bottom_repo_mut(&mut self) -> Option<&mut RepoState> {
-        let id = self.active_workspace()?.home;
+        let id = Self::bottom_repo_id(self.active_workspace()?);
         self.repo_mut(id)
+    }
+
+    /// Makes `repo` the bottom panel's selected repo in the active
+    /// workspace, when it lists it.
+    fn select_bottom_repo(&mut self, repo: RepoId) {
+        if let Some(ws) = self.active_workspace_mut() {
+            if ws.repos.contains(&repo) {
+                ws.bottom_repo = repo;
+            }
+        }
+    }
+
+    /// The repos of `ws` the bottom panel shows, in its order (TRU-180):
+    /// the local ones. A remote workspace's panel stays its home's, as
+    /// before repos (it lists no other).
+    fn panel_repos<'a>(&'a self, ws: &'a Workspace) -> Vec<&'a RepoState> {
+        ws.repos
+            .iter()
+            .filter_map(|id| self.repo(*id))
+            .filter(|repo| repo.id == ws.home || repo.key.is_local())
+            .collect()
+    }
+
+    /// The repo `ws` lists that holds `path`: the deepest containing it,
+    /// else its home (a tab outside every repo runs with the home's env,
+    /// as every tab did before repos).
+    fn workspace_repo_for_path(&self, ws: &Workspace, path: &Path) -> RepoId {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        ws.repos
+            .iter()
+            .filter_map(|id| self.repo(*id))
+            .filter(|repo| match &repo.key {
+                RepoKey::Local(dir) => canonical.starts_with(dir) || path.starts_with(&repo.dir),
+                _ => false,
+            })
+            .max_by_key(|repo| repo.dir.components().count())
+            .map_or(ws.home, |repo| repo.id)
     }
 
     /// What `ws` runs a tab, terminal or console in repo `id` with: the
@@ -12147,8 +12263,78 @@ impl App {
     /// workspace comes through here. Returns its index.
     fn open_workspace(&mut self, mut ws: Workspace) -> usize {
         self.register_home(&mut ws);
+        for dir in std::mem::take(&mut ws.pending_repos) {
+            if let Some(id) = self.list_repo(&ws.name, &ws.location, dir) {
+                if !ws.repos.contains(&id) {
+                    ws.repos.push(id);
+                }
+            }
+        }
         self.workspaces.push(ws);
         self.workspaces.len() - 1
+    }
+
+    /// The repo `dir` for workspace `name` at `ws_location` to list
+    /// (TRU-180): the open one with its checkout, else a new one from its
+    /// stored settings (run command, env, bottom terminals) or, never
+    /// stored, a fresh one with the detected run command. Only this Mac's
+    /// folders join a workspace beside its home; `None` for a remote one.
+    fn list_repo(
+        &mut self,
+        name: &str,
+        ws_location: &WorkspaceLocation,
+        dir: PathBuf,
+    ) -> Option<RepoId> {
+        if !matches!(ws_location, WorkspaceLocation::Local { .. }) {
+            eprintln!(
+                "[workspace] {name:?}: not listing {}: a remote workspace lists only its home",
+                dir.display()
+            );
+            return None;
+        }
+        let location = WorkspaceLocation::Local { root: dir.clone() };
+        let key = repo_key(&dir, &location);
+        if let Some(id) = self.repos.by_key(&key) {
+            return Some(id);
+        }
+        let stored = self
+            .stored_repos
+            .iter()
+            .find(|repo| repo.key() == key)
+            .cloned();
+        let mut seed = match &stored {
+            Some(stored) => {
+                let mut seed = RepoSeed::new(None);
+                seed.set_run_command(stored.run_command.as_ref());
+                seed.env = stored.env.clone();
+                seed
+            }
+            None => RepoSeed::new(detect_run_command(&dir)),
+        };
+        for bt in stored
+            .iter()
+            .flat_map(|stored| stored.bottom_terminals.iter())
+        {
+            let terminal = self.create_bottom_terminal_for(name, PathBuf::from(&bt.dir));
+            seed.bottom_terminals.push(terminal);
+        }
+        let (id, _) = self.repos.attach(dir, location, seed);
+        Some(id)
+    }
+
+    /// Lists `dir` in the open workspace `uid` (a manual add or an auto
+    /// join). Returns the repo, or `None` when it cannot be listed.
+    fn add_repo_to_workspace(&mut self, uid: u64, dir: PathBuf) -> Option<RepoId> {
+        let idx = self.workspace_index_by_uid(uid)?;
+        let name = self.workspaces[idx].name.clone();
+        let location = self.workspaces[idx].location.clone();
+        let id = self.list_repo(&name, &location, dir)?;
+        let ws = &mut self.workspaces[idx];
+        if !ws.repos.contains(&id) {
+            ws.repos.push(id);
+        }
+        self.mark_workspaces_dirty();
+        Some(id)
     }
 
     /// `open_workspace` without adding `ws` to `workspaces` (startup's
@@ -12164,7 +12350,111 @@ impl App {
         }
         ws.home = id;
         ws.current = id;
+        ws.bottom_repo = id;
         ws.repos = vec![id];
+    }
+
+    /// Removes repo `id` from the open workspace `uid` by hand (× on its
+    /// row, or undoing an auto-add): it stays out when the chats touch it
+    /// again, and stops unless another open workspace lists it. The home
+    /// cannot be removed.
+    fn remove_repo_from_workspace(&mut self, uid: u64, id: RepoId) {
+        let Some(idx) = self.workspace_index_by_uid(uid) else {
+            eprintln!("[workspace] cannot remove a repo: workspace uid={uid} is not open");
+            return;
+        };
+        let Some(dir) = self.repo(id).map(|repo| repo.dir.clone()) else {
+            return;
+        };
+        let ws = &mut self.workspaces[idx];
+        if id == ws.home {
+            eprintln!("[workspace] {:?}: the home repo stays listed", ws.name);
+            return;
+        }
+        ws.repos.retain(|listed| *listed != id);
+        ws.joined_note.retain(|joined| *joined != id);
+        if ws.current == id {
+            ws.current = ws.home;
+        }
+        gitterm::workspace_repos::remove_manually(&dir, &mut ws.repos_added, &mut ws.repos_removed);
+        self.release_unlisted_repos();
+        self.sync_visible_terminals();
+        self.mark_workspaces_dirty();
+    }
+
+    /// Lists the repos the open work workspaces' chats brought in
+    /// (TRU-180): main checkouts they edited in or started workers in,
+    /// in first-touch order, minus those removed by hand. Runs when the
+    /// chat index lands; a folder-scoped workspace lists only its home
+    /// and what was added by hand.
+    fn sync_workspace_repos(&mut self) {
+        let task_worktrees: Vec<PathBuf> = self
+            .task_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .tasks()
+                    .iter()
+                    .filter_map(|task| task.worktree.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let canonical =
+            |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
+        for ws in &self.workspaces {
+            if !ws.is_work() || !matches!(ws.location, WorkspaceLocation::Local { .. }) {
+                continue;
+            }
+            let work = self.workspace_chat_entries(ws);
+            let workers: Vec<PathBuf> = work
+                .iter()
+                .filter_map(|entry| entry.facts.as_ref())
+                .flat_map(|facts| facts.children.iter())
+                .filter(|child| child.kind == chat_facts::ChildKind::Worker)
+                .filter_map(|child| child.task_id.as_deref())
+                .filter_map(|task_id| self.task_store.as_ref()?.get(task_id))
+                .filter_map(|task| task_main_checkout(&task.repository.common_dir))
+                .collect();
+            let candidates: Vec<PathBuf> =
+                gitterm::workspace_repos::auto_repo_candidates(&work, &workers, &task_worktrees)
+                    .iter()
+                    // A checkout since deleted does not join.
+                    .filter(|dir| dir.is_dir())
+                    .map(|dir| canonical(dir))
+                    .collect();
+            let listed: Vec<PathBuf> = ws
+                .repos
+                .iter()
+                .filter_map(|id| self.repo(*id))
+                .map(|repo| canonical(&repo.dir))
+                .collect();
+            let removed: Vec<PathBuf> = ws.repos_removed.iter().map(|d| canonical(d)).collect();
+            let (_, joined) = gitterm::workspace_repos::derive_repo_list(
+                &canonical(&ws.dir),
+                &listed,
+                &candidates,
+                &[],
+                &removed,
+            );
+            if !joined.is_empty() {
+                joins.push((ws.uid, joined));
+            }
+        }
+        for (uid, dirs) in joins {
+            for dir in dirs {
+                let Some(id) = self.add_repo_to_workspace(uid, dir.clone()) else {
+                    continue;
+                };
+                eprintln!("[workspace] uid={uid}: {} joined its repos", dir.display());
+                if let Some(idx) = self.workspace_index_by_uid(uid) {
+                    let ws = &mut self.workspaces[idx];
+                    if !ws.joined_note.contains(&id) {
+                        ws.joined_note.push(id);
+                    }
+                }
+            }
+        }
     }
 
     /// Stops every repo no open workspace lists any more, exactly as
@@ -12208,11 +12498,23 @@ impl App {
         seed.env = saved.env;
         seed.set_run_command(saved.run_command.as_ref());
         ws.env_overrides = cfg.env_overrides.clone();
+        // The other repos it listed join when it opens (local only).
+        let home = cfg.home_dir();
+        ws.pending_repos = cfg
+            .repos
+            .iter()
+            .filter(|dir| dir.as_str() != home)
+            .map(PathBuf::from)
+            .collect();
+        ws.repos_added = cfg.repos_added.iter().map(PathBuf::from).collect();
+        ws.repos_removed = cfg.repos_removed.iter().map(PathBuf::from).collect();
     }
 
-    /// Starts (or with `restart`, restarts) the bottom panel's console in
-    /// the active tab's directory, else the workspace root, with the
-    /// repo's env and the workspace's overrides.
+    /// Starts (or with `restart`, restarts) the bottom panel's console
+    /// with the repo's env and the workspace's overrides. The home repo's
+    /// console runs in the active tab's directory, else the workspace
+    /// root, as before repos; another repo's runs in the active tab's
+    /// directory when that is inside the repo, else the repo's own.
     fn start_active_console(&mut self, restart: bool) {
         let Some(ws) = self.active_workspace() else {
             return;
@@ -12220,11 +12522,9 @@ impl App {
         let Some(repo_id) = self.active_bottom_repo().map(|repo| repo.id) else {
             return;
         };
-        // Use active tab's directory (tracks terminal cwd), fall back to workspace root
-        let dir = ws
-            .active_tab()
-            .map(|t| t.current_dir.clone())
-            .unwrap_or_else(|| ws.dir.clone());
+        let Some(dir) = self.repo_run_dir(ws, repo_id) else {
+            return;
+        };
         let env: Vec<(String, String)> = self.workspace_repo_env(ws, repo_id).into_iter().collect();
         if let Some(repo) = self.repo_mut(repo_id) {
             if restart {
@@ -12233,6 +12533,53 @@ impl App {
             repo.console.detected_url = None;
             repo.console.spawn_process_with_env(&dir, &env);
         }
+    }
+
+    /// Where a console or new bottom terminal of repo `repo_id` in `ws`
+    /// runs. The home repo's: the active tab's directory, else the
+    /// workspace root, as before repos. Another repo's: the active tab's
+    /// directory when that is inside the repo, else the repo's own.
+    fn repo_run_dir(&self, ws: &Workspace, repo_id: RepoId) -> Option<PathBuf> {
+        let repo = self.repo(repo_id)?;
+        let tab_dir = ws.active_tab().map(|t| t.current_dir.clone());
+        Some(if repo_id == ws.home {
+            tab_dir.unwrap_or_else(|| ws.dir.clone())
+        } else {
+            tab_dir
+                .filter(|dir| self.workspace_repo_for_path(ws, dir) == repo_id)
+                .unwrap_or_else(|| repo.dir.clone())
+        })
+    }
+
+    /// A new bottom terminal in repo `repo_id` of the active workspace,
+    /// selected and focused (`+`, `+ ▾`).
+    fn add_bottom_terminal_in(&mut self, repo_id: RepoId) -> Task<Event> {
+        self.bottom_repo_picker_open = false;
+        let Some(ws) = self.active_workspace() else {
+            return Task::none();
+        };
+        if !ws.repos.contains(&repo_id) {
+            eprintln!(
+                "[workspace] {:?}: no such repo for a bottom terminal",
+                ws.name
+            );
+            return Task::none();
+        }
+        let name = ws.name.clone();
+        let Some(dir) = self.repo_run_dir(ws, repo_id) else {
+            return Task::none();
+        };
+        let bt = self.create_bottom_terminal_for(&name, dir);
+        let Some(repo) = self.repo_mut(repo_id) else {
+            return Task::none();
+        };
+        repo.bottom_terminals.push(bt);
+        let idx = repo.bottom_terminals.len() - 1;
+        repo.active_bottom_tab = BottomPanelTab::Terminal(idx);
+        self.console_expanded = true;
+        self.mark_workspaces_dirty();
+        self.save_config();
+        self.focus_bottom_terminal(repo_id, idx)
     }
 
     /// Workspace settings' env editor: sets (`Some`) or removes `key` in
@@ -14252,6 +14599,32 @@ impl App {
             (FolderPickerPurpose::OpenFolder, Some(remote_id)) => {
                 self.open_remote_folder_tab(&remote_id, dir)
             }
+            (FolderPickerPurpose::AddRepo(uid), None) => {
+                let dir = PathBuf::from(dir);
+                if let Some(idx) = self.workspace_index_by_uid(uid) {
+                    let ws = &mut self.workspaces[idx];
+                    gitterm::workspace_repos::add_manually(
+                        &dir,
+                        &mut ws.repos_added,
+                        &mut ws.repos_removed,
+                    );
+                }
+                match self.add_repo_to_workspace(uid, dir.clone()) {
+                    Some(_) => eprintln!("[workspace] uid={uid}: added {}", dir.display()),
+                    None => eprintln!(
+                        "[workspace] cannot add {}: workspace uid={uid} is not open on this Mac",
+                        dir.display()
+                    ),
+                }
+                self.mark_workspaces_dirty();
+                Task::none()
+            }
+            (FolderPickerPurpose::AddRepo(uid), Some(remote_id)) => {
+                eprintln!(
+                    "[workspace] uid={uid}: a repo on {remote_id} cannot join; repos join from this Mac"
+                );
+                Task::none()
+            }
         };
         Task::batch([opened, self.present_active_tab_surfaces()])
     }
@@ -15983,7 +16356,8 @@ impl App {
             .is_some();
         if !home_open && ws_config.done_at.is_none() {
             for bt_config in self.saved_home_repo(ws_config).bottom_terminals {
-                let bt = self.create_bottom_terminal(PathBuf::from(&bt_config.dir));
+                let bt =
+                    self.create_bottom_terminal_for(&ws_config.name, PathBuf::from(&bt_config.dir));
                 workspace.seed_mut().bottom_terminals.push(bt);
             }
         }
@@ -16206,6 +16580,7 @@ impl App {
             workspaces: Vec::new(),
             repos: RepoRegistry::default(),
             stored_repos: Vec::new(),
+            bottom_repo_picker_open: false,
             active_workspace_idx: 0,
             next_tab_id: 0,
             task_store,
@@ -17104,11 +17479,16 @@ fi
             .map(|ws| ws.guidelines_off)
             .or_else(|| saved_ws.map(|cfg| cfg.guidelines_off))
             .unwrap_or(false);
-        // The workspace's repo env with its overrides (TRU-180).
+        // The env of the repo holding the tab's folder, with the
+        // workspace's overrides (TRU-180).
         let mut extra_env: Vec<(String, String)> = ws_name
             .as_deref()
             .zip(saved_file.as_ref())
-            .map(|(name, file)| file.workspace_env(name).into_iter().collect())
+            .map(|(name, file)| {
+                file.workspace_env(name, Some(&repo_path))
+                    .into_iter()
+                    .collect()
+            })
             .unwrap_or_default();
         if let Some(connection) = &self.browser_mcp {
             extra_env.extend(connection.terminal_environment(Some(&tab.session_uid)));
@@ -17147,12 +17527,24 @@ fi
         tab
     }
 
+    /// A bottom terminal in `cwd` for the active workspace.
     fn create_bottom_terminal(&mut self, cwd: PathBuf) -> BottomTerminal {
-        let ws_name = self.active_workspace().map(|ws| ws.name.clone());
-        let mut extra_env: Vec<(String, String)> = ws_name
-            .and_then(|name| {
-                WorkspacesFile::load_normalized()
-                    .map(|file| file.workspace_env(&name).into_iter().collect())
+        let ws_name = self
+            .active_workspace()
+            .map(|ws| ws.name.clone())
+            .unwrap_or_default();
+        self.create_bottom_terminal_for(&ws_name, cwd)
+    }
+
+    /// A bottom terminal in `cwd` for workspace `ws_name`: the env of the
+    /// repo holding `cwd`, with the workspace's overrides (TRU-180), read
+    /// fresh from `workspaces.json` as tabs do.
+    fn create_bottom_terminal_for(&mut self, ws_name: &str, cwd: PathBuf) -> BottomTerminal {
+        let mut extra_env: Vec<(String, String)> = WorkspacesFile::load_normalized()
+            .map(|file| {
+                file.workspace_env(ws_name, Some(&cwd))
+                    .into_iter()
+                    .collect()
             })
             .unwrap_or_default();
         let id = self.next_tab_id;
@@ -19420,12 +19812,12 @@ fi
                     return self.focus_main_terminal();
                 }
             }
-            Event::BottomTerminalClicked(idx) => {
+            Event::BottomTerminalClicked(repo, idx) => {
                 // In case the chat page above still holds AppKit focus,
                 // where it would take Cmd+V for itself.
                 webview::focus_app_view();
                 if !self.bottom_panel_focused {
-                    return self.focus_bottom_terminal(idx);
+                    return self.focus_bottom_terminal(repo, idx);
                 }
             }
             Event::Terminal(tab_id, iced_term::Event::BackendCall(_, cmd)) => {
@@ -22125,46 +22517,66 @@ fi
                     return self.scroll_to_active_tab();
                 }
             }
-            Event::BottomTabSelect(tab) => {
+            Event::BottomTabSelect(repo_id, tab) => {
+                self.bottom_repo_picker_open = false;
+                self.select_bottom_repo(repo_id);
                 if let Some(repo) = self.active_bottom_repo_mut() {
                     repo.active_bottom_tab = tab;
                 }
                 // Focus the appropriate terminal
                 return match tab {
-                    BottomPanelTab::Terminal(idx) => self.focus_bottom_terminal(idx),
+                    BottomPanelTab::Terminal(idx) => self.focus_bottom_terminal(repo_id, idx),
                     BottomPanelTab::Console => self.focus_main_terminal(),
                 };
             }
-            Event::BottomTerminalAdd => {
-                let dir = self
-                    .active_workspace()
-                    .map(|ws| {
-                        ws.active_tab()
-                            .map(|t| t.current_dir.clone())
-                            .unwrap_or_else(|| ws.dir.clone())
-                    })
-                    .unwrap_or_else(|| PathBuf::from("."));
-                let bt = self.create_bottom_terminal(dir);
-                let bt_idx = if let Some(repo) = self.active_bottom_repo_mut() {
-                    repo.bottom_terminals.push(bt);
-                    let idx = repo.bottom_terminals.len() - 1;
-                    repo.active_bottom_tab = BottomPanelTab::Terminal(idx);
-                    Some(idx)
-                } else {
-                    None
-                };
-                if let Some(idx) = bt_idx {
-                    self.console_expanded = true;
-                    self.mark_workspaces_dirty();
-                    self.save_config();
-                    return self.focus_bottom_terminal(idx);
+            Event::BottomRepoPickerToggle => {
+                self.bottom_repo_picker_open = !self.bottom_repo_picker_open;
+            }
+            Event::WorkspaceRepoSelect(uid, repo_id) => {
+                if let Some(idx) = self.workspace_index_by_uid(uid) {
+                    let ws = &mut self.workspaces[idx];
+                    if ws.repos.contains(&repo_id) {
+                        ws.current = repo_id;
+                        ws.bottom_repo = repo_id;
+                    }
+                }
+                self.sync_visible_terminals();
+            }
+            Event::WorkspaceRepoRemove(uid, repo_id) => {
+                self.remove_repo_from_workspace(uid, repo_id);
+            }
+            Event::WorkspaceRepoAdd(uid) => {
+                return self.open_folder_picker(FolderPickerPurpose::AddRepo(uid), None);
+            }
+            Event::WorkspaceRepoJoinedUndo(uid) => {
+                let joined = self
+                    .workspace_index_by_uid(uid)
+                    .map(|idx| std::mem::take(&mut self.workspaces[idx].joined_note))
+                    .unwrap_or_default();
+                for repo_id in joined {
+                    self.remove_repo_from_workspace(uid, repo_id);
                 }
             }
-            Event::BottomTerminalClose(idx) => {
+            Event::WorkspaceRepoJoinedDismiss(uid) => {
+                if let Some(idx) = self.workspace_index_by_uid(uid) {
+                    self.workspaces[idx].joined_note.clear();
+                }
+            }
+            Event::BottomTerminalAdd => {
+                let Some(current) = self.active_workspace().map(|ws| ws.current) else {
+                    return Task::none();
+                };
+                return self.add_bottom_terminal_in(current);
+            }
+            Event::BottomTerminalAddIn(repo_id) => {
+                return self.add_bottom_terminal_in(repo_id);
+            }
+            Event::BottomTerminalClose(repo_id, idx) => {
                 let was_active_terminal = self.active_bottom_repo()
+                    .filter(|repo| repo.id == repo_id)
                     .map(|repo| matches!(repo.active_bottom_tab, BottomPanelTab::Terminal(i) if i == idx))
                     .unwrap_or(false);
-                if let Some(repo) = self.active_bottom_repo_mut() {
+                if let Some(repo) = self.repo_mut(repo_id) {
                     if idx < repo.bottom_terminals.len() {
                         repo.bottom_terminals.remove(idx);
                         // Fix active tab reference
@@ -24838,6 +25250,8 @@ fi
                 self.chat_index_loaded_at = Some(Instant::now());
                 self.sync_task_sessions_from_chat_index();
                 self.refill_park_note();
+                // Work workspaces list the repos their chats touched (TRU-180).
+                self.sync_workspace_repos();
                 // PR homes read the index's facts (TRU-173).
                 self.prs.homes_built = None;
                 // Workspace overviews read the index (TRU-167).
@@ -26480,6 +26894,7 @@ fi
                 let title = match purpose {
                     FolderPickerPurpose::NewWorkspace => "Select Workspace Folder",
                     FolderPickerPurpose::OpenFolder => "Select Folder",
+                    FolderPickerPurpose::AddRepo(_) => "Add Repo to Workspace",
                 };
                 let dialog = Task::perform(
                     async move {
@@ -28484,6 +28899,7 @@ fi
         let title = match picker.purpose {
             FolderPickerPurpose::NewWorkspace => "New workspace",
             FolderPickerPurpose::OpenFolder => "Open folder",
+            FolderPickerPurpose::AddRepo(_) => "Add a repo to this workspace",
         };
         let mut body = Column::new().spacing(8).width(Length::Fixed(520.0));
         body = body.push(text(title).size(font).color(text_primary));
@@ -33255,6 +33671,145 @@ fi
     /// screen h's branch rows): the workspace's coordinators and fan-out,
     /// the repos it edited with the branches it owns, and its issue keys.
     /// A pure render over `workspace_overviews`; git is read by the poller.
+    /// The overview's Repos section (TRU-180): each repo the workspace
+    /// lists with its console state; selecting a row makes it current
+    /// (where new bottom terminals open); × removes one (not the home);
+    /// `+ add repo` picks a folder. A note offers undo when repos joined
+    /// from the chats' touches.
+    fn view_overview_repos(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+        let ws = self.active_workspace()?;
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let font_small = self.ui_font_small();
+        let text_primary = theme.text_primary();
+        let text_muted = theme.text_muted();
+        let hover = theme.bg_overlay();
+        let surface0 = theme.surface0();
+        let uid = ws.uid;
+        let mut section = Column::new()
+            .spacing(3)
+            .push(text("REPOS").size(10).color(text_muted).font(mono));
+
+        if !ws.joined_note.is_empty() {
+            let names: Vec<String> = ws
+                .joined_note
+                .iter()
+                .filter_map(|id| self.repo(*id))
+                .map(|repo| gitterm::workspace_repos::repo_name(&repo.dir))
+                .collect();
+            let note = format!("{} added to this workspace's repos", names.join(", "));
+            section = section.push(
+                row![
+                    text(note)
+                        .size(font_small - 1.0)
+                        .color(theme.text_secondary())
+                        .width(Length::Fill),
+                    button(text("Undo").size(font_small - 1.0).color(theme.accent()))
+                        .style(self.ghost_button_style())
+                        .padding([2, 6])
+                        .on_press(Event::WorkspaceRepoJoinedUndo(uid)),
+                    button(text("\u{00D7}").size(font_small - 1.0).color(text_muted))
+                        .style(self.ghost_button_style())
+                        .padding([2, 4])
+                        .on_press(Event::WorkspaceRepoJoinedDismiss(uid)),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+
+        let several = ws.repos.len() > 1;
+        for repo in ws.repos.iter().filter_map(|id| self.repo(*id)) {
+            let is_current = repo.id == ws.current;
+            let console = &repo.console;
+            let state = match console.status {
+                ConsoleStatus::Running => match &console.detected_url {
+                    Some(url) => format!("running \u{00B7} {url}"),
+                    None => "running".to_string(),
+                },
+                ConsoleStatus::Error => match console.exit_code {
+                    Some(code) => format!("exited {code}"),
+                    None => "error".to_string(),
+                },
+                ConsoleStatus::Stopped => "stopped".to_string(),
+                ConsoleStatus::NoneConfigured => "no run command".to_string(),
+            };
+            let state_color = match console.status {
+                ConsoleStatus::Running => theme.success(),
+                ConsoleStatus::Error => theme.danger(),
+                ConsoleStatus::Stopped | ConsoleStatus::NoneConfigured => text_muted,
+            };
+            let marker = repo_tab_color(&repo.dir, theme);
+            let mut name = gitterm::workspace_repos::repo_name(&repo.dir);
+            if repo.id == ws.home {
+                name.push_str(" \u{00B7} home");
+            }
+            let row_body = row![
+                container(iced::widget::Space::new())
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(12.0))
+                    .style(move |_| container::Style {
+                        background: Some(marker.into()),
+                        ..Default::default()
+                    }),
+                text(name)
+                    .size(font_small)
+                    .color(text_primary)
+                    .width(Length::Fill),
+                text(state).size(10).color(state_color).font(mono),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            let select = button(row_body)
+                .width(Length::Fill)
+                .padding([3, 6])
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if is_current && several {
+                            surface0
+                        } else if matches!(status, button::Status::Hovered) {
+                            hover
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .on_press(Event::WorkspaceRepoSelect(uid, repo.id));
+            let mut line = Row::new()
+                .spacing(2)
+                .align_y(iced::Alignment::Center)
+                .push(select);
+            if repo.id != ws.home {
+                line = line.push(
+                    button(text("\u{00D7}").size(font_small).color(text_muted))
+                        .style(self.ghost_button_style())
+                        .padding([2, 4])
+                        .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
+                );
+            }
+            section = section.push(line);
+        }
+        if matches!(ws.location, WorkspaceLocation::Local { .. }) {
+            section = section.push(
+                button(
+                    text("+ add repo")
+                        .size(font_small - 1.0)
+                        .color(theme.accent()),
+                )
+                .style(self.ghost_button_style())
+                .padding([2, 6])
+                .on_press(Event::WorkspaceRepoAdd(uid)),
+            );
+        }
+        Some(section.into())
+    }
+
     fn view_workspace_overview<'a>(&'a self) -> Element<'a, Event, Theme, iced::Renderer> {
         const COORDINATOR_ROWS: usize = 12;
         const OLDER_ROWS: usize = 20;
@@ -33351,6 +33906,10 @@ fi
                         .color(text_secondary),
                 ),
             );
+        }
+        // Repos: the checkouts this workspace lists (TRU-180).
+        if let Some(repos) = self.view_overview_repos() {
+            content = content.push(repos);
         }
         let Some(state) = state else {
             return finish(
@@ -41998,7 +42557,7 @@ fi
                         .height(Length::Fill)
                         .padding([2, 0]);
                         iced::widget::mouse_area(bt_container)
-                            .on_press(Event::BottomTerminalClicked(idx))
+                            .on_press(Event::BottomTerminalClicked(repo.id, idx))
                             .into()
                     } else {
                         let text_color = theme.text_secondary();
@@ -42138,6 +42697,140 @@ fi
             .into()
     }
 
+    /// One bottom panel tab: a repo's console (`terminal: None`) or one of
+    /// its terminals. `repo_color` marks which repo it belongs to when the
+    /// panel shows several (TRU-180).
+    fn view_bottom_tab<'a>(
+        &'a self,
+        repo: &'a RepoState,
+        terminal: Option<usize>,
+        label: String,
+        is_active: bool,
+        repo_color: Option<iced::Color>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let label_color = if is_active {
+            theme.text_primary()
+        } else {
+            theme.text_secondary()
+        };
+        let tab_bg = if is_active {
+            theme.bg_overlay()
+        } else {
+            iced::Color::TRANSPARENT
+        };
+        let hover_bg = theme.surface0();
+        let active_accent = if is_active {
+            repo_color.unwrap_or(theme.accent())
+        } else {
+            iced::Color::TRANSPARENT
+        };
+        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center);
+        if let Some(color) = repo_color {
+            content = content.push(
+                container(iced::widget::Space::new())
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(12.0))
+                    .style(move |_| container::Style {
+                        background: Some(color.into()),
+                        border: iced::Border {
+                            radius: 1.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+        let (glyph, select): (Element<'a, Event, Theme, iced::Renderer>, BottomPanelTab) =
+            match terminal {
+                None => {
+                    let dot_color = match repo.console.status {
+                        ConsoleStatus::Running => theme.success(),
+                        ConsoleStatus::Error => theme.danger(),
+                        ConsoleStatus::Stopped | ConsoleStatus::NoneConfigured => {
+                            theme.text_muted()
+                        }
+                    };
+                    let dot = container(iced::widget::Space::new())
+                        .width(Length::Fixed(6.0))
+                        .height(Length::Fixed(6.0))
+                        .style(move |_| container::Style {
+                            background: Some(dot_color.into()),
+                            border: iced::Border {
+                                radius: 3.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        });
+                    (dot.into(), BottomPanelTab::Console)
+                }
+                Some(idx) => (
+                    text(">_").size(10).color(label_color).font(mono).into(),
+                    BottomPanelTab::Terminal(idx),
+                ),
+            };
+        content = content
+            .push(glyph)
+            .push(text(label).size(12).color(label_color).font(mono));
+        let tab_btn = button(content)
+            .style(move |_theme, status| {
+                let bg = if matches!(status, button::Status::Hovered) && !is_active {
+                    hover_bg
+                } else {
+                    tab_bg
+                };
+                button::Style {
+                    background: Some(bg.into()),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        ..Default::default()
+                    },
+                    text_color: label_color,
+                    ..Default::default()
+                }
+            })
+            .padding(if terminal.is_some() { [4, 8] } else { [4, 10] })
+            .on_press(Event::BottomTabSelect(repo.id, select));
+        let mut tab_row = Row::new()
+            .spacing(0)
+            .align_y(iced::Alignment::Center)
+            .push(tab_btn);
+        if let Some(idx) = terminal {
+            let close_color = theme.text_muted();
+            let close_hover = theme.text_primary();
+            tab_row = tab_row.push(
+                button(text("\u{00D7}").size(12).color(close_color))
+                    .style(move |_theme, status| {
+                        let c = if matches!(status, button::Status::Hovered) {
+                            close_hover
+                        } else {
+                            close_color
+                        };
+                        button::Style {
+                            background: Some(iced::Color::TRANSPARENT.into()),
+                            text_color: c,
+                            ..Default::default()
+                        }
+                    })
+                    .padding([0, 2])
+                    .on_press(Event::BottomTerminalClose(repo.id, idx)),
+            );
+        }
+        column![
+            tab_row,
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fixed(2.0))
+                .style(move |_| container::Style {
+                    background: Some(active_accent.into()),
+                    ..Default::default()
+                })
+        ]
+        .spacing(0)
+        .into()
+    }
+
     fn view_bottom_tab_bar<'a>(
         &'a self,
         repo: &'a RepoState,
@@ -42145,6 +42838,83 @@ fi
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let active_tab = repo.active_bottom_tab;
+        let console_is_active = active_tab == BottomPanelTab::Console;
+        let Some(ws) = self.active_workspace() else {
+            return iced::widget::Space::new().into();
+        };
+        // Every local repo's console and terminals, grouped by repo
+        // (TRU-180); one repo looks as before.
+        let panel_repos = self.panel_repos(ws);
+        let several = panel_repos.len() > 1;
+        let tabs = gitterm::workspace_repos::panel_tabs(
+            &panel_repos
+                .iter()
+                .map(|panel| gitterm::workspace_repos::PanelRepo {
+                    dir: panel.dir.clone(),
+                    terminals: panel
+                        .bottom_terminals
+                        .iter()
+                        .map(|bt| bt.title.clone())
+                        .collect(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut tab_buttons: Vec<Element<'a, Event, Theme, iced::Renderer>> = Vec::new();
+        for tab in tabs {
+            let panel = panel_repos[tab.repo];
+            let is_active = panel.id == repo.id
+                && match tab.terminal {
+                    None => console_is_active,
+                    Some(idx) => active_tab == BottomPanelTab::Terminal(idx),
+                };
+            let repo_color = several.then(|| repo_tab_color(&panel.dir, theme));
+            tab_buttons.push(self.view_bottom_tab(
+                panel,
+                tab.terminal,
+                tab.label,
+                is_active,
+                repo_color,
+            ));
+        }
+
+        // "+" opens a terminal in the current repo; "▾" picks another.
+        let plus_color = theme.text_secondary();
+        let plus_hover_bg = theme.surface0();
+        let small_button = move |label: String, event: Event| {
+            button(text(label).size(14).color(plus_color))
+                .style(move |_theme, status| {
+                    let bg = if matches!(status, button::Status::Hovered) {
+                        plus_hover_bg
+                    } else {
+                        iced::Color::TRANSPARENT
+                    };
+                    button::Style {
+                        background: Some(bg.into()),
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            ..Default::default()
+                        },
+                        text_color: plus_color,
+                        ..Default::default()
+                    }
+                })
+                .padding([2, 8])
+                .on_press(event)
+        };
+        let plus_btn = small_button("+".to_string(), Event::BottomTerminalAdd);
+        let mut picker: Vec<Element<'a, Event, Theme, iced::Renderer>> = Vec::new();
+        if several {
+            picker.push(small_button("\u{25BE}".to_string(), Event::BottomRepoPickerToggle).into());
+            if self.bottom_repo_picker_open {
+                for panel in &panel_repos {
+                    let name = gitterm::workspace_repos::repo_name(&panel.dir);
+                    picker.push(
+                        small_button(format!("+ {name}"), Event::BottomTerminalAddIn(panel.id))
+                            .into(),
+                    );
+                }
+            }
+        }
 
         // Chevron button (toggle expand/collapse)
         let chevron = if self.console_expanded {
@@ -42161,204 +42931,6 @@ fi
             .padding([4, 6])
             .on_press(Event::ConsoleToggle);
 
-        // --- Console tab button ---
-        let console_is_active = active_tab == BottomPanelTab::Console;
-        let dot_color = match console.status {
-            ConsoleStatus::Running => theme.success(),
-            ConsoleStatus::Error => theme.danger(),
-            ConsoleStatus::Stopped | ConsoleStatus::NoneConfigured => theme.text_muted(),
-        };
-        let status_dot = container(iced::widget::Space::new())
-            .width(Length::Fixed(6.0))
-            .height(Length::Fixed(6.0))
-            .style(move |_| container::Style {
-                background: Some(dot_color.into()),
-                border: iced::Border {
-                    radius: 3.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-
-        let console_label_color = if console_is_active {
-            theme.text_primary()
-        } else {
-            theme.text_secondary()
-        };
-        let console_tab_bg = if console_is_active {
-            theme.bg_overlay()
-        } else {
-            iced::Color::TRANSPARENT
-        };
-        let console_hover_bg = theme.surface0();
-        let console_active_accent = if console_is_active {
-            theme.accent()
-        } else {
-            iced::Color::TRANSPARENT
-        };
-
-        let console_tab_btn = button(
-            row![
-                status_dot,
-                text("Console")
-                    .size(12)
-                    .color(console_label_color)
-                    .font(iced::Font::with_name("Menlo"))
-            ]
-            .spacing(5)
-            .align_y(iced::Alignment::Center),
-        )
-        .style(move |_theme, status| {
-            let bg = if matches!(status, button::Status::Hovered) && !console_is_active {
-                console_hover_bg
-            } else {
-                console_tab_bg
-            };
-            button::Style {
-                background: Some(bg.into()),
-                border: iced::Border {
-                    width: 0.0,
-                    color: iced::Color::TRANSPARENT,
-                    radius: 3.0.into(),
-                },
-                text_color: console_label_color,
-                ..Default::default()
-            }
-        })
-        .padding([4, 10])
-        .on_press(Event::BottomTabSelect(BottomPanelTab::Console));
-
-        // Underline for console tab when active
-        let console_tab_with_underline: Element<'a, Event, Theme, iced::Renderer> = column![
-            console_tab_btn,
-            container(iced::widget::Space::new())
-                .width(Length::Fill)
-                .height(Length::Fixed(2.0))
-                .style(move |_| container::Style {
-                    background: Some(console_active_accent.into()),
-                    ..Default::default()
-                })
-        ]
-        .spacing(0)
-        .into();
-
-        // --- Terminal tab buttons ---
-        let mut tab_buttons: Vec<Element<'a, Event, Theme, iced::Renderer>> = Vec::new();
-        for (idx, bt) in repo.bottom_terminals.iter().enumerate() {
-            let is_active = active_tab == BottomPanelTab::Terminal(idx);
-            let label: String = bt
-                .title
-                .clone()
-                .unwrap_or_else(|| format!("Terminal {}", idx + 1));
-            let label_color = if is_active {
-                theme.text_primary()
-            } else {
-                theme.text_secondary()
-            };
-            let tab_bg = if is_active {
-                theme.bg_overlay()
-            } else {
-                iced::Color::TRANSPARENT
-            };
-            let tab_hover_bg = theme.surface0();
-            let active_accent = if is_active {
-                theme.accent()
-            } else {
-                iced::Color::TRANSPARENT
-            };
-
-            let close_color = theme.text_muted();
-            let close_hover = theme.text_primary();
-            let close_btn = button(text("\u{00D7}").size(12).color(close_color))
-                .style(move |_theme, status| {
-                    let c = if matches!(status, button::Status::Hovered) {
-                        close_hover
-                    } else {
-                        close_color
-                    };
-                    button::Style {
-                        background: Some(iced::Color::TRANSPARENT.into()),
-                        text_color: c,
-                        ..Default::default()
-                    }
-                })
-                .padding([0, 2])
-                .on_press(Event::BottomTerminalClose(idx));
-
-            let tab_btn = button(
-                row![
-                    text(">_")
-                        .size(10)
-                        .color(label_color)
-                        .font(iced::Font::with_name("Menlo")),
-                    text(label)
-                        .size(12)
-                        .color(label_color)
-                        .font(iced::Font::with_name("Menlo")),
-                ]
-                .spacing(4)
-                .align_y(iced::Alignment::Center),
-            )
-            .style(move |_theme, status| {
-                let bg = if matches!(status, button::Status::Hovered) && !is_active {
-                    tab_hover_bg
-                } else {
-                    tab_bg
-                };
-                button::Style {
-                    background: Some(bg.into()),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        ..Default::default()
-                    },
-                    text_color: label_color,
-                    ..Default::default()
-                }
-            })
-            .padding([4, 8])
-            .on_press(Event::BottomTabSelect(BottomPanelTab::Terminal(idx)));
-
-            let tab_with_close: Element<'a, Event, Theme, iced::Renderer> = column![
-                row![tab_btn, close_btn]
-                    .spacing(0)
-                    .align_y(iced::Alignment::Center),
-                container(iced::widget::Space::new())
-                    .width(Length::Fill)
-                    .height(Length::Fixed(2.0))
-                    .style(move |_| container::Style {
-                        background: Some(active_accent.into()),
-                        ..Default::default()
-                    })
-            ]
-            .spacing(0)
-            .into();
-
-            tab_buttons.push(tab_with_close);
-        }
-
-        // "+" button to add terminal
-        let plus_color = theme.text_secondary();
-        let plus_hover_bg = theme.surface0();
-        let plus_btn = button(text("+").size(14).color(plus_color))
-            .style(move |_theme, status| {
-                let bg = if matches!(status, button::Status::Hovered) {
-                    plus_hover_bg
-                } else {
-                    iced::Color::TRANSPARENT
-                };
-                button::Style {
-                    background: Some(bg.into()),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        ..Default::default()
-                    },
-                    text_color: plus_color,
-                    ..Default::default()
-                }
-            })
-            .padding([2, 8])
-            .on_press(Event::BottomTerminalAdd);
-
         // Spacer
         let spacer = iced::widget::Space::new().width(Length::Fill);
 
@@ -42367,13 +42939,15 @@ fi
             .spacing(4)
             .align_y(iced::Alignment::Center)
             .padding([0, 8])
-            .push(chevron_btn)
-            .push(console_tab_with_underline);
+            .push(chevron_btn);
 
         for tb in tab_buttons {
             header_row = header_row.push(tb);
         }
         header_row = header_row.push(plus_btn);
+        for item in picker {
+            header_row = header_row.push(item);
+        }
 
         // Quick commands button (⚡) — only show if commands are configured
         if !self.quick_commands.is_empty() {
@@ -45810,6 +46384,8 @@ mod tests {
             repos: vec![format!("/tmp/{name}")],
             home: None,
             env_overrides: HashMap::new(),
+            repos_added: Vec::new(),
+            repos_removed: Vec::new(),
         }
     }
 
@@ -45949,6 +46525,39 @@ mod tests {
         let stored = repo_config_of(&released[0]).unwrap();
         assert_eq!(stored.dir, dir.to_string_lossy());
         assert_eq!(stored.bottom_terminals.len(), 1);
+    }
+
+    #[test]
+    fn a_repo_another_workspace_lists_keeps_running_when_one_removes_it() {
+        let mut registry = RepoRegistry::default();
+        let home_a = PathBuf::from("/tmp/tru180-not-a-folder/a");
+        let home_b = PathBuf::from("/tmp/tru180-not-a-folder/b");
+        let shared = PathBuf::from("/tmp/tru180-not-a-folder/api");
+        let (a, _) = registry.attach(home_a.clone(), local(&home_a), RepoSeed::new(None));
+        let (b, _) = registry.attach(home_b.clone(), local(&home_b), RepoSeed::new(None));
+        let (api, _) = registry.attach(shared.clone(), local(&shared), RepoSeed::new(None));
+        let (api_again, _) = registry.attach(shared.clone(), local(&shared), RepoSeed::new(None));
+        assert_eq!(api, api_again);
+        // Workspace A lists [a, api], B lists [b, api]; A removes api.
+        let listed: HashSet<RepoId> = [a, b, api].into_iter().collect();
+        assert!(registry.release_unlisted(&listed).is_empty());
+        // B parks too: api and b stop.
+        let listed: HashSet<RepoId> = [a].into_iter().collect();
+        let released: Vec<RepoId> = registry
+            .release_unlisted(&listed)
+            .iter()
+            .map(|repo| repo.id)
+            .collect();
+        assert_eq!(released, [b, api]);
+    }
+
+    #[test]
+    fn a_task_repository_folds_to_its_main_checkout() {
+        assert_eq!(
+            task_main_checkout(Path::new("/w/api/.git")),
+            Some(PathBuf::from("/w/api"))
+        );
+        assert_eq!(task_main_checkout(Path::new("/w/api.git")), None);
     }
 
     #[test]
