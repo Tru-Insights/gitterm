@@ -97,8 +97,8 @@ use work_prs::PrEvent;
 // Start with just config for now to avoid conflicts
 use config::{
     AgentPreset, BottomTerminalConfig, Config, ParkedInfo, QuickCommand, RemoteAgentConfig,
-    RemoteAgentsFile, RemoteSessionConfig, RemoteSessionsFile, WorkspaceColor, WorkspaceConfig,
-    WorkspaceLocationConfig, WorkspaceTabConfig, WorkspacesFile,
+    RemoteAgentsFile, RemoteSessionConfig, RemoteSessionsFile, RepoConfig, RepoKey, WorkspaceColor,
+    WorkspaceConfig, WorkspaceLocationConfig, WorkspaceTabConfig, WorkspacesFile,
 };
 use events::SidebarMode;
 use theme::AppTheme;
@@ -5468,21 +5468,182 @@ fn next_workspace_uid() -> u64 {
     NEXT_WORKSPACE_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Runtime identity of a repo in `App::repos` (TRU-180); never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RepoId(u64);
+
+impl RepoId {
+    /// A workspace's ids before `App::open_workspace` registers its home.
+    const UNREGISTERED: RepoId = RepoId(0);
+}
+
+/// A checkout folder's runtime (TRU-180): its console (run command, dev
+/// server), bottom terminals and env. One per checkout: every open
+/// workspace listing the same dir on the same machine shares it. It
+/// lives while an open workspace lists it; settings persist in the
+/// `repos` section of `workspaces.json`.
+struct RepoState {
+    id: RepoId,
+    key: RepoKey,
+    dir: PathBuf,
+    location: WorkspaceLocation,
+    console: ConsoleState,
+    bottom_terminals: Vec<BottomTerminal>,
+    active_bottom_tab: BottomPanelTab,
+    env: HashMap<String, String>,
+}
+
+/// What a workspace's home repo starts with until the workspace opens
+/// (`App::open_workspace`): the constructors and restore paths fill it in
+/// before the workspace is registered, and registering moves it into a
+/// new `RepoState` or merges it into the open one it shares.
+struct RepoSeed {
+    console: ConsoleState,
+    bottom_terminals: Vec<BottomTerminal>,
+    env: HashMap<String, String>,
+}
+
+impl RepoSeed {
+    fn new(run_command: Option<String>) -> Self {
+        Self {
+            console: ConsoleState::new(run_command),
+            bottom_terminals: Vec::new(),
+            env: HashMap::new(),
+        }
+    }
+
+    /// Takes a stored run command (one restored from `workspaces.json`).
+    fn set_run_command(&mut self, command: Option<&String>) {
+        if let Some(cmd) = command {
+            self.console.run_command = Some(cmd.clone());
+            self.console.status = ConsoleStatus::Stopped;
+        }
+    }
+}
+
+/// The repo key of a checkout `dir` at `location`.
+fn repo_key(dir: &Path, location: &WorkspaceLocation) -> RepoKey {
+    match location {
+        WorkspaceLocation::Local { .. } => RepoKey::local(dir),
+        WorkspaceLocation::RemoteAgent {
+            remote_id, root, ..
+        } => RepoKey::RemoteAgent {
+            remote_id: remote_id.clone(),
+            root: root.clone(),
+        },
+        WorkspaceLocation::LegacyRemoteSession { session_name, root } => RepoKey::LegacyRemote {
+            session_name: session_name.clone(),
+            root: root.clone(),
+        },
+    }
+}
+
+/// The open repos (TRU-180), in the order they were registered.
+#[derive(Default)]
+struct RepoRegistry {
+    repos: Vec<RepoState>,
+    next_id: u64,
+}
+
+impl RepoRegistry {
+    fn get(&self, id: RepoId) -> Option<&RepoState> {
+        self.repos.iter().find(|repo| repo.id == id)
+    }
+
+    fn get_mut(&mut self, id: RepoId) -> Option<&mut RepoState> {
+        self.repos.iter_mut().find(|repo| repo.id == id)
+    }
+
+    fn by_key(&self, key: &RepoKey) -> Option<RepoId> {
+        self.repos
+            .iter()
+            .find(|repo| repo.key == *key)
+            .map(|repo| repo.id)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &RepoState> {
+        self.repos.iter()
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut RepoState> {
+        self.repos.iter_mut()
+    }
+
+    /// Registers the checkout `dir` at `location` seeded with `seed`, or
+    /// joins the open repo with its key. Joining keeps the open repo's
+    /// console, run command and env; the seed's bottom terminals are added
+    /// to the repo's, and the seed's env entries the repo lacks or holds
+    /// differently come back as overrides for the joining workspace.
+    fn attach(
+        &mut self,
+        dir: PathBuf,
+        location: WorkspaceLocation,
+        seed: RepoSeed,
+    ) -> (RepoId, HashMap<String, String>) {
+        let key = repo_key(&dir, &location);
+        if let Some(repo) = self.repos.iter_mut().find(|repo| repo.key == key) {
+            let RepoSeed {
+                mut console,
+                mut bottom_terminals,
+                env,
+            } = seed;
+            // A seed's console never ran; stop it anyway so nothing leaks.
+            console.kill_process();
+            repo.bottom_terminals.append(&mut bottom_terminals);
+            return (repo.id, config::env_difference(&env, &repo.env));
+        }
+        self.next_id += 1;
+        let id = RepoId(self.next_id);
+        self.repos.push(RepoState {
+            id,
+            key,
+            dir,
+            location,
+            console: seed.console,
+            bottom_terminals: seed.bottom_terminals,
+            active_bottom_tab: BottomPanelTab::Console,
+            env: seed.env,
+        });
+        (id, HashMap::new())
+    }
+
+    /// Removes every repo no id in `listed` names and returns them: the
+    /// caller stores their settings and stops their console. Dropping a
+    /// repo drops its bottom terminals, closing their PTYs.
+    fn release_unlisted(&mut self, listed: &HashSet<RepoId>) -> Vec<RepoState> {
+        let (kept, released): (Vec<RepoState>, Vec<RepoState>) = std::mem::take(&mut self.repos)
+            .into_iter()
+            .partition(|repo| listed.contains(&repo.id));
+        self.repos = kept;
+        released
+    }
+}
+
 // Workspace groups tabs by project
 struct Workspace {
     uid: u64,
     name: String,
     abbrev: String,
+    /// The home repo's dir (TRU-180): `RepoState::dir` of `home`.
     dir: PathBuf,
     color: WorkspaceColor,
+    /// The home repo's machine; the workspace's bar group.
     location: WorkspaceLocation,
     remote_session: Option<RemoteSessionDefinition>,
     tabs: Vec<TabState>,
     active_tab: usize,
-    console: ConsoleState,
-    bottom_terminals: Vec<BottomTerminal>,
-    active_bottom_tab: BottomPanelTab,
-    env: std::collections::HashMap<String, String>,
+    /// The repo new chats start in (TRU-180), first of `repos`.
+    home: RepoId,
+    /// The repos this workspace lists, home first, in join order.
+    repos: Vec<RepoId>,
+    /// The selected repo: default for new bottom terminals and the one
+    /// the Git sidebar shows.
+    current: RepoId,
+    /// Env on top of each repo's env for this workspace's tabs, terminals
+    /// and console (TRU-180).
+    env_overrides: HashMap<String, String>,
+    /// The home repo's state until the workspace opens; `None` after.
+    seed: Option<RepoSeed>,
     /// Root chat session ids this workspace owns (TRU-169); empty for a
     /// folder-scoped workspace. See `WorkspaceConfig::chats`.
     chats: Vec<String>,
@@ -5498,7 +5659,6 @@ impl Workspace {
     fn new(name: String, dir: PathBuf, color: WorkspaceColor) -> Self {
         let abbrev = Self::derive_abbrev(&name);
         let run_command = detect_run_command(&dir);
-        let console = ConsoleState::new(run_command);
         Self {
             uid: next_workspace_uid(),
             name,
@@ -5509,10 +5669,11 @@ impl Workspace {
             remote_session: None,
             tabs: Vec::new(),
             active_tab: 0,
-            console,
-            bottom_terminals: Vec::new(),
-            active_bottom_tab: BottomPanelTab::Console,
-            env: std::collections::HashMap::new(),
+            home: RepoId::UNREGISTERED,
+            repos: Vec::new(),
+            current: RepoId::UNREGISTERED,
+            env_overrides: HashMap::new(),
+            seed: Some(RepoSeed::new(run_command)),
             chats: Vec::new(),
             claims_new_chats: false,
             guidelines_off: false,
@@ -5536,14 +5697,24 @@ impl Workspace {
             remote_session: Some(session),
             tabs: Vec::new(),
             active_tab: 0,
-            console: ConsoleState::new(None),
-            bottom_terminals: Vec::new(),
-            active_bottom_tab: BottomPanelTab::Console,
-            env: std::collections::HashMap::new(),
+            home: RepoId::UNREGISTERED,
+            repos: Vec::new(),
+            current: RepoId::UNREGISTERED,
+            env_overrides: HashMap::new(),
+            seed: Some(RepoSeed::new(None)),
             chats: Vec::new(),
             claims_new_chats: false,
             guidelines_off: false,
         }
+    }
+
+    /// The home repo's seed while the workspace is being built. Only the
+    /// constructors and restore paths call this, before
+    /// `App::open_workspace`; after it the repo is in `App::repos`.
+    fn seed_mut(&mut self) -> &mut RepoSeed {
+        self.seed
+            .as_mut()
+            .expect("a workspace's repo seed is only edited before the workspace opens")
     }
 
     fn derive_abbrev(name: &str) -> String {
@@ -6483,6 +6654,11 @@ fn paired_browser_evidence(evidence: &[BrowserEvidence]) -> Vec<&BrowserEvidence
 struct App {
     title: String,
     workspaces: Vec<Workspace>,
+    /// The open repos the workspaces list (TRU-180).
+    repos: RepoRegistry,
+    /// Settings of repos no open workspace lists, as `workspaces.json`
+    /// stores them: loaded at startup, updated when a repo stops.
+    stored_repos: Vec<config::RepoConfig>,
     active_workspace_idx: usize,
     next_tab_id: usize,
     // Durable task registry and cross-workspace Tasks UI state.
@@ -7340,6 +7516,69 @@ fn workspace_config_dir(workspace: &Workspace) -> String {
     }
 }
 
+/// A repo's dir as `workspaces.json` writes it (see `workspace_config_dir`).
+fn repo_config_dir(repo: &RepoState) -> String {
+    match &repo.location {
+        WorkspaceLocation::RemoteAgent { root, .. } => root.clone(),
+        WorkspaceLocation::Local { .. } | WorkspaceLocation::LegacyRemoteSession { .. } => {
+            repo.dir.to_string_lossy().to_string()
+        }
+    }
+}
+
+/// A repo as the `repos` section of `workspaces.json` stores it; `None`
+/// for a legacy remote workspace's repo, which is never stored (see
+/// `WorkspaceConfig::is_legacy_remote`).
+fn repo_config_of(repo: &RepoState) -> Option<RepoConfig> {
+    if matches!(repo.key, RepoKey::LegacyRemote { .. }) {
+        return None;
+    }
+    Some(RepoConfig {
+        dir: repo_config_dir(repo),
+        location: workspace_location_config_from_location(&repo.location),
+        run_command: repo.console.run_command.clone(),
+        env: repo.env.clone(),
+        bottom_terminals: repo
+            .bottom_terminals
+            .iter()
+            .map(|bt| BottomTerminalConfig {
+                dir: bt.cwd.to_string_lossy().to_string(),
+            })
+            .collect(),
+    })
+}
+
+/// Replaces the stored repo with `repo`'s key, or adds it.
+fn upsert_repo_config(stored: &mut Vec<RepoConfig>, repo: RepoConfig) {
+    let key = repo.key();
+    match stored.iter_mut().find(|known| known.key() == key) {
+        Some(known) => *known = repo,
+        None => stored.push(repo),
+    }
+}
+
+/// The `repos` section to write: every open repo (`open`, registry
+/// order), then each stored repo a closed workspace still lists. A repo
+/// no workspace lists is dropped.
+fn repos_section(
+    open: Vec<RepoConfig>,
+    stored: &[RepoConfig],
+    closed: &[WorkspaceConfig],
+) -> Vec<RepoConfig> {
+    let mut section = open;
+    let listed_by_closed: Vec<RepoKey> = closed
+        .iter()
+        .flat_map(|cfg| cfg.repos.iter().filter_map(|dir| cfg.repo_key(dir)))
+        .collect();
+    for repo in stored {
+        let key = repo.key();
+        if listed_by_closed.contains(&key) && !section.iter().any(|known| known.key() == key) {
+            section.push(repo.clone());
+        }
+    }
+    section
+}
+
 fn remote_agent_root(location: &WorkspaceLocation) -> Option<&str> {
     match location {
         WorkspaceLocation::RemoteAgent { root, .. } => Some(root.as_str()),
@@ -7761,15 +8000,16 @@ impl App {
         let mut console_line_count = 0usize;
         let mut console_bytes = 0usize;
 
-        for ws in &self.workspaces {
-            console_line_count += ws.console.output_lines.len();
-            console_bytes += ws
+        for repo in self.repos.iter() {
+            console_line_count += repo.console.output_lines.len();
+            console_bytes += repo
                 .console
                 .output_lines
                 .iter()
                 .map(|l| l.timestamp.len() + 1 + l.content.len())
                 .sum::<usize>();
-
+        }
+        for ws in &self.workspaces {
             for tab in &ws.tabs {
                 tab_count += 1;
                 if let Some(fv) = tab.file_viewer() {
@@ -7816,8 +8056,8 @@ impl App {
     fn focus_bottom_terminal(&mut self, idx: usize) -> Task<Event> {
         self.bottom_panel_focused = true;
         if let Some(bt) = self
-            .active_workspace_mut()
-            .and_then(|ws| ws.bottom_terminals.get_mut(idx))
+            .active_bottom_repo_mut()
+            .and_then(|repo| repo.bottom_terminals.get_mut(idx))
         {
             if let Some(term) = &mut bt.terminal {
                 term.sync_and_redraw();
@@ -7837,14 +8077,22 @@ impl App {
         if !self.console_expanded {
             return None;
         }
-        let workspace = self.active_workspace()?;
-        let BottomPanelTab::Terminal(idx) = workspace.active_bottom_tab else {
+        let repo = self.active_bottom_repo()?;
+        let BottomPanelTab::Terminal(idx) = repo.active_bottom_tab else {
             return None;
         };
-        workspace
-            .bottom_terminals
-            .get(idx)
-            .map(|terminal| terminal.id)
+        repo.bottom_terminals.get(idx).map(|terminal| terminal.id)
+    }
+
+    /// The bottom panel's selected terminal, when a terminal is selected.
+    fn active_bottom_terminal_mut(&mut self) -> Option<&mut iced_term::Terminal> {
+        let repo = self.active_bottom_repo_mut()?;
+        let BottomPanelTab::Terminal(idx) = repo.active_bottom_tab else {
+            return None;
+        };
+        repo.bottom_terminals
+            .get_mut(idx)
+            .and_then(|bottom| bottom.terminal.as_mut())
     }
 
     fn sync_visible_terminals(&mut self) {
@@ -7857,14 +8105,8 @@ impl App {
             terminal.sync_and_redraw();
         }
         if console_expanded {
-            if let BottomPanelTab::Terminal(idx) = workspace.active_bottom_tab {
-                if let Some(terminal) = workspace
-                    .bottom_terminals
-                    .get_mut(idx)
-                    .and_then(|bottom| bottom.terminal.as_mut())
-                {
-                    terminal.sync_and_redraw();
-                }
+            if let Some(terminal) = self.active_bottom_terminal_mut() {
+                terminal.sync_and_redraw();
             }
         }
     }
@@ -7884,14 +8126,8 @@ impl App {
             }
         }
         if bottom_pending && console_expanded {
-            if let BottomPanelTab::Terminal(idx) = workspace.active_bottom_tab {
-                if let Some(terminal) = workspace
-                    .bottom_terminals
-                    .get_mut(idx)
-                    .and_then(|bottom| bottom.terminal.as_mut())
-                {
-                    terminal.sync_and_redraw();
-                }
+            if let Some(terminal) = self.active_bottom_terminal_mut() {
+                terminal.sync_and_redraw();
             }
         }
     }
@@ -8006,6 +8242,7 @@ impl App {
     /// and bottom terminals. Parking (TRU-171) stores the same entry with
     /// `active: false`, so resuming restores the tabs.
     fn workspace_config(&self, ws: &Workspace) -> WorkspaceConfig {
+        let home = self.repo(ws.home);
         WorkspaceConfig {
             name: ws.name.clone(),
             abbrev: ws.abbrev.clone(),
@@ -8043,20 +8280,33 @@ impl App {
                     session_uid: Some(tab.session_uid.clone()),
                 })
                 .collect(),
-            run_command: ws.console.run_command.clone(),
-            bottom_terminals: ws
-                .bottom_terminals
-                .iter()
-                .map(|bt| BottomTerminalConfig {
-                    dir: bt.cwd.to_string_lossy().to_string(),
+            // Pre-TRU-180 fields, from the home repo, so an older build
+            // still reads the entry.
+            run_command: home.and_then(|repo| repo.console.run_command.clone()),
+            bottom_terminals: home
+                .map(|repo| {
+                    repo.bottom_terminals
+                        .iter()
+                        .map(|bt| BottomTerminalConfig {
+                            dir: bt.cwd.to_string_lossy().to_string(),
+                        })
+                        .collect()
                 })
-                .collect(),
-            env: ws.env.clone(),
+                .unwrap_or_default(),
+            env: self.workspace_repo_env(ws, ws.home),
             active: true,
             chats: ws.chats.clone(),
             parked: None,
             done_at: None,
             guidelines_off: ws.guidelines_off,
+            repos: ws
+                .repos
+                .iter()
+                .filter_map(|id| self.repo(*id))
+                .map(repo_config_dir)
+                .collect(),
+            home: Some(workspace_config_dir(ws)),
+            env_overrides: ws.env_overrides.clone(),
         }
     }
 
@@ -8108,8 +8358,16 @@ impl App {
             .save();
         }
 
+        let closed: Vec<WorkspaceConfig> =
+            configs.iter().filter(|cfg| !cfg.active).cloned().collect();
+        let repos = repos_section(
+            self.repos.iter().filter_map(repo_config_of).collect(),
+            &self.stored_repos,
+            &closed,
+        );
         let ws_file = WorkspacesFile {
             workspaces: configs,
+            repos,
             active_workspace: self.active_workspace_idx,
             remote_sessions,
             remote_agents: remote_agent_defs,
@@ -10732,7 +10990,10 @@ impl App {
         self.workspaces
             .iter()
             .find(|workspace| self.task_belongs_to_workspace(task, workspace))
-            .and_then(|workspace| workspace.env.get(GH_ACCOUNT_ENV_KEY))
+            .and_then(|workspace| {
+                self.workspace_repo_env(workspace, workspace.home)
+                    .remove(GH_ACCOUNT_ENV_KEY)
+            })
             .map(|account| account.trim().to_string())
             .filter(|account| !account.is_empty())
     }
@@ -11454,11 +11715,9 @@ impl App {
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| managed.name.clone());
-                    repository_workspaces.push(Workspace::new(
-                        name,
-                        repository_dir.clone(),
-                        managed.color,
-                    ));
+                    let mut owner = Workspace::new(name, repository_dir.clone(), managed.color);
+                    self.register_home(&mut owner);
+                    repository_workspaces.push(owner);
                     repository_workspaces.len() - 1
                 });
             let tab_offset = repository_workspaces[owner_idx].tabs.len();
@@ -11478,9 +11737,14 @@ impl App {
             repository_workspaces[owner_idx]
                 .tabs
                 .append(&mut managed.tabs);
-            repository_workspaces[owner_idx]
-                .bottom_terminals
-                .append(&mut managed.bottom_terminals);
+            let mut moved = self
+                .repo_mut(managed.home)
+                .map(|repo| std::mem::take(&mut repo.bottom_terminals))
+                .unwrap_or_default();
+            let owner_home = repository_workspaces[owner_idx].home;
+            if let Some(owner_repo) = self.repo_mut(owner_home) {
+                owner_repo.bottom_terminals.append(&mut moved);
+            }
             if managed_was_active {
                 repository_workspaces[owner_idx].active_tab = tab_offset
                     + managed_active_tab.min(
@@ -11494,6 +11758,9 @@ impl App {
         }
 
         self.workspaces = repository_workspaces;
+        // The folded workspaces' repos (task worktrees) are listed by no
+        // one now; their terminals moved to the owner's repo above.
+        self.release_unlisted_repos();
         self.active_workspace_idx = active_repository_dir
             .as_ref()
             .and_then(|directory| {
@@ -11744,9 +12011,9 @@ impl App {
         for tab_id in tab_ids {
             self.stop_remote_chat_for_closing_tab(tab_id);
         }
-        // Kill console process before removing workspace
-        self.workspaces[idx].console.kill_process();
+        // Its repos stop unless another open workspace lists them.
         self.workspaces.remove(idx);
+        self.release_unlisted_repos();
         if self.active_workspace_idx >= self.workspaces.len() {
             self.active_workspace_idx = self.workspaces.len() - 1;
         }
@@ -11836,11 +12103,182 @@ impl App {
         self.mark_workspaces_dirty();
     }
 
+    // -----------------------------------------------------------------------
+    // Repos (TRU-180): a workspace lists repos; the registry owns each
+    // repo's console, bottom terminals and env, one per checkout.
+
+    fn repo(&self, id: RepoId) -> Option<&RepoState> {
+        self.repos.get(id)
+    }
+
+    fn repo_mut(&mut self, id: RepoId) -> Option<&mut RepoState> {
+        self.repos.get_mut(id)
+    }
+
+    /// The repo whose console and terminals the bottom panel shows.
+    fn active_bottom_repo(&self) -> Option<&RepoState> {
+        self.active_workspace().and_then(|ws| self.repo(ws.home))
+    }
+
+    fn active_bottom_repo_mut(&mut self) -> Option<&mut RepoState> {
+        let id = self.active_workspace()?.home;
+        self.repo_mut(id)
+    }
+
+    /// What `ws` runs a tab, terminal or console in repo `id` with: the
+    /// repo's env, then the workspace's overrides.
+    fn workspace_repo_env(&self, ws: &Workspace, id: RepoId) -> HashMap<String, String> {
+        let empty = HashMap::new();
+        let env = self.repo(id).map_or(&empty, |repo| &repo.env);
+        config::layered_env(env, &ws.env_overrides)
+    }
+
+    /// Whether a console of a repo `ws` lists exited with an error.
+    fn workspace_console_error(&self, ws: &Workspace) -> bool {
+        ws.repos.iter().any(|id| {
+            self.repo(*id)
+                .is_some_and(|repo| repo.console.status == ConsoleStatus::Error)
+        })
+    }
+
+    /// Adds `ws` at the end of `workspaces`, registering its home repo:
+    /// a new `RepoState`, or the open one with the same checkout, which it
+    /// then shares (see `RepoRegistry::attach`). Every path that opens a
+    /// workspace comes through here. Returns its index.
+    fn open_workspace(&mut self, mut ws: Workspace) -> usize {
+        self.register_home(&mut ws);
+        self.workspaces.push(ws);
+        self.workspaces.len() - 1
+    }
+
+    /// `open_workspace` without adding `ws` to `workspaces` (startup's
+    /// fold of task workspaces builds the list itself).
+    fn register_home(&mut self, ws: &mut Workspace) {
+        let seed = ws
+            .seed
+            .take()
+            .expect("a workspace is opened once, with its repo seed");
+        let (id, overrides) = self.repos.attach(ws.dir.clone(), ws.location.clone(), seed);
+        for (key, value) in overrides {
+            ws.env_overrides.entry(key).or_insert(value);
+        }
+        ws.home = id;
+        ws.current = id;
+        ws.repos = vec![id];
+    }
+
+    /// Stops every repo no open workspace lists any more, exactly as
+    /// closing its workspace did before repos were shared: the console
+    /// process is killed and the bottom terminals close. Its settings are
+    /// kept in `stored_repos` for a closed workspace that lists it.
+    fn release_unlisted_repos(&mut self) {
+        let listed: HashSet<RepoId> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.repos.iter().copied())
+            .collect();
+        for mut repo in self.repos.release_unlisted(&listed) {
+            repo.console.kill_process();
+            if let Some(stored) = repo_config_of(&repo) {
+                upsert_repo_config(&mut self.stored_repos, stored);
+            }
+        }
+    }
+
+    /// The saved settings of `cfg`'s home repo: the stored repo, else the
+    /// entry's own fields (a legacy remote workspace, a file before
+    /// TRU-180, an entry edited by hand).
+    fn saved_home_repo(&self, cfg: &WorkspaceConfig) -> RepoConfig {
+        cfg.repo_key(cfg.home_dir())
+            .and_then(|key| {
+                self.stored_repos
+                    .iter()
+                    .find(|repo| repo.key() == key)
+                    .cloned()
+            })
+            .unwrap_or_else(|| cfg.own_home_repo())
+    }
+
+    /// Seeds `ws`'s home repo from saved entry `cfg`: its run command and
+    /// env, and the entry's env overrides. Bottom terminals are restored
+    /// only by `restore_workspace_from_config`.
+    fn seed_from_saved(&self, ws: &mut Workspace, cfg: &WorkspaceConfig) {
+        let saved = self.saved_home_repo(cfg);
+        let seed = ws.seed_mut();
+        seed.env = saved.env;
+        seed.set_run_command(saved.run_command.as_ref());
+        ws.env_overrides = cfg.env_overrides.clone();
+    }
+
+    /// Starts (or with `restart`, restarts) the bottom panel's console in
+    /// the active tab's directory, else the workspace root, with the
+    /// repo's env and the workspace's overrides.
+    fn start_active_console(&mut self, restart: bool) {
+        let Some(ws) = self.active_workspace() else {
+            return;
+        };
+        let Some(repo_id) = self.active_bottom_repo().map(|repo| repo.id) else {
+            return;
+        };
+        // Use active tab's directory (tracks terminal cwd), fall back to workspace root
+        let dir = ws
+            .active_tab()
+            .map(|t| t.current_dir.clone())
+            .unwrap_or_else(|| ws.dir.clone());
+        let env: Vec<(String, String)> = self.workspace_repo_env(ws, repo_id).into_iter().collect();
+        if let Some(repo) = self.repo_mut(repo_id) {
+            if restart {
+                repo.console.kill_process();
+            }
+            repo.console.detected_url = None;
+            repo.console.spawn_process_with_env(&dir, &env);
+        }
+    }
+
+    /// Workspace settings' env editor: sets (`Some`) or removes `key` in
+    /// workspace `idx`'s env. A key the workspace overrides is edited in
+    /// its overrides; any other in its home repo's env, which every
+    /// workspace sharing the repo sees.
+    fn set_workspace_env(&mut self, idx: usize, key: String, value: Option<String>) {
+        let Some(ws) = self.workspaces.get_mut(idx) else {
+            return;
+        };
+        if let Some(overridden) = ws.env_overrides.get_mut(&key) {
+            match value {
+                Some(value) => *overridden = value,
+                None => {
+                    ws.env_overrides.remove(&key);
+                }
+            }
+            return;
+        }
+        let home = ws.home;
+        if let Some(repo) = self.repo_mut(home) {
+            match value {
+                Some(value) => repo.env.insert(key, value),
+                None => repo.env.remove(&key),
+            };
+        }
+    }
+
+    /// A profile replaces workspace `idx`'s env: its home repo's env
+    /// becomes the profile and its overrides are cleared.
+    fn apply_env_profile(&mut self, idx: usize, profile: HashMap<String, String>) {
+        let Some(ws) = self.workspaces.get_mut(idx) else {
+            return;
+        };
+        ws.env_overrides.clear();
+        let home = ws.home;
+        if let Some(repo) = self.repo_mut(home) {
+            repo.env = profile;
+        }
+    }
+
     /// Adds `workspace` to the bar in machine order, makes it active and
     /// returns its index.
     fn push_and_activate_workspace(&mut self, workspace: Workspace) -> usize {
         let uid = workspace.uid;
-        self.workspaces.push(workspace);
+        self.open_workspace(workspace);
         self.normalize_workspace_order();
         self.active_workspace_idx = self
             .workspace_index_by_uid(uid)
@@ -11901,7 +12339,8 @@ impl App {
             let cfg = self.closed_workspace_configs.remove(closed_idx);
             let mut ws = Workspace::new(cfg.name.clone(), PathBuf::from(&cfg.dir), cfg.color);
             ws.abbrev = cfg.abbrev.clone();
-            ws.env = cfg.env.clone();
+            ws.seed_mut().env = self.saved_home_repo(&cfg).env;
+            ws.env_overrides = cfg.env_overrides.clone();
             ws.chats = cfg.chats.clone();
             ws.guidelines_off = cfg.guidelines_off;
             if let Some(config::WorkspaceLocationConfig::RemoteAgent {
@@ -11946,8 +12385,7 @@ impl App {
             _ => workspace.dir.to_string_lossy().into_owned(),
         };
         self.add_remote_agent_tab_to_workspace(&mut workspace, browse_root, None);
-        self.workspaces.push(workspace);
-        self.active_workspace_idx = self.workspaces.len() - 1;
+        self.active_workspace_idx = self.open_workspace(workspace);
         self.normalize_workspace_order();
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
@@ -13850,8 +14288,7 @@ impl App {
         };
         self.add_remote_agent_tab_to_workspace(&mut workspace, root, None);
         workspace.active_tab = 0;
-        self.workspaces.push(workspace);
-        self.active_workspace_idx = self.workspaces.len() - 1;
+        self.active_workspace_idx = self.open_workspace(workspace);
         self.normalize_workspace_order();
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
@@ -15251,14 +15688,10 @@ impl App {
             }
         }
         workspace.abbrev = ws_config.abbrev.clone();
-        workspace.env = ws_config.env.clone();
         workspace.chats = ws_config.chats.clone();
         workspace.guidelines_off = ws_config.guidelines_off;
-        // Restore saved run command if present
-        if let Some(cmd) = &ws_config.run_command {
-            workspace.console.run_command = Some(cmd.clone());
-            workspace.console.status = ConsoleStatus::Stopped;
-        }
+        // The home repo's saved env and run command (TRU-180).
+        self.seed_from_saved(&mut workspace, ws_config);
 
         let workspace_is_remote_agent =
             matches!(workspace.location, WorkspaceLocation::RemoteAgent { .. });
@@ -15541,10 +15974,18 @@ impl App {
             }
         }
 
-        // Restore bottom panel terminals
-        for bt_config in &ws_config.bottom_terminals {
-            let bt = self.create_bottom_terminal(PathBuf::from(&bt_config.dir));
-            workspace.bottom_terminals.push(bt);
+        // Restore the home repo's bottom terminals (TRU-180), unless the
+        // repo is open already: its live terminals are the shared set. A
+        // done entry comes back without its old terminals.
+        let home_open = self
+            .repos
+            .by_key(&repo_key(&workspace.dir, &workspace.location))
+            .is_some();
+        if !home_open && ws_config.done_at.is_none() {
+            for bt_config in self.saved_home_repo(ws_config).bottom_terminals {
+                let bt = self.create_bottom_terminal(PathBuf::from(&bt_config.dir));
+                workspace.seed_mut().bottom_terminals.push(bt);
+            }
         }
 
         workspace.active_tab = ws_config
@@ -15763,6 +16204,8 @@ impl App {
                 String::from(config::WINDOW_TITLE)
             },
             workspaces: Vec::new(),
+            repos: RepoRegistry::default(),
+            stored_repos: Vec::new(),
             active_workspace_idx: 0,
             next_tab_id: 0,
             task_store,
@@ -15962,7 +16405,18 @@ impl App {
         }
 
         // Try to restore workspaces from saved config
-        if let Some(ws_file) = WorkspacesFile::load() {
+        if let Some(mut ws_file) = WorkspacesFile::load() {
+            // Key names only: env values can hold tokens.
+            for (name, keys) in ws_file.stale_env_copies() {
+                eprintln!(
+                    "[workspace] {name:?}: its \"env\" in workspaces.json differs from its repo's \
+                     env for {}; tabs use the repo's \"env\" (repos section) and the \
+                     workspace's \"env_overrides\"",
+                    keys.join(", ")
+                );
+            }
+            ws_file.normalize_repos();
+            app.stored_repos = ws_file.repos.clone();
             app.collapsed_repo_groups = ws_file.collapsed_repo_groups.iter().cloned().collect();
             for agent in &ws_file.remote_agents {
                 push_remote_agent_config(&mut app.remote_agent_defs, agent.clone());
@@ -15984,7 +16438,7 @@ impl App {
                     continue;
                 }
                 let workspace = app.restore_workspace_from_config(ws_config, true);
-                app.workspaces.push(workspace);
+                app.open_workspace(workspace);
             }
 
             for workspace in &app.workspaces {
@@ -16011,8 +16465,7 @@ impl App {
                 });
                 if !already_present && !already_closed {
                     let color = WorkspaceColor::from_index(app.workspaces.len());
-                    app.workspaces
-                        .push(Workspace::new_remote(remote_def, color));
+                    app.open_workspace(Workspace::new_remote(remote_def, color));
                     app.workspaces_dirty = true;
                 }
             }
@@ -16038,7 +16491,7 @@ impl App {
                 .unwrap_or_else(|| "Home".to_string());
             let mut workspace = Workspace::new(name, dir.clone(), WorkspaceColor::Lavender);
             app.add_tab_to_workspace(&mut workspace, dir);
-            app.workspaces.push(workspace);
+            app.open_workspace(workspace);
         }
 
         // The localhost content server backs Plans, Docs, and on-demand browser
@@ -16558,9 +17011,9 @@ fi
             .filter(|session| session.harness.is_some() || session.task_handle.is_some())
             .count();
         let bottom = self
-            .workspaces
+            .repos
             .iter()
-            .flat_map(|ws| ws.bottom_terminals.iter())
+            .flat_map(|repo| repo.bottom_terminals.iter())
             .filter(|bt| bt.terminal.is_some())
             .count();
         let open_workspaces = self.workspaces.len();
@@ -16635,12 +17088,13 @@ fi
         let ws_name = workspace_name
             .map(|s| s.to_string())
             .or_else(|| self.active_workspace().map(|ws| ws.name.clone()));
-        let global_ws_path = config::global_config_dir().join("workspaces.json");
+        let saved_file = ws_name
+            .as_deref()
+            .and_then(|_| WorkspacesFile::load_normalized());
         let saved_ws = ws_name.as_deref().and_then(|name| {
-            std::fs::read_to_string(&global_ws_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<WorkspacesFile>(&s).ok())
-                .and_then(|f| f.workspaces.into_iter().find(|w| w.name == name))
+            saved_file
+                .as_ref()
+                .and_then(|f| f.workspaces.iter().find(|w| w.name == name))
         });
         // The open workspace's switch wins over its last save; during init
         // the workspace is not open yet and the save is all there is.
@@ -16648,10 +17102,13 @@ fi
             .as_deref()
             .and_then(|name| self.workspaces.iter().find(|ws| ws.name == name))
             .map(|ws| ws.guidelines_off)
-            .or_else(|| saved_ws.as_ref().map(|cfg| cfg.guidelines_off))
+            .or_else(|| saved_ws.map(|cfg| cfg.guidelines_off))
             .unwrap_or(false);
-        let mut extra_env: Vec<(String, String)> = saved_ws
-            .map(|cfg| cfg.env.into_iter().collect())
+        // The workspace's repo env with its overrides (TRU-180).
+        let mut extra_env: Vec<(String, String)> = ws_name
+            .as_deref()
+            .zip(saved_file.as_ref())
+            .map(|(name, file)| file.workspace_env(name).into_iter().collect())
             .unwrap_or_default();
         if let Some(connection) = &self.browser_mcp {
             extra_env.extend(connection.terminal_environment(Some(&tab.session_uid)));
@@ -16692,15 +17149,11 @@ fi
 
     fn create_bottom_terminal(&mut self, cwd: PathBuf) -> BottomTerminal {
         let ws_name = self.active_workspace().map(|ws| ws.name.clone());
-        let global_ws_path = config::global_config_dir().join("workspaces.json");
         let mut extra_env: Vec<(String, String)> = ws_name
             .and_then(|name| {
-                std::fs::read_to_string(&global_ws_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<WorkspacesFile>(&s).ok())
-                    .and_then(|f| f.workspaces.into_iter().find(|w| w.name == name))
+                WorkspacesFile::load_normalized()
+                    .map(|file| file.workspace_env(&name).into_iter().collect())
             })
-            .map(|cfg| cfg.env.into_iter().collect())
             .unwrap_or_default();
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -17245,13 +17698,9 @@ fi
             workspace.name = saved.name.clone();
             workspace.abbrev = saved.abbrev.clone();
             workspace.dir = PathBuf::from(&saved.dir);
-            workspace.env = saved.env.clone();
             workspace.chats = saved.chats.clone();
             workspace.guidelines_off = saved.guidelines_off;
-            if let Some(cmd) = &saved.run_command {
-                workspace.console.run_command = Some(cmd.clone());
-                workspace.console.status = ConsoleStatus::Stopped;
-            }
+            self.seed_from_saved(&mut workspace, saved);
             workspace
         } else {
             let used_colors: Vec<WorkspaceColor> = self
@@ -17273,8 +17722,7 @@ fi
         }
         workspace.active_tab = 0;
 
-        self.workspaces.push(workspace);
-        self.active_workspace_idx = self.workspaces.len() - 1;
+        self.active_workspace_idx = self.open_workspace(workspace);
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
         self.sync_plans_dir();
@@ -18305,9 +18753,9 @@ fi
             .flat_map(|workspace| workspace.tabs.iter())
             .map(|tab| (tab.session_uid.clone(), self.browser_owner_label(tab)))
             .chain(
-                self.workspaces
+                self.repos
                     .iter()
-                    .flat_map(|workspace| workspace.bottom_terminals.iter())
+                    .flat_map(|repo| repo.bottom_terminals.iter())
                     .map(|bt| (bottom_terminal_caller(bt.id), bt.browser_label.clone())),
             )
             .collect();
@@ -18463,15 +18911,19 @@ fi
                     );
                 }
             }
-            // Bottom panel terminal subscriptions
-            for bt in &ws.bottom_terminals {
-                if let Some(term) = &bt.terminal {
-                    subs.push(
-                        term.subscription()
-                            .with(bt.id)
-                            .map(|(id, e)| Event::BottomTerminalEvent(id, e)),
-                    );
-                }
+        }
+        // Bottom panel terminal subscriptions, once per repo.
+        for bt in self
+            .repos
+            .iter()
+            .flat_map(|repo| repo.bottom_terminals.iter())
+        {
+            if let Some(term) = &bt.terminal {
+                subs.push(
+                    term.subscription()
+                        .with(bt.id)
+                        .map(|(id, e)| Event::BottomTerminalEvent(id, e)),
+                );
             }
         }
 
@@ -19007,8 +19459,8 @@ fi
                     }
                 }
                 if self.console_expanded {
-                    if let Some(ws) = self.active_workspace() {
-                        if ws.console.search_visible {
+                    if let Some(repo) = self.active_bottom_repo() {
+                        if repo.console.search_visible {
                             if let iced_term::backend::Command::Write(_) = &cmd {
                                 return Task::none();
                             }
@@ -19441,13 +19893,13 @@ fi
 
                 self.observe_needs_you();
 
-                // Drain console output for all workspaces
+                // Drain console output for every open repo
                 let _drain_start = std::time::Instant::now();
                 let mut auto_expand = false;
                 let mut console_changed = false;
-                for ws in &mut self.workspaces {
+                for repo in self.repos.iter_mut() {
                     // Take rx out to avoid double-borrow
-                    if let Some(mut rx) = ws.console.output_rx.take() {
+                    if let Some(mut rx) = repo.console.output_rx.take() {
                         let mut exited_info = None;
                         let mut messages = Vec::new();
                         while let Ok(msg) = rx.try_recv() {
@@ -19459,11 +19911,11 @@ fi
                         for msg in messages {
                             match msg {
                                 ConsoleOutputMessage::Stdout(line) => {
-                                    ws.console.push_line(line, false);
+                                    repo.console.push_line(line, false);
                                     console_changed = true;
                                 }
                                 ConsoleOutputMessage::Stderr(line) => {
-                                    ws.console.push_line(line, true);
+                                    repo.console.push_line(line, true);
                                     console_changed = true;
                                 }
                                 ConsoleOutputMessage::Exited(code) => {
@@ -19473,21 +19925,21 @@ fi
                             }
                         }
                         // Rebuild editor content once for the entire batch
-                        ws.console.rebuild_if_dirty();
+                        repo.console.rebuild_if_dirty();
                         if let Some(code) = exited_info {
-                            ws.console.exit_code = code;
-                            ws.console.stopped_at = Some(std::time::Instant::now());
+                            repo.console.exit_code = code;
+                            repo.console.stopped_at = Some(std::time::Instant::now());
                             if code.is_some() && code != Some(0) {
-                                ws.console.status = ConsoleStatus::Error;
+                                repo.console.status = ConsoleStatus::Error;
                                 auto_expand = true;
                             } else {
-                                ws.console.status = ConsoleStatus::Stopped;
+                                repo.console.status = ConsoleStatus::Stopped;
                             }
-                            ws.console.child_killer = None;
+                            repo.console.child_killer = None;
                             // Don't put rx back — process is done
                         } else {
                             // Put rx back
-                            ws.console.output_rx = Some(rx);
+                            repo.console.output_rx = Some(rx);
                         }
                     }
                 }
@@ -21521,10 +21973,10 @@ fi
                     let cmd_bytes = format!("{}\n", qc.command).into_bytes();
                     // Find active bottom terminal, or create one
                     let has_bottom_terminal = self
-                        .active_workspace()
-                        .map(|ws| {
-                            matches!(ws.active_bottom_tab, BottomPanelTab::Terminal(_))
-                                && !ws.bottom_terminals.is_empty()
+                        .active_bottom_repo()
+                        .map(|repo| {
+                            matches!(repo.active_bottom_tab, BottomPanelTab::Terminal(_))
+                                && !repo.bottom_terminals.is_empty()
                         })
                         .unwrap_or(false);
 
@@ -21539,18 +21991,18 @@ fi
                             })
                             .unwrap_or_else(|| PathBuf::from("."));
                         let bt = self.create_bottom_terminal(dir);
-                        if let Some(ws) = self.active_workspace_mut() {
-                            ws.bottom_terminals.push(bt);
-                            let idx = ws.bottom_terminals.len() - 1;
-                            ws.active_bottom_tab = BottomPanelTab::Terminal(idx);
+                        if let Some(repo) = self.active_bottom_repo_mut() {
+                            repo.bottom_terminals.push(bt);
+                            let idx = repo.bottom_terminals.len() - 1;
+                            repo.active_bottom_tab = BottomPanelTab::Terminal(idx);
                         }
                         self.console_expanded = true;
                     }
 
                     // Write the command to the active bottom terminal
-                    if let Some(ws) = self.active_workspace_mut() {
-                        if let BottomPanelTab::Terminal(bt_idx) = ws.active_bottom_tab {
-                            if let Some(bt) = ws.bottom_terminals.get_mut(bt_idx) {
+                    if let Some(repo) = self.active_bottom_repo_mut() {
+                        if let BottomPanelTab::Terminal(bt_idx) = repo.active_bottom_tab {
+                            if let Some(bt) = repo.bottom_terminals.get_mut(bt_idx) {
                                 if let Some(term) = &mut bt.terminal {
                                     Self::handle_terminal_backend_command(
                                         term,
@@ -21674,8 +22126,8 @@ fi
                 }
             }
             Event::BottomTabSelect(tab) => {
-                if let Some(ws) = self.active_workspace_mut() {
-                    ws.active_bottom_tab = tab;
+                if let Some(repo) = self.active_bottom_repo_mut() {
+                    repo.active_bottom_tab = tab;
                 }
                 // Focus the appropriate terminal
                 return match tab {
@@ -21693,10 +22145,10 @@ fi
                     })
                     .unwrap_or_else(|| PathBuf::from("."));
                 let bt = self.create_bottom_terminal(dir);
-                let bt_idx = if let Some(ws) = self.active_workspace_mut() {
-                    ws.bottom_terminals.push(bt);
-                    let idx = ws.bottom_terminals.len() - 1;
-                    ws.active_bottom_tab = BottomPanelTab::Terminal(idx);
+                let bt_idx = if let Some(repo) = self.active_bottom_repo_mut() {
+                    repo.bottom_terminals.push(bt);
+                    let idx = repo.bottom_terminals.len() - 1;
+                    repo.active_bottom_tab = BottomPanelTab::Terminal(idx);
                     Some(idx)
                 } else {
                     None
@@ -21709,19 +22161,19 @@ fi
                 }
             }
             Event::BottomTerminalClose(idx) => {
-                let was_active_terminal = self.active_workspace()
-                    .map(|ws| matches!(ws.active_bottom_tab, BottomPanelTab::Terminal(i) if i == idx))
+                let was_active_terminal = self.active_bottom_repo()
+                    .map(|repo| matches!(repo.active_bottom_tab, BottomPanelTab::Terminal(i) if i == idx))
                     .unwrap_or(false);
-                if let Some(ws) = self.active_workspace_mut() {
-                    if idx < ws.bottom_terminals.len() {
-                        ws.bottom_terminals.remove(idx);
+                if let Some(repo) = self.active_bottom_repo_mut() {
+                    if idx < repo.bottom_terminals.len() {
+                        repo.bottom_terminals.remove(idx);
                         // Fix active tab reference
-                        match ws.active_bottom_tab {
+                        match repo.active_bottom_tab {
                             BottomPanelTab::Terminal(active_idx) if active_idx == idx => {
-                                ws.active_bottom_tab = BottomPanelTab::Console;
+                                repo.active_bottom_tab = BottomPanelTab::Console;
                             }
                             BottomPanelTab::Terminal(active_idx) if active_idx > idx => {
-                                ws.active_bottom_tab = BottomPanelTab::Terminal(active_idx - 1);
+                                repo.active_bottom_tab = BottomPanelTab::Terminal(active_idx - 1);
                             }
                             _ => {}
                         }
@@ -21778,9 +22230,9 @@ fi
                 }
                 let mut terminal_handled = false;
                 if let Some(bt) = self
-                    .workspaces
+                    .repos
                     .iter_mut()
-                    .flat_map(|ws| ws.bottom_terminals.iter_mut())
+                    .flat_map(|repo| repo.bottom_terminals.iter_mut())
                     .find(|bt| bt.id == id)
                 {
                     if let Some(term) = &mut bt.terminal {
@@ -22251,8 +22703,8 @@ fi
 
                 // Console search shortcuts (Cmd+F when console active, Escape to close)
                 if self.console_expanded {
-                    if let Some(ws) = self.active_workspace() {
-                        if ws.active_bottom_tab == BottomPanelTab::Console {
+                    if let Some(repo) = self.active_bottom_repo() {
+                        if repo.active_bottom_tab == BottomPanelTab::Console {
                             if modifiers.command() {
                                 if let Key::Character(c) = key.as_ref() {
                                     if c == "f" {
@@ -22260,7 +22712,7 @@ fi
                                     }
                                 }
                             }
-                            if ws.console.search_visible {
+                            if repo.console.search_visible {
                                 if let Key::Named(key::Named::Escape) = key.as_ref() {
                                     return Task::done(Event::ConsoleSearchClose);
                                 }
@@ -24296,8 +24748,8 @@ fi
             }
             Event::WindowCloseRequested => {
                 // Kill all console processes
-                for ws in &mut self.workspaces {
-                    ws.console.kill_process();
+                for repo in self.repos.iter_mut() {
+                    repo.console.kill_process();
                 }
                 if self.workspaces_dirty {
                     self.save_workspaces();
@@ -26072,12 +26524,8 @@ fi
                 let mut workspace = Workspace::new(name, path.clone(), color);
                 if let Some(ref cfg) = saved {
                     workspace.abbrev = cfg.abbrev.clone();
-                    workspace.env = cfg.env.clone();
                     workspace.guidelines_off = cfg.guidelines_off;
-                    if let Some(cmd) = &cfg.run_command {
-                        workspace.console.run_command = Some(cmd.clone());
-                        workspace.console.status = ConsoleStatus::Stopped;
-                    }
+                    self.seed_from_saved(&mut workspace, cfg);
                 }
                 self.add_tab_to_workspace_with_command(
                     &mut workspace,
@@ -26086,8 +26534,7 @@ fi
                     Some("claude".to_string()),
                     None,
                 );
-                self.workspaces.push(workspace);
-                self.active_workspace_idx = self.workspaces.len() - 1;
+                self.active_workspace_idx = self.open_workspace(workspace);
                 self.normalize_workspace_order();
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
@@ -26159,10 +26606,7 @@ fi
                 let key = self.workspace_settings_new_key.trim().to_string();
                 let val = self.workspace_settings_new_value.trim().to_string();
                 if !key.is_empty() {
-                    let idx = self.workspace_settings_idx;
-                    if let Some(ws) = self.workspaces.get_mut(idx) {
-                        ws.env.insert(key, val);
-                    }
+                    self.set_workspace_env(self.workspace_settings_idx, key, Some(val));
                     self.workspace_settings_new_key = String::new();
                     self.workspace_settings_new_value = String::new();
                     self.workspaces_dirty = true;
@@ -26170,10 +26614,7 @@ fi
                 }
             }
             Event::WorkspaceSettingsEnvRemove(key) => {
-                let idx = self.workspace_settings_idx;
-                if let Some(ws) = self.workspaces.get_mut(idx) {
-                    ws.env.remove(&key);
-                }
+                self.set_workspace_env(self.workspace_settings_idx, key, None);
                 self.workspaces_dirty = true;
                 self.next_workspace_save_at = Some(Instant::now());
             }
@@ -26187,12 +26628,10 @@ fi
             }
             Event::WorkspaceSettingsApplyProfile(profile_name) => {
                 let idx = self.workspace_settings_idx;
-                if let Some(ws) = self.workspaces.get_mut(idx) {
-                    if let Some(profiles) = Self::load_profiles() {
-                        if let Some(profile) = profiles.get(&profile_name) {
-                            ws.env = profile.clone();
-                        }
-                    }
+                if let Some(profile) =
+                    Self::load_profiles().and_then(|profiles| profiles.get(&profile_name).cloned())
+                {
+                    self.apply_env_profile(idx, profile);
                 }
                 self.workspaces_dirty = true;
                 self.next_workspace_save_at = Some(Instant::now());
@@ -26209,77 +26648,57 @@ fi
                 }
             }
             Event::ConsoleStart => {
-                if let Some(ws) = self.active_workspace_mut() {
-                    // Use active tab's directory (tracks terminal cwd), fall back to workspace root
-                    let dir = ws
-                        .active_tab()
-                        .map(|t| t.current_dir.clone())
-                        .unwrap_or_else(|| ws.dir.clone());
-                    ws.console.detected_url = None;
-                    let env: Vec<(String, String)> =
-                        ws.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                    ws.console.spawn_process_with_env(&dir, &env);
-                }
+                self.start_active_console(false);
                 self.console_expanded = true;
             }
             Event::ConsoleStop => {
-                if let Some(ws) = self.active_workspace_mut() {
-                    ws.console.kill_process();
-                    ws.console.status = ConsoleStatus::Stopped;
+                if let Some(repo) = self.active_bottom_repo_mut() {
+                    repo.console.kill_process();
+                    repo.console.status = ConsoleStatus::Stopped;
                 }
             }
             Event::ConsoleRestart => {
-                if let Some(ws) = self.active_workspace_mut() {
-                    ws.console.kill_process();
-                    ws.console.detected_url = None;
-                    let dir = ws
-                        .active_tab()
-                        .map(|t| t.current_dir.clone())
-                        .unwrap_or_else(|| ws.dir.clone());
-                    let env: Vec<(String, String)> =
-                        ws.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                    ws.console.spawn_process_with_env(&dir, &env);
-                }
+                self.start_active_console(true);
                 self.console_expanded = true;
             }
             Event::ConsoleEditorAction(action) => {
                 // Allow selection/navigation but not editing
                 if !action.is_edit() {
-                    if let Some(ws) = self.active_workspace_mut() {
-                        ws.console.editor_content.perform(action);
+                    if let Some(repo) = self.active_bottom_repo_mut() {
+                        repo.console.editor_content.perform(action);
                     }
                 }
             }
             Event::ConsoleSearchToggle => {
-                if let Some(ws) = self.active_workspace_mut() {
-                    ws.console.search_visible = !ws.console.search_visible;
-                    if !ws.console.search_visible {
-                        ws.console.search_query.clear();
-                        ws.console.rebuild_editor_content();
+                if let Some(repo) = self.active_bottom_repo_mut() {
+                    repo.console.search_visible = !repo.console.search_visible;
+                    if !repo.console.search_visible {
+                        repo.console.search_query.clear();
+                        repo.console.rebuild_editor_content();
                     }
                 }
             }
             Event::ConsoleSearchChanged(query) => {
-                if let Some(ws) = self.active_workspace_mut() {
-                    ws.console.search_query = query;
-                    ws.console.rebuild_editor_content();
+                if let Some(repo) = self.active_bottom_repo_mut() {
+                    repo.console.search_query = query;
+                    repo.console.rebuild_editor_content();
                 }
             }
             Event::ConsoleSearchClose => {
-                if let Some(ws) = self.active_workspace_mut() {
-                    ws.console.search_visible = false;
-                    ws.console.search_query.clear();
-                    ws.console.rebuild_editor_content();
+                if let Some(repo) = self.active_bottom_repo_mut() {
+                    repo.console.search_visible = false;
+                    repo.console.search_query.clear();
+                    repo.console.rebuild_editor_content();
                 }
             }
             Event::ConsoleClearOutput => {
-                if let Some(ws) = self.active_workspace_mut() {
-                    ws.console.clear_output();
+                if let Some(repo) = self.active_bottom_repo_mut() {
+                    repo.console.clear_output();
                 }
             }
             Event::ConsoleOpenBrowser => {
-                if let Some(ws) = self.active_workspace() {
-                    if let Some(url) = &ws.console.detected_url {
+                if let Some(repo) = self.active_bottom_repo() {
+                    if let Some(url) = &repo.console.detected_url {
                         let _ = std::process::Command::new("open").arg(url).spawn();
                     }
                 }
@@ -26289,8 +26708,8 @@ fi
             }
             Event::ConsoleCommandEditStart => {
                 let current = self
-                    .active_workspace()
-                    .and_then(|ws| ws.console.run_command.clone())
+                    .active_bottom_repo()
+                    .and_then(|repo| repo.console.run_command.clone())
                     .unwrap_or_default();
                 self.editing_console_command = Some(current);
             }
@@ -26299,14 +26718,14 @@ fi
             }
             Event::ConsoleCommandSubmit => {
                 if let Some(cmd) = self.editing_console_command.take() {
-                    if let Some(ws) = self.active_workspace_mut() {
+                    if let Some(repo) = self.active_bottom_repo_mut() {
                         if cmd.trim().is_empty() {
-                            ws.console.run_command = None;
-                            ws.console.status = ConsoleStatus::NoneConfigured;
+                            repo.console.run_command = None;
+                            repo.console.status = ConsoleStatus::NoneConfigured;
                         } else {
-                            ws.console.run_command = Some(cmd.trim().to_string());
-                            if !ws.console.is_running() {
-                                ws.console.status = ConsoleStatus::Stopped;
+                            repo.console.run_command = Some(cmd.trim().to_string());
+                            if !repo.console.is_running() {
+                                repo.console.status = ConsoleStatus::Stopped;
                             }
                         }
                     }
@@ -27331,8 +27750,8 @@ fi
         }
 
         // Recreate bottom panel terminals
-        for ws in self.workspaces.iter_mut() {
-            for bt in ws.bottom_terminals.iter_mut() {
+        for repo in self.repos.iter_mut() {
+            for bt in repo.bottom_terminals.iter_mut() {
                 let bt_browser_environment =
                     browser_environment(Some(&bottom_terminal_caller(bt.id)));
                 let bt_browser_environment_refs: Vec<(&str, &str)> = bt_browser_environment
@@ -29245,6 +29664,8 @@ fi
                     .into();
             }
         };
+        // The env its terminals get: the home repo's, with its overrides.
+        let ws_env = self.workspace_repo_env(ws, ws.home);
 
         // --- Title --- (✎ renames inline on the bar chip, TRU-169)
         let title = row![
@@ -29296,7 +29717,7 @@ fi
         if let Some(ref profiles) = profiles {
             // Detect which profile is currently active (all keys match)
             let current_profile = profiles.iter().find_map(|(name, env)| {
-                if !env.is_empty() && env.iter().all(|(k, v)| ws.env.get(k) == Some(v)) {
+                if !env.is_empty() && env.iter().all(|(k, v)| ws_env.get(k) == Some(v)) {
                     Some(name.as_str())
                 } else {
                     None
@@ -29383,7 +29804,7 @@ fi
         );
 
         // Existing entries (sorted for stable display)
-        let mut env_entries: Vec<(&String, &String)> = ws.env.iter().collect();
+        let mut env_entries: Vec<(&String, &String)> = ws_env.iter().collect();
         env_entries.sort_by_key(|(k, _)| k.as_str());
 
         for (key, val) in env_entries {
@@ -29398,9 +29819,9 @@ fi
 
             env_col = env_col.push(
                 row![
-                    container(text(key.as_str()).size(12).color(text_primary).font(mono))
+                    container(text(key.clone()).size(12).color(text_primary).font(mono))
                         .width(Length::Fixed(180.0)),
-                    text(val.as_str()).size(12).color(text_secondary).font(mono),
+                    text(val.clone()).size(12).color(text_secondary).font(mono),
                     iced::widget::Space::new().width(Length::Fill),
                     remove_btn,
                 ]
@@ -30347,7 +30768,7 @@ fi
         let attn_count = ws.attention_count();
         let has_attention = attn_count > 0;
         let attention_reason = ws.highest_priority_attention();
-        let has_error = ws.console.status == ConsoleStatus::Error;
+        let has_error = self.workspace_console_error(ws);
 
         // Colored dot before name — override for attention/error
         let dot_color = if has_error
@@ -30557,7 +30978,7 @@ fi
         let hidden_news = toggle.hidden.iter().any(|&idx| {
             self.workspaces.get(idx).is_some_and(|ws| {
                 ws.attention_count() > 0
-                    || ws.console.status == ConsoleStatus::Error
+                    || self.workspace_console_error(ws)
                     || self.workspace_pr_badge(ws.uid).is_some()
             })
         });
@@ -31051,7 +31472,7 @@ fi
             let (rows, running) = self.workspace_rail_state(&items, idx);
             let urgency = workspace_rail_urgency(&rows, running);
             let pending = urgency.filter(|urgency| *urgency != RailUrgency::Running);
-            let has_error = ws.console.status == ConsoleStatus::Error;
+            let has_error = self.workspace_console_error(ws);
 
             // Larger dot for something waiting or a console error when
             // inactive; the active workspace keeps its tall bar.
@@ -41095,10 +41516,14 @@ fi
                     has_tab = true;
                 }
             }
-            for terminal in &workspace.bottom_terminals {
-                if paths_equal(&terminal.cwd, path) {
-                    has_bottom_terminal = true;
-                }
+        }
+        for terminal in self
+            .repos
+            .iter()
+            .flat_map(|repo| repo.bottom_terminals.iter())
+        {
+            if paths_equal(&terminal.cwd, path) {
+                has_bottom_terminal = true;
             }
         }
 
@@ -41529,17 +41954,17 @@ fi
 
     fn view_bottom_panel(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let ws = match self.active_workspace() {
-            Some(ws) => ws,
+        let repo = match self.active_bottom_repo() {
+            Some(repo) => repo,
             None => {
                 return iced::widget::Space::new().width(0).height(0).into();
             }
         };
-        let console = &ws.console;
-        let active_bottom_tab = ws.active_bottom_tab;
+        let console = &repo.console;
+        let active_bottom_tab = repo.active_bottom_tab;
 
         // --- Tab bar ---
-        let tab_bar = self.view_bottom_tab_bar(ws, console);
+        let tab_bar = self.view_bottom_tab_bar(repo, console);
 
         if !self.console_expanded {
             let border_color = theme.surface0();
@@ -41562,7 +41987,7 @@ fi
         let content: Element<'_, Event, Theme, iced::Renderer> = match active_bottom_tab {
             BottomPanelTab::Console => self.view_console_output(console),
             BottomPanelTab::Terminal(idx) => {
-                if let Some(bt) = ws.bottom_terminals.get(idx) {
+                if let Some(bt) = repo.bottom_terminals.get(idx) {
                     if let Some(term) = &bt.terminal {
                         let bt_id = bt.id;
                         let bt_container = container(
@@ -41715,11 +42140,11 @@ fi
 
     fn view_bottom_tab_bar<'a>(
         &'a self,
-        ws: &'a Workspace,
+        repo: &'a RepoState,
         console: &'a ConsoleState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let active_tab = ws.active_bottom_tab;
+        let active_tab = repo.active_bottom_tab;
 
         // Chevron button (toggle expand/collapse)
         let chevron = if self.console_expanded {
@@ -41819,7 +42244,7 @@ fi
 
         // --- Terminal tab buttons ---
         let mut tab_buttons: Vec<Element<'a, Event, Theme, iced::Renderer>> = Vec::new();
-        for (idx, bt) in ws.bottom_terminals.iter().enumerate() {
+        for (idx, bt) in repo.bottom_terminals.iter().enumerate() {
             let is_active = active_tab == BottomPanelTab::Terminal(idx);
             let label: String = bt
                 .title
@@ -45382,6 +45807,9 @@ mod tests {
             }),
             done_at: None,
             guidelines_off: false,
+            repos: vec![format!("/tmp/{name}")],
+            home: None,
+            env_overrides: HashMap::new(),
         }
     }
 
@@ -45417,5 +45845,140 @@ mod tests {
                 "acme-legacy"
             ]
         );
+    }
+
+    // --- TRU-180: repos ---
+
+    fn test_bottom_terminal(id: usize, cwd: &Path) -> BottomTerminal {
+        BottomTerminal {
+            id,
+            browser_label: bottom_terminal_browser_label(cwd),
+            terminal: None,
+            title: None,
+            cwd: cwd.to_path_buf(),
+        }
+    }
+
+    fn local(dir: &Path) -> WorkspaceLocation {
+        WorkspaceLocation::Local {
+            root: dir.to_path_buf(),
+        }
+    }
+
+    fn fake_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn two_workspaces_on_one_checkout_share_one_repo_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("app");
+        std::fs::create_dir_all(&checkout).unwrap();
+        // The same checkout reached through a symlink is the same repo.
+        let link = temp.path().join("app-link");
+        std::os::unix::fs::symlink(&checkout, &link).unwrap();
+
+        let mut registry = RepoRegistry::default();
+        let mut first = RepoSeed::new(Some("npm run dev".into()));
+        first.env = fake_env(&[("TEAM", "PRJ")]);
+        first
+            .bottom_terminals
+            .push(test_bottom_terminal(1, &checkout));
+        let (a, a_overrides) = registry.attach(checkout.clone(), local(&checkout), first);
+        assert!(a_overrides.is_empty());
+
+        let mut second = RepoSeed::new(Some("cargo run".into()));
+        second.env = fake_env(&[("TEAM", "OPS")]);
+        second.bottom_terminals.push(test_bottom_terminal(2, &link));
+        let (b, b_overrides) = registry.attach(link.clone(), local(&link), second);
+
+        assert_eq!(a, b);
+        assert_eq!(registry.iter().count(), 1);
+        let repo = registry.get(a).unwrap();
+        // The open repo keeps its console and env; the joiner's terminals
+        // join it and its differing env comes back as its overrides.
+        assert_eq!(repo.console.run_command.as_deref(), Some("npm run dev"));
+        assert_eq!(repo.env["TEAM"], "PRJ");
+        assert_eq!(
+            repo.bottom_terminals
+                .iter()
+                .map(|bt| bt.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(b_overrides, fake_env(&[("TEAM", "OPS")]));
+
+        // Another folder, or the same path on a remote machine, is not.
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let (c, _) = registry.attach(other.clone(), local(&other), RepoSeed::new(None));
+        let remote = WorkspaceLocation::RemoteAgent {
+            remote_id: "box".into(),
+            workspace_id: checkout.to_string_lossy().into_owned(),
+            root: checkout.to_string_lossy().into_owned(),
+        };
+        let (d, _) = registry.attach(checkout.clone(), remote, RepoSeed::new(None));
+        assert_ne!(c, a);
+        assert_ne!(d, a);
+        assert_eq!(registry.iter().count(), 3);
+    }
+
+    #[test]
+    fn a_repo_stops_when_the_last_workspace_listing_it_closes() {
+        let mut registry = RepoRegistry::default();
+        let dir = PathBuf::from("/tmp/tru180-not-a-folder/app");
+        let mut seed = RepoSeed::new(None);
+        seed.bottom_terminals.push(test_bottom_terminal(7, &dir));
+        let (id, _) = registry.attach(dir.clone(), local(&dir), seed);
+        let (shared, _) = registry.attach(dir.clone(), local(&dir), RepoSeed::new(None));
+        assert_eq!(id, shared);
+
+        // Two workspaces list it; one closes: it keeps running.
+        let both: HashSet<RepoId> = [id].into_iter().collect();
+        assert!(registry.release_unlisted(&both).is_empty());
+        assert!(registry.get(id).is_some());
+
+        // The last one closes: it is released, terminals and all, and its
+        // settings can be stored for the closed workspace.
+        let released = registry.release_unlisted(&HashSet::new());
+        assert_eq!(released.len(), 1);
+        assert!(registry.get(id).is_none());
+        let stored = repo_config_of(&released[0]).unwrap();
+        assert_eq!(stored.dir, dir.to_string_lossy());
+        assert_eq!(stored.bottom_terminals.len(), 1);
+    }
+
+    #[test]
+    fn the_repos_section_keeps_open_repos_and_those_closed_workspaces_list() {
+        let open = vec![RepoConfig {
+            dir: "/tmp/tru180-open".into(),
+            location: None,
+            run_command: None,
+            env: HashMap::new(),
+            bottom_terminals: Vec::new(),
+        }];
+        let stored_for = |dir: &str| RepoConfig {
+            dir: dir.into(),
+            location: None,
+            run_command: Some("make".into()),
+            env: fake_env(&[("K", "fake")]),
+            bottom_terminals: Vec::new(),
+        };
+        let stored = vec![
+            stored_for("/tmp/tru180-open"),
+            stored_for("/tmp/acme-parked"),
+            stored_for("/tmp/tru180-orphan"),
+        ];
+        let closed = vec![closed_config("acme-parked", Some("2026-10-30T00:00:00Z"))];
+        let section = repos_section(open, &stored, &closed);
+        let dirs: Vec<&str> = section.iter().map(|repo| repo.dir.as_str()).collect();
+        // The open repo's runtime wins over its stored copy; an entry no
+        // workspace lists is dropped.
+        assert_eq!(dirs, ["/tmp/tru180-open", "/tmp/acme-parked"]);
+        assert_eq!(section[0].run_command, None);
+        assert_eq!(section[1].run_command.as_deref(), Some("make"));
     }
 }
