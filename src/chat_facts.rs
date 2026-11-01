@@ -62,10 +62,32 @@ pub struct ChatFacts {
     /// a GitHub PR URL. Written by the hosting tab only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prs: Vec<PrRef>,
+    /// Markdown files the chat wrote or edited (TRU-191: Write, Edit,
+    /// MultiEdit on a `.md` / `.markdown` path), absolute, oldest first.
+    /// At most [`DOCUMENTS_CAP`], the newest kept. Inside git or not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<PathBuf>,
     /// "Index older chats" has scanned this chat's transcript; it never
     /// scans it again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub backfilled: bool,
+    /// The backfill scan that set `backfilled` also recorded `documents`.
+    /// A chat backfilled before TRU-191 lacks it and is scanned once more.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub documents_backfilled: bool,
+}
+
+/// Markdown paths kept per chat; older ones drop off first.
+pub const DOCUMENTS_CAP: usize = 200;
+
+/// Edit tools whose target counts as a document the chat wrote.
+const DOCUMENT_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit"];
+
+/// Whether `path` names a markdown file (`.md` / `.markdown`, any case).
+pub fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
 }
 
 /// A repository (main checkout dir) the chat worked in.
@@ -166,6 +188,16 @@ impl ChatFacts {
             && self.checkouts.is_empty()
             && self.children.is_empty()
             && self.prs.is_empty()
+            && self.documents.is_empty()
+    }
+
+    /// Records a markdown file the chat wrote now: it moves to the newest
+    /// end, and the oldest drop off past [`DOCUMENTS_CAP`].
+    pub fn add_document(&mut self, path: &Path) {
+        self.documents.retain(|known| known != path);
+        self.documents.push(path.to_path_buf());
+        let over = self.documents.len().saturating_sub(DOCUMENTS_CAP);
+        self.documents.drain(..over);
     }
 
     /// Records a PR the chat created, once.
@@ -295,6 +327,19 @@ impl ChatFacts {
         }
         for child in scan.children {
             self.add_child(child);
+        }
+        // The scan saw the whole transcript in order: its documents are the
+        // newest; any only a tab recorded keep their place before them.
+        if !scan.documents.is_empty() {
+            let mut merged: Vec<PathBuf> = self
+                .documents
+                .drain(..)
+                .filter(|known| !scan.documents.contains(known))
+                .collect();
+            merged.extend(scan.documents);
+            let over = merged.len().saturating_sub(DOCUMENTS_CAP);
+            merged.drain(..over);
+            self.documents = merged;
         }
     }
 
@@ -549,6 +594,8 @@ pub struct RawFacts {
     pub children: Vec<ChatChild>,
     /// PRs from `gh pr create` results (live tabs only).
     pub prs: Vec<PrRef>,
+    /// Markdown files written or edited, in call order (TRU-191).
+    pub documents: Vec<PathBuf>,
 }
 
 impl RawFacts {
@@ -557,6 +604,7 @@ impl RawFacts {
             && self.issue_keys.is_empty()
             && self.children.is_empty()
             && self.prs.is_empty()
+            && self.documents.is_empty()
     }
 
     pub fn observe_tool_call(
@@ -568,6 +616,10 @@ impl RawFacts {
         at: &str,
     ) {
         if let Some((kind, paths)) = tool_call_touches(name, input, home) {
+            if DOCUMENT_TOOLS.contains(&name) {
+                self.documents
+                    .extend(paths.iter().filter(|path| is_markdown_path(path)).cloned());
+            }
             for path in paths {
                 self.touches.push(RawTouch {
                     kind,
@@ -607,6 +659,7 @@ impl RawFacts {
     fn append(&mut self, other: RawFacts) {
         self.touches.extend(other.touches);
         self.prs.extend(other.prs);
+        self.documents.extend(other.documents);
         for key in other.issue_keys {
             if !self.issue_keys.contains(&key) {
                 self.issue_keys.push(key);
@@ -633,6 +686,9 @@ impl RawFacts {
         }
         for pr in self.prs {
             facts.add_pr(pr);
+        }
+        for path in &self.documents {
+            facts.add_document(path);
         }
     }
 }
@@ -1100,7 +1156,7 @@ pub fn backfill_claude(
             .is_ok_and(|written| target.mtime > written);
         if existing
             .as_ref()
-            .is_some_and(|facts| facts.backfilled && !stale)
+            .is_some_and(|facts| facts.backfilled && facts.documents_backfilled && !stale)
         {
             report.already += 1;
             continue;
@@ -1126,6 +1182,7 @@ pub fn backfill_claude(
             facts.add_child(link.child.clone());
         }
         facts.backfilled = true;
+        facts.documents_backfilled = true;
         match write_facts(&path, &facts) {
             Ok(()) => report.scanned += 1,
             Err(error) => {
@@ -1585,6 +1642,125 @@ branch refs/heads/tracey/tru-12-thing
         assert_eq!(live.checkouts[0].last, "2026-10-29T09:00:00Z");
         assert_eq!(live.issue_keys, vec!["TRU-1", "TRU-2"]);
         assert_eq!(live.fan_out_line().as_deref(), Some("1 subagent"));
+    }
+
+    #[test]
+    fn facts_record_markdown_paths_written_or_edited_only() {
+        let home = Some(Path::new("/Users/me"));
+        let mut raw = RawFacts::default();
+        let at = "2026-10-30T10:00:00Z";
+        raw.observe_tool_call(
+            "w1",
+            "Write",
+            &json!({"file_path": "/work/example/docs/status.md"}),
+            home,
+            at,
+        );
+        raw.observe_tool_call(
+            "e1",
+            "Edit",
+            &json!({"file_path": "~/code/api/docs/DECISIONS.MD"}),
+            home,
+            at,
+        );
+        raw.observe_tool_call(
+            "m1",
+            "MultiEdit",
+            &json!({"file_path": "/code/api/notes.markdown"}),
+            home,
+            at,
+        );
+        // Not markdown, or not a write: ignored.
+        raw.observe_tool_call(
+            "e2",
+            "Edit",
+            &json!({"file_path": "/code/api/src/main.rs"}),
+            home,
+            at,
+        );
+        raw.observe_tool_call(
+            "r1",
+            "Read",
+            &json!({"file_path": "/code/api/README.md"}),
+            home,
+            at,
+        );
+        raw.observe_tool_call(
+            "n1",
+            "NotebookEdit",
+            &json!({"notebook_path": "/code/api/x.md"}),
+            home,
+            at,
+        );
+        // Written again later: it becomes the newest.
+        raw.observe_tool_call(
+            "w2",
+            "Write",
+            &json!({"file_path": "/work/example/docs/status.md"}),
+            home,
+            at,
+        );
+        let mut facts = ChatFacts::default();
+        raw.resolve_into(&mut facts, &mut GitResolver::default());
+        assert_eq!(
+            facts.documents,
+            vec![
+                PathBuf::from("/Users/me/code/api/docs/DECISIONS.MD"),
+                PathBuf::from("/code/api/notes.markdown"),
+                PathBuf::from("/work/example/docs/status.md"),
+            ]
+        );
+        assert!(!facts.is_empty());
+
+        // The backfill reads the same calls from transcript lines.
+        let mut scanned = RawFacts::default();
+        let line = json!({"type": "assistant", "timestamp": at,
+            "message": {"content": [{"type": "tool_use", "id": "w3", "name": "Write",
+                "input": {"file_path": "/work/example/docs/plan.md"}}]}})
+        .to_string();
+        observe_claude_line(&mut scanned, &line, home, true);
+        assert_eq!(
+            scanned.documents,
+            vec![PathBuf::from("/work/example/docs/plan.md")]
+        );
+    }
+
+    #[test]
+    fn documents_keep_the_newest_within_the_cap_and_merge_with_a_scan() {
+        let mut facts = ChatFacts::default();
+        for n in 0..DOCUMENTS_CAP + 5 {
+            facts.add_document(Path::new(&format!("/notes/{n}.md")));
+        }
+        assert_eq!(facts.documents.len(), DOCUMENTS_CAP);
+        assert_eq!(facts.documents[0], PathBuf::from("/notes/5.md"));
+        assert_eq!(
+            facts.documents.last(),
+            Some(&PathBuf::from(format!("/notes/{}.md", DOCUMENTS_CAP + 4)))
+        );
+
+        let mut live = ChatFacts::default();
+        live.add_document(Path::new("/a.md"));
+        live.add_document(Path::new("/b.md"));
+        let mut scan = ChatFacts::default();
+        scan.add_document(Path::new("/b.md"));
+        scan.add_document(Path::new("/c.md"));
+        live.absorb_scan(scan);
+        assert_eq!(
+            live.documents,
+            vec![
+                PathBuf::from("/a.md"),
+                PathBuf::from("/b.md"),
+                PathBuf::from("/c.md")
+            ]
+        );
+
+        // Facts files from before TRU-191 load without documents and are
+        // due one more backfill scan.
+        let old: ChatFacts = serde_json::from_str(r#"{"backfilled": true}"#).unwrap();
+        assert!(old.documents.is_empty());
+        assert!(old.backfilled && !old.documents_backfilled);
+        let written = serde_json::to_value(ChatFacts::default()).unwrap();
+        assert!(written.get("documents").is_none());
     }
 
     #[test]

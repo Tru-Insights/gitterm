@@ -61,5 +61,13 @@ Take the first option that fully works:
 - End your reply with one or two lines: what you skipped or did not check,
   and any risk the user must know.
 
+## Documents
+
+- Working notes (status, plans, scratch) go in the work's docs folder
+  when GitTerm gives you one.
+- Decisions the team should see go in the decisions repo, following its
+  conventions, and land through a PR.
+- Otherwise follow the repository's own conventions for documents.
+
 ---
 Adapted in part from ponytail (MIT, https://github.com/dietrichgebert/ponytail).

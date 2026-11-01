@@ -140,6 +140,39 @@ mod tests {
     }
 
     #[test]
+    fn decisions_repo_is_additive_and_round_trips() {
+        // An entry from before TRU-191 loads with none and writes no key.
+        let old = r#"{
+            "name": "example-work",
+            "abbrev": "EW",
+            "dir": "/tmp/work/example-work",
+            "color": "blue",
+            "tabs": [],
+            "chats": ["s1"]
+        }"#;
+        let cfg: WorkspaceConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.decisions_repo, None);
+        assert!(serde_json::to_value(&cfg)
+            .unwrap()
+            .get("decisions_repo")
+            .is_none());
+        let mut set = cfg.clone();
+        set.decisions_repo = Some("/tmp/code/team-decisions".to_string());
+        let back: WorkspaceConfig =
+            serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert_eq!(
+            back.decisions_repo.as_deref(),
+            Some("/tmp/code/team-decisions")
+        );
+        // A whole workspaces.json from before it loads too.
+        let file: WorkspacesFile = serde_json::from_str(&format!(
+            r#"{{"workspaces": [{old}], "active_workspace": 0}}"#
+        ))
+        .unwrap();
+        assert_eq!(file.workspaces[0].decisions_repo, None);
+    }
+
+    #[test]
     fn workspace_config_loads_old_entries_and_round_trips_parking() {
         // A workspace closed before parking existed: `active:false`, no
         // `parked` or `done_at`. It loads unchanged and lists as parked.
@@ -1933,6 +1966,11 @@ pub struct WorkspaceConfig {
     /// running one keeps what it started with.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claude_in_chrome: bool,
+    /// The listed repo team-facing decisions go to (TRU-191), by dir; the
+    /// work's agents are told it beside the work's docs folder. None by
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions_repo: Option<String>,
     /// The repos this workspace lists, by dir on its machine, home first
     /// (TRU-180). Their settings live in `WorkspacesFile::repos`. Files
     /// written before TRU-180 have none: `normalize_repos` makes `[dir]`.

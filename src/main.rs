@@ -639,10 +639,54 @@ fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guideli
     gitterm::guidelines::for_launch(&config::global_config_dir(), cwd, workspace_off)
 }
 
-/// A terminal startup command with the guidelines added when it starts
-/// `claude`, `pi` or `codex`. Other commands are not inspected, so they
-/// never read the guidelines file.
-fn terminal_command_with_guidelines(command: &str, cwd: &Path, workspace_off: bool) -> String {
+/// What an agent starting now in `cwd` gets appended: the guidelines and,
+/// in a piece of work, the documents note naming `places` (TRU-191). The
+/// work's docs folder is created here, as the agent starts; a failure is
+/// logged and the note still names it.
+fn launch_instructions(
+    cwd: &Path,
+    workspace_off: bool,
+    places: Option<&gitterm::guidelines::DocumentPlaces>,
+) -> Option<gitterm::guidelines::Guidelines> {
+    if let Some(places) = places {
+        if let Err(error) = std::fs::create_dir_all(&places.docs_dir) {
+            eprintln!(
+                "[guidelines] cannot create the work's docs folder {}: {error}",
+                places.docs_dir.display()
+            );
+        }
+    }
+    gitterm::guidelines::with_documents(
+        launch_guidelines(cwd, workspace_off),
+        places,
+        &config::instance_config_dir(),
+    )
+}
+
+/// The document places of a saved workspace entry (a workspace not open
+/// yet): a work entry owns chats; its home is where they start.
+fn config_document_places(cfg: &WorkspaceConfig) -> Option<gitterm::guidelines::DocumentPlaces> {
+    let local = matches!(
+        cfg.location,
+        None | Some(config::WorkspaceLocationConfig::Local { .. })
+    ) && cfg.remote_session.is_none();
+    gitterm::guidelines::document_places(
+        !cfg.chats.is_empty(),
+        local,
+        Path::new(cfg.home_dir()),
+        cfg.decisions_repo.as_deref().map(Path::new),
+    )
+}
+
+/// A terminal startup command with the guidelines (and the documents note
+/// of `places`) added when it starts `claude`, `pi` or `codex`. Other
+/// commands are not inspected, so they never read the guidelines file.
+fn terminal_command_with_guidelines(
+    command: &str,
+    cwd: &Path,
+    workspace_off: bool,
+    places: Option<&gitterm::guidelines::DocumentPlaces>,
+) -> String {
     // shortcut: the added option is POSIX-quoted, so Windows terminals
     // (cmd, PowerShell) launch without the guidelines until the quoting is
     // per-shell.
@@ -652,7 +696,7 @@ fn terminal_command_with_guidelines(command: &str, cwd: &Path, workspace_off: bo
     if !gitterm::guidelines::starts_a_harness(command) {
         return command.to_string();
     }
-    match launch_guidelines(cwd, workspace_off) {
+    match launch_instructions(cwd, workspace_off, places) {
         Some(guidelines) => gitterm::guidelines::configure_terminal_command(command, &guidelines),
         None => command.to_string(),
     }
@@ -1844,6 +1888,29 @@ pub enum OverviewKey {
     Owner(u64),
 }
 
+/// One option of the ⚙ modal's "Decisions repo" picker (TRU-191): none,
+/// or one of the workspace's listed local repos.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionsRepoChoice {
+    dir: Option<PathBuf>,
+    label: String,
+}
+
+impl DecisionsRepoChoice {
+    fn none() -> Self {
+        Self {
+            dir: None,
+            label: "None".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for DecisionsRepoChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
 /// Where an inline workspace rename is edited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameSite {
@@ -2063,6 +2130,22 @@ fn parked_order(configs: &[WorkspaceConfig]) -> Vec<usize> {
 fn workspace_rename_input_id() -> iced::widget::Id {
     iced::widget::Id::new("workspace-rename-input")
 }
+
+/// A workspace's documents (TRU-191), gathered off the UI thread for the
+/// overview's Documents section and the Plans mode.
+#[derive(Debug, Default)]
+struct WorkDocumentsState {
+    result: Option<gitterm::work_documents::ScanResult>,
+    in_flight: bool,
+    scanned_at: Option<Instant>,
+    /// Why the last scan did not finish.
+    error: Option<String>,
+}
+
+/// Visible documents are gathered again after this long.
+const WORK_DOCUMENTS_POLL: Duration = Duration::from_secs(60);
+/// Documents the overview lists before "more in Plans".
+const OVERVIEW_DOCUMENT_ROWS: usize = 8;
 
 /// One workspace's overview (TRU-167): the summary from the chat index and
 /// tasks, and the owned branches' git state from the background poller.
@@ -5612,6 +5695,9 @@ struct Workspace {
     /// Claude sessions started here get Claude in Chrome (TRU-181); off by
     /// default. See `WorkspaceConfig::claude_in_chrome`.
     claude_in_chrome: bool,
+    /// The repo team-facing decisions go to (TRU-191), named to the
+    /// agents started in this work beside its docs folder.
+    decisions_repo: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -5642,6 +5728,7 @@ impl Workspace {
             claims_new_chats: false,
             guidelines_off: false,
             claude_in_chrome: false,
+            decisions_repo: None,
         }
     }
 
@@ -5676,6 +5763,7 @@ impl Workspace {
             claims_new_chats: false,
             guidelines_off: false,
             claude_in_chrome: false,
+            decisions_repo: None,
         }
     }
 
@@ -5701,6 +5789,20 @@ impl Workspace {
     /// piece of work and claims the chats started in it.
     fn is_work(&self) -> bool {
         self.owns_chats() || self.claims_new_chats
+    }
+
+    /// Where agents started in this work keep documents (TRU-191): its
+    /// docs folder and decisions repo. `None` for a folder workspace or
+    /// one on another machine.
+    fn document_places(&self) -> Option<gitterm::guidelines::DocumentPlaces> {
+        let local = matches!(self.location, WorkspaceLocation::Local { .. })
+            && self.remote_session.is_none();
+        gitterm::guidelines::document_places(
+            self.is_work(),
+            local,
+            &self.dir,
+            self.decisions_repo.as_deref(),
+        )
     }
 
     fn backend_ref(&self) -> WorkspaceBackendRef {
@@ -6213,6 +6315,8 @@ pub enum Event {
     GuidelinesEdit,
     /// The workspace settings modal's Claude in Chrome switch (TRU-181).
     ClaudeInChromeToggled(bool),
+    /// The ⚙ modal's "Decisions repo" picker (TRU-191).
+    DecisionsRepoPicked(DecisionsRepoChoice),
     // Slide animation events
     SlideAnimationTick,
     // Edge peek events
@@ -6391,6 +6495,14 @@ pub enum Event {
     ChatFactsBackfilled(Result<chat_facts::BackfillReport, String>),
     /// Workspace overview (TRU-167): rebuild from the index and reread git.
     WorkspaceOverviewRefresh,
+    /// Gather the active workspace's documents again (TRU-191).
+    WorkDocumentsRefresh,
+    WorkDocumentsScanned(
+        u64,
+        Box<Result<gitterm::work_documents::ScanResult, String>>,
+    ),
+    /// Show or hide a document's copies, by its key.
+    WorkDocumentCopiesToggle(String),
     /// A background refresh finished: workspace dir, generation, result.
     WorkspaceOverviewRefreshed(OverviewKey, u64, Box<overview::RefreshOutcome>),
     /// Open a coordinator's conversation in the main area; the sidebar
@@ -6812,6 +6924,10 @@ struct App {
     /// one that owns its chats (TRU-169); built when the panel first opens
     /// in that workspace.
     workspace_overviews: HashMap<OverviewKey, WorkspaceOverviewState>,
+    /// Each open workspace's documents by uid (TRU-191).
+    work_documents: HashMap<u64, WorkDocumentsState>,
+    /// The document whose copies are listed (its key), if any.
+    work_document_copies_open: Option<String>,
     /// Hand-picked overview focus per workspace, kept across restarts.
     overview_focus_picks: overview::FocusPicks,
     /// An inline workspace rename in progress (TRU-169).
@@ -8296,6 +8412,10 @@ impl App {
             done_at: None,
             guidelines_off: ws.guidelines_off,
             claude_in_chrome: ws.claude_in_chrome,
+            decisions_repo: ws
+                .decisions_repo
+                .as_ref()
+                .map(|dir| dir.to_string_lossy().into_owned()),
             repos: ws
                 .repos
                 .iter()
@@ -9555,6 +9675,19 @@ impl App {
 
     /// Whether the workspace named `name` switched the change guidelines
     /// off (TRU-174); a workspace that is not open reads its saved entry.
+    /// Where agents started for the workspace named `name` keep documents
+    /// (TRU-191); a workspace that is not open reads its saved entry.
+    fn workspace_document_places(&self, name: &str) -> Option<gitterm::guidelines::DocumentPlaces> {
+        match self.workspaces.iter().find(|ws| ws.name == name) {
+            Some(ws) => ws.document_places(),
+            None => self
+                .closed_workspace_configs
+                .iter()
+                .find(|cfg| cfg.name == name)
+                .and_then(config_document_places),
+        }
+    }
+
     fn workspace_guidelines_off(&self, name: &str) -> bool {
         self.workspaces
             .iter()
@@ -12264,7 +12397,13 @@ impl App {
     /// workspace comes through here. Returns its index.
     fn open_workspace(&mut self, mut ws: Workspace) -> usize {
         self.register_home(&mut ws);
-        for dir in std::mem::take(&mut ws.pending_repos) {
+        let mut pending = std::mem::take(&mut ws.pending_repos);
+        // A saved list holding a linked worktree lists its main checkout
+        // instead (TRU-191); only this Mac's folders are read.
+        if matches!(ws.location, WorkspaceLocation::Local { .. }) {
+            pending = gitterm::workspace_repos::fold_worktrees(pending);
+        }
+        for dir in pending {
             if let Some(id) = self.list_repo(&ws.name, &ws.location, dir) {
                 if !ws.repos.contains(&id) {
                     ws.repos.push(id);
@@ -12398,13 +12537,13 @@ impl App {
                 .filter_map(|task_id| self.task_store.as_ref()?.get(task_id))
                 .filter_map(|task| task_main_checkout(&task.repository.common_dir))
                 .collect();
-            let candidates: Vec<PathBuf> =
+            // A linked worktree (an agent-made one too) joins as its main
+            // checkout (TRU-191); a checkout since deleted does not join.
+            let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
                 gitterm::workspace_repos::auto_repo_candidates(&work, &workers, &task_worktrees)
-                    .iter()
-                    // A checkout since deleted does not join.
-                    .filter(|dir| dir.is_dir())
-                    .map(|dir| canonical(dir))
-                    .collect();
+                    .into_iter()
+                    .filter(|dir| dir.is_dir()),
+            );
             let listed: Vec<PathBuf> = ws
                 .repos
                 .iter()
@@ -12688,6 +12827,7 @@ impl App {
             ws.chats = cfg.chats.clone();
             ws.guidelines_off = cfg.guidelines_off;
             ws.claude_in_chrome = cfg.claude_in_chrome;
+            ws.decisions_repo = cfg.decisions_repo.as_ref().map(PathBuf::from);
             if let Some(config::WorkspaceLocationConfig::RemoteAgent {
                 remote_id,
                 workspace_id,
@@ -13754,7 +13894,8 @@ impl App {
         } else {
             self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full)
         };
-        Task::batch([index, refresh])
+        let documents = self.poll_work_documents();
+        Task::batch([index, refresh, documents])
     }
 
     /// Tick-driven polling (design decision 16). While the panel shows, a
@@ -13791,6 +13932,96 @@ impl App {
             return Task::none();
         }
         self.start_workspace_overview_refresh(&dir, mode)
+    }
+
+    // -----------------------------------------------------------------------
+    // Documents of the work (TRU-191).
+
+    /// What a documents scan of `ws` reads: its docs folder, the markdown
+    /// its chats (and their children) wrote, and its listed local repos.
+    /// `None` for a workspace on another machine.
+    fn work_documents_request(
+        &self,
+        ws: &Workspace,
+    ) -> Option<gitterm::work_documents::ScanRequest> {
+        if !matches!(ws.location, WorkspaceLocation::Local { .. })
+            || ws.remote_session.is_some()
+            || self.remote_agent_id_for_workspace(ws).is_some()
+        {
+            return None;
+        }
+        let written = self
+            .workspace_chat_entries(ws)
+            .iter()
+            .filter_map(|entry| entry.facts.as_ref())
+            .flat_map(|facts| facts.documents.iter().cloned())
+            .collect();
+        let repos = self
+            .local_repos(ws)
+            .into_iter()
+            .map(|repo| repo.dir.clone())
+            .collect();
+        Some(gitterm::work_documents::ScanRequest {
+            docs_dir: ws.dir.join("docs"),
+            written,
+            repos,
+        })
+    }
+
+    /// Gathers the active workspace's documents in the background unless
+    /// a scan of it is running.
+    fn start_work_documents_scan(&mut self) -> Task<Event> {
+        let Some(ws) = self.active_workspace() else {
+            return Task::none();
+        };
+        let uid = ws.uid;
+        let Some(request) = self.work_documents_request(ws) else {
+            return Task::none();
+        };
+        let state = self.work_documents.entry(uid).or_default();
+        if state.in_flight {
+            return Task::none();
+        }
+        state.in_flight = true;
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || gitterm::work_documents::scan(&request))
+                    .await
+                    .map_err(|error| format!("the documents scan did not finish: {error}"))
+            },
+            move |result| Event::WorkDocumentsScanned(uid, Box::new(result)),
+        )
+    }
+
+    /// The overview or the Plans mode shows the active workspace's
+    /// documents.
+    fn work_documents_visible(&self) -> bool {
+        self.workspace_overview_visible()
+            || (!self.sidebar_is_collapsed()
+                && self
+                    .active_tab()
+                    .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Plans))
+    }
+
+    /// Tick: shown documents are gathered when never read or older than
+    /// [`WORK_DOCUMENTS_POLL`].
+    fn poll_work_documents(&mut self) -> Task<Event> {
+        if !self.work_documents_visible() {
+            return Task::none();
+        }
+        let Some(uid) = self.active_workspace().map(|ws| ws.uid) else {
+            return Task::none();
+        };
+        let due = self.work_documents.get(&uid).is_none_or(|state| {
+            state
+                .scanned_at
+                .is_none_or(|at| at.elapsed() >= WORK_DOCUMENTS_POLL)
+        });
+        if due {
+            self.start_work_documents_scan()
+        } else {
+            Task::none()
+        }
     }
 
     /// Opens the review pane (TRU-178) on an owned checkout of the active
@@ -14598,7 +14829,8 @@ impl App {
                 self.open_remote_folder_tab(&remote_id, dir)
             }
             (FolderPickerPurpose::AddRepo(uid), None) => {
-                let dir = PathBuf::from(dir);
+                // A linked worktree is listed as its main checkout (TRU-191).
+                let dir = gitterm::workspace_repos::main_checkout(Path::new(&dir));
                 if let Some(idx) = self.workspace_index_by_uid(uid) {
                     let ws = &mut self.workspaces[idx];
                     gitterm::workspace_repos::add_manually(
@@ -15201,9 +15433,11 @@ impl App {
             };
             match gitterm::delegations::codex_run(delegation, &config_root) {
                 Ok(mut run) => {
-                    run.guidelines = launch_guidelines(
+                    run.guidelines = launch_instructions(
                         &run.cwd,
                         self.workspace_guidelines_off(&delegation.parent.workspace),
+                        self.workspace_document_places(&delegation.parent.workspace)
+                            .as_ref(),
                     );
                     runs.push((delegation_id, run))
                 }
@@ -16062,6 +16296,7 @@ impl App {
         workspace.chats = ws_config.chats.clone();
         workspace.guidelines_off = ws_config.guidelines_off;
         workspace.claude_in_chrome = ws_config.claude_in_chrome;
+        workspace.decisions_repo = ws_config.decisions_repo.as_ref().map(PathBuf::from);
         // The home repo's saved env and run command (TRU-180).
         self.seed_from_saved(&mut workspace, ws_config);
 
@@ -16716,6 +16951,8 @@ impl App {
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
             workspace_overviews: HashMap::new(),
+            work_documents: HashMap::new(),
+            work_document_copies_open: None,
             overview_focus_picks: overview::FocusPicks::load(&overview::FocusPicks::path_in(
                 &config::global_config_dir(),
             )),
@@ -17499,6 +17736,14 @@ fi
             .map(|ws| ws.claude_in_chrome)
             .or_else(|| saved_ws.map(|cfg| cfg.claude_in_chrome))
             .unwrap_or(false);
+        // And where a work's agents keep documents (TRU-191).
+        let document_places = match ws_name
+            .as_deref()
+            .and_then(|name| self.workspaces.iter().find(|ws| ws.name == name))
+        {
+            Some(ws) => ws.document_places(),
+            None => saved_ws.and_then(config_document_places),
+        };
         // The env of the repo holding the tab's folder, with the
         // workspace's overrides (TRU-180).
         let mut extra_env: Vec<(String, String)> = ws_name
@@ -17523,7 +17768,12 @@ fi
 
         // Added at launch only: the stored startup command stays as given.
         let launch_command = startup_command.as_deref().map(|command| {
-            let command = terminal_command_with_guidelines(command, &repo_path, guidelines_off);
+            let command = terminal_command_with_guidelines(
+                command,
+                &repo_path,
+                guidelines_off,
+                document_places.as_ref(),
+            );
             gitterm::harness::claude::configure_terminal_chrome(&command, claude_in_chrome)
         });
         let settings = Self::build_terminal_settings(
@@ -18118,6 +18368,7 @@ fi
             workspace.chats = saved.chats.clone();
             workspace.guidelines_off = saved.guidelines_off;
             workspace.claude_in_chrome = saved.claude_in_chrome;
+            workspace.decisions_repo = saved.decisions_repo.as_ref().map(PathBuf::from);
             self.seed_from_saved(&mut workspace, saved);
             workspace
         } else {
@@ -20108,6 +20359,8 @@ fi
                 tasks.push(self.poll_overview_transcripts());
                 // Owned branches of the workspace overview (TRU-167).
                 tasks.push(self.poll_workspace_overview());
+                // Its documents, while the overview or Plans shows (TRU-191).
+                tasks.push(self.poll_work_documents());
                 // The PR watch (TRU-173): one background poll when PRs are due.
                 tasks.push(self.poll_pr_watch());
                 // Closed tabs release their browser targets (TRU-176).
@@ -20744,6 +20997,8 @@ fi
                     };
                 'outer_submit: for ws in &mut self.workspaces {
                     let guidelines_off = ws.guidelines_off;
+                    // Named to an agent this prompt starts (TRU-191).
+                    let document_places = ws.document_places();
                     // Read as the process starts; a running chat keeps
                     // what it started with (TRU-181).
                     let claude_in_chrome = ws.claude_in_chrome;
@@ -20849,7 +21104,13 @@ fi
                                 // guidelines (TRU-174 is local only).
                                 let guidelines_file = remote_chat
                                     .is_none()
-                                    .then(|| launch_guidelines(&repo_path, guidelines_off))
+                                    .then(|| {
+                                        launch_instructions(
+                                            &repo_path,
+                                            guidelines_off,
+                                            document_places.as_ref(),
+                                        )
+                                    })
                                     .flatten()
                                     .map(|guidelines| guidelines.path);
                                 let Some(config) = session.claude_session_config(
@@ -20933,8 +21194,12 @@ fi
                             echo = tab::AgentEvent::user_prompt(&prompt.text);
                         }
                         if session.task_handle.is_none() {
-                            let guidelines_file = launch_guidelines(&repo_path, guidelines_off)
-                                .map(|guidelines| guidelines.path);
+                            let guidelines_file = launch_instructions(
+                                &repo_path,
+                                guidelines_off,
+                                document_places.as_ref(),
+                            )
+                            .map(|guidelines| guidelines.path);
                             let handle = tab::spawn_agent_task(
                                 session.config.clone(),
                                 repo_path,
@@ -24406,6 +24671,10 @@ fi
                     return Task::batch([task, self.present_active_tab_surfaces()]);
                 }
                 self.settle_agent_surface();
+                if mode == SidebarMode::Plans {
+                    // The Plans mode lists the work's documents (TRU-191).
+                    return Task::batch([task, self.poll_work_documents()]);
+                }
                 return task;
             }
             Event::SetGitViewMode(mode) => {
@@ -25401,7 +25670,33 @@ fi
                 };
                 let refresh =
                     self.start_workspace_overview_refresh(&dir, overview::RefreshMode::Full);
-                return Task::batch([index, refresh]);
+                let documents = self.start_work_documents_scan();
+                return Task::batch([index, refresh, documents]);
+            }
+            Event::WorkDocumentsRefresh => {
+                return self.start_work_documents_scan();
+            }
+            Event::WorkDocumentsScanned(uid, result) => {
+                let Some(state) = self.work_documents.get_mut(&uid) else {
+                    return Task::none();
+                };
+                state.in_flight = false;
+                state.scanned_at = Some(Instant::now());
+                match *result {
+                    Ok(result) => {
+                        state.result = Some(result);
+                        state.error = None;
+                    }
+                    Err(error) => {
+                        eprintln!("[work-documents] workspace uid={uid}: {error}");
+                        state.error = Some(error);
+                    }
+                }
+            }
+            Event::WorkDocumentCopiesToggle(key) => {
+                self.work_document_copies_open = (self.work_document_copies_open.as_deref()
+                    != Some(key.as_str()))
+                .then_some(key);
             }
             Event::WorkspaceOverviewRefreshed(dir, generation, outcome) => {
                 let Some(state) = self.workspace_overviews.get_mut(&dir) else {
@@ -26904,6 +27199,7 @@ fi
                     workspace.abbrev = cfg.abbrev.clone();
                     workspace.guidelines_off = cfg.guidelines_off;
                     workspace.claude_in_chrome = cfg.claude_in_chrome;
+                    workspace.decisions_repo = cfg.decisions_repo.as_ref().map(PathBuf::from);
                     self.seed_from_saved(&mut workspace, cfg);
                 }
                 self.add_tab_to_workspace_with_command(
@@ -26970,6 +27266,17 @@ fi
                     ws.claude_in_chrome = on;
                     self.workspaces_dirty = true;
                     self.next_workspace_save_at = Some(Instant::now());
+                }
+            }
+            Event::DecisionsRepoPicked(choice) => {
+                // Named to agents started from now on; running ones keep
+                // what they started with.
+                if let Some(ws) = self.workspaces.get_mut(self.workspace_settings_idx) {
+                    if ws.decisions_repo != choice.dir {
+                        ws.decisions_repo = choice.dir;
+                        self.workspaces_dirty = true;
+                        self.next_workspace_save_at = Some(Instant::now());
+                    }
                 }
             }
             Event::GuidelinesEdit => {
@@ -30380,6 +30687,83 @@ fi
         ]
         .spacing(6);
 
+        // --- Decisions repo (TRU-191) ---
+        let repo_choice = |dir: &Path| DecisionsRepoChoice {
+            dir: Some(dir.to_path_buf()),
+            label: format!(
+                "{} \u{00B7} {}",
+                gitterm::workspace_repos::repo_name(dir),
+                dir.display()
+            ),
+        };
+        let mut decisions_choices = vec![DecisionsRepoChoice::none()];
+        decisions_choices.extend(
+            self.local_repos(ws)
+                .into_iter()
+                .map(|repo| repo_choice(&repo.dir)),
+        );
+        let decisions_selected = match &ws.decisions_repo {
+            None => DecisionsRepoChoice::none(),
+            Some(dir) => match decisions_choices
+                .iter()
+                .find(|choice| choice.dir.as_deref() == Some(dir.as_path()))
+            {
+                Some(choice) => choice.clone(),
+                // Saved, but no longer listed: still shown, still told.
+                None => {
+                    let mut choice = repo_choice(dir);
+                    choice.label.push_str(" (not listed)");
+                    decisions_choices.push(choice.clone());
+                    choice
+                }
+            },
+        };
+        let decisions_col = column![
+            row![
+                text("Decisions repo:")
+                    .size(12)
+                    .color(text_secondary)
+                    .font(mono),
+                pick_list(
+                    decisions_choices,
+                    Some(decisions_selected),
+                    Event::DecisionsRepoPicked,
+                )
+                .width(Length::Fill)
+                .padding([4, 8])
+                .text_size(12)
+                .font(mono)
+                .style(move |_, status| pick_list::Style {
+                    text_color: text_primary,
+                    placeholder_color: text_muted,
+                    handle_color: if matches!(status, pick_list::Status::Hovered) {
+                        accent
+                    } else {
+                        text_muted
+                    },
+                    background: bg_base.into(),
+                    border: iced::Border {
+                        color: if matches!(status, pick_list::Status::Opened { .. }) {
+                            accent
+                        } else {
+                            border_color
+                        },
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                }),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+            text(
+                "Agents started in this work are told its docs folder for working \
+                 notes and this repo for decisions the team should see (through a PR)."
+            )
+            .size(11)
+            .color(text_muted),
+        ]
+        .spacing(6);
+
         // --- Compose card ---
         let card_content = column![
             title,
@@ -30391,6 +30775,8 @@ fi
             guidelines_col,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             chrome_col,
+            container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
+            decisions_col,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             section_label,
             gh_account_hint,
@@ -33866,6 +34252,17 @@ fi
         // Repos: the checkouts this workspace lists (TRU-180).
         if let Some(repos) = self.view_overview_repos() {
             content = content.push(repos);
+        }
+        // Documents of the work (TRU-191), newest first.
+        if let Some(documents) = self.view_work_documents(Some(OVERVIEW_DOCUMENT_ROWS)) {
+            let count = self
+                .active_workspace()
+                .and_then(|ws| self.work_documents.get(&ws.uid))
+                .and_then(|state| state.result.as_ref())
+                .map_or(0, |result| result.documents.len());
+            content = content
+                .push(section(format!("DOCUMENTS \u{00B7} {count}")))
+                .push(documents);
         }
         let Some(state) = state else {
             return finish(
@@ -39126,7 +39523,6 @@ fi
 
     fn view_plans_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let font = self.ui_font();
         let font_small = self.ui_font_small();
 
         let Some(workspace_dir) = self
@@ -39143,133 +39539,80 @@ fi
             .into();
         };
 
-        fn is_safe_sidebar_document_path(path: &str) -> bool {
-            !path.is_empty()
-                && path.ends_with(".md")
-                && !path.starts_with('/')
-                && !path.starts_with('\\')
-                && path.split('/').all(|segment| {
-                    !segment.is_empty()
-                        && segment != "."
-                        && segment != ".."
-                        && segment != "_archive"
-                        && !segment.starts_with('.')
-                        && !segment.contains('\\')
-                })
+        // The work's documents (TRU-191): the same list as the overview's
+        // Documents section, in full.
+        let docs_dir = workspace_dir.join("docs");
+        let mono = iced::Font::with_name("Menlo");
+        let state = self
+            .active_workspace()
+            .and_then(|ws| self.work_documents.get(&ws.uid));
+        let reading = state.is_some_and(|state| state.in_flight);
+        let mut refresh = button(
+            text(if reading {
+                "reading\u{2026}"
+            } else {
+                "\u{21BB} Refresh"
+            })
+            .size(11)
+            .color(theme.blue())
+            .font(mono),
+        )
+        .style(self.ghost_button_style())
+        .padding([4, 5]);
+        if !reading {
+            refresh = refresh.on_press(Event::WorkDocumentsRefresh);
         }
-
-        fn extract_sidebar_document_title(content: &str, fallback: &str) -> String {
-            content
-                .lines()
-                .find_map(|l| {
-                    l.trim_start()
-                        .strip_prefix("# ")
-                        .map(|s| s.trim().to_string())
+        let count = state
+            .and_then(|state| state.result.as_ref())
+            .map(|result| result.documents.len());
+        let mut list = Column::new().spacing(4).padding(8).push(
+            row![
+                text(match count {
+                    Some(count) => format!("DOCUMENTS \u{00B7} {count}"),
+                    None => "DOCUMENTS".to_string(),
                 })
-                .unwrap_or_else(|| fallback.trim_end_matches(".md").to_string())
-        }
-
-        fn collect_sidebar_document_entries(
-            root: &Path,
-            dir: &Path,
-            entries: &mut Vec<(String, String)>,
-        ) {
-            let Ok(read_dir) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in read_dir.flatten() {
-                let path = entry.path();
-                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if file_name.starts_with('.') || file_name == "_archive" {
-                    continue;
-                }
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if file_type.is_dir() {
-                    collect_sidebar_document_entries(root, &path, entries);
-                    continue;
-                }
-                if !file_type.is_file() {
-                    continue;
-                }
-                let Ok(rel_path) = path.strip_prefix(root) else {
-                    continue;
-                };
-                let name = rel_path.to_string_lossy().replace('\\', "/");
-                if !is_safe_sidebar_document_path(&name) {
-                    continue;
-                }
-                let content = std::fs::read_to_string(&path).unwrap_or_default();
-                let title = extract_sidebar_document_title(&content, &name);
-                entries.push((name, title));
+                .size(10)
+                .color(theme.text_muted())
+                .font(mono),
+                iced::widget::Space::new().width(Length::Fill),
+                refresh,
+            ]
+            .align_y(iced::Alignment::Center),
+        );
+        match self.view_work_documents(None) {
+            Some(documents) => list = list.push(documents),
+            None if count.is_none() && state.is_none_or(|state| state.error.is_none()) => {
+                list = list.push(
+                    text("Reading\u{2026}")
+                        .size(font_small)
+                        .color(theme.text_muted()),
+                );
             }
-        }
-
-        let collect_entries = |dir: &Path| -> Vec<(String, String)> {
-            let mut entries: Vec<(String, String)> = Vec::new();
-            collect_sidebar_document_entries(dir, dir, &mut entries);
-            entries.sort_by_key(|a| a.1.to_lowercase());
-            entries
-        };
-
-        let mut list = Column::new().spacing(2).padding(8);
-        for (source, label, dir) in [
-            (
-                plans_viewer::DocumentSource::Plans,
-                "Plans",
-                workspace_dir.join(".plans"),
-            ),
-            (
-                plans_viewer::DocumentSource::Docs,
-                "Docs",
-                workspace_dir.join("docs"),
-            ),
-        ] {
-            list = list.push(
-                text(label.to_uppercase())
-                    .size(10)
-                    .color(theme.text_muted()),
-            );
-
-            let entries = collect_entries(&dir);
-            if entries.is_empty() {
+            None => {
                 list = list.push(
                     column![
-                        text(format!("No {} found", label.to_lowercase()))
+                        text("No documents found")
                             .size(font_small)
                             .color(theme.text_secondary()),
-                        text(format!("Looked in {}", dir.display()))
-                            .size(font_small)
-                            .color(theme.text_muted()),
+                        text(format!(
+                            "Looked in {}, the chats' writes, and .plans/ and docs/ of each listed repo",
+                            docs_dir.display()
+                        ))
+                        .size(font_small)
+                        .color(theme.text_muted()),
                     ]
                     .spacing(2)
                     .padding([2, 8]),
                 );
-            } else {
-                for (name, title) in entries {
-                    let button_content: Element<'_, Event, Theme, iced::Renderer> =
-                        if name.contains('/') {
-                            column![
-                                text(title).size(font).color(theme.text_primary()),
-                                text(name.clone())
-                                    .size(font_small)
-                                    .color(theme.text_muted()),
-                            ]
-                            .spacing(1)
-                            .into()
-                        } else {
-                            text(title).size(font).color(theme.text_primary()).into()
-                        };
-                    let btn = button(button_content)
-                        .style(self.ghost_button_style())
-                        .padding([6, 8])
-                        .width(Length::Fill)
-                        .on_press(Event::OpenPlan(source, name));
-                    list = list.push(btn);
-                }
+            }
+        }
+        if let Some(error) = state.and_then(|state| state.error.as_ref()) {
+            if count.is_none() {
+                list = list.push(
+                    text(overview::shorten(error, 200))
+                        .size(10)
+                        .color(theme.danger()),
+                );
             }
         }
 
@@ -39277,6 +39620,133 @@ fi
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// The active workspace's documents (TRU-191), newest first, at most
+    /// `limit` of them. Each row: title and age, then the newest copy's
+    /// source and the path within its checkout, and "N copies" (with
+    /// "copies differ") when there are more; clicking opens the newest copy
+    /// in the markdown viewer and the copies line lists each copy to open.
+    /// `None` while nothing has been read or nothing was found.
+    fn view_work_documents(
+        &self,
+        limit: Option<usize>,
+    ) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+        let theme = &self.theme;
+        let mono = iced::Font::with_name("Menlo");
+        let font_small = self.ui_font_small();
+        let text_primary = theme.text_primary();
+        let text_muted = theme.text_muted();
+        let state = self.work_documents.get(&self.active_workspace()?.uid)?;
+        let result = state.result.as_ref()?;
+        if result.documents.is_empty() {
+            return None;
+        }
+        let shown = limit.unwrap_or(usize::MAX);
+        let mut col = Column::new().spacing(2);
+        for doc in result.documents.iter().take(shown) {
+            let newest = doc.newest();
+            let head = row![
+                text(overview::shorten(&doc.title, 60))
+                    .size(font_small)
+                    .color(text_primary)
+                    .width(Length::Fill),
+                text(overview::age_label(newest.modified))
+                    .size(10)
+                    .color(text_muted)
+                    .font(mono),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            let detail = text(overview::shorten(
+                &format!("{} \u{00B7} {}", newest.source.label(), doc.rel),
+                80,
+            ))
+            .size(10)
+            .color(text_muted);
+            let mut entry = Column::new().spacing(1).push(
+                button(column![head, detail].spacing(1))
+                    .style(self.ghost_button_style())
+                    .padding([4, 6])
+                    .width(Length::Fill)
+                    .on_press(Event::ViewFile(SourcePath::Local(newest.path.clone()))),
+            );
+            if doc.copies.len() > 1 {
+                let open = self.work_document_copies_open.as_deref() == Some(doc.key.as_str());
+                let label = format!(
+                    "{} {} copies{}",
+                    if open { "\u{25BE}" } else { "\u{25B8}" },
+                    doc.copies.len(),
+                    if doc.differ {
+                        " \u{00B7} copies differ"
+                    } else {
+                        ""
+                    }
+                );
+                entry = entry.push(
+                    button(text(label).size(10).color(if doc.differ {
+                        theme.yellow()
+                    } else {
+                        text_muted
+                    }))
+                    .style(self.ghost_button_style())
+                    .padding([1, 12])
+                    .on_press(Event::WorkDocumentCopiesToggle(doc.key.clone())),
+                );
+                if open {
+                    for (index, copy) in doc.copies.iter().enumerate() {
+                        let line = format!(
+                            "{}{} \u{00B7} {}",
+                            if index == 0 { "newest \u{00B7} " } else { "" },
+                            copy.source.label(),
+                            overview::age_label(copy.modified)
+                        );
+                        entry = entry.push(
+                            button(
+                                text(overview::shorten(&line, 70))
+                                    .size(10)
+                                    .color(theme.accent()),
+                            )
+                            .style(self.ghost_button_style())
+                            .padding([1, 18])
+                            .width(Length::Fill)
+                            .on_press(Event::ViewFile(SourcePath::Local(copy.path.clone()))),
+                        );
+                    }
+                }
+            }
+            col = col.push(entry);
+        }
+        if result.documents.len() > shown {
+            col = col.push(
+                button(
+                    text(format!(
+                        "\u{2026} {} more in Plans",
+                        result.documents.len() - shown
+                    ))
+                    .size(10)
+                    .color(theme.accent()),
+                )
+                .style(self.ghost_button_style())
+                .padding([2, 6])
+                .on_press(Event::SetSidebarMode(SidebarMode::Plans)),
+            );
+        }
+        if result.truncated {
+            col = col.push(
+                text("Stopped reading at the scan's limit; some documents may be missing.")
+                    .size(10)
+                    .color(text_muted),
+            );
+        }
+        if let Some(error) = &state.error {
+            col = col.push(
+                text(overview::shorten(error, 200))
+                    .size(10)
+                    .color(theme.danger()),
+            );
+        }
+        Some(col.into())
     }
 
     fn view_agent_sidebar<'a>(
@@ -46296,6 +46766,7 @@ mod tests {
             done_at: None,
             guidelines_off: false,
             claude_in_chrome: false,
+            decisions_repo: None,
             repos: vec![format!("/tmp/{name}")],
             home: None,
             env_overrides: HashMap::new(),

@@ -17,6 +17,12 @@
 //!
 //! The file is read before every launch: an unreadable one launches the
 //! agent without it and is logged. A launch is never blocked.
+//!
+//! An agent started in a piece of work also gets a short documents note
+//! (TRU-191, [`with_documents`]) naming the work's docs folder and its
+//! decisions repo. It goes in through the same options; for the harnesses
+//! that read a file, the guidelines and the note are written together to a
+//! per-launch file.
 
 use std::path::{Path, PathBuf};
 
@@ -192,6 +198,108 @@ pub fn for_launch(config_dir: &Path, cwd: &Path, workspace_off: bool) -> Option<
             None
         }
     }
+}
+
+/// Where a work workspace's agents keep their documents (TRU-191): its
+/// private docs folder in the work's home, and the repo the team's
+/// decisions go to, when one is set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentPlaces {
+    pub docs_dir: PathBuf,
+    pub decisions_repo: Option<PathBuf>,
+}
+
+/// The document places of an agent starting in a workspace: only a piece
+/// of work on this Mac has them. A folder workspace's agents follow the
+/// repo's own conventions and are told nothing.
+pub fn document_places(
+    is_work: bool,
+    local: bool,
+    home: &Path,
+    decisions_repo: Option<&Path>,
+) -> Option<DocumentPlaces> {
+    (is_work && local).then(|| DocumentPlaces {
+        docs_dir: home.join("docs"),
+        decisions_repo: decisions_repo.map(Path::to_path_buf),
+    })
+}
+
+/// The text appended for `places`, naming both locations as paths.
+pub fn documents_note(places: &DocumentPlaces) -> String {
+    let mut note = format!(
+        "# Documents for this work (added by GitTerm)\n\n\
+         - Working notes for this work (status, plans, scratch) go in \
+         `{}`. That folder is private and not in git.\n",
+        places.docs_dir.display()
+    );
+    match &places.decisions_repo {
+        Some(repo) => note.push_str(&format!(
+            "- Decisions the team should see go in the decisions repo, `{}`, \
+             following that repo's conventions, and land through a merged PR.\n",
+            repo.display()
+        )),
+        None => note.push_str(
+            "- No decisions repo is set for this work: put decisions the team \
+             should see where the repository you change keeps them, following \
+             its conventions, through a PR.\n",
+        ),
+    }
+    note
+}
+
+/// The instructions a launch carries: the guidelines (when they apply)
+/// followed by the documents note (when the workspace has places). With a
+/// note, the combined text is written to a file in `launch_dir` (named by
+/// its content, so equal launches share one) for the harnesses that read a
+/// file. A file that cannot be written is logged and the launch carries
+/// the guidelines alone; a launch is never blocked.
+pub fn with_documents(
+    guidelines: Option<Guidelines>,
+    places: Option<&DocumentPlaces>,
+    launch_dir: &Path,
+) -> Option<Guidelines> {
+    let Some(places) = places else {
+        return guidelines;
+    };
+    let note = documents_note(places);
+    let text = match &guidelines {
+        Some(guidelines) => format!("{}\n\n{note}", guidelines.text.trim_end()),
+        None => note,
+    };
+    match write_launch_file(launch_dir, &text) {
+        Ok(path) => Some(Guidelines { path, text }),
+        Err(error) => {
+            log(&format!(
+                "{error}; starting the agent without the documents note"
+            ));
+            guidelines
+        }
+    }
+}
+
+fn write_launch_file(launch_dir: &Path, text: &str) -> Result<PathBuf, String> {
+    let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
+    let name: String = digest.as_ref()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let path = launch_dir.join(format!("agent-instructions-{name}.md"));
+    if std::fs::read_to_string(&path).is_ok_and(|existing| existing == text) {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(launch_dir)
+        .map_err(|error| format!("cannot create {}: {error}", launch_dir.display()))?;
+    let temporary = launch_dir.join(format!(
+        ".agent-instructions-{name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&temporary, text)
+        .and_then(|()| std::fs::rename(&temporary, &path))
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("cannot write {}: {error}", path.display())
+        })?;
+    Ok(path)
 }
 
 /// Claude's options for the control-protocol chat process.
@@ -459,6 +567,52 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         std::fs::write(empty.path().join(GUIDELINES_FILE), "  \n").unwrap();
         assert!(for_launch(empty.path(), empty.path(), false).is_none());
+    }
+
+    #[test]
+    fn work_launches_name_the_docs_folder_and_the_decisions_repo() {
+        let home = Path::new("/work/example-work");
+        let repo = Path::new("/code/team-decisions");
+        let places = document_places(true, true, home, Some(repo)).unwrap();
+        let launch = tempfile::tempdir().unwrap();
+        let combined = with_documents(Some(sample()), Some(&places), launch.path()).unwrap();
+        assert!(combined.text.starts_with("Say \"why\"."));
+        assert!(combined.text.contains("`/work/example-work/docs`"));
+        assert!(combined.text.contains("`/code/team-decisions`"));
+        assert!(combined.text.contains("merged PR"));
+        // Claude and pi read the file; it holds the same text, and Codex
+        // gets the text itself.
+        assert!(combined.path.starts_with(launch.path()));
+        assert_eq!(
+            std::fs::read_to_string(&combined.path).unwrap(),
+            combined.text
+        );
+        assert!(codex_config_value(&combined).contains("example-work/docs"));
+        // Equal launches share the file.
+        let again = with_documents(Some(sample()), Some(&places), launch.path()).unwrap();
+        assert_eq!(again.path, combined.path);
+
+        // Without a decisions repo it says so; with the guidelines off the
+        // note still goes in, alone.
+        let no_repo = document_places(true, true, home, None).unwrap();
+        let alone = with_documents(None, Some(&no_repo), launch.path()).unwrap();
+        assert!(alone.text.starts_with("# Documents for this work"));
+        assert!(alone.text.contains("`/work/example-work/docs`"));
+        assert!(alone.text.contains("No decisions repo is set"));
+    }
+
+    #[test]
+    fn folder_and_remote_workspaces_get_no_documents_note() {
+        let home = Path::new("/code/api");
+        assert_eq!(document_places(false, true, home, None), None);
+        assert_eq!(document_places(true, false, home, None), None);
+        let launch = tempfile::tempdir().unwrap();
+        assert_eq!(
+            with_documents(Some(sample()), None, launch.path()),
+            Some(sample())
+        );
+        assert_eq!(with_documents(None, None, launch.path()), None);
+        assert_eq!(std::fs::read_dir(launch.path()).unwrap().count(), 0);
     }
 
     fn sample() -> Guidelines {
