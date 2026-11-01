@@ -585,8 +585,8 @@ pub fn repos_touched(work: &[&ChatIndexEntry]) -> Vec<RepoTouched> {
 /// The work's issue keys, most mentioned first. A key is kept only when
 /// its prefix also appears in one of `names` (the work's owned branch and
 /// worktree folder names): a prefix seen only in chat text never
-/// qualifies. Year-like (`BETA-2026`) and zero-padded (`ARTIST-00`) numbers
-/// are dropped everywhere, including as the source of a prefix.
+/// qualifies. Zero-padded (`ARTIST-00`) numbers are dropped everywhere,
+/// including as the source of a prefix; year-like ones (`ABC-2024`) are kept.
 pub fn work_issue_keys(per_chat: &[&[String]], names: &[&str]) -> Vec<String> {
     let name_prefixes: HashSet<String> = names
         .iter()
@@ -614,13 +614,10 @@ fn key_prefix(key: &str) -> Option<&str> {
     key.split_once('-').map(|(prefix, _)| prefix)
 }
 
-/// Not a year (`-1990`..`-2099`) and not zero-padded (`-00`, `-05`).
+/// Not zero-padded (`-00`, `-05`). Year-like numbers (`ABC-2024`) are real.
 fn plausible_key(key: &str) -> bool {
-    let Some((_, number)) = key.split_once('-') else {
-        return false;
-    };
-    let year_like = number.len() == 4 && (number.starts_with("19") || number.starts_with("20"));
-    !number.starts_with('0') && !year_like
+    key.split_once('-')
+        .is_some_and(|(_, number)| !number.starts_with('0'))
 }
 
 // ---------------------------------------------------------------------------
@@ -2240,23 +2237,24 @@ mod tests {
             "OPS-7",
             "BETA-2026",
             "ARTIST-00",
+            "ABC-2024",
             "C8-10014",
             "RELEASE-7",
         ]);
         let b = keys(&["PRJ-101", "PRJ-102", "OPS-8", "LOCAL-2576"]);
         let per_chat: Vec<&[String]> = vec![&a, &b];
-        // PRJ and OPS name owned branches or worktree folders; RELEASE only
-        // through a year, which never counts; the rest are text only.
+        // PRJ, OPS and ABC (a year-like number is a real key) name owned
+        // branches or worktree folders; the rest are text only.
         let kept = work_issue_keys(
             &per_chat,
             &[
                 "work/prj-101-standby",
                 "api-server-ops-9",
-                "release-2026",
+                "abc-1-year",
                 "main",
             ],
         );
-        assert_eq!(kept, ["PRJ-101", "OPS-7", "OPS-8", "PRJ-102"]);
+        assert_eq!(kept, ["PRJ-101", "ABC-2024", "OPS-7", "OPS-8", "PRJ-102"]);
         assert!(work_issue_keys(&per_chat, &[]).is_empty());
         let padded = keys(&["PRJ-05"]);
         assert!(work_issue_keys(&[&padded], &["prj-101-x"]).is_empty());

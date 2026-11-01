@@ -7413,7 +7413,7 @@ fn chat_facts_line(facts: &chat_facts::ChatFacts) -> Option<String> {
     }
     let parts: Vec<String> = [
         capped(facts.issue_keys.clone(), 3),
-        capped(facts.repo_names(), 3),
+        capped(facts.edited_repo_names(), 3),
         facts.fan_out_line(),
     ]
     .into_iter()
@@ -45097,7 +45097,7 @@ mod tests {
         assert_eq!(
             chat_facts_line(&facts).as_deref(),
             Some(
-                "PRJ-101 PRJ-102 PRJ-103 +1 · infra auth-service socket · 2 subagents · 1 worker · 1 review"
+                "PRJ-101 PRJ-102 PRJ-103 +1 · infra auth-service · 2 subagents · 1 worker · 1 review"
             )
         );
     }

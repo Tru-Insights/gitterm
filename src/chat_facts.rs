@@ -322,9 +322,24 @@ impl ChatFacts {
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
-    /// Folder names of the repos touched, most edited first.
+    /// Folder names of the repos touched (visited or edited), most edited
+    /// first.
     pub fn repo_names(&self) -> Vec<String> {
-        let mut repos: Vec<&RepoTouch> = self.repos_touched.iter().collect();
+        self.names_of_repos(false)
+    }
+
+    /// Folder names of the repos the chat edited, most edited first. A repo
+    /// it only `cd`'d into is not listed (the "+N repos" fact).
+    pub fn edited_repo_names(&self) -> Vec<String> {
+        self.names_of_repos(true)
+    }
+
+    fn names_of_repos(&self, edited_only: bool) -> Vec<String> {
+        let mut repos: Vec<&RepoTouch> = self
+            .repos_touched
+            .iter()
+            .filter(|repo| !edited_only || repo.edits > 0)
+            .collect();
         repos.sort_by_key(|repo| std::cmp::Reverse(repo.edits));
         repos
             .into_iter()
@@ -383,18 +398,40 @@ fn normalize_stamp(raw: &str) -> Option<String> {
 // Issue keys: the repo's key pattern `[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}`
 // (agent-workflow.config.json), on word boundaries.
 
+/// Prefixes that match the key shape but name encodings, hashes and
+/// standards, never issues (`UTF-8`, `SHA-256`).
+const NON_ISSUE_PREFIXES: &[&str] = &["UTF", "ISO", "SHA", "RFC", "HTTP"];
+
+fn is_non_issue_key(key: &str) -> bool {
+    key.split_once('-')
+        .is_some_and(|(prefix, _)| NON_ISSUE_PREFIXES.contains(&prefix))
+}
+
 /// Issue keys in human text, in order of first appearance. Case-sensitive:
-/// prose like "utf-8" is not a key.
+/// prose like "utf-8" is not a key. A key must be a whole token: not a
+/// piece of a longer hyphenated name (`WS-ABC-10`, `HOST-PROD-DEV-2`,
+/// `DEV-01-x`) or a path (`/a/ABC-12`), and not in `NON_ISSUE_PREFIXES`.
 pub fn issue_keys_in_text(text: &str) -> Vec<String> {
+    scan_issue_keys(text, true)
+}
+
+fn scan_issue_keys(text: &str, whole_token: bool) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let at_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let at_boundary = i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || (whole_token && matches!(bytes[i - 1], b'-' | b'_' | b'.' | b'/')));
         if at_boundary && bytes[i].is_ascii_uppercase() {
             if let Some(len) = key_len_at(&bytes[i..]) {
+                let continues = whole_token
+                    && matches!(bytes.get(i + len), Some(b'-' | b'_'))
+                    && bytes
+                        .get(i + len + 1)
+                        .is_some_and(|b| b.is_ascii_alphanumeric());
                 let key = &text[i..i + len];
-                if !keys.iter().any(|known| known == key) {
+                if !continues && !is_non_issue_key(key) && !keys.iter().any(|known| known == key) {
                     keys.push(key.to_string());
                 }
                 i += len;
@@ -408,8 +445,9 @@ pub fn issue_keys_in_text(text: &str) -> Vec<String> {
 
 /// Issue keys in a branch or folder name, which are usually lowercase
 /// (`tracey/tru-166-chat-facts`, `blobfs-prj-102`); returned uppercase.
+/// Names are hyphen-joined words, so a key may sit between separators here.
 pub fn issue_keys_in_name(name: &str) -> Vec<String> {
-    issue_keys_in_text(&name.to_ascii_uppercase())
+    scan_issue_keys(&name.to_ascii_uppercase(), false)
 }
 
 /// Length of a key starting at `bytes[0]`, if one does, with nothing
@@ -1054,7 +1092,16 @@ pub fn backfill_claude(
                 continue;
             }
         };
-        if existing.as_ref().is_some_and(|facts| facts.backfilled) {
+        // A backfilled chat is scanned again when its transcript moved on
+        // after the facts file was written (a CLI session has no live
+        // writer, so this is how it catches up).
+        let stale = std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|written| target.mtime > written);
+        if existing
+            .as_ref()
+            .is_some_and(|facts| facts.backfilled && !stale)
+        {
             report.already += 1;
             continue;
         }
@@ -1378,6 +1425,40 @@ branch refs/heads/tracey/tru-12-thing
         );
         assert!(issue_keys_in_name("live-pipeline-standby").is_empty());
         assert!(issue_keys_in_name("api-server-pr587").is_empty());
+    }
+
+    #[test]
+    fn non_issue_prefixes_are_not_keys_but_year_like_numbers_are() {
+        assert!(issue_keys_in_text("UTF-8 ISO-8601 SHA-1 RFC-2616 HTTP-2").is_empty());
+        // Pieces of longer hyphenated names and paths are not keys.
+        assert!(
+            issue_keys_in_text("WS-ABC-10 HOST-PROD-DEV-2 DEV-01-x /a/ABC-12 a_ABC-1").is_empty()
+        );
+        assert_eq!(
+            issue_keys_in_text("fix ABC-2024 and ABC-123, see ABC-12. (ABC-13)"),
+            vec!["ABC-2024", "ABC-123", "ABC-12", "ABC-13"]
+        );
+    }
+
+    #[test]
+    fn repo_names_list_only_repos_with_edits() {
+        let facts = ChatFacts {
+            repos_touched: vec![
+                RepoTouch {
+                    dir: "/w/visited".into(),
+                    edits: 0,
+                },
+                RepoTouch {
+                    dir: "/w/edited".into(),
+                    edits: 2,
+                },
+            ],
+            ..ChatFacts::default()
+        };
+        assert_eq!(facts.edited_repo_names(), vec!["edited"]);
+        assert_eq!(facts.repo_names(), vec!["edited", "visited"]);
+        // Search still matches a repo the chat only visited.
+        assert!(facts.searchable_folder_names().any(|n| n == "visited"));
     }
 
     #[test]
@@ -1961,6 +2042,15 @@ branch refs/heads/tracey/tru-12-thing
         // Once per transcript; hosted chats and the batch bound are honoured.
         let again = backfill_claude(targets.clone(), &facts_dir, &HashSet::new(), &[], 10, None);
         assert_eq!((again.scanned, again.already), (0, 1));
+        // A transcript that moved on after the facts were written is
+        // scanned again; an untouched one is not.
+        let moved_on = vec![BackfillTarget {
+            id: "s1".into(),
+            path: transcript.clone(),
+            mtime: SystemTime::now() + std::time::Duration::from_secs(3600),
+        }];
+        let rescan = backfill_claude(moved_on, &facts_dir, &HashSet::new(), &[], 10, None);
+        assert_eq!((rescan.scanned, rescan.already), (1, 0));
         let hosted: HashSet<String> = ["s1".to_string()].into();
         let skipped = backfill_claude(targets, &facts_dir, &hosted, &[], 10, None);
         assert_eq!((skipped.scanned, skipped.hosted), (0, 1));
