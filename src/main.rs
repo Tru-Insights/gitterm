@@ -34794,6 +34794,11 @@ fi
                 ),
             );
         }
+        // PRs of the work in merge order (TRU-173).
+        if let Some(prs) = self.view_overview_prs() {
+            content = content.push(prs);
+        }
+
         // Repos: the checkouts this workspace lists (TRU-180).
         if let Some(repos) = self.view_overview_repos() {
             content = content.push(repos);
@@ -34816,17 +34821,6 @@ fi
                 .padding([2, 6])
                 .on_press(Event::SetSidebarMode(SidebarMode::Claude)),
             );
-        }
-        // Documents of the work (TRU-191), newest first.
-        if let Some(documents) = self.view_work_documents() {
-            let count = self
-                .active_workspace()
-                .and_then(|ws| self.work_documents.get(&ws.uid))
-                .and_then(|state| state.result.as_ref())
-                .map_or(0, |result| result.documents.len());
-            content = content
-                .push(section(format!("DOCUMENTS \u{00B7} {count}")))
-                .push(documents);
         }
         let Some(state) = state else {
             return finish(
@@ -35034,6 +35028,18 @@ fi
             content = content.push(chats);
         }
 
+        // Documents of the work (TRU-191), newest first.
+        if let Some(documents) = self.view_work_documents() {
+            let count = self
+                .active_workspace()
+                .and_then(|ws| self.work_documents.get(&ws.uid))
+                .and_then(|state| state.result.as_ref())
+                .map_or(0, |result| result.documents.len());
+            content = content
+                .push(section(format!("DOCUMENTS \u{00B7} {count}")))
+                .push(documents);
+        }
+
         // Coordinators that live in another workspace but edited here.
         if !summary.also_worked.is_empty() {
             content = content.push(section(format!(
@@ -35049,11 +35055,6 @@ fi
                 ));
             }
             content = content.push(also);
-        }
-
-        // PRs of the work in merge order (TRU-173).
-        if let Some(prs) = self.view_overview_prs() {
-            content = content.push(prs);
         }
 
         // Repos touched, each with the branches the work owns there.
