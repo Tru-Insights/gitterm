@@ -40,6 +40,7 @@ mod chat_summary;
 mod config;
 mod config_import;
 mod events;
+mod hover_bounds;
 mod tab;
 mod theme;
 mod v5_pickup;
@@ -6740,7 +6741,8 @@ pub enum Event {
     /// Open or close one of the workspace bar's menus (TRU-192).
     BarMenuToggle(BarMenu),
     /// The pointer entered a bar item with this hint text (TRU-192).
-    BarHintEnter(String),
+    /// A bar item's hint text and its centre x in window coordinates.
+    BarHintEnter(String, f32),
     /// The pointer left the bar item with this hint text.
     BarHintExit(String),
     /// The hint delay for this hover has passed.
@@ -7153,8 +7155,6 @@ struct App {
     bar_hint_seq: u64,
     /// The page currently showing the hint, to hide it there.
     bar_hint_in: Option<WebviewSurface>,
-    /// The pointer's x in window coordinates.
-    cursor_x: f32,
     /// The listed repo (and the tab) the Git or Files panel shows,
     /// picked from a repo row in Work or the Files roots (TRU-192).
     panel_repo: Option<(usize, PathBuf)>,
@@ -7313,9 +7313,8 @@ const BAR_HEIGHT: f32 = 28.0;
 const BAR_HINT_DELAY: Duration = Duration::from_millis(400);
 const BAR_HINT_HIDE_SCRIPT: &str = "window.__gittermHint && window.__gittermHint(null)";
 
-/// The hover hint of a bar item (TRU-192): its text and the pointer's x in
-/// window coordinates when the pointer entered, which stands for the item's
-/// centre.
+/// The hover hint of a bar item (TRU-192): its text and the item's centre x
+/// in window coordinates.
 #[derive(Debug, Clone, PartialEq)]
 struct BarHint {
     text: String,
@@ -7345,9 +7344,10 @@ fn bar_hint_target(visible: VisibleSurface, console_expanded: bool) -> BarHintTa
     }
 }
 
-/// A rough bubble width for 12px Menlo text, enough to keep it on screen.
+/// A rough bubble width for 15px Menlo text (0.6em a character), enough to
+/// keep it on screen and centred.
 fn bar_hint_width(text: &str) -> f32 {
-    text.chars().count() as f32 * 7.3 + 16.0
+    text.chars().count() as f32 * 9.0 + 20.0
 }
 
 /// Move a bubble's centre so a bubble `width` wide stays inside `0..bound`
@@ -17442,7 +17442,6 @@ impl App {
             bar_hint: None,
             bar_hint_seq: 0,
             bar_hint_in: None,
-            cursor_x: 0.0,
             panel_repo: None,
             remote_chat_indexes: HashMap::new(),
             remote_running_chats: HashMap::new(),
@@ -25387,9 +25386,9 @@ fi
                     self.save_config();
                 }
             }
-            Event::BarHintEnter(text) => {
+            Event::BarHintEnter(text, center_x) => {
                 self.bar_hint_exit(None);
-                return self.bar_hint_enter(text);
+                return self.bar_hint_enter(text, center_x);
             }
             Event::BarHintExit(text) => {
                 self.bar_hint_exit(Some(&text));
@@ -25398,7 +25397,6 @@ fi
                 self.bar_hint_due(seq);
             }
             Event::MouseMoved(x, y) => {
-                self.cursor_x = x;
                 if self.dragging_divider {
                     // Clamp sidebar width between 150 and 600 pixels (subtract rail width)
                     self.sidebar_width = (x - SPINE_WIDTH).clamp(150.0, 600.0);
@@ -31668,10 +31666,13 @@ fi
         content: impl Into<Element<'a, Event, Theme, iced::Renderer>>,
         tip: String,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
-        iced::widget::mouse_area(content)
-            .on_enter(Event::BarHintEnter(tip.clone()))
-            .on_exit(Event::BarHintExit(tip))
-            .into()
+        let enter_tip = tip.clone();
+        hover_bounds::hover_bounds(
+            content,
+            move |bounds| Event::BarHintEnter(enter_tip.clone(), bounds.center_x()),
+            Event::BarHintExit(tip),
+        )
+        .into()
     }
 
     /// Where the hover hint is drawn right now.
@@ -31696,11 +31697,11 @@ fi
         let fg = self.theme.bg_base();
         let bubble = container(
             text(hint.text.clone())
-                .size(12)
+                .size(15)
                 .color(fg)
                 .font(iced::Font::with_name("Menlo")),
         )
-        .padding([4, 8])
+        .padding([5, 10])
         .style(move |_| container::Style {
             background: Some(bg.into()),
             border: iced::Border {
@@ -31733,12 +31734,12 @@ fi
     }
 
     /// Hover entered a bar item: remember it and, after the delay, show it.
-    fn bar_hint_enter(&mut self, text: String) -> Task<Event> {
+    fn bar_hint_enter(&mut self, text: String, center_x: f32) -> Task<Event> {
         self.bar_hint_seq += 1;
         let seq = self.bar_hint_seq;
         self.bar_hint = Some(BarHint {
             text,
-            center_x: self.cursor_x,
+            center_x,
             shown: false,
         });
         Task::perform(
