@@ -6739,6 +6739,12 @@ pub enum Event {
     ToggleReposZone(String),
     /// Open or close one of the workspace bar's menus (TRU-192).
     BarMenuToggle(BarMenu),
+    /// The pointer entered a bar item with this hint text (TRU-192).
+    BarHintEnter(String),
+    /// The pointer left the bar item with this hint text.
+    BarHintExit(String),
+    /// The hint delay for this hover has passed.
+    BarHintDue(u64),
     BarMenuClose,
     /// A bar menu item: closes the menu, then runs the event.
     BarMenuRun(Box<Event>),
@@ -7141,6 +7147,14 @@ struct App {
     collapsed_repo_groups: std::collections::HashSet<String>,
     /// The workspace bar menu that is open (TRU-192).
     bar_menu: Option<BarMenu>,
+    /// The bar item under the pointer and its hint (TRU-192).
+    bar_hint: Option<BarHint>,
+    /// Bumped on each hover change so a stale delay is ignored.
+    bar_hint_seq: u64,
+    /// The page currently showing the hint, to hide it there.
+    bar_hint_in: Option<WebviewSurface>,
+    /// The pointer's x in window coordinates.
+    cursor_x: f32,
     /// The listed repo (and the tab) the Git or Files panel shows,
     /// picked from a repo row in Work or the Files roots (TRU-192).
     panel_repo: Option<(usize, PathBuf)>,
@@ -7291,6 +7305,69 @@ enum ActiveTabSurface {
     /// An agent tab whose chat is covered by its file viewer overlay or by
     /// the git diff panel for a selected file.
     AgentFileOverlay,
+}
+
+/// The workspace bar's height in logical pixels, border included.
+const BAR_HEIGHT: f32 = 28.0;
+/// How long the pointer rests on a bar item before its hint shows.
+const BAR_HINT_DELAY: Duration = Duration::from_millis(400);
+const BAR_HINT_HIDE_SCRIPT: &str = "window.__gittermHint && window.__gittermHint(null)";
+
+/// The hover hint of a bar item (TRU-192): its text and the pointer's x in
+/// window coordinates when the pointer entered, which stands for the item's
+/// centre.
+#[derive(Debug, Clone, PartialEq)]
+struct BarHint {
+    text: String,
+    center_x: f32,
+    /// The delay has passed, so the hint is on screen.
+    shown: bool,
+}
+
+/// What draws the bar hint: an Iced overlay, or a page's `__gittermHint`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarHintTarget {
+    Iced,
+    Webview(WebviewSurface),
+}
+
+/// A webview covers anything Iced draws above the bar only when it sits
+/// directly on top of it, so with the terminal panel open (Iced content
+/// between the two) or no webview showing, Iced draws the bubble.
+fn bar_hint_target(visible: VisibleSurface, console_expanded: bool) -> BarHintTarget {
+    if console_expanded {
+        return BarHintTarget::Iced;
+    }
+    match visible {
+        VisibleSurface::None => BarHintTarget::Iced,
+        VisibleSurface::Viewer => BarHintTarget::Webview(WebviewSurface::Viewer),
+        VisibleSurface::AgentChat(tab_id) => BarHintTarget::Webview(WebviewSurface::Agent(tab_id)),
+    }
+}
+
+/// A rough bubble width for 10.5px Menlo text, enough to keep it on screen.
+fn bar_hint_width(text: &str) -> f32 {
+    text.chars().count() as f32 * 6.4 + 14.0
+}
+
+/// Move a bubble's centre so a bubble `width` wide stays inside `0..bound`
+/// with a 4px margin (the page's or window's width).
+fn clamp_hint_center(center: f32, width: f32, bound: f32) -> f32 {
+    const MARGIN: f32 = 4.0;
+    let half = width / 2.0;
+    let low = half + MARGIN;
+    let high = bound - half - MARGIN;
+    if high < low {
+        return bound / 2.0;
+    }
+    center.clamp(low, high)
+}
+
+/// The script that shows the hint on a page; the text goes in as a JSON
+/// string so the page treats it as text.
+fn bar_hint_show_script(text: &str, x: f32) -> String {
+    let text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    format!("window.__gittermHint && window.__gittermHint({text}, {x})")
 }
 
 /// The one webview surface that should be on screen.
@@ -17361,6 +17438,10 @@ impl App {
             chat_open_section_collapsed: false,
             collapsed_repo_groups: std::collections::HashSet::new(),
             bar_menu: None,
+            bar_hint: None,
+            bar_hint_seq: 0,
+            bar_hint_in: None,
+            cursor_x: 0.0,
             panel_repo: None,
             remote_chat_indexes: HashMap::new(),
             remote_running_chats: HashMap::new(),
@@ -25305,7 +25386,18 @@ fi
                     self.save_config();
                 }
             }
+            Event::BarHintEnter(text) => {
+                self.bar_hint_exit(None);
+                return self.bar_hint_enter(text);
+            }
+            Event::BarHintExit(text) => {
+                self.bar_hint_exit(Some(&text));
+            }
+            Event::BarHintDue(seq) => {
+                self.bar_hint_due(seq);
+            }
             Event::MouseMoved(x, y) => {
+                self.cursor_x = x;
                 if self.dragging_divider {
                     // Clamp sidebar width between 150 and 600 pixels (subtract rail width)
                     self.sidebar_width = (x - SPINE_WIDTH).clamp(150.0, 600.0);
@@ -28799,6 +28891,19 @@ fi
     }
 
     fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let base = self.view_base();
+        match self.view_bar_hint() {
+            Some(hint) => Stack::new()
+                .push(base)
+                .push(hint)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            None => base,
+        }
+    }
+
+    fn view_base(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         heartbeat("view");
         let spine = freeze_time!("view_spine", { self.view_spine() });
 
@@ -31553,24 +31658,128 @@ fi
         (state, label, color, driving)
     }
 
-    /// A one-line hover label beside a bar item. Beside, not above: with
-    /// the terminal panel folded a chat page sits right on top of the bar
-    /// and would cover anything drawn above it.
-    fn bar_tooltip<'a>(
+    /// Track hover on a bar item so its hint can pop up above it
+    /// (`BarHint`). The bubble is drawn by `view_bar_hint` over Iced
+    /// content, or by the page's `__gittermHint` when a webview sits above
+    /// the bar, which would cover anything Iced draws there.
+    fn bar_hint_area<'a>(
         &self,
         content: impl Into<Element<'a, Event, Theme, iced::Renderer>>,
         tip: String,
-        position: iced::widget::tooltip::Position,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let tip = self.rail_tooltip(
-            text(tip)
-                .size(10)
-                .color(self.theme.text_primary())
-                .font(iced::Font::with_name("Menlo")),
-        );
-        iced::widget::tooltip(content, tip, position)
-            .gap(4.0)
+        iced::widget::mouse_area(content)
+            .on_enter(Event::BarHintEnter(tip.clone()))
+            .on_exit(Event::BarHintExit(tip))
             .into()
+    }
+
+    /// Where the hover hint is drawn right now.
+    fn bar_hint_target(&self) -> BarHintTarget {
+        let target = bar_hint_target(self.visible_webview_surface(), self.console_expanded);
+        match target {
+            BarHintTarget::Webview(surface) if !webview::is_active(surface) => BarHintTarget::Iced,
+            other => other,
+        }
+    }
+
+    /// The Iced bubble for a shown hint, anchored just above the bar at the
+    /// hovered item's x. `None` unless the hint is due and Iced draws it.
+    fn view_bar_hint(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+        let hint = self.bar_hint.as_ref().filter(|hint| hint.shown)?;
+        if self.bar_hint_target() != BarHintTarget::Iced {
+            return None;
+        }
+        let bubble_w = bar_hint_width(&hint.text);
+        let center = clamp_hint_center(hint.center_x, bubble_w, self.window_size.0);
+        let bg = self.theme.text_primary();
+        let fg = self.theme.bg_base();
+        let bubble = container(
+            text(hint.text.clone())
+                .size(10.5)
+                .color(fg)
+                .font(iced::Font::with_name("Menlo")),
+        )
+        .padding([3, 7])
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            border: iced::Border {
+                radius: 5.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let pointer_offset = (hint.center_x - (center - bubble_w / 2.0) - 4.0)
+            .clamp(6.0, (bubble_w - 14.0).max(6.0));
+        let pointer = row![
+            iced::widget::Space::new().width(Length::Fixed(pointer_offset)),
+            text("\u{25BE}").size(9).color(bg)
+        ];
+        let card = column![bubble, pointer].spacing(0);
+        let positioned = row![
+            iced::widget::Space::new().width(Length::Fixed(center - bubble_w / 2.0)),
+            card
+        ];
+        Some(
+            column![
+                iced::widget::Space::new().height(Length::Fill),
+                positioned,
+                iced::widget::Space::new().height(Length::Fixed(BAR_HEIGHT + 1.0)),
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        )
+    }
+
+    /// Hover entered a bar item: remember it and, after the delay, show it.
+    fn bar_hint_enter(&mut self, text: String) -> Task<Event> {
+        self.bar_hint_seq += 1;
+        let seq = self.bar_hint_seq;
+        self.bar_hint = Some(BarHint {
+            text,
+            center_x: self.cursor_x,
+            shown: false,
+        });
+        Task::perform(
+            async move {
+                tokio::time::sleep(BAR_HINT_DELAY).await;
+                seq
+            },
+            Event::BarHintDue,
+        )
+    }
+
+    /// The delay passed: show the hint if it is still the one hovered.
+    fn bar_hint_due(&mut self, seq: u64) {
+        if seq != self.bar_hint_seq {
+            return;
+        }
+        let target = self.bar_hint_target();
+        let (x, _, page_w, _) = self.calculate_webview_bounds();
+        let Some(hint) = self.bar_hint.as_mut().filter(|hint| !hint.shown) else {
+            return;
+        };
+        hint.shown = true;
+        if let BarHintTarget::Webview(surface) = target {
+            let bubble_w = bar_hint_width(&hint.text);
+            let in_page = clamp_hint_center(hint.center_x - x, bubble_w, page_w);
+            webview::evaluate_script(surface, &bar_hint_show_script(&hint.text, in_page));
+            self.bar_hint_in = Some(surface);
+        }
+    }
+
+    /// Hover left `text`'s item (or something else took over): hide at once.
+    fn bar_hint_exit(&mut self, text: Option<&str>) {
+        if let Some(text) = text {
+            if self.bar_hint.as_ref().is_none_or(|hint| hint.text != text) {
+                return;
+            }
+        }
+        self.bar_hint_seq += 1;
+        self.bar_hint = None;
+        if let Some(surface) = self.bar_hint_in.take() {
+            webview::evaluate_script(surface, BAR_HINT_HIDE_SCRIPT);
+        }
     }
 
     /// A small text button on the bar.
@@ -31660,7 +31869,7 @@ fi
             })
             .padding([7, 7])
             .on_press_maybe(event);
-        self.bar_tooltip(btn, label, iced::widget::tooltip::Position::Left)
+        self.bar_hint_area(btn, label)
     }
 
     /// The bar's terminal toggle (TRU-192): opens or folds the bottom
@@ -31685,7 +31894,7 @@ fi
             (false, false) => "Terminal panel (\u{2318}J)",
         };
         let btn = self.bar_text_button(">_".to_string(), color, Some(Event::ConsoleToggle));
-        self.bar_tooltip(btn, tip.to_string(), iced::widget::tooltip::Position::Left)
+        self.bar_hint_area(btn, tip.to_string())
     }
 
     /// One workspace chip on the bar: dot, name (double-click renames),
@@ -31898,11 +32107,7 @@ fi
         if renaming.is_some() {
             return chip;
         }
-        self.bar_tooltip(
-            chip,
-            ws.name.clone(),
-            iced::widget::tooltip::Position::Right,
-        )
+        self.bar_hint_area(chip, ws.name.clone())
     }
 
     /// A machine's display name and, for a remote agent, its connection
@@ -32050,11 +32255,7 @@ fi
             })
             .padding([6, 12])
             .on_press(Event::BarMenuToggle(BarMenu::Repos));
-        self.bar_tooltip(
-            btn,
-            tip_parts.join(" \u{00B7} "),
-            iced::widget::tooltip::Position::Right,
-        )
+        self.bar_hint_area(btn, tip_parts.join(" \u{00B7} "))
     }
 
     fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -32096,11 +32297,7 @@ fi
             theme.text_muted(),
             Some(Event::NewWorkOpen),
         );
-        bar_row = bar_row.push(self.bar_tooltip(
-            plus,
-            "New workspace".to_string(),
-            iced::widget::tooltip::Position::Right,
-        ));
+        bar_row = bar_row.push(self.bar_hint_area(plus, "New workspace".to_string()));
 
         let scrollable_bar = scrollable(bar_row.padding([0, 4]).align_y(iced::Alignment::Center))
             .direction(scrollable::Direction::Horizontal(
@@ -32169,11 +32366,8 @@ fi
                 theme.text_muted(),
                 Some(Event::ParkedListToggle),
             );
-            bar_inner = bar_inner.push(self.bar_tooltip(
-                parked,
-                format!("{parked_count} parked"),
-                iced::widget::tooltip::Position::Left,
-            ));
+            bar_inner =
+                bar_inner.push(self.bar_hint_area(parked, format!("{parked_count} parked")));
         }
         let more_open = self.bar_menu == Some(BarMenu::More);
         let more = self.bar_text_button(
@@ -32189,11 +32383,7 @@ fi
             .push(control_separator)
             .push(self.view_terminal_toggle())
             .push(self.view_browser_icon())
-            .push(self.bar_tooltip(
-                more,
-                "Help and browser actions".to_string(),
-                iced::widget::tooltip::Position::Left,
-            ))
+            .push(self.bar_hint_area(more, "Help and browser actions".to_string()))
             .push(iced::widget::Space::new().width(Length::Fixed(4.0)))
             .spacing(0)
             .align_y(iced::Alignment::Center)
@@ -43153,6 +43343,43 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn bar_hint_centre_is_clamped_to_the_window_or_page() {
+        // Inside: untouched.
+        assert_eq!(clamp_hint_center(500.0, 100.0, 1000.0), 500.0);
+        // Near the left edge: the bubble's left side keeps a 4px margin.
+        assert_eq!(clamp_hint_center(10.0, 100.0, 1000.0), 54.0);
+        // Near the right edge.
+        assert_eq!(clamp_hint_center(995.0, 100.0, 1000.0), 946.0);
+        // A page narrower than the bubble centres it.
+        assert_eq!(clamp_hint_center(10.0, 100.0, 80.0), 40.0);
+    }
+
+    #[test]
+    fn bar_hint_draws_in_iced_unless_a_webview_sits_on_the_bar() {
+        use BarHintTarget::{Iced, Webview};
+        assert_eq!(bar_hint_target(VisibleSurface::None, false), Iced);
+        assert_eq!(
+            bar_hint_target(VisibleSurface::Viewer, false),
+            Webview(WebviewSurface::Viewer)
+        );
+        assert_eq!(
+            bar_hint_target(VisibleSurface::AgentChat(3), false),
+            Webview(WebviewSurface::Agent(3))
+        );
+        // The open terminal panel is Iced content between page and bar.
+        assert_eq!(bar_hint_target(VisibleSurface::Viewer, true), Iced);
+        assert_eq!(bar_hint_target(VisibleSurface::AgentChat(3), true), Iced);
+    }
+
+    #[test]
+    fn bar_hint_script_passes_the_text_as_a_json_string() {
+        assert_eq!(
+            bar_hint_show_script("a \"b\" </script>", 12.5),
+            "window.__gittermHint && window.__gittermHint(\"a \\\"b\\\" </script>\", 12.5)"
+        );
+    }
 
     #[test]
     fn overview_transcript_reads_resume_after_the_last_whole_line() {

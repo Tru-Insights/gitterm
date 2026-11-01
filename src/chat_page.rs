@@ -22,14 +22,30 @@ pub const AGENT_CHAT_VENDOR_JS: [&str; 2] = [
 ];
 pub const AGENT_CHAT_VENDOR_SLOT: &str = "/*__VENDOR_JS__*/";
 
+/// Where a page takes the bar-hint script (`bar_hint_script`).
+pub const BAR_HINT_SLOT: &str = "/*__BAR_HINT__*/";
+const BAR_HINT_JS: &str = include_str!("../assets/bar_hint.js");
+
+/// The script that defines `window.__gittermHint(text, x)` on a page
+/// (TRU-192): a bubble at the page's bottom edge, drawn in `background`
+/// with `color` text. Both are CSS colour values.
+pub fn bar_hint_script(background: &str, color: &str) -> String {
+    BAR_HINT_JS
+        .replace("__BG__", background)
+        .replace("__FG__", color)
+}
+
 /// The chat page with the vendored scripts inlined into its slot.
 pub fn agent_chat_html() -> String {
     debug_assert!(AGENT_CHAT_HTML.contains(AGENT_CHAT_VENDOR_SLOT));
-    AGENT_CHAT_HTML.replacen(
-        AGENT_CHAT_VENDOR_SLOT,
-        &AGENT_CHAT_VENDOR_JS.join("\n;\n"),
-        1,
-    )
+    debug_assert!(AGENT_CHAT_HTML.contains(BAR_HINT_SLOT));
+    AGENT_CHAT_HTML
+        .replacen(
+            AGENT_CHAT_VENDOR_SLOT,
+            &AGENT_CHAT_VENDOR_JS.join("\n;\n"),
+            1,
+        )
+        .replacen(BAR_HINT_SLOT, &bar_hint_script("var(--fg)", "var(--bg)"), 1)
 }
 
 /// The page's echo of a prompt the human submitted.
