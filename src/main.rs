@@ -34565,16 +34565,16 @@ fi
             .into()
     }
 
-    /// The Workspace overview (TRU-167; mockups screen b's sidebar with
-    /// screen h's branch rows): the workspace's coordinators and fan-out,
-    /// the repos it edited with the branches it owns, and its issue keys.
-    /// A pure render over `workspace_overviews`; git is read by the poller.
-    /// The overview's Repos section (TRU-180): each repo the workspace
-    /// lists with its console state; selecting a row makes it current
-    /// (where new bottom terminals open); × removes one (not the home);
-    /// `+ add repo` picks a folder. A note offers undo when repos joined
-    /// from the chats' touches.
-    fn view_overview_repos(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+    /// The overview's one Repos section (TRU-167, TRU-180, TRU-192): every
+    /// repo the workspace lists or the work touched, each with its edit
+    /// count and the owned branches under it. The header carries the repo's
+    /// run command, a remove control (not the home) and opens the Git view
+    /// on a click; `+ add repo` picks a folder. A note offers undo when
+    /// repos joined from the chats' touches. A pure render over `state`.
+    fn view_overview_repos<'a>(
+        &'a self,
+        state: Option<&'a WorkspaceOverviewState>,
+    ) -> Option<Element<'a, Event, Theme, iced::Renderer>> {
         let ws = self.active_workspace()?;
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
@@ -34582,9 +34582,45 @@ fi
         let text_primary = theme.text_primary();
         let text_muted = theme.text_muted();
         let uid = ws.uid;
-        let mut section = Column::new()
-            .spacing(3)
-            .push(text("REPOS").size(10).color(text_muted).font(mono));
+
+        let listed: Vec<&RepoState> = ws.repos.iter().filter_map(|id| self.repo(*id)).collect();
+        let listed_dirs: Vec<PathBuf> = listed.iter().map(|repo| repo.dir.clone()).collect();
+        let groups = overview::merge_repo_groups(
+            &listed_dirs,
+            state.map_or(&[][..], |state| &state.summary.repos),
+            state.map_or(&[][..], |state| &state.branches),
+        );
+        let owned_count: usize = groups
+            .iter()
+            .map(|group| group.rows.iter().filter(|row| !row.owned.gone).count())
+            .sum();
+
+        let mut header = Row::new()
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .push(
+                text(format!(
+                    "REPOS \u{00B7} {} \u{00B7} BRANCHES \u{00B7} {owned_count}",
+                    groups.len()
+                ))
+                .size(10)
+                .color(text_muted)
+                .font(mono),
+            )
+            .push(iced::widget::Space::new().width(Length::Fill));
+        if matches!(ws.location, WorkspaceLocation::Local { .. }) {
+            header = header.push(
+                button(
+                    text("+ add repo")
+                        .size(font_small - 1.0)
+                        .color(theme.accent()),
+                )
+                .style(self.ghost_button_style())
+                .padding([2, 6])
+                .on_press(Event::WorkspaceRepoAdd(uid)),
+            );
+        }
+        let mut section = Column::new().spacing(3).push(header);
 
         if !ws.joined_note.is_empty() {
             let names: Vec<String> = ws
@@ -34614,31 +34650,50 @@ fi
             );
         }
 
-        for repo in ws.repos.iter().filter_map(|id| self.repo(*id)) {
-            let mut name = gitterm::workspace_repos::repo_name(&repo.dir);
-            if repo.id == ws.home {
+        let home = dirs::home_dir();
+        let selected = self.open_review_checkout();
+        let mut repos = Column::new().spacing(6);
+        for group in groups {
+            let repo_state = listed.iter().find(|repo| repo.dir == group.dir);
+            // Worktrees git still lists whose folder is gone: one dim
+            // line per repo, never read.
+            let (gone, rows): (Vec<_>, Vec<_>) =
+                group.rows.into_iter().partition(|row| row.owned.gone);
+            let oldest = rows.iter().map(|row| row.checked_at).min();
+            let mut name = overview::folder_name(&group.dir);
+            if repo_state.is_some_and(|repo| repo.id == ws.home) {
                 name.push_str(" \u{00B7} home");
             }
             // The name opens the Git view on the repo (TRU-192).
-            let mut line =
-                Row::new().spacing(4).align_y(iced::Alignment::Center).push(
-                    button(text(name).size(font_small).color(text_primary))
-                        .style(self.ghost_button_style())
-                        .padding([2, 4])
-                        .width(Length::Fill)
-                        .on_press_maybe(repo.key.is_local().then(|| {
-                            Event::OpenRepoPanel(SidebarMode::Git, Some(repo.dir.clone()))
-                        })),
+            let local = repo_state.is_none_or(|repo| repo.key.is_local());
+            let mut head = row![
+                button(text(name).size(font_small).color(text_primary).font(mono))
+                    .style(self.ghost_button_style())
+                    .padding([0, 2])
+                    .on_press_maybe(local.then(|| {
+                        Event::OpenRepoPanel(SidebarMode::Git, Some(group.dir.clone()))
+                    }))
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            if let Some(edits) = group.edits {
+                head = head.push(
+                    text(format!("{edits} edits"))
+                        .size(10)
+                        .color(text_muted)
+                        .font(mono),
                 );
+            }
+            head = head.push(iced::widget::Space::new().width(Length::Fill));
             // Its run command (TRU-180): `▶` opens it as a terminal tab
             // below; ✎ edits it. Only this Mac's folders run.
-            if repo.key.is_local() {
+            if let Some(repo) = repo_state.filter(|repo| repo.key.is_local()) {
                 let editing = self
                     .editing_run_command
                     .as_ref()
                     .filter(|(id, _)| *id == repo.id);
-                line = match (editing, &repo.run_command) {
-                    (Some((_, draft)), _) => line.push(
+                head = match (editing, &repo.run_command) {
+                    (Some((_, draft)), _) => head.push(
                         text_input("npm run dev", draft)
                             .on_input(Event::RunCommandChanged)
                             .on_submit(Event::RunCommandSubmit)
@@ -34647,7 +34702,7 @@ fi
                             .width(Length::Fixed(160.0))
                             .font(mono),
                     ),
-                    (None, Some(command)) => line
+                    (None, Some(command)) => head
                         .push(
                             button(
                                 text(format!("\u{25B6} {command}"))
@@ -34656,48 +34711,82 @@ fi
                                     .font(mono),
                             )
                             .style(self.ghost_button_style())
-                            .padding([2, 4])
+                            .padding([0, 4])
                             .on_press(Event::RunRepoCommand(repo.id)),
                         )
                         .push(
                             button(text("\u{270E}").size(10).color(text_muted))
                                 .style(self.ghost_button_style())
-                                .padding([2, 4])
+                                .padding([0, 4])
                                 .on_press(Event::RunCommandEditStart(repo.id)),
                         ),
-                    (None, None) => line.push(
+                    (None, None) => head.push(
                         button(text("+ run command").size(10).color(text_muted).font(mono))
                             .style(self.ghost_button_style())
-                            .padding([2, 4])
+                            .padding([0, 4])
                             .on_press(Event::RunCommandEditStart(repo.id)),
                     ),
                 };
             }
-            if repo.id != ws.home {
-                line = line.push(
+            if let Some(oldest) = oldest {
+                head = head.push(
+                    text(overview::age_label(oldest))
+                        .size(10)
+                        .color(text_muted)
+                        .font(mono),
+                );
+            }
+            if let Some(repo) = repo_state.filter(|repo| repo.id != ws.home) {
+                head = head.push(
                     button(text("\u{00D7}").size(font_small).color(text_muted))
                         .style(self.ghost_button_style())
-                        .padding([2, 4])
+                        .padding([0, 4])
                         .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
                 );
             }
-            section = section.push(container(line).padding([3, 6]));
+            let mut column = Column::new().spacing(2).push(head);
+            if rows.is_empty() && gone.is_empty() {
+                let note = if group.edits.is_none() {
+                    "no edits yet"
+                } else if state.is_some_and(|state| state.last_full_refresh.is_none()) {
+                    "reading\u{2026}"
+                } else {
+                    "no live checkout of this work"
+                };
+                column = column.push(text(note).size(10).color(text_muted));
+            }
+            for row in rows {
+                column = column.push(self.view_overview_branch_row(
+                    row,
+                    home.as_deref(),
+                    selected == Some(row.owned.checkout.as_path()),
+                ));
+            }
+            if !gone.is_empty() {
+                let names: Vec<&str> = gone
+                    .iter()
+                    .map(|row| row.owned.branch.as_deref().unwrap_or("(detached)"))
+                    .collect();
+                column = column.push(
+                    text(format!(
+                        "\u{25B8} {} folder{} gone \u{00B7} {}",
+                        gone.len(),
+                        if gone.len() == 1 { "" } else { "s" },
+                        overview::shorten(&names.join(", "), 60)
+                    ))
+                    .size(10)
+                    .color(theme.overlay0()),
+                );
+            }
+            repos = repos.push(column);
         }
-        if matches!(ws.location, WorkspaceLocation::Local { .. }) {
-            section = section.push(
-                button(
-                    text("+ add repo")
-                        .size(font_small - 1.0)
-                        .color(theme.accent()),
-                )
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::WorkspaceRepoAdd(uid)),
-            );
-        }
-        Some(section.into())
+        Some(section.push(repos).into())
     }
 
+    /// The Workspace overview (TRU-167; mockups screen b's sidebar with
+    /// screen h's branch rows): the workspace's coordinators and fan-out,
+    /// the repos it edited with the branches it owns, and its issue keys.
+    /// A pure render over `workspace_overviews`; git is read by the poller.
     fn view_workspace_overview<'a>(&'a self) -> Element<'a, Event, Theme, iced::Renderer> {
         const COORDINATOR_ROWS: usize = 12;
         const OLDER_ROWS: usize = 20;
@@ -34800,8 +34889,8 @@ fi
             content = content.push(prs);
         }
 
-        // Repos: the checkouts this workspace lists (TRU-180).
-        if let Some(repos) = self.view_overview_repos() {
+        // Repos with their branches (TRU-167, TRU-180, TRU-192).
+        if let Some(repos) = self.view_overview_repos(state) {
             content = content.push(repos);
         }
         // What the agent has here (TRU-192): opens the Agent view.
@@ -35056,105 +35145,6 @@ fi
                 ));
             }
             content = content.push(also);
-        }
-
-        // Repos touched, each with the branches the work owns there.
-        let mut groups: Vec<(&Path, Option<u64>, Vec<&overview::BranchStatus>)> = summary
-            .repos
-            .iter()
-            .map(|repo| (repo.dir.as_path(), Some(repo.edits), Vec::new()))
-            .collect();
-        for row in &state.branches {
-            match groups
-                .iter_mut()
-                .find(|(repo, _, _)| *repo == row.owned.repo.as_path())
-            {
-                Some((_, _, rows)) => rows.push(row),
-                None => groups.push((row.owned.repo.as_path(), None, vec![row])),
-            }
-        }
-        if !groups.is_empty() {
-            let owned_count: usize = groups
-                .iter()
-                .map(|(_, _, rows)| rows.iter().filter(|row| !row.owned.gone).count())
-                .sum();
-            content = content.push(section(format!(
-                "REPOS \u{00B7} {} \u{00B7} BRANCHES \u{00B7} {owned_count}",
-                groups.len()
-            )));
-            let home = dirs::home_dir();
-            let selected = self.open_review_checkout();
-            let mut repos = Column::new().spacing(6);
-            for (repo, edits, rows) in groups {
-                // Worktrees git still lists whose folder is gone: one dim
-                // line per repo, never read.
-                let (gone, rows): (Vec<_>, Vec<_>) =
-                    rows.into_iter().partition(|row| row.owned.gone);
-                let oldest = rows.iter().map(|row| row.checked_at).min();
-                let mut head = row![text(overview::folder_name(repo))
-                    .size(font_small)
-                    .color(text_primary)
-                    .font(mono)]
-                .spacing(6)
-                .align_y(iced::Alignment::Center);
-                if let Some(edits) = edits {
-                    head = head.push(
-                        text(format!("{edits} edits"))
-                            .size(10)
-                            .color(text_muted)
-                            .font(mono),
-                    );
-                }
-                head = head.push(iced::widget::Space::new().width(Length::Fill));
-                if let Some(oldest) = oldest {
-                    head = head.push(
-                        text(overview::age_label(oldest))
-                            .size(10)
-                            .color(text_muted)
-                            .font(mono),
-                    );
-                }
-                let mut group = Column::new().spacing(2).push(head);
-                if rows.is_empty() && gone.is_empty() {
-                    let note = if state.last_full_refresh.is_none() {
-                        "reading\u{2026}"
-                    } else {
-                        "no live checkout of this work"
-                    };
-                    group = group.push(text(note).size(10).color(text_muted));
-                }
-                for row in rows {
-                    group = group.push(self.view_overview_branch_row(
-                        row,
-                        home.as_deref(),
-                        selected == Some(row.owned.checkout.as_path()),
-                    ));
-                }
-                if !gone.is_empty() {
-                    let names: Vec<&str> = gone
-                        .iter()
-                        .map(|row| row.owned.branch.as_deref().unwrap_or("(detached)"))
-                        .collect();
-                    group = group.push(
-                        text(format!(
-                            "\u{25B8} {} folder{} gone \u{00B7} {}",
-                            gone.len(),
-                            if gone.len() == 1 { "" } else { "s" },
-                            overview::shorten(&names.join(", "), 60)
-                        ))
-                        .size(10)
-                        .color(theme.overlay0()),
-                    );
-                }
-                repos = repos.push(group);
-            }
-            content = content.push(repos);
-        } else if summary.has_facts {
-            content = content.push(
-                text("No repo edits recorded for this workspace's chats.")
-                    .size(font_small)
-                    .color(text_muted),
-            );
         }
 
         if !summary.issue_keys.is_empty() {
