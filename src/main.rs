@@ -43,6 +43,7 @@ mod config_import;
 mod events;
 mod tab;
 mod theme;
+mod v5_pickup;
 mod work_prs;
 mod workspace_bar;
 
@@ -232,6 +233,12 @@ pub enum AgentIpcMessage {
     /// native `paste:` action.
     PastePage {
         tab_id: usize,
+    },
+    /// "Continue here" on a V5 conversation the empty chat tab was offered
+    /// (TRU-183).
+    V5Continue {
+        tab_id: usize,
+        session_id: String,
     },
 }
 
@@ -669,6 +676,25 @@ fn agent_webview_note(tab_id: usize, text: &str) {
     );
 }
 
+/// Show, or with `None` clear, the note offering an empty chat tab its V5
+/// conversations above the composer (TRU-183).
+fn push_v5_offer(tab_id: usize, offer: Option<&serde_json::Value>) {
+    let offer = offer.map_or_else(|| "null".to_string(), |offer| offer.to_string());
+    webview::evaluate_script(
+        WebviewSurface::Agent(tab_id),
+        &format!("window.__setV5Offer({offer})"),
+    );
+}
+
+/// Why "Continue here" did not bind the tab, shown in the V5 note.
+fn push_v5_offer_error(tab_id: usize, text: &str) {
+    let text = serde_json::Value::String(text.to_string());
+    webview::evaluate_script(
+        WebviewSurface::Agent(tab_id),
+        &format!("window.__setV5OfferError({text})"),
+    );
+}
+
 /// Reset a tab's chat page: clears all rendered messages and sets status to
 /// Idle.
 fn reset_agent_webview(tab_id: usize) {
@@ -989,6 +1015,20 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                 AgentIpcMessage::OpenFile {
                     tab_id,
                     path: PathBuf::from(path),
+                }
+            }
+            "v5_continue" => {
+                let Some(session_id) = value
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .filter(|id| !id.is_empty())
+                else {
+                    eprintln!("[agent-ipc] v5_continue without sessionId: {body}");
+                    return;
+                };
+                AgentIpcMessage::V5Continue {
+                    tab_id,
+                    session_id: session_id.to_string(),
                 }
             }
             "open_review" => match gitterm::review_pane::chat_review_path(&value) {
@@ -6146,6 +6186,9 @@ pub enum Event {
     /// A remote chat's transcript could not be fetched (TRU-152); the
     /// message is shown in the chat.
     AgentHistoryUnavailable(usize, String),
+    /// The V5 conversations an empty chat tab could continue, likeliest
+    /// first, or why there is nothing to offer (TRU-183).
+    V5OfferLoaded(usize, Result<Vec<v5_pickup::V5Conversation>, String>),
     /// The Claude chats a remote's agent is running (TRU-152).
     RemoteRunningChatsLoaded(String, Result<Vec<RunningClaudeChat>, String>),
     /// A CLI transcript the Chats overview follows was checked (TRU-154):
@@ -6676,6 +6719,12 @@ struct App {
     review_marks: Option<Result<review_pane::ViewedMarks, String>>,
     chat_index_loading: bool,
     chat_index_loaded_at: Option<Instant>,
+    /// Empty chat tabs whose V5 offer (TRU-183) lists a conversation the
+    /// chats index has no title for yet; offered again when it loads.
+    v5_offer_awaiting_titles: HashSet<usize>,
+    /// Why the last V5 offer could not be made, so a missing or malformed
+    /// V5 file is logged once rather than on every chat page shown.
+    v5_offer_unavailable: Option<String>,
     chat_query: String,
     chat_scope: chats::ChatScope,
     /// Backend filter chip; None shows all backends.
@@ -16486,6 +16535,8 @@ impl App {
             review_marks: None,
             chat_index_loading: false,
             chat_index_loaded_at: None,
+            v5_offer_awaiting_titles: HashSet::new(),
+            v5_offer_unavailable: None,
             chat_query: String::new(),
             chat_scope: chats::ChatScope::default(),
             chat_backend_filter: None,
@@ -20407,6 +20458,9 @@ fi
                     AgentIpcMessage::OpenReview { tab_id, path } => {
                         self.open_review_from_chat(tab_id, path)
                     }
+                    AgentIpcMessage::V5Continue { tab_id, session_id } => {
+                        self.continue_v5_conversation(tab_id, session_id)
+                    }
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
@@ -21540,7 +21594,13 @@ fi
                 if let Some(key) = self.roster_reveal_held.remove(&tab_id) {
                     webview::reveal_agent_roster_row(tab_id, &key);
                 }
-                return self.refresh_delegation_head(tab_id);
+                return Task::batch([
+                    self.refresh_delegation_head(tab_id),
+                    self.request_v5_offer(tab_id),
+                ]);
+            }
+            Event::V5OfferLoaded(tab_id, result) => {
+                return self.v5_offer_loaded(tab_id, result);
             }
             Event::AgentHistoryUnavailable(tab_id, error) => {
                 eprintln!("[remote-chat] tab {tab_id}: {error}");
@@ -24957,7 +25017,17 @@ fi
                     }
                     _ => Task::none(),
                 };
-                return Task::batch([self.request_chat_rank(), overview_refresh]);
+                // Offers that were waiting for conversation titles.
+                let retitled: Vec<usize> = self.v5_offer_awaiting_titles.drain().collect();
+                let offers: Vec<Task<Event>> = retitled
+                    .into_iter()
+                    .map(|tab_id| self.request_v5_offer(tab_id))
+                    .collect();
+                return Task::batch([
+                    self.request_chat_rank(),
+                    overview_refresh,
+                    Task::batch(offers),
+                ]);
             }
             Event::ChatsQueryChanged(query) => {
                 self.chat_query = query;
@@ -27525,9 +27595,14 @@ fi
         }
 
         let surface_task = match action {
-            AgentSurfaceAction::Reveal | AgentSurfaceAction::SwitchTab => {
+            AgentSurfaceAction::Reveal => {
                 self.reveal_agent_page(tab_id);
                 Task::none()
+            }
+            // Coming back to a kept page: its V5 offer may be stale.
+            AgentSurfaceAction::SwitchTab => {
+                self.reveal_agent_page(tab_id);
+                self.request_v5_offer(tab_id)
             }
             AgentSurfaceAction::Create => {
                 webview::set_pending_content_with_ipc(
@@ -42662,6 +42737,230 @@ fi
             ..Default::default()
         })
         .into()
+    }
+}
+
+// ---- V5 conversation pickup (TRU-183) ---------------------------------------
+//
+// The first-launch import unbinds chat tabs from their V5 conversations, so
+// an imported chat tab opens empty. Its page offers the V5 conversations of
+// the same workspace dir that no V6 tab holds; "Continue here" binds one.
+// V5's files are only read (`v5_pickup`).
+impl App {
+    /// What an empty chat tab asks V5 for: a native Claude chat with no
+    /// conversation (no session id, an empty timeline, no process, no
+    /// task) in a workspace on this Mac. `None` for any other tab.
+    fn v5_offer_query(&self, tab_id: usize) -> Option<v5_pickup::TabQuery> {
+        let (workspace, position, tab) = self.workspaces.iter().find_map(|workspace| {
+            let position = workspace.tabs.iter().position(|tab| tab.id == tab_id)?;
+            Some((workspace, position, &workspace.tabs[position]))
+        })?;
+        if !matches!(workspace.location, WorkspaceLocation::Local { .. })
+            || workspace.remote_session.is_some()
+        {
+            return None;
+        }
+        let session = tab.agent_session()?;
+        let empty = session.backend() == tab::AgentBackend::Claude
+            && tab.chat_session_id.is_none()
+            && tab.task_id.is_none()
+            && session.session_id.is_none()
+            && session.conversation.is_empty()
+            && session.harness.is_none();
+        empty.then(|| v5_pickup::TabQuery {
+            dir: workspace.dir.clone(),
+            position,
+            agent_config: v5_pickup::config_value(&session.config),
+        })
+    }
+
+    /// Every conversation a V6 tab holds, in an open workspace or a closed
+    /// one, with that workspace's name.
+    fn v6_bound_conversations(&self) -> HashMap<String, String> {
+        let mut bound = HashMap::new();
+        for workspace in &self.workspaces {
+            for tab in &workspace.tabs {
+                let session_id = tab
+                    .agent_session()
+                    .map(|session| session.session_id.clone());
+                // A terminal resuming a conversation it was not given an
+                // id for (`claude --resume <id>`) holds it too.
+                let resumed = tab.startup_command().map(v5_pickup::claude_resume_id);
+                for id in [
+                    tab.chat_session_id.clone(),
+                    session_id.flatten(),
+                    resumed.flatten(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    bound.entry(id).or_insert_with(|| workspace.name.clone());
+                }
+            }
+        }
+        for config in &self.closed_workspace_configs {
+            for tab in &config.tabs {
+                let resumed = tab
+                    .startup_command
+                    .as_deref()
+                    .and_then(v5_pickup::claude_resume_id);
+                for id in [tab.chat_session_id.clone(), resumed].into_iter().flatten() {
+                    bound.entry(id).or_insert_with(|| config.name.clone());
+                }
+            }
+        }
+        bound
+    }
+
+    /// Look up, off the UI thread, the V5 conversations chat tab `tab_id`
+    /// could continue (`V5OfferLoaded` shows them). A tab that no longer
+    /// qualifies has its note cleared.
+    fn request_v5_offer(&mut self, tab_id: usize) -> Task<Event> {
+        let Some(query) = self.v5_offer_query(tab_id) else {
+            push_v5_offer(tab_id, None);
+            return Task::none();
+        };
+        let bound = self.v6_bound_conversations();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let dir = config_import::v5_config_dir()?;
+                    let v5 = v5_pickup::read_v5_workspaces(&dir)?;
+                    Ok(v5_pickup::candidates(&v5, &query, &bound)
+                        .into_iter()
+                        .cloned()
+                        .collect())
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("the V5 read failed: {error}")))
+            },
+            move |result| Event::V5OfferLoaded(tab_id, result),
+        )
+    }
+
+    /// Show tab `tab_id` the V5 conversations it could continue, titled
+    /// from the chats index, or clear its note when there are none.
+    fn v5_offer_loaded(
+        &mut self,
+        tab_id: usize,
+        result: Result<Vec<v5_pickup::V5Conversation>, String>,
+    ) -> Task<Event> {
+        let conversations = match result {
+            Ok(conversations) => {
+                self.v5_offer_unavailable = None;
+                conversations
+            }
+            Err(reason) => {
+                if self.v5_offer_unavailable.as_deref() != Some(reason.as_str()) {
+                    eprintln!("{}: no offer ({reason})", v5_pickup::LOG_PREFIX);
+                    self.v5_offer_unavailable = Some(reason);
+                }
+                push_v5_offer(tab_id, None);
+                return Task::none();
+            }
+        };
+        // The tab or the bindings may have changed while V5 was read.
+        let bound = self.v6_bound_conversations();
+        let conversations: Vec<_> = conversations
+            .into_iter()
+            .filter(|conversation| !bound.contains_key(&conversation.session_id))
+            .collect();
+        if self.v5_offer_query(tab_id).is_none() || conversations.is_empty() {
+            push_v5_offer(tab_id, None);
+            return Task::none();
+        }
+        let mut untitled = false;
+        let rows: Vec<serde_json::Value> = conversations
+            .iter()
+            .map(|conversation| {
+                let title = self
+                    .chat_index
+                    .iter()
+                    .find(|entry| entry.id == conversation.session_id)
+                    .map(|entry| entry.title.clone());
+                untitled |= title.is_none();
+                let title = title.unwrap_or_else(|| {
+                    let short: String = conversation.session_id.chars().take(8).collect();
+                    format!("Conversation {short}")
+                });
+                serde_json::json!({
+                    "id": conversation.session_id,
+                    "title": title,
+                    "origin": match conversation.origin {
+                        v5_pickup::V5Origin::Chat => "chat",
+                        v5_pickup::V5Origin::Terminal => "terminal",
+                    },
+                })
+            })
+            .collect();
+        push_v5_offer(tab_id, Some(&serde_json::json!({ "conversations": rows })));
+        if untitled {
+            self.v5_offer_awaiting_titles.insert(tab_id);
+            return self.refresh_local_chat_index_if_stale();
+        }
+        Task::none()
+    }
+
+    /// "Continue here": bind empty chat tab `tab_id` to V5 conversation
+    /// `session_id` the way a restored tab is bound, read its transcript
+    /// back and persist the binding. Refused, in the note, when the tab
+    /// already has a conversation, another V6 tab holds this one, or its
+    /// transcript is gone.
+    fn continue_v5_conversation(&mut self, tab_id: usize, session_id: String) -> Task<Event> {
+        let refusal = if self.v5_offer_query(tab_id).is_none() {
+            Some("This tab already has a conversation, so it cannot continue another.".to_string())
+        } else {
+            v5_pickup::bind_refusal(
+                &session_id,
+                &self.v6_bound_conversations(),
+                chats::claude_session_exists,
+            )
+        };
+        if let Some(refusal) = refusal {
+            eprintln!(
+                "{}: tab {tab_id}: not continuing {session_id}: {refusal}",
+                v5_pickup::LOG_PREFIX
+            );
+            push_v5_offer_error(tab_id, &refusal);
+            return Task::none();
+        }
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.tabs.iter_mut())
+            .find(|tab| tab.id == tab_id)
+        else {
+            return Task::none();
+        };
+        tab.chat_session_id = Some(session_id.clone());
+        if let Some(session) = tab.agent_session_mut() {
+            session.session_id = Some(session_id.clone());
+            session.history = tab::HistoryLoad::NotLoaded;
+        }
+        eprintln!(
+            "{}: tab {tab_id}: continuing V5 conversation {session_id}",
+            v5_pickup::LOG_PREFIX
+        );
+        push_v5_offer(tab_id, None);
+        self.v5_offer_awaiting_titles.remove(&tab_id);
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        let mut tasks = vec![self.start_agent_history_load(tab_id)];
+        // Other kept chat pages may list this conversation too.
+        let others: Vec<usize> = self
+            .agent_pages
+            .iter()
+            .copied()
+            .filter(|other| *other != tab_id)
+            .collect();
+        for other in others {
+            tasks.push(self.request_v5_offer(other));
+        }
+        // The strip shows the conversation's title from the index.
+        if self.local_chat_tab_untitled(Some(tab_id)) {
+            tasks.push(self.refresh_local_chat_index_if_stale());
+        }
+        Task::batch(tasks)
     }
 }
 
