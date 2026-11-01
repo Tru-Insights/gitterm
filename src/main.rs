@@ -7345,9 +7345,9 @@ fn bar_hint_target(visible: VisibleSurface, console_expanded: bool) -> BarHintTa
     }
 }
 
-/// A rough bubble width for 10.5px Menlo text, enough to keep it on screen.
+/// A rough bubble width for 12px Menlo text, enough to keep it on screen.
 fn bar_hint_width(text: &str) -> f32 {
-    text.chars().count() as f32 * 6.4 + 14.0
+    text.chars().count() as f32 * 7.3 + 16.0
 }
 
 /// Move a bubble's centre so a bubble `width` wide stays inside `0..bound`
@@ -31696,11 +31696,11 @@ fi
         let fg = self.theme.bg_base();
         let bubble = container(
             text(hint.text.clone())
-                .size(10.5)
+                .size(12)
                 .color(fg)
                 .font(iced::Font::with_name("Menlo")),
         )
-        .padding([3, 7])
+        .padding([4, 8])
         .style(move |_| container::Style {
             background: Some(bg.into()),
             border: iced::Border {
