@@ -14434,6 +14434,7 @@ impl App {
             docs_dir: ws.dir.join("docs"),
             written,
             repos,
+            task_worktrees: self.task_worktree_dirs(),
         })
     }
 
