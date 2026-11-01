@@ -2,8 +2,8 @@ use git2::{DiffOptions, Repository, Status, StatusOptions};
 use iced::advanced::graphics::core::Element;
 use iced::keyboard::{self, key, Key, Modifiers};
 use iced::widget::{
-    button, checkbox, column, container, image, pick_list, row, scrollable, text, text_editor,
-    text_input, Column, Row, Stack,
+    button, checkbox, column, container, image, pick_list, row, scrollable, text, text_input,
+    Column, Row, Stack,
 };
 use iced::{color, Length, Size, Subscription, Task, Theme};
 use iced_term::{SearchMatch, TerminalView};
@@ -2058,7 +2058,6 @@ struct SearchState {
 const CONSOLE_HEADER_HEIGHT: f32 = 32.0;
 const CONSOLE_DIVIDER_HEIGHT: f32 = 3.0;
 
-const MAX_CONSOLE_LINES: usize = 1000;
 const MAX_INLINE_WEBVIEW_BYTES: u64 = 1_500_000;
 const MAX_FULL_TEXT_LOAD_BYTES: u64 = 1_000_000;
 const LARGE_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
@@ -2752,127 +2751,12 @@ fn build_diff_syntax_highlight_lines(
     (Some(highlighted), truncation_notice)
 }
 
-// Console panel status
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ConsoleStatus {
-    Running,
-    Stopped,
-    Error,
-    NoneConfigured,
-}
+/// Reading a run tab's output (TRU-180): a run command opens as an
+/// ordinary bottom terminal; its dev-server URL is detected from what the
+/// terminal shows.
+struct RunOutput;
 
-#[derive(Debug, Clone)]
-struct ConsoleOutputLine {
-    timestamp: String,
-    content: String,
-}
-
-// Sent through mpsc channel from background task
-#[derive(Debug)]
-enum ConsoleOutputMessage {
-    Stdout(String),
-    Stderr(String),
-    Exited(Option<i32>),
-}
-
-struct ConsoleState {
-    run_command: Option<String>,
-    status: ConsoleStatus,
-    exit_code: Option<i32>,
-    started_at: Option<std::time::Instant>,
-    stopped_at: Option<std::time::Instant>,
-    output_lines: Vec<ConsoleOutputLine>,
-    output_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ConsoleOutputMessage>>,
-    child_killer: Option<tokio::sync::oneshot::Sender<()>>,
-    detected_url: Option<String>,
-    editor_content: text_editor::Content,
-    editor_dirty: bool,
-    search_query: String,
-    search_visible: bool,
-}
-
-impl ConsoleState {
-    fn new(run_command: Option<String>) -> Self {
-        let status = if run_command.is_some() {
-            ConsoleStatus::Stopped
-        } else {
-            ConsoleStatus::NoneConfigured
-        };
-        Self {
-            run_command,
-            status,
-            exit_code: None,
-            started_at: None,
-            stopped_at: None,
-            output_lines: Vec::new(),
-            output_rx: None,
-            child_killer: None,
-            detected_url: None,
-            editor_content: text_editor::Content::new(),
-            editor_dirty: false,
-            search_query: String::new(),
-            search_visible: false,
-        }
-    }
-
-    fn push_line(&mut self, content: String, _is_stderr: bool) {
-        // Detect URLs/ports in output (only if we haven't found one yet)
-        if self.detected_url.is_none() {
-            if let Some(url) = Self::detect_url(&content) {
-                self.detected_url = Some(url);
-            }
-        }
-        let now = chrono::Local::now();
-        let timestamp = now.format("%H:%M:%S").to_string();
-        self.output_lines.push(ConsoleOutputLine {
-            timestamp: timestamp.clone(),
-            content,
-        });
-        // Cap output buffer
-        if self.output_lines.len() > MAX_CONSOLE_LINES {
-            let drain_count = self.output_lines.len() - MAX_CONSOLE_LINES;
-            self.output_lines.drain(..drain_count);
-        }
-        self.editor_dirty = true;
-    }
-
-    /// Rebuild editor content from output_lines if dirty. Called once per drain batch.
-    fn rebuild_if_dirty(&mut self) {
-        if !self.editor_dirty {
-            return;
-        }
-        self.editor_dirty = false;
-        self.rebuild_editor_content();
-    }
-
-    fn rebuild_editor_content(&mut self) {
-        let query = self.search_query.to_lowercase();
-        let filtering = self.search_visible && !query.is_empty();
-        let full_text: String = self
-            .output_lines
-            .iter()
-            .filter(|l| {
-                !filtering
-                    || l.content.to_lowercase().contains(&query)
-                    || l.timestamp.contains(&query)
-            })
-            .map(|l| format!("{} {}", l.timestamp, l.content))
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.editor_content = text_editor::Content::with_text(&full_text);
-    }
-
-    fn matching_line_count(&self) -> usize {
-        let query = self.search_query.to_lowercase();
-        if query.is_empty() {
-            return 0;
-        }
-        self.output_lines
-            .iter()
-            .filter(|l| l.content.to_lowercase().contains(&query) || l.timestamp.contains(&query))
-            .count()
-    }
-
+impl RunOutput {
     /// Strip ANSI escape sequences from a string.
     fn strip_ansi(s: &str) -> String {
         let mut result = String::with_capacity(s.len());
@@ -2930,161 +2814,6 @@ impl ConsoleState {
             }
         }
         None
-    }
-
-    fn clear_output(&mut self) {
-        self.output_lines.clear();
-        self.editor_content = text_editor::Content::new();
-        self.editor_dirty = false;
-        self.search_query.clear();
-        self.search_visible = false;
-    }
-
-    fn uptime_string(&self) -> String {
-        if let Some(started) = self.started_at {
-            let elapsed = if self.status == ConsoleStatus::Running {
-                started.elapsed()
-            } else if let Some(stopped) = self.stopped_at {
-                stopped.duration_since(started)
-            } else {
-                started.elapsed()
-            };
-            let secs = elapsed.as_secs();
-            if secs < 60 {
-                format!("\u{2191} {}s", secs)
-            } else if secs < 3600 {
-                format!("\u{2191} {}m", secs / 60)
-            } else {
-                format!("\u{2191} {}h{}m", secs / 3600, (secs % 3600) / 60)
-            }
-        } else {
-            String::new()
-        }
-    }
-
-    fn is_running(&self) -> bool {
-        self.status == ConsoleStatus::Running
-    }
-
-    fn spawn_process_with_env(&mut self, dir: &Path, extra_env: &[(String, String)]) {
-        let cmd_str = match &self.run_command {
-            Some(cmd) => cmd.clone(),
-            None => return,
-        };
-
-        // Set up channels
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-
-        self.output_rx = Some(rx);
-        self.child_killer = Some(kill_tx);
-        self.status = ConsoleStatus::Running;
-        self.exit_code = None;
-        self.started_at = Some(std::time::Instant::now());
-        self.stopped_at = None;
-
-        let dir = dir.to_path_buf();
-        let extra_env = extra_env.to_vec();
-
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            use tokio::process::Command;
-
-            // Use a login shell so the user's full environment is available
-            // (bun, nvm, cargo, etc. all add to PATH via shell profiles)
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-
-            let mut cmd = Command::new(&shell);
-            cmd.arg("-l")
-                .arg("-c")
-                .arg(&cmd_str)
-                .current_dir(&dir)
-                .env("TERM", "dumb")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-
-            for (key, value) in &extra_env {
-                cmd.env(key, value);
-            }
-
-            // Spawn in its own process group so we can kill the entire tree
-            #[cfg(unix)]
-            cmd.process_group(0);
-
-            let mut child = match cmd.spawn() {
-                Ok(child) => child,
-                Err(e) => {
-                    let _ = tx.send(ConsoleOutputMessage::Stderr(format!(
-                        "Failed to start: {}",
-                        e
-                    )));
-                    let _ = tx.send(ConsoleOutputMessage::Exited(Some(1)));
-                    return;
-                }
-            };
-
-            #[cfg(unix)]
-            let child_pid = child.id();
-
-            let stdout = child.stdout.take().unwrap();
-            let stderr = child.stderr.take().unwrap();
-
-            let tx_out = tx.clone();
-            let stdout_task = tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx_out.send(ConsoleOutputMessage::Stdout(line)).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let tx_err = tx.clone();
-            let stderr_task = tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx_err.send(ConsoleOutputMessage::Stderr(line)).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            // Wait for either kill signal or natural exit
-            tokio::select! {
-                _ = kill_rx => {
-                    // Kill the entire process group (shell + all children)
-                    #[cfg(unix)]
-                    if let Some(pid) = child_pid {
-                        unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
-                        // Give processes a moment to clean up, then force kill
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
-                    }
-                    #[cfg(not(unix))]
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    let _ = tx.send(ConsoleOutputMessage::Exited(None));
-                }
-                status = child.wait() => {
-                    let code = status.ok().and_then(|s| s.code());
-                    let _ = tx.send(ConsoleOutputMessage::Exited(code));
-                }
-            }
-
-            stdout_task.abort();
-            stderr_task.abort();
-        });
-    }
-
-    fn kill_process(&mut self) {
-        if let Some(killer) = self.child_killer.take() {
-            let _ = killer.send(());
-        }
-        self.stopped_at = Some(std::time::Instant::now());
-        // output_rx will drain remaining messages including Exited
     }
 }
 
@@ -5315,13 +5044,6 @@ impl TabState {
     }
 }
 
-// Bottom panel tab types
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BottomPanelTab {
-    Console,
-    Terminal(usize), // index into bottom_terminals vec
-}
-
 /// The browser caller identity of a bottom-panel terminal (TRU-176). Its
 /// `id` is unique for the run; browser ownership never outlives the run, so
 /// no persisted identity is needed. Cannot collide with a tab's uuid.
@@ -5344,6 +5066,8 @@ fn bottom_terminal_browser_label(cwd: &Path) -> String {
     format!("{repo} terminal")
 }
 
+/// A bottom terminal of a workspace (TRU-180). Terminals belong to the
+/// workspace that opened them and are never shared with another.
 struct BottomTerminal {
     id: usize,
     /// Owner label of this terminal's browser targets (TRU-176).
@@ -5351,6 +5075,89 @@ struct BottomTerminal {
     terminal: Option<iced_term::Terminal>,
     title: Option<String>,
     cwd: PathBuf,
+    /// Its shell is running: false when it failed to start or exited.
+    alive: bool,
+    /// Set when a repo's run command opened this tab (`▶`).
+    run: Option<RunTab>,
+}
+
+/// What a run tab runs (TRU-180): a repo's run command, in the repo's
+/// folder, in an ordinary terminal.
+struct RunTab {
+    repo: RepoId,
+    command: String,
+    /// The dev-server URL its output shows, once seen.
+    detected_url: Option<String>,
+    /// When to look at its output for a URL next (while none is seen).
+    next_url_scan: Instant,
+}
+
+/// What `▶ <command>` does for repo `repo` in a workspace's terminals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunTabAction {
+    /// Its run tab is alive: show it.
+    Focus(usize),
+    /// Its run tab exited, failed, or runs an older command: run the
+    /// command again in that tab.
+    Restart(usize),
+    /// No run tab yet: open one.
+    Open,
+}
+
+/// One run tab per repo per workspace: the action never opens a second.
+fn run_tab_action(terminals: &[BottomTerminal], repo: RepoId, command: &str) -> RunTabAction {
+    let Some(idx) = terminals
+        .iter()
+        .position(|bt| bt.run.as_ref().is_some_and(|run| run.repo == repo))
+    else {
+        return RunTabAction::Open;
+    };
+    let bt = &terminals[idx];
+    let same_command = bt.run.as_ref().is_some_and(|run| run.command == command);
+    if bt.alive && same_command {
+        RunTabAction::Focus(idx)
+    } else {
+        RunTabAction::Restart(idx)
+    }
+}
+
+/// Where a new bottom terminal opens: the folder picked in `+ ▾` (a
+/// listed repo), else the workspace's home dir, never a repo's.
+fn new_bottom_terminal_dir(home: &Path, picked: Option<PathBuf>) -> PathBuf {
+    picked.unwrap_or_else(|| home.to_path_buf())
+}
+
+/// The selected bottom terminal after terminal `closed` is removed,
+/// leaving `remaining`: a later selection shifts down; closing the
+/// selected one selects its neighbour (the one before it at the end).
+fn bottom_selection_after_close(
+    selected: Option<usize>,
+    closed: usize,
+    remaining: usize,
+) -> Option<usize> {
+    if remaining == 0 {
+        return None;
+    }
+    match selected? {
+        idx if idx > closed => Some(idx - 1),
+        idx if idx == closed => Some(closed.min(remaining - 1)),
+        idx => Some(idx),
+    }
+}
+
+/// How often a run tab's output is read for its URL until one is seen.
+const RUN_URL_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+/// How many of the last output lines that read looks at.
+const RUN_URL_SCAN_LINES: usize = 200;
+
+/// The dev-server URL in a run tab's `output`: the first one in its last
+/// `RUN_URL_SCAN_LINES` lines.
+fn run_output_url(output: &str) -> Option<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let start = lines.len().saturating_sub(RUN_URL_SCAN_LINES);
+    lines[start..]
+        .iter()
+        .find_map(|line| RunOutput::detect_url(line))
 }
 
 #[derive(Debug, Clone)]
@@ -5477,9 +5284,10 @@ impl RepoId {
     const UNREGISTERED: RepoId = RepoId(0);
 }
 
-/// A checkout folder's runtime (TRU-180): its console (run command, dev
-/// server), bottom terminals and env. One per checkout: every open
-/// workspace listing the same dir on the same machine shares it. It
+/// A checkout folder a workspace lists (TRU-180): its run command and
+/// env. One per checkout: every open workspace listing the same dir on
+/// the same machine shares it, so its env is edited once. Terminals are
+/// not the repo's: they belong to the workspace that opened them. It
 /// lives while an open workspace lists it; settings persist in the
 /// `repos` section of `workspaces.json`.
 struct RepoState {
@@ -5487,27 +5295,24 @@ struct RepoState {
     key: RepoKey,
     dir: PathBuf,
     location: WorkspaceLocation,
-    console: ConsoleState,
-    bottom_terminals: Vec<BottomTerminal>,
-    active_bottom_tab: BottomPanelTab,
+    /// What `▶` runs in a terminal tab in this folder.
+    run_command: Option<String>,
     env: HashMap<String, String>,
 }
 
 /// What a workspace's home repo starts with until the workspace opens
 /// (`App::open_workspace`): the constructors and restore paths fill it in
 /// before the workspace is registered, and registering moves it into a
-/// new `RepoState` or merges it into the open one it shares.
+/// new `RepoState` or joins the open one with the same checkout.
 struct RepoSeed {
-    console: ConsoleState,
-    bottom_terminals: Vec<BottomTerminal>,
+    run_command: Option<String>,
     env: HashMap<String, String>,
 }
 
 impl RepoSeed {
     fn new(run_command: Option<String>) -> Self {
         Self {
-            console: ConsoleState::new(run_command),
-            bottom_terminals: Vec::new(),
+            run_command,
             env: HashMap::new(),
         }
     }
@@ -5515,8 +5320,7 @@ impl RepoSeed {
     /// Takes a stored run command (one restored from `workspaces.json`).
     fn set_run_command(&mut self, command: Option<&String>) {
         if let Some(cmd) = command {
-            self.console.run_command = Some(cmd.clone());
-            self.console.status = ConsoleStatus::Stopped;
+            self.run_command = Some(cmd.clone());
         }
     }
 }
@@ -5565,15 +5369,10 @@ impl RepoRegistry {
         self.repos.iter()
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut RepoState> {
-        self.repos.iter_mut()
-    }
-
     /// Registers the checkout `dir` at `location` seeded with `seed`, or
     /// joins the open repo with its key. Joining keeps the open repo's
-    /// console, run command and env; the seed's bottom terminals are added
-    /// to the repo's, and the seed's env entries the repo lacks or holds
-    /// differently come back as overrides for the joining workspace.
+    /// run command and env; the seed's env entries the repo lacks or
+    /// holds differently come back as the joining workspace's overrides.
     fn attach(
         &mut self,
         dir: PathBuf,
@@ -5581,16 +5380,8 @@ impl RepoRegistry {
         seed: RepoSeed,
     ) -> (RepoId, HashMap<String, String>) {
         let key = repo_key(&dir, &location);
-        if let Some(repo) = self.repos.iter_mut().find(|repo| repo.key == key) {
-            let RepoSeed {
-                mut console,
-                mut bottom_terminals,
-                env,
-            } = seed;
-            // A seed's console never ran; stop it anyway so nothing leaks.
-            console.kill_process();
-            repo.bottom_terminals.append(&mut bottom_terminals);
-            return (repo.id, config::env_difference(&env, &repo.env));
+        if let Some(repo) = self.repos.iter().find(|repo| repo.key == key) {
+            return (repo.id, config::env_difference(&seed.env, &repo.env));
         }
         self.next_id += 1;
         let id = RepoId(self.next_id);
@@ -5599,17 +5390,14 @@ impl RepoRegistry {
             key,
             dir,
             location,
-            console: seed.console,
-            bottom_terminals: seed.bottom_terminals,
-            active_bottom_tab: BottomPanelTab::Console,
+            run_command: seed.run_command,
             env: seed.env,
         });
         (id, HashMap::new())
     }
 
-    /// Removes every repo no id in `listed` names and returns them: the
-    /// caller stores their settings and stops their console. Dropping a
-    /// repo drops its bottom terminals, closing their PTYs.
+    /// Removes every repo no id in `listed` names and returns them, for
+    /// the caller to store their settings.
     fn release_unlisted(&mut self, listed: &HashSet<RepoId>) -> Vec<RepoState> {
         let (kept, released): (Vec<RepoState>, Vec<RepoState>) = std::mem::take(&mut self.repos)
             .into_iter()
@@ -5636,12 +5424,11 @@ struct Workspace {
     home: RepoId,
     /// The repos this workspace lists, home first, in join order.
     repos: Vec<RepoId>,
-    /// The selected repo (the overview's Repos rows): where new bottom
-    /// terminals open.
-    current: RepoId,
-    /// The repo whose console or terminal the bottom panel has selected;
-    /// that repo's `active_bottom_tab` says which.
-    bottom_repo: RepoId,
+    /// This workspace's bottom terminals (TRU-180): its own, never
+    /// another workspace's. New ones open in the home dir.
+    bottom_terminals: Vec<BottomTerminal>,
+    /// The selected bottom terminal; `None` with no terminals.
+    active_bottom: Option<usize>,
     /// Repos added and removed by hand (TRU-180), persisted; the chats'
     /// touches never re-add a removed one.
     repos_added: Vec<PathBuf>,
@@ -5652,8 +5439,8 @@ struct Workspace {
     /// Repos that joined automatically and have not been acknowledged:
     /// the overview's undo note. Runtime only.
     joined_note: Vec<RepoId>,
-    /// Env on top of each repo's env for this workspace's tabs, terminals
-    /// and console (TRU-180).
+    /// Env on top of each repo's env for this workspace's tabs and
+    /// terminals (TRU-180).
     env_overrides: HashMap<String, String>,
     /// The home repo's state until the workspace opens; `None` after.
     seed: Option<RepoSeed>,
@@ -5684,8 +5471,8 @@ impl Workspace {
             active_tab: 0,
             home: RepoId::UNREGISTERED,
             repos: Vec::new(),
-            current: RepoId::UNREGISTERED,
-            bottom_repo: RepoId::UNREGISTERED,
+            bottom_terminals: Vec::new(),
+            active_bottom: None,
             repos_added: Vec::new(),
             repos_removed: Vec::new(),
             pending_repos: Vec::new(),
@@ -5717,8 +5504,8 @@ impl Workspace {
             active_tab: 0,
             home: RepoId::UNREGISTERED,
             repos: Vec::new(),
-            current: RepoId::UNREGISTERED,
-            bottom_repo: RepoId::UNREGISTERED,
+            bottom_terminals: Vec::new(),
+            active_bottom: None,
             repos_added: Vec::new(),
             repos_removed: Vec::new(),
             pending_repos: Vec::new(),
@@ -6267,18 +6054,9 @@ pub enum Event {
     EdgePeekEnter(bool), // true=right, false=left
     EdgePeekExit,
     SlideScrolled(scrollable::Viewport),
-    // Console panel events
+    // Bottom panel events (expand/collapse, height)
     ConsoleToggle,
-    ConsoleStart,
-    ConsoleStop,
-    ConsoleRestart,
-    ConsoleClearOutput,
-    ConsoleOpenBrowser,
     ConsoleDividerDragStart,
-    ConsoleCommandEditStart,
-    ConsoleCommandChanged(String),
-    ConsoleCommandSubmit,
-    ConsoleCommandCancel,
     // Attention system events
     AttentionPulseTick,
     AttentionJumpNext,
@@ -6395,16 +6173,24 @@ pub enum Event {
     ToggleClaudeSection(String),
     ClaudeItemSelect(String, usize),
     // Bottom panel tabs
-    /// A bottom panel tab of one of the workspace's repos (TRU-180).
-    BottomTabSelect(RepoId, BottomPanelTab),
-    /// A bottom terminal in the current repo (`+`).
+    /// The workspace's bottom terminal at this index (TRU-180).
+    BottomTabSelect(usize),
+    /// A bottom terminal in the workspace's home dir (`+`).
     BottomTerminalAdd,
-    /// A bottom terminal in another of the workspace's repos (`+ ▾`).
+    /// A bottom terminal in one of the workspace's repos (`+ ▾`).
     BottomTerminalAddIn(RepoId),
     BottomRepoPickerToggle,
-    BottomTerminalClose(RepoId, usize),
+    BottomTerminalClose(usize),
+    /// `▶ <command>`: a repo's run command in its run tab (TRU-180).
+    RunRepoCommand(RepoId),
+    /// The selected run tab's dev-server URL, in the browser.
+    RunOpenUrl,
+    /// Editing a repo's run command on its Repos row.
+    RunCommandEditStart(RepoId),
+    RunCommandChanged(String),
+    RunCommandSubmit,
+    RunCommandCancel,
     /// Overview Repos rows (TRU-180), by workspace uid.
-    WorkspaceRepoSelect(u64, RepoId),
     WorkspaceRepoRemove(u64, RepoId),
     WorkspaceRepoAdd(u64),
     /// The auto-add note: undo removes the repos that just joined.
@@ -6412,19 +6198,13 @@ pub enum Event {
     WorkspaceRepoJoinedDismiss(u64),
     BottomTerminalEvent(usize, iced_term::Event),
     TerminalRedrawTick,
-    // Console editor (selectable output)
-    ConsoleEditorAction(text_editor::Action),
-    // Console search
-    ConsoleSearchToggle,
-    ConsoleSearchChanged(String),
-    ConsoleSearchClose,
     // Modifier tracking
     ModifiersChanged(Modifiers),
     // Help modal
     ToggleHelp,
     // Terminal focus click events
     MainTerminalClicked,
-    BottomTerminalClicked(RepoId, usize),
+    BottomTerminalClicked(usize),
     GitStatusLoaded(GitStatusSnapshot),
     GitWorktreesLoaded(GitWorktreesSnapshot),
     /// A repository's worktree list for chat-tab worktree following
@@ -6791,7 +6571,7 @@ struct App {
     console_expanded: bool,
     console_height: f32,
     dragging_console_divider: bool,
-    editing_console_command: Option<String>,
+    editing_run_command: Option<(RepoId, String)>,
     // Slide animation state
     slide_offset: f32,
     slide_target: f32,
@@ -7553,12 +7333,6 @@ fn workspace_config_dir(workspace: &Workspace) -> String {
     }
 }
 
-/// A repo's colour on bottom panel tabs and overview rows (TRU-180):
-/// a workspace colour picked by its dir, the same everywhere.
-fn repo_tab_color(dir: &Path, theme: &AppTheme) -> iced::Color {
-    WorkspaceColor::from_index(gitterm::workspace_repos::palette_index(dir, 8)).color(theme)
-}
-
 fn path_strings(paths: &[PathBuf]) -> Vec<String> {
     paths
         .iter()
@@ -7592,15 +7366,11 @@ fn repo_config_of(repo: &RepoState) -> Option<RepoConfig> {
     Some(RepoConfig {
         dir: repo_config_dir(repo),
         location: workspace_location_config_from_location(&repo.location),
-        run_command: repo.console.run_command.clone(),
+        run_command: repo.run_command.clone(),
         env: repo.env.clone(),
-        bottom_terminals: repo
-            .bottom_terminals
-            .iter()
-            .map(|bt| BottomTerminalConfig {
-                dir: bt.cwd.to_string_lossy().to_string(),
-            })
-            .collect(),
+        // Terminals are the workspace's (stored on its entry); this field
+        // is only read, from files written before they were.
+        bottom_terminals: Vec::new(),
     })
 }
 
@@ -8056,18 +7826,7 @@ impl App {
         let mut preview_notice_count = 0usize;
         let mut file_content_bytes = 0usize;
         let mut webview_html_bytes = 0usize;
-        let mut console_line_count = 0usize;
-        let mut console_bytes = 0usize;
 
-        for repo in self.repos.iter() {
-            console_line_count += repo.console.output_lines.len();
-            console_bytes += repo
-                .console
-                .output_lines
-                .iter()
-                .map(|l| l.timestamp.len() + 1 + l.content.len())
-                .sum::<usize>();
-        }
         for ws in &self.workspaces {
             for tab in &ws.tabs {
                 tab_count += 1;
@@ -8083,13 +7842,11 @@ impl App {
         }
 
         perf_log!(
-            "mem tabs={} viewing_files={} file_bytes={}KB webview_bytes={}KB console_bytes={}KB console_lines={} notices={}",
+            "mem tabs={} viewing_files={} file_bytes={}KB webview_bytes={}KB notices={}",
             tab_count,
             viewing_files,
             file_content_bytes / 1024,
             webview_html_bytes / 1024,
-            console_bytes / 1024,
-            console_line_count,
             preview_notice_count
         );
 
@@ -8111,14 +7868,13 @@ impl App {
         Task::none()
     }
 
-    /// Focus bottom terminal `idx` of repo `repo` (unfocusing the main tab
-    /// terminal); the panel selects that repo.
-    fn focus_bottom_terminal(&mut self, repo: RepoId, idx: usize) -> Task<Event> {
+    /// Focus the active workspace's bottom terminal `idx` (unfocusing the
+    /// main tab terminal).
+    fn focus_bottom_terminal(&mut self, idx: usize) -> Task<Event> {
         self.bottom_panel_focused = true;
-        self.select_bottom_repo(repo);
         if let Some(bt) = self
-            .active_bottom_repo_mut()
-            .and_then(|repo| repo.bottom_terminals.get_mut(idx))
+            .active_workspace_mut()
+            .and_then(|ws| ws.bottom_terminals.get_mut(idx))
         {
             if let Some(term) = &mut bt.terminal {
                 term.sync_and_redraw();
@@ -8138,20 +7894,14 @@ impl App {
         if !self.console_expanded {
             return None;
         }
-        let repo = self.active_bottom_repo()?;
-        let BottomPanelTab::Terminal(idx) = repo.active_bottom_tab else {
-            return None;
-        };
-        repo.bottom_terminals.get(idx).map(|terminal| terminal.id)
+        self.active_bottom_terminal().map(|terminal| terminal.id)
     }
 
-    /// The bottom panel's selected terminal, when a terminal is selected.
+    /// The bottom panel's selected terminal.
     fn active_bottom_terminal_mut(&mut self) -> Option<&mut iced_term::Terminal> {
-        let repo = self.active_bottom_repo_mut()?;
-        let BottomPanelTab::Terminal(idx) = repo.active_bottom_tab else {
-            return None;
-        };
-        repo.bottom_terminals
+        let ws = self.active_workspace_mut()?;
+        let idx = ws.active_bottom?;
+        ws.bottom_terminals
             .get_mut(idx)
             .and_then(|bottom| bottom.terminal.as_mut())
     }
@@ -8341,19 +8091,18 @@ impl App {
                     session_uid: Some(tab.session_uid.clone()),
                 })
                 .collect(),
-            // Pre-TRU-180 fields, from the home repo, so an older build
-            // still reads the entry.
-            run_command: home.and_then(|repo| repo.console.run_command.clone()),
-            bottom_terminals: home
-                .map(|repo| {
-                    repo.bottom_terminals
-                        .iter()
-                        .map(|bt| BottomTerminalConfig {
-                            dir: bt.cwd.to_string_lossy().to_string(),
-                        })
-                        .collect()
+            // The run command is a pre-TRU-180 field, from the home repo,
+            // so an older build still reads the entry. Run tabs are not
+            // kept: `▶` opens them again.
+            run_command: home.and_then(|repo| repo.run_command.clone()),
+            bottom_terminals: ws
+                .bottom_terminals
+                .iter()
+                .filter(|bt| bt.run.is_none())
+                .map(|bt| BottomTerminalConfig {
+                    dir: bt.cwd.to_string_lossy().to_string(),
                 })
-                .unwrap_or_default(),
+                .collect(),
             env: self.workspace_repo_env(ws, ws.home),
             active: true,
             chats: ws.chats.clone(),
@@ -11805,14 +11554,11 @@ impl App {
             repository_workspaces[owner_idx]
                 .tabs
                 .append(&mut managed.tabs);
-            let mut moved = self
-                .repo_mut(managed.home)
-                .map(|repo| std::mem::take(&mut repo.bottom_terminals))
-                .unwrap_or_default();
-            let owner_home = repository_workspaces[owner_idx].home;
-            if let Some(owner_repo) = self.repo_mut(owner_home) {
-                owner_repo.bottom_terminals.append(&mut moved);
+            let owner = &mut repository_workspaces[owner_idx];
+            if owner.active_bottom.is_none() && !managed.bottom_terminals.is_empty() {
+                owner.active_bottom = Some(owner.bottom_terminals.len());
             }
+            owner.bottom_terminals.append(&mut managed.bottom_terminals);
             if managed_was_active {
                 repository_workspaces[owner_idx].active_tab = tab_offset
                     + managed_active_tab.min(
@@ -11827,7 +11573,7 @@ impl App {
 
         self.workspaces = repository_workspaces;
         // The folded workspaces' repos (task worktrees) are listed by no
-        // one now; their terminals moved to the owner's repo above.
+        // one now; their terminals moved to the owner above.
         self.release_unlisted_repos();
         self.active_workspace_idx = active_repository_dir
             .as_ref()
@@ -12172,8 +11918,9 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Repos (TRU-180): a workspace lists repos; the registry owns each
-    // repo's console, bottom terminals and env, one per checkout.
+    // Repos (TRU-180): a workspace lists repos; the registry holds each
+    // repo's run command and env, one per checkout. Bottom terminals are
+    // the workspace's own.
 
     fn repo(&self, id: RepoId) -> Option<&RepoState> {
         self.repos.get(id)
@@ -12183,45 +11930,19 @@ impl App {
         self.repos.get_mut(id)
     }
 
-    /// The repo of `ws` whose console or terminal the bottom panel has
-    /// selected: `bottom_repo` while `ws` lists it, else its home.
-    fn bottom_repo_id(ws: &Workspace) -> RepoId {
-        if ws.repos.contains(&ws.bottom_repo) {
-            ws.bottom_repo
-        } else {
-            ws.home
-        }
+    /// The active workspace's selected bottom terminal.
+    fn active_bottom_terminal(&self) -> Option<&BottomTerminal> {
+        let ws = self.active_workspace()?;
+        ws.bottom_terminals.get(ws.active_bottom?)
     }
 
-    /// The repo whose console and terminals the bottom panel shows.
-    fn active_bottom_repo(&self) -> Option<&RepoState> {
-        self.active_workspace()
-            .and_then(|ws| self.repo(Self::bottom_repo_id(ws)))
-    }
-
-    fn active_bottom_repo_mut(&mut self) -> Option<&mut RepoState> {
-        let id = Self::bottom_repo_id(self.active_workspace()?);
-        self.repo_mut(id)
-    }
-
-    /// Makes `repo` the bottom panel's selected repo in the active
-    /// workspace, when it lists it.
-    fn select_bottom_repo(&mut self, repo: RepoId) {
-        if let Some(ws) = self.active_workspace_mut() {
-            if ws.repos.contains(&repo) {
-                ws.bottom_repo = repo;
-            }
-        }
-    }
-
-    /// The repos of `ws` the bottom panel shows, in its order (TRU-180):
-    /// the local ones. A remote workspace's panel stays its home's, as
-    /// before repos (it lists no other).
-    fn panel_repos<'a>(&'a self, ws: &'a Workspace) -> Vec<&'a RepoState> {
+    /// The local repos `ws` lists, in its order: what the `+ ▾` picker
+    /// and the `▶` actions offer.
+    fn local_repos<'a>(&'a self, ws: &'a Workspace) -> Vec<&'a RepoState> {
         ws.repos
             .iter()
             .filter_map(|id| self.repo(*id))
-            .filter(|repo| repo.id == ws.home || repo.key.is_local())
+            .filter(|repo| repo.key.is_local())
             .collect()
     }
 
@@ -12241,20 +11962,12 @@ impl App {
             .map_or(ws.home, |repo| repo.id)
     }
 
-    /// What `ws` runs a tab, terminal or console in repo `id` with: the
-    /// repo's env, then the workspace's overrides.
+    /// What `ws` runs a tab or terminal in repo `id` with: the repo's
+    /// env, then the workspace's overrides.
     fn workspace_repo_env(&self, ws: &Workspace, id: RepoId) -> HashMap<String, String> {
         let empty = HashMap::new();
         let env = self.repo(id).map_or(&empty, |repo| &repo.env);
         config::layered_env(env, &ws.env_overrides)
-    }
-
-    /// Whether a console of a repo `ws` lists exited with an error.
-    fn workspace_console_error(&self, ws: &Workspace) -> bool {
-        ws.repos.iter().any(|id| {
-            self.repo(*id)
-                .is_some_and(|repo| repo.console.status == ConsoleStatus::Error)
-        })
     }
 
     /// Adds `ws` at the end of `workspaces`, registering its home repo:
@@ -12276,9 +11989,9 @@ impl App {
 
     /// The repo `dir` for workspace `name` at `ws_location` to list
     /// (TRU-180): the open one with its checkout, else a new one from its
-    /// stored settings (run command, env, bottom terminals) or, never
-    /// stored, a fresh one with the detected run command. Only this Mac's
-    /// folders join a workspace beside its home; `None` for a remote one.
+    /// stored settings (run command, env) or, never stored, a fresh one
+    /// with the detected run command. Only this Mac's folders join a
+    /// workspace beside its home; `None` for a remote one.
     fn list_repo(
         &mut self,
         name: &str,
@@ -12297,12 +12010,7 @@ impl App {
         if let Some(id) = self.repos.by_key(&key) {
             return Some(id);
         }
-        let stored = self
-            .stored_repos
-            .iter()
-            .find(|repo| repo.key() == key)
-            .cloned();
-        let mut seed = match &stored {
+        let seed = match self.stored_repos.iter().find(|repo| repo.key() == key) {
             Some(stored) => {
                 let mut seed = RepoSeed::new(None);
                 seed.set_run_command(stored.run_command.as_ref());
@@ -12311,13 +12019,6 @@ impl App {
             }
             None => RepoSeed::new(detect_run_command(&dir)),
         };
-        for bt in stored
-            .iter()
-            .flat_map(|stored| stored.bottom_terminals.iter())
-        {
-            let terminal = self.create_bottom_terminal_for(name, PathBuf::from(&bt.dir));
-            seed.bottom_terminals.push(terminal);
-        }
         let (id, _) = self.repos.attach(dir, location, seed);
         Some(id)
     }
@@ -12349,15 +12050,12 @@ impl App {
             ws.env_overrides.entry(key).or_insert(value);
         }
         ws.home = id;
-        ws.current = id;
-        ws.bottom_repo = id;
         ws.repos = vec![id];
     }
 
     /// Removes repo `id` from the open workspace `uid` by hand (× on its
     /// row, or undoing an auto-add): it stays out when the chats touch it
-    /// again, and stops unless another open workspace lists it. The home
-    /// cannot be removed.
+    /// again. The home cannot be removed. The workspace's terminals stay.
     fn remove_repo_from_workspace(&mut self, uid: u64, id: RepoId) {
         let Some(idx) = self.workspace_index_by_uid(uid) else {
             eprintln!("[workspace] cannot remove a repo: workspace uid={uid} is not open");
@@ -12373,12 +12071,8 @@ impl App {
         }
         ws.repos.retain(|listed| *listed != id);
         ws.joined_note.retain(|joined| *joined != id);
-        if ws.current == id {
-            ws.current = ws.home;
-        }
         gitterm::workspace_repos::remove_manually(&dir, &mut ws.repos_added, &mut ws.repos_removed);
         self.release_unlisted_repos();
-        self.sync_visible_terminals();
         self.mark_workspaces_dirty();
     }
 
@@ -12457,9 +12151,7 @@ impl App {
         }
     }
 
-    /// Stops every repo no open workspace lists any more, exactly as
-    /// closing its workspace did before repos were shared: the console
-    /// process is killed and the bottom terminals close. Its settings are
+    /// Drops every repo no open workspace lists any more. Its settings are
     /// kept in `stored_repos` for a closed workspace that lists it.
     fn release_unlisted_repos(&mut self) {
         let listed: HashSet<RepoId> = self
@@ -12467,8 +12159,7 @@ impl App {
             .iter()
             .flat_map(|ws| ws.repos.iter().copied())
             .collect();
-        for mut repo in self.repos.release_unlisted(&listed) {
-            repo.console.kill_process();
+        for repo in self.repos.release_unlisted(&listed) {
             if let Some(stored) = repo_config_of(&repo) {
                 upsert_repo_config(&mut self.stored_repos, stored);
             }
@@ -12510,76 +12201,94 @@ impl App {
         ws.repos_removed = cfg.repos_removed.iter().map(PathBuf::from).collect();
     }
 
-    /// Starts (or with `restart`, restarts) the bottom panel's console
-    /// with the repo's env and the workspace's overrides. The home repo's
-    /// console runs in the active tab's directory, else the workspace
-    /// root, as before repos; another repo's runs in the active tab's
-    /// directory when that is inside the repo, else the repo's own.
-    fn start_active_console(&mut self, restart: bool) {
-        let Some(ws) = self.active_workspace() else {
-            return;
-        };
-        let Some(repo_id) = self.active_bottom_repo().map(|repo| repo.id) else {
-            return;
-        };
-        let Some(dir) = self.repo_run_dir(ws, repo_id) else {
-            return;
-        };
-        let env: Vec<(String, String)> = self.workspace_repo_env(ws, repo_id).into_iter().collect();
-        if let Some(repo) = self.repo_mut(repo_id) {
-            if restart {
-                repo.console.kill_process();
-            }
-            repo.console.detected_url = None;
-            repo.console.spawn_process_with_env(&dir, &env);
-        }
-    }
-
-    /// Where a console or new bottom terminal of repo `repo_id` in `ws`
-    /// runs. The home repo's: the active tab's directory, else the
-    /// workspace root, as before repos. Another repo's: the active tab's
-    /// directory when that is inside the repo, else the repo's own.
-    fn repo_run_dir(&self, ws: &Workspace, repo_id: RepoId) -> Option<PathBuf> {
-        let repo = self.repo(repo_id)?;
-        let tab_dir = ws.active_tab().map(|t| t.current_dir.clone());
-        Some(if repo_id == ws.home {
-            tab_dir.unwrap_or_else(|| ws.dir.clone())
-        } else {
-            tab_dir
-                .filter(|dir| self.workspace_repo_for_path(ws, dir) == repo_id)
-                .unwrap_or_else(|| repo.dir.clone())
-        })
-    }
-
-    /// A new bottom terminal in repo `repo_id` of the active workspace,
-    /// selected and focused (`+`, `+ ▾`).
-    fn add_bottom_terminal_in(&mut self, repo_id: RepoId) -> Task<Event> {
+    /// `▶ <command>` for repo `repo_id` in the active workspace (TRU-180):
+    /// opens a terminal tab in the repo's folder running its run command,
+    /// named after the command. Its tab, while alive, is shown instead; a
+    /// run tab that exited (or runs an older command) runs it again. A
+    /// workspace never holds two run tabs for one repo.
+    fn run_repo_command(&mut self, repo_id: RepoId) -> Task<Event> {
         self.bottom_repo_picker_open = false;
         let Some(ws) = self.active_workspace() else {
             return Task::none();
         };
         if !ws.repos.contains(&repo_id) {
-            eprintln!(
-                "[workspace] {:?}: no such repo for a bottom terminal",
-                ws.name
-            );
+            eprintln!("[run] {:?}: no such repo to run", ws.name);
             return Task::none();
         }
+        let Some(repo) = self.repo(repo_id) else {
+            return Task::none();
+        };
+        if !repo.key.is_local() {
+            eprintln!("[run] {:?}: only this Mac's repos run here", ws.name);
+            return Task::none();
+        }
+        let Some(command) = repo.run_command.clone() else {
+            eprintln!(
+                "[run] {:?}: {} has no run command",
+                ws.name,
+                repo.dir.display()
+            );
+            return Task::none();
+        };
+        let dir = repo.dir.clone();
         let name = ws.name.clone();
-        let Some(dir) = self.repo_run_dir(ws, repo_id) else {
-            return Task::none();
+        let action = run_tab_action(&ws.bottom_terminals, repo_id, &command);
+        let idx = match action {
+            RunTabAction::Focus(idx) => idx,
+            RunTabAction::Restart(_) | RunTabAction::Open => {
+                let mut bt = self.create_bottom_terminal_for(&name, dir, Some(&command));
+                bt.title = Some(command.clone());
+                bt.run = Some(RunTab {
+                    repo: repo_id,
+                    command,
+                    detected_url: None,
+                    next_url_scan: Instant::now() + RUN_URL_SCAN_INTERVAL,
+                });
+                let Some(ws) = self.active_workspace_mut() else {
+                    return Task::none();
+                };
+                match action {
+                    RunTabAction::Restart(idx) => {
+                        ws.bottom_terminals[idx] = bt;
+                        idx
+                    }
+                    _ => {
+                        ws.bottom_terminals.push(bt);
+                        ws.bottom_terminals.len() - 1
+                    }
+                }
+            }
         };
-        let bt = self.create_bottom_terminal_for(&name, dir);
-        let Some(repo) = self.repo_mut(repo_id) else {
-            return Task::none();
-        };
-        repo.bottom_terminals.push(bt);
-        let idx = repo.bottom_terminals.len() - 1;
-        repo.active_bottom_tab = BottomPanelTab::Terminal(idx);
+        if let Some(ws) = self.active_workspace_mut() {
+            ws.active_bottom = Some(idx);
+        }
         self.console_expanded = true;
         self.mark_workspaces_dirty();
         self.save_config();
-        self.focus_bottom_terminal(repo_id, idx)
+        self.focus_bottom_terminal(idx)
+    }
+
+    /// A new bottom terminal in the active workspace, selected and
+    /// focused (`+`, `+ ▾`): in `dir` (a listed repo from the picker),
+    /// else the workspace's home dir.
+    fn add_bottom_terminal(&mut self, dir: Option<PathBuf>) -> Task<Event> {
+        self.bottom_repo_picker_open = false;
+        let Some(ws) = self.active_workspace() else {
+            return Task::none();
+        };
+        let name = ws.name.clone();
+        let dir = new_bottom_terminal_dir(&ws.dir, dir);
+        let bt = self.create_bottom_terminal_for(&name, dir, None);
+        let Some(ws) = self.active_workspace_mut() else {
+            return Task::none();
+        };
+        ws.bottom_terminals.push(bt);
+        let idx = ws.bottom_terminals.len() - 1;
+        ws.active_bottom = Some(idx);
+        self.console_expanded = true;
+        self.mark_workspaces_dirty();
+        self.save_config();
+        self.focus_bottom_terminal(idx)
     }
 
     /// Workspace settings' env editor: sets (`Some`) or removes `key` in
@@ -16347,18 +16056,19 @@ impl App {
             }
         }
 
-        // Restore the home repo's bottom terminals (TRU-180), unless the
-        // repo is open already: its live terminals are the shared set. A
-        // done entry comes back without its old terminals.
-        let home_open = self
-            .repos
-            .by_key(&repo_key(&workspace.dir, &workspace.location))
-            .is_some();
-        if !home_open && ws_config.done_at.is_none() {
-            for bt_config in self.saved_home_repo(ws_config).bottom_terminals {
-                let bt =
-                    self.create_bottom_terminal_for(&ws_config.name, PathBuf::from(&bt_config.dir));
-                workspace.seed_mut().bottom_terminals.push(bt);
+        // Restore the workspace's bottom terminals (TRU-180). A done entry
+        // comes back without its old terminals.
+        if ws_config.done_at.is_none() {
+            for bt_config in &ws_config.bottom_terminals {
+                let bt = self.create_bottom_terminal_for(
+                    &ws_config.name,
+                    PathBuf::from(&bt_config.dir),
+                    None,
+                );
+                workspace.bottom_terminals.push(bt);
+            }
+            if !workspace.bottom_terminals.is_empty() {
+                workspace.active_bottom = Some(0);
             }
         }
 
@@ -16643,7 +16353,7 @@ impl App {
             console_expanded: config.console_expanded,
             console_height: config.console_height.clamp(32.0, 600.0),
             dragging_console_divider: false,
-            editing_console_command: None,
+            editing_run_command: None,
             slide_offset: 0.0,
             slide_target: 0.0,
             slide_animating: false,
@@ -17386,9 +17096,9 @@ fi
             .filter(|session| session.harness.is_some() || session.task_handle.is_some())
             .count();
         let bottom = self
-            .repos
+            .workspaces
             .iter()
-            .flat_map(|repo| repo.bottom_terminals.iter())
+            .flat_map(|ws| ws.bottom_terminals.iter())
             .filter(|bt| bt.terminal.is_some())
             .count();
         let open_workspaces = self.workspaces.len();
@@ -17527,19 +17237,16 @@ fi
         tab
     }
 
-    /// A bottom terminal in `cwd` for the active workspace.
-    fn create_bottom_terminal(&mut self, cwd: PathBuf) -> BottomTerminal {
-        let ws_name = self
-            .active_workspace()
-            .map(|ws| ws.name.clone())
-            .unwrap_or_default();
-        self.create_bottom_terminal_for(&ws_name, cwd)
-    }
-
-    /// A bottom terminal in `cwd` for workspace `ws_name`: the env of the
-    /// repo holding `cwd`, with the workspace's overrides (TRU-180), read
-    /// fresh from `workspaces.json` as tabs do.
-    fn create_bottom_terminal_for(&mut self, ws_name: &str, cwd: PathBuf) -> BottomTerminal {
+    /// A bottom terminal in `cwd` for workspace `ws_name`, running
+    /// `command` when given (a run tab): the env of the repo holding
+    /// `cwd`, with the workspace's overrides (TRU-180), read fresh from
+    /// `workspaces.json` as tabs do.
+    fn create_bottom_terminal_for(
+        &mut self,
+        ws_name: &str,
+        cwd: PathBuf,
+        command: Option<&str>,
+    ) -> BottomTerminal {
         let mut extra_env: Vec<(String, String)> = WorkspacesFile::load_normalized()
             .map(|file| {
                 file.workspace_env(ws_name, Some(&cwd))
@@ -17565,7 +17272,7 @@ fi
 
         let settings = Self::build_terminal_settings(
             &cwd,
-            None,
+            command,
             self.scrollback_lines,
             &self.theme,
             self.terminal_font_size,
@@ -17586,9 +17293,11 @@ fi
         BottomTerminal {
             id,
             browser_label: bottom_terminal_browser_label(&cwd),
+            alive: terminal.is_some(),
             terminal,
             title: None,
             cwd,
+            run: None,
         }
     }
 
@@ -19145,9 +18854,9 @@ fi
             .flat_map(|workspace| workspace.tabs.iter())
             .map(|tab| (tab.session_uid.clone(), self.browser_owner_label(tab)))
             .chain(
-                self.repos
+                self.workspaces
                     .iter()
-                    .flat_map(|repo| repo.bottom_terminals.iter())
+                    .flat_map(|ws| ws.bottom_terminals.iter())
                     .map(|bt| (bottom_terminal_caller(bt.id), bt.browser_label.clone())),
             )
             .collect();
@@ -19304,11 +19013,11 @@ fi
                 }
             }
         }
-        // Bottom panel terminal subscriptions, once per repo.
+        // Bottom panel terminal subscriptions, every workspace's.
         for bt in self
-            .repos
+            .workspaces
             .iter()
-            .flat_map(|repo| repo.bottom_terminals.iter())
+            .flat_map(|ws| ws.bottom_terminals.iter())
         {
             if let Some(term) = &bt.terminal {
                 subs.push(
@@ -19812,12 +19521,12 @@ fi
                     return self.focus_main_terminal();
                 }
             }
-            Event::BottomTerminalClicked(repo, idx) => {
+            Event::BottomTerminalClicked(idx) => {
                 // In case the chat page above still holds AppKit focus,
                 // where it would take Cmd+V for itself.
                 webview::focus_app_view();
                 if !self.bottom_panel_focused {
-                    return self.focus_bottom_terminal(repo, idx);
+                    return self.focus_bottom_terminal(idx);
                 }
             }
             Event::Terminal(tab_id, iced_term::Event::BackendCall(_, cmd)) => {
@@ -19830,8 +19539,8 @@ fi
                 if matches!(&cmd, iced_term::backend::Command::Write(_)) {
                     self.bottom_panel_focused = false;
                 }
-                // Don't forward keyboard input to terminal while editing console command or console search
-                if self.editing_console_command.is_some() {
+                // Don't forward keyboard input to terminal while editing a run command
+                if self.editing_run_command.is_some() {
                     return Task::none();
                 }
                 // Modal capture layers: typing in the task switcher, the
@@ -19848,15 +19557,6 @@ fi
                 {
                     if let iced_term::backend::Command::Write(_) = &cmd {
                         return Task::none();
-                    }
-                }
-                if self.console_expanded {
-                    if let Some(repo) = self.active_bottom_repo() {
-                        if repo.console.search_visible {
-                            if let iced_term::backend::Command::Write(_) = &cmd {
-                                return Task::none();
-                            }
-                        }
                     }
                 }
                 // Suppress terminal writes for keys we handle as app shortcuts (Ctrl+1-9, Ctrl+`)
@@ -20285,67 +19985,30 @@ fi
 
                 self.observe_needs_you();
 
-                // Drain console output for every open repo
+                // Look for each run tab's dev-server URL until one is seen.
                 let _drain_start = std::time::Instant::now();
-                let mut auto_expand = false;
-                let mut console_changed = false;
-                for repo in self.repos.iter_mut() {
-                    // Take rx out to avoid double-borrow
-                    if let Some(mut rx) = repo.console.output_rx.take() {
-                        let mut exited_info = None;
-                        let mut messages = Vec::new();
-                        while let Ok(msg) = rx.try_recv() {
-                            messages.push(msg);
-                            if messages.len() >= 50 {
-                                break;
-                            }
-                        }
-                        for msg in messages {
-                            match msg {
-                                ConsoleOutputMessage::Stdout(line) => {
-                                    repo.console.push_line(line, false);
-                                    console_changed = true;
-                                }
-                                ConsoleOutputMessage::Stderr(line) => {
-                                    repo.console.push_line(line, true);
-                                    console_changed = true;
-                                }
-                                ConsoleOutputMessage::Exited(code) => {
-                                    exited_info = Some(code);
-                                    console_changed = true;
-                                }
-                            }
-                        }
-                        // Rebuild editor content once for the entire batch
-                        repo.console.rebuild_if_dirty();
-                        if let Some(code) = exited_info {
-                            repo.console.exit_code = code;
-                            repo.console.stopped_at = Some(std::time::Instant::now());
-                            if code.is_some() && code != Some(0) {
-                                repo.console.status = ConsoleStatus::Error;
-                                auto_expand = true;
-                            } else {
-                                repo.console.status = ConsoleStatus::Stopped;
-                            }
-                            repo.console.child_killer = None;
-                            // Don't put rx back — process is done
-                        } else {
-                            // Put rx back
-                            repo.console.output_rx = Some(rx);
-                        }
+                let now = Instant::now();
+                for bt in self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.bottom_terminals.iter_mut())
+                {
+                    let Some(run) = bt.run.as_mut() else {
+                        continue;
+                    };
+                    if run.detected_url.is_some() || now < run.next_url_scan {
+                        continue;
+                    }
+                    run.next_url_scan = now + RUN_URL_SCAN_INTERVAL;
+                    if let Some(terminal) = &bt.terminal {
+                        run.detected_url = run_output_url(&terminal.get_all_text());
                     }
                 }
-                if auto_expand {
-                    self.console_expanded = true;
-                }
                 let _drain_elapsed = _drain_start.elapsed();
-                if console_changed {
-                    self.mark_log_server_dirty();
-                }
                 let _check_menu_elapsed = _check_menu_start.elapsed();
                 if _check_menu_elapsed > Duration::from_millis(50) {
                     freeze_debug!(
-                        "CheckMenu handler took {}ms (menu_poll={}ms, console_drain={}ms)",
+                        "CheckMenu handler took {}ms (menu_poll={}ms, run_url_scan={}ms)",
                         _check_menu_elapsed.as_millis(),
                         _menu_poll_elapsed.as_millis(),
                         _drain_elapsed.as_millis()
@@ -22363,48 +22026,33 @@ fi
                 self.quick_commands_visible = false;
                 if let Some(qc) = self.quick_commands.get(idx).cloned() {
                     let cmd_bytes = format!("{}\n", qc.command).into_bytes();
-                    // Find active bottom terminal, or create one
-                    let has_bottom_terminal = self
-                        .active_bottom_repo()
-                        .map(|repo| {
-                            matches!(repo.active_bottom_tab, BottomPanelTab::Terminal(_))
-                                && !repo.bottom_terminals.is_empty()
-                        })
-                        .unwrap_or(false);
-
-                    if !has_bottom_terminal {
-                        // Create a bottom terminal first
-                        let dir = self
-                            .active_workspace()
-                            .map(|ws| {
-                                ws.active_tab()
-                                    .map(|t| t.current_dir.clone())
-                                    .unwrap_or_else(|| ws.dir.clone())
-                            })
-                            .unwrap_or_else(|| PathBuf::from("."));
-                        let bt = self.create_bottom_terminal(dir);
-                        if let Some(repo) = self.active_bottom_repo_mut() {
-                            repo.bottom_terminals.push(bt);
-                            let idx = repo.bottom_terminals.len() - 1;
-                            repo.active_bottom_tab = BottomPanelTab::Terminal(idx);
+                    // The selected plain bottom terminal (not a run tab),
+                    // else a new one in the workspace's home dir.
+                    let has_plain_terminal = self
+                        .active_bottom_terminal()
+                        .is_some_and(|bt| bt.run.is_none());
+                    if !has_plain_terminal {
+                        let Some(ws) = self.active_workspace() else {
+                            return Task::none();
+                        };
+                        let name = ws.name.clone();
+                        let dir = new_bottom_terminal_dir(&ws.dir, None);
+                        let bt = self.create_bottom_terminal_for(&name, dir, None);
+                        if let Some(ws) = self.active_workspace_mut() {
+                            ws.bottom_terminals.push(bt);
+                            ws.active_bottom = Some(ws.bottom_terminals.len() - 1);
                         }
                         self.console_expanded = true;
                     }
 
                     // Write the command to the active bottom terminal
-                    if let Some(repo) = self.active_bottom_repo_mut() {
-                        if let BottomPanelTab::Terminal(bt_idx) = repo.active_bottom_tab {
-                            if let Some(bt) = repo.bottom_terminals.get_mut(bt_idx) {
-                                if let Some(term) = &mut bt.terminal {
-                                    Self::handle_terminal_backend_command(
-                                        term,
-                                        iced_term::backend::Command::Write(cmd_bytes),
-                                        "run_quick_command_bottom_terminal",
-                                        true, // user-initiated, always redraw
-                                    );
-                                }
-                            }
-                        }
+                    if let Some(term) = self.active_bottom_terminal_mut() {
+                        Self::handle_terminal_backend_command(
+                            term,
+                            iced_term::backend::Command::Write(cmd_bytes),
+                            "run_quick_command_bottom_terminal",
+                            true, // user-initiated, always redraw
+                        );
                     }
                     self.mark_workspaces_dirty();
                 }
@@ -22517,30 +22165,21 @@ fi
                     return self.scroll_to_active_tab();
                 }
             }
-            Event::BottomTabSelect(repo_id, tab) => {
+            Event::BottomTabSelect(idx) => {
                 self.bottom_repo_picker_open = false;
-                self.select_bottom_repo(repo_id);
-                if let Some(repo) = self.active_bottom_repo_mut() {
-                    repo.active_bottom_tab = tab;
-                }
-                // Focus the appropriate terminal
-                return match tab {
-                    BottomPanelTab::Terminal(idx) => self.focus_bottom_terminal(repo_id, idx),
-                    BottomPanelTab::Console => self.focus_main_terminal(),
+                let selected = match self.active_workspace_mut() {
+                    Some(ws) if idx < ws.bottom_terminals.len() => {
+                        ws.active_bottom = Some(idx);
+                        true
+                    }
+                    _ => false,
                 };
+                if selected {
+                    return self.focus_bottom_terminal(idx);
+                }
             }
             Event::BottomRepoPickerToggle => {
                 self.bottom_repo_picker_open = !self.bottom_repo_picker_open;
-            }
-            Event::WorkspaceRepoSelect(uid, repo_id) => {
-                if let Some(idx) = self.workspace_index_by_uid(uid) {
-                    let ws = &mut self.workspaces[idx];
-                    if ws.repos.contains(&repo_id) {
-                        ws.current = repo_id;
-                        ws.bottom_repo = repo_id;
-                    }
-                }
-                self.sync_visible_terminals();
             }
             Event::WorkspaceRepoRemove(uid, repo_id) => {
                 self.remove_repo_from_workspace(uid, repo_id);
@@ -22563,32 +22202,27 @@ fi
                 }
             }
             Event::BottomTerminalAdd => {
-                let Some(current) = self.active_workspace().map(|ws| ws.current) else {
-                    return Task::none();
-                };
-                return self.add_bottom_terminal_in(current);
+                return self.add_bottom_terminal(None);
             }
             Event::BottomTerminalAddIn(repo_id) => {
-                return self.add_bottom_terminal_in(repo_id);
+                let dir = self.repo(repo_id).map(|repo| repo.dir.clone());
+                if dir.is_none() {
+                    eprintln!("[workspace] no such repo for a bottom terminal");
+                    return Task::none();
+                }
+                return self.add_bottom_terminal(dir);
             }
-            Event::BottomTerminalClose(repo_id, idx) => {
-                let was_active_terminal = self.active_bottom_repo()
-                    .filter(|repo| repo.id == repo_id)
-                    .map(|repo| matches!(repo.active_bottom_tab, BottomPanelTab::Terminal(i) if i == idx))
-                    .unwrap_or(false);
-                if let Some(repo) = self.repo_mut(repo_id) {
-                    if idx < repo.bottom_terminals.len() {
-                        repo.bottom_terminals.remove(idx);
-                        // Fix active tab reference
-                        match repo.active_bottom_tab {
-                            BottomPanelTab::Terminal(active_idx) if active_idx == idx => {
-                                repo.active_bottom_tab = BottomPanelTab::Console;
-                            }
-                            BottomPanelTab::Terminal(active_idx) if active_idx > idx => {
-                                repo.active_bottom_tab = BottomPanelTab::Terminal(active_idx - 1);
-                            }
-                            _ => {}
-                        }
+            Event::BottomTerminalClose(idx) => {
+                let mut was_active_terminal = false;
+                if let Some(ws) = self.active_workspace_mut() {
+                    if idx < ws.bottom_terminals.len() {
+                        ws.bottom_terminals.remove(idx);
+                        was_active_terminal = ws.active_bottom == Some(idx);
+                        ws.active_bottom = bottom_selection_after_close(
+                            ws.active_bottom,
+                            idx,
+                            ws.bottom_terminals.len(),
+                        );
                     }
                 }
                 self.mark_workspaces_dirty();
@@ -22642,9 +22276,9 @@ fi
                 }
                 let mut terminal_handled = false;
                 if let Some(bt) = self
-                    .repos
+                    .workspaces
                     .iter_mut()
-                    .flat_map(|repo| repo.bottom_terminals.iter_mut())
+                    .flat_map(|ws| ws.bottom_terminals.iter_mut())
                     .find(|bt| bt.id == id)
                 {
                     if let Some(term) = &mut bt.terminal {
@@ -22655,8 +22289,10 @@ fi
                             "bottom_terminal_event",
                             false,
                         ) {
-                            iced_term::actions::Action::Shutdown => {}
-                            iced_term::actions::Action::ChangeTitle(title) => {
+                            // `▶` runs the command again in an exited run tab.
+                            iced_term::actions::Action::Shutdown => bt.alive = false,
+                            // A run tab keeps the command as its name.
+                            iced_term::actions::Action::ChangeTitle(title) if bt.run.is_none() => {
                                 bt.title = Some(title);
                             }
                             iced_term::actions::Action::ClipboardStore(text) => {
@@ -23066,10 +22702,10 @@ fi
                     }
                 }
 
-                // Escape cancels console command editing
-                if self.editing_console_command.is_some() {
+                // Escape cancels run command editing
+                if self.editing_run_command.is_some() {
                     if let Key::Named(key::Named::Escape) = key.as_ref() {
-                        return Task::done(Event::ConsoleCommandCancel);
+                        return Task::done(Event::RunCommandCancel);
                     }
                 }
 
@@ -23094,9 +22730,11 @@ fi
                         if c == "j" && !modifiers.shift() {
                             return Task::done(Event::ConsoleToggle);
                         }
-                        // Cmd+Shift+R - Restart console process
+                        // Cmd+Shift+R - the home repo's run command (TRU-180)
                         if (c == "r" || c == "R") && modifiers.shift() {
-                            return Task::done(Event::ConsoleRestart);
+                            if let Some(home) = self.active_workspace().map(|ws| ws.home) {
+                                return Task::done(Event::RunRepoCommand(home));
+                            }
                         }
                         // Cmd+Shift+W - Close current workspace
                         if (c == "w" || c == "W") && modifiers.shift() {
@@ -23109,26 +22747,6 @@ fi
                         // Cmd+Shift+O - the Chats overview (TRU-154)
                         if global_shortcut(&key, modifiers) == Some(GlobalShortcut::ChatsOverview) {
                             return Task::done(Event::ChatsOverviewOpen);
-                        }
-                    }
-                }
-
-                // Console search shortcuts (Cmd+F when console active, Escape to close)
-                if self.console_expanded {
-                    if let Some(repo) = self.active_bottom_repo() {
-                        if repo.active_bottom_tab == BottomPanelTab::Console {
-                            if modifiers.command() {
-                                if let Key::Character(c) = key.as_ref() {
-                                    if c == "f" {
-                                        return Task::done(Event::ConsoleSearchToggle);
-                                    }
-                                }
-                            }
-                            if repo.console.search_visible {
-                                if let Key::Named(key::Named::Escape) = key.as_ref() {
-                                    return Task::done(Event::ConsoleSearchClose);
-                                }
-                            }
                         }
                     }
                 }
@@ -25159,10 +24777,6 @@ fi
                 }
             }
             Event::WindowCloseRequested => {
-                // Kill all console processes
-                for repo in self.repos.iter_mut() {
-                    repo.console.kill_process();
-                }
                 if self.workspaces_dirty {
                     self.save_workspaces();
                     self.workspaces_dirty = false;
@@ -26389,7 +26003,7 @@ fi
                 eprintln!("[STT] Error: {}", e);
             }
             Event::WorkspaceSelect(idx) => {
-                self.editing_console_command = None;
+                self.editing_run_command = None;
                 if self.usage_view.open {
                     usage_view_step(
                         &mut self.usage_view,
@@ -26551,7 +26165,7 @@ fi
                             self.sync_visible_terminals();
                             self.mark_workspaces_dirty();
                             self.dismiss_viewer_surface();
-                            self.editing_console_command = None;
+                            self.editing_run_command = None;
                             self.sync_plans_dir();
                             let refresh_worktrees_task = self.refresh_worktrees_for_active_tab();
                             let refresh_files_task = self.refresh_files_for_active_tab();
@@ -27062,93 +26676,46 @@ fi
                     return self.focus_main_terminal();
                 }
             }
-            Event::ConsoleStart => {
-                self.start_active_console(false);
-                self.console_expanded = true;
+            Event::RunRepoCommand(repo_id) => {
+                return self.run_repo_command(repo_id);
             }
-            Event::ConsoleStop => {
-                if let Some(repo) = self.active_bottom_repo_mut() {
-                    repo.console.kill_process();
-                    repo.console.status = ConsoleStatus::Stopped;
-                }
-            }
-            Event::ConsoleRestart => {
-                self.start_active_console(true);
-                self.console_expanded = true;
-            }
-            Event::ConsoleEditorAction(action) => {
-                // Allow selection/navigation but not editing
-                if !action.is_edit() {
-                    if let Some(repo) = self.active_bottom_repo_mut() {
-                        repo.console.editor_content.perform(action);
-                    }
-                }
-            }
-            Event::ConsoleSearchToggle => {
-                if let Some(repo) = self.active_bottom_repo_mut() {
-                    repo.console.search_visible = !repo.console.search_visible;
-                    if !repo.console.search_visible {
-                        repo.console.search_query.clear();
-                        repo.console.rebuild_editor_content();
-                    }
-                }
-            }
-            Event::ConsoleSearchChanged(query) => {
-                if let Some(repo) = self.active_bottom_repo_mut() {
-                    repo.console.search_query = query;
-                    repo.console.rebuild_editor_content();
-                }
-            }
-            Event::ConsoleSearchClose => {
-                if let Some(repo) = self.active_bottom_repo_mut() {
-                    repo.console.search_visible = false;
-                    repo.console.search_query.clear();
-                    repo.console.rebuild_editor_content();
-                }
-            }
-            Event::ConsoleClearOutput => {
-                if let Some(repo) = self.active_bottom_repo_mut() {
-                    repo.console.clear_output();
-                }
-            }
-            Event::ConsoleOpenBrowser => {
-                if let Some(repo) = self.active_bottom_repo() {
-                    if let Some(url) = &repo.console.detected_url {
-                        let _ = std::process::Command::new("open").arg(url).spawn();
+            Event::RunOpenUrl => {
+                let url = self
+                    .active_bottom_terminal()
+                    .and_then(|bt| bt.run.as_ref())
+                    .and_then(|run| run.detected_url.clone());
+                if let Some(url) = url {
+                    if let Err(error) = std::process::Command::new("open").arg(&url).spawn() {
+                        eprintln!("[run] cannot open {url}: {error}");
                     }
                 }
             }
             Event::ConsoleDividerDragStart => {
                 self.dragging_console_divider = true;
             }
-            Event::ConsoleCommandEditStart => {
+            Event::RunCommandEditStart(repo_id) => {
                 let current = self
-                    .active_bottom_repo()
-                    .and_then(|repo| repo.console.run_command.clone())
+                    .repo(repo_id)
+                    .and_then(|repo| repo.run_command.clone())
                     .unwrap_or_default();
-                self.editing_console_command = Some(current);
+                self.editing_run_command = Some((repo_id, current));
             }
-            Event::ConsoleCommandChanged(val) => {
-                self.editing_console_command = Some(val);
+            Event::RunCommandChanged(val) => {
+                if let Some((_, draft)) = self.editing_run_command.as_mut() {
+                    *draft = val;
+                }
             }
-            Event::ConsoleCommandSubmit => {
-                if let Some(cmd) = self.editing_console_command.take() {
-                    if let Some(repo) = self.active_bottom_repo_mut() {
-                        if cmd.trim().is_empty() {
-                            repo.console.run_command = None;
-                            repo.console.status = ConsoleStatus::NoneConfigured;
-                        } else {
-                            repo.console.run_command = Some(cmd.trim().to_string());
-                            if !repo.console.is_running() {
-                                repo.console.status = ConsoleStatus::Stopped;
-                            }
-                        }
+            Event::RunCommandSubmit => {
+                if let Some((repo_id, cmd)) = self.editing_run_command.take() {
+                    if let Some(repo) = self.repo_mut(repo_id) {
+                        let cmd = cmd.trim();
+                        repo.run_command = (!cmd.is_empty()).then(|| cmd.to_string());
                     }
                     self.mark_workspaces_dirty();
                 }
             }
-            Event::ConsoleCommandCancel => {
-                self.editing_console_command = None;
+            Event::RunCommandCancel => {
+                self.editing_run_command = None;
             }
             Event::ModifiersChanged(modifiers) => {
                 self.current_modifiers = modifiers;
@@ -28164,9 +27731,9 @@ fi
             }
         }
 
-        // Recreate bottom panel terminals
-        for repo in self.repos.iter_mut() {
-            for bt in repo.bottom_terminals.iter_mut() {
+        // Recreate bottom panel terminals; a run tab runs its command again.
+        for ws in self.workspaces.iter_mut() {
+            for bt in ws.bottom_terminals.iter_mut() {
                 let bt_browser_environment =
                     browser_environment(Some(&bottom_terminal_caller(bt.id)));
                 let bt_browser_environment_refs: Vec<(&str, &str)> = bt_browser_environment
@@ -28175,7 +27742,7 @@ fi
                     .collect();
                 let settings = Self::build_terminal_settings(
                     &bt.cwd,
-                    None,
+                    bt.run.as_ref().map(|run| run.command.as_str()),
                     scrollback,
                     &theme,
                     font_size,
@@ -28194,6 +27761,7 @@ fi
                         None
                     }
                 };
+                bt.alive = bt.terminal.is_some();
             }
         }
 
@@ -29710,7 +29278,10 @@ fi
         // Console
         content_col = content_col.push(section_header("Console"));
         content_col = content_col.push(shortcut_row("Cmd + J", "Toggle bottom panel"));
-        content_col = content_col.push(shortcut_row("Cmd + Shift + R", "Restart console"));
+        content_col = content_col.push(shortcut_row(
+            "Cmd + Shift + R",
+            "Run the home repo's command",
+        ));
 
         // Terminal
         content_col = content_col.push(section_header("Terminal"));
@@ -31184,14 +30755,12 @@ fi
         let attn_count = ws.attention_count();
         let has_attention = attn_count > 0;
         let attention_reason = ws.highest_priority_attention();
-        let has_error = self.workspace_console_error(ws);
 
         // Colored dot before name — override for attention/error
-        let dot_color = if has_error
-            || matches!(
-                attention_reason,
-                Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))
-            ) {
+        let dot_color = if matches!(
+            attention_reason,
+            Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_))
+        ) {
             theme.danger()
         } else if matches!(
             attention_reason,
@@ -31273,27 +30842,7 @@ fi
         }
 
         // Attention/error badge
-        if has_error {
-            let badge_bg = theme.danger();
-            let badge_text_color = theme.bg_crust();
-            btn_content = btn_content.push(
-                container(
-                    text("!")
-                        .size(9)
-                        .color(badge_text_color)
-                        .font(iced::Font::with_name("Menlo")),
-                )
-                .padding([0, 4])
-                .style(move |_| container::Style {
-                    background: Some(badge_bg.into()),
-                    border: iced::Border {
-                        radius: 6.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
-            );
-        } else if has_attention {
+        if has_attention {
             let badge_bg = match attention_reason {
                 Some(AttentionReason::AgentFailed | AttentionReason::DelegationFailed(_)) => {
                     theme.danger()
@@ -31393,9 +30942,7 @@ fi
         content = content.push(text(label).size(11).font(iced::Font::with_name("Menlo")));
         let hidden_news = toggle.hidden.iter().any(|&idx| {
             self.workspaces.get(idx).is_some_and(|ws| {
-                ws.attention_count() > 0
-                    || self.workspace_console_error(ws)
-                    || self.workspace_pr_badge(ws.uid).is_some()
+                ws.attention_count() > 0 || self.workspace_pr_badge(ws.uid).is_some()
             })
         });
         if hidden_news {
@@ -31888,25 +31435,21 @@ fi
             let (rows, running) = self.workspace_rail_state(&items, idx);
             let urgency = workspace_rail_urgency(&rows, running);
             let pending = urgency.filter(|urgency| *urgency != RailUrgency::Running);
-            let has_error = self.workspace_console_error(ws);
 
-            // Larger dot for something waiting or a console error when
-            // inactive; the active workspace keeps its tall bar.
+            // Larger dot for something waiting when inactive; the active
+            // workspace keeps its tall bar.
             let (dot_w, dot_h) = if is_active {
                 (4.0, 18.0)
-            } else if pending.is_some() || has_error {
+            } else if pending.is_some() {
                 (6.0, 6.0)
             } else {
                 (4.0, 4.0)
             };
 
-            // Color: console error (inactive) > most urgent waiting reason >
-            // a running turn (inactive only — the active bar keeps its
-            // workspace colour, which the tab strip's stamp matches) >
-            // active (ws color) > inactive.
-            let dot_color = if has_error && !is_active {
-                theme.danger()
-            } else if let Some(urgency) = pending {
+            // Color: most urgent waiting reason > a running turn (inactive
+            // only — the active bar keeps its workspace colour, which the
+            // tab strip's stamp matches) > active (ws color) > inactive.
+            let dot_color = if let Some(urgency) = pending {
                 rail_urgency_color(theme, urgency, pulse_bright)
             } else if urgency == Some(RailUrgency::Running) && !is_active {
                 rail_urgency_color(theme, RailUrgency::Running, pulse_bright)
@@ -33683,8 +33226,6 @@ fi
         let font_small = self.ui_font_small();
         let text_primary = theme.text_primary();
         let text_muted = theme.text_muted();
-        let hover = theme.bg_overlay();
-        let surface0 = theme.surface0();
         let uid = ws.uid;
         let mut section = Column::new()
             .spacing(3)
@@ -33718,73 +33259,60 @@ fi
             );
         }
 
-        let several = ws.repos.len() > 1;
         for repo in ws.repos.iter().filter_map(|id| self.repo(*id)) {
-            let is_current = repo.id == ws.current;
-            let console = &repo.console;
-            let state = match console.status {
-                ConsoleStatus::Running => match &console.detected_url {
-                    Some(url) => format!("running \u{00B7} {url}"),
-                    None => "running".to_string(),
-                },
-                ConsoleStatus::Error => match console.exit_code {
-                    Some(code) => format!("exited {code}"),
-                    None => "error".to_string(),
-                },
-                ConsoleStatus::Stopped => "stopped".to_string(),
-                ConsoleStatus::NoneConfigured => "no run command".to_string(),
-            };
-            let state_color = match console.status {
-                ConsoleStatus::Running => theme.success(),
-                ConsoleStatus::Error => theme.danger(),
-                ConsoleStatus::Stopped | ConsoleStatus::NoneConfigured => text_muted,
-            };
-            let marker = repo_tab_color(&repo.dir, theme);
             let mut name = gitterm::workspace_repos::repo_name(&repo.dir);
             if repo.id == ws.home {
                 name.push_str(" \u{00B7} home");
             }
-            let row_body = row![
-                container(iced::widget::Space::new())
-                    .width(Length::Fixed(3.0))
-                    .height(Length::Fixed(12.0))
-                    .style(move |_| container::Style {
-                        background: Some(marker.into()),
-                        ..Default::default()
-                    }),
+            let mut line = Row::new().spacing(4).align_y(iced::Alignment::Center).push(
                 text(name)
                     .size(font_small)
                     .color(text_primary)
                     .width(Length::Fill),
-                text(state).size(10).color(state_color).font(mono),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
-            let select = button(row_body)
-                .width(Length::Fill)
-                .padding([3, 6])
-                .style(move |_, status| button::Style {
-                    background: Some(
-                        if is_current && several {
-                            surface0
-                        } else if matches!(status, button::Status::Hovered) {
-                            hover
-                        } else {
-                            iced::Color::TRANSPARENT
-                        }
-                        .into(),
+            );
+            // Its run command (TRU-180): `▶` opens it as a terminal tab
+            // below; ✎ edits it. Only this Mac's folders run.
+            if repo.key.is_local() {
+                let editing = self
+                    .editing_run_command
+                    .as_ref()
+                    .filter(|(id, _)| *id == repo.id);
+                line = match (editing, &repo.run_command) {
+                    (Some((_, draft)), _) => line.push(
+                        text_input("npm run dev", draft)
+                            .on_input(Event::RunCommandChanged)
+                            .on_submit(Event::RunCommandSubmit)
+                            .size(font_small - 1.0)
+                            .padding([2, 4])
+                            .width(Length::Fixed(160.0))
+                            .font(mono),
                     ),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                })
-                .on_press(Event::WorkspaceRepoSelect(uid, repo.id));
-            let mut line = Row::new()
-                .spacing(2)
-                .align_y(iced::Alignment::Center)
-                .push(select);
+                    (None, Some(command)) => line
+                        .push(
+                            button(
+                                text(format!("\u{25B6} {command}"))
+                                    .size(10)
+                                    .color(theme.success())
+                                    .font(mono),
+                            )
+                            .style(self.ghost_button_style())
+                            .padding([2, 4])
+                            .on_press(Event::RunRepoCommand(repo.id)),
+                        )
+                        .push(
+                            button(text("\u{270E}").size(10).color(text_muted))
+                                .style(self.ghost_button_style())
+                                .padding([2, 4])
+                                .on_press(Event::RunCommandEditStart(repo.id)),
+                        ),
+                    (None, None) => line.push(
+                        button(text("+ run command").size(10).color(text_muted).font(mono))
+                            .style(self.ghost_button_style())
+                            .padding([2, 4])
+                            .on_press(Event::RunCommandEditStart(repo.id)),
+                    ),
+                };
+            }
             if repo.id != ws.home {
                 line = line.push(
                     button(text("\u{00D7}").size(font_small).color(text_muted))
@@ -33793,7 +33321,7 @@ fi
                         .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
                 );
             }
-            section = section.push(line);
+            section = section.push(container(line).padding([3, 6]));
         }
         if matches!(ws.location, WorkspaceLocation::Local { .. }) {
             section = section.push(
@@ -42077,9 +41605,9 @@ fi
             }
         }
         for terminal in self
-            .repos
+            .workspaces
             .iter()
-            .flat_map(|repo| repo.bottom_terminals.iter())
+            .flat_map(|ws| ws.bottom_terminals.iter())
         {
             if paths_equal(&terminal.cwd, path) {
                 has_bottom_terminal = true;
@@ -42513,17 +42041,12 @@ fi
 
     fn view_bottom_panel(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let repo = match self.active_bottom_repo() {
-            Some(repo) => repo,
-            None => {
-                return iced::widget::Space::new().width(0).height(0).into();
-            }
+        let Some(ws) = self.active_workspace() else {
+            return iced::widget::Space::new().width(0).height(0).into();
         };
-        let console = &repo.console;
-        let active_bottom_tab = repo.active_bottom_tab;
 
         // --- Tab bar ---
-        let tab_bar = self.view_bottom_tab_bar(repo, console);
+        let tab_bar = self.view_bottom_tab_bar(ws);
 
         if !self.console_expanded {
             let border_color = theme.surface0();
@@ -42543,36 +42066,39 @@ fi
         }
 
         // --- Content area ---
-        let content: Element<'_, Event, Theme, iced::Renderer> = match active_bottom_tab {
-            BottomPanelTab::Console => self.view_console_output(console),
-            BottomPanelTab::Terminal(idx) => {
-                if let Some(bt) = repo.bottom_terminals.get(idx) {
-                    if let Some(term) = &bt.terminal {
-                        let bt_id = bt.id;
-                        let bt_container = container(
-                            TerminalView::show(term)
-                                .map(move |e| Event::BottomTerminalEvent(bt_id, e)),
-                        )
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .padding([2, 0]);
-                        iced::widget::mouse_area(bt_container)
-                            .on_press(Event::BottomTerminalClicked(repo.id, idx))
-                            .into()
-                    } else {
-                        let text_color = theme.text_secondary();
-                        container(text("Terminal unavailable").size(14).color(text_color))
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .center_x(Length::Fill)
-                            .center_y(Length::Fill)
-                            .into()
-                    }
-                } else {
-                    // Invalid index — fall back to console
-                    self.view_console_output(console)
+        let placeholder = |message: &'static str| -> Element<'_, Event, Theme, iced::Renderer> {
+            container(
+                text(message)
+                    .size(13)
+                    .color(theme.text_muted())
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+        };
+        let content: Element<'_, Event, Theme, iced::Renderer> = match ws
+            .active_bottom
+            .and_then(|idx| Some((idx, ws.bottom_terminals.get(idx)?)))
+        {
+            Some((idx, bt)) => match &bt.terminal {
+                Some(term) => {
+                    let bt_id = bt.id;
+                    let bt_container = container(
+                        TerminalView::show(term).map(move |e| Event::BottomTerminalEvent(bt_id, e)),
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding([2, 0]);
+                    iced::widget::mouse_area(bt_container)
+                        .on_press(Event::BottomTerminalClicked(idx))
+                        .into()
                 }
-            }
+                None => placeholder("Terminal unavailable"),
+            },
+            None => placeholder("Press + for a terminal, or \u{25B6} to run a repo's command"),
         };
 
         let bg = theme.bg_crust();
@@ -42697,16 +42223,13 @@ fi
             .into()
     }
 
-    /// One bottom panel tab: a repo's console (`terminal: None`) or one of
-    /// its terminals. `repo_color` marks which repo it belongs to when the
-    /// panel shows several (TRU-180).
+    /// One bottom panel tab: the active workspace's terminal `idx`; a run
+    /// tab (TRU-180) shows a `▶` and the command as its name.
     fn view_bottom_tab<'a>(
         &'a self,
-        repo: &'a RepoState,
-        terminal: Option<usize>,
-        label: String,
+        idx: usize,
+        bt: &'a BottomTerminal,
         is_active: bool,
-        repo_color: Option<iced::Color>,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
@@ -42722,57 +42245,25 @@ fi
         };
         let hover_bg = theme.surface0();
         let active_accent = if is_active {
-            repo_color.unwrap_or(theme.accent())
+            theme.accent()
         } else {
             iced::Color::TRANSPARENT
         };
-        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center);
-        if let Some(color) = repo_color {
-            content = content.push(
-                container(iced::widget::Space::new())
-                    .width(Length::Fixed(3.0))
-                    .height(Length::Fixed(12.0))
-                    .style(move |_| container::Style {
-                        background: Some(color.into()),
-                        border: iced::Border {
-                            radius: 1.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-            );
-        }
-        let (glyph, select): (Element<'a, Event, Theme, iced::Renderer>, BottomPanelTab) =
-            match terminal {
-                None => {
-                    let dot_color = match repo.console.status {
-                        ConsoleStatus::Running => theme.success(),
-                        ConsoleStatus::Error => theme.danger(),
-                        ConsoleStatus::Stopped | ConsoleStatus::NoneConfigured => {
-                            theme.text_muted()
-                        }
-                    };
-                    let dot = container(iced::widget::Space::new())
-                        .width(Length::Fixed(6.0))
-                        .height(Length::Fixed(6.0))
-                        .style(move |_| container::Style {
-                            background: Some(dot_color.into()),
-                            border: iced::Border {
-                                radius: 3.0.into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        });
-                    (dot.into(), BottomPanelTab::Console)
-                }
-                Some(idx) => (
-                    text(">_").size(10).color(label_color).font(mono).into(),
-                    BottomPanelTab::Terminal(idx),
-                ),
-            };
-        content = content
-            .push(glyph)
-            .push(text(label).size(12).color(label_color).font(mono));
+        let (glyph, glyph_color) = match &bt.run {
+            Some(_) if bt.alive => ("\u{25B6}", theme.success()),
+            Some(_) => ("\u{25A0}", theme.text_muted()),
+            None => (">_", label_color),
+        };
+        let label = bt
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("Terminal {}", idx + 1));
+        let content = row![
+            text(glyph).size(10).color(glyph_color).font(mono),
+            text(label).size(12).color(label_color).font(mono),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center);
         let tab_btn = button(content)
             .style(move |_theme, status| {
                 let bg = if matches!(status, button::Status::Hovered) && !is_active {
@@ -42790,33 +42281,30 @@ fi
                     ..Default::default()
                 }
             })
-            .padding(if terminal.is_some() { [4, 8] } else { [4, 10] })
-            .on_press(Event::BottomTabSelect(repo.id, select));
-        let mut tab_row = Row::new()
-            .spacing(0)
-            .align_y(iced::Alignment::Center)
-            .push(tab_btn);
-        if let Some(idx) = terminal {
-            let close_color = theme.text_muted();
-            let close_hover = theme.text_primary();
-            tab_row = tab_row.push(
-                button(text("\u{00D7}").size(12).color(close_color))
-                    .style(move |_theme, status| {
-                        let c = if matches!(status, button::Status::Hovered) {
-                            close_hover
-                        } else {
-                            close_color
-                        };
-                        button::Style {
-                            background: Some(iced::Color::TRANSPARENT.into()),
-                            text_color: c,
-                            ..Default::default()
-                        }
-                    })
-                    .padding([0, 2])
-                    .on_press(Event::BottomTerminalClose(repo.id, idx)),
-            );
-        }
+            .padding([4, 8])
+            .on_press(Event::BottomTabSelect(idx));
+        let close_color = theme.text_muted();
+        let close_hover = theme.text_primary();
+        let tab_row = row![
+            tab_btn,
+            button(text("\u{00D7}").size(12).color(close_color))
+                .style(move |_theme, status| {
+                    let c = if matches!(status, button::Status::Hovered) {
+                        close_hover
+                    } else {
+                        close_color
+                    };
+                    button::Style {
+                        background: Some(iced::Color::TRANSPARENT.into()),
+                        text_color: c,
+                        ..Default::default()
+                    }
+                })
+                .padding([0, 2])
+                .on_press(Event::BottomTerminalClose(idx)),
+        ]
+        .spacing(0)
+        .align_y(iced::Alignment::Center);
         column![
             tab_row,
             container(iced::widget::Space::new())
@@ -42831,90 +42319,19 @@ fi
         .into()
     }
 
+    /// The bottom panel's header (TRU-180): the workspace's terminals,
+    /// `+` (a terminal in the home dir), `▾` (one in a listed repo), the
+    /// listed repos' `▶ <command>` actions, and the selected run tab's URL.
     fn view_bottom_tab_bar<'a>(
         &'a self,
-        repo: &'a RepoState,
-        console: &'a ConsoleState,
+        ws: &'a Workspace,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let active_tab = repo.active_bottom_tab;
-        let console_is_active = active_tab == BottomPanelTab::Console;
-        let Some(ws) = self.active_workspace() else {
-            return iced::widget::Space::new().into();
-        };
-        // Every local repo's console and terminals, grouped by repo
-        // (TRU-180); one repo looks as before.
-        let panel_repos = self.panel_repos(ws);
-        let several = panel_repos.len() > 1;
-        let tabs = gitterm::workspace_repos::panel_tabs(
-            &panel_repos
-                .iter()
-                .map(|panel| gitterm::workspace_repos::PanelRepo {
-                    dir: panel.dir.clone(),
-                    terminals: panel
-                        .bottom_terminals
-                        .iter()
-                        .map(|bt| bt.title.clone())
-                        .collect(),
-                })
-                .collect::<Vec<_>>(),
-        );
-        let mut tab_buttons: Vec<Element<'a, Event, Theme, iced::Renderer>> = Vec::new();
-        for tab in tabs {
-            let panel = panel_repos[tab.repo];
-            let is_active = panel.id == repo.id
-                && match tab.terminal {
-                    None => console_is_active,
-                    Some(idx) => active_tab == BottomPanelTab::Terminal(idx),
-                };
-            let repo_color = several.then(|| repo_tab_color(&panel.dir, theme));
-            tab_buttons.push(self.view_bottom_tab(
-                panel,
-                tab.terminal,
-                tab.label,
-                is_active,
-                repo_color,
-            ));
-        }
-
-        // "+" opens a terminal in the current repo; "▾" picks another.
-        let plus_color = theme.text_secondary();
-        let plus_hover_bg = theme.surface0();
-        let small_button = move |label: String, event: Event| {
-            button(text(label).size(14).color(plus_color))
-                .style(move |_theme, status| {
-                    let bg = if matches!(status, button::Status::Hovered) {
-                        plus_hover_bg
-                    } else {
-                        iced::Color::TRANSPARENT
-                    };
-                    button::Style {
-                        background: Some(bg.into()),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            ..Default::default()
-                        },
-                        text_color: plus_color,
-                        ..Default::default()
-                    }
-                })
-                .padding([2, 8])
-                .on_press(event)
-        };
-        let plus_btn = small_button("+".to_string(), Event::BottomTerminalAdd);
-        let mut picker: Vec<Element<'a, Event, Theme, iced::Renderer>> = Vec::new();
-        if several {
-            picker.push(small_button("\u{25BE}".to_string(), Event::BottomRepoPickerToggle).into());
-            if self.bottom_repo_picker_open {
-                for panel in &panel_repos {
-                    let name = gitterm::workspace_repos::repo_name(&panel.dir);
-                    picker.push(
-                        small_button(format!("+ {name}"), Event::BottomTerminalAddIn(panel.id))
-                            .into(),
-                    );
-                }
-            }
-        }
+        let mono = iced::Font::with_name("Menlo");
+        let mut header_row = Row::new()
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+            .padding([0, 8]);
 
         // Chevron button (toggle expand/collapse)
         let chevron = if self.console_expanded {
@@ -42923,40 +42340,28 @@ fi
             "\u{25B6}"
         };
         let chevron_color = theme.text_muted();
-        let chevron_btn = button(text(chevron).size(10).color(chevron_color))
-            .style(|_theme, _status| button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                ..Default::default()
-            })
-            .padding([4, 6])
-            .on_press(Event::ConsoleToggle);
+        header_row = header_row.push(
+            button(text(chevron).size(10).color(chevron_color))
+                .style(|_theme, _status| button::Style {
+                    background: Some(iced::Color::TRANSPARENT.into()),
+                    ..Default::default()
+                })
+                .padding([4, 6])
+                .on_press(Event::ConsoleToggle),
+        );
 
-        // Spacer
-        let spacer = iced::widget::Space::new().width(Length::Fill);
-
-        // --- Contextual controls (right side, only when Console tab is active) ---
-        let mut header_row = Row::new()
-            .spacing(4)
-            .align_y(iced::Alignment::Center)
-            .padding([0, 8])
-            .push(chevron_btn);
-
-        for tb in tab_buttons {
-            header_row = header_row.push(tb);
-        }
-        header_row = header_row.push(plus_btn);
-        for item in picker {
-            header_row = header_row.push(item);
+        for (idx, bt) in ws.bottom_terminals.iter().enumerate() {
+            header_row =
+                header_row.push(self.view_bottom_tab(idx, bt, ws.active_bottom == Some(idx)));
         }
 
-        // Quick commands button (⚡) — only show if commands are configured
-        if !self.quick_commands.is_empty() {
-            let qc_color = theme.peach();
-            let qc_hover_bg = theme.surface0();
-            let qc_btn = button(text("\u{26a1}").size(12).color(qc_color))
+        let plus_color = theme.text_secondary();
+        let hover_bg = theme.surface0();
+        let small_button = move |label: String, color: iced::Color, event: Event| {
+            button(text(label).size(12).color(color).font(mono))
                 .style(move |_theme, status| {
                     let bg = if matches!(status, button::Status::Hovered) {
-                        qc_hover_bg
+                        hover_bg
                     } else {
                         iced::Color::TRANSPARENT
                     };
@@ -42966,229 +42371,83 @@ fi
                             radius: 4.0.into(),
                             ..Default::default()
                         },
-                        text_color: qc_color,
+                        text_color: color,
                         ..Default::default()
                     }
                 })
-                .padding([2, 6])
-                .on_press(Event::ShowQuickCommands);
-            header_row = header_row.push(qc_btn);
-        }
-
-        header_row = header_row.push(spacer);
-
-        // Console-specific controls on the right
-        if console_is_active {
-            // Process name — click to edit, or show text input when editing
-            let name_element: Element<'a, Event, Theme, iced::Renderer> =
-                if let Some(edit_val) = &self.editing_console_command {
-                    let input_bg = theme.bg_base();
-                    let input_border = theme.accent();
-                    text_input("e.g. cargo run, bun run dev", edit_val)
-                        .on_input(Event::ConsoleCommandChanged)
-                        .on_submit(Event::ConsoleCommandSubmit)
-                        .size(12)
-                        .width(Length::Fixed(220.0))
-                        .padding([3, 6])
-                        .style(move |_theme, _status| text_input::Style {
-                            background: input_bg.into(),
-                            border: iced::Border {
-                                width: 1.0,
-                                color: input_border,
-                                radius: 3.0.into(),
-                            },
-                            icon: iced::Color::TRANSPARENT,
-                            placeholder: theme.text_muted(),
-                            value: theme.text_primary(),
-                            selection: theme.accent(),
-                        })
-                        .into()
-                } else {
-                    let process_name = console
-                        .run_command
-                        .as_deref()
-                        .unwrap_or("Click to set command");
-                    let name_color = if console.run_command.is_some() {
-                        theme.text_primary()
-                    } else {
-                        theme.text_muted()
-                    };
-                    let hover_bg = theme.surface0();
-                    button(
-                        text(process_name)
-                            .size(12)
-                            .color(name_color)
-                            .font(iced::Font::with_name("Menlo")),
-                    )
-                    .style(move |_theme, status| {
-                        let bg = if matches!(status, button::Status::Hovered) {
-                            hover_bg
-                        } else {
-                            iced::Color::TRANSPARENT
-                        };
-                        button::Style {
-                            background: Some(bg.into()),
-                            border: iced::Border {
-                                radius: 3.0.into(),
-                                ..Default::default()
-                            },
-                            text_color: name_color,
-                            ..Default::default()
-                        }
-                    })
-                    .padding([2, 4])
-                    .on_press(Event::ConsoleCommandEditStart)
-                    .into()
-                };
-
-            let uptime = console.uptime_string();
-            let uptime_label = text(uptime)
-                .size(11)
-                .color(theme.text_muted())
-                .font(iced::Font::with_name("Menlo"));
-
-            let btn_color = theme.text_secondary();
-            let hover_bg = theme.surface0();
-            let action_btn_style = move |_theme: &Theme, status: button::Status| {
-                let bg = if matches!(status, button::Status::Hovered) {
-                    hover_bg
-                } else {
-                    iced::Color::TRANSPARENT
-                };
-                button::Style {
-                    background: Some(bg.into()),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        ..Default::default()
-                    },
-                    text_color: btn_color,
-                    ..Default::default()
+                .padding([2, 8])
+                .on_press(event)
+        };
+        header_row = header_row.push(small_button(
+            "+".to_string(),
+            plus_color,
+            Event::BottomTerminalAdd,
+        ));
+        let repos = self.local_repos(ws);
+        if repos.len() > 1 {
+            header_row = header_row.push(small_button(
+                "\u{25BE}".to_string(),
+                plus_color,
+                Event::BottomRepoPickerToggle,
+            ));
+            if self.bottom_repo_picker_open {
+                for repo in &repos {
+                    let name = gitterm::workspace_repos::repo_name(&repo.dir);
+                    header_row = header_row.push(small_button(
+                        format!("+ {name}"),
+                        plus_color,
+                        Event::BottomTerminalAddIn(repo.id),
+                    ));
                 }
-            };
-
-            let browser_btn: Option<Element<'a, Event, Theme, iced::Renderer>> =
-                if console.detected_url.is_some() {
-                    let link_color = theme.accent();
-                    let hover_bg_browser = theme.surface0();
-                    Some(
-                        button(text("\u{1F517}").size(12).color(link_color))
-                            .style(move |_theme, status| {
-                                let bg = if matches!(status, button::Status::Hovered) {
-                                    hover_bg_browser
-                                } else {
-                                    iced::Color::TRANSPARENT
-                                };
-                                button::Style {
-                                    background: Some(bg.into()),
-                                    border: iced::Border {
-                                        radius: 4.0.into(),
-                                        ..Default::default()
-                                    },
-                                    text_color: link_color,
-                                    ..Default::default()
-                                }
-                            })
-                            .padding([2, 6])
-                            .on_press(Event::ConsoleOpenBrowser)
-                            .into(),
-                    )
-                } else {
-                    None
-                };
-
-            let clear_btn = button(text("\u{2300}").size(12).color(btn_color))
-                .style(action_btn_style)
-                .padding([2, 6])
-                .on_press(Event::ConsoleClearOutput);
-
-            let restart_btn = button(text("\u{21BB}").size(12).color(btn_color))
-                .style(action_btn_style)
-                .padding([2, 6])
-                .on_press(Event::ConsoleRestart);
-
-            let stop_start_btn = if console.is_running() {
-                let stop_color = theme.danger();
-                button(text("\u{25A0}").size(12).color(stop_color))
-                    .style(move |_theme, status| {
-                        let bg = if matches!(status, button::Status::Hovered) {
-                            hover_bg
-                        } else {
-                            iced::Color::TRANSPARENT
-                        };
-                        button::Style {
-                            background: Some(bg.into()),
-                            border: iced::Border {
-                                radius: 4.0.into(),
-                                ..Default::default()
-                            },
-                            text_color: stop_color,
-                            ..Default::default()
-                        }
-                    })
-                    .padding([2, 6])
-                    .on_press(Event::ConsoleStop)
-            } else {
-                let start_color = theme.success();
-                button(text("\u{25B6}").size(12).color(start_color))
-                    .style(move |_theme, status| {
-                        let bg = if matches!(status, button::Status::Hovered) {
-                            hover_bg
-                        } else {
-                            iced::Color::TRANSPARENT
-                        };
-                        button::Style {
-                            background: Some(bg.into()),
-                            border: iced::Border {
-                                radius: 4.0.into(),
-                                ..Default::default()
-                            },
-                            text_color: start_color,
-                            ..Default::default()
-                        }
-                    })
-                    .padding([2, 6])
-                    .on_press_maybe(if console.run_command.is_some() {
-                        Some(Event::ConsoleStart)
-                    } else {
-                        None
-                    })
-            };
-
-            let search_icon_color = if console.search_visible {
-                theme.accent()
-            } else {
-                btn_color
-            };
-            let terminal_mirror_status = if self.terminal_log_mirroring_enabled {
-                ("Mirror:on", theme.success())
-            } else {
-                ("Mirror:off", theme.text_muted())
-            };
-            let log_toggle_btn = button(
-                text(terminal_mirror_status.0)
-                    .size(11)
-                    .color(terminal_mirror_status.1)
-                    .font(iced::Font::with_name("Menlo")),
-            )
-            .style(action_btn_style)
-            .padding([2, 6])
-            .on_press(Event::ToggleTerminalLogMirroring);
-            let search_btn = button(text("\u{2315}").size(12).color(search_icon_color))
-                .style(action_btn_style)
-                .padding([2, 6])
-                .on_press(Event::ConsoleSearchToggle);
-
-            header_row = header_row.push(name_element).push(uptime_label);
-            if let Some(btn) = browser_btn {
-                header_row = header_row.push(btn);
             }
-            header_row = header_row
-                .push(log_toggle_btn)
-                .push(search_btn)
-                .push(clear_btn)
-                .push(restart_btn)
-                .push(stop_start_btn);
         }
+
+        // Quick commands button (⚡) — only show if commands are configured
+        if !self.quick_commands.is_empty() {
+            header_row = header_row.push(small_button(
+                "\u{26a1}".to_string(),
+                theme.peach(),
+                Event::ShowQuickCommands,
+            ));
+        }
+
+        header_row = header_row.push(iced::widget::Space::new().width(Length::Fill));
+
+        // The selected run tab's dev-server URL, once its output shows one.
+        if let Some(url) = self
+            .active_bottom_terminal()
+            .and_then(|bt| bt.run.as_ref())
+            .and_then(|run| run.detected_url.as_deref())
+        {
+            header_row = header_row.push(small_button(
+                format!("\u{1F517} {url}"),
+                theme.accent(),
+                Event::RunOpenUrl,
+            ));
+        }
+
+        // Each listed repo's run command (TRU-180): opens, or shows, its
+        // run tab.
+        for repo in &repos {
+            if let Some(command) = &repo.run_command {
+                header_row = header_row.push(small_button(
+                    format!("\u{25B6} {command}"),
+                    theme.success(),
+                    Event::RunRepoCommand(repo.id),
+                ));
+            }
+        }
+
+        let terminal_mirror_status = if self.terminal_log_mirroring_enabled {
+            ("Mirror:on", theme.success())
+        } else {
+            ("Mirror:off", theme.text_muted())
+        };
+        header_row = header_row.push(small_button(
+            terminal_mirror_status.0.to_string(),
+            terminal_mirror_status.1,
+            Event::ToggleTerminalLogMirroring,
+        ));
 
         let header_bg = theme.bg_surface();
         let top_border = theme.surface0();
@@ -43207,153 +42466,6 @@ fi
                 ..Default::default()
             })
             .into()
-    }
-
-    fn view_console_output<'a>(
-        &'a self,
-        console: &'a ConsoleState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-
-        if console.output_lines.is_empty() {
-            // Show hint text
-            let hint = if console.run_command.is_none() {
-                "No command configured for this workspace"
-            } else if console.status == ConsoleStatus::Stopped
-                || console.status == ConsoleStatus::NoneConfigured
-            {
-                "Press \u{25B6} to start"
-            } else {
-                "Waiting for output..."
-            };
-
-            let bg = theme.bg_crust();
-            return container(
-                text(hint)
-                    .size(13)
-                    .color(theme.text_muted())
-                    .font(iced::Font::with_name("Menlo")),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(bg.into()),
-                ..Default::default()
-            })
-            .into();
-        }
-
-        let bg = theme.bg_crust();
-        let text_color = theme.text_secondary();
-        let selection_color = theme.surface2();
-
-        let editor: Element<'_, Event, Theme, iced::Renderer> = container(
-            text_editor(&console.editor_content)
-                .on_action(Event::ConsoleEditorAction)
-                .font(iced::Font::with_name("Menlo"))
-                .size(13)
-                .padding([4, 8])
-                .style(move |_theme, _status| text_editor::Style {
-                    background: bg.into(),
-                    border: iced::Border::default(),
-                    placeholder: text_color,
-                    value: text_color,
-                    selection: selection_color,
-                })
-                .height(Length::Fill),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into();
-
-        if console.search_visible {
-            let search_bar = self.view_console_search_bar(console);
-            column![search_bar, editor]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            editor
-        }
-    }
-
-    fn view_console_search_bar<'a>(
-        &'a self,
-        console: &'a ConsoleState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font = self.ui_font();
-
-        let match_display = if console.search_query.is_empty() {
-            String::new()
-        } else {
-            let count = console.matching_line_count();
-            if count == 0 {
-                "No matches".to_string()
-            } else {
-                format!("{} matching lines", count)
-            }
-        };
-
-        let search_input = text_input("Filter output...", &console.search_query)
-            .on_input(Event::ConsoleSearchChanged)
-            .size(font)
-            .width(Length::Fixed(200.0))
-            .padding([4, 8]);
-
-        let match_text_color =
-            if !console.search_query.is_empty() && console.matching_line_count() == 0 {
-                theme.danger()
-            } else {
-                theme.text_secondary()
-            };
-
-        let match_label = text(match_display).size(font).color(match_text_color);
-
-        let close_color = theme.text_secondary();
-        let hover_bg = theme.surface0();
-        let close_btn = button(text("\u{2715}").size(12).color(close_color))
-            .style(move |_theme, status| {
-                let bg = if matches!(status, button::Status::Hovered) {
-                    hover_bg
-                } else {
-                    iced::Color::TRANSPARENT
-                };
-                button::Style {
-                    background: Some(bg.into()),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        ..Default::default()
-                    },
-                    text_color: close_color,
-                    ..Default::default()
-                }
-            })
-            .padding([2, 6])
-            .on_press(Event::ConsoleSearchClose);
-
-        let bar_bg = theme.bg_surface();
-        let border_color = theme.surface0();
-
-        container(
-            row![search_input, match_label, close_btn]
-                .spacing(8)
-                .align_y(iced::Alignment::Center)
-                .padding([4, 8]),
-        )
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(bar_bg.into()),
-            border: iced::Border {
-                width: 1.0,
-                color: border_color,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        })
-        .into()
     }
 
     fn view_search_bar<'a>(
@@ -45088,45 +44200,42 @@ mod tests {
         }
     }
 
-    // === ConsoleState::strip_ansi ===
+    // === RunOutput::strip_ansi ===
 
     #[test]
     fn strip_ansi_plain_text() {
-        assert_eq!(ConsoleState::strip_ansi("hello world"), "hello world");
+        assert_eq!(RunOutput::strip_ansi("hello world"), "hello world");
     }
 
     #[test]
     fn strip_ansi_color_codes() {
-        assert_eq!(
-            ConsoleState::strip_ansi("\x1b[31mred text\x1b[0m"),
-            "red text"
-        );
+        assert_eq!(RunOutput::strip_ansi("\x1b[31mred text\x1b[0m"), "red text");
     }
 
     #[test]
     fn strip_ansi_bold() {
-        assert_eq!(ConsoleState::strip_ansi("\x1b[1mbold\x1b[0m"), "bold");
+        assert_eq!(RunOutput::strip_ansi("\x1b[1mbold\x1b[0m"), "bold");
     }
 
     #[test]
     fn strip_ansi_nested() {
         assert_eq!(
-            ConsoleState::strip_ansi("\x1b[1m\x1b[31mbold red\x1b[0m\x1b[0m"),
+            RunOutput::strip_ansi("\x1b[1m\x1b[31mbold red\x1b[0m\x1b[0m"),
             "bold red"
         );
     }
 
     #[test]
     fn strip_ansi_empty() {
-        assert_eq!(ConsoleState::strip_ansi(""), "");
+        assert_eq!(RunOutput::strip_ansi(""), "");
     }
 
-    // === ConsoleState::detect_url ===
+    // === RunOutput::detect_url ===
 
     #[test]
     fn detect_url_http() {
         assert_eq!(
-            ConsoleState::detect_url("Server at http://localhost:3000"),
+            RunOutput::detect_url("Server at http://localhost:3000"),
             Some("http://localhost:3000".to_string())
         );
     }
@@ -45134,7 +44243,7 @@ mod tests {
     #[test]
     fn detect_url_https_localhost() {
         assert_eq!(
-            ConsoleState::detect_url("Running on https://localhost:8443/api"),
+            RunOutput::detect_url("Running on https://localhost:8443/api"),
             Some("https://localhost:8443/api".to_string())
         );
     }
@@ -45142,7 +44251,7 @@ mod tests {
     #[test]
     fn detect_url_port_pattern() {
         assert_eq!(
-            ConsoleState::detect_url("listening on :4000"),
+            RunOutput::detect_url("listening on :4000"),
             Some("http://localhost:4000".to_string())
         );
     }
@@ -45150,20 +44259,20 @@ mod tests {
     #[test]
     fn detect_url_on_port() {
         assert_eq!(
-            ConsoleState::detect_url("Server started on port 8080"),
+            RunOutput::detect_url("Server started on port 8080"),
             Some("http://localhost:8080".to_string())
         );
     }
 
     #[test]
     fn detect_url_no_match() {
-        assert_eq!(ConsoleState::detect_url("just some log output"), None);
+        assert_eq!(RunOutput::detect_url("just some log output"), None);
     }
 
     #[test]
     fn detect_url_in_ansi() {
         assert_eq!(
-            ConsoleState::detect_url("\x1b[32mhttp://localhost:3000\x1b[0m"),
+            RunOutput::detect_url("\x1b[32mhttp://localhost:3000\x1b[0m"),
             Some("http://localhost:3000".to_string())
         );
     }
@@ -45172,7 +44281,7 @@ mod tests {
     fn detect_url_trailing_punctuation() {
         // Trailing quotes/parens should be trimmed from the URL
         assert_eq!(
-            ConsoleState::detect_url("Visit http://localhost:5000)"),
+            RunOutput::detect_url("Visit http://localhost:5000)"),
             Some("http://localhost:5000".to_string())
         );
     }
@@ -45180,7 +44289,7 @@ mod tests {
     #[test]
     fn detect_url_http_ip() {
         assert_eq!(
-            ConsoleState::detect_url("http://127.0.0.1:9090/health"),
+            RunOutput::detect_url("http://127.0.0.1:9090/health"),
             Some("http://127.0.0.1:9090/health".to_string())
         );
     }
@@ -45532,18 +44641,18 @@ mod tests {
     #[test]
     fn detect_url_port_zero() {
         // Port 0 should not match (guard: port > 0)
-        assert_eq!(ConsoleState::detect_url("listening on :0"), None);
+        assert_eq!(RunOutput::detect_url("listening on :0"), None);
     }
 
     #[test]
     fn detect_url_no_digits_after_port() {
-        assert_eq!(ConsoleState::detect_url("listening on :abc"), None);
+        assert_eq!(RunOutput::detect_url("listening on :abc"), None);
     }
 
     #[test]
     fn detect_url_http_with_path_and_query() {
         assert_eq!(
-            ConsoleState::detect_url("http://localhost:3000/api?key=val"),
+            RunOutput::detect_url("http://localhost:3000/api?key=val"),
             Some("http://localhost:3000/api?key=val".to_string())
         );
     }
@@ -45552,7 +44661,7 @@ mod tests {
     fn detect_url_quoted_url() {
         // Double-quote should terminate the URL
         assert_eq!(
-            ConsoleState::detect_url(r#"Visit "http://localhost:8080/app" now"#),
+            RunOutput::detect_url(r#"Visit "http://localhost:8080/app" now"#),
             Some("http://localhost:8080/app".to_string())
         );
     }
@@ -45561,7 +44670,7 @@ mod tests {
     fn detect_url_256_color_ansi() {
         // 256-color ANSI: ESC[38;5;82m
         assert_eq!(
-            ConsoleState::detect_url("\x1b[38;5;82mhttp://localhost:4000\x1b[0m"),
+            RunOutput::detect_url("\x1b[38;5;82mhttp://localhost:4000\x1b[0m"),
             Some("http://localhost:4000".to_string())
         );
     }
@@ -45809,13 +44918,13 @@ mod tests {
     #[test]
     fn strip_ansi_bare_escape() {
         // Lone ESC without [ should skip ESC + next char
-        assert_eq!(ConsoleState::strip_ansi("\x1bXhello"), "hello");
+        assert_eq!(RunOutput::strip_ansi("\x1bXhello"), "hello");
     }
 
     #[test]
     fn strip_ansi_preserves_non_escape_content() {
         let input = "line1\nline2\ttab";
-        assert_eq!(ConsoleState::strip_ansi(input), input);
+        assert_eq!(RunOutput::strip_ansi(input), input);
     }
 
     #[cfg(feature = "stt")]
@@ -46432,7 +45541,22 @@ mod tests {
             terminal: None,
             title: None,
             cwd: cwd.to_path_buf(),
+            alive: true,
+            run: None,
         }
+    }
+
+    fn test_run_tab(id: usize, repo: RepoId, command: &str, alive: bool) -> BottomTerminal {
+        let mut bt = test_bottom_terminal(id, Path::new("/tmp/tru180-not-a-folder/app"));
+        bt.title = Some(command.to_string());
+        bt.alive = alive;
+        bt.run = Some(RunTab {
+            repo,
+            command: command.to_string(),
+            detected_url: None,
+            next_url_scan: Instant::now(),
+        });
+        bt
     }
 
     fn local(dir: &Path) -> WorkspaceLocation {
@@ -46460,31 +45584,20 @@ mod tests {
         let mut registry = RepoRegistry::default();
         let mut first = RepoSeed::new(Some("npm run dev".into()));
         first.env = fake_env(&[("TEAM", "PRJ")]);
-        first
-            .bottom_terminals
-            .push(test_bottom_terminal(1, &checkout));
         let (a, a_overrides) = registry.attach(checkout.clone(), local(&checkout), first);
         assert!(a_overrides.is_empty());
 
         let mut second = RepoSeed::new(Some("cargo run".into()));
         second.env = fake_env(&[("TEAM", "OPS")]);
-        second.bottom_terminals.push(test_bottom_terminal(2, &link));
         let (b, b_overrides) = registry.attach(link.clone(), local(&link), second);
 
         assert_eq!(a, b);
         assert_eq!(registry.iter().count(), 1);
         let repo = registry.get(a).unwrap();
-        // The open repo keeps its console and env; the joiner's terminals
-        // join it and its differing env comes back as its overrides.
-        assert_eq!(repo.console.run_command.as_deref(), Some("npm run dev"));
+        // The open repo keeps its run command and env; the joiner's
+        // differing env comes back as its overrides.
+        assert_eq!(repo.run_command.as_deref(), Some("npm run dev"));
         assert_eq!(repo.env["TEAM"], "PRJ");
-        assert_eq!(
-            repo.bottom_terminals
-                .iter()
-                .map(|bt| bt.id)
-                .collect::<Vec<_>>(),
-            [1, 2]
-        );
         assert_eq!(b_overrides, fake_env(&[("TEAM", "OPS")]));
 
         // Another folder, or the same path on a remote machine, is not.
@@ -46503,28 +45616,96 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_stops_when_the_last_workspace_listing_it_closes() {
+    fn a_repo_is_released_when_the_last_workspace_listing_it_closes() {
         let mut registry = RepoRegistry::default();
         let dir = PathBuf::from("/tmp/tru180-not-a-folder/app");
-        let mut seed = RepoSeed::new(None);
-        seed.bottom_terminals.push(test_bottom_terminal(7, &dir));
-        let (id, _) = registry.attach(dir.clone(), local(&dir), seed);
+        let (id, _) = registry.attach(dir.clone(), local(&dir), RepoSeed::new(Some("make".into())));
         let (shared, _) = registry.attach(dir.clone(), local(&dir), RepoSeed::new(None));
         assert_eq!(id, shared);
 
-        // Two workspaces list it; one closes: it keeps running.
+        // Two workspaces list it; one closes: it stays.
         let both: HashSet<RepoId> = [id].into_iter().collect();
         assert!(registry.release_unlisted(&both).is_empty());
         assert!(registry.get(id).is_some());
 
-        // The last one closes: it is released, terminals and all, and its
-        // settings can be stored for the closed workspace.
+        // The last one closes: it is released, and its settings can be
+        // stored for the closed workspace. Terminals are never a repo's.
         let released = registry.release_unlisted(&HashSet::new());
         assert_eq!(released.len(), 1);
         assert!(registry.get(id).is_none());
         let stored = repo_config_of(&released[0]).unwrap();
         assert_eq!(stored.dir, dir.to_string_lossy());
-        assert_eq!(stored.bottom_terminals.len(), 1);
+        assert_eq!(stored.run_command.as_deref(), Some("make"));
+        assert!(stored.bottom_terminals.is_empty());
+    }
+
+    #[test]
+    fn a_run_action_opens_one_tab_and_then_reuses_it() {
+        let api = RepoId(1);
+        let web = RepoId(2);
+        let mut terminals = vec![test_bottom_terminal(1, Path::new("/w/home"))];
+        // No run tab for the repo yet (a plain terminal is not one): open.
+        assert_eq!(
+            run_tab_action(&terminals, api, "npm run dev"),
+            RunTabAction::Open
+        );
+        terminals.push(test_run_tab(2, api, "npm run dev", true));
+        // Its tab is alive: show it, never a second tab.
+        assert_eq!(
+            run_tab_action(&terminals, api, "npm run dev"),
+            RunTabAction::Focus(1)
+        );
+        // Another repo's command gets its own tab.
+        assert_eq!(
+            run_tab_action(&terminals, web, "cargo run"),
+            RunTabAction::Open
+        );
+        // The command exited, or was edited since: run it again in that tab.
+        terminals[1].alive = false;
+        assert_eq!(
+            run_tab_action(&terminals, api, "npm run dev"),
+            RunTabAction::Restart(1)
+        );
+        terminals[1].alive = true;
+        assert_eq!(
+            run_tab_action(&terminals, api, "npm run start"),
+            RunTabAction::Restart(1)
+        );
+    }
+
+    #[test]
+    fn a_new_bottom_terminal_opens_in_the_workspace_home() {
+        let home = Path::new("/w/work/launch");
+        assert_eq!(new_bottom_terminal_dir(home, None), home);
+        // `+ ▾` may pick a listed repo instead.
+        assert_eq!(
+            new_bottom_terminal_dir(home, Some(PathBuf::from("/w/api"))),
+            PathBuf::from("/w/api")
+        );
+    }
+
+    #[test]
+    fn closing_a_bottom_terminal_keeps_a_sensible_selection() {
+        // Closing one before the selection shifts it down.
+        assert_eq!(bottom_selection_after_close(Some(2), 0, 2), Some(1));
+        // Closing one after it leaves it.
+        assert_eq!(bottom_selection_after_close(Some(0), 1, 2), Some(0));
+        // Closing the selected one selects the next, or the last.
+        assert_eq!(bottom_selection_after_close(Some(1), 1, 2), Some(1));
+        assert_eq!(bottom_selection_after_close(Some(2), 2, 2), Some(1));
+        // The last one closes: nothing selected.
+        assert_eq!(bottom_selection_after_close(Some(0), 0, 0), None);
+        assert_eq!(bottom_selection_after_close(None, 0, 1), None);
+    }
+
+    #[test]
+    fn a_run_tab_finds_its_url_in_recent_output() {
+        let output = "compiling\n  Local:   http://localhost:5173/\nready";
+        assert_eq!(
+            run_output_url(output).as_deref(),
+            Some("http://localhost:5173/")
+        );
+        assert_eq!(run_output_url("no url here\n"), None);
     }
 
     #[test]

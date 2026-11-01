@@ -439,22 +439,22 @@ mod tests {
         }"#;
         let mut file: WorkspacesFile = serde_json::from_str(json).unwrap();
         file.normalize_repos();
-        // One repo: the first open workspace wins its settings, the second
-        // open one's terminals join, the parked one adds none.
+        // One repo: the first open workspace wins its settings. Each
+        // workspace keeps its own bottom terminals.
         assert_eq!(file.repos.len(), 1);
         let repo = &file.repos[0];
         assert_eq!(repo.run_command.as_deref(), Some("npm run dev"));
-        assert_eq!(
-            repo.bottom_terminals,
-            [
-                BottomTerminalConfig {
-                    dir: "/w/shared".into()
-                },
-                BottomTerminalConfig {
-                    dir: "/w/shared/sub".into()
-                },
-            ]
-        );
+        assert!(repo.bottom_terminals.is_empty());
+        let dirs = |idx: usize| -> Vec<&str> {
+            file.workspaces[idx]
+                .bottom_terminals
+                .iter()
+                .map(|bt| bt.dir.as_str())
+                .collect()
+        };
+        assert_eq!(dirs(0), ["/w/shared/parked"]);
+        assert_eq!(dirs(1), ["/w/shared"]);
+        assert_eq!(dirs(2), ["/w/shared/sub"]);
         // The second's differing env became its overrides; each tab env
         // keeps what its workspace had (plus keys the repo adds).
         assert_eq!(file.workspaces[2].env_overrides["TEAM"], "OPS");
@@ -462,6 +462,68 @@ mod tests {
         assert_eq!(file.workspace_env("second", None)["TEAM"], "OPS");
         assert_eq!(file.workspace_env("parked", None)["TEAM"], "PARKED");
         assert_eq!(file.workspace_env("second", None)["ONLY_FIRST"], "1");
+    }
+
+    #[test]
+    fn terminals_kept_on_repos_go_to_every_workspace_listing_them() {
+        // As the build that kept bottom terminals on repos wrote it: each
+        // workspace's own `bottom_terminals` is a copy of its home's.
+        let json = r#"{
+          "workspaces": [
+            { "name": "one", "abbrev": "ON", "dir": "/w/shared", "color": "red",
+              "tabs": [], "home": "/w/shared", "repos": ["/w/shared", "/w/api"],
+              "bottom_terminals": [{ "dir": "/w/shared" }, { "dir": "/w/shared/sub" }] },
+            { "name": "two", "abbrev": "TW", "dir": "/w/api", "color": "blue",
+              "tabs": [], "home": "/w/api", "repos": ["/w/api", "/w/shared"],
+              "bottom_terminals": [{ "dir": "/w/api" }] },
+            { "name": "parked", "abbrev": "PA", "dir": "/w/shared", "color": "green",
+              "tabs": [], "active": false, "home": "/w/shared", "repos": ["/w/shared"],
+              "bottom_terminals": [{ "dir": "/w/shared" }, { "dir": "/w/shared/sub" }] },
+            { "name": "solo", "abbrev": "SO", "dir": "/w/solo", "color": "teal",
+              "tabs": [], "home": "/w/solo", "repos": ["/w/solo"],
+              "bottom_terminals": [] }
+          ],
+          "repos": [
+            { "dir": "/w/shared", "run_command": "npm run dev",
+              "bottom_terminals": [{ "dir": "/w/shared" }, { "dir": "/w/shared/sub" }] },
+            { "dir": "/w/api", "bottom_terminals": [{ "dir": "/w/api" }] },
+            { "dir": "/w/solo", "bottom_terminals": [] }
+          ],
+          "active_workspace": 0
+        }"#;
+        let mut file: WorkspacesFile = serde_json::from_str(json).unwrap();
+        file.normalize_repos();
+        let dirs = |file: &WorkspacesFile, idx: usize| -> Vec<String> {
+            file.workspaces[idx]
+                .bottom_terminals
+                .iter()
+                .map(|bt| bt.dir.clone())
+                .collect()
+        };
+        // Every terminal is kept; a repo listed by several workspaces gives
+        // its terminals to each, home's first.
+        assert_eq!(dirs(&file, 0), ["/w/shared", "/w/shared/sub", "/w/api"]);
+        assert_eq!(dirs(&file, 1), ["/w/api", "/w/shared", "/w/shared/sub"]);
+        assert_eq!(dirs(&file, 2), ["/w/shared", "/w/shared/sub"]);
+        assert!(dirs(&file, 3).is_empty());
+        // The repos keep their settings and no longer hold terminals.
+        assert!(file
+            .repos
+            .iter()
+            .all(|repo| repo.bottom_terminals.is_empty()));
+        assert_eq!(file.repos[0].run_command.as_deref(), Some("npm run dev"));
+
+        // Written back, terminals are only the workspaces'; loading that
+        // again changes nothing.
+        let json = serde_json::to_string_pretty(&file).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(raw["repos"][0].get("bottom_terminals").is_none());
+        assert_eq!(raw["workspaces"][1]["bottom_terminals"][0]["dir"], "/w/api");
+        let mut read: WorkspacesFile = serde_json::from_str(&json).unwrap();
+        read.normalize_repos();
+        for idx in 0..4 {
+            assert_eq!(dirs(&read, idx), dirs(&file, idx));
+        }
     }
 
     #[test]
@@ -1306,18 +1368,18 @@ pub struct WorkspacesFile {
     /// and restarts; empty (every zone expanded) by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed_repo_groups: Vec<String>,
-    /// The repos workspaces list (TRU-180): a checkout's run command, env
-    /// and bottom terminals, shared by every workspace listing it. Files
-    /// written before TRU-180 have none; `normalize_repos` derives them
-    /// from each workspace's own fields.
+    /// The repos workspaces list (TRU-180): a checkout's run command and
+    /// env, shared by every workspace listing it. Files written before
+    /// TRU-180 have none; `normalize_repos` derives them from each
+    /// workspace's own fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<RepoConfig>,
 }
 
 /// A repo as `workspaces.json` stores it (TRU-180). Identified by `dir` on
-/// its machine (`location`; `None` is this Mac), see `RepoKey`. Its
-/// runtime (console process, PTYs) exists only while an open workspace
-/// lists it; this entry persists while any workspace does.
+/// its machine (`location`; `None` is this Mac), see `RepoKey`. It is
+/// open while an open workspace lists it; this entry persists while any
+/// workspace does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoConfig {
     pub dir: String,
@@ -1325,11 +1387,14 @@ pub struct RepoConfig {
     pub location: Option<WorkspaceLocationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_command: Option<String>,
-    /// Environment for terminals, tabs and the console running in this
-    /// repo; a workspace's `env_overrides` apply on top.
+    /// Environment for terminals and tabs running in this repo; a
+    /// workspace's `env_overrides` apply on top.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
-    #[serde(default)]
+    /// Read only: the build that kept bottom terminals on repos wrote
+    /// them here. `WorkspacesFile::normalize_repos` hands them to the
+    /// workspaces listing the repo; terminals are each workspace's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bottom_terminals: Vec<BottomTerminalConfig>,
 }
 
@@ -1525,10 +1590,10 @@ pub struct WorkspaceConfig {
     /// The home repo's dir, where new chats start; `dir` until set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,
-    /// Env applied on top of a repo's env for this workspace's tabs,
-    /// terminals and console (TRU-180). `env`, `run_command` and
-    /// `bottom_terminals` above are still written, from the home repo
-    /// (env with these applied), so a build before TRU-180 reads them.
+    /// Env applied on top of a repo's env for this workspace's tabs and
+    /// terminals (TRU-180). `env` and `run_command` above are still
+    /// written, from the home repo (env with these applied), so a build
+    /// before TRU-180 reads them; `bottom_terminals` is the workspace's.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env_overrides: HashMap<String, String>,
     /// Repos added by hand ("+ add repo"); listed whatever the chats touch.
@@ -1574,14 +1639,14 @@ impl WorkspaceConfig {
     }
 
     /// The home repo's settings as this entry's own (pre-TRU-180) fields
-    /// hold them.
+    /// hold them. Its terminals stay the workspace's.
     pub fn own_home_repo(&self) -> RepoConfig {
         RepoConfig {
             dir: self.home_dir().to_string(),
             location: self.location.clone(),
             run_command: self.run_command.clone(),
             env: self.env.clone(),
-            bottom_terminals: self.bottom_terminals.clone(),
+            bottom_terminals: Vec::new(),
         }
     }
 }
@@ -1641,12 +1706,21 @@ impl WorkspacesFile {
     /// each workspace lists its `dir` as home and only repo, and a home
     /// with no `repos` entry gets one from the workspace's own fields.
     /// Open workspaces go first, in file order, so the first open one
-    /// sharing a dir wins its run command and env; a later open one's
-    /// differing env becomes its overrides and its bottom terminals join
-    /// the repo's. A closed one sharing that dir joins without adding
-    /// terminals: the open repo's set is the one it resumes into.
-    /// Entries already in `repos` are left as stored.
+    /// sharing a dir wins its run command and env; a later one's
+    /// differing env becomes its overrides. Entries already in `repos`
+    /// are left as stored.
+    ///
+    /// Bottom terminals are each workspace's own `bottom_terminals`. A
+    /// file from the build that kept them on repos (`repos[].bottom_terminals`)
+    /// gives each workspace the terminals of every repo it lists, home
+    /// first: a repo's terminals shared by several workspaces go to each.
     pub fn normalize_repos(&mut self) {
+        let repo_terminals: Vec<(RepoKey, Vec<BottomTerminalConfig>)> = self
+            .repos
+            .iter_mut()
+            .map(|repo| (repo.key(), std::mem::take(&mut repo.bottom_terminals)))
+            .collect();
+        let terminals_on_repos = repo_terminals.iter().any(|(_, t)| !t.is_empty());
         let mut created: Vec<RepoKey> = Vec::new();
         let order: Vec<usize> = (0..self.workspaces.len())
             .filter(|&i| self.workspaces[i].active)
@@ -1670,13 +1744,30 @@ impl WorkspacesFile {
                     for (k, v) in env_difference(&ws.env, &repo.env) {
                         ws.env_overrides.entry(k).or_insert(v);
                     }
-                    if ws.active {
-                        repo.bottom_terminals
-                            .extend(ws.bottom_terminals.iter().cloned());
-                    }
                 }
                 Some(_) => {}
             }
+        }
+        if !terminals_on_repos {
+            return;
+        }
+        for ws in &mut self.workspaces {
+            let stored = |dir: &String| {
+                let key = ws.repo_key(dir)?;
+                repo_terminals.iter().find(|(k, _)| *k == key)
+            };
+            // A home the repo section never held (a legacy remote, an entry
+            // an older build added) keeps the workspace's own terminals.
+            if ws.repos.first().and_then(stored).is_none() {
+                continue;
+            }
+            let terminals: Vec<BottomTerminalConfig> = ws
+                .repos
+                .iter()
+                .filter_map(stored)
+                .flat_map(|(_, terminals)| terminals.iter().cloned())
+                .collect();
+            ws.bottom_terminals = terminals;
         }
     }
 
