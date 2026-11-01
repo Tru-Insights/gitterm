@@ -113,6 +113,7 @@ fn load_github_accounts_from(dir: &Path) -> BTreeMap<String, String> {
 pub fn print_instance_info() {
     eprintln!("{APP_NAME} instance: {}", instance_id());
     eprintln!("Config directory: {}", instance_config_dir().display());
+    eprintln!("Settings: {}", Config::settings_path().display());
     if let Some(dir) = config_dir_override() {
         eprintln!("Config dir override ({CONFIG_DIR_ENV}): {}", dir.display());
     }
@@ -172,6 +173,23 @@ mod tests {
             serde_json::to_value(&off).unwrap()["guidelines_off"],
             serde_json::json!(true)
         );
+        // Claude in Chrome is off unless the workspace switched it on
+        // (TRU-181); off writes nothing.
+        assert!(!cfg.claude_in_chrome);
+        assert!(written.get("claude_in_chrome").is_none());
+        let chrome: WorkspaceConfig = serde_json::from_str(&old.replace(
+            r#""active": false"#,
+            r#""active": false, "claude_in_chrome": true"#,
+        ))
+        .unwrap();
+        assert!(chrome.claude_in_chrome);
+        let json = serde_json::to_string(&chrome).unwrap();
+        let back: WorkspaceConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.claude_in_chrome);
+        assert_eq!(
+            serde_json::to_value(&back).unwrap()["claude_in_chrome"],
+            serde_json::json!(true)
+        );
 
         // An open workspace is never on the Parked list.
         let open: WorkspaceConfig =
@@ -198,6 +216,177 @@ mod tests {
         let bare: ParkedInfo =
             serde_json::from_str(r#"{"parked_at":"2026-10-30T09:00:00+00:00"}"#).unwrap();
         assert_eq!(bare.note, "");
+    }
+
+    /// Writes `instance-<id>/config.json` under `dir` with `contents`,
+    /// modified `age_secs` seconds ago.
+    fn write_instance_config(dir: &Path, id: &str, contents: &str, age_secs: u64) {
+        let instance = dir.join(format!("instance-{id}"));
+        std::fs::create_dir_all(&instance).unwrap();
+        let path = instance.join(INSTANCE_CONFIG_FILE);
+        std::fs::write(&path, contents).unwrap();
+        let modified = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    #[test]
+    fn settings_round_trip_through_the_shared_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            theme: "light".into(),
+            terminal_font_size: 16.0,
+            ..Config::default()
+        };
+        config.chat.default_model = "sonnet".into();
+        config.chat.default_effort = Some("high".into());
+        config.chat.remember_model("haiku");
+        config.chat.gemini_model = "gemini-test".into();
+        config.notifications.needs_you = false;
+        config.review.default_reviewer = ReviewerKind::Codex;
+        save_settings_to(dir.path(), &config).unwrap();
+
+        let path = dir.path().join(SETTINGS_FILE);
+        assert!(path.is_file());
+        // No temporary file is left beside it.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [SETTINGS_FILE]);
+
+        let loaded = load_settings_from(dir.path());
+        assert_eq!(loaded.refused, None);
+        let back = loaded.config;
+        assert_eq!(back.theme, "light");
+        assert_eq!(back.terminal_font_size, 16.0);
+        assert_eq!(back.chat, config.chat);
+        assert_eq!(back.notifications, config.notifications);
+        assert_eq!(back.review, config.review);
+        assert_eq!(back.policy, config.policy);
+        assert_eq!(back.usage, config.usage);
+        // The default worktree root is not pinned in the shared file.
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw.get("task_worktree_root").is_none(), "{raw}");
+        assert_eq!(back.task_worktree_root, default_task_worktree_root());
+
+        // A hand-written file with only some settings loads with the rest
+        // defaulted.
+        std::fs::write(&path, r#"{"chat":{"default_model":"sonnet"}}"#).unwrap();
+        let partial = load_settings_from(dir.path());
+        assert_eq!(partial.refused, None);
+        assert_eq!(partial.config.chat.default_model, "sonnet");
+        assert_eq!(partial.config.theme, "dark");
+        assert!(partial.config.notifications.needs_you);
+    }
+
+    #[test]
+    fn carry_over_picks_the_newest_instance_with_settings_and_runs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // The newest file has no settings (an instance that wrote nothing
+        // of them), the next is malformed; the older one with settings wins
+        // over the oldest.
+        write_instance_config(dir.path(), "400", r#"{"theme":"light"}"#, 10);
+        write_instance_config(dir.path(), "300", "not json", 20);
+        write_instance_config(
+            dir.path(),
+            "200",
+            r#"{"theme":"light","chat":{"default_model":"sonnet"},"notifications":{"needs_you":false}}"#,
+            30,
+        );
+        write_instance_config(
+            dir.path(),
+            "100",
+            r#"{"theme":"dark","chat":{"default_model":"haiku"}}"#,
+            40,
+        );
+        // Not an instance dir: ignored.
+        std::fs::create_dir_all(dir.path().join("worktrees")).unwrap();
+        std::fs::write(
+            dir.path().join("worktrees").join(INSTANCE_CONFIG_FILE),
+            r#"{"theme":"dark","chat":{"default_model":"opus"}}"#,
+        )
+        .unwrap();
+
+        let first = load_settings_from(dir.path());
+        assert_eq!(first.refused, None);
+        assert_eq!(first.config.chat.default_model, "sonnet");
+        assert_eq!(first.config.theme, "light");
+        assert!(!first.config.notifications.needs_you);
+        // The shared file now holds them.
+        let path = dir.path().join(SETTINGS_FILE);
+        let written: Config =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.chat.default_model, "sonnet");
+
+        // A newer instance config appearing later does not run it again:
+        // the shared file wins.
+        write_instance_config(
+            dir.path(),
+            "500",
+            r#"{"theme":"dark","chat":{"default_model":"haiku"}}"#,
+            0,
+        );
+        let second = load_settings_from(dir.path());
+        assert_eq!(second.config.chat.default_model, "sonnet");
+        assert_eq!(second.config.theme, "light");
+    }
+
+    #[test]
+    fn carry_over_without_earlier_settings_writes_the_defaults_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = load_settings_from(dir.path());
+        assert_eq!(loaded.refused, None);
+        assert_eq!(loaded.config.chat, ChatDefaults::default());
+        assert!(dir.path().join(SETTINGS_FILE).is_file());
+        // An instance config found afterwards is not carried over.
+        write_instance_config(
+            dir.path(),
+            "100",
+            r#"{"theme":"light","chat":{"default_model":"haiku"}}"#,
+            0,
+        );
+        let again = load_settings_from(dir.path());
+        assert_eq!(again.config.chat, ChatDefaults::default());
+        assert_eq!(again.config.theme, "dark");
+    }
+
+    #[test]
+    fn a_malformed_shared_file_is_refused_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let malformed = r#"{"chat": {"default_model": "sonnet",}"#;
+        std::fs::write(&path, malformed).unwrap();
+        // An instance config with settings is not carried over in its place.
+        write_instance_config(
+            dir.path(),
+            "100",
+            r#"{"theme":"light","chat":{"default_model":"haiku"}}"#,
+            0,
+        );
+
+        let loaded = load_settings_from(dir.path());
+        let reason = loaded.refused.expect("a malformed file is refused");
+        assert!(reason.contains(SETTINGS_FILE), "{reason}");
+        assert!(reason.contains("malformed"), "{reason}");
+        // The run uses the defaults, not the instance config.
+        assert_eq!(loaded.config.chat, ChatDefaults::default());
+        assert_eq!(loaded.config.theme, "dark");
+        // The file is untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), malformed);
+
+        // A well-formed file of the wrong shape is refused too.
+        std::fs::write(&path, r#"{"chat": "sonnet"}"#).unwrap();
+        assert!(load_settings_from(dir.path()).refused.is_some());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"chat": "sonnet"}"#
+        );
     }
 
     #[test]
@@ -336,6 +525,7 @@ mod tests {
         let old: WorkspacesFile = serde_json::from_str(OLD_WORKSPACES_JSON).unwrap();
         assert_eq!(old.workspaces.len(), 2);
         assert!(old.workspaces.iter().all(|ws| ws.chats.is_empty()));
+        assert!(old.workspaces.iter().all(|ws| !ws.claude_in_chrome));
         assert_eq!(old.workspaces[0].env["LINEAR_TEAM"], "PRJ");
         assert!(!old.workspaces[1].active);
         // Without chats nothing new is written.
@@ -801,6 +991,15 @@ mod tests {
     fn acp_chat_models_default_and_parse() {
         let chat: ChatDefaults = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(chat.gemini_model, "gemini-4-argon");
+        // The global Claude in Chrome switch of earlier builds is ignored
+        // (it is per workspace now) and not written back.
+        let earlier: ChatDefaults =
+            serde_json::from_value(serde_json::json!({"claude_in_chrome": true})).unwrap();
+        assert_eq!(earlier, ChatDefaults::default());
+        assert!(serde_json::to_value(&earlier)
+            .unwrap()
+            .get("claude_in_chrome")
+            .is_none());
         assert_eq!(chat.opencode_model, "");
         let chat: ChatDefaults = serde_json::from_value(serde_json::json!({
             "gemini_model": "gemini-3.8-flash",
@@ -902,6 +1101,14 @@ pub fn task_worktree_root_for_config_root(config_root: &Path) -> PathBuf {
     config_root.join("worktrees")
 }
 
+fn is_default_task_worktree_root(root: &Path) -> bool {
+    *root == default_task_worktree_root()
+}
+
+fn default_theme() -> String {
+    "dark".to_string()
+}
+
 fn default_terminal_font() -> f32 {
     14.0
 }
@@ -955,7 +1162,8 @@ fn default_max_concurrent_local_tasks() -> usize {
     4
 }
 
-// Persistent configuration
+// Persistent configuration: the shared `settings.json` (TRU-181), see
+// `SETTINGS_FILE`. Every field is a setting the user expects to keep.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_terminal_font")]
@@ -969,6 +1177,8 @@ pub struct Config {
     // Legacy field for migration
     #[serde(default)]
     pub font_size: Option<f32>,
+    /// Defaulted so a hand-written `settings.json` may leave it out.
+    #[serde(default = "default_theme")]
     pub theme: String,
     #[serde(default)]
     pub show_hidden: bool,
@@ -990,7 +1200,13 @@ pub struct Config {
     pub agent_presets: Vec<AgentPreset>,
     #[serde(default)]
     pub quick_commands: Vec<QuickCommand>,
-    #[serde(default = "default_task_worktree_root")]
+    /// Written only when changed from the default: the shared
+    /// `settings.json` must not pin one config dir's worktree root, so a
+    /// copy of it in another (isolated) config dir keeps its own.
+    #[serde(
+        default = "default_task_worktree_root",
+        skip_serializing_if = "is_default_task_worktree_root"
+    )]
     pub task_worktree_root: PathBuf,
     /// How many local tasks may run agent sessions at once. Dispatching past
     /// the limit queues the task; capacity release starts the next in FIFO
@@ -1019,7 +1235,7 @@ pub struct Config {
 }
 
 /// Which macOS notifications GitTerm posts (TRU-148). Edit the
-/// `notifications` object in `config.json`:
+/// `notifications` object in `settings.json`:
 ///
 /// ```json
 /// "notifications": { "needs_you": true }
@@ -1050,11 +1266,10 @@ fn default_gemini_model() -> String {
 }
 
 /// What a new chat tab starts with (TRU-143). The app has no settings
-/// panel; edit the `chat` object in `config.json`:
+/// panel; edit the `chat` object in `settings.json`:
 ///
 /// ```json
-/// "chat": { "default_model": "opus", "default_effort": "high", "remember_last": true,
-///           "claude_in_chrome": true }
+/// "chat": { "default_model": "opus", "default_effort": "high", "remember_last": true }
 /// ```
 ///
 /// `default_model` is a Claude model alias (`default` leaves the choice to
@@ -1062,11 +1277,11 @@ fn default_gemini_model() -> String {
 /// levels (`low`, `medium`, `high`, `xhigh`, `max`), or absent for the
 /// model's own default. With `remember_last`, a new chat starts with the
 /// model and effort last picked on any chat (`last`, written by the app)
-/// instead of the defaults. `claude_in_chrome` starts chats with Claude in
-/// Chrome (the CLI's `--chrome`), which drives the user's own Chrome through
-/// the extension; headless Claude ignores the CLI's own "on by default"
-/// setting, so GitTerm passes the flag. Chats also keep GitTerm's browser,
-/// a separate Chrome profile.
+/// instead of the defaults.
+///
+/// Claude in Chrome is per workspace (`WorkspaceConfig::claude_in_chrome`,
+/// TRU-181); a `claude_in_chrome` key here, from an earlier build, is
+/// ignored.
 ///
 /// `gemini_model` and `opencode_model` are what new Gemini and OpenCode
 /// chats start on (TRU-153): a model id as the agent lists it, such as
@@ -1084,8 +1299,6 @@ pub struct ChatDefaults {
     /// not per workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<ChatSelection>,
-    #[serde(default = "default_true")]
-    pub claude_in_chrome: bool,
     #[serde(default = "default_gemini_model")]
     pub gemini_model: String,
     #[serde(default)]
@@ -1107,7 +1320,6 @@ impl Default for ChatDefaults {
             default_effort: None,
             remember_last: true,
             last: None,
-            claude_in_chrome: true,
             gemini_model: default_gemini_model(),
             opencode_model: String::new(),
         }
@@ -1323,32 +1535,165 @@ impl Default for Config {
     }
 }
 
+/// The user's settings (TRU-181): every `Config` field, in the shared config
+/// dir, so they survive restarts and every instance reads the same ones.
+/// Before TRU-181 they lived in the per-instance `instance-<pid>/config.json`,
+/// which starts empty on every launch; that file is no longer written (it
+/// held no per-launch state). Follows the pattern of `github-accounts.json`
+/// and `agent-guidelines.json`.
+///
+/// Carry-over: when this file is missing, it is built once from the newest
+/// `instance-*/config.json` holding the settings (`CARRY_OVER_KEYS`), or
+/// from the defaults when there is none, and written. This file wins after
+/// that. A file that cannot be read or parsed is logged and never
+/// overwritten: the run uses the defaults and saves are refused.
+pub const SETTINGS_FILE: &str = "settings.json";
+
+/// The per-instance config file settings lived in before TRU-181; read
+/// only for the carry-over.
+const INSTANCE_CONFIG_FILE: &str = "config.json";
+
+/// The keys that mark an instance `config.json` as one a build with these
+/// settings wrote; any one of them is enough.
+const CARRY_OVER_KEYS: [&str; 4] = ["chat", "notifications", "usage", "policy"];
+
+fn settings_log(msg: &str) {
+    eprintln!("[settings] {msg}");
+}
+
+/// The settings a run starts with, and whether it may write them back.
+#[derive(Debug)]
+pub struct LoadedSettings {
+    pub config: Config,
+    /// Set when `settings.json` exists but cannot be read or parsed: the
+    /// run uses the defaults and must not write the file.
+    pub refused: Option<String>,
+}
+
 impl Config {
-    pub fn config_path() -> PathBuf {
-        instance_config_dir().join("config.json")
+    pub fn settings_path() -> PathBuf {
+        global_config_dir().join(SETTINGS_FILE)
     }
 
-    pub fn load() -> Self {
-        let path = Self::config_path();
-        if path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str(&contents) {
-                    return config;
-                }
-            }
-        }
-        Self::default()
+    /// `settings.json` from the shared config dir, carried over from the
+    /// newest instance config the first time it is missing.
+    pub fn load() -> LoadedSettings {
+        load_settings_from(&global_config_dir())
     }
 
-    pub fn save(&self) {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
-        }
+    /// Write `settings.json` atomically.
+    pub fn save(&self) -> Result<(), String> {
+        save_settings_to(&global_config_dir(), self)
     }
+}
+
+fn load_settings_from(dir: &Path) -> LoadedSettings {
+    let path = dir.join(SETTINGS_FILE);
+    let refuse = |reason: String| {
+        let reason = format!(
+            "{reason}; using the default settings for this run and not writing {}. \
+             Fix or remove the file and restart",
+            path.display()
+        );
+        settings_log(&reason);
+        LoadedSettings {
+            config: Config::default(),
+            refused: Some(reason),
+        }
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str::<Config>(&contents) {
+            Ok(config) => LoadedSettings {
+                config,
+                refused: None,
+            },
+            Err(error) => refuse(format!("{} is malformed: {error}", path.display())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => carry_over_settings(dir),
+        Err(error) => refuse(format!("cannot read {}: {error}", path.display())),
+    }
+}
+
+/// Builds `settings.json` the first time it is missing: from the newest
+/// instance config holding the settings, else from the defaults. Writing
+/// it makes this a one-time step; a failed write is logged and retried on
+/// the next save.
+fn carry_over_settings(dir: &Path) -> LoadedSettings {
+    let config = match newest_instance_settings(dir) {
+        Some((config, source)) => {
+            settings_log(&format!(
+                "carried the settings over from {}",
+                source.display()
+            ));
+            config
+        }
+        None => {
+            settings_log("no earlier settings found; starting from the defaults");
+            Config::default()
+        }
+    };
+    if let Err(error) = save_settings_to(dir, &config) {
+        settings_log(&format!("cannot write the carried-over settings: {error}"));
+    }
+    LoadedSettings {
+        config,
+        refused: None,
+    }
+}
+
+/// The settings in the most recently modified `instance-*/config.json`
+/// under `dir` that holds any of `CARRY_OVER_KEYS`, with its path. Files
+/// that cannot be read or parsed are logged and skipped.
+fn newest_instance_settings(dir: &Path) -> Option<(Config, PathBuf)> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            settings_log(&format!(
+                "cannot list {} for earlier settings: {error}",
+                dir.display()
+            ));
+            return None;
+        }
+    };
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("instance-"))
+        .map(|entry| entry.path().join(INSTANCE_CONFIG_FILE))
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    // Newest first; the path breaks ties so the pick is stable.
+    candidates.sort_by(|a, b| b.cmp(a));
+    candidates.into_iter().find_map(|(_, path)| {
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|error| settings_log(&format!("skipping {}: {error}", path.display())))
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_str(&contents)
+            .map_err(|error| settings_log(&format!("skipping {}: {error}", path.display())))
+            .ok()?;
+        let has_settings = value
+            .as_object()
+            .is_some_and(|object| CARRY_OVER_KEYS.iter().any(|key| object.contains_key(*key)));
+        if !has_settings {
+            return None;
+        }
+        let config = serde_json::from_value::<Config>(value)
+            .map_err(|error| settings_log(&format!("skipping {}: {error}", path.display())))
+            .ok()?;
+        Some((config, path))
+    })
+}
+
+fn save_settings_to(dir: &Path, config: &Config) -> Result<(), String> {
+    let path = dir.join(SETTINGS_FILE);
+    let json = serde_json::to_vec_pretty(config)
+        .map_err(|error| format!("cannot encode {}: {error}", path.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    gitterm::merge_plan::write_atomically(&path, &json)
 }
 
 // Workspace persistence
@@ -1582,6 +1927,12 @@ pub struct WorkspaceConfig {
     /// (TRU-174). See `gitterm::guidelines`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guidelines_off: bool,
+    /// Claude sessions started in this workspace get Claude in Chrome
+    /// (`--chrome`); off (`--no-chrome`) by default, so agents use GitTerm's
+    /// own browser tools (TRU-181). Read when a Claude process starts; a
+    /// running one keeps what it started with.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claude_in_chrome: bool,
     /// The repos this workspace lists, by dir on its machine, home first
     /// (TRU-180). Their settings live in `WorkspacesFile::repos`. Files
     /// written before TRU-180 have none: `normalize_repos` makes `[dir]`.

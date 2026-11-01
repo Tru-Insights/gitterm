@@ -131,7 +131,7 @@ fn codex_seed() -> RoleModels {
 }
 
 /// Which model each worker role gets, per provider (`policy` in
-/// `config.json`). Seeded with Tracey's table (2026-10-08): coordinator
+/// `settings.json`). Seeded with Tracey's table (2026-10-08): coordinator
 /// Opus 5.5 / GPT-6.1 Sol; scoped worker Sonnet / GPT-6 Luna; judgment
 /// worker Opus 5.5 / GPT-6.1 Sol; specialist Fable / GPT-6 Astra.
 ///
@@ -295,7 +295,7 @@ pub fn resolve_worker(
             Some(model) => {
                 return Err(format!(
                     "the model policy's {} {} model {model:?} is not a model name; fix policy in \
-                     config.json",
+                     settings.json",
                     provider.label(),
                     role.label()
                 ))
@@ -496,7 +496,7 @@ mod tests {
         );
         policy.codex.scoped = Some("GPT 6".into());
         let error = resolve_worker(&presets(), None, None, None, &policy).unwrap_err();
-        assert!(error.contains("fix policy in config.json"), "{error}");
+        assert!(error.contains("fix policy in settings.json"), "{error}");
     }
 
     #[test]

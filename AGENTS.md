@@ -255,9 +255,11 @@ Windows CI exists.
 
 ### Persistence
 
-- Config: `~/.config/gitterm-v6/config.json` (global) +
-  `~/.config/gitterm-v6/instance-<pid>/config.json` (per-instance). Per-instance
-  values override globals.
+- Settings: `~/.config/gitterm-v6/settings.json`, shared by every instance and
+  kept across restarts (TRU-181); see `config::SETTINGS_FILE`. It is built
+  once from the newest `instance-<pid>/config.json` (where settings lived
+  before) when missing. A malformed file is logged and never overwritten.
+  `instance-<pid>/` holds per-launch state only and is removed on exit.
 - Workspaces: `~/.config/gitterm-v6/workspaces.json`.
 - All paths resolved via `dirs::home_dir()` — on Windows that's
   `%USERPROFILE%\.config\gitterm-v6\`.
@@ -268,9 +270,9 @@ Windows CI exists.
   the first-launch import (`src/config_import.rs`), which copies from
   `~/.config/gitterm-v5` (or `GITTERM_V5_CONFIG_DIR`) and never writes there.
 - **A second instance must never share the real config dir.** Tracey runs the
-  installed V5 all day. `workspaces.json`, `tasks.json`, `profiles.json`,
-  `remote-agents.json`, `browser-profile/`, `worktrees/` and `task-briefs/`
-  are shared across instances and each instance writes back its whole view
+  installed V5 all day. `workspaces.json`, `settings.json`, `tasks.json`,
+  `profiles.json`, `remote-agents.json`, `browser-profile/`, `worktrees/` and
+  `task-briefs/` are shared across instances and each instance writes back its whole view
   (last writer wins), so a dev or test launch against `~/.config/gitterm-v6`
   can erase or resurrect tabs, tasks and chat sessions in the running app and
   contend for the Chrome profile lock. Every dev/test launch, by an agent or

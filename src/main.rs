@@ -5453,6 +5453,9 @@ struct Workspace {
     claims_new_chats: bool,
     /// Agents started here get no change guidelines (TRU-174).
     guidelines_off: bool,
+    /// Claude sessions started here get Claude in Chrome (TRU-181); off by
+    /// default. See `WorkspaceConfig::claude_in_chrome`.
+    claude_in_chrome: bool,
 }
 
 impl Workspace {
@@ -5482,6 +5485,7 @@ impl Workspace {
             chats: Vec::new(),
             claims_new_chats: false,
             guidelines_off: false,
+            claude_in_chrome: false,
         }
     }
 
@@ -5515,6 +5519,7 @@ impl Workspace {
             chats: Vec::new(),
             claims_new_chats: false,
             guidelines_off: false,
+            claude_in_chrome: false,
         }
     }
 
@@ -6048,6 +6053,8 @@ pub enum Event {
     GuidelinesWorkspaceToggled(bool),
     GuidelinesRepoToggled(bool),
     GuidelinesEdit,
+    /// The workspace settings modal's Claude in Chrome switch (TRU-181).
+    ClaudeInChromeToggled(bool),
     // Slide animation events
     SlideAnimationTick,
     // Edge peek events
@@ -6591,7 +6598,7 @@ struct App {
     attention_pulse_bright: bool,
     /// Background needs-you transitions → macOS notifications (TRU-148).
     needs_you_notifier: NeedsYouNotifier,
-    /// `notifications` from config.json, written back on save.
+    /// `notifications` from settings.json, written back on save.
     notifications_config: config::NotificationsConfig,
     // Track modifier state for filtering terminal writes
     current_modifiers: Modifiers,
@@ -6749,9 +6756,12 @@ struct App {
     /// Ranking snippets per transcript (path, mtime, size), shared with
     /// the ranking task that reads them off the UI thread.
     chat_snippets: Arc<Mutex<chat_rank::SnippetCache>>,
-    /// Usage panel (TRU-145). Price overrides from config.json, written
+    /// Usage panel (TRU-145). Price overrides from settings.json, written
     /// back on save.
     usage_config: gitterm::usage::UsageConfig,
+    /// Why `settings.json` must not be written this run (TRU-181): it
+    /// exists but could not be read or parsed. `None` saves normally.
+    settings_refused: Option<String>,
     /// The full-window Usage view: open or not, and its repo filter.
     usage_view: UsageViewState,
     usage_window: gitterm::usage::UsageWindow,
@@ -7989,7 +7999,14 @@ impl App {
         ))
     }
 
+    /// Writes the settings to the shared `settings.json` (TRU-181). Refused,
+    /// with a log line, when the file was malformed at startup, so a bad
+    /// edit is never replaced by this run's defaults.
     fn save_config(&self) {
+        if let Some(reason) = &self.settings_refused {
+            eprintln!("[settings] not saving: {reason}");
+            return;
+        }
         let started = Instant::now();
         let config = Config {
             terminal_font_size: self.terminal_font_size,
@@ -8019,7 +8036,9 @@ impl App {
             usage: self.usage_config.clone(),
             notifications: self.notifications_config.clone(),
         };
-        config.save();
+        if let Err(error) = config.save() {
+            eprintln!("[settings] cannot save the settings: {error}");
+        }
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(100) {
             freeze_debug!("save_config took {}ms", elapsed.as_millis());
@@ -8109,6 +8128,7 @@ impl App {
             parked: None,
             done_at: None,
             guidelines_off: ws.guidelines_off,
+            claude_in_chrome: ws.claude_in_chrome,
             repos: ws
                 .repos
                 .iter()
@@ -9065,7 +9085,13 @@ impl App {
                 return Task::none();
             }
         };
-        let chrome = self.chat_config.claude_in_chrome;
+        // Attaching starts no process; the config carries the workspace's
+        // choice for consistency with a start (TRU-181).
+        let chrome = self
+            .workspaces
+            .iter()
+            .find(|ws| ws.tabs.iter().any(|t| t.id == tab_id))
+            .is_some_and(|ws| ws.claude_in_chrome);
         let history = self.start_agent_history_load(tab_id);
         let Some(tab) = self
             .workspaces
@@ -9372,6 +9398,23 @@ impl App {
                     .iter()
                     .find(|cfg| cfg.name == name)
                     .map(|cfg| cfg.guidelines_off)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether Claude sessions started in the workspace named `name` get
+    /// Claude in Chrome (TRU-181); a workspace that is not open reads its
+    /// saved entry. Off unless switched on.
+    fn workspace_claude_in_chrome(&self, name: &str) -> bool {
+        self.workspaces
+            .iter()
+            .find(|ws| ws.name == name)
+            .map(|ws| ws.claude_in_chrome)
+            .or_else(|| {
+                self.closed_workspace_configs
+                    .iter()
+                    .find(|cfg| cfg.name == name)
+                    .map(|cfg| cfg.claude_in_chrome)
             })
             .unwrap_or(false)
     }
@@ -12399,6 +12442,7 @@ impl App {
             ws.env_overrides = cfg.env_overrides.clone();
             ws.chats = cfg.chats.clone();
             ws.guidelines_off = cfg.guidelines_off;
+            ws.claude_in_chrome = cfg.claude_in_chrome;
             if let Some(config::WorkspaceLocationConfig::RemoteAgent {
                 remote_id,
                 workspace_id,
@@ -15772,6 +15816,7 @@ impl App {
         workspace.abbrev = ws_config.abbrev.clone();
         workspace.chats = ws_config.chats.clone();
         workspace.guidelines_off = ws_config.guidelines_off;
+        workspace.claude_in_chrome = ws_config.claude_in_chrome;
         // The home repo's saved env and run command (TRU-180).
         self.seed_from_saved(&mut workspace, ws_config);
 
@@ -16088,7 +16133,10 @@ impl App {
 
     fn new() -> (Self, Task<Event>) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let config = Config::load();
+        let config::LoadedSettings {
+            config,
+            refused: settings_refused,
+        } = Config::load();
         let task_commands = init_task_control_channel();
         let task_store_path = TaskStore::path_for_config_root(&config::global_config_dir());
         let (mut task_store, task_store_error) = match load_task_store_for_startup(
@@ -16468,6 +16516,7 @@ impl App {
             chat_rank: chat_rank::ChatRankState::default(),
             chat_snippets: Arc::new(Mutex::new(chat_rank::SnippetCache::default())),
             usage_config: config.usage.clone(),
+            settings_refused,
             usage_view: UsageViewState::default(),
             usage_window: gitterm::usage::UsageWindow::default(),
             usage_chart_tokens: false,
@@ -16827,6 +16876,13 @@ impl App {
                 .unwrap_or_else(|| "/bin/zsh -il".to_string()),
             (None, None) => "/bin/zsh -il".to_string(),
         };
+        // A Claude launch on the remote gets the workspace's Claude in
+        // Chrome choice too (TRU-181); other commands are unchanged.
+        let remote_command = gitterm::harness::claude::configure_terminal_chrome(
+            &remote_command,
+            self.active_workspace()
+                .is_some_and(|ws| ws.claude_in_chrome),
+        );
         // Start the session in the directory the user is browsing — but
         // only when that browser state belongs to this source (an attach
         // tab's browser is local and would be meaningless on the remote).
@@ -17189,6 +17245,13 @@ fi
             .map(|ws| ws.guidelines_off)
             .or_else(|| saved_ws.map(|cfg| cfg.guidelines_off))
             .unwrap_or(false);
+        // The same for Claude in Chrome (TRU-181), off unless switched on.
+        let claude_in_chrome = ws_name
+            .as_deref()
+            .and_then(|name| self.workspaces.iter().find(|ws| ws.name == name))
+            .map(|ws| ws.claude_in_chrome)
+            .or_else(|| saved_ws.map(|cfg| cfg.claude_in_chrome))
+            .unwrap_or(false);
         // The env of the repo holding the tab's folder, with the
         // workspace's overrides (TRU-180).
         let mut extra_env: Vec<(String, String)> = ws_name
@@ -17212,9 +17275,10 @@ fi
             .collect();
 
         // Added at launch only: the stored startup command stays as given.
-        let launch_command = startup_command
-            .as_deref()
-            .map(|command| terminal_command_with_guidelines(command, &repo_path, guidelines_off));
+        let launch_command = startup_command.as_deref().map(|command| {
+            let command = terminal_command_with_guidelines(command, &repo_path, guidelines_off);
+            gitterm::harness::claude::configure_terminal_chrome(&command, claude_in_chrome)
+        });
         let settings = Self::build_terminal_settings(
             &repo_path,
             launch_command.as_deref(),
@@ -17270,9 +17334,14 @@ fi
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
+        // A run command that starts Claude gets the workspace's Claude in
+        // Chrome choice (TRU-181); `run.command` stays as given.
+        let chrome = self.workspace_claude_in_chrome(ws_name);
+        let launch_command = command
+            .map(|command| gitterm::harness::claude::configure_terminal_chrome(command, chrome));
         let settings = Self::build_terminal_settings(
             &cwd,
-            command,
+            launch_command.as_deref(),
             self.scrollback_lines,
             &self.theme,
             self.terminal_font_size,
@@ -17801,6 +17870,7 @@ fi
             workspace.dir = PathBuf::from(&saved.dir);
             workspace.chats = saved.chats.clone();
             workspace.guidelines_off = saved.guidelines_off;
+            workspace.claude_in_chrome = saved.claude_in_chrome;
             self.seed_from_saved(&mut workspace, saved);
             workspace
         } else {
@@ -20340,7 +20410,6 @@ fi
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
-                let claude_in_chrome = self.chat_config.claude_in_chrome;
                 // Find the tab. If it's an Agent tab, ensure a subprocess
                 // manager is spawned (lazy on first prompt) and forward the
                 // prompt. The first spawn returns a Task that bridges the
@@ -20425,6 +20494,9 @@ fi
                     };
                 'outer_submit: for ws in &mut self.workspaces {
                     let guidelines_off = ws.guidelines_off;
+                    // Read as the process starts; a running chat keeps
+                    // what it started with (TRU-181).
+                    let claude_in_chrome = ws.claude_in_chrome;
                     for t in &mut ws.tabs {
                         if t.id != tab_id {
                             continue;
@@ -26554,6 +26626,7 @@ fi
                 if let Some(ref cfg) = saved {
                     workspace.abbrev = cfg.abbrev.clone();
                     workspace.guidelines_off = cfg.guidelines_off;
+                    workspace.claude_in_chrome = cfg.claude_in_chrome;
                     self.seed_from_saved(&mut workspace, cfg);
                 }
                 self.add_tab_to_workspace_with_command(
@@ -26612,6 +26685,15 @@ fi
                     self.next_workspace_save_at = Some(Instant::now());
                 }
                 self.refresh_guidelines_markers();
+            }
+            Event::ClaudeInChromeToggled(on) => {
+                // Applies to Claude sessions started from now on; running
+                // ones keep what they started with.
+                if let Some(ws) = self.workspaces.get_mut(self.workspace_settings_idx) {
+                    ws.claude_in_chrome = on;
+                    self.workspaces_dirty = true;
+                    self.next_workspace_save_at = Some(Instant::now());
+                }
             }
             Event::GuidelinesEdit => {
                 match gitterm::guidelines::ensure_guidelines_file(&config::global_config_dir()) {
@@ -27733,6 +27815,7 @@ fi
 
         // Recreate bottom panel terminals; a run tab runs its command again.
         for ws in self.workspaces.iter_mut() {
+            let chrome = ws.claude_in_chrome;
             for bt in ws.bottom_terminals.iter_mut() {
                 let bt_browser_environment =
                     browser_environment(Some(&bottom_terminal_caller(bt.id)));
@@ -27740,9 +27823,13 @@ fi
                     .iter()
                     .map(|(key, value)| (key.as_str(), value.as_str()))
                     .collect();
+                // As `create_bottom_terminal_for` (TRU-181).
+                let run_command = bt.run.as_ref().map(|run| {
+                    gitterm::harness::claude::configure_terminal_chrome(&run.command, chrome)
+                });
                 let settings = Self::build_terminal_settings(
                     &bt.cwd,
-                    bt.run.as_ref().map(|run| run.command.as_str()),
+                    run_command.as_deref(),
                     scrollback,
                     &theme,
                     font_size,
@@ -29954,6 +30041,23 @@ fi
             ));
         }
 
+        // --- Claude in Chrome (TRU-181) ---
+        let chrome_col = column![
+            text("Claude in Chrome").size(12).color(accent).font(mono),
+            guidelines_check(
+                ws.claude_in_chrome,
+                "Start Claude sessions in this workspace with Claude in Chrome".to_string(),
+                Event::ClaudeInChromeToggled,
+            ),
+            text(
+                "Off: agents use GitTerm's browser. Applies to Claude sessions started \
+                 from now on; a running chat keeps its setting until it restarts."
+            )
+            .size(11)
+            .color(text_muted),
+        ]
+        .spacing(6);
+
         // --- Compose card ---
         let card_content = column![
             title,
@@ -29963,6 +30067,8 @@ fi
             profile_row,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             guidelines_col,
+            container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
+            chrome_col,
             container(iced::widget::Space::new()).height(Length::Fixed(16.0)),
             section_label,
             gh_account_hint,
@@ -42945,6 +43051,73 @@ mod tests {
         );
     }
 
+    /// Claude in Chrome is off unless the workspace switches it on
+    /// (TRU-181), on every path GitTerm starts Claude by.
+    #[test]
+    fn claude_launches_pass_no_chrome_unless_the_workspace_switch_is_on() {
+        use gitterm::harness::claude::configure_terminal_chrome;
+        let mut workspace = Workspace::new(
+            "work".to_string(),
+            PathBuf::from("/repo"),
+            WorkspaceColor::Blue,
+        );
+        assert!(!workspace.claude_in_chrome);
+        let has = |args: &[String], flag: &str| args.iter().any(|arg| arg == flag);
+
+        for on in [false, true] {
+            workspace.claude_in_chrome = on;
+            let (want, not) = if on {
+                ("--chrome", "--no-chrome")
+            } else {
+                ("--no-chrome", "--chrome")
+            };
+            let chrome = workspace.claude_in_chrome;
+
+            // Native chat: a new chat and a resumed one.
+            let chat = AgentSession::new(new_claude_chat_config(&config::ChatDefaults::default()));
+            let args = chat
+                .claude_session_config(PathBuf::from("/repo"), Vec::new(), chrome, None)
+                .unwrap()
+                .args();
+            assert!(has(&args, want) && !has(&args, not), "{args:?}");
+            let resumed = resumed_claude_chat_session(&config::ChatDefaults::default(), "3f2a");
+            let args = resumed
+                .claude_session_config(PathBuf::from("/repo"), Vec::new(), chrome, None)
+                .unwrap()
+                .args();
+            assert!(has(&args, want) && !has(&args, not), "{args:?}");
+            assert!(has(&args, "--resume=3f2a"), "{args:?}");
+
+            // Terminal-hosted: a preset launch, a task worker with its
+            // brief, and a task conversation resume.
+            let (preset, _) = App::with_preassigned_session_id("claude");
+            let launch = configure_terminal_chrome(&preset, chrome);
+            assert!(launch.starts_with(&format!("claude {want} --session-id ")));
+            let worker = command_with_initial_prompt(
+                "claude --session-id abc",
+                Path::new("/cfg/task-briefs/abc.md"),
+            );
+            assert_eq!(
+                configure_terminal_chrome(&worker, chrome),
+                format!("claude {want} --session-id abc \"$(cat '/cfg/task-briefs/abc.md')\"")
+            );
+            let resume = conversation_resume_command(&HarnessConversationRef {
+                backend: HarnessConversationBackend::Claude,
+                session_id: "abc".to_string(),
+            });
+            let launch = configure_terminal_chrome(&resume, chrome);
+            assert!(launch.starts_with(&format!("claude {want} ")), "{launch}");
+            assert!(launch.ends_with("abc"), "{launch}");
+
+            // Other harnesses are untouched.
+            let codex = conversation_resume_command(&HarnessConversationRef {
+                backend: HarnessConversationBackend::Codex,
+                session_id: "abc".to_string(),
+            });
+            assert_eq!(configure_terminal_chrome(&codex, chrome), codex);
+        }
+    }
+
     #[test]
     fn task_context_supports_multiple_distinct_child_sessions() {
         let mut workspace = Workspace::new(
@@ -45336,7 +45509,6 @@ mod tests {
                 model: "sonnet".to_string(),
                 effort: None,
             }),
-            claude_in_chrome: true,
             ..config::ChatDefaults::default()
         };
         let session = resumed_claude_chat_session(&defaults, "3f2a");
@@ -45363,6 +45535,11 @@ mod tests {
             .expect("claude config");
         assert_eq!(spawn.resume.as_deref(), Some("3f2a"));
         assert_eq!(spawn.model.as_deref(), Some("opus"));
+        // Without the workspace's switch, the resume starts without Claude
+        // in Chrome (TRU-181).
+        let args = spawn.args();
+        assert!(args.contains(&"--no-chrome".to_string()), "{args:?}");
+        assert!(args.contains(&"--resume=3f2a".to_string()), "{args:?}");
 
         // A remembered selection wins, exactly as for "New chat".
         defaults.remember_last = true;
@@ -45490,6 +45667,7 @@ mod tests {
             }),
             done_at: None,
             guidelines_off: false,
+            claude_in_chrome: false,
             repos: vec![format!("/tmp/{name}")],
             home: None,
             env_overrides: HashMap::new(),

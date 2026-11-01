@@ -872,8 +872,10 @@ pub struct ClaudeSessionConfig {
     pub wire_log_dir: Option<PathBuf>,
     /// GitTerm MCP servers to attach (task and browser controls).
     pub mcp_servers: Vec<ClaudeMcpServer>,
-    /// Attach Claude in Chrome (`--chrome`). Headless Claude does not
-    /// apply the CLI's own default for it.
+    /// Claude in Chrome: `--chrome` when on, `--no-chrome` when off
+    /// (TRU-181). Off unless the chat's workspace switches it on: GitTerm's
+    /// own browser tools are the agents' browser. Always explicit, so the
+    /// CLI's own default never decides.
     pub chrome: bool,
     /// GitTerm's change guidelines (TRU-174), appended to Claude's system
     /// prompt with `--append-system-prompt-file`. The caller checks the
@@ -896,9 +898,7 @@ impl ClaudeSessionConfig {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        if self.chrome {
-            args.push("--chrome".into());
-        }
+        args.push(chrome_flag(self.chrome).into());
         if let Some(model) = &self.model {
             args.push("--model".into());
             args.push(model.clone());
@@ -928,6 +928,37 @@ impl ClaudeSessionConfig {
         }
         args
     }
+}
+
+/// The Claude in Chrome option for a launch (TRU-181).
+pub fn chrome_flag(chrome: bool) -> &'static str {
+    if chrome {
+        "--chrome"
+    } else {
+        "--no-chrome"
+    }
+}
+
+/// A terminal startup command with the Claude in Chrome option added right
+/// after the executable when it starts `claude` (TRU-181). A command that
+/// already passes `--chrome` or `--no-chrome` keeps that choice; any other
+/// command is returned unchanged.
+pub fn configure_terminal_chrome(command: &str, chrome: bool) -> String {
+    let trimmed = command.trim();
+    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let (executable, rest) = trimmed.split_at(end);
+    let name = executable
+        .trim_matches(['\'', '"'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(executable);
+    let chosen = rest
+        .split_whitespace()
+        .any(|word| word == "--chrome" || word == "--no-chrome");
+    if name != "claude" || chosen {
+        return command.to_string();
+    }
+    format!("{executable} {}{rest}", chrome_flag(chrome))
 }
 
 /// Directories where `claude` is commonly installed but that a Finder-
@@ -3102,13 +3133,15 @@ mod tests {
             guidelines_file: None,
         };
         let args = cfg.args().join(" ");
-        assert!(args.contains("--chrome"));
-        assert!(!ClaudeSessionConfig {
+        assert!(cfg.args().contains(&"--chrome".to_string()));
+        assert!(!cfg.args().contains(&"--no-chrome".to_string()));
+        let off = ClaudeSessionConfig {
             chrome: false,
             ..cfg.clone()
         }
-        .args()
-        .contains(&"--chrome".to_string()));
+        .args();
+        assert!(off.contains(&"--no-chrome".to_string()));
+        assert!(!off.contains(&"--chrome".to_string()));
         assert!(args.contains("--permission-prompt-tool stdio"));
         assert!(args.contains("--input-format stream-json"));
         assert!(args.contains("--include-partial-messages"));
@@ -3117,6 +3150,77 @@ mod tests {
         assert!(args.ends_with("--resume=sid"));
         assert!(!args.contains("--print"));
         assert!(!args.contains("--setting-sources"));
+    }
+
+    #[test]
+    fn a_resumed_or_remote_chat_carries_the_chrome_choice() {
+        // A resume (a chat reopened from the Chats panel or a restart).
+        let resumed = config_with(Vec::new());
+        assert!(resumed.args().contains(&"--no-chrome".to_string()));
+        assert!(resumed.args().contains(&"--resume=sid".to_string()));
+        assert!(ClaudeSessionConfig {
+            chrome: true,
+            ..resumed.clone()
+        }
+        .args()
+        .contains(&"--chrome".to_string()));
+        // A remote chat: the agent side starts with the same option.
+        let start = RemoteClaudeChatStart::from_config(&resumed).unwrap();
+        let agent = start.into_config(PathBuf::from("/tmp"));
+        assert!(agent.args().contains(&"--no-chrome".to_string()));
+        // An agent started by a build before TRU-181 sent `chrome: false`.
+        let older: RemoteClaudeChatStart = serde_json::from_value(json!({
+            "cwd": "/tmp", "model": null, "permission_mode": "default",
+            "effort": null, "resume": null, "chrome": false
+        }))
+        .unwrap();
+        assert!(older
+            .into_config(PathBuf::from("/tmp"))
+            .args()
+            .contains(&"--no-chrome".to_string()));
+    }
+
+    #[test]
+    fn terminal_claude_launches_get_the_chrome_option() {
+        assert_eq!(
+            configure_terminal_chrome("claude", false),
+            "claude --no-chrome"
+        );
+        assert_eq!(configure_terminal_chrome("claude", true), "claude --chrome");
+        // Resumes and worker launches with a brief.
+        assert_eq!(
+            configure_terminal_chrome("claude --resume abc", false),
+            "claude --no-chrome --resume abc"
+        );
+        assert_eq!(
+            configure_terminal_chrome("claude --session-id abc \"$(cat '/b.md')\"", false),
+            "claude --no-chrome --session-id abc \"$(cat '/b.md')\""
+        );
+        assert_eq!(
+            configure_terminal_chrome("/opt/bin/claude --model opus", true),
+            "/opt/bin/claude --chrome --model opus"
+        );
+        assert_eq!(
+            configure_terminal_chrome("'/opt/bin/claude' --resume abc", false),
+            "'/opt/bin/claude' --no-chrome --resume abc"
+        );
+        // A command that already chooses keeps its choice.
+        assert_eq!(
+            configure_terminal_chrome("claude --chrome --resume abc", false),
+            "claude --chrome --resume abc"
+        );
+        assert_eq!(
+            configure_terminal_chrome("claude --no-chrome", true),
+            "claude --no-chrome"
+        );
+        // Other harnesses and commands are untouched.
+        for command in ["codex resume --last", "pi --model x", "npm run dev", ""] {
+            assert_eq!(configure_terminal_chrome(command, false), command);
+        }
+        assert_eq!(
+            configure_terminal_chrome("claude-helper --x", false),
+            "claude-helper --x"
+        );
     }
 
     const SECRET: &str = "s3cret-bearer-value";
