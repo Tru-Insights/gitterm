@@ -2004,6 +2004,66 @@ async fn rev_list_counts(checkout: &Path, rev: &str) -> Result<Option<(u32, u32)
     Ok(parse_left_right(&text))
 }
 
+/// A checkout no overview row names, read as a row reads it: its main
+/// repo, branch and nearest base (TRU-179, a chat's edit card opening the
+/// review pane).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutFacts {
+    /// The main checkout (a linked worktree's repo), for its name.
+    pub repo: PathBuf,
+    /// `None` when detached.
+    pub branch: Option<String>,
+    pub base: Option<BaseChoice>,
+}
+
+/// Reads [`CheckoutFacts`] for `checkout` (its top level): the common git
+/// dir, `status --branch` headers, then the base candidates measured as
+/// [`read_checkout`] measures them.
+pub async fn checkout_facts(checkout: &Path) -> Result<CheckoutFacts, String> {
+    let common = git_text(
+        checkout,
+        &[
+            "--no-optional-locks",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    let common = PathBuf::from(common.trim());
+    let repo = match common.file_name() {
+        Some(name) if name == ".git" => common
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| checkout.to_path_buf()),
+        // A bare repo's worktree: the repo is the git dir itself.
+        _ => common,
+    };
+    let mut counts = StatusCounts::default();
+    // Headers come first; the first entry line ends the read.
+    run_git_lines(
+        checkout,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "--branch",
+        ],
+        GIT_TIMEOUT,
+        |line| counts.observe(line, 1),
+    )
+    .await?;
+    let mut candidates = base_candidates(None, counts.head.as_deref(), counts.upstream.as_deref());
+    let mut git_runs = 0;
+    let measured = measure_bases(checkout, &mut candidates, &mut git_runs).await?;
+    Ok(CheckoutFacts {
+        repo,
+        branch: counts.head,
+        base: choose_nearest(&candidates, &measured).map(|(base, _)| base),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Review sources.
 

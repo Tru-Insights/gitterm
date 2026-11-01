@@ -215,6 +215,11 @@ pub enum AgentIpcMessage {
     },
     /// A message from the review pane's page on the Viewer (TRU-178).
     Review(gitterm::review_pane::ReviewIpc),
+    /// An edit card's Open in review (TRU-179): the absolute file it edited.
+    OpenReview {
+        tab_id: usize,
+        path: PathBuf,
+    },
     /// A global shortcut typed while the chat page had keyboard focus, so
     /// the key never reached the Iced key handler (TRU-140). Only chords
     /// `global_shortcut` knows get here.
@@ -986,6 +991,13 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     path: PathBuf::from(path),
                 }
             }
+            "open_review" => match gitterm::review_pane::chat_review_path(&value) {
+                Ok(path) => AgentIpcMessage::OpenReview { tab_id, path },
+                Err(e) => {
+                    eprintln!("[agent-ipc] tab {tab_id}: {e}");
+                    return;
+                }
+            },
             "hostkey" => {
                 let (key, modifiers) = match hostkey_chord(&value) {
                     Ok(chord) => chord,
@@ -1775,6 +1787,9 @@ struct ReviewPaneState {
     nonce: String,
     /// "Hide tests & generated", kept across a source switch.
     hide_noise: bool,
+    /// The checkout-relative file the page scrolls to (opened from a
+    /// chat's edit card, TRU-179), kept across a source switch.
+    focus: Option<String>,
     /// The diff and the canonical checkout its viewed marks are keyed by.
     loaded: Option<(review_pane::ReviewDiff, PathBuf)>,
     error: Option<String>,
@@ -6259,6 +6274,8 @@ pub enum Event {
     ReviewOpen(PathBuf, overview::DiffSource),
     /// A review load finished, for this generation.
     ReviewLoaded(u64, Box<Result<review_pane::ReviewLoad, String>>),
+    /// A chat tab's Open in review resolved its file's checkout (TRU-179).
+    ReviewOpenFromChat(usize, Box<Result<review_pane::EditReview, String>>),
     /// The review pane's Close (the Iced header or Escape).
     ReviewClose,
     /// Fold or unfold a root chat's children in the Chats panel.
@@ -12997,25 +13014,26 @@ impl App {
     /// workspace's overview: a loading page at once in the Viewer surface,
     /// the diff read off the UI thread.
     fn open_review(&mut self, checkout: PathBuf, source: overview::DiffSource) -> Task<Event> {
-        let Some(row) = self.overview_key().and_then(|dir| {
+        let Some(target) = self.overview_review_target(&checkout) else {
+            return Task::none();
+        };
+        let hide_noise = self.review_hide_noise(&checkout);
+        self.start_review(target, source, hide_noise, None)
+    }
+
+    /// The review target of the active workspace overview's owned row for
+    /// `checkout`, if it lists one.
+    fn overview_review_target(&self, checkout: &Path) -> Option<review_pane::ReviewTarget> {
+        let row = self.overview_key().and_then(|dir| {
             self.workspace_overviews.get(&dir).and_then(|state| {
                 state
                     .branches
                     .iter()
                     .find(|row| row.owned.checkout == checkout && !row.owned.gone)
-                    .cloned()
             })
-        }) else {
-            return Task::none();
-        };
-        // Reopening the same checkout keeps the toggle where it was.
-        let hide_noise = self
-            .review_pane
-            .as_ref()
-            .filter(|pane| pane.target.checkout == checkout)
-            .is_none_or(|pane| pane.hide_noise);
-        let target = review_pane::ReviewTarget {
-            checkout,
+        })?;
+        Some(review_pane::ReviewTarget {
+            checkout: checkout.to_path_buf(),
             repo: overview::folder_name(&row.owned.repo),
             branch: row
                 .owned
@@ -13024,8 +13042,74 @@ impl App {
                 .unwrap_or_else(|| "(detached)".to_string()),
             owner: row.owner_label(),
             base: row.base.clone(),
+        })
+    }
+
+    /// "Hide tests & generated" for a pane opening on `checkout`: reopening
+    /// the same checkout keeps the toggle where it was; on by default.
+    fn review_hide_noise(&self, checkout: &Path) -> bool {
+        self.review_pane
+            .as_ref()
+            .filter(|pane| pane.target.checkout == checkout)
+            .is_none_or(|pane| pane.hide_noise)
+    }
+
+    /// An edit card's Open in review (TRU-179): the review pane on the
+    /// checkout holding `file`, scrolled to it. The checkout's facts and
+    /// the file's state are read off the UI thread; whatever cannot open
+    /// says why in the chat.
+    fn open_review_from_chat(&mut self, tab_id: usize, file: PathBuf) -> Task<Event> {
+        // A remote chat's paths are not files on this Mac (TRU-152).
+        if self.tab_remote_id(tab_id).is_some() {
+            eprintln!(
+                "[review] open_review {} from remote tab {tab_id} refused",
+                file.display()
+            );
+            agent_webview_note(
+                tab_id,
+                "A remote chat's files cannot be reviewed from here.",
+            );
+            return Task::none();
+        }
+        let Some(checkout) = review_pane::checkout_containing(&file) else {
+            eprintln!(
+                "[review] open_review: no git checkout contains {}",
+                file.display()
+            );
+            agent_webview_note(
+                tab_id,
+                &format!(
+                    "Not opened in review: no git checkout contains {}.",
+                    file.display()
+                ),
+            );
+            return Task::none();
         };
-        self.start_review(target, source, hide_noise)
+        let known = self.overview_review_target(&checkout);
+        Task::perform(
+            review_pane::resolve_edit_review(checkout, file, known),
+            move |result| Event::ReviewOpenFromChat(tab_id, Box::new(result)),
+        )
+    }
+
+    fn review_opened_from_chat(
+        &mut self,
+        tab_id: usize,
+        result: Result<review_pane::EditReview, String>,
+    ) -> Task<Event> {
+        match result {
+            Ok(open) => {
+                // A test or generated file stays in sight.
+                let hide_noise = self.review_hide_noise(&open.target.checkout)
+                    && !review_pane::classify_path(&open.focus).is_noise();
+                self.start_review(open.target, open.source, hide_noise, Some(open.focus))
+            }
+            Err(error) => {
+                eprintln!("[review] open_review from tab {tab_id}: {error}");
+                agent_webview_note(tab_id, &format!("Not opened in review: {error}"));
+                Task::none()
+            }
+        }
     }
 
     /// Shows the review pane's loading page for `target` and starts reading
@@ -13035,6 +13119,7 @@ impl App {
         target: review_pane::ReviewTarget,
         source: overview::DiffSource,
         hide_noise: bool,
+        focus: Option<String>,
     ) -> Task<Event> {
         self.review_generation += 1;
         let generation = self.review_generation;
@@ -13045,6 +13130,7 @@ impl App {
             token: uuid::Uuid::new_v4().simple().to_string(),
             nonce: uuid::Uuid::new_v4().simple().to_string(),
             hide_noise,
+            focus,
             loaded: None,
             error: None,
         });
@@ -13167,6 +13253,7 @@ impl App {
             hide_noise: pane.hide_noise,
             token: &pane.token,
             nonce: &pane.nonce,
+            focus: pane.focus.as_deref(),
         });
         let bounds = self.calculate_webview_bounds();
         self.show_viewer_html(html, bounds, ViewerWebview::Review)
@@ -13199,7 +13286,8 @@ impl App {
                     return Task::none();
                 }
                 let target = pane.target.clone();
-                self.start_review(target, source, hide_noise)
+                let focus = pane.focus.clone();
+                self.start_review(target, source, hide_noise, focus)
             }
             ReviewIpc::SetViewed { path, viewed, .. } => {
                 let Some((file, canonical)) = pane.loaded.as_ref().and_then(|(diff, canonical)| {
@@ -19739,6 +19827,9 @@ fi
                         Task::none()
                     }
                     AgentIpcMessage::Review(message) => self.handle_review_ipc(message),
+                    AgentIpcMessage::OpenReview { tab_id, path } => {
+                        self.open_review_from_chat(tab_id, path)
+                    }
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
@@ -24655,6 +24746,9 @@ fi
             }
             Event::ReviewLoaded(generation, result) => {
                 return self.review_loaded(generation, *result);
+            }
+            Event::ReviewOpenFromChat(tab_id, result) => {
+                return self.review_opened_from_chat(tab_id, *result);
             }
             Event::ReviewClose => {
                 if self.viewer_webview == ViewerWebview::Review {

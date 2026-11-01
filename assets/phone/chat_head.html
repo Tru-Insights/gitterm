@@ -28,8 +28,9 @@
   body.phone-act #toolbar .tb-send button { padding: 8px 18px; font-size: 15px; min-height: 38px; }
   /* 16px keeps iOS from zooming into the field on focus. */
   body.phone-act #prompt { font-size: 16px; max-height: 30vh; }
-  /* Withdrawing a queued message is the desktop's. */
-  .queued-tag button { display: none !important; }
+  /* Withdrawing a queued message is the desktop's, as is the review pane
+     an edit card opens. */
+  .queued-tag button, .tool-review { display: none !important; }
   /* Prompts show what Claude waits on; only an acting phone answers. */
   body:not(.phone-act) .rq-actions, body:not(.phone-act) .rq-options, body:not(.phone-act) .rq-other { display: none !important; }
   body.phone-act .rq-actions button, body.phone-act .rq-options button { min-height: 36px; }

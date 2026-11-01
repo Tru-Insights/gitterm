@@ -1668,6 +1668,118 @@ pub fn parse_ipc(body: &str) -> Result<ReviewIpc, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Opening from a chat (TRU-179).
+//
+// An Edit, MultiEdit or Write card in the chat page posts
+// `{"type": "open_review", "path": "<absolute file>"}`. The pane opens on
+// the checkout holding that file, scrolled to it.
+
+/// The file an `open_review` message from the chat page names: an absolute,
+/// normalized path (no `.` or `..` parts, no NUL).
+pub fn chat_review_path(message: &serde_json::Value) -> Result<PathBuf, String> {
+    let path = message
+        .get("path")
+        .and_then(|path| path.as_str())
+        .ok_or_else(|| format!("open_review without a path: {message}"))?;
+    let bad = !path.starts_with('/')
+        || path.contains('\0')
+        || path.split('/').any(|part| part == "." || part == "..");
+    if bad {
+        return Err(format!("open_review sent an invalid path {path:?}"));
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// The checkout `file` belongs to: its nearest ancestor holding a `.git`
+/// entry (the directory of a main checkout, or the file a linked worktree
+/// or submodule has). A worktree is its own checkout.
+pub fn checkout_containing(file: &Path) -> Option<PathBuf> {
+    file.ancestors()
+        .skip(1)
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// `file` relative to `checkout`, `/`-separated as git lists it.
+pub fn checkout_relative(checkout: &Path, file: &Path) -> Result<String, String> {
+    let rel = file
+        .strip_prefix(checkout)
+        .map_err(|_| format!("{} is not inside {}", file.display(), checkout.display()))?;
+    let parts: Vec<String> = rel
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.is_empty() {
+        return Err(format!("{} is the checkout itself", file.display()));
+    }
+    Ok(parts.join("/"))
+}
+
+/// Which view a file opens in: Uncommitted when it has uncommitted
+/// changes (or there is no base to compare with), else vs base.
+pub fn edit_review_source(uncommitted: bool, has_base: bool) -> DiffSource {
+    if uncommitted || !has_base {
+        DiffSource::Uncommitted
+    } else {
+        DiffSource::VsBase
+    }
+}
+
+/// What an `open_review` resolves to: the pane's target and source, and
+/// the checkout-relative file to scroll to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditReview {
+    pub target: ReviewTarget,
+    pub source: DiffSource,
+    pub focus: String,
+}
+
+/// Resolves an `open_review` for `file` in `checkout`. `known` is the
+/// overview's row for the checkout when there is one (its owner and base);
+/// otherwise the checkout is read as a row would be. Never call on the UI
+/// thread.
+pub async fn resolve_edit_review(
+    checkout: PathBuf,
+    file: PathBuf,
+    known: Option<ReviewTarget>,
+) -> Result<EditReview, String> {
+    let focus = checkout_relative(&checkout, &file)?;
+    let target = match known {
+        Some(target) => target,
+        None => {
+            let facts = crate::workspace_overview::checkout_facts(&checkout).await?;
+            ReviewTarget {
+                repo: crate::workspace_overview::folder_name(&facts.repo),
+                branch: facts.branch.unwrap_or_else(|| "(detached)".to_string()),
+                owner: "opened from a chat".to_string(),
+                base: facts.base,
+                checkout,
+            }
+        }
+    };
+    let pathspec = format!(":(literal){focus}");
+    let status = git_text(
+        &target.checkout,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            &pathspec,
+        ],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    let source = edit_review_source(!status.trim().is_empty(), target.base.is_some());
+    Ok(EditReview {
+        target,
+        source,
+        focus,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // The page.
 
 const PAGE_CSS: &str = include_str!("../assets/review_pane.css");
@@ -1715,6 +1827,9 @@ pub struct ReviewPage<'a> {
     pub token: &'a str,
     /// The CSP nonce for the page's inline style and scripts.
     pub nonce: &'a str,
+    /// A checkout-relative file the page scrolls to on load (a chat's edit
+    /// card opened the pane, TRU-179).
+    pub focus: Option<&'a str>,
 }
 
 fn plural(count: usize, one: &str) -> String {
@@ -1747,8 +1862,15 @@ pub fn render_page(page: &ReviewPage) -> String {
         "<style nonce=\"{nonce}\">\n{PAGE_CSS}\n</style>\n"
     ));
     html.push_str("</head>\n");
+    // The focused file, when this view lists it; the script scrolls there.
+    let focus = match (page.focus, page.state) {
+        (Some(path), PageState::Ready { diff, .. }) if diff.file(path).is_some() => {
+            format!(" data-focus=\"{}\"", escape_html(path))
+        }
+        _ => String::new(),
+    };
     html.push_str(&format!(
-        "<body class=\"{}\" data-token=\"{}\">\n",
+        "<body class=\"{}\" data-token=\"{}\"{focus}>\n",
         if page.hide_noise { "hide-noise" } else { "" },
         escape_html(page.token)
     ));
@@ -1842,6 +1964,23 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
         "<div class=\"facts\">{}</div>\n",
         facts.join(" \u{00B7} ")
     ));
+    if let (Some(path), PageState::Ready { diff, .. }) = (page.focus, page.state) {
+        if diff.file(path).is_none() {
+            let view = match page.source {
+                DiffSource::Uncommitted => "uncommitted changes",
+                DiffSource::VsBase => "changes against the base",
+            };
+            html.push_str(&format!(
+                "<div class=\"focus-note\">{} is not in the {view}{}.</div>\n",
+                escape_html(path),
+                if diff.unlisted > 0 {
+                    " (or is past the files listed)"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
 
     if let PageState::Ready { diff, .. } = page.state {
         let all = diff.totals.all();
@@ -2640,6 +2779,7 @@ mod tests {
             hide_noise: true,
             token: "tok\"en",
             nonce: "n0nce",
+            focus: None,
         });
         assert!(!html.contains("<img"), "an unescaped tag reached the page");
         assert!(!html.contains("onerror=alert(1)>"));
@@ -2683,6 +2823,7 @@ mod tests {
             hide_noise: false,
             token: "t",
             nonce: "n",
+            focus: None,
         });
         assert!(html.contains("class=\"file k-code s-modified viewed collapsed\" id=\"f0\""));
         assert!(html.contains("class=\"file k-code s-modified stale\" id=\"f1\""));
@@ -2705,6 +2846,7 @@ mod tests {
                 hide_noise: true,
                 token: "t",
                 nonce: "n",
+                focus: None,
             });
             assert!(html.contains("id=\"close\""));
             assert!(!html.contains("git <failed>"));
@@ -2875,5 +3017,171 @@ mod tests {
         assert!(load_review(target(&repo, None), DiffSource::VsBase)
             .await
             .is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Opening from a chat (TRU-179).
+
+    #[test]
+    fn chat_review_path_takes_only_normalized_absolute_paths() {
+        let ok =
+            serde_json::json!({"type": "open_review", "path": "/tmp/acme/src/a b.rs", "tabId": 3});
+        assert_eq!(
+            chat_review_path(&ok).unwrap(),
+            PathBuf::from("/tmp/acme/src/a b.rs")
+        );
+        for bad in [
+            serde_json::json!({"type": "open_review"}),
+            serde_json::json!({"type": "open_review", "path": 7}),
+            serde_json::json!({"type": "open_review", "path": ""}),
+            serde_json::json!({"type": "open_review", "path": "src/a.rs"}),
+            serde_json::json!({"type": "open_review", "path": "/tmp/acme/../etc/passwd"}),
+            serde_json::json!({"type": "open_review", "path": "/tmp/acme/./a.rs"}),
+            serde_json::json!({"type": "open_review", "path": "/tmp/acme/a\u{0}.rs"}),
+        ] {
+            assert!(chat_review_path(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn checkout_is_the_nearest_git_ancestor_and_a_worktree_is_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("acme");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        // A linked worktree inside the main checkout has a `.git` file.
+        let worktree = repo.join(".worktrees/acme-prj-7");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../.git/worktrees/acme-prj-7\n",
+        )
+        .unwrap();
+        assert_eq!(
+            checkout_containing(&repo.join("src/deep/a.rs")),
+            Some(repo.clone())
+        );
+        // The file need not exist (a Write that failed, a deleted file).
+        assert_eq!(
+            checkout_containing(&repo.join("new/b.rs")),
+            Some(repo.clone())
+        );
+        assert_eq!(
+            checkout_containing(&worktree.join("src/a.rs")),
+            Some(worktree.clone())
+        );
+        let outside = temp.path().join("loose/a.rs");
+        assert_eq!(
+            checkout_containing(&outside).filter(|found| found.starts_with(temp.path())),
+            None
+        );
+        assert_eq!(
+            checkout_relative(&worktree, &worktree.join("src/a.rs")).unwrap(),
+            "src/a.rs"
+        );
+        assert!(checkout_relative(&worktree, &repo.join("src/a.rs")).is_err());
+        assert!(checkout_relative(&worktree, &worktree).is_err());
+    }
+
+    #[test]
+    fn edit_review_prefers_uncommitted_then_vs_base() {
+        assert_eq!(edit_review_source(true, true), DiffSource::Uncommitted);
+        assert_eq!(edit_review_source(false, true), DiffSource::VsBase);
+        assert_eq!(edit_review_source(false, false), DiffSource::Uncommitted);
+    }
+
+    #[test]
+    fn page_scrolls_to_a_listed_focus_and_notes_a_missing_one() {
+        let (target, mut diff) = hostile_diff();
+        diff.files = vec![file("src/a.rs", FileKind::Code, 1, 0)];
+        diff.totals = ReviewTotals::of(&diff.files);
+        let viewed = [ViewedState::Unviewed];
+        let page = |focus| {
+            render_page(&ReviewPage {
+                target: &target,
+                source: DiffSource::Uncommitted,
+                state: PageState::Ready {
+                    diff: &diff,
+                    viewed: &viewed,
+                },
+                dark: true,
+                hide_noise: false,
+                token: "t",
+                nonce: "n",
+                focus,
+            })
+        };
+        let listed = page(Some("src/a.rs"));
+        assert!(listed.contains("data-focus=\"src/a.rs\""));
+        assert!(!listed.contains("class=\"focus-note\""));
+        let missing = page(Some("src/<b>.rs"));
+        assert!(!missing.contains("data-focus="));
+        assert!(missing.contains(
+            "<div class=\"focus-note\">src/&lt;b&gt;.rs is not in the uncommitted changes.</div>"
+        ));
+        let none = page(None);
+        assert!(!none.contains("data-focus=") && !none.contains("class=\"focus-note\""));
+    }
+
+    #[tokio::test]
+    async fn real_git_edit_review_resolves_a_worktree_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::worktree_follow::resolve_for_match(temp.path());
+        let repo = root.join("acme");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        let worktree = root.join("acme-prj-7");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "prj-7",
+                worktree.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::create_dir(worktree.join("src")).unwrap();
+        std::fs::write(worktree.join("src/done.rs"), "fn done() {}\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-q", "-m", "done"]);
+        std::fs::write(worktree.join("src/[wip].rs"), "fn wip() {}\n").unwrap();
+
+        let wip = worktree.join("src/[wip].rs");
+        let checkout = checkout_containing(&wip).unwrap();
+        assert_eq!(checkout, worktree);
+        let open = resolve_edit_review(checkout.clone(), wip, None)
+            .await
+            .unwrap();
+        assert_eq!(open.focus, "src/[wip].rs");
+        assert_eq!(open.source, DiffSource::Uncommitted, "untracked counts");
+        assert_eq!(open.target.checkout, worktree);
+        assert_eq!(open.target.repo, "acme");
+        assert_eq!(open.target.branch, "prj-7");
+        assert_eq!(
+            open.target.base.as_ref().map(|b| b.reference.as_str()),
+            Some("main")
+        );
+
+        // Committed, clean: vs base, which lists it.
+        let done = resolve_edit_review(checkout, worktree.join("src/done.rs"), None)
+            .await
+            .unwrap();
+        assert_eq!(done.source, DiffSource::VsBase);
+        let load = load_review(done.target.clone(), done.source).await.unwrap();
+        assert!(load.diff.file(&done.focus).is_some());
+
+        // A row's target is used as it is.
+        let known = target(&worktree, None);
+        let open = resolve_edit_review(worktree.clone(), worktree.join("a.txt"), Some(known))
+            .await
+            .unwrap();
+        assert_eq!(open.target.owner, "coordinator");
+        assert_eq!(open.source, DiffSource::Uncommitted, "no base to compare");
     }
 }
