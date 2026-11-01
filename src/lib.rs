@@ -22,6 +22,7 @@ pub mod task_mcp;
 pub mod task_worktree;
 pub mod tasks;
 pub mod usage;
+pub mod work_documents;
 pub mod workers;
 pub mod workspace_overview;
 pub mod workspace_repos;

@@ -1594,7 +1594,9 @@ mod tests {
                 title: Some("Fable review of identity design".into()),
             }],
             prs: Vec::new(),
+            documents: Vec::new(),
             backfilled: false,
+            documents_backfilled: false,
         });
         assert_eq!(
             entry.query_match("prj-102"),
