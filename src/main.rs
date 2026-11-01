@@ -6591,7 +6591,7 @@ struct App {
     attention_pulse_bright: bool,
     /// Background needs-you transitions → macOS notifications (TRU-148).
     needs_you_notifier: NeedsYouNotifier,
-    /// `notifications` from config.json, written back on save.
+    /// `notifications` from settings.json, written back on save.
     notifications_config: config::NotificationsConfig,
     // Track modifier state for filtering terminal writes
     current_modifiers: Modifiers,
@@ -6749,9 +6749,12 @@ struct App {
     /// Ranking snippets per transcript (path, mtime, size), shared with
     /// the ranking task that reads them off the UI thread.
     chat_snippets: Arc<Mutex<chat_rank::SnippetCache>>,
-    /// Usage panel (TRU-145). Price overrides from config.json, written
+    /// Usage panel (TRU-145). Price overrides from settings.json, written
     /// back on save.
     usage_config: gitterm::usage::UsageConfig,
+    /// Why `settings.json` must not be written this run (TRU-181): it
+    /// exists but could not be read or parsed. `None` saves normally.
+    settings_refused: Option<String>,
     /// The full-window Usage view: open or not, and its repo filter.
     usage_view: UsageViewState,
     usage_window: gitterm::usage::UsageWindow,
@@ -7989,7 +7992,14 @@ impl App {
         ))
     }
 
+    /// Writes the settings to the shared `settings.json` (TRU-181). Refused,
+    /// with a log line, when the file was malformed at startup, so a bad
+    /// edit is never replaced by this run's defaults.
     fn save_config(&self) {
+        if let Some(reason) = &self.settings_refused {
+            eprintln!("[settings] not saving: {reason}");
+            return;
+        }
         let started = Instant::now();
         let config = Config {
             terminal_font_size: self.terminal_font_size,
@@ -8019,7 +8029,9 @@ impl App {
             usage: self.usage_config.clone(),
             notifications: self.notifications_config.clone(),
         };
-        config.save();
+        if let Err(error) = config.save() {
+            eprintln!("[settings] cannot save the settings: {error}");
+        }
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(100) {
             freeze_debug!("save_config took {}ms", elapsed.as_millis());
@@ -16088,7 +16100,10 @@ impl App {
 
     fn new() -> (Self, Task<Event>) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let config = Config::load();
+        let config::LoadedSettings {
+            config,
+            refused: settings_refused,
+        } = Config::load();
         let task_commands = init_task_control_channel();
         let task_store_path = TaskStore::path_for_config_root(&config::global_config_dir());
         let (mut task_store, task_store_error) = match load_task_store_for_startup(
@@ -16468,6 +16483,7 @@ impl App {
             chat_rank: chat_rank::ChatRankState::default(),
             chat_snippets: Arc::new(Mutex::new(chat_rank::SnippetCache::default())),
             usage_config: config.usage.clone(),
+            settings_refused,
             usage_view: UsageViewState::default(),
             usage_window: gitterm::usage::UsageWindow::default(),
             usage_chart_tokens: false,

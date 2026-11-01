@@ -51,7 +51,7 @@
 //!
 //! Pricing policy: [`SEED_PRICES`] holds per-million list rates that were
 //! verified at the time of writing; models whose rates could not be
-//! verified offline are seeded as `None`. `config.json` may override or
+//! verified offline are seeded as `None`. `settings.json` may override or
 //! add rows under `usage.pricing` (same shape; `null` marks a model
 //! unpriced). A model with no priced row is shown as unpriced with its
 //! tokens and never contributes a guessed cost.
@@ -214,7 +214,7 @@ impl ModelPrice {
 /// API list prices as published on 2026-10-06 (input, output, cache read,
 /// 5-minute cache write = 1.25x input, 1-hour cache write = 2x input).
 /// `None` rows are models whose list price could not be verified offline:
-/// they show as unpriced until `usage.pricing` in config.json gives them
+/// they show as unpriced until `usage.pricing` in settings.json gives them
 /// a rate.
 pub const SEED_PRICES: &[(&str, Option<ModelPrice>)] = &[
     (
@@ -271,7 +271,7 @@ pub const SEED_PRICES: &[(&str, Option<ModelPrice>)] = &[
     // input tokens reprice the whole request (2x input, 1.5x output); not
     // modelled. OpenAI has no 1-hour cache tier.
     // Sol's cached-input rate is launch pricing, noted as promotional
-    // through 2026-11-21; override in config.json if it changes.
+    // through 2026-11-21; override in settings.json if it changes.
     ("gpt-6.1-sol", Some(ModelPrice::flat(2.0, 10.0, 0.10, 2.5))),
     (
         "gpt-6-luna",
@@ -280,7 +280,7 @@ pub const SEED_PRICES: &[(&str, Option<ModelPrice>)] = &[
     ("gpt-6-astra", Some(ModelPrice::flat(10.0, 50.0, 1.0, 12.5))),
 ];
 
-/// The `usage` object in config.json:
+/// The `usage` object in settings.json:
 ///
 /// ```json
 /// "usage": { "pricing": {
