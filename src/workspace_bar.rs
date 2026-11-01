@@ -22,6 +22,9 @@ pub(crate) struct BarChip {
     pub group: String,
     /// A piece of work rather than a plain folder workspace.
     pub work: bool,
+    /// Parked while it keeps running (TRU-186): off the bar, the slide and
+    /// Ctrl+1-9 entirely, even when pinned.
+    pub parked: bool,
 }
 
 /// The `Repos` toggle of one machine group: present when the group has
@@ -90,6 +93,9 @@ fn layout_pinned(
 ) -> Vec<BarGroup> {
     let mut groups: Vec<BarGroup> = Vec::new();
     for (idx, chip) in chips.iter().enumerate() {
+        if chip.parked {
+            continue;
+        }
         let pos = match groups.iter().position(|group| group.key == chip.group) {
             Some(pos) => pos,
             None => {
@@ -188,7 +194,26 @@ mod tests {
         BarChip {
             group: group.to_string(),
             work,
+            parked: false,
         }
+    }
+
+    #[test]
+    fn a_running_parked_workspace_is_off_the_bar_and_the_slide() {
+        let mut chips = [
+            chip("local", true),
+            chip("local", true),
+            chip("agent:box-one", true),
+        ];
+        chips[1].parked = true;
+        chips[2].parked = true;
+        let groups = bar_layout(&chips, 0, &set(&[]), &set(&[]));
+        // A group whose only chips are parked is not shown at all.
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].size, 1);
+        assert_eq!(visible_order(&groups), [0]);
+        // Even pinned (active or a slide's start), it stays off.
+        assert_eq!(slide_order(&chips, 0, Some(1), &set(&[]), &set(&[])), [0]);
     }
 
     fn set(keys: &[&str]) -> HashSet<String> {

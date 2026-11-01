@@ -1950,6 +1950,9 @@ struct ParkSheet {
     /// The note as prefilled; while `note` still equals it, a chat index
     /// that lands later may refill it.
     prefilled: String,
+    /// "Keep running" (TRU-186): off by default; only the work Park sheet
+    /// shows it.
+    keep_running: bool,
 }
 
 /// Which sheet × opens (TRU-190). A work workspace parks with a note; a
@@ -1968,6 +1971,110 @@ impl CloseSheetKind {
             Self::Close
         }
     }
+}
+
+/// What parking does with a workspace's processes (TRU-186).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkMode {
+    /// The park of TRU-171: the tabs are kept as config and their
+    /// terminals and chats stop.
+    Stop,
+    /// The workspace leaves the bar with its tabs and processes alive, and
+    /// comes back when one of its chats needs you.
+    KeepRunning,
+}
+
+impl ParkMode {
+    /// Only the work Park sheet offers Keep running; the folder Close
+    /// sheet's Park always stops.
+    fn for_sheet(kind: CloseSheetKind, keep_running: bool) -> Self {
+        if kind == CloseSheetKind::Park && keep_running {
+            Self::KeepRunning
+        } else {
+            Self::Stop
+        }
+    }
+
+    fn stops_processes(self) -> bool {
+        self == Self::Stop
+    }
+}
+
+/// Why a running parked workspace came back to the bar (TRU-186), shown
+/// on its chip until it is visited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeReason {
+    NeedsYou,
+    Finished,
+    Failed,
+}
+
+impl WakeReason {
+    /// The chat attention marks that wake it: a question or permission
+    /// request, a finished turn, an error. Delegation results are not a
+    /// chat of its own asking.
+    fn for_attention(reason: AttentionReason) -> Option<Self> {
+        match reason {
+            AttentionReason::HumanInputRequired => Some(Self::NeedsYou),
+            AttentionReason::CompletedUnread => Some(Self::Finished),
+            AttentionReason::AgentFailed => Some(Self::Failed),
+            AttentionReason::DelegationReady(_)
+            | AttentionReason::DelegationFailed(_)
+            | AttentionReason::DelegationBlocked(_) => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "needs you",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The wake a chat event raises: the attention mark it drives today
+/// (`agent_event_attention_reason`), no detection of its own.
+fn chat_event_wake(event: &tab::AgentEvent) -> Option<WakeReason> {
+    agent_event_attention_reason(event).and_then(WakeReason::for_attention)
+}
+
+/// A running parked workspace as `workspaces.json` stores it (TRU-186):
+/// an ordinary parked entry, since quitting GitTerm stops its processes.
+fn running_parked_config(mut cfg: WorkspaceConfig, info: &ParkedInfo) -> WorkspaceConfig {
+    cfg.active = false;
+    cfg.parked = Some(info.clone());
+    cfg
+}
+
+/// The saved `active_workspace`: the active workspace's index among the
+/// ones the file reopens, which skips the running parked (`parked`, in
+/// Vec order).
+fn persisted_active_index(active: usize, parked: &[bool]) -> usize {
+    parked
+        .iter()
+        .take(active)
+        .filter(|parked| !**parked)
+        .count()
+}
+
+/// The workspace that becomes active when the one at `from` leaves the
+/// bar, by Vec index after the change: the first one on the bar from
+/// `from` on, else the last before it. `parked` marks the ones off the
+/// bar (the leaving one, when it stays in the Vec). With nothing parked
+/// this is what park always did: the next workspace, else the last.
+fn next_on_bar(from: usize, parked: &[bool]) -> Option<usize> {
+    (from..parked.len())
+        .find(|&idx| !parked[idx])
+        .or_else(|| (0..from.min(parked.len())).rev().find(|&idx| !parked[idx]))
+}
+
+/// The open workspace a Parked list row names when it is parked running
+/// (TRU-186).
+fn running_parked_index(workspaces: &[Workspace], key: &ParkedKey) -> Option<usize> {
+    workspaces.iter().position(|ws| {
+        ws.running_park.is_some() && ws.name == key.name && workspace_config_dir(ws) == key.dir
+    })
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -5698,6 +5805,11 @@ struct Workspace {
     /// The repo team-facing decisions go to (TRU-191), named to the
     /// agents started in this work beside its docs folder.
     decisions_repo: Option<PathBuf>,
+    /// Parked with Keep running (TRU-186): off the bar with its tabs and
+    /// processes alive. Runtime only; saved as an ordinary parked entry.
+    running_park: Option<ParkedInfo>,
+    /// Why it came back from a running park, until it is visited.
+    woke: Option<WakeReason>,
 }
 
 impl Workspace {
@@ -5729,6 +5841,8 @@ impl Workspace {
             guidelines_off: false,
             claude_in_chrome: false,
             decisions_repo: None,
+            running_park: None,
+            woke: None,
         }
     }
 
@@ -5764,6 +5878,8 @@ impl Workspace {
             guidelines_off: false,
             claude_in_chrome: false,
             decisions_repo: None,
+            running_park: None,
+            woke: None,
         }
     }
 
@@ -6246,6 +6362,8 @@ pub enum Event {
     /// × on a workspace: opens the Park sheet (TRU-171).
     WorkspaceClose(usize),
     ParkNoteChanged(String),
+    /// The Park sheet's "Keep running" checkbox (TRU-186).
+    ParkKeepRunningToggled(bool),
     ParkSubmit,
     ParkCancel,
     /// `⏸ n parked`: open or close the Parked list.
@@ -8330,10 +8448,15 @@ impl App {
 
     fn save_workspaces(&self) {
         // Active workspaces from runtime state
+        // A running parked workspace is saved parked (TRU-186): quitting
+        // stops its processes.
         let mut configs: Vec<WorkspaceConfig> = self
             .workspaces
             .iter()
-            .map(|ws| self.workspace_config(ws))
+            .map(|ws| match &ws.running_park {
+                Some(info) => running_parked_config(self.workspace_config(ws), info),
+                None => self.workspace_config(ws),
+            })
             .collect();
 
         // Append closed workspace configs so their env/settings survive
@@ -8341,9 +8464,9 @@ impl App {
         // A workspace that owns chats is not its folder: one sharing a dir
         // with another is a different workspace and is kept.
         for closed in &self.closed_workspace_configs {
-            let already_active = configs
-                .iter()
-                .any(|c| c.dir == closed.dir && c.chats.is_empty() && closed.chats.is_empty());
+            let already_active = configs.iter().any(|c| {
+                c.active && c.dir == closed.dir && c.chats.is_empty() && closed.chats.is_empty()
+            });
             if !already_active {
                 configs.push(closed.clone());
             }
@@ -8487,7 +8610,10 @@ impl App {
         let ws_file = WorkspacesFile {
             workspaces: configs,
             repos,
-            active_workspace: self.active_workspace_idx,
+            active_workspace: persisted_active_index(
+                self.active_workspace_idx,
+                &self.running_parked_flags(),
+            ),
             remote_sessions,
             remote_agents: remote_agent_defs,
             collapsed_repo_groups: {
@@ -11695,7 +11821,23 @@ impl App {
             .map(|ws| workspace_bar::BarChip {
                 group: self.machine_group_key(ws),
                 work: ws.is_work(),
+                parked: ws.running_park.is_some(),
             })
+            .collect()
+    }
+
+    /// The open workspaces on the bar: all but the running parked.
+    fn bar_workspace_count(&self) -> usize {
+        self.workspaces
+            .iter()
+            .filter(|ws| ws.running_park.is_none())
+            .count()
+    }
+
+    fn running_parked_flags(&self) -> Vec<bool> {
+        self.workspaces
+            .iter()
+            .map(|ws| ws.running_park.is_some())
             .collect()
     }
 
@@ -12136,7 +12278,7 @@ impl App {
     /// workspace's most recent chat. The last open workspace cannot be
     /// parked (the bar always shows one).
     fn open_park_sheet(&mut self, idx: usize) -> Task<Event> {
-        if idx >= self.workspaces.len() || self.workspaces.len() <= 1 {
+        if idx >= self.workspaces.len() || self.bar_workspace_count() <= 1 {
             return Task::none();
         }
         let ws = &self.workspaces[idx];
@@ -12155,6 +12297,7 @@ impl App {
             kind,
             note: note.clone(),
             prefilled: note,
+            keep_running: false,
         });
         // A stale index refills the note when it lands (`refill_park_note`).
         let index = if remote {
@@ -12202,23 +12345,42 @@ impl App {
 
     /// Park: what closing did, keeping the tabs. The entry stays in
     /// `workspaces.json` (`active: false`) with its tabs, bottom terminals
-    /// and the note; its processes stop with the tabs.
-    fn park_workspace(&mut self, uid: u64, note: &str) -> Task<Event> {
+    /// and the note. With `ParkMode::Stop` its processes stop with the
+    /// tabs; with `KeepRunning` (TRU-186) it only leaves the bar.
+    fn park_workspace(&mut self, uid: u64, note: &str, mode: ParkMode) -> Task<Event> {
         let Some(idx) = self.workspace_index_by_uid(uid) else {
             eprintln!("[workspace] cannot park uid={uid}: no longer open");
             return self.apply_webview_surfaces();
         };
-        if self.workspaces.len() <= 1 {
+        let on_bar = self.workspaces[idx].running_park.is_none();
+        if on_bar && self.bar_workspace_count() <= 1 {
             eprintln!("[workspace] cannot park uid={uid}: it is the last open workspace");
             return self.apply_webview_surfaces();
         }
-        self.dismiss_viewer_surface();
-        let mut cfg = self.workspace_config(&self.workspaces[idx]);
-        cfg.active = false;
-        cfg.parked = Some(ParkedInfo {
+        let info = ParkedInfo {
             note: note.trim().to_string(),
             parked_at: chrono::Utc::now().to_rfc3339(),
-        });
+        };
+        if mode.stops_processes() {
+            self.park_stopping(idx, info)
+        } else {
+            self.park_keep_running(idx, info)
+        }
+    }
+
+    /// Stops workspace `idx` into a parked entry with `info`: its tabs
+    /// drop, so its terminals and chats stop. The active workspace stays
+    /// active unless it is the one parked.
+    fn park_stopping(&mut self, idx: usize, info: ParkedInfo) -> Task<Event> {
+        self.dismiss_viewer_surface();
+        let uid = self.workspaces[idx].uid;
+        let active_uid = self
+            .active_workspace()
+            .map(|ws| ws.uid)
+            .filter(|&active| active != uid);
+        let mut cfg = self.workspace_config(&self.workspaces[idx]);
+        cfg.active = false;
+        cfg.parked = Some(info);
         eprintln!(
             "[workspace] parked {:?} with {} tab(s)",
             cfg.name,
@@ -12233,9 +12395,45 @@ impl App {
         // Its repos stop unless another open workspace lists them.
         self.workspaces.remove(idx);
         self.release_unlisted_repos();
-        if self.active_workspace_idx >= self.workspaces.len() {
-            self.active_workspace_idx = self.workspaces.len() - 1;
+        let kept_active = active_uid.and_then(|active| self.workspace_index_by_uid(active));
+        match kept_active.or_else(|| next_on_bar(idx, &self.running_parked_flags())) {
+            Some(active) => self.active_workspace_idx = active,
+            None => {
+                eprintln!("[workspace] no workspace is left on the bar after parking uid={uid}");
+                self.active_workspace_idx = self.workspaces.len().saturating_sub(1);
+            }
         }
+        self.after_workspace_left_bar()
+    }
+
+    /// Keep running (TRU-186): workspace `idx` leaves the bar with its tabs
+    /// and processes alive; the file saves it as an ordinary parked entry
+    /// (`running_parked_config`).
+    fn park_keep_running(&mut self, idx: usize, info: ParkedInfo) -> Task<Event> {
+        self.dismiss_viewer_surface();
+        let ws = &mut self.workspaces[idx];
+        ws.running_park = Some(info);
+        ws.woke = None;
+        eprintln!(
+            "[workspace] parked {:?} with {} tab(s), still running",
+            ws.name,
+            ws.tabs.len()
+        );
+        if self.active_workspace_idx == idx {
+            match next_on_bar(idx, &self.running_parked_flags()) {
+                Some(active) => self.active_workspace_idx = active,
+                None => eprintln!(
+                    "[workspace] no workspace is left on the bar after parking {:?}",
+                    self.workspaces[idx].name
+                ),
+            }
+        }
+        self.after_workspace_left_bar()
+    }
+
+    /// The bar and content after a workspace left the bar: the now-active
+    /// workspace's slide, chat page and remote connection.
+    fn after_workspace_left_bar(&mut self) -> Task<Event> {
         self.sync_visible_terminals();
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
@@ -12243,29 +12441,99 @@ impl App {
 
         // Snap slide to new active workspace (no animation)
         self.snap_slide_to_active_workspace();
-        let new_target = self.slide_target;
-
-        let scroll_task = iced::advanced::widget::operate(
-            iced::advanced::widget::operation::scrollable::scroll_to(
-                workspace_scrollable_id(),
-                scrollable::AbsoluteOffset {
-                    x: Some(new_target),
-                    y: None,
-                },
-            ),
-        );
         let remote_agent_task = self.ensure_active_remote_agent_connection(false);
         // The sheet is gone: show the now-active workspace's chat page.
         Task::batch([
-            scroll_task,
+            self.scroll_content_slide_to_target(),
             remote_agent_task,
             self.present_active_tab_surfaces(),
         ])
     }
 
-    /// Resume: the parked entry comes back with its tabs through the path
-    /// startup restores workspaces with, and becomes active.
+    /// Scrolls the content slide to `slide_target` at once.
+    fn scroll_content_slide_to_target(&self) -> Task<Event> {
+        iced::advanced::widget::operate(iced::advanced::widget::operation::scrollable::scroll_to(
+            workspace_scrollable_id(),
+            scrollable::AbsoluteOffset {
+                x: Some(self.slide_target),
+                y: None,
+            },
+        ))
+    }
+
+    /// A running parked workspace returns to the bar as it is (TRU-186):
+    /// nothing restarts. `woke` is why, when it came back on its own.
+    fn return_running_parked(&mut self, idx: usize, woke: Option<WakeReason>) {
+        let ws = &mut self.workspaces[idx];
+        if ws.running_park.take().is_none() {
+            return;
+        }
+        ws.woke = woke;
+        eprintln!(
+            "[workspace] {:?} is back on the bar{}",
+            ws.name,
+            woke.map(|reason| format!(": {}", reason.label()))
+                .unwrap_or_default()
+        );
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+    }
+
+    /// Wake (TRU-186): a chat of running parked workspace `uid` asked,
+    /// finished or failed. It comes back without taking focus: the active
+    /// workspace stays, and the chip says why until it is visited. A
+    /// request is announced by the needs-you notifier, which sees the tab
+    /// like any other background tab; a finished or failed turn posts
+    /// through the same notification, under the same setting.
+    fn wake_running_parked(&mut self, uid: u64, reason: WakeReason) -> Task<Event> {
+        let Some(idx) = self.workspace_index_by_uid(uid) else {
+            eprintln!("[workspace] cannot wake uid={uid}: no longer open");
+            return Task::none();
+        };
+        if self.workspaces[idx].running_park.is_none() {
+            return Task::none();
+        }
+        self.return_running_parked(idx, Some(reason));
+        if reason != WakeReason::NeedsYou && self.notifications_config.needs_you {
+            post_needs_you_notification(
+                &self.workspaces[idx].name,
+                &format!("Back from parked: {}", reason.label()),
+            );
+        }
+        // Its chip joins the bar: the active panel's place may move.
+        self.snap_slide_to_active_workspace();
+        self.scroll_content_slide_to_target()
+    }
+
+    /// After each update: the active workspace is visited, so its wake
+    /// label goes; a running parked one something went to (a chat, a task,
+    /// an attention target) comes back to the bar (TRU-186).
+    fn settle_active_workspace(&mut self) -> Option<Task<Event>> {
+        let idx = self.active_workspace_idx;
+        let ws = self.workspaces.get_mut(idx)?;
+        ws.woke = None;
+        ws.running_park.as_ref()?;
+        self.return_running_parked(idx, None);
+        self.snap_slide_to_active_workspace();
+        Some(Task::batch([
+            self.scroll_content_slide_to_target(),
+            self.scroll_to_active_workspace_bar(),
+        ]))
+    }
+
+    /// Resume: a running parked entry comes back as it is (TRU-186); a
+    /// stopped one comes back with its tabs through the path startup
+    /// restores workspaces with. Either becomes active.
     fn resume_parked_workspace(&mut self, key: &ParkedKey) -> Task<Event> {
+        if let Some(idx) = running_parked_index(&self.workspaces, key) {
+            self.return_running_parked(idx, None);
+            self.parked_list_open = false;
+            self.active_workspace_idx = idx;
+            self.snap_slide_to_active_workspace();
+            self.sync_visible_terminals();
+            self.sync_plans_dir();
+            return Task::batch([self.after_resume(), self.scroll_content_slide_to_target()]);
+        }
         let Some(pos) = self
             .closed_workspace_configs
             .iter()
@@ -12288,6 +12556,11 @@ impl App {
         self.parked_list_open = false;
         self.push_and_activate_workspace(ws);
         self.sync_visible_terminals();
+        self.after_resume()
+    }
+
+    /// The resumed, now-active workspace's git, files, connection and page.
+    fn after_resume(&mut self) -> Task<Event> {
         let git_task = match self.active_tab().map(|tab| (tab.id, tab.repo_path.clone())) {
             Some((tab_id, repo_path)) => {
                 self.request_git_status_for_active_source(tab_id, repo_path)
@@ -12304,8 +12577,19 @@ impl App {
         ])
     }
 
-    /// Done: the entry leaves the Parked list and stays in the file.
-    fn mark_parked_done(&mut self, key: &ParkedKey) {
+    /// Done: the entry leaves the Parked list and stays in the file. A
+    /// running parked one stops first, the way park stops (TRU-186).
+    fn mark_parked_done(&mut self, key: &ParkedKey) -> Task<Event> {
+        let task = match running_parked_index(&self.workspaces, key) {
+            Some(idx) => {
+                let info = self.workspaces[idx]
+                    .running_park
+                    .clone()
+                    .expect("running_parked_index finds only running parked workspaces");
+                self.park_stopping(idx, info)
+            }
+            None => Task::none(),
+        };
         if finish_parked(
             &mut self.closed_workspace_configs,
             key,
@@ -12319,10 +12603,11 @@ impl App {
                 key.name, key.dir
             );
         }
+        task
     }
 
-    /// Close (TRU-190): park the workspace, then mark that entry done, the
-    /// same as Done in the Parked list.
+    /// Close (TRU-190): park the workspace, stopping it, then mark that
+    /// entry done, the same as Done in the Parked list.
     fn close_workspace(&mut self, uid: u64) -> Task<Event> {
         let Some(idx) = self.workspace_index_by_uid(uid) else {
             eprintln!("[workspace] cannot close uid={uid}: no longer open");
@@ -12331,9 +12616,9 @@ impl App {
         let cfg = self.workspace_config(&self.workspaces[idx]);
         let key = ParkedKey::of(&cfg);
         let before = self.closed_workspace_configs.len();
-        let task = self.park_workspace(uid, "");
+        let task = self.park_workspace(uid, "", ParkMode::Stop);
         if self.closed_workspace_configs.len() > before {
-            self.mark_parked_done(&key);
+            return Task::batch([task, self.mark_parked_done(&key)]);
         }
         task
     }
@@ -19600,6 +19885,14 @@ fi
     }
 
     fn update(&mut self, event: Event) -> Task<Event> {
+        let task = self.update_event(event);
+        match self.settle_active_workspace() {
+            Some(settle) => Task::batch([task, settle]),
+            None => task,
+        }
+    }
+
+    fn update_event(&mut self, event: Event) -> Task<Event> {
         // Heartbeat for freeze watchdog — skip high-frequency terminal events
         match &event {
             Event::Terminal(_, _)
@@ -22177,6 +22470,10 @@ fi
                 // shown last counts as being read (completion is not unread).
                 let is_front_page = self.agent_pages.first() == Some(&tab_id);
                 let attention_reason = agent_event_attention_reason(&ev);
+                // A running parked workspace comes back when its chat asks,
+                // finishes or fails (TRU-186): the uid it wakes.
+                let wake = chat_event_wake(&ev);
+                let mut woken: Option<u64> = None;
                 // A held Send-to-Claude goes out when the turn ends (TRU-142).
                 let turn_ended = matches!(
                     &ev,
@@ -22227,8 +22524,12 @@ fi
                     let local_workspace = matches!(ws.location, WorkspaceLocation::Local { .. });
                     let owning_workspace =
                         (ws.owns_chats() || ws.claims_new_chats).then_some(ws.uid);
+                    let parked_running = ws.running_park.is_some().then_some(ws.uid);
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
+                            if wake.is_some() {
+                                woken = parked_running;
+                            }
                             if t.task_id.is_some() {
                                 t.task_last_activity = Some(Instant::now());
                                 progress_task = t.task_id.clone();
@@ -22522,6 +22823,12 @@ fi
                     Task::batch([follow_task, self.flush_chat_facts(tab_id, facts_force)])
                 } else {
                     follow_task
+                };
+                let follow_task = match (woken, wake) {
+                    (Some(uid), Some(reason)) => {
+                        Task::batch([follow_task, self.wake_running_parked(uid, reason)])
+                    }
+                    _ => follow_task,
                 };
                 if turn_ended {
                     // A chat's first turn gives it a title; index it so
@@ -26826,11 +27133,17 @@ fi
                     sheet.note = note;
                 }
             }
+            Event::ParkKeepRunningToggled(keep_running) => {
+                if let Some(sheet) = self.park_sheet.as_mut() {
+                    sheet.keep_running = keep_running;
+                }
+            }
             Event::ParkSubmit => {
                 let Some(sheet) = self.park_sheet.take() else {
                     return Task::none();
                 };
-                return self.park_workspace(sheet.uid, &sheet.note);
+                let mode = ParkMode::for_sheet(sheet.kind, sheet.keep_running);
+                return self.park_workspace(sheet.uid, &sheet.note, mode);
             }
             Event::CloseConfirm => {
                 let Some(sheet) = self.park_sheet.take() else {
@@ -26853,7 +27166,7 @@ fi
                 return self.resume_parked_workspace(&key);
             }
             Event::ParkedDone(key) => {
-                self.mark_parked_done(&key);
+                return self.mark_parked_done(&key);
             }
             Event::WorkspaceCreate => {
                 // The picker's machine selector (with its "connect a
@@ -30142,7 +30455,8 @@ fi
 
     /// × on a workspace (TRU-171): a note, prefilled from its most recent
     /// chat, and Park. Parking stops the workspace's processes; a chat
-    /// mid-turn is named, not blocking.
+    /// mid-turn is named, not blocking. Keep running (TRU-186) parks it
+    /// with its processes alive.
     fn view_park_sheet(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
@@ -30202,9 +30516,13 @@ fi
                     .color(theme.text_primary()),
             )
             .push(
-                text("It leaves the bar and keeps its tabs. Its terminals and chats stop; Resume from ⏸ parked brings them back.")
-                    .size(font_small)
-                    .color(theme.text_secondary()),
+                text(if sheet.keep_running {
+                    "It leaves the bar and keeps its tabs. Its terminals and chats keep running; it comes back to the bar when a chat needs you, finishes or fails."
+                } else {
+                    "It leaves the bar and keeps its tabs. Its terminals and chats stop; Resume from ⏸ parked brings them back."
+                })
+                .size(font_small)
+                .color(theme.text_secondary()),
             )
             .push(
                 text_input("Where you left off", &sheet.note)
@@ -30213,8 +30531,15 @@ fi
                     .on_submit(Event::ParkSubmit)
                     .size(font_small)
                     .padding([6, 8]),
+            )
+            .push(
+                checkbox(sheet.keep_running)
+                    .label("Keep running")
+                    .on_toggle(Event::ParkKeepRunningToggled)
+                    .size(14)
+                    .text_size(font_small),
             );
-        if Self::workspace_chat_working(ws) {
+        if !sheet.keep_running && Self::workspace_chat_working(ws) {
             card = card.push(
                 text("● a chat is still working; parking stops it")
                     .size(font_small)
@@ -30247,7 +30572,27 @@ fi
         let font_small = self.ui_font_small();
         let order = parked_order(&self.closed_workspace_configs);
         let mut rows = Column::new().spacing(8);
-        if order.is_empty() {
+        // Running parked workspaces first (TRU-186): they are live.
+        let running: Vec<&Workspace> = self
+            .workspaces
+            .iter()
+            .filter(|ws| ws.running_park.is_some())
+            .collect();
+        for ws in &running {
+            let key = ParkedKey {
+                name: ws.name.clone(),
+                dir: workspace_config_dir(ws),
+            };
+            rows = rows.push(self.view_parked_row(
+                &ws.name,
+                ws.color,
+                ws.chats.len(),
+                ws.running_park.as_ref(),
+                key,
+                true,
+            ));
+        }
+        if order.is_empty() && running.is_empty() {
             rows = rows.push(
                 text("Nothing parked.")
                     .size(font_small)
@@ -30256,70 +30601,14 @@ fi
         }
         for idx in order {
             let cfg = &self.closed_workspace_configs[idx];
-            let key = ParkedKey::of(cfg);
-            let age = cfg
-                .parked
-                .as_ref()
-                .and_then(|parked| overview::parse_stamp(&parked.parked_at))
-                .map(overview::age_label);
-            let note = cfg
-                .parked
-                .as_ref()
-                .map(|parked| parked.note.as_str())
-                .filter(|note| !note.is_empty());
-            let owned = match cfg.chats.len() {
-                0 => "folder".to_string(),
-                1 => "1 chat".to_string(),
-                n => format!("{n} chats"),
-            };
-            let mut head = Row::new()
-                .spacing(8)
-                .align_y(iced::Alignment::Center)
-                .push(
-                    text(cfg.name.clone())
-                        .size(font_small)
-                        .color(cfg.color.color(theme))
-                        .font(iced::Font::with_name("Menlo")),
-                )
-                .push(text(owned).size(font_small - 1.0).color(theme.text_muted()));
-            if let Some(age) = age {
-                head = head.push(text(age).size(font_small - 1.0).color(theme.text_muted()));
-            }
-            let note_line = match note {
-                Some(note) => text(note.to_string())
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-                None => text("No note").size(font_small).color(theme.text_muted()),
-            };
-            let mut lines = column![head, note_line].spacing(2).width(Length::Fill);
-            // PR news of the parked work (TRU-173).
-            if let Some((news, color)) = self.parked_pr_news(&key) {
-                lines = lines.push(text(news).size(font_small - 1.0).color(color));
-            }
-            let row_content = row![
-                lines,
-                button(text("Resume").size(font_small))
-                    .style(button::primary)
-                    .padding([4, 10])
-                    .on_press(Event::ParkedResume(key.clone())),
-                button(text("Done").size(font_small))
-                    .style(button::text)
-                    .padding([4, 10])
-                    .on_press(Event::ParkedDone(key)),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center);
-            let row_bg = theme.bg_base();
-            rows = rows.push(container(row_content).padding([6, 8]).style(move |_| {
-                container::Style {
-                    background: Some(row_bg.into()),
-                    border: iced::Border {
-                        radius: 6.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            }));
+            rows = rows.push(self.view_parked_row(
+                &cfg.name,
+                cfg.color,
+                cfg.chats.len(),
+                cfg.parked.as_ref(),
+                ParkedKey::of(cfg),
+                false,
+            ));
         }
         let card = Column::new()
             .spacing(10)
@@ -30342,6 +30631,89 @@ fi
                 .align_y(iced::Alignment::Center),
             );
         self.view_sheet_card(card)
+    }
+
+    /// One Parked list row: name, chats, age, note and PR news, with
+    /// Resume and Done. `running` (TRU-186) marks one parked with its
+    /// processes alive.
+    fn view_parked_row(
+        &self,
+        name: &str,
+        color: WorkspaceColor,
+        chats: usize,
+        parked: Option<&ParkedInfo>,
+        key: ParkedKey,
+        running: bool,
+    ) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let age = parked
+            .and_then(|parked| overview::parse_stamp(&parked.parked_at))
+            .map(overview::age_label);
+        let note = parked
+            .map(|parked| parked.note.as_str())
+            .filter(|note| !note.is_empty());
+        let owned = match chats {
+            0 => "folder".to_string(),
+            1 => "1 chat".to_string(),
+            n => format!("{n} chats"),
+        };
+        let mut head = Row::new()
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .push(
+                text(name.to_string())
+                    .size(font_small)
+                    .color(color.color(theme))
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .push(text(owned).size(font_small - 1.0).color(theme.text_muted()));
+        if running {
+            head = head.push(
+                text("\u{25CF} running")
+                    .size(font_small - 1.0)
+                    .color(theme.success()),
+            );
+        }
+        if let Some(age) = age {
+            head = head.push(text(age).size(font_small - 1.0).color(theme.text_muted()));
+        }
+        let note_line = match note {
+            Some(note) => text(note.to_string())
+                .size(font_small)
+                .color(theme.text_secondary()),
+            None => text("No note").size(font_small).color(theme.text_muted()),
+        };
+        let mut lines = column![head, note_line].spacing(2).width(Length::Fill);
+        // PR news of the parked work (TRU-173).
+        if let Some((news, color)) = self.parked_pr_news(&key) {
+            lines = lines.push(text(news).size(font_small - 1.0).color(color));
+        }
+        let row_content = row![
+            lines,
+            button(text("Resume").size(font_small))
+                .style(button::primary)
+                .padding([4, 10])
+                .on_press(Event::ParkedResume(key.clone())),
+            button(text("Done").size(font_small))
+                .style(button::text)
+                .padding([4, 10])
+                .on_press(Event::ParkedDone(key)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        let row_bg = theme.bg_base();
+        container(row_content)
+            .padding([6, 8])
+            .style(move |_| container::Style {
+                background: Some(row_bg.into()),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
     }
 
     fn view_workspace_settings_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -31686,6 +32058,21 @@ fi
             );
         }
 
+        // Back from a running park (TRU-186): why, until it is visited.
+        if let Some(reason) = ws.woke.filter(|_| !is_active) {
+            let color = match reason {
+                WakeReason::NeedsYou => theme.peach(),
+                WakeReason::Finished => theme.success(),
+                WakeReason::Failed => theme.danger(),
+            };
+            btn_content = btn_content.push(
+                text(reason.label())
+                    .size(9)
+                    .color(color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+
         // PR news (TRU-173): the newest, e.g. "#841 checks failed".
         if let Some((label, color)) = self.workspace_pr_badge(ws.uid) {
             btn_content = btn_content.push(
@@ -32008,7 +32395,8 @@ fi
             .closed_workspace_configs
             .iter()
             .filter(|cfg| cfg.is_parked())
-            .count();
+            .count()
+            + (self.workspaces.len() - self.bar_workspace_count());
         let parked_btn = (parked_count > 0).then(|| {
             let parked_color = theme.text_muted();
             let parked_hover = theme.text_secondary();
@@ -32829,7 +33217,7 @@ fi
 
             // Close workspace button (only if more than one workspace, matching
             // the WorkspaceClose handler's guard so the button never no-ops)
-            if self.workspaces.len() > 1 {
+            if self.bar_workspace_count() > 1 {
                 let close_color = theme.overlay0();
                 let close_hover = theme.text_primary();
                 let ws_idx = self.active_workspace_idx;
@@ -46742,6 +47130,185 @@ mod tests {
         assert_eq!(configs[0].done_at.as_deref(), Some("2026-01-02T00:00:00Z"));
         // Already done: nothing to finish.
         assert!(!finish_parked(&mut configs, &key, "later".into()));
+    }
+
+    #[test]
+    fn park_keeps_processes_only_with_keep_running_on_the_work_sheet() {
+        let keep = ParkMode::for_sheet(CloseSheetKind::Park, true);
+        assert_eq!(keep, ParkMode::KeepRunning);
+        assert!(!keep.stops_processes());
+        // Unchecked: today's park.
+        let stop = ParkMode::for_sheet(CloseSheetKind::Park, false);
+        assert_eq!(stop, ParkMode::Stop);
+        assert!(stop.stops_processes());
+        // The folder Close sheet's Park has no Keep running.
+        assert_eq!(
+            ParkMode::for_sheet(CloseSheetKind::Close, true),
+            ParkMode::Stop
+        );
+    }
+
+    #[test]
+    fn the_next_active_workspace_skips_running_parked_ones() {
+        // Nothing parked: what park always did, the next else the last.
+        assert_eq!(next_on_bar(1, &[false, false, false]), Some(1));
+        assert_eq!(next_on_bar(3, &[false, false, false]), Some(2));
+        // Keep running leaves 1 in the Vec, parked: 2 takes over.
+        assert_eq!(next_on_bar(1, &[false, true, false]), Some(2));
+        // A running parked one is never picked; else the last before.
+        assert_eq!(next_on_bar(1, &[false, true, true]), Some(0));
+        assert_eq!(next_on_bar(0, &[true, true]), None);
+    }
+
+    #[test]
+    fn chats_wake_a_running_parked_workspace_when_they_ask_finish_or_fail() {
+        let harness = |ev| chat_event_wake(&tab::AgentEvent::Harness(ev));
+        // A question or a permission request.
+        assert_eq!(
+            harness(HarnessEvent::RuntimeRequest {
+                request_id: "r1".into(),
+                tool_use_id: "t1".into(),
+                kind: gitterm::harness::RuntimeRequestKind::Question {
+                    questions: serde_json::json!([]),
+                },
+            }),
+            Some(WakeReason::NeedsYou)
+        );
+        let completed = |status| HarnessEvent::TurnCompleted {
+            status,
+            usage: serde_json::Value::Null,
+            cost_usd: None,
+        };
+        assert_eq!(
+            harness(completed(TurnStatus::Completed)),
+            Some(WakeReason::Finished)
+        );
+        assert_eq!(
+            harness(completed(TurnStatus::Failed("x".into()))),
+            Some(WakeReason::Failed)
+        );
+        assert_eq!(
+            harness(HarnessEvent::Error("boom".into())),
+            Some(WakeReason::Failed)
+        );
+        // An interrupted turn or streaming text does not wake it.
+        assert_eq!(harness(completed(TurnStatus::Interrupted)), None);
+        assert_eq!(harness(HarnessEvent::TextDelta("hi".into())), None);
+        assert_eq!(
+            chat_event_wake(&tab::AgentEvent::AssistantText("working".into())),
+            None
+        );
+        // Older stream sentinels drive the same marks.
+        assert_eq!(
+            chat_event_wake(&tab::AgentEvent::Result(serde_json::json!({}))),
+            Some(WakeReason::Finished)
+        );
+        assert_eq!(
+            chat_event_wake(&tab::AgentEvent::Other(
+                serde_json::json!({ "type": "error" })
+            )),
+            Some(WakeReason::Failed)
+        );
+        // A delegation result is another chat's news, not a wake.
+        assert_eq!(
+            WakeReason::for_attention(AttentionReason::DelegationReady(
+                gitterm::tasks::DelegationKind::Review
+            )),
+            None
+        );
+        // What the bar shows.
+        assert_eq!(WakeReason::NeedsYou.label(), "needs you");
+        assert_eq!(WakeReason::Finished.label(), "finished");
+        assert_eq!(WakeReason::Failed.label(), "failed");
+    }
+
+    #[test]
+    fn a_running_parked_workspace_loads_as_a_plain_parked_one_after_a_restart() {
+        let mut open = closed_config("Coordinator", None);
+        open.active = true;
+        open.chats = vec!["chat-1".to_string()];
+        open.tabs = vec![serde_json::from_value(serde_json::json!({
+            "dir": "/tmp/Coordinator",
+            "tab_kind": "agent",
+            "chat_session_id": "chat-1",
+        }))
+        .expect("tab config")];
+        let info = ParkedInfo {
+            note: "waiting on review".to_string(),
+            parked_at: "2026-11-01T09:00:00Z".to_string(),
+        };
+        let saved = running_parked_config(open, &info);
+        let json = serde_json::to_value(&saved).expect("serialize");
+        // Nothing says it was running: the file is an ordinary parked entry.
+        let mut plain = closed_config("Coordinator", Some("x"));
+        plain.chats = vec!["chat-1".to_string()];
+        plain.tabs = saved.tabs.clone();
+        let plain = serde_json::to_value(plain).expect("serialize");
+        let keys = |value: &serde_json::Value| {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&json), keys(&plain));
+        let loaded: WorkspaceConfig = serde_json::from_value(json).expect("deserialize");
+        assert!(!loaded.active);
+        assert!(loaded.is_parked());
+        assert_eq!(loaded.parked, Some(info));
+        // Its tabs come back on Resume, as any parked entry's do.
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].chat_session_id.as_deref(), Some("chat-1"));
+
+        // The saved active index skips running parked ones, which the
+        // file does not reopen.
+        assert_eq!(persisted_active_index(2, &[false, true, false]), 1);
+        assert_eq!(persisted_active_index(0, &[true, false]), 0);
+        assert_eq!(persisted_active_index(2, &[false, false, false]), 2);
+    }
+
+    #[test]
+    fn done_or_close_on_a_running_parked_workspace_stops_it() {
+        let mut workspaces = vec![
+            Workspace::new(
+                "acme-bar".into(),
+                PathBuf::from("/tmp/acme-bar"),
+                WorkspaceColor::Blue,
+            ),
+            Workspace::new(
+                "acme-work".into(),
+                PathBuf::from("/tmp/acme-work"),
+                WorkspaceColor::Green,
+            ),
+        ];
+        let info = ParkedInfo {
+            note: String::new(),
+            parked_at: "2026-11-01T09:00:00Z".to_string(),
+        };
+        workspaces[1].running_park = Some(info.clone());
+        let key = |ws: &Workspace| ParkedKey {
+            name: ws.name.clone(),
+            dir: workspace_config_dir(ws),
+        };
+        let running_key = key(&workspaces[1]);
+        // Only the running parked one is a Parked list entry; the one on
+        // the bar is not.
+        assert_eq!(running_parked_index(&workspaces, &running_key), Some(1));
+        assert_eq!(
+            running_parked_index(&workspaces, &key(&workspaces[0])),
+            None
+        );
+
+        // Done stops it the way park does: it leaves the open workspaces
+        // (its tabs and their processes drop) for a stopped parked entry,
+        // which is then done. Close parks with `ParkMode::Stop` the same.
+        assert!(ParkMode::Stop.stops_processes());
+        let mut stopped = closed_config("acme-work", None);
+        stopped.dir = running_key.dir.clone();
+        let mut closed = vec![running_parked_config(stopped, &info)];
+        workspaces.remove(1);
+        assert!(closed[0].is_parked());
+        assert!(finish_parked(&mut closed, &running_key, "later".into()));
+        assert!(!closed[0].is_parked());
+        assert_eq!(running_parked_index(&workspaces, &running_key), None);
     }
 
     fn closed_config(name: &str, parked_at: Option<&str>) -> WorkspaceConfig {
