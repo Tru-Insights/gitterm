@@ -34,7 +34,6 @@ mod source;
 mod webview;
 
 // New modules
-mod agent;
 mod chat_overview;
 mod chat_rank;
 mod chat_summary;
@@ -89,9 +88,7 @@ use gitterm::worktree_follow::{
     self, CacheLookup, WorktreeFollow, WorktreeInfo, WorktreeListCache,
 };
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
-use tab::{
-    AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
-};
+use tab::{AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab};
 use webview::WebviewSurface;
 use work_prs::PrEvent;
 
@@ -2239,7 +2236,7 @@ fn workspace_rename_input_id() -> iced::widget::Id {
 }
 
 /// A workspace's documents (TRU-191), gathered off the UI thread for the
-/// overview's Documents section and the Plans mode.
+/// overview's Documents section (Work).
 #[derive(Debug, Default)]
 struct WorkDocumentsState {
     result: Option<gitterm::work_documents::ScanResult>,
@@ -2251,8 +2248,6 @@ struct WorkDocumentsState {
 
 /// Visible documents are gathered again after this long.
 const WORK_DOCUMENTS_POLL: Duration = Duration::from_secs(60);
-/// Documents the overview lists before "more in Plans".
-const OVERVIEW_DOCUMENT_ROWS: usize = 8;
 
 /// One workspace's overview (TRU-167): the summary from the chat index and
 /// tasks, and the owned branches' git state from the background poller.
@@ -4421,8 +4416,6 @@ struct TabState {
     attention: Option<TabAttention>,
     // Claude config tree view
     claude_config: ClaudeConfig,
-    // Agent activity sidebar state (shared across tab kinds — see AgentActivityState).
-    agent_sidebar: AgentActivityState,
     // Chat selected in the Chats sidebar; the main pane shows its preview
     // while the Chats mode is active.
     selected_chat: Option<chats::ChatRef>,
@@ -4500,8 +4493,8 @@ impl TabState {
             diff_syntax_notice: None,
             file_index: -1,
             created_at: Instant::now(),
-            sidebar_mode: SidebarMode::Git,
-            sidebar_mode_before_chats: SidebarMode::Git,
+            sidebar_mode: SidebarMode::Workspace,
+            sidebar_mode_before_chats: SidebarMode::Workspace,
             files: FilesState::at(SourcePath::Local(current_dir.clone())),
             current_dir,
             search: SearchState::default(),
@@ -4514,7 +4507,6 @@ impl TabState {
             task_last_activity: None,
             attention: None,
             claude_config: ClaudeConfig::default(),
-            agent_sidebar: AgentActivityState::default(),
             worktree_follow: WorktreeFollow::default(),
             chat_facts: chat_facts::LiveFacts::default(),
             is_git_repo,
@@ -5017,25 +5009,6 @@ impl TabState {
             }
         }
         self.last_poll = Instant::now();
-    }
-
-    fn fetch_agent_activity(&mut self) -> Task<Event> {
-        self.agent_sidebar.loading = true;
-        let tab_id = self.id;
-        let repo_path = self.repo_path.clone();
-        Task::perform(
-            async move {
-                match tokio::task::spawn_blocking(move || {
-                    agent::AgentActivity::load_from_repo(&repo_path)
-                })
-                .await
-                {
-                    Ok(result) => (tab_id, result),
-                    Err(e) => (tab_id, Err(format!("spawn_blocking failed: {}", e))),
-                }
-            },
-            |(tab_id, result)| Event::AgentActivityLoaded(tab_id, result),
-        )
     }
 
     fn fetch_claude_config(&mut self) {
@@ -6259,6 +6232,9 @@ pub enum Event {
     // Sidebar
     ToggleSidebar,
     SetSidebarMode(SidebarMode),
+    /// Open the Git or Files panel on a listed repo (`None`: back to the
+    /// Files roots) (TRU-192).
+    OpenRepoPanel(SidebarMode, Option<PathBuf>),
     TaskCreateOpen,
     TaskCreateCancel,
     TaskTitleChanged(String),
@@ -6450,9 +6426,6 @@ pub enum Event {
     /// A workspace dot on the rail was clicked (TRU-148).
     WorkspaceDotPressed(usize),
     // Launch agent preset by index
-    AgentActivityLoaded(usize, Result<agent::AgentActivity, String>),
-    AgentConversationLoaded(usize, agent::Conversation),
-    SelectAgentCapture(usize),
     LaunchAgentPreset(usize),
     RemoteSessionLaunched(Result<(String, String, Option<String>), String>),
     LaunchSessionKind(Option<String>),
@@ -7044,7 +7017,6 @@ struct App {
     remote_sessions: Vec<RemoteSessionEntry>,
     remote_sessions_loading: bool,
     remote_sessions_error: Option<String>,
-    remote_sessions_loaded_at: Option<Instant>,
     // Chats panel (TRU-78): machine-wide conversation index + UI state.
     // App-level because the index spans workspaces; selection is per-tab.
     chat_index: Vec<chats::ChatIndexEntry>,
@@ -7110,6 +7082,9 @@ struct App {
     collapsed_repo_groups: std::collections::HashSet<String>,
     /// The workspace bar menu that is open (TRU-192).
     bar_menu: Option<BarMenu>,
+    /// The listed repo (and the tab) the Git or Files panel shows,
+    /// picked from a repo row in Work or the Files roots (TRU-192).
+    panel_repo: Option<(usize, PathBuf)>,
     /// Per-remote chat indexes (TRU-78 slice 4), keyed by remote id.
     /// Kept when a machine becomes unreachable so Everywhere still shows
     /// its (stale) chats.
@@ -9964,7 +9939,16 @@ impl App {
     /// the worktree a chat tab's agent works in.
     fn panel_context_root(&self) -> Option<PathBuf> {
         self.task_context_worktree_root()
+            .or_else(|| self.panel_repo_root())
             .or_else(|| self.followed_worktree_root())
+    }
+
+    /// The listed repo picked for the active tab's Git or Files panel
+    /// (TRU-192). Local workspaces only.
+    fn panel_repo_root(&self) -> Option<PathBuf> {
+        let (tab_id, dir) = self.panel_repo.as_ref()?;
+        (self.active_tab()?.id == *tab_id && !self.active_workspace_is_remote())
+            .then(|| dir.clone())
     }
 
     /// Resolve a chat tab's candidate paths against its repository's
@@ -14294,20 +14278,10 @@ impl App {
         )
     }
 
-    /// The overview or the Plans mode shows the active workspace's
-    /// documents.
-    fn work_documents_visible(&self) -> bool {
-        self.workspace_overview_visible()
-            || (!self.sidebar_is_collapsed()
-                && self
-                    .active_tab()
-                    .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Plans))
-    }
-
-    /// Tick: shown documents are gathered when never read or older than
-    /// [`WORK_DOCUMENTS_POLL`].
+    /// Tick: shown documents (Work's Documents section) are gathered when
+    /// never read or older than [`WORK_DOCUMENTS_POLL`].
     fn poll_work_documents(&mut self) -> Task<Event> {
-        if !self.work_documents_visible() {
+        if !self.workspace_overview_visible() {
             return Task::none();
         }
         let Some(uid) = self.active_workspace().map(|ws| ws.uid) else {
@@ -17219,7 +17193,6 @@ impl App {
             remote_sessions: Vec::new(),
             remote_sessions_loading: false,
             remote_sessions_error: None,
-            remote_sessions_loaded_at: None,
             window_focused: true,
             terminal_redraws: TerminalRedrawQueue::default(),
             bottom_panel_focused: false,
@@ -17281,6 +17254,7 @@ impl App {
             chat_open_section_collapsed: false,
             collapsed_repo_groups: std::collections::HashSet::new(),
             bar_menu: None,
+            panel_repo: None,
             remote_chat_indexes: HashMap::new(),
             remote_running_chats: HashMap::new(),
             remote_running_chats_revision: 0,
@@ -17495,7 +17469,6 @@ impl App {
                 remote_tab_title_for_startup_command(session, startup_command_for_title.as_deref());
             tab.repo_name = title.clone();
             tab.set_terminal_title(Some(title));
-            tab.sidebar_mode = SidebarMode::Remote;
         }
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
@@ -18481,7 +18454,9 @@ fi
     fn browse_active_tab_to(&mut self, dir: SourcePath) -> Task<Event> {
         let source = self.source_for_active_tab();
         let show_hidden = self.show_hidden;
-        let followed_root = self.followed_worktree_root();
+        let followed_root = self
+            .followed_worktree_root()
+            .or_else(|| self.panel_repo_root());
         let Some(tab) = self.active_tab_mut() else {
             return Task::none();
         };
@@ -18778,7 +18753,6 @@ fi
             if let Some(tab) = self.workspaces[ws_idx].tabs.get_mut(idx) {
                 tab.repo_name = title.clone();
                 tab.set_terminal_title(Some(title));
-                tab.sidebar_mode = SidebarMode::Remote;
             }
             self.workspaces[ws_idx].active_tab = idx;
             self.mark_workspaces_dirty();
@@ -18795,7 +18769,6 @@ fi
             self.create_tab_for_workspace(local_cwd, Some(startup_command), Some(&workspace_name));
         tab.repo_name = title.clone();
         tab.set_terminal_title(Some(title));
-        tab.sidebar_mode = SidebarMode::Remote;
         self.workspaces[ws_idx].tabs.push(tab);
         self.workspaces[ws_idx].active_tab = self.workspaces[ws_idx].tabs.len() - 1;
         self.mark_workspaces_dirty();
@@ -20980,77 +20953,6 @@ fi
                     self.refresh_task_conversation_history(),
                     self.present_active_tab_surfaces(),
                 ]);
-            }
-            Event::AgentActivityLoaded(tab_id, result) => {
-                // Find the tab by id and apply the loaded activity
-                'outer_activity: for ws in &mut self.workspaces {
-                    for tab in &mut ws.tabs {
-                        if tab.id == tab_id {
-                            tab.agent_sidebar.loading = false;
-                            match result {
-                                Ok(activity) => tab.agent_sidebar.activity = Some(activity),
-                                Err(e) => {
-                                    eprintln!("Failed to load agent activity: {}", e);
-                                    tab.agent_sidebar.activity = Some(agent::AgentActivity::new());
-                                }
-                            }
-                            break 'outer_activity;
-                        }
-                    }
-                }
-                return Task::none();
-            }
-            Event::AgentConversationLoaded(tab_id, conversation) => {
-                'outer_conv: for ws in &mut self.workspaces {
-                    for tab in &mut ws.tabs {
-                        if tab.id == tab_id {
-                            tab.agent_sidebar.conversation = Some(conversation);
-                            break 'outer_conv;
-                        }
-                    }
-                }
-                return Task::none();
-            }
-            Event::SelectAgentCapture(idx) => {
-                if let Some(tab) = self.active_tab_mut() {
-                    if tab.agent_sidebar.selected_capture_idx == Some(idx) {
-                        // Deselect if clicking the same one
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                    } else {
-                        tab.agent_sidebar.selected_capture_idx = Some(idx);
-                        tab.agent_sidebar.conversation = None; // Clear while loading
-                                                               // Load conversation async
-                        if let Some(activity) = &tab.agent_sidebar.activity {
-                            if let Some(capture) = activity.captures.get(idx) {
-                                let capture = capture.clone();
-                                let tab_id = tab.id;
-                                return Task::perform(
-                                    async move {
-                                        match tokio::task::spawn_blocking(move || {
-                                            agent::Conversation::load_for_capture(&capture)
-                                        })
-                                        .await
-                                        {
-                                            Ok(conv) => (tab_id, conv),
-                                            Err(_) => (
-                                                tab_id,
-                                                agent::Conversation {
-                                                    entries: Vec::new(),
-                                                    error: Some(
-                                                        "Failed to load conversation".to_string(),
-                                                    ),
-                                                },
-                                            ),
-                                        }
-                                    },
-                                    |(tab_id, conv)| Event::AgentConversationLoaded(tab_id, conv),
-                                );
-                            }
-                        }
-                    }
-                }
-                return Task::none();
             }
             Event::LaunchAgentPreset(idx) => {
                 // Option+click on "+" shows tab picker (but not if picker is already open)
@@ -24979,7 +24881,26 @@ fi
                 };
                 return self.close_task_tab(prompt);
             }
+            Event::OpenRepoPanel(mode, dir) => {
+                self.panel_repo = dir
+                    .zip(self.active_tab().map(|tab| tab.id))
+                    .map(|(dir, tab_id)| (tab_id, dir));
+                if self
+                    .active_tab()
+                    .is_some_and(|tab| tab.sidebar_mode == mode)
+                {
+                    // Files roots to a root: list it.
+                    return match self.panel_repo_root() {
+                        Some(root) => self.browse_active_tab_to(SourcePath::Local(root)),
+                        None => Task::none(),
+                    };
+                }
+                let task = self.set_sidebar_mode(mode);
+                self.settle_agent_surface();
+                return task;
+            }
             Event::SetSidebarMode(mode) => {
+                self.panel_repo = None;
                 let leaving_chats = mode != SidebarMode::Chats
                     && self
                         .active_tab()
@@ -24992,10 +24913,6 @@ fi
                     return Task::batch([task, self.present_active_tab_surfaces()]);
                 }
                 self.settle_agent_surface();
-                if mode == SidebarMode::Plans {
-                    // The Plans mode lists the work's documents (TRU-191).
-                    return Task::batch([task, self.poll_work_documents()]);
-                }
                 return task;
             }
             Event::SetGitViewMode(mode) => {
@@ -25110,7 +25027,6 @@ fi
             }
             Event::RemoteSessionsLoaded(snapshot) => {
                 self.remote_sessions_loading = false;
-                self.remote_sessions_loaded_at = Some(Instant::now());
                 if let Some(error) = snapshot.error {
                     self.remote_sessions.clear();
                     self.remote_sessions_error = Some(format!("{}: {}", snapshot.host_name, error));
@@ -26352,6 +26268,10 @@ fi
                         })
                     });
                 let is_active_tab = self.active_tab().is_some_and(|t| t.id == snapshot.tab_id);
+                // Nor a repo picked from Work or the Files roots (TRU-192).
+                let snapshot_root_is_panel_repo = self
+                    .panel_repo_root()
+                    .is_some_and(|dir| paths_equal(&dir, &snapshot.repo_path));
                 let context_root_before = self.panel_context_root();
                 if let Some(tab) = self
                     .workspaces
@@ -26388,6 +26308,7 @@ fi
                         if snapshot.repo_path != tab.repo_path
                             && snapshot.is_git_repo
                             && !(tab.task_id.is_none() && snapshot_root_is_task_worktree)
+                            && !snapshot_root_is_panel_repo
                             && !tab
                                 .worktree_follow
                                 .followed_paths()
@@ -27893,192 +27814,92 @@ fi
             .as_ref()
             .map(|source| source.capabilities())
             .unwrap_or_else(SourceCapabilities::none);
-        let active_workspace_is_remote = self.active_workspace_is_remote();
-        let active_workspace_is_remote_agent = self
-            .active_workspace()
-            .is_some_and(|workspace| self.remote_agent_id_for_workspace(workspace).is_some());
-        if mode == SidebarMode::Remote && !active_workspace_is_remote {
-            return Task::none();
-        }
+        let legacy_remote = self.active_workspace_is_remote()
+            && self
+                .active_workspace()
+                .is_none_or(|workspace| self.remote_agent_id_for_workspace(workspace).is_none());
 
         // Expand sidebar if collapsed when switching modes
-        if self.sidebar_collapsed {
-            self.sidebar_collapsed = false;
-        }
+        self.sidebar_collapsed = false;
         // Hide WebView when switching modes (but keep agent webview alive
         // — it's the agent tab's primary content, not a modal overlay).
         self.dismiss_viewer_surface();
 
         let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
-        if let Some(tab) = self.active_tab_mut() {
-            if tab.sidebar_mode != mode {
-                if mode == SidebarMode::Chats {
-                    tab.sidebar_mode_before_chats = tab.sidebar_mode;
+        let Some(tab) = self.active_tab_mut() else {
+            return Task::none();
+        };
+        if tab.sidebar_mode == mode {
+            return Task::none();
+        }
+        if mode == SidebarMode::Chats {
+            tab.sidebar_mode_before_chats = tab.sidebar_mode;
+        }
+        // Files keeps the file viewer open; Git keeps the selected diff.
+        if mode != SidebarMode::Files || legacy_remote {
+            tab.close_file_viewer();
+        }
+        if mode != SidebarMode::Git || legacy_remote {
+            tab.selected_file = None;
+            tab.diff_lines.clear();
+            tab.diff_syntax_lines = None;
+            tab.diff_syntax_notice = None;
+        }
+        tab.diff_load_in_progress = false;
+        tab.diff_load_started_at = None;
+        tab.sidebar_mode = mode;
+        if legacy_remote {
+            return Task::none();
+        }
+        match mode {
+            SidebarMode::Git => {
+                tab.last_poll = Instant::now();
+                tab.git_status_loading = true;
+                let tab_id = tab.id;
+                let repo_path = tab.repo_path.clone();
+                let load_worktrees =
+                    tab.git_view_mode == GitViewMode::Worktrees && active_caps.git_worktrees;
+                if load_worktrees {
+                    tab.worktrees_loading = true;
+                    tab.last_worktrees_poll = Instant::now();
                 }
-                if active_workspace_is_remote
-                    && !active_workspace_is_remote_agent
-                    && mode != SidebarMode::Remote
-                {
-                    tab.agent_sidebar.selected_capture_idx = None;
-                    tab.agent_sidebar.conversation = None;
-                    tab.close_file_viewer();
-                    tab.selected_file = None;
-                    tab.diff_lines.clear();
-                    tab.diff_load_in_progress = false;
-                    tab.diff_load_started_at = None;
-                    tab.diff_syntax_lines = None;
-                    tab.diff_syntax_notice = None;
-                    tab.sidebar_mode = mode;
+                let Some(source) = active_source else {
+                    tab.git_status_loading = false;
                     return Task::none();
+                };
+                self.mark_log_server_dirty();
+                let status_task =
+                    Self::request_source_git_status(source, tab_id, repo_path.clone());
+                if load_worktrees {
+                    let worktrees_repo_path = active_workspace_dir.unwrap_or(repo_path);
+                    return Task::batch([
+                        status_task,
+                        Self::request_git_worktrees(tab_id, worktrees_repo_path),
+                    ]);
                 }
-                match mode {
-                    SidebarMode::Git => {
-                        // Switching to Git mode - clear file viewer and refresh status
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.last_poll = Instant::now();
-                        tab.git_status_loading = true;
-                        let tab_id = tab.id;
-                        let repo_path = tab.repo_path.clone();
-                        let load_worktrees = tab.git_view_mode == GitViewMode::Worktrees
-                            && active_caps.git_worktrees;
-                        if load_worktrees {
-                            tab.worktrees_loading = true;
-                            tab.last_worktrees_poll = Instant::now();
-                        }
-                        let Some(source) = active_source else {
-                            tab.git_status_loading = false;
-                            tab.sidebar_mode = mode;
-                            return Task::none();
-                        };
-                        tab.sidebar_mode = mode;
-                        self.mark_log_server_dirty();
-                        let status_task =
-                            Self::request_source_git_status(source, tab_id, repo_path.clone());
-                        if load_worktrees {
-                            let worktrees_repo_path =
-                                active_workspace_dir.unwrap_or_else(|| repo_path.clone());
-                            return Task::batch([
-                                status_task,
-                                Self::request_git_worktrees(tab_id, worktrees_repo_path),
-                            ]);
-                        }
-                        return status_task;
-                    }
-                    SidebarMode::Files => {
-                        // Switching to Files mode - clear git selection
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.sidebar_mode = mode;
-                        let dir = tab.files.dir.clone();
-                        return self.browse_active_tab_to(dir);
-                    }
-                    SidebarMode::Claude => {
-                        // Switching to Claude mode - clear file viewer and git selection
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.fetch_claude_config();
-                    }
-                    SidebarMode::Agent => {
-                        // Switching to Agent mode - clear file viewer and git selection
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        let task = tab.fetch_agent_activity();
-                        tab.sidebar_mode = mode;
-                        return task;
-                    }
-                    SidebarMode::Plans => {
-                        // Switching to Plans mode - clear file viewer and git selection.
-                        // Plan list is read fresh in view_plans_sidebar on each render.
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                    }
-                    SidebarMode::Chats => {
-                        // Switching to Chats mode - clear other detail panes;
-                        // the index refreshes in the background if stale.
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.sidebar_mode = mode;
-                        self.chat_rank.panel_opened();
-                        let refresh = self.refresh_chat_index_if_stale();
-                        return Task::batch([refresh, self.request_chat_rank()]);
-                    }
-                    SidebarMode::Tasks => {
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                    }
-                    SidebarMode::Remote => {
-                        // Switching to Remote mode - clear local file/git detail panes.
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.sidebar_mode = mode;
-                        return self.refresh_remote_sessions();
-                    }
-                    SidebarMode::Workspace => {
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.sidebar_mode = mode;
-                        return self.open_workspace_overview();
-                    }
-                }
-                tab.sidebar_mode = mode;
+                status_task
+            }
+            SidebarMode::Files => {
+                let dir = tab.files.dir.clone();
+                self.browse_active_tab_to(dir)
+            }
+            SidebarMode::Claude => {
+                tab.fetch_claude_config();
+                Task::none()
+            }
+            SidebarMode::Chats => {
+                // The index refreshes in the background if stale.
+                self.chat_rank.panel_opened();
+                let refresh = self.refresh_chat_index_if_stale();
+                Task::batch([refresh, self.request_chat_rank()])
+            }
+            SidebarMode::Tasks => Task::none(),
+            SidebarMode::Workspace => {
+                // For Work's "skills · MCPs · hooks" line.
+                tab.fetch_claude_config();
+                self.open_workspace_overview()
             }
         }
-        Task::none()
     }
 
     /// Synchronously show or hide the agent pages per
@@ -30270,7 +30091,7 @@ fi
         content_col = content_col.push(shortcut_row("Cmd + ↑", "Return to General"));
         content_col = content_col.push(shortcut_row("Cmd + 0", "Open task overview"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + U", "Open usage view"));
-        content_col = content_col.push(shortcut_row("Cmd + Shift + O", "Chats overview"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + O", "Find: the chats overview"));
         content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to next needs-you"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + W", "Close workspace"));
         content_col = content_col.push(shortcut_row("Cmd + B", "Toggle sidebar"));
@@ -33467,12 +33288,6 @@ fi
                     // background that lets the webview occupy the same area.
                     freeze_time!("view_agent_tab", { self.view_agent_tab(tab) })
                 }
-            } else if tab.agent_sidebar.selected_capture_idx.is_some()
-                && tab.sidebar_mode == SidebarMode::Agent
-            {
-                freeze_time!("view_agent_conversation", {
-                    self.view_agent_conversation(tab)
-                })
             } else if tab.sidebar_mode == SidebarMode::Chats {
                 // The whole main pane belongs to Chats while the panel is
                 // open — also keeps the terminal out of the widget tree so
@@ -34020,177 +33835,48 @@ fi
             .into()
     }
 
+    /// The sidebar header (TRU-192): Work, Files, Find, then the collapse
+    /// chevron. Git and the agent view show under Work.
     fn view_sidebar_toggle<'a>(
         &'a self,
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
-        let changes = tab.total_changes();
-
-        let git_active = tab.sidebar_mode == SidebarMode::Git;
-        let files_active = tab.sidebar_mode == SidebarMode::Files;
-        let tasks_active = tab.sidebar_mode == SidebarMode::Tasks;
-        let claude_active = tab.sidebar_mode == SidebarMode::Claude;
-        let workspace_is_remote = self.active_workspace_is_remote();
-        let remote_active = workspace_is_remote && tab.sidebar_mode == SidebarMode::Remote;
-        let _agent_active = tab.sidebar_mode == SidebarMode::Agent;
-
-        // Git tab label with optional badge
-        // Inactive nav items use subtext0, not the overlay tier: overlay grays
-        // sit too close to the dark surface for small text to stay readable.
-        let git_text_color = if git_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let mut git_label: Row<'_, Event, Theme, iced::Renderer> =
-            Row::new().spacing(4).align_y(iced::Alignment::Center);
-        git_label = git_label.push(text("Git").size(font).color(git_text_color));
-
-        if changes > 0 {
-            let badge_bg = iced::Color {
-                a: 0.2,
-                ..theme.warning()
-            };
-            let warning_color = theme.warning();
-            let badge = container(text(format!("{}", changes)).size(10).color(warning_color))
-                .padding([1, 6])
-                .style(move |_| container::Style {
-                    background: Some(badge_bg.into()),
-                    border: iced::Border {
-                        radius: 8.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                });
-            git_label = git_label.push(badge);
-        }
-
-        let git_tab = self.view_sidebar_tab(
-            git_label.into(),
-            git_active,
-            Event::SetSidebarMode(SidebarMode::Git),
-        );
-
-        // Files tab
-        let files_text_color = if files_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let files_tab = self.view_sidebar_tab(
-            text("Files").size(font).color(files_text_color).into(),
-            files_active,
-            Event::SetSidebarMode(SidebarMode::Files),
-        );
-
-        let tasks_text_color = if tasks_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let tasks_tab = self.view_sidebar_tab(
-            text("Tasks").size(font).color(tasks_text_color).into(),
-            tasks_active,
-            Event::SetSidebarMode(SidebarMode::Tasks),
-        );
-
-        // Agent tab (was "Claude" — same SidebarMode::Claude variant, shows skills/plugins/hooks)
-        let agent_text_color = if claude_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let agent_tab = self.view_sidebar_tab(
-            text("Agent").size(font).color(agent_text_color).into(),
-            claude_active,
-            Event::SetSidebarMode(SidebarMode::Claude),
-        );
-
-        let bg = theme.bg_crust();
-        let border_color = theme.surface0();
-
-        // Collapse chevron (same style as console toggle)
-        let chevron_color = theme.subtext0();
-        let collapse_chevron = button(
-            text("\u{25C0}").size(10).color(chevron_color), // ◀ left-pointing
-        )
-        .style(|_theme, _status| button::Style {
-            background: Some(iced::Color::TRANSPARENT.into()),
-            ..Default::default()
-        })
-        .padding([4, 4])
-        .on_press(Event::ToggleSidebar);
-
-        // Plans tab (replaces the legacy "Agent" sidebar tab)
-        let plans_active = tab.sidebar_mode == SidebarMode::Plans;
-        let plans_text_color = if plans_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let plans_tab = self.view_sidebar_tab(
-            text("Plans").size(font).color(plans_text_color).into(),
-            plans_active,
-            Event::SetSidebarMode(SidebarMode::Plans),
-        );
-
-        let chats_active = tab.sidebar_mode == SidebarMode::Chats;
-        let chats_text_color = if chats_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let chats_tab = self.view_sidebar_tab(
-            text("Chats").size(font).color(chats_text_color).into(),
-            chats_active,
-            Event::SetSidebarMode(SidebarMode::Chats),
-        );
-
-        // Workspace overview (TRU-167): a glyph, as the spine shows it, so
-        // the text row keeps its width.
-        let workspace_active = tab.sidebar_mode == SidebarMode::Workspace;
-        let workspace_text_color = if workspace_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let workspace_tab = self.view_sidebar_tab(
-            text("\u{25A6}")
-                .size(font)
-                .color(workspace_text_color)
-                .into(),
-            workspace_active,
-            Event::SetSidebarMode(SidebarMode::Workspace),
-        );
-
-        let mut tabs = Row::new()
-            .spacing(0)
-            .push(git_tab)
-            .push(files_tab)
-            .push(tasks_tab)
-            .push(agent_tab)
-            .push(chats_tab)
-            .push(plans_tab)
-            .push(workspace_tab);
-
-        if workspace_is_remote {
-            let remote_text_color = if remote_active {
+        let active = tab.sidebar_mode.header_mode();
+        let mut tabs = Row::new().spacing(0);
+        for mode in SidebarMode::header_modes() {
+            // Inactive nav items use subtext0, not the overlay tier: overlay
+            // grays sit too close to the dark surface for small text.
+            let color = if mode == active {
                 theme.text_primary()
             } else {
                 theme.subtext0()
             };
-            let remote_tab = self.view_sidebar_tab(
-                text("Remote").size(font).color(remote_text_color).into(),
-                remote_active,
-                Event::SetSidebarMode(SidebarMode::Remote),
+            tabs = tabs.push(
+                self.view_sidebar_tab(
+                    text(mode.label_and_glyph().0)
+                        .size(font)
+                        .color(color)
+                        .into(),
+                    mode == active,
+                    Event::SetSidebarMode(mode),
+                ),
             );
-            tabs = tabs.push(remote_tab);
         }
+        let chevron_color = theme.subtext0();
+        tabs = tabs.push(
+            button(text("\u{25C0}").size(10).color(chevron_color))
+                .style(|_theme, _status| button::Style {
+                    background: Some(iced::Color::TRANSPARENT.into()),
+                    ..Default::default()
+                })
+                .padding([4, 4])
+                .on_press(Event::ToggleSidebar),
+        );
 
-        tabs = tabs.push(collapse_chevron);
-
+        let bg = theme.bg_crust();
+        let border_color = theme.surface0();
         let tab_row = container(tabs)
             .padding([4, 4])
             .width(Length::Fill)
@@ -34198,7 +33884,6 @@ fi
                 background: Some(bg.into()),
                 ..Default::default()
             });
-
         let separator = container(iced::widget::Space::new().height(0))
             .width(Length::Fill)
             .height(Length::Fixed(1.0))
@@ -34206,33 +33891,103 @@ fi
                 background: Some(border_color.into()),
                 ..Default::default()
             });
-
         column![tab_row, separator].into()
+    }
+
+    /// The Files panel's top-level folders for the active workspace
+    /// (TRU-192): a local piece of work's listed repos and its docs folder.
+    fn files_roots_for_active(&self) -> Option<Vec<PathBuf>> {
+        let ws = self
+            .active_workspace()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))?;
+        let repos: Vec<PathBuf> = ws
+            .repos
+            .iter()
+            .filter_map(|id| self.repo(*id))
+            .map(|repo| repo.dir.clone())
+            .collect();
+        let docs = Some(ws.dir.join("docs")).filter(|docs| docs.is_dir());
+        gitterm::workspace_repos::files_roots(ws.is_work(), &repos, docs)
+    }
+
+    /// The Files roots of a piece of work: each opens the file tree in it.
+    fn view_files_roots<'a>(
+        &'a self,
+        dirs: &[PathBuf],
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let mut col = Column::new().spacing(2).padding(8);
+        for dir in dirs {
+            col = col.push(
+                button(
+                    row![
+                        text("📁")
+                            .size(font)
+                            .color(theme.accent())
+                            .width(Length::Fixed(24.0)),
+                        text(format!("{}/", gitterm::workspace_repos::repo_name(dir)))
+                            .size(font)
+                            .color(theme.accent()),
+                    ]
+                    .spacing(4),
+                )
+                .style(button::text)
+                .padding([4, 8])
+                .width(Length::Fill)
+                .on_press(Event::OpenRepoPanel(SidebarMode::Files, Some(dir.clone()))),
+            );
+        }
+        scrollable(col)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
     }
 
     fn view_sidebar<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let mut content = Column::new().spacing(0);
         let workspace_is_remote = self.active_workspace_is_remote();
         let workspace_is_remote_agent = self.tab_belongs_to_remote_agent_workspace(tab.id);
-
-        // Mode toggle buttons
-        let toggle = self.view_sidebar_toggle(tab);
-        content = content.push(toggle);
-
-        let sidebar_mode = if tab.sidebar_mode == SidebarMode::Remote && !workspace_is_remote {
-            SidebarMode::Git
-        } else {
-            tab.sidebar_mode
-        };
+        let mut content = Column::new().spacing(0).push(self.view_sidebar_toggle(tab));
 
         let sidebar_caps = self
             .source_for_active_tab()
             .map(|source| source.capabilities())
             .unwrap_or_else(|_| SourceCapabilities::none());
 
+        // Git and the agent view open from Work, and go back to it; Files
+        // in a piece of work goes back to its roots.
+        let back = |label: &'static str, event: Event| {
+            button(text(label).size(self.ui_font_small()).color(theme.accent()))
+                .style(self.ghost_button_style())
+                .padding([4, 8])
+                .on_press(event)
+        };
+        let files_roots = self.files_roots_for_active();
+        match tab.sidebar_mode {
+            SidebarMode::Git | SidebarMode::Claude => {
+                content = content.push(
+                    container(back(
+                        "\u{2190} Work",
+                        Event::SetSidebarMode(SidebarMode::Workspace),
+                    ))
+                    .padding([4, 4]),
+                );
+            }
+            SidebarMode::Files if files_roots.is_some() && self.panel_repo_root().is_some() => {
+                content = content.push(
+                    container(back(
+                        "\u{2190} All folders",
+                        Event::OpenRepoPanel(SidebarMode::Files, None),
+                    ))
+                    .padding([4, 4]),
+                );
+            }
+            _ => {}
+        }
+
         // Content based on mode
-        let mode_content: Element<'_, Event, Theme, iced::Renderer> = match sidebar_mode {
+        let mode_content: Element<'_, Event, Theme, iced::Renderer> = match tab.sidebar_mode {
             SidebarMode::Git if !sidebar_caps.git_status => {
                 self.view_remote_local_mode_placeholder("Git")
             }
@@ -34240,33 +33995,21 @@ fi
             SidebarMode::Files if workspace_is_remote && !workspace_is_remote_agent => {
                 self.view_remote_local_mode_placeholder("Files")
             }
-            SidebarMode::Files => freeze_time!("view_file_tree", { self.view_file_tree(tab) }),
+            SidebarMode::Files => match files_roots {
+                Some(roots) if self.panel_repo_root().is_none() => self.view_files_roots(&roots),
+                _ => freeze_time!("view_file_tree", { self.view_file_tree(tab) }),
+            },
             SidebarMode::Claude if workspace_is_remote => {
                 self.view_remote_local_mode_placeholder("Agent")
             }
             SidebarMode::Claude => {
                 freeze_time!("view_claude_sidebar", { self.view_claude_sidebar(tab) })
             }
-            SidebarMode::Agent if workspace_is_remote => {
-                self.view_remote_local_mode_placeholder("Agent")
-            }
-            SidebarMode::Agent => {
-                freeze_time!("view_agent_sidebar", { self.view_agent_sidebar(tab) })
-            }
-            SidebarMode::Plans if workspace_is_remote => {
-                self.view_remote_local_mode_placeholder("Plans")
-            }
-            SidebarMode::Plans => {
-                freeze_time!("view_plans_sidebar", { self.view_plans_sidebar() })
-            }
             SidebarMode::Chats => {
                 freeze_time!("view_chats_sidebar", { self.view_chats_sidebar(tab) })
             }
             SidebarMode::Tasks => {
                 freeze_time!("view_task_rail", { self.view_task_rail() })
-            }
-            SidebarMode::Remote => {
-                freeze_time!("view_remote_sidebar", { self.view_remote_sidebar() })
             }
             SidebarMode::Workspace => {
                 freeze_time!("view_workspace_overview", {
@@ -34338,63 +34081,12 @@ fi
         let font = self.ui_font();
 
         let rail_width = SPINE_WIDTH;
-        let workspace_is_remote = self.active_workspace_is_remote();
-        let mut task_dots = self
-            .active_workspace()
-            .and_then(|workspace| {
-                self.task_store.as_ref().map(|store| {
-                    store
-                        .tasks()
-                        .iter()
-                        .filter(|task| {
-                            task.lifecycle != TaskLifecycle::Archived
-                                && self.task_belongs_to_workspace(task, workspace)
-                        })
-                        .filter_map(|task| {
-                            let (priority, color) = match task.attention.reason {
-                                Some(TaskAttentionReason::ExecutionFailed) => (0, theme.danger()),
-                                Some(TaskAttentionReason::RequiresInput)
-                                | Some(TaskAttentionReason::Interrupted)
-                                | Some(TaskAttentionReason::RemoteUnavailable) => {
-                                    (1, theme.peach())
-                                }
-                                Some(TaskAttentionReason::CompletedUnread)
-                                | Some(TaskAttentionReason::ReadyForReview) => (2, theme.green()),
-                                None if task.lifecycle == TaskLifecycle::Failed => {
-                                    (0, theme.danger())
-                                }
-                                None if task.lifecycle == TaskLifecycle::Interrupted => {
-                                    (1, theme.peach())
-                                }
-                                None if task.lifecycle.is_active() => (3, theme.blue()),
-                                _ => return None,
-                            };
-                            Some((priority, color))
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .unwrap_or_default();
-        task_dots.sort_by_key(|(priority, _)| *priority);
-        task_dots.truncate(3);
-
-        let mut modes = vec![
-            ("\u{2387}", SidebarMode::Git),       // ⎇ branch symbol
-            ("\u{1F4C1}", SidebarMode::Files),    // 📁 folder
-            ("\u{25C8}", SidebarMode::Tasks),     // ◈ task dispatch
-            ("\u{2726}", SidebarMode::Claude),    // ✦ sparkle
-            ("\u{224B}", SidebarMode::Chats),     // ≋ conversation history
-            ("\u{25A4}", SidebarMode::Plans),     // ▤ plans
-            ("\u{25A6}", SidebarMode::Workspace), // ▦ workspace overview
-        ];
-        if workspace_is_remote {
-            modes.push(("\u{2601}", SidebarMode::Remote)); // cloud
-        }
 
         let mut rail_col = Column::new().spacing(0).width(Length::Fixed(rail_width));
 
-        for (label, mode) in &modes {
-            let is_active = tab.sidebar_mode == *mode;
+        for mode in SidebarMode::header_modes() {
+            let label = mode.label_and_glyph().1;
+            let is_active = tab.sidebar_mode.header_mode() == mode;
             let text_color = if is_active {
                 theme.text_primary()
             } else {
@@ -34421,36 +34113,9 @@ fi
                     ..Default::default()
                 });
 
-            let glyph: Element<'_, Event, Theme, iced::Renderer> =
-                if *mode == SidebarMode::Tasks && !task_dots.is_empty() {
-                    let mut dots = Column::new().spacing(2);
-                    for (_, color) in &task_dots {
-                        let dot_color = *color;
-                        dots = dots.push(
-                            container(iced::widget::Space::new())
-                                .width(Length::Fixed(4.0))
-                                .height(Length::Fixed(4.0))
-                                .style(move |_| container::Style {
-                                    background: Some(dot_color.into()),
-                                    border: iced::Border {
-                                        radius: 2.0.into(),
-                                        ..Default::default()
-                                    },
-                                    ..Default::default()
-                                }),
-                        );
-                    }
-                    row![text(*label).size(font).color(text_color), dots]
-                        .spacing(3)
-                        .align_y(iced::Alignment::Center)
-                        .into()
-                } else {
-                    text(*label).size(font).color(text_color).into()
-                };
-
             let btn_content = row![
                 indicator,
-                container(glyph)
+                container(text(label).size(font).color(text_color))
                     .center_x(Length::Fill)
                     .center_y(Length::Fixed(24.0))
             ]
@@ -34458,7 +34123,6 @@ fi
             .align_y(iced::Alignment::Center)
             .width(Length::Fixed(rail_width));
 
-            let mode_clone = *mode;
             let mode_btn = button(btn_content)
                 .style(move |_theme, status| {
                     let bg = if matches!(status, button::Status::Hovered) {
@@ -34475,7 +34139,7 @@ fi
                 })
                 .padding([8, 0])
                 .width(Length::Fixed(rail_width))
-                .on_press(Event::SetSidebarMode(mode_clone));
+                .on_press(Event::SetSidebarMode(mode));
 
             rail_col = rail_col.push(mode_btn);
         }
@@ -34573,12 +34237,17 @@ fi
             if repo.id == ws.home {
                 name.push_str(" \u{00B7} home");
             }
-            let mut line = Row::new().spacing(4).align_y(iced::Alignment::Center).push(
-                text(name)
-                    .size(font_small)
-                    .color(text_primary)
-                    .width(Length::Fill),
-            );
+            // The name opens the Git view on the repo (TRU-192).
+            let mut line =
+                Row::new().spacing(4).align_y(iced::Alignment::Center).push(
+                    button(text(name).size(font_small).color(text_primary))
+                        .style(self.ghost_button_style())
+                        .padding([2, 4])
+                        .width(Length::Fill)
+                        .on_press_maybe(repo.key.is_local().then(|| {
+                            Event::OpenRepoPanel(SidebarMode::Git, Some(repo.dir.clone()))
+                        })),
+                );
             // Its run command (TRU-180): `▶` opens it as a terminal tab
             // below; ✎ edits it. Only this Mac's folders run.
             if repo.key.is_local() {
@@ -34748,8 +34417,27 @@ fi
         if let Some(repos) = self.view_overview_repos() {
             content = content.push(repos);
         }
+        // What the agent has here (TRU-192): opens the Agent view.
+        if let Some(config) = self.active_tab().map(|tab| &tab.claude_config) {
+            content = content.push(
+                button(
+                    text(format!(
+                        "skills {} \u{00B7} MCPs {} \u{00B7} hooks {}",
+                        config.skills.len(),
+                        config.mcp_servers.len(),
+                        config.hooks.len()
+                    ))
+                    .size(10)
+                    .color(theme.accent())
+                    .font(mono),
+                )
+                .style(self.ghost_button_style())
+                .padding([2, 6])
+                .on_press(Event::SetSidebarMode(SidebarMode::Claude)),
+            );
+        }
         // Documents of the work (TRU-191), newest first.
-        if let Some(documents) = self.view_work_documents(Some(OVERVIEW_DOCUMENT_ROWS)) {
+        if let Some(documents) = self.view_work_documents() {
             let count = self
                 .active_workspace()
                 .and_then(|ws| self.work_documents.get(&ws.uid))
@@ -34919,7 +34607,7 @@ fi
             }
             let more_in_chats = |count: usize| {
                 button(
-                    text(format!("\u{2026} {count} more in Chats"))
+                    text(format!("\u{2026} {count} more in Find"))
                         .size(10)
                         .color(theme.accent()),
                 )
@@ -36967,140 +36655,6 @@ fi
             ..Default::default()
         })
         .into()
-    }
-
-    fn view_remote_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-        let mut content = Column::new().spacing(8).padding(8);
-        let active_remote_agent_workspace = self
-            .active_workspace()
-            .filter(|workspace| self.remote_agent_id_for_workspace(workspace).is_some());
-
-        let header = row![
-            text(if active_remote_agent_workspace.is_some() {
-                "Remote agent"
-            } else {
-                "Remote sessions"
-            })
-            .size(font)
-            .color(theme.text_primary())
-            .width(Length::Fill),
-            button(
-                text(if active_remote_agent_workspace.is_some() {
-                    "Reconnect"
-                } else {
-                    "Refresh"
-                })
-                .size(font_small)
-            )
-            .style(self.ghost_button_style())
-            .padding([3, 8])
-            .on_press_maybe(active_remote_agent_workspace.map_or(
-                Some(Event::RefreshRemoteSessions),
-                |workspace| {
-                    self.remote_agent_id_for_workspace(workspace)
-                        .map(|remote_id| Event::RemoteAgentConnect(remote_id.to_string()))
-                },
-            )),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
-        content = content.push(header);
-
-        if let Some(workspace) = active_remote_agent_workspace {
-            content = content.push(self.view_remote_agent_connection_panel(workspace));
-            if let Some(actions) = self.view_remote_agent_session_actions(workspace) {
-                content = content.push(actions);
-            }
-            return scrollable(content)
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into();
-        }
-
-        if self.remote_sessions_loading {
-            content = content.push(
-                text("Loading remote sessions...")
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-            );
-        }
-
-        if let Some(error) = &self.remote_sessions_error {
-            let error_bg = iced::Color {
-                a: 0.12,
-                ..theme.danger()
-            };
-            content = content.push(
-                container(text(error).size(font_small).color(theme.danger()))
-                    .padding([6, 8])
-                    .width(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(error_bg.into()),
-                        border: iced::Border {
-                            radius: 6.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-            );
-        }
-
-        if let Some(loaded_at) = self.remote_sessions_loaded_at {
-            content = content.push(
-                text(format!("Updated {}s ago", loaded_at.elapsed().as_secs()))
-                    .size(10)
-                    .color(theme.text_muted()),
-            );
-        }
-
-        let active_remote_session = self
-            .active_workspace()
-            .and_then(|workspace| self.remote_session_for_workspace(workspace));
-        let Some(session) = active_remote_session else {
-            content = content.push(
-                text("Remote sessions are scoped to remote workspaces.")
-                    .size(font)
-                    .color(theme.text_secondary()),
-            );
-            content = content.push(
-                text("Use the workspace bar to open a mac-mini:* workspace.")
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-            );
-            return scrollable(content)
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into();
-        };
-
-        let runtime = self
-            .remote_sessions
-            .iter()
-            .find(|entry| entry.name == session.session_name);
-        let codex_session_name = remote_codex_session_name(session);
-        let codex_runtime = self
-            .remote_sessions
-            .iter()
-            .find(|entry| entry.name == codex_session_name);
-        let claude_session_name = remote_claude_session_name(session);
-        let claude_runtime = self
-            .remote_sessions
-            .iter()
-            .find(|entry| entry.name == claude_session_name);
-        content = content.push(self.view_remote_session_item(
-            session,
-            runtime,
-            codex_runtime,
-            claude_runtime,
-        ));
-
-        scrollable(content)
-            .height(Length::Fill)
-            .width(Length::Fill)
-            .into()
     }
 
     fn view_remote_session_item<'a>(
@@ -40016,117 +39570,12 @@ fi
         .into()
     }
 
-    fn view_plans_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font_small = self.ui_font_small();
-
-        let Some(workspace_dir) = self
-            .workspaces
-            .get(self.active_workspace_idx)
-            .map(|ws| &ws.dir)
-        else {
-            return container(
-                text("No active workspace")
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-            )
-            .padding(16)
-            .into();
-        };
-
-        // The work's documents (TRU-191): the same list as the overview's
-        // Documents section, in full.
-        let docs_dir = workspace_dir.join("docs");
-        let mono = iced::Font::with_name("Menlo");
-        let state = self
-            .active_workspace()
-            .and_then(|ws| self.work_documents.get(&ws.uid));
-        let reading = state.is_some_and(|state| state.in_flight);
-        let mut refresh = button(
-            text(if reading {
-                "reading\u{2026}"
-            } else {
-                "\u{21BB} Refresh"
-            })
-            .size(11)
-            .color(theme.blue())
-            .font(mono),
-        )
-        .style(self.ghost_button_style())
-        .padding([4, 5]);
-        if !reading {
-            refresh = refresh.on_press(Event::WorkDocumentsRefresh);
-        }
-        let count = state
-            .and_then(|state| state.result.as_ref())
-            .map(|result| result.documents.len());
-        let mut list = Column::new().spacing(4).padding(8).push(
-            row![
-                text(match count {
-                    Some(count) => format!("DOCUMENTS \u{00B7} {count}"),
-                    None => "DOCUMENTS".to_string(),
-                })
-                .size(10)
-                .color(theme.text_muted())
-                .font(mono),
-                iced::widget::Space::new().width(Length::Fill),
-                refresh,
-            ]
-            .align_y(iced::Alignment::Center),
-        );
-        match self.view_work_documents(None) {
-            Some(documents) => list = list.push(documents),
-            None if count.is_none() && state.is_none_or(|state| state.error.is_none()) => {
-                list = list.push(
-                    text("Reading\u{2026}")
-                        .size(font_small)
-                        .color(theme.text_muted()),
-                );
-            }
-            None => {
-                list = list.push(
-                    column![
-                        text("No documents found")
-                            .size(font_small)
-                            .color(theme.text_secondary()),
-                        text(format!(
-                            "Looked in {}, the chats' writes, and .plans/ and docs/ of each listed repo",
-                            docs_dir.display()
-                        ))
-                        .size(font_small)
-                        .color(theme.text_muted()),
-                    ]
-                    .spacing(2)
-                    .padding([2, 8]),
-                );
-            }
-        }
-        if let Some(error) = state.and_then(|state| state.error.as_ref()) {
-            if count.is_none() {
-                list = list.push(
-                    text(overview::shorten(error, 200))
-                        .size(10)
-                        .color(theme.danger()),
-                );
-            }
-        }
-
-        iced::widget::scrollable(list)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-
-    /// The active workspace's documents (TRU-191), newest first, at most
-    /// `limit` of them. Each row: title and age, then the newest copy's
+    /// The active workspace's documents (TRU-191), newest first. Each row: title and age, then the newest copy's
     /// source and the path within its checkout, and "N copies" (with
     /// "copies differ") when there are more; clicking opens the newest copy
     /// in the markdown viewer and the copies line lists each copy to open.
     /// `None` while nothing has been read or nothing was found.
-    fn view_work_documents(
-        &self,
-        limit: Option<usize>,
-    ) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+    fn view_work_documents(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
         let font_small = self.ui_font_small();
@@ -40137,9 +39586,8 @@ fi
         if result.documents.is_empty() {
             return None;
         }
-        let shown = limit.unwrap_or(usize::MAX);
         let mut col = Column::new().spacing(2);
-        for doc in result.documents.iter().take(shown) {
+        for doc in &result.documents {
             let newest = doc.newest();
             let head = row![
                 text(overview::shorten(&doc.title, 60))
@@ -40212,21 +39660,6 @@ fi
             }
             col = col.push(entry);
         }
-        if result.documents.len() > shown {
-            col = col.push(
-                button(
-                    text(format!(
-                        "\u{2026} {} more in Plans",
-                        result.documents.len() - shown
-                    ))
-                    .size(10)
-                    .color(theme.accent()),
-                )
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::SetSidebarMode(SidebarMode::Plans)),
-            );
-        }
         if result.truncated {
             col = col.push(
                 text("Stopped reading at the scan's limit; some documents may be missing.")
@@ -40242,646 +39675,6 @@ fi
             );
         }
         Some(col.into())
-    }
-
-    fn view_agent_sidebar<'a>(
-        &'a self,
-        tab: &'a TabState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-
-        if tab.agent_sidebar.loading {
-            let spinner = container(
-                text("Loading agent activity...")
-                    .size(font_small)
-                    .color(theme.subtext0()),
-            )
-            .padding(20)
-            .center_x(Length::Fill);
-
-            return spinner.into();
-        }
-
-        let activity = match &tab.agent_sidebar.activity {
-            Some(activity) => activity,
-            None => {
-                let no_data = container(
-                    column![
-                        text("No Agent Activity")
-                            .size(font)
-                            .color(theme.text_primary()),
-                        text("No captured sessions found for this repository")
-                            .size(font_small)
-                            .color(theme.subtext0())
-                    ]
-                    .spacing(4),
-                )
-                .padding(20)
-                .center_x(Length::Fill);
-
-                return no_data.into();
-            }
-        };
-
-        let mut content = Column::new().spacing(0);
-
-        // Header with overview stats
-        let header_bg = theme.surface0();
-        let accent_glow = iced::Color {
-            a: 0.1,
-            ..theme.mauve()
-        };
-
-        let commits_count = activity.total_commits;
-        let live_count = activity.live_capture_count();
-        let git_count = commits_count - live_count;
-        let cost_display = activity.format_total_cost();
-
-        let mut stats_row = Row::new().spacing(8);
-
-        // Agent sessions badge (live captures)
-        if live_count > 0 {
-            stats_row = stats_row.push(
-                container(
-                    text(format!("{} sessions", live_count))
-                        .size(font_small)
-                        .color(theme.mauve()),
-                )
-                .padding([2, 8])
-                .style(move |_| container::Style {
-                    background: Some(
-                        iced::Color {
-                            a: 0.15,
-                            ..theme.mauve()
-                        }
-                        .into(),
-                    ),
-                    border: iced::Border::default().rounded(8),
-                    ..Default::default()
-                }),
-            );
-        }
-
-        // Git commits badge (reconstructed)
-        if git_count > 0 {
-            stats_row = stats_row.push(
-                container(
-                    text(format!("{} commits", git_count))
-                        .size(font_small)
-                        .color(theme.text_secondary()),
-                )
-                .padding([2, 8])
-                .style(move |_| container::Style {
-                    background: Some(
-                        iced::Color {
-                            a: 0.12,
-                            ..theme.text_secondary()
-                        }
-                        .into(),
-                    ),
-                    border: iced::Border::default().rounded(8),
-                    ..Default::default()
-                }),
-            );
-        }
-
-        // Cost badge (only if there are live captures with cost)
-        if activity.total_cost > 0.0 {
-            stats_row = stats_row.push(
-                container(text(cost_display).size(font_small).color(theme.peach()))
-                    .padding([2, 8])
-                    .style(move |_| container::Style {
-                        background: Some(
-                            iced::Color {
-                                a: 0.15,
-                                ..theme.peach()
-                            }
-                            .into(),
-                        ),
-                        border: iced::Border::default().rounded(8),
-                        ..Default::default()
-                    }),
-            );
-        }
-
-        let header_stats = container(
-            column![
-                text("Agent Activity Journal")
-                    .size(font)
-                    .color(theme.text_primary()),
-                stats_row
-            ]
-            .spacing(6),
-        )
-        .padding(12)
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(header_bg.into()),
-            border: iced::Border {
-                width: 1.0,
-                color: accent_glow,
-                radius: iced::border::Radius::from(6),
-            },
-            ..Default::default()
-        });
-
-        content = content.push(header_stats);
-        content = content.push(iced::widget::Space::new().height(8));
-
-        // Recent captures timeline
-        if activity.captures.is_empty() {
-            let empty_state = container(
-                column![
-                    text("✨ Ready for your first agent session")
-                        .size(font)
-                        .color(theme.subtext1()),
-                    text("Commit with an agent to see activity here")
-                        .size(font_small)
-                        .color(theme.subtext0())
-                ]
-                .spacing(4)
-                .align_x(iced::Alignment::Center),
-            )
-            .padding(20)
-            .width(Length::Fill)
-            .center_x(Length::Fill);
-
-            content = content.push(empty_state);
-        } else {
-            // Show recent captures
-            let recent_captures = activity.recent_captures(50);
-            let selected_idx = tab.agent_sidebar.selected_capture_idx;
-
-            for (idx, capture) in recent_captures.iter().enumerate() {
-                let is_selected = selected_idx == Some(idx);
-                content =
-                    content.push(self.view_agent_capture_entry(capture, theme, idx, is_selected));
-            }
-        }
-
-        scrollable(content).into()
-    }
-
-    fn view_agent_capture_entry<'a>(
-        &'a self,
-        capture: &'a agent::AgentCapture,
-        theme: &'a AppTheme,
-        idx: usize,
-        is_selected: bool,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let font_small = self.ui_font_small();
-        let font_tiny = font_small * 0.9;
-
-        let is_reconstructed = capture.is_reconstructed();
-        let is_live = !is_reconstructed;
-
-        // Container styling — highlight selected
-        let entry_bg = if is_selected {
-            theme.surface0()
-        } else if is_reconstructed {
-            theme.bg_base()
-        } else {
-            theme.bg_overlay()
-        };
-        let border_color = if is_selected {
-            theme.accent()
-        } else if is_reconstructed {
-            theme.surface0()
-        } else {
-            theme.surface1()
-        };
-
-        // Format timestamp
-        let time_display = if let Some(timestamp) = capture.timestamp_parsed() {
-            let elapsed = timestamp.elapsed().unwrap_or(Duration::from_secs(0));
-            let secs = elapsed.as_secs();
-            if secs >= 24 * 3600 {
-                format!("{}d", secs / (24 * 3600))
-            } else if secs >= 3600 {
-                format!("{}h", secs / 3600)
-            } else {
-                format!("{}m", secs / 60)
-            }
-        } else {
-            "now".to_string()
-        };
-
-        let mut entry_content = Column::new().spacing(2);
-
-        // === Row 1: Description (the most important thing) ===
-        if let Some(desc) = capture.description() {
-            let truncated: String = if desc.len() > 72 {
-                format!("{}…", truncate_str(&desc, 71))
-            } else {
-                desc
-            };
-            let desc_color = if is_live {
-                theme.text_primary()
-            } else {
-                theme.subtext1()
-            };
-            entry_content = entry_content.push(text(truncated).size(font_small).color(desc_color));
-        }
-
-        // === Row 2: Badges row — hash, type badge, key stat, timestamp ===
-        let mut badges_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
-
-        // Commit hash
-        let hash_color = if is_live {
-            theme.blue()
-        } else {
-            theme.text_muted()
-        };
-        badges_row = badges_row.push(text(capture.short_hash()).size(font_tiny).color(hash_color));
-
-        if is_live {
-            // Model badge
-            let (model_name, model_badge_color) = if let Some((name, _)) = capture.primary_model() {
-                let color = if name.contains("opus") {
-                    theme.mauve()
-                } else if name.contains("sonnet") {
-                    theme.blue()
-                } else if name.contains("haiku") || name.contains("gpt") {
-                    theme.green()
-                } else {
-                    theme.text_secondary()
-                };
-                // Short name: "opus-4-6" from "claude-opus-4-6"
-                let short = name.split('/').next_back().unwrap_or(name);
-                let short = short.strip_prefix("claude-").unwrap_or(short);
-                (short, color)
-            } else {
-                ("unknown", theme.text_secondary())
-            };
-            badges_row = badges_row.push(
-                container(text(model_name).size(font_tiny).color(model_badge_color))
-                    .padding([1, 5])
-                    .style(move |_| container::Style {
-                        background: Some(
-                            iced::Color {
-                                a: 0.15,
-                                ..model_badge_color
-                            }
-                            .into(),
-                        ),
-                        border: iced::Border::default().rounded(4),
-                        ..Default::default()
-                    }),
-            );
-
-            // Turns count
-            badges_row = badges_row.push(
-                text(format!("{}t", capture.turns))
-                    .size(font_tiny)
-                    .color(theme.subtext0()),
-            );
-
-            // Duration
-            badges_row = badges_row.push(
-                text(capture.format_duration())
-                    .size(font_tiny)
-                    .color(theme.subtext0()),
-            );
-        } else {
-            // Git badge for reconstructed
-            let git_color = theme.text_secondary();
-            badges_row = badges_row.push(
-                container(text("git").size(font_tiny).color(git_color))
-                    .padding([1, 5])
-                    .style(move |_| container::Style {
-                        background: Some(
-                            iced::Color {
-                                a: 0.12,
-                                ..git_color
-                            }
-                            .into(),
-                        ),
-                        border: iced::Border::default().rounded(4),
-                        ..Default::default()
-                    }),
-            );
-
-            // Diff summary
-            let diff = capture.diff_summary();
-            if !diff.is_empty() {
-                badges_row = badges_row.push(text(diff).size(font_tiny).color(theme.text_muted()));
-            }
-        }
-
-        // Timestamp pushed to the right
-        badges_row = badges_row.push(iced::widget::Space::new().width(Length::Fill));
-        badges_row = badges_row.push(text(time_display).size(font_tiny).color(theme.text_muted()));
-
-        entry_content = entry_content.push(badges_row);
-
-        let entry_container = container(entry_content)
-            .padding([6, 12])
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(entry_bg.into()),
-                border: iced::Border {
-                    width: 1.0,
-                    color: border_color,
-                    radius: iced::border::Radius::from(4),
-                },
-                ..Default::default()
-            });
-
-        // Only make live captures clickable (they have conversations)
-        if is_live {
-            iced::widget::mouse_area(entry_container)
-                .on_press(Event::SelectAgentCapture(idx))
-                .into()
-        } else {
-            entry_container.into()
-        }
-    }
-
-    fn view_agent_conversation<'a>(
-        &'a self,
-        tab: &'a TabState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-        let font_tiny = font_small * 0.9;
-
-        let conversation = match &tab.agent_sidebar.conversation {
-            Some(c) => c,
-            None => {
-                return container(
-                    text("Select a session to view its conversation")
-                        .size(font_small)
-                        .color(theme.subtext0()),
-                )
-                .padding(20)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .into();
-            }
-        };
-
-        // Get capture info for the header
-        let capture = tab
-            .agent_sidebar
-            .selected_capture_idx
-            .and_then(|idx| tab.agent_sidebar.activity.as_ref()?.captures.get(idx));
-
-        let mut content = Column::new().spacing(0);
-
-        // Header with capture info
-        if let Some(cap) = capture {
-            let header_bg = theme.surface0();
-            let desc = cap
-                .description()
-                .unwrap_or_else(|| cap.short_hash().to_string());
-            let desc_truncated: String = if desc.len() > 80 {
-                format!("{}…", truncate_str(&desc, 79))
-            } else {
-                desc
-            };
-
-            let mut header_col = Column::new().spacing(4);
-            header_col =
-                header_col.push(text(desc_truncated).size(font).color(theme.text_primary()));
-
-            // Stats line
-            let mut stats_parts = Vec::new();
-            stats_parts.push(cap.short_hash().to_string());
-            if let Some((name, _)) = cap.primary_model() {
-                let short = name.split('/').next_back().unwrap_or(name);
-                let short = short.strip_prefix("claude-").unwrap_or(short);
-                stats_parts.push(short.to_string());
-            }
-            stats_parts.push(format!("{}t", cap.turns));
-            stats_parts.push(cap.format_duration());
-            stats_parts.push(cap.format_cost());
-
-            header_col = header_col.push(
-                text(stats_parts.join(" · "))
-                    .size(font_tiny)
-                    .color(theme.subtext0()),
-            );
-
-            content = content.push(
-                container(header_col)
-                    .padding([10, 16])
-                    .width(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(header_bg.into()),
-                        ..Default::default()
-                    }),
-            );
-        }
-
-        // Error state
-        if let Some(err) = &conversation.error {
-            content = content.push(
-                container(text(err).size(font_small).color(theme.subtext0()))
-                    .padding([16, 16])
-                    .width(Length::Fill)
-                    .center_x(Length::Fill),
-            );
-            return scrollable(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-        }
-
-        if conversation.entries.is_empty() {
-            content = content.push(
-                container(
-                    text("No conversation entries found")
-                        .size(font_small)
-                        .color(theme.subtext0()),
-                )
-                .padding([16, 16])
-                .width(Length::Fill),
-            );
-            return scrollable(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-        }
-
-        // Render conversation entries
-        let mut thread = Column::new().spacing(2).padding([8, 12]);
-
-        for entry in &conversation.entries {
-            match entry {
-                agent::ConversationEntry::User { text: user_text } => {
-                    let user_color = theme.blue();
-                    let bg = iced::Color {
-                        a: 0.08,
-                        ..user_color
-                    };
-
-                    let display_text: String = if user_text.len() > 500 {
-                        format!("{}…", truncate_str(user_text, 497))
-                    } else {
-                        user_text.clone()
-                    };
-
-                    thread = thread.push(
-                        container(
-                            column![
-                                text("You").size(font_tiny).color(user_color),
-                                text(display_text)
-                                    .size(font_small)
-                                    .color(theme.text_primary())
-                            ]
-                            .spacing(2),
-                        )
-                        .padding([8, 12])
-                        .width(Length::Fill)
-                        .style(move |_| container::Style {
-                            background: Some(bg.into()),
-                            border: iced::Border {
-                                width: 0.0,
-                                color: iced::Color::TRANSPARENT,
-                                radius: iced::border::Radius::from(6),
-                            },
-                            ..Default::default()
-                        }),
-                    );
-                }
-                agent::ConversationEntry::Assistant {
-                    text: asst_text,
-                    model,
-                } => {
-                    let model_short = model.strip_prefix("claude-").unwrap_or(model);
-                    let asst_color = theme.mauve();
-                    let bg = iced::Color {
-                        a: 0.05,
-                        ..asst_color
-                    };
-
-                    let display_text: String = if asst_text.len() > 1000 {
-                        format!("{}…", truncate_str(asst_text, 997))
-                    } else {
-                        asst_text.clone()
-                    };
-
-                    thread = thread.push(
-                        container(
-                            column![
-                                text(model_short).size(font_tiny).color(asst_color),
-                                text(display_text)
-                                    .size(font_small)
-                                    .color(theme.text_secondary())
-                            ]
-                            .spacing(2),
-                        )
-                        .padding([8, 12])
-                        .width(Length::Fill)
-                        .style(move |_| container::Style {
-                            background: Some(bg.into()),
-                            border: iced::Border {
-                                width: 0.0,
-                                color: iced::Color::TRANSPARENT,
-                                radius: iced::border::Radius::from(6),
-                            },
-                            ..Default::default()
-                        }),
-                    );
-                }
-                agent::ConversationEntry::ToolCall { tool, summary } => {
-                    let tool_color = theme.yellow();
-
-                    let label = format!("→ {} {}", tool, summary);
-                    let label_truncated: String = if label.len() > 100 {
-                        format!("{}…", truncate_str(&label, 97))
-                    } else {
-                        label
-                    };
-
-                    thread = thread.push(
-                        container(text(label_truncated).size(font_tiny).color(tool_color))
-                            .padding([3, 12]),
-                    );
-                }
-                agent::ConversationEntry::ToolResult {
-                    tool: _,
-                    output,
-                    is_error,
-                } => {
-                    if !output.is_empty() {
-                        let result_color = if *is_error {
-                            theme.red()
-                        } else {
-                            theme.text_secondary()
-                        };
-                        let prefix = if *is_error { "✗ " } else { "" };
-                        let bg = if *is_error {
-                            iced::Color {
-                                a: 0.06,
-                                ..theme.red()
-                            }
-                        } else {
-                            theme.bg_base()
-                        };
-
-                        // Only show first few lines of output
-                        let lines: Vec<&str> = output.lines().take(6).collect();
-                        let display = if output.lines().count() > 6 {
-                            format!("{}{}…", prefix, lines.join("\n"))
-                        } else {
-                            format!("{}{}", prefix, lines.join("\n"))
-                        };
-
-                        thread = thread.push(
-                            container(text(display).size(font_tiny).color(result_color))
-                                .padding([4, 12])
-                                .width(Length::Fill)
-                                .style(move |_| container::Style {
-                                    background: Some(bg.into()),
-                                    border: iced::Border {
-                                        width: 0.0,
-                                        color: iced::Color::TRANSPARENT,
-                                        radius: iced::border::Radius::from(4),
-                                    },
-                                    ..Default::default()
-                                }),
-                        );
-                    }
-                }
-                agent::ConversationEntry::Thinking { text: think_text } => {
-                    let think_color = theme.text_muted();
-                    let display: String = if think_text.len() > 300 {
-                        format!("💭 {}…", truncate_str(think_text, 297))
-                    } else {
-                        format!("💭 {}", think_text)
-                    };
-
-                    thread = thread.push(
-                        container(text(display).size(font_tiny).color(think_color))
-                            .padding([3, 12]),
-                    );
-                }
-                agent::ConversationEntry::Compaction { summary } => {
-                    let compact_color = theme.peach();
-                    let display: String = if summary.len() > 200 {
-                        format!("⟳ Context compacted: {}…", truncate_str(summary, 197))
-                    } else {
-                        format!("⟳ Context compacted: {}", summary)
-                    };
-
-                    thread = thread.push(
-                        container(text(display).size(font_tiny).color(compact_color))
-                            .padding([6, 12]),
-                    );
-                }
-            }
-        }
-
-        content = content.push(thread);
-
-        scrollable(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
     }
 
     fn view_claude_sidebar<'a>(
