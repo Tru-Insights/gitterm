@@ -2274,6 +2274,7 @@ dependencies = [
  "hyper 0.14.32",
  "iced",
  "iced_term",
+ "image",
  "libc",
  "muda",
  "objc2 0.5.2",
