@@ -639,10 +639,54 @@ fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guideli
     gitterm::guidelines::for_launch(&config::global_config_dir(), cwd, workspace_off)
 }
 
-/// A terminal startup command with the guidelines added when it starts
-/// `claude`, `pi` or `codex`. Other commands are not inspected, so they
-/// never read the guidelines file.
-fn terminal_command_with_guidelines(command: &str, cwd: &Path, workspace_off: bool) -> String {
+/// What an agent starting now in `cwd` gets appended: the guidelines and,
+/// in a piece of work, the documents note naming `places` (TRU-191). The
+/// work's docs folder is created here, as the agent starts; a failure is
+/// logged and the note still names it.
+fn launch_instructions(
+    cwd: &Path,
+    workspace_off: bool,
+    places: Option<&gitterm::guidelines::DocumentPlaces>,
+) -> Option<gitterm::guidelines::Guidelines> {
+    if let Some(places) = places {
+        if let Err(error) = std::fs::create_dir_all(&places.docs_dir) {
+            eprintln!(
+                "[guidelines] cannot create the work's docs folder {}: {error}",
+                places.docs_dir.display()
+            );
+        }
+    }
+    gitterm::guidelines::with_documents(
+        launch_guidelines(cwd, workspace_off),
+        places,
+        &config::instance_config_dir(),
+    )
+}
+
+/// The document places of a saved workspace entry (a workspace not open
+/// yet): a work entry owns chats; its home is where they start.
+fn config_document_places(cfg: &WorkspaceConfig) -> Option<gitterm::guidelines::DocumentPlaces> {
+    let local = matches!(
+        cfg.location,
+        None | Some(config::WorkspaceLocationConfig::Local { .. })
+    ) && cfg.remote_session.is_none();
+    gitterm::guidelines::document_places(
+        !cfg.chats.is_empty(),
+        local,
+        Path::new(cfg.home_dir()),
+        None,
+    )
+}
+
+/// A terminal startup command with the guidelines (and the documents note
+/// of `places`) added when it starts `claude`, `pi` or `codex`. Other
+/// commands are not inspected, so they never read the guidelines file.
+fn terminal_command_with_guidelines(
+    command: &str,
+    cwd: &Path,
+    workspace_off: bool,
+    places: Option<&gitterm::guidelines::DocumentPlaces>,
+) -> String {
     // shortcut: the added option is POSIX-quoted, so Windows terminals
     // (cmd, PowerShell) launch without the guidelines until the quoting is
     // per-shell.
@@ -652,7 +696,7 @@ fn terminal_command_with_guidelines(command: &str, cwd: &Path, workspace_off: bo
     if !gitterm::guidelines::starts_a_harness(command) {
         return command.to_string();
     }
-    match launch_guidelines(cwd, workspace_off) {
+    match launch_instructions(cwd, workspace_off, places) {
         Some(guidelines) => gitterm::guidelines::configure_terminal_command(command, &guidelines),
         None => command.to_string(),
     }
@@ -5612,6 +5656,9 @@ struct Workspace {
     /// Claude sessions started here get Claude in Chrome (TRU-181); off by
     /// default. See `WorkspaceConfig::claude_in_chrome`.
     claude_in_chrome: bool,
+    /// The repo team-facing decisions go to (TRU-191), named to the
+    /// agents started in this work beside its docs folder.
+    decisions_repo: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -5642,6 +5689,7 @@ impl Workspace {
             claims_new_chats: false,
             guidelines_off: false,
             claude_in_chrome: false,
+            decisions_repo: None,
         }
     }
 
@@ -5676,6 +5724,7 @@ impl Workspace {
             claims_new_chats: false,
             guidelines_off: false,
             claude_in_chrome: false,
+            decisions_repo: None,
         }
     }
 
@@ -5701,6 +5750,20 @@ impl Workspace {
     /// piece of work and claims the chats started in it.
     fn is_work(&self) -> bool {
         self.owns_chats() || self.claims_new_chats
+    }
+
+    /// Where agents started in this work keep documents (TRU-191): its
+    /// docs folder and decisions repo. `None` for a folder workspace or
+    /// one on another machine.
+    fn document_places(&self) -> Option<gitterm::guidelines::DocumentPlaces> {
+        let local = matches!(self.location, WorkspaceLocation::Local { .. })
+            && self.remote_session.is_none();
+        gitterm::guidelines::document_places(
+            self.is_work(),
+            local,
+            &self.dir,
+            self.decisions_repo.as_deref(),
+        )
     }
 
     fn backend_ref(&self) -> WorkspaceBackendRef {
@@ -9555,6 +9618,19 @@ impl App {
 
     /// Whether the workspace named `name` switched the change guidelines
     /// off (TRU-174); a workspace that is not open reads its saved entry.
+    /// Where agents started for the workspace named `name` keep documents
+    /// (TRU-191); a workspace that is not open reads its saved entry.
+    fn workspace_document_places(&self, name: &str) -> Option<gitterm::guidelines::DocumentPlaces> {
+        match self.workspaces.iter().find(|ws| ws.name == name) {
+            Some(ws) => ws.document_places(),
+            None => self
+                .closed_workspace_configs
+                .iter()
+                .find(|cfg| cfg.name == name)
+                .and_then(config_document_places),
+        }
+    }
+
     fn workspace_guidelines_off(&self, name: &str) -> bool {
         self.workspaces
             .iter()
@@ -15201,9 +15277,11 @@ impl App {
             };
             match gitterm::delegations::codex_run(delegation, &config_root) {
                 Ok(mut run) => {
-                    run.guidelines = launch_guidelines(
+                    run.guidelines = launch_instructions(
                         &run.cwd,
                         self.workspace_guidelines_off(&delegation.parent.workspace),
+                        self.workspace_document_places(&delegation.parent.workspace)
+                            .as_ref(),
                     );
                     runs.push((delegation_id, run))
                 }
@@ -17499,6 +17577,14 @@ fi
             .map(|ws| ws.claude_in_chrome)
             .or_else(|| saved_ws.map(|cfg| cfg.claude_in_chrome))
             .unwrap_or(false);
+        // And where a work's agents keep documents (TRU-191).
+        let document_places = match ws_name
+            .as_deref()
+            .and_then(|name| self.workspaces.iter().find(|ws| ws.name == name))
+        {
+            Some(ws) => ws.document_places(),
+            None => saved_ws.and_then(config_document_places),
+        };
         // The env of the repo holding the tab's folder, with the
         // workspace's overrides (TRU-180).
         let mut extra_env: Vec<(String, String)> = ws_name
@@ -17523,7 +17609,12 @@ fi
 
         // Added at launch only: the stored startup command stays as given.
         let launch_command = startup_command.as_deref().map(|command| {
-            let command = terminal_command_with_guidelines(command, &repo_path, guidelines_off);
+            let command = terminal_command_with_guidelines(
+                command,
+                &repo_path,
+                guidelines_off,
+                document_places.as_ref(),
+            );
             gitterm::harness::claude::configure_terminal_chrome(&command, claude_in_chrome)
         });
         let settings = Self::build_terminal_settings(
@@ -20744,6 +20835,8 @@ fi
                     };
                 'outer_submit: for ws in &mut self.workspaces {
                     let guidelines_off = ws.guidelines_off;
+                    // Named to an agent this prompt starts (TRU-191).
+                    let document_places = ws.document_places();
                     // Read as the process starts; a running chat keeps
                     // what it started with (TRU-181).
                     let claude_in_chrome = ws.claude_in_chrome;
@@ -20849,7 +20942,13 @@ fi
                                 // guidelines (TRU-174 is local only).
                                 let guidelines_file = remote_chat
                                     .is_none()
-                                    .then(|| launch_guidelines(&repo_path, guidelines_off))
+                                    .then(|| {
+                                        launch_instructions(
+                                            &repo_path,
+                                            guidelines_off,
+                                            document_places.as_ref(),
+                                        )
+                                    })
                                     .flatten()
                                     .map(|guidelines| guidelines.path);
                                 let Some(config) = session.claude_session_config(
@@ -20933,8 +21032,12 @@ fi
                             echo = tab::AgentEvent::user_prompt(&prompt.text);
                         }
                         if session.task_handle.is_none() {
-                            let guidelines_file = launch_guidelines(&repo_path, guidelines_off)
-                                .map(|guidelines| guidelines.path);
+                            let guidelines_file = launch_instructions(
+                                &repo_path,
+                                guidelines_off,
+                                document_places.as_ref(),
+                            )
+                            .map(|guidelines| guidelines.path);
                             let handle = tab::spawn_agent_task(
                                 session.config.clone(),
                                 repo_path,
