@@ -125,6 +125,35 @@ pub fn auto_repo_candidates(
     found
 }
 
+/// The local repos the New workspace sheet offers (TRU-194): the homes of
+/// repo workspaces (open or parked), then the main checkouts `chats`
+/// edited in (see [`auto_repo_candidates`]), each once by canonical dir,
+/// linked worktrees folded, folders that still exist only, by name.
+/// Blocking: folding runs git for a linked worktree.
+pub fn known_repos(
+    workspace_homes: Vec<PathBuf>,
+    chats: &[&ChatIndexEntry],
+    task_worktrees: &[PathBuf],
+) -> Vec<PathBuf> {
+    let touched = auto_repo_candidates(chats, &[], task_worktrees);
+    let mut repos: Vec<PathBuf> = fold_worktrees(workspace_homes.into_iter().chain(touched))
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .collect();
+    repos.sort_by_cached_key(|dir| (repo_name(dir).to_lowercase(), dir.clone()));
+    repos
+}
+
+/// The repos among `repos` whose path holds `query`, ignoring case; all
+/// of them for a blank query.
+pub fn filter_repos<'a>(repos: &'a [PathBuf], query: &str) -> Vec<&'a PathBuf> {
+    let query = query.trim().to_lowercase();
+    repos
+        .iter()
+        .filter(|dir| query.is_empty() || dir.to_string_lossy().to_lowercase().contains(&query))
+        .collect()
+}
+
 /// A workspace's repo list after applying what joined: `home` first,
 /// then `current` in its order, then manual adds and auto `candidates`
 /// not yet listed. A dir in `removed` is never listed (home excepted).
@@ -472,5 +501,55 @@ mod tests {
         );
         // A folder workspace keeps browsing its own dir.
         assert_eq!(files_roots(false, &repos, None), None);
+    }
+
+    // A symlinked home shows dedup by canonical dir.
+    #[cfg(unix)]
+    #[test]
+    fn known_repos_are_workspace_homes_and_edited_repos_once_each_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        for repo in ["web", "api", "infra", "read-only"] {
+            std::fs::create_dir_all(root.join(repo).join(".git")).unwrap();
+        }
+        // The api home reached through a symlink is the same repo.
+        std::os::unix::fs::symlink(root.join("api"), root.join("api-link")).unwrap();
+        let dir = |name: &str| root.join(name).to_string_lossy().into_owned();
+        let chat = entry(
+            "chat",
+            1,
+            ChatFacts {
+                repos_touched: vec![
+                    touch(&dir("api"), 2),
+                    touch(&dir("infra"), 1),
+                    // Read only: not offered.
+                    touch(&dir("read-only"), 0),
+                    // Since deleted: not offered.
+                    touch(&dir("gone"), 4),
+                    // A task worktree is never a repo.
+                    touch(&dir("tasks/api-ops-1"), 3),
+                ],
+                ..ChatFacts::default()
+            },
+        );
+        std::fs::create_dir_all(root.join("tasks/api-ops-1")).unwrap();
+        let known = known_repos(
+            vec![root.join("web"), root.join("api-link"), root.join("api")],
+            &[&chat],
+            &[root.join("tasks/api-ops-1")],
+        );
+        assert_eq!(
+            known,
+            vec![root.join("api"), root.join("infra"), root.join("web")]
+        );
+    }
+
+    #[test]
+    fn filtering_known_repos_matches_the_path_ignoring_case() {
+        let repos = paths(&["/w/api", "/w/web", "/srv/Api-Docs"]);
+        assert_eq!(filter_repos(&repos, "  ").len(), 3);
+        assert_eq!(filter_repos(&repos, "API"), vec![&repos[0], &repos[2]]);
+        assert_eq!(filter_repos(&repos, "srv/"), vec![&repos[2]]);
+        assert!(filter_repos(&repos, "nothing").is_empty());
     }
 }

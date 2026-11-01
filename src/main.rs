@@ -1926,11 +1926,64 @@ struct WorkspaceRename {
 /// piece of work rather than a repo (TRU-169).
 const WORK_FOLDER: &str = "Work";
 
-/// "New workspace…": a piece of work that needs no repo.
+/// "New workspace" (TRU-194, `+`): a sheet for a piece of work. Its
+/// name, optional starting repos (from `known`, filtered by `query`) and
+/// a decisions repo among them.
 #[derive(Debug, Clone, Default)]
-struct NewWorkForm {
+struct NewWorkSheet {
     name: String,
     error: Option<String>,
+    /// This Mac's known repos, read when the sheet opens.
+    known: Vec<PathBuf>,
+    query: String,
+    /// The starting repos, in the order picked.
+    repos: Vec<PathBuf>,
+    decisions_repo: Option<PathBuf>,
+}
+
+/// The New workspace sheet's home preview: `~/Work/<slug>`, live from
+/// the name.
+fn new_work_home_preview(name: &str) -> String {
+    if name.trim().is_empty() {
+        return format!("~/{WORK_FOLDER}/\u{2026}");
+    }
+    format!("~/{WORK_FOLDER}/{}", overview::work_folder_slug(name))
+}
+
+/// What a new piece of work starts with (TRU-194): repos added by hand,
+/// and a decisions repo among them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorkStart {
+    repos: Vec<PathBuf>,
+    decisions_repo: Option<PathBuf>,
+}
+
+impl WorkStart {
+    /// Rejects a decisions repo that is not one of `repos`.
+    fn new(repos: Vec<PathBuf>, decisions_repo: Option<PathBuf>) -> Result<Self, String> {
+        if let Some(dir) = &decisions_repo {
+            if !repos.contains(dir) {
+                return Err(format!(
+                    "The decisions repo {} is not one of the starting repos.",
+                    dir.display()
+                ));
+            }
+        }
+        Ok(Self {
+            repos,
+            decisions_repo,
+        })
+    }
+
+    /// Sets up work `ws` before it opens: each repo is added by hand (so
+    /// it persists) and listed when it opens; the decisions repo is set.
+    fn apply(self, ws: &mut Workspace) {
+        for dir in &self.repos {
+            gitterm::workspace_repos::add_manually(dir, &mut ws.repos_added, &mut ws.repos_removed);
+        }
+        ws.pending_repos = self.repos;
+        ws.decisions_repo = self.decisions_repo;
+    }
 }
 
 fn new_work_name_input_id() -> iced::widget::Id {
@@ -6620,9 +6673,15 @@ pub enum Event {
     WorkspaceRenameInput(String),
     WorkspaceRenameSubmit,
     WorkspaceRenameCancel,
-    /// "New workspace…" (no repo needed): open the name form.
+    /// `+` or "New workspace…": open the New workspace sheet (TRU-194).
     NewWorkOpen,
     NewWorkNameChanged(String),
+    NewWorkQueryChanged(String),
+    /// A known repo was picked (true) or unpicked as a starting repo.
+    NewWorkRepoToggled(PathBuf, bool),
+    NewWorkDecisionsPicked(DecisionsRepoChoice),
+    /// "Open a folder as a repo workspace…": the folder picker instead.
+    NewWorkOpenFolder,
     NewWorkSubmit,
     NewWorkCancel,
     /// PRs of the work: watch, merge plans, Approve / Merge (TRU-173).
@@ -7034,8 +7093,8 @@ struct App {
     workspace_rename: Option<WorkspaceRename>,
     /// The Chats preview's "Add to workspace…" picker is open.
     chat_add_to_workspace_open: bool,
-    /// The "New workspace…" name form (TRU-169), when open.
-    new_work_form: Option<NewWorkForm>,
+    /// The New workspace sheet (TRU-194), when open.
+    new_work_sheet: Option<NewWorkSheet>,
     /// The Park sheet × opened (TRU-171), when open.
     park_sheet: Option<ParkSheet>,
     /// The Parked list `⏸ n parked` opens (TRU-171).
@@ -12794,17 +12853,7 @@ impl App {
     /// chat index lands; a folder-scoped workspace lists only its home
     /// and what was added by hand.
     fn sync_workspace_repos(&mut self) {
-        let task_worktrees: Vec<PathBuf> = self
-            .task_store
-            .as_ref()
-            .map(|store| {
-                store
-                    .tasks()
-                    .iter()
-                    .filter_map(|task| task.worktree.path.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let task_worktrees = self.task_worktree_dirs();
         let canonical =
             |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
@@ -13808,7 +13857,8 @@ impl App {
             return self.go_to_chat_owner(id);
         }
         let name = overview::workspace_name_from_title(&entry.title);
-        let (idx, uid) = match self.create_work_workspace(&name, vec![id.to_string()]) {
+        let made = self.create_work_workspace(&name, vec![id.to_string()], WorkStart::default());
+        let (idx, uid) = match made {
             Ok(made) => made,
             Err(error) => {
                 eprintln!("[workspace] cannot make a workspace from {id}: {error}");
@@ -13853,12 +13903,13 @@ impl App {
 
     /// A workspace that is a piece of work, not a folder: named `name`,
     /// homed in a new `~/Work/<slug>` folder (created here), owning
-    /// `chats`, claiming the chats started in it, on the bar and active.
-    /// Returns its index and uid.
+    /// `chats`, claiming the chats started in it, listing `start`'s repos,
+    /// on the bar and active. Returns its index and uid.
     fn create_work_workspace(
         &mut self,
         name: &str,
         chats: Vec<String>,
+        start: WorkStart,
     ) -> Result<(usize, u64), String> {
         let home = dirs::home_dir().ok_or("no home directory to put ~/Work in")?;
         let base = home.join(WORK_FOLDER);
@@ -13872,38 +13923,94 @@ impl App {
         );
         workspace.chats = chats;
         workspace.claims_new_chats = true;
+        start.apply(&mut workspace);
         let uid = workspace.uid;
         let idx = self.push_and_activate_workspace(workspace);
         Ok((idx, uid))
     }
 
-    /// "New workspace…" confirmed: the `~/Work/<slug>` folder is created
-    /// now, the workspace joins the bar and becomes active, and a new
-    /// Claude chat opens there; that chat joins the workspace's chats once
-    /// it has a session id. No repo is needed.
+    /// The New workspace sheet's Create: the `~/Work/<slug>` folder is
+    /// created now, the workspace joins the bar and becomes active with
+    /// its starting repos and decisions repo, and a new Claude chat opens
+    /// there; that chat joins the workspace's chats once it has a session
+    /// id.
     fn submit_new_work(&mut self) -> Task<Event> {
-        let Some(form) = self.new_work_form.as_mut() else {
+        let Some(sheet) = self.new_work_sheet.as_mut() else {
             return Task::none();
         };
-        let name = form.name.split_whitespace().collect::<Vec<_>>().join(" ");
+        let name = sheet.name.split_whitespace().collect::<Vec<_>>().join(" ");
         if name.is_empty() {
-            form.error = Some("Name the work, for example \"Cloud migration\".".to_string());
+            sheet.error = Some("Name the work, for example \"Cloud migration\".".to_string());
             return Task::none();
         }
-        let (_, uid) = match self.create_work_workspace(&name, Vec::new()) {
+        let start = match WorkStart::new(sheet.repos.clone(), sheet.decisions_repo.clone()) {
+            Ok(start) => start,
+            Err(error) => {
+                sheet.error = Some(error);
+                return Task::none();
+            }
+        };
+        let (_, uid) = match self.create_work_workspace(&name, Vec::new(), start) {
             Ok(made) => made,
             Err(error) => {
                 eprintln!("[workspace] new workspace {name:?}: {error}");
-                if let Some(form) = self.new_work_form.as_mut() {
-                    form.error = Some(error);
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.error = Some(error);
                 }
                 return Task::none();
             }
         };
         eprintln!("[workspace] new workspace uid={uid} {name:?}");
-        self.new_work_form = None;
+        self.new_work_sheet = None;
         let chat = self.update(Event::NewClaudeChatTab);
         Task::batch([chat, self.apply_webview_surfaces()])
+    }
+
+    /// The repos the New workspace sheet offers: this Mac's repo
+    /// workspaces, open or parked, and the repos its chats edited in.
+    fn known_local_repos(&self) -> Vec<PathBuf> {
+        let open = self
+            .workspaces
+            .iter()
+            .filter(|ws| {
+                !ws.is_work()
+                    && ws.remote_session.is_none()
+                    && matches!(ws.location, WorkspaceLocation::Local { .. })
+            })
+            .map(|ws| ws.dir.clone());
+        let parked = self
+            .closed_workspace_configs
+            .iter()
+            .filter(|cfg| {
+                cfg.is_parked()
+                    && cfg.chats.is_empty()
+                    && cfg.remote_session.is_none()
+                    && matches!(
+                        cfg.location,
+                        None | Some(config::WorkspaceLocationConfig::Local { .. })
+                    )
+            })
+            .map(|cfg| PathBuf::from(cfg.home_dir()));
+        let chats: Vec<&chats::ChatIndexEntry> = self.chat_index.iter().collect();
+        gitterm::workspace_repos::known_repos(
+            open.chain(parked).collect(),
+            &chats,
+            &self.task_worktree_dirs(),
+        )
+    }
+
+    /// Every task's worktree folder: never a repo of a workspace.
+    fn task_worktree_dirs(&self) -> Vec<PathBuf> {
+        self.task_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .tasks()
+                    .iter()
+                    .filter_map(|task| task.worktree.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// "Go to <name>": switches to (or reopens) the workspace owning local
@@ -17232,7 +17339,7 @@ impl App {
             )),
             workspace_rename: None,
             chat_add_to_workspace_open: false,
-            new_work_form: None,
+            new_work_sheet: None,
             park_sheet: None,
             parked_list_open: false,
             prs: work_prs::PrsState::load(&config::global_config_dir()),
@@ -20397,7 +20504,7 @@ fi
                 // keystrokes into the focused PTY.
                 if self.task_switcher_open
                     || self.new_task_form.is_some()
-                    || self.new_work_form.is_some()
+                    || self.new_work_sheet.is_some()
                     || self.park_sheet.is_some()
                     || self.prs.action.is_some()
                     || self.task_tab_close_prompt.is_some()
@@ -23061,7 +23168,7 @@ fi
                 // Modal capture layers must never leak keystrokes into the PTY
                 if self.task_switcher_open
                     || self.new_task_form.is_some()
-                    || self.new_work_form.is_some()
+                    || self.new_work_sheet.is_some()
                     || self.park_sheet.is_some()
                     || self.prs.action.is_some()
                     || self.task_tab_close_prompt.is_some()
@@ -23358,8 +23465,8 @@ fi
                     return Task::none();
                 }
 
-                // New workspace form: Escape closes
-                if self.new_work_form.is_some()
+                // New workspace sheet: Escape closes
+                if self.new_work_sheet.is_some()
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     return self.update(Event::NewWorkCancel);
@@ -26078,7 +26185,10 @@ fi
             Event::NewWorkOpen => {
                 self.bar_menu = None;
                 let close = self.close_folder_picker();
-                self.new_work_form = Some(NewWorkForm::default());
+                self.new_work_sheet = Some(NewWorkSheet {
+                    known: self.known_local_repos(),
+                    ..NewWorkSheet::default()
+                });
                 return Task::batch([
                     close,
                     self.apply_webview_surfaces(),
@@ -26086,16 +26196,42 @@ fi
                 ]);
             }
             Event::NewWorkNameChanged(name) => {
-                if let Some(form) = self.new_work_form.as_mut() {
-                    form.name = name;
-                    form.error = None;
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.name = name;
+                    sheet.error = None;
                 }
+            }
+            Event::NewWorkQueryChanged(query) => {
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.query = query;
+                }
+            }
+            Event::NewWorkRepoToggled(dir, picked) => {
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.repos.retain(|repo| *repo != dir);
+                    if picked {
+                        sheet.repos.push(dir);
+                    } else if sheet.decisions_repo.as_ref() == Some(&dir) {
+                        sheet.decisions_repo = None;
+                    }
+                    sheet.error = None;
+                }
+            }
+            Event::NewWorkDecisionsPicked(choice) => {
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.decisions_repo = choice.dir;
+                    sheet.error = None;
+                }
+            }
+            Event::NewWorkOpenFolder => {
+                self.new_work_sheet = None;
+                return self.update(Event::WorkspaceCreate);
             }
             Event::NewWorkSubmit => {
                 return self.submit_new_work();
             }
             Event::NewWorkCancel => {
-                self.new_work_form = None;
+                self.new_work_sheet = None;
                 return Task::batch([self.apply_webview_surfaces(), self.focus_main_terminal()]);
             }
             Event::ReviewOpen(checkout, source) => {
@@ -27759,7 +27895,7 @@ fi
             || self.folder_picker.is_some()
             || self.phone_panel.is_some()
             || self.remote_connect_form.is_some()
-            || self.new_work_form.is_some()
+            || self.new_work_sheet.is_some()
             || self.park_sheet.is_some()
             || self.parked_list_open
             || self.prs.action.is_some()
@@ -28727,7 +28863,7 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
-        } else if self.new_work_form.is_some() {
+        } else if self.new_work_sheet.is_some() {
             Stack::new()
                 .push(main_view)
                 .push(self.view_new_work_modal())
@@ -29462,15 +29598,6 @@ fi
                     .padding([6, 12])
                     .on_press(Event::FolderPickerNativeDialog),
             );
-            // A piece of work that needs no repo (TRU-169).
-            if picker.purpose == FolderPickerPurpose::NewWorkspace {
-                actions = actions.push(
-                    button(text("New workspace, no repo…").size(font_small))
-                        .style(button::text)
-                        .padding([6, 12])
-                        .on_press(Event::NewWorkOpen),
-                );
-            }
         }
         actions = actions
             .push(iced::widget::Space::new().width(Length::Fill))
@@ -30173,52 +30300,139 @@ fi
         .into()
     }
 
-    /// "New workspace…" (TRU-169): a name, the `~/Work/<slug>` folder it
-    /// will get, and Create. Nothing is created until Create.
+    /// The New workspace sheet (TRU-194): a name, where it runs, optional
+    /// starting repos and a decisions repo among them, and the
+    /// `~/Work/<slug>` home it will get. Nothing is created until Create.
     fn view_new_work_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
         let font_small = self.ui_font_small();
-        let Some(form) = &self.new_work_form else {
+        let Some(sheet) = &self.new_work_sheet else {
             return iced::widget::Space::new().into();
         };
-        let bg_surface = theme.bg_surface();
-        let border_color = theme.border();
-        let bg_crust = theme.bg_crust();
-        let slug = overview::work_folder_slug(&form.name);
+        let home = dirs::home_dir().map(|home| home.to_string_lossy().into_owned());
+        let shown = |dir: &Path| folder_picker_tilde(&dir.to_string_lossy(), home.as_deref());
+        let field = |label: &str, value: Element<'static, Event, Theme, iced::Renderer>| {
+            row![
+                text(label.to_string())
+                    .size(font_small)
+                    .color(theme.text_secondary())
+                    .width(Length::Fixed(110.0)),
+                value,
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+        };
+        let muted = |line: String| -> Element<'static, Event, Theme, iced::Renderer> {
+            text(line).size(font_small).color(theme.text_muted()).into()
+        };
+
+        let mut repos = Column::new().spacing(2);
+        let matching = gitterm::workspace_repos::filter_repos(&sheet.known, &sheet.query);
+        if sheet.known.is_empty() {
+            repos = repos.push(muted("No repos known on this Mac yet.".to_string()));
+        } else if matching.is_empty() {
+            repos = repos.push(muted("No repo matches.".to_string()));
+        }
+        for dir in matching {
+            let picked = sheet.repos.contains(dir);
+            let toggled = dir.clone();
+            repos = repos.push(
+                checkbox(picked)
+                    .label(format!(
+                        "{} \u{00B7} {}",
+                        gitterm::workspace_repos::repo_name(dir),
+                        shown(dir)
+                    ))
+                    .on_toggle(move |on| Event::NewWorkRepoToggled(toggled.clone(), on))
+                    .size(14)
+                    .text_size(font_small),
+            );
+        }
+        let picked_note = match sheet.repos.len() {
+            0 => "Optional. Repos also join as the work's chats edit them.".to_string(),
+            n => format!("{n} picked"),
+        };
+
+        let decisions: Element<'static, Event, Theme, iced::Renderer> = if sheet.repos.is_empty() {
+            muted("Optional, from the starting repos.".to_string())
+        } else {
+            let choice = |dir: &Path| DecisionsRepoChoice {
+                dir: Some(dir.to_path_buf()),
+                label: format!(
+                    "{} \u{00B7} {}",
+                    gitterm::workspace_repos::repo_name(dir),
+                    shown(dir)
+                ),
+            };
+            let mut choices = vec![DecisionsRepoChoice::none()];
+            choices.extend(sheet.repos.iter().map(|dir| choice(dir)));
+            let selected = sheet
+                .decisions_repo
+                .as_deref()
+                .map_or_else(DecisionsRepoChoice::none, choice);
+            pick_list(choices, Some(selected), Event::NewWorkDecisionsPicked)
+                .width(Length::Fill)
+                .padding([4, 8])
+                .text_size(font_small)
+                .into()
+        };
+
         let mut card = Column::new()
             .spacing(10)
-            .width(Length::Fixed(440.0))
+            .width(Length::Fixed(520.0))
             .push(text("New workspace").size(font).color(theme.text_primary()))
             .push(
-                text("A piece of work, not a repo. Repos join as the work touches them.")
+                text("A piece of work. Its home folder is made on Create and a new Claude chat opens there.")
                     .size(font_small)
                     .color(theme.text_secondary()),
             )
-            .push(
-                text_input("Cloud migration", &form.name)
+            .push(field(
+                "Name",
+                text_input("Cloud migration", &sheet.name)
                     .id(new_work_name_input_id())
                     .on_input(Event::NewWorkNameChanged)
                     .on_submit(Event::NewWorkSubmit)
                     .size(font_small)
-                    .padding([6, 8]),
-            )
+                    .padding([6, 8])
+                    .into(),
+            ))
+            .push(field(
+                "Runs on",
+                text("This Mac")
+                    .size(font_small)
+                    .color(theme.text_primary())
+                    .into(),
+            ))
+            .push(field("Starting repos", muted(picked_note)))
             .push(
-                text(format!(
-                    "Home: ~/{WORK_FOLDER}/{slug} (a -2, -3 suffix if taken), made on Create; a new Claude chat opens there."
-                ))
-                .size(font_small - 1.0)
-                .color(theme.text_muted()),
-            );
-        if let Some(error) = &form.error {
+                text_input("Filter repos", &sheet.query)
+                    .on_input(Event::NewWorkQueryChanged)
+                    .size(font_small)
+                    .padding([4, 8]),
+            )
+            .push(container(scrollable(repos)).max_height(132.0))
+            .push(field("Decisions repo", decisions))
+            .push(field(
+                "Home folder",
+                muted(format!(
+                    "{} (a -2, -3 suffix if taken)",
+                    new_work_home_preview(&sheet.name)
+                )),
+            ));
+        if let Some(error) = &sheet.error {
             card = card.push(text(error.clone()).size(font_small).color(theme.danger()));
         }
-        let can_create = !form.name.trim().is_empty();
+        let can_create = !sheet.name.trim().is_empty();
         card = card.push(
             row![
+                button(text("Open a folder as a repo workspace\u{2026}").size(font_small))
+                    .style(button::text)
+                    .padding([6, 0])
+                    .on_press(Event::NewWorkOpenFolder),
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("Cancel").size(font_small))
-                    .style(button::text)
+                    .style(button::secondary)
                     .padding([6, 12])
                     .on_press(Event::NewWorkCancel),
                 button(text("Create").size(font_small))
@@ -30229,30 +30443,7 @@ fi
             .spacing(8)
             .align_y(iced::Alignment::Center),
         );
-        let card = container(card)
-            .padding([20, 24])
-            .style(move |_| container::Style {
-                background: Some(bg_surface.into()),
-                border: iced::Border {
-                    color: border_color,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                ..Default::default()
-            });
-        let backdrop_color = iced::Color { a: 0.8, ..bg_crust };
-        container(
-            container(card)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(backdrop_color.into()),
-            ..Default::default()
-        })
-        .into()
+        self.view_sheet_card(card)
     }
 
     /// A centred card over a dimmed backdrop, as the other sheets draw.
@@ -31898,12 +32089,12 @@ fi
             bar_row = bar_row.push(self.view_workspace_chip(idx));
         }
 
-        // The one "+": a new workspace, on any machine, from the folder
-        // picker's machine selector.
+        // The one "+": the New workspace sheet for a piece of work
+        // (TRU-194); its link opens the folder picker for a repo.
         let plus = self.bar_text_button(
             "+".to_string(),
             theme.text_muted(),
-            Some(Event::WorkspaceCreate),
+            Some(Event::NewWorkOpen),
         );
         bar_row = bar_row.push(self.bar_tooltip(
             plus,
@@ -32256,7 +32447,7 @@ fi
             let action = |label: String| text(label).size(font_small).color(theme.text_muted());
             if key == workspace_bar::LOCAL_GROUP {
                 col = col.push(self.bar_menu_item(
-                    action("New workspace, no repo\u{2026}".to_string()),
+                    action("New workspace\u{2026}".to_string()),
                     Event::NewWorkOpen,
                 ));
                 if !workspaces.is_empty() {
@@ -46502,5 +46693,57 @@ mod tests {
         assert_eq!(dirs, ["/tmp/tru180-open", "/tmp/acme-parked"]);
         assert_eq!(section[0].run_command, None);
         assert_eq!(section[1].run_command.as_deref(), Some("make"));
+    }
+
+    /// The New workspace sheet's home preview follows the name (TRU-194).
+    #[test]
+    fn new_work_home_preview_is_the_slug_under_work() {
+        assert_eq!(new_work_home_preview(""), "~/Work/\u{2026}");
+        assert_eq!(new_work_home_preview("   "), "~/Work/\u{2026}");
+        assert_eq!(
+            new_work_home_preview("Cloud migration"),
+            "~/Work/cloud-migration"
+        );
+        assert_eq!(
+            new_work_home_preview("PRJ-101: ship!"),
+            "~/Work/prj-101-ship"
+        );
+    }
+
+    /// Create lists the starting repos as added by hand, so they persist,
+    /// and sets the decisions repo; one not among them is rejected.
+    #[test]
+    fn new_work_starts_with_its_repos_and_decisions_repo() {
+        let api = PathBuf::from("/w/api");
+        let web = PathBuf::from("/w/web");
+        let mut ws = Workspace::new(
+            "Cloud migration".to_string(),
+            PathBuf::from("/w/work/cloud-migration"),
+            WorkspaceColor::Blue,
+        );
+        WorkStart::new(vec![web.clone(), api.clone()], Some(api.clone()))
+            .unwrap()
+            .apply(&mut ws);
+        assert_eq!(ws.repos_added, vec![web.clone(), api.clone()]);
+        assert_eq!(ws.pending_repos, vec![web.clone(), api.clone()]);
+        assert!(ws.repos_removed.is_empty());
+        assert_eq!(ws.decisions_repo, Some(api.clone()));
+        assert_eq!(
+            path_strings(&ws.repos_added),
+            vec!["/w/web".to_string(), "/w/api".to_string()]
+        );
+
+        // No repos, no decisions repo: as before.
+        let mut bare = Workspace::new(
+            "Bare".to_string(),
+            PathBuf::from("/w/work/bare"),
+            WorkspaceColor::Blue,
+        );
+        WorkStart::new(Vec::new(), None).unwrap().apply(&mut bare);
+        assert!(bare.repos_added.is_empty() && bare.pending_repos.is_empty());
+        assert_eq!(bare.decisions_repo, None);
+
+        let error = WorkStart::new(vec![web], Some(api)).unwrap_err();
+        assert!(error.contains("/w/api"), "{error}");
     }
 }
