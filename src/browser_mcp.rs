@@ -1161,13 +1161,17 @@ impl BrowserMcpTools {
 struct SnapshotRefsRequest {
     /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
+    /// Also keep this page state as evidence under this label (a viewport
+    /// capture, as browser_capture would), so browser_diff can use it as a
+    /// baseline. Omit to just read the refs.
+    label: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DiffRequest {
     /// One of this chat's named browser targets. Omit to use its active target.
     target: Option<String>,
-    /// Label of this chat's browser_capture evidence to compare against.
+    /// Label of this chat's evidence (browser_capture, or browser_snapshot_refs with a label) to compare against.
     baseline_label: String,
     /// The target that evidence was captured on. Defaults to `target`.
     baseline_target: Option<String>,
@@ -1197,7 +1201,7 @@ struct ViewportRequest {
 #[tool_router(router = agent_browser_tool_router)]
 impl BrowserMcpTools {
     #[tool(
-        description = "Interactive accessibility tree with refs (e3) for click and type ref locators. Capped; says when cut.",
+        description = "Interactive accessibility tree with refs (e3) for click and type ref locators. Capped; says when cut. With a label, also stores the page state (viewport screenshot and accessibility text) as evidence under it, so browser_diff can use it as a baseline.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1216,7 +1220,11 @@ impl BrowserMcpTools {
                 &parts,
                 |browser, caller| async move {
                     browser
-                        .snapshot_refs_in(&caller, request.target.as_deref())
+                        .snapshot_refs_in(
+                            &caller,
+                            request.target.as_deref(),
+                            request.label.as_deref(),
+                        )
                         .await
                 },
             )
@@ -1225,7 +1233,7 @@ impl BrowserMcpTools {
     }
 
     #[tool(
-        description = "Diff the page against this chat's labelled browser_capture evidence, as accessibility-tree text or pixels.",
+        description = "Diff the page against this chat's labelled evidence (from browser_capture or a labelled browser_snapshot_refs), as accessibility-tree text or pixels. A pixel diff also lists up to 10 changed regions as {x, y, width, height} boxes in page CSS pixels, largest first, plus the totals and a diff image.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

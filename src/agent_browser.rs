@@ -77,6 +77,14 @@ const SESSION_IDLE_TIMEOUT: &str = "30m";
 const MAX_CLI_OUTPUT_CHARS: usize = 2_000;
 const MAX_SNAPSHOT_REFS_CHARS: usize = 24_000;
 const MAX_DIFF_CHARS: usize = 24_000;
+/// Changed regions a pixel diff lists.
+const MAX_DIFF_REGIONS: usize = 10;
+/// Changed pixels closer than this many device pixels join one region.
+const DIFF_REGION_CELL: u32 = 16;
+/// Per-channel difference below which two pixels count as the same.
+const DIFF_PIXEL_TOLERANCE: u8 = 8;
+/// Larger screenshots are not decoded for regions, to bound memory.
+const MAX_DIFF_REGION_PIXELS: u64 = 36_000_000;
 const MAX_BASELINE_SNAPSHOT_CHARS: usize = 512_000;
 const MAX_SCRATCH_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HAR_ENTRIES: usize = 200;
@@ -659,6 +667,9 @@ pub(crate) fn summarize_har(har: &Value) -> (Vec<BrowserHarEntry>, usize) {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BrowserSnapshotRefs {
     pub target: String,
+    /// Set when the call stored this page state as diff evidence under it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_label: Option<String>,
     pub url: Option<String>,
     /// One line per element; its `[ref=eN]` works as a `ref` locator.
     pub snapshot: String,
@@ -707,6 +718,15 @@ pub enum BrowserDiffMode {
     Screenshot,
 }
 
+/// One changed area of a pixel diff, in page CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BrowserDiffRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// browser_diff: the current page against a labelled baseline.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BrowserDiff {
@@ -733,6 +753,17 @@ pub struct BrowserDiff {
     pub total_pixels: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimension_mismatch: Option<Value>,
+    /// Pixel diff: where the page changed, largest first, at most
+    /// `MAX_DIFF_REGIONS`, in page CSS pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regions: Option<Vec<BrowserDiffRegion>>,
+    /// Pixel diff: how many regions changed in all; more than `regions` lists
+    /// when the list is capped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_count: Option<usize>,
+    /// Pixel diff: why `regions` is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regions_unavailable: Option<String>,
     /// The pixel diff image, returned as image content.
     #[serde(skip)]
     pub diff_png: Option<Vec<u8>>,
@@ -1485,6 +1516,21 @@ impl AgentBrowserEngine {
         let mut state = self.state.lock().await;
         let key = state.registry.key(owner, target)?;
         let page = self.page(&mut state, &key).await?;
+        self.capture_labelled(&mut state, owner, &key, &page, label, capture_mode)
+            .await
+    }
+
+    /// A labelled capture of an already-resolved page, retained as evidence.
+    /// browser_capture and a labelled browser_snapshot_refs both land here.
+    async fn capture_labelled(
+        &self,
+        state: &mut AbState,
+        owner: &str,
+        key: &TargetKey,
+        page: &AbPage,
+        label: &str,
+        capture_mode: BrowserCaptureMode,
+    ) -> Result<BrowserSnapshot> {
         let full_page = capture_mode == BrowserCaptureMode::FullPage;
         let mut reads = vec![AbCommand::Eval {
             script: snapshot_expression(),
@@ -1495,7 +1541,7 @@ impl AgentBrowserEngine {
             });
         }
         let rows = self
-            .run_page(&mut state, &key, &page, &reads, "read the page")
+            .run_page(state, key, page, &reads, "read the page")
             .await?;
         let page_state: SnapshotState = eval_value(&rows[0], "snapshot")?;
         if full_page {
@@ -1504,9 +1550,9 @@ impl AgentBrowserEngine {
         let shot = ScratchFile::new(&self.state_dir, "png");
         let rows = self
             .run_page(
-                &mut state,
-                &key,
-                &page,
+                state,
+                key,
+                page,
                 &[
                     AbCommand::Screenshot {
                         path: shot.0.clone(),
@@ -1530,7 +1576,7 @@ impl AgentBrowserEngine {
         keep_last(&mut console_errors, MAX_CONSOLE_ERRORS);
         let viewport = state
             .registry
-            .get(&key)
+            .get(key)
             .and_then(|target| target.viewport)
             .unwrap_or(page_state.viewport);
         let snapshot = BrowserSnapshot {
@@ -1546,7 +1592,23 @@ impl AgentBrowserEngine {
             failed_requests: parse_failed_requests(&rows[4]),
             screenshot_png,
         };
-        let evidence_id = self.browser.record_evidence(owner, label, &snapshot).await;
+        self.record_capture(state, owner, label, &snapshot, accessibility)
+            .await;
+        Ok(snapshot)
+    }
+
+    /// Retain a labelled capture as evidence, with its accessibility text as
+    /// the snapshot-diff baseline when small enough. Pruned with the evidence
+    /// set.
+    async fn record_capture(
+        &self,
+        state: &mut AbState,
+        owner: &str,
+        label: &str,
+        snapshot: &BrowserSnapshot,
+        accessibility: &str,
+    ) {
+        let evidence_id = self.browser.record_evidence(owner, label, snapshot).await;
         if accessibility.chars().count() <= MAX_BASELINE_SNAPSHOT_CHARS {
             state
                 .baselines
@@ -1554,7 +1616,6 @@ impl AgentBrowserEngine {
         }
         let retained = self.browser.retained_evidence_ids().await;
         state.baselines.retain(|id, _| retained.contains(id));
-        Ok(snapshot)
     }
 
     pub async fn click_in(
@@ -1925,10 +1986,31 @@ impl AgentBrowserEngine {
         &self,
         owner: &str,
         target: Option<&str>,
+        label: Option<&str>,
     ) -> Result<BrowserSnapshotRefs> {
+        let label = label.map(validate_evidence_label).transpose()?;
         let mut state = self.state.lock().await;
         let key = state.registry.key(owner, target)?;
         let page = self.page(&mut state, &key).await?;
+        // A label retains this page state as a diff baseline, exactly as a
+        // labelled browser_capture does (viewport screenshot included). It
+        // runs first so the interactive snapshot below is the last one taken
+        // and its refs are the live ones.
+        let evidence_label = match label {
+            Some(label) => {
+                self.capture_labelled(
+                    &mut state,
+                    owner,
+                    &key,
+                    &page,
+                    label,
+                    BrowserCaptureMode::Viewport,
+                )
+                .await?;
+                Some(label.to_string())
+            }
+            None => None,
+        };
         let rows = self
             .run_page(
                 &mut state,
@@ -1952,6 +2034,7 @@ impl AgentBrowserEngine {
         let (snapshot, truncated) = cap_text(full, MAX_SNAPSHOT_REFS_CHARS);
         Ok(BrowserSnapshotRefs {
             target: key.name,
+            evidence_label,
             url: data
                 .get("origin")
                 .and_then(Value::as_str)
@@ -2003,6 +2086,9 @@ impl AgentBrowserEngine {
             different_pixels: None,
             total_pixels: None,
             dimension_mismatch: None,
+            regions: None,
+            region_count: None,
+            regions_unavailable: None,
             diff_png: None,
         };
         match mode {
@@ -2032,20 +2118,50 @@ impl AgentBrowserEngine {
                 let baseline = ScratchFile::new(&self.state_dir, "png");
                 baseline.write(&evidence.screenshot_png, "screenshot baseline")?;
                 let output = ScratchFile::new(&self.state_dir, "png");
+                let current = ScratchFile::new(&self.state_dir, "png");
+                let full_page = evidence.capture_mode == BrowserCaptureMode::FullPage;
                 let rows = self
                     .run_page(
                         &mut state,
                         &key,
                         &page,
-                        &[AbCommand::DiffScreenshot {
-                            baseline: baseline.0.clone(),
-                            output: output.0.clone(),
-                            full_page: evidence.capture_mode == BrowserCaptureMode::FullPage,
-                        }],
+                        &[
+                            AbCommand::DiffScreenshot {
+                                baseline: baseline.0.clone(),
+                                output: output.0.clone(),
+                                full_page,
+                            },
+                            AbCommand::Screenshot {
+                                path: current.0.clone(),
+                                full_page,
+                            },
+                        ],
                         "diff the screenshot",
                     )
                     .await?;
                 apply_screenshot_diff(&mut diff, &rows[0]);
+                if diff.changed && diff.dimension_mismatch.is_none() {
+                    let current_png = current.read("current screenshot")?;
+                    match changed_regions(
+                        &evidence.screenshot_png,
+                        &current_png,
+                        evidence.viewport.device_scale_factor,
+                    ) {
+                        Ok((regions, count)) => {
+                            diff.regions = Some(regions);
+                            diff.region_count = Some(count);
+                        }
+                        Err(reason) => diff.regions_unavailable = Some(reason),
+                    }
+                } else if diff.changed {
+                    diff.regions_unavailable = Some(
+                        "the screenshots differ in size, so there is no pixel-for-pixel comparison"
+                            .into(),
+                    );
+                } else {
+                    diff.regions = Some(Vec::new());
+                    diff.region_count = Some(0);
+                }
                 if output.0.exists() {
                     diff.diff_png = Some(output.read("diff image")?);
                 }
@@ -2413,6 +2529,124 @@ fn apply_screenshot_diff(diff: &mut BrowserDiff, data: &Value) {
         .cloned();
 }
 
+/// Where two same-size PNG screenshots differ: nearby changed pixels merge
+/// into regions (bounding boxes in page CSS pixels, `scale` device pixels to
+/// one), the largest first, capped at `MAX_DIFF_REGIONS`. Also returns how
+/// many regions there are in all. Memory only; nothing is written.
+fn changed_regions(
+    baseline_png: &[u8],
+    current_png: &[u8],
+    scale: f64,
+) -> std::result::Result<(Vec<BrowserDiffRegion>, usize), String> {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let decode = |bytes: &[u8], what: &str| {
+        image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+            .map(|decoded| decoded.into_rgba8())
+            .map_err(|error| format!("could not decode the {what} screenshot: {error}"))
+    };
+    let (bw, bh) = png_dimensions(baseline_png, "baseline")?;
+    let (cw, ch) = png_dimensions(current_png, "current")?;
+    if (bw, bh) != (cw, ch) {
+        return Err(format!(
+            "the screenshots differ in size ({bw}x{bh} against {cw}x{ch})"
+        ));
+    }
+    if u64::from(bw) * u64::from(bh) > MAX_DIFF_REGION_PIXELS {
+        return Err(format!(
+            "the screenshots are too large ({bw}x{bh}) to locate regions"
+        ));
+    }
+    let before = decode(baseline_png, "baseline")?;
+    let after = decode(current_png, "current")?;
+
+    let cell = DIFF_REGION_CELL;
+    let cols = bw.div_ceil(cell) as usize;
+    let rows = bh.div_ceil(cell) as usize;
+    // Per cell: the changed pixels' bounds (x0, y0, x1, y1), if any.
+    let mut cells: Vec<Option<(u32, u32, u32, u32)>> = vec![None; cols * rows];
+    for (x, y, a) in before.enumerate_pixels() {
+        let b = after.get_pixel(x, y);
+        let changed =
+            a.0.iter()
+                .zip(b.0.iter())
+                .any(|(p, q)| p.abs_diff(*q) > DIFF_PIXEL_TOLERANCE);
+        if changed {
+            let slot = &mut cells[(y / cell) as usize * cols + (x / cell) as usize];
+            *slot = Some(match *slot {
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                None => (x, y, x, y),
+            });
+        }
+    }
+
+    // Changed cells that touch (8 neighbours) are one region.
+    let mut seen = vec![false; cells.len()];
+    let mut regions: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for start in 0..cells.len() {
+        if seen[start] || cells[start].is_none() {
+            continue;
+        }
+        seen[start] = true;
+        let mut bounds = cells[start].unwrap_or_default();
+        let mut stack = vec![start];
+        while let Some(index) = stack.pop() {
+            let (cx, cy) = (index % cols, index / cols);
+            for ny in cy.saturating_sub(1)..=(cy + 1).min(rows - 1) {
+                for nx in cx.saturating_sub(1)..=(cx + 1).min(cols - 1) {
+                    let next = ny * cols + nx;
+                    if let (false, Some(cell_bounds)) = (seen[next], cells[next]) {
+                        seen[next] = true;
+                        bounds = (
+                            bounds.0.min(cell_bounds.0),
+                            bounds.1.min(cell_bounds.1),
+                            bounds.2.max(cell_bounds.2),
+                            bounds.3.max(cell_bounds.3),
+                        );
+                        stack.push(next);
+                    }
+                }
+            }
+        }
+        regions.push(bounds);
+    }
+
+    let count = regions.len();
+    let mut boxes: Vec<BrowserDiffRegion> = regions
+        .into_iter()
+        .map(|(x0, y0, x1, y1)| {
+            let left = (f64::from(x0) / scale).floor() as u32;
+            let top = (f64::from(y0) / scale).floor() as u32;
+            let right = (f64::from(x1 + 1) / scale).ceil() as u32;
+            let bottom = (f64::from(y1 + 1) / scale).ceil() as u32;
+            BrowserDiffRegion {
+                x: left,
+                y: top,
+                width: right.saturating_sub(left).max(1),
+                height: bottom.saturating_sub(top).max(1),
+            }
+        })
+        .collect();
+    boxes.sort_by_key(|region| {
+        (
+            std::cmp::Reverse(u64::from(region.width) * u64::from(region.height)),
+            region.y,
+            region.x,
+        )
+    });
+    boxes.truncate(MAX_DIFF_REGIONS);
+    Ok((boxes, count))
+}
+
+fn png_dimensions(bytes: &[u8], what: &str) -> std::result::Result<(u32, u32), String> {
+    image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png)
+        .into_dimensions()
+        .map_err(|error| format!("could not read the {what} screenshot: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2752,6 +2986,9 @@ mod tests {
             different_pixels: None,
             total_pixels: None,
             dimension_mismatch: None,
+            regions: None,
+            region_count: None,
+            regions_unavailable: None,
             diff_png: None,
         };
         apply_snapshot_diff(&mut diff, &serde_json::from_str(DIFF_SNAPSHOT).unwrap());
@@ -2932,5 +3169,139 @@ mod tests {
         assert!(status.active_target.is_none() && status.target_id.is_none());
         let status = engine.status_for("chat-a").await.unwrap();
         assert_eq!(status.active_target.as_deref(), Some("design"));
+    }
+
+    fn solid_png(width: u32, height: u32, paint: &[(u32, u32, u32, u32)]) -> Vec<u8> {
+        let mut img =
+            image::RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]));
+        for &(x, y, w, h) in paint {
+            for py in y..y + h {
+                for px in x..x + w {
+                    img.put_pixel(px, py, image::Rgba([200, 0, 0, 255]));
+                }
+            }
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn identical_screenshots_have_no_regions() {
+        let a = solid_png(100, 80, &[(10, 10, 5, 5)]);
+        let (regions, count) = changed_regions(&a, &a, 1.0).unwrap();
+        assert!(regions.is_empty());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn changed_regions_are_boxed_merged_and_largest_first() {
+        let base = solid_png(200, 100, &[]);
+        // Two blocks 4px apart merge; a distant small one stays apart.
+        let now = solid_png(
+            200,
+            100,
+            &[(10, 10, 10, 10), (24, 10, 10, 10), (150, 60, 3, 3)],
+        );
+        let (regions, count) = changed_regions(&base, &now, 1.0).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            regions,
+            [
+                BrowserDiffRegion {
+                    x: 10,
+                    y: 10,
+                    width: 24,
+                    height: 10
+                },
+                BrowserDiffRegion {
+                    x: 150,
+                    y: 60,
+                    width: 3,
+                    height: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn region_boxes_are_in_css_pixels_and_capped() {
+        // 2x scale: device pixels halve into CSS pixels.
+        let base = solid_png(200, 100, &[]);
+        let now = solid_png(200, 100, &[(20, 20, 40, 20)]);
+        let (regions, _) = changed_regions(&base, &now, 2.0).unwrap();
+        assert_eq!(
+            regions,
+            [BrowserDiffRegion {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 10
+            }]
+        );
+
+        // Twelve far-apart changes: all counted, ten listed, biggest first.
+        let paint: Vec<_> = (0..12).map(|i| (i * 40, 0, 1 + i, 1)).collect();
+        let wide = solid_png(500, 20, &[]);
+        let now = solid_png(500, 20, &paint);
+        let (regions, count) = changed_regions(&wide, &now, 1.0).unwrap();
+        assert_eq!(count, 12);
+        assert_eq!(regions.len(), MAX_DIFF_REGIONS);
+        assert_eq!(regions[0].width, 12);
+        assert!(regions
+            .windows(2)
+            .all(|pair| pair[0].width >= pair[1].width));
+    }
+
+    #[test]
+    fn mismatched_screenshot_sizes_give_no_regions() {
+        let error =
+            changed_regions(&solid_png(10, 10, &[]), &solid_png(12, 10, &[]), 1.0).unwrap_err();
+        assert!(error.contains("differ in size"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_labelled_capture_is_a_diff_baseline_and_an_unlabelled_read_is_not() {
+        let temp = tempdir().unwrap();
+        let engine = engine_with_binary(temp.path(), temp.path().join("unused"));
+        let snapshot = BrowserSnapshot {
+            target: "primary".into(),
+            capture_mode: BrowserCaptureMode::Viewport,
+            url: "https://example.com/".into(),
+            title: "Example".into(),
+            loading_state: "complete".into(),
+            visible_text: String::new(),
+            interactive_elements: Vec::new(),
+            viewport: BrowserViewport::desktop(100, 80),
+            console_errors: Vec::new(),
+            failed_requests: Vec::new(),
+            screenshot_png: solid_png(100, 80, &[]),
+        };
+        // What a labelled browser_snapshot_refs stores (capture_labelled ends here).
+        let mut state = engine.state.lock().await;
+        engine
+            .record_capture(&mut state, "chat-1", "before", &snapshot, "- button \"Go\"")
+            .await;
+        let evidence = engine
+            .browser
+            .owned_evidence("chat-1", "primary", "before")
+            .await
+            .expect("labelled evidence is retained");
+        assert_eq!(
+            state.baselines.get(&evidence.id).map(|text| text.as_str()),
+            Some("- button \"Go\"")
+        );
+        assert_eq!(*evidence.screenshot_png, snapshot.screenshot_png);
+        // Another chat, or an unlabelled read, finds nothing.
+        assert!(engine
+            .browser
+            .owned_evidence("chat-2", "primary", "before")
+            .await
+            .is_none());
+        assert!(engine
+            .browser
+            .owned_evidence("chat-1", "primary", "after")
+            .await
+            .is_none());
     }
 }

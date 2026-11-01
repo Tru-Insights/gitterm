@@ -331,8 +331,9 @@ impl BrowserEngine {
         &self,
         owner: &str,
         target: Option<&str>,
+        label: Option<&str>,
     ) -> Result<BrowserSnapshotRefs> {
-        engine_call!(self, _browser => Err(agent_browser_only("browser_snapshot_refs")), engine => engine.snapshot_refs_in(owner, target).await)
+        engine_call!(self, _browser => Err(agent_browser_only("browser_snapshot_refs")), engine => engine.snapshot_refs_in(owner, target, label).await)
     }
 
     pub async fn diff_in(
