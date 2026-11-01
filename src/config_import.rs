@@ -98,14 +98,7 @@ pub fn import_v5_config_on_first_launch() {
     if dest.exists() {
         return;
     }
-    let source = match import_source(
-        config::config_dir_override().is_some(),
-        config::resolve_dir_override(
-            config::V5_CONFIG_DIR_ENV,
-            std::env::var_os(config::V5_CONFIG_DIR_ENV),
-        ),
-        dirs::home_dir(),
-    ) {
+    let source = match v5_config_dir() {
         Ok(source) => source,
         Err(reason) => {
             eprintln!("{LOG_PREFIX}: skipped ({reason})");
@@ -137,6 +130,20 @@ pub fn import_v5_config_on_first_launch() {
             dest.display()
         ),
     }
+}
+
+/// The V5 config dir this V6 instance may read: the import's source, also
+/// read (never written) when an imported chat tab picks up its V5
+/// conversation (TRU-183).
+pub(crate) fn v5_config_dir() -> Result<PathBuf, String> {
+    import_source(
+        config::config_dir_override().is_some(),
+        config::resolve_dir_override(
+            config::V5_CONFIG_DIR_ENV,
+            std::env::var_os(config::V5_CONFIG_DIR_ENV),
+        ),
+        dirs::home_dir(),
+    )
 }
 
 /// Where to import from. An isolated V6 instance (its config dir
@@ -342,7 +349,7 @@ fn rewrite_token_refs(value: &mut Value, source: &Path, dest: &Path) -> usize {
     rewritten
 }
 
-fn expand_home(path: &str) -> PathBuf {
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest);
@@ -360,6 +367,19 @@ const TAB_FIELDS_DROPPED: &[&str] = &[
     "task_session_id",
     "session_uid",
 ];
+
+/// Whether the import keeps V5 tab `tab`: not owned by a V5 task
+/// (`task_id`) and not rooted inside the V5 dir `source`.
+pub(crate) fn import_keeps_tab(tab: &Value, source: &Path) -> bool {
+    let inside_source = |dir: Option<&str>| {
+        dir.map(|dir| expand_home(dir).starts_with(source))
+            .unwrap_or(false)
+    };
+    let task_bound = tab.get("task_id").is_some_and(|id| !id.is_null());
+    !task_bound
+        && !inside_source(tab.get("dir").and_then(Value::as_str))
+        && !inside_source(tab.get("repo_dir").and_then(Value::as_str))
+}
 
 /// Make imported workspaces safe to restore beside a running V5:
 /// - drop workspaces rooted inside the V5 config dir (task worktrees);
@@ -386,12 +406,7 @@ fn sanitize_workspaces(value: &mut Value, source: &Path, dest: &Path) -> String 
                 continue;
             };
             let before = tabs.len();
-            tabs.retain(|tab| {
-                let task_bound = tab.get("task_id").is_some_and(|id| !id.is_null());
-                !task_bound
-                    && !inside_source(tab.get("dir").and_then(Value::as_str))
-                    && !inside_source(tab.get("repo_dir").and_then(Value::as_str))
-            });
+            tabs.retain(|tab| import_keeps_tab(tab, source));
             let removed = before - tabs.len();
             dropped_tabs += removed;
             if tabs.is_empty() {

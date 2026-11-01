@@ -281,6 +281,26 @@
     overflow-y: auto;
   }
   #request-panel.visible { display: block; }
+
+  /* An empty chat tab imported from V5: its V5 conversations (TRU-183). */
+  #v5-offer {
+    display: none;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    background: var(--bg-block);
+    padding: 10px 12px;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+  #v5-offer.visible { display: block; }
+  .v5-head { font-weight: 600; margin-bottom: 4px; }
+  .v5-sub { color: var(--fg-muted); font-size: 12.5px; margin-bottom: 6px; }
+  .v5-row { display: flex; gap: 8px; align-items: center; padding: 3px 0; }
+  .v5-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .v5-origin { color: var(--fg-muted); font-size: 12px; white-space: nowrap; }
+  .v5-warn { color: var(--warn); font-size: 12.5px; margin-top: 8px; }
+  .v5-error { color: var(--err); font-size: 12.5px; margin-top: 4px; }
+  .v5-error:empty { display: none; }
   .rq-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; }
   .rq-title { font-weight: 600; }
   .rq-count { color: var(--fg-muted); font-size: 12px; margin-left: auto; }
@@ -572,6 +592,7 @@
     <span class="activity-label">Starting</span>
     <span class="activity-meta"></span>
   </div>
+  <div id="v5-offer"></div>
   <div id="request-panel"></div>
   <div id="roster"></div>
   <div id="composer">
@@ -696,6 +717,49 @@
     if (!window.ipc || typeof window.ipc.postMessage !== 'function') return;
     window.ipc.postMessage(JSON.stringify(Object.assign({}, payload, { tabId: window.__currentTabId })));
   }
+
+  // ---- V5 conversation pickup (TRU-183) ----------------------------------
+  // An empty chat tab imported from V5 lists the V5 conversations of its
+  // workspace that no V6 tab holds ({conversations: [{id, title, origin}]},
+  // likeliest first); null clears the note.
+  const v5OfferEl = document.getElementById('v5-offer');
+  function setV5OfferButtons(enabled) {
+    for (const b of v5OfferEl.querySelectorAll('button')) b.disabled = !enabled;
+  }
+  window.__setV5Offer = function (offer) {
+    v5OfferEl.innerHTML = '';
+    const list = offer && Array.isArray(offer.conversations) ? offer.conversations : [];
+    v5OfferEl.classList.toggle('visible', list.length > 0);
+    if (!list.length) return;
+    v5OfferEl.append(el('div', 'v5-head', 'This tab came from GitTerm V5.'));
+    v5OfferEl.append(el('div', 'v5-sub', list.length === 1
+      ? 'Its V5 conversation:'
+      : 'Its V5 conversations, likeliest first:'));
+    for (const c of list) {
+      const row = el('div', 'v5-row');
+      const title = el('span', 'v5-title', c.title);
+      title.title = c.title;
+      row.append(title);
+      if (c.origin === 'terminal') row.append(el('span', 'v5-origin', 'was a terminal tab'));
+      const go = el('button', 'primary', 'Continue here');
+      go.addEventListener('click', () => {
+        setV5OfferButtons(false);
+        const err = v5OfferEl.querySelector('.v5-error');
+        if (err) err.textContent = '';
+        postIpc({ type: 'v5_continue', sessionId: c.id });
+      });
+      row.append(go);
+      v5OfferEl.append(row);
+    }
+    v5OfferEl.append(el('div', 'v5-warn', 'Close this chat in V5 first. Two apps sending to one conversation will tangle it.'));
+    v5OfferEl.append(el('div', 'v5-error'));
+  };
+  window.__setV5OfferError = function (text) {
+    const err = v5OfferEl.querySelector('.v5-error');
+    if (!err) return;
+    err.textContent = text;
+    setV5OfferButtons(true);
+  };
 
   // ---- scrolling ---------------------------------------------------------
   function atBottom() {
@@ -1406,6 +1470,8 @@
       payload.images = attachments.map((a) => ({ media_type: a.media_type, data: a.data }));
     }
     postIpc(payload);
+    // A first message starts this tab's own conversation.
+    window.__setV5Offer(null);
     promptEl.value = '';
     promptEl.style.height = 'auto';
     attachments = [];
