@@ -12369,7 +12369,13 @@ impl App {
     /// workspace comes through here. Returns its index.
     fn open_workspace(&mut self, mut ws: Workspace) -> usize {
         self.register_home(&mut ws);
-        for dir in std::mem::take(&mut ws.pending_repos) {
+        let mut pending = std::mem::take(&mut ws.pending_repos);
+        // A saved list holding a linked worktree lists its main checkout
+        // instead (TRU-191); only this Mac's folders are read.
+        if matches!(ws.location, WorkspaceLocation::Local { .. }) {
+            pending = gitterm::workspace_repos::fold_worktrees(pending);
+        }
+        for dir in pending {
             if let Some(id) = self.list_repo(&ws.name, &ws.location, dir) {
                 if !ws.repos.contains(&id) {
                     ws.repos.push(id);
@@ -12503,13 +12509,13 @@ impl App {
                 .filter_map(|task_id| self.task_store.as_ref()?.get(task_id))
                 .filter_map(|task| task_main_checkout(&task.repository.common_dir))
                 .collect();
-            let candidates: Vec<PathBuf> =
+            // A linked worktree (an agent-made one too) joins as its main
+            // checkout (TRU-191); a checkout since deleted does not join.
+            let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
                 gitterm::workspace_repos::auto_repo_candidates(&work, &workers, &task_worktrees)
-                    .iter()
-                    // A checkout since deleted does not join.
-                    .filter(|dir| dir.is_dir())
-                    .map(|dir| canonical(dir))
-                    .collect();
+                    .into_iter()
+                    .filter(|dir| dir.is_dir()),
+            );
             let listed: Vec<PathBuf> = ws
                 .repos
                 .iter()
@@ -14704,7 +14710,8 @@ impl App {
                 self.open_remote_folder_tab(&remote_id, dir)
             }
             (FolderPickerPurpose::AddRepo(uid), None) => {
-                let dir = PathBuf::from(dir);
+                // A linked worktree is listed as its main checkout (TRU-191).
+                let dir = gitterm::workspace_repos::main_checkout(Path::new(&dir));
                 if let Some(idx) = self.workspace_index_by_uid(uid) {
                     let ws = &mut self.workspaces[idx];
                     gitterm::workspace_repos::add_manually(
