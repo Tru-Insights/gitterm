@@ -363,6 +363,281 @@ mod tests {
     }
 
     #[test]
+    fn an_old_file_loads_as_one_repo_per_workspace_and_round_trips() {
+        let mut file: WorkspacesFile = serde_json::from_str(OLD_WORKSPACES_JSON).unwrap();
+        assert!(file.repos.is_empty());
+        file.normalize_repos();
+
+        // Each workspace lists its dir as home and only repo; each home
+        // gets a repo entry from the workspace's own fields.
+        for ws in &file.workspaces {
+            assert_eq!(ws.home.as_deref(), Some(ws.dir.as_str()));
+            assert_eq!(ws.repos, [ws.dir.clone()]);
+            assert!(ws.env_overrides.is_empty());
+        }
+        assert_eq!(file.repos.len(), 2);
+        let api = file
+            .repo(&RepoKey::of_config("/w/api-server", None))
+            .unwrap();
+        assert_eq!(api.env["LINEAR_TEAM"], "PRJ");
+        assert_eq!(api.run_command, None);
+        // The env a tab gets is unchanged.
+        assert_eq!(file.workspace_env("api-server", None)["LINEAR_TEAM"], "PRJ");
+        assert!(file.workspace_env("acme", None).is_empty());
+        assert!(file.workspace_env("unknown", None).is_empty());
+
+        // Written and read back: the repo model survives, the old fields
+        // are still there for an older build, and normalizing again
+        // changes nothing.
+        let json = serde_json::to_string_pretty(&file).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(raw["repos"][0]["dir"], "/w/api-server");
+        assert_eq!(raw["workspaces"][0]["env"]["LINEAR_TEAM"], "PRJ");
+        assert_eq!(raw["workspaces"][0]["home"], "/w/api-server");
+        let mut read: WorkspacesFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.repos, file.repos);
+        read.normalize_repos();
+        assert_eq!(read.repos, file.repos);
+        assert_eq!(read.workspaces[0].repos, file.workspaces[0].repos);
+        assert!(read.stale_env_copies().is_empty());
+
+        // An older build reads the file, dropping what it doesn't know.
+        let older: serde_json::Value = {
+            let mut value = raw.clone();
+            value.as_object_mut().unwrap().remove("repos");
+            for ws in value["workspaces"].as_array_mut().unwrap() {
+                let ws = ws.as_object_mut().unwrap();
+                ws.remove("repos");
+                ws.remove("home");
+                ws.remove("env_overrides");
+            }
+            value
+        };
+        let mut again: WorkspacesFile = serde_json::from_value(older).unwrap();
+        again.normalize_repos();
+        assert_eq!(again.repos, file.repos);
+    }
+
+    #[test]
+    fn workspaces_sharing_a_dir_in_an_old_file_share_one_repo() {
+        let json = r#"{
+          "workspaces": [
+            { "name": "parked", "abbrev": "PA", "dir": "/w/shared", "color": "red",
+              "tabs": [], "active": false, "run_command": "make parked",
+              "env": { "TEAM": "PARKED" },
+              "bottom_terminals": [{ "dir": "/w/shared/parked" }] },
+            { "name": "first", "abbrev": "FI", "dir": "/w/shared", "color": "blue",
+              "tabs": [], "run_command": "npm run dev",
+              "env": { "TEAM": "PRJ", "ONLY_FIRST": "1" },
+              "bottom_terminals": [{ "dir": "/w/shared" }] },
+            { "name": "second", "abbrev": "SE", "dir": "/w/shared", "color": "green",
+              "tabs": [], "run_command": "cargo run",
+              "env": { "TEAM": "OPS" },
+              "bottom_terminals": [{ "dir": "/w/shared/sub" }] }
+          ],
+          "active_workspace": 0
+        }"#;
+        let mut file: WorkspacesFile = serde_json::from_str(json).unwrap();
+        file.normalize_repos();
+        // One repo: the first open workspace wins its settings. Each
+        // workspace keeps its own bottom terminals.
+        assert_eq!(file.repos.len(), 1);
+        let repo = &file.repos[0];
+        assert_eq!(repo.run_command.as_deref(), Some("npm run dev"));
+        assert!(repo.bottom_terminals.is_empty());
+        let dirs = |idx: usize| -> Vec<&str> {
+            file.workspaces[idx]
+                .bottom_terminals
+                .iter()
+                .map(|bt| bt.dir.as_str())
+                .collect()
+        };
+        assert_eq!(dirs(0), ["/w/shared/parked"]);
+        assert_eq!(dirs(1), ["/w/shared"]);
+        assert_eq!(dirs(2), ["/w/shared/sub"]);
+        // The second's differing env became its overrides; each tab env
+        // keeps what its workspace had (plus keys the repo adds).
+        assert_eq!(file.workspaces[2].env_overrides["TEAM"], "OPS");
+        assert_eq!(file.workspace_env("first", None)["TEAM"], "PRJ");
+        assert_eq!(file.workspace_env("second", None)["TEAM"], "OPS");
+        assert_eq!(file.workspace_env("parked", None)["TEAM"], "PARKED");
+        assert_eq!(file.workspace_env("second", None)["ONLY_FIRST"], "1");
+    }
+
+    #[test]
+    fn terminals_kept_on_repos_go_to_every_workspace_listing_them() {
+        // As the build that kept bottom terminals on repos wrote it: each
+        // workspace's own `bottom_terminals` is a copy of its home's.
+        let json = r#"{
+          "workspaces": [
+            { "name": "one", "abbrev": "ON", "dir": "/w/shared", "color": "red",
+              "tabs": [], "home": "/w/shared", "repos": ["/w/shared", "/w/api"],
+              "bottom_terminals": [{ "dir": "/w/shared" }, { "dir": "/w/shared/sub" }] },
+            { "name": "two", "abbrev": "TW", "dir": "/w/api", "color": "blue",
+              "tabs": [], "home": "/w/api", "repos": ["/w/api", "/w/shared"],
+              "bottom_terminals": [{ "dir": "/w/api" }] },
+            { "name": "parked", "abbrev": "PA", "dir": "/w/shared", "color": "green",
+              "tabs": [], "active": false, "home": "/w/shared", "repos": ["/w/shared"],
+              "bottom_terminals": [{ "dir": "/w/shared" }, { "dir": "/w/shared/sub" }] },
+            { "name": "solo", "abbrev": "SO", "dir": "/w/solo", "color": "teal",
+              "tabs": [], "home": "/w/solo", "repos": ["/w/solo"],
+              "bottom_terminals": [] }
+          ],
+          "repos": [
+            { "dir": "/w/shared", "run_command": "npm run dev",
+              "bottom_terminals": [{ "dir": "/w/shared" }, { "dir": "/w/shared/sub" }] },
+            { "dir": "/w/api", "bottom_terminals": [{ "dir": "/w/api" }] },
+            { "dir": "/w/solo", "bottom_terminals": [] }
+          ],
+          "active_workspace": 0
+        }"#;
+        let mut file: WorkspacesFile = serde_json::from_str(json).unwrap();
+        file.normalize_repos();
+        let dirs = |file: &WorkspacesFile, idx: usize| -> Vec<String> {
+            file.workspaces[idx]
+                .bottom_terminals
+                .iter()
+                .map(|bt| bt.dir.clone())
+                .collect()
+        };
+        // Every terminal is kept; a repo listed by several workspaces gives
+        // its terminals to each, home's first.
+        assert_eq!(dirs(&file, 0), ["/w/shared", "/w/shared/sub", "/w/api"]);
+        assert_eq!(dirs(&file, 1), ["/w/api", "/w/shared", "/w/shared/sub"]);
+        assert_eq!(dirs(&file, 2), ["/w/shared", "/w/shared/sub"]);
+        assert!(dirs(&file, 3).is_empty());
+        // The repos keep their settings and no longer hold terminals.
+        assert!(file
+            .repos
+            .iter()
+            .all(|repo| repo.bottom_terminals.is_empty()));
+        assert_eq!(file.repos[0].run_command.as_deref(), Some("npm run dev"));
+
+        // Written back, terminals are only the workspaces'; loading that
+        // again changes nothing.
+        let json = serde_json::to_string_pretty(&file).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(raw["repos"][0].get("bottom_terminals").is_none());
+        assert_eq!(raw["workspaces"][1]["bottom_terminals"][0]["dir"], "/w/api");
+        let mut read: WorkspacesFile = serde_json::from_str(&json).unwrap();
+        read.normalize_repos();
+        for idx in 0..4 {
+            assert_eq!(dirs(&read, idx), dirs(&file, idx));
+        }
+    }
+
+    #[test]
+    fn a_tab_gets_the_env_of_the_repo_holding_its_cwd_then_overrides() {
+        let json = r#"{
+          "workspaces": [
+            { "name": "work", "abbrev": "WO", "dir": "/w/work", "color": "blue",
+              "tabs": [], "home": "/w/work",
+              "repos": ["/w/work", "/w/org-a/api", "/w/org-b/web", "/w/new"],
+              "env": { "GH_TOKEN": "fake-home" },
+              "env_overrides": { "LINEAR_TEAM": "PRJ" },
+              "repos_added": ["/w/new"],
+              "repos_removed": ["/w/gone"] }
+          ],
+          "repos": [
+            { "dir": "/w/work", "env": { "GH_TOKEN": "fake-home" } },
+            { "dir": "/w/org-a/api", "env": { "GH_TOKEN": "fake-a" } },
+            { "dir": "/w/org-b/web", "env": { "GH_TOKEN": "fake-b", "LINEAR_TEAM": "OPS" } }
+          ],
+          "active_workspace": 0
+        }"#;
+        let mut file: WorkspacesFile = serde_json::from_str(json).unwrap();
+        file.normalize_repos();
+        let env = |cwd: &str| file.workspace_env("work", Some(Path::new(cwd)));
+        assert_eq!(env("/w/org-a/api/src")["GH_TOKEN"], "fake-a");
+        assert_eq!(env("/w/org-b/web")["GH_TOKEN"], "fake-b");
+        // Overrides apply on top of every repo.
+        assert_eq!(env("/w/org-b/web")["LINEAR_TEAM"], "PRJ");
+        // Outside every listed repo: the home repo's env, as before repos.
+        assert_eq!(env("/elsewhere")["GH_TOKEN"], "fake-home");
+        assert_eq!(env("/w/work/notes")["GH_TOKEN"], "fake-home");
+        // A listed repo with nothing stored has only the overrides.
+        assert!(!env("/w/new/x").contains_key("GH_TOKEN"));
+        assert_eq!(env("/w/new/x")["LINEAR_TEAM"], "PRJ");
+
+        // Manual adds and removes round trip.
+        let read: WorkspacesFile =
+            serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!(read.workspaces[0].repos_added, ["/w/new"]);
+        assert_eq!(read.workspaces[0].repos_removed, ["/w/gone"]);
+        assert_eq!(read.workspaces[0].repos[1], "/w/org-a/api");
+    }
+
+    #[test]
+    fn env_layers_overrides_on_the_repo_env() {
+        let env: HashMap<String, String> = [("A", "repo"), ("B", "repo")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let overrides: HashMap<String, String> = [("B", "ws"), ("C", "ws")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let layered = layered_env(&env, &overrides);
+        assert_eq!(layered["A"], "repo");
+        assert_eq!(layered["B"], "ws");
+        assert_eq!(layered["C"], "ws");
+        assert_eq!(env_difference(&layered, &env), overrides);
+        assert!(env_difference(&env, &env).is_empty());
+    }
+
+    #[test]
+    fn a_hand_edited_env_copy_is_reported_by_key() {
+        let mut file: WorkspacesFile = serde_json::from_str(OLD_WORKSPACES_JSON).unwrap();
+        file.normalize_repos();
+        file.workspaces[0]
+            .env
+            .insert("FAKE_TOKEN".into(), "fake-value".into());
+        assert_eq!(
+            file.stale_env_copies(),
+            [("api-server".to_string(), vec!["FAKE_TOKEN".to_string()])]
+        );
+        // The repo's env is what tabs get.
+        assert!(!file
+            .workspace_env("api-server", None)
+            .contains_key("FAKE_TOKEN"));
+    }
+
+    #[test]
+    fn remote_and_legacy_workspaces_key_their_repos_by_machine() {
+        let remote = RepoKey::of_config(
+            "/srv/app",
+            Some(&WorkspaceLocationConfig::RemoteAgent {
+                remote_id: "box".into(),
+                workspace_id: "/srv/app".into(),
+                root: "/srv/app".into(),
+            }),
+        );
+        assert_ne!(remote, RepoKey::of_config("/srv/app", None));
+        let legacy: WorkspaceConfig = serde_json::from_value(serde_json::json!({
+            "name": "box:app", "abbrev": "BO", "dir": "/Users/me", "color": "blue",
+            "tabs": [], "env": { "K": "v" },
+            "remote_session": {
+                "label": "box", "host_name": "box", "ssh_target": "box",
+                "identity_file": "", "session_name": "app", "remote_dir": "/srv/app"
+            }
+        }))
+        .unwrap();
+        assert!(legacy.is_legacy_remote());
+        let mut file = WorkspacesFile {
+            workspaces: vec![legacy],
+            active_workspace: 0,
+            remote_sessions: Vec::new(),
+            remote_agents: Vec::new(),
+            collapsed_repo_groups: Vec::new(),
+            repos: Vec::new(),
+        };
+        file.normalize_repos();
+        // Never stored as a repo; its own env stays its source.
+        assert!(file.repos.is_empty());
+        assert_eq!(file.workspace_env("box:app", None)["K"], "v");
+    }
+
+    #[test]
     fn collapsed_repo_groups_are_additive_and_round_trip() {
         // An old file loads with every Repos zone expanded and writes
         // nothing new.
@@ -1093,6 +1368,104 @@ pub struct WorkspacesFile {
     /// and restarts; empty (every zone expanded) by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed_repo_groups: Vec<String>,
+    /// The repos workspaces list (TRU-180): a checkout's run command and
+    /// env, shared by every workspace listing it. Files written before
+    /// TRU-180 have none; `normalize_repos` derives them from each
+    /// workspace's own fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<RepoConfig>,
+}
+
+/// A repo as `workspaces.json` stores it (TRU-180). Identified by `dir` on
+/// its machine (`location`; `None` is this Mac), see `RepoKey`. It is
+/// open while an open workspace lists it; this entry persists while any
+/// workspace does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoConfig {
+    pub dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<WorkspaceLocationConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_command: Option<String>,
+    /// Environment for terminals and tabs running in this repo; a
+    /// workspace's `env_overrides` apply on top.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    /// Read only: the build that kept bottom terminals on repos wrote
+    /// them here. `WorkspacesFile::normalize_repos` hands them to the
+    /// workspaces listing the repo; terminals are each workspace's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bottom_terminals: Vec<BottomTerminalConfig>,
+}
+
+impl RepoConfig {
+    pub fn key(&self) -> RepoKey {
+        RepoKey::of_config(&self.dir, self.location.as_ref())
+    }
+}
+
+/// Which checkout a repo is (TRU-180): its canonical dir on this Mac, or
+/// its root on a remote machine. Two workspaces whose repos have the same
+/// key share one repo.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RepoKey {
+    Local(PathBuf),
+    RemoteAgent {
+        remote_id: String,
+        root: String,
+    },
+    /// A tmux-session workspace from before remote agents. Runtime only:
+    /// its dir is a local stand-in, so it is never stored as a repo.
+    LegacyRemote {
+        session_name: String,
+        root: String,
+    },
+}
+
+impl RepoKey {
+    /// A local checkout, by canonical path. A folder that cannot be
+    /// resolved (gone, unreadable) keys by the path as given.
+    pub fn local(dir: &Path) -> Self {
+        RepoKey::Local(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+    }
+
+    pub fn of_config(dir: &str, location: Option<&WorkspaceLocationConfig>) -> Self {
+        match location {
+            Some(WorkspaceLocationConfig::RemoteAgent { remote_id, .. }) => RepoKey::RemoteAgent {
+                remote_id: remote_id.clone(),
+                root: dir.to_string(),
+            },
+            Some(WorkspaceLocationConfig::Local { .. }) | None => RepoKey::local(Path::new(dir)),
+        }
+    }
+
+    /// A checkout on this Mac.
+    pub fn is_local(&self) -> bool {
+        matches!(self, RepoKey::Local(_))
+    }
+}
+
+/// `env` with `overrides` on top: what a tab, terminal or console in a
+/// repo of a workspace runs with (TRU-180).
+pub fn layered_env(
+    env: &HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut layered = env.clone();
+    layered.extend(overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
+    layered
+}
+
+/// The entries of `env` that `base` lacks or holds differently: what a
+/// workspace joining a shared repo keeps as its overrides.
+pub fn env_difference(
+    env: &HashMap<String, String>,
+    base: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    env.iter()
+        .filter(|(key, value)| base.get(*key) != Some(*value))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1209,6 +1582,27 @@ pub struct WorkspaceConfig {
     /// (TRU-174). See `gitterm::guidelines`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guidelines_off: bool,
+    /// The repos this workspace lists, by dir on its machine, home first
+    /// (TRU-180). Their settings live in `WorkspacesFile::repos`. Files
+    /// written before TRU-180 have none: `normalize_repos` makes `[dir]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
+    /// The home repo's dir, where new chats start; `dir` until set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// Env applied on top of a repo's env for this workspace's tabs and
+    /// terminals (TRU-180). `env` and `run_command` above are still
+    /// written, from the home repo (env with these applied), so a build
+    /// before TRU-180 reads them; `bottom_terminals` is the workspace's.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env_overrides: HashMap<String, String>,
+    /// Repos added by hand ("+ add repo"); listed whatever the chats touch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_added: Vec<String>,
+    /// Repos removed by hand (×, or undoing an auto-add); never listed
+    /// again by the chats touching them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos_removed: Vec<String>,
 }
 
 /// Why and when a workspace was parked (TRU-171).
@@ -1224,6 +1618,36 @@ impl WorkspaceConfig {
     /// On the Parked list: closed and not done.
     pub fn is_parked(&self) -> bool {
         !self.active && self.done_at.is_none()
+    }
+
+    /// The home repo's dir: `home`, else `dir` (files before TRU-180).
+    pub fn home_dir(&self) -> &str {
+        self.home.as_deref().unwrap_or(&self.dir)
+    }
+
+    /// A tmux-session workspace from before remote agents: its repo is
+    /// never stored in the `repos` section (its dir is a local stand-in),
+    /// so its own fields stay the source of its settings.
+    pub fn is_legacy_remote(&self) -> bool {
+        self.location.is_none() && self.remote_session.is_some()
+    }
+
+    /// The key of repo `dir` this workspace lists; `None` for a legacy
+    /// remote workspace (see `is_legacy_remote`).
+    pub fn repo_key(&self, dir: &str) -> Option<RepoKey> {
+        (!self.is_legacy_remote()).then(|| RepoKey::of_config(dir, self.location.as_ref()))
+    }
+
+    /// The home repo's settings as this entry's own (pre-TRU-180) fields
+    /// hold them. Its terminals stay the workspace's.
+    pub fn own_home_repo(&self) -> RepoConfig {
+        RepoConfig {
+            dir: self.home_dir().to_string(),
+            location: self.location.clone(),
+            run_command: self.run_command.clone(),
+            env: self.env.clone(),
+            bottom_terminals: Vec::new(),
+        }
     }
 }
 
@@ -1268,7 +1692,7 @@ pub struct WorkspaceTabConfig {
     pub session_uid: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BottomTerminalConfig {
     pub dir: String,
 }
@@ -1276,6 +1700,150 @@ pub struct BottomTerminalConfig {
 impl WorkspacesFile {
     pub fn file_path() -> PathBuf {
         global_config_dir().join("workspaces.json")
+    }
+
+    /// Fills in the repo model (TRU-180) for entries written without it:
+    /// each workspace lists its `dir` as home and only repo, and a home
+    /// with no `repos` entry gets one from the workspace's own fields.
+    /// Open workspaces go first, in file order, so the first open one
+    /// sharing a dir wins its run command and env; a later one's
+    /// differing env becomes its overrides. Entries already in `repos`
+    /// are left as stored.
+    ///
+    /// Bottom terminals are each workspace's own `bottom_terminals`. A
+    /// file from the build that kept them on repos (`repos[].bottom_terminals`)
+    /// gives each workspace the terminals of every repo it lists, home
+    /// first: a repo's terminals shared by several workspaces go to each.
+    pub fn normalize_repos(&mut self) {
+        let repo_terminals: Vec<(RepoKey, Vec<BottomTerminalConfig>)> = self
+            .repos
+            .iter_mut()
+            .map(|repo| (repo.key(), std::mem::take(&mut repo.bottom_terminals)))
+            .collect();
+        let terminals_on_repos = repo_terminals.iter().any(|(_, t)| !t.is_empty());
+        let mut created: Vec<RepoKey> = Vec::new();
+        let order: Vec<usize> = (0..self.workspaces.len())
+            .filter(|&i| self.workspaces[i].active)
+            .chain((0..self.workspaces.len()).filter(|&i| !self.workspaces[i].active))
+            .collect();
+        for idx in order {
+            let ws = &mut self.workspaces[idx];
+            let home = ws.home_dir().to_string();
+            ws.home = Some(home.clone());
+            ws.repos.retain(|dir| *dir != home);
+            ws.repos.insert(0, home.clone());
+            let Some(key) = ws.repo_key(&home) else {
+                continue;
+            };
+            match self.repos.iter_mut().find(|repo| repo.key() == key) {
+                None => {
+                    self.repos.push(ws.own_home_repo());
+                    created.push(key);
+                }
+                Some(repo) if created.contains(&key) => {
+                    for (k, v) in env_difference(&ws.env, &repo.env) {
+                        ws.env_overrides.entry(k).or_insert(v);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        if !terminals_on_repos {
+            return;
+        }
+        for ws in &mut self.workspaces {
+            let stored = |dir: &String| {
+                let key = ws.repo_key(dir)?;
+                repo_terminals.iter().find(|(k, _)| *k == key)
+            };
+            // A home the repo section never held (a legacy remote, an entry
+            // an older build added) keeps the workspace's own terminals.
+            if ws.repos.first().and_then(stored).is_none() {
+                continue;
+            }
+            let terminals: Vec<BottomTerminalConfig> = ws
+                .repos
+                .iter()
+                .filter_map(stored)
+                .flat_map(|(_, terminals)| terminals.iter().cloned())
+                .collect();
+            ws.bottom_terminals = terminals;
+        }
+    }
+
+    /// The stored repo with `key`.
+    pub fn repo(&self, key: &RepoKey) -> Option<&RepoConfig> {
+        self.repos.iter().find(|repo| repo.key() == *key)
+    }
+
+    /// The env a tab or terminal of workspace `name` running in `cwd`
+    /// gets (TRU-180): the env of the deepest repo it lists containing
+    /// `cwd`, else of its home repo (every tab got the workspace's env
+    /// before repos), with the workspace's overrides on top. A legacy
+    /// remote workspace, or a home with no stored repo, uses the
+    /// workspace's own `env`. An unknown workspace gets none, as before.
+    pub fn workspace_env(&self, name: &str, cwd: Option<&Path>) -> HashMap<String, String> {
+        let Some(ws) = self.workspaces.iter().find(|ws| ws.name == name) else {
+            return HashMap::new();
+        };
+        let home = ws.home_dir();
+        let dir = cwd
+            .filter(|_| !ws.is_legacy_remote())
+            .and_then(|cwd| {
+                let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+                ws.repos
+                    .iter()
+                    .filter(|dir| {
+                        let dir = Path::new(dir.as_str());
+                        let canonical =
+                            std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                        cwd.starts_with(&canonical) || cwd.starts_with(dir)
+                    })
+                    .max_by_key(|dir| Path::new(dir.as_str()).components().count())
+            })
+            .map(String::as_str)
+            .unwrap_or(home);
+        let stored = |dir: &str| ws.repo_key(dir).and_then(|key| self.repo(&key));
+        let base = match stored(dir) {
+            Some(repo) => &repo.env,
+            // A listed repo with nothing stored yet has no env of its own.
+            None if dir != home => return ws.env_overrides.clone(),
+            None => &ws.env,
+        };
+        layered_env(base, &ws.env_overrides)
+    }
+
+    /// Entries a TRU-180 build wrote whose `env` copy no longer matches
+    /// what the repo model gives them (the copy was edited by hand), with
+    /// the keys that differ. That copy is only for older builds: tabs get
+    /// the repo's env and `env_overrides`, so edits belong there.
+    pub fn stale_env_copies(&self) -> Vec<(String, Vec<String>)> {
+        self.workspaces
+            .iter()
+            .filter(|ws| ws.home.is_some())
+            .filter_map(|ws| {
+                let repo = self.repo(&ws.repo_key(ws.home_dir())?)?;
+                let layered = layered_env(&repo.env, &ws.env_overrides);
+                let mut keys: Vec<String> = ws
+                    .env
+                    .keys()
+                    .chain(layered.keys())
+                    .filter(|key| ws.env.get(*key) != layered.get(*key))
+                    .cloned()
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                (!keys.is_empty()).then(|| (ws.name.clone(), keys))
+            })
+            .collect()
+    }
+
+    /// `workspaces.json` read fresh from disk with the repo model filled
+    /// in; `None` when absent or unreadable, as `load`.
+    pub fn load_normalized() -> Option<Self> {
+        let mut file = Self::load()?;
+        file.normalize_repos();
+        Some(file)
     }
 
     pub fn load() -> Option<Self> {
