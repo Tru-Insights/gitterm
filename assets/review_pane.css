@@ -43,6 +43,8 @@ button:disabled { cursor: default; opacity: 0.45; }
 #close { background: transparent; border: 1px solid var(--border); border-radius: 5px; padding: 3px 12px; }
 #close:hover { background: var(--bg-hover); }
 .facts { margin-top: 5px; color: var(--fg-muted); font-size: 11.5px; overflow-wrap: anywhere; }
+.focus-note { margin-top: 5px; color: var(--warn); font-size: 12px; overflow-wrap: anywhere; }
+section.file.focused > .fh { box-shadow: inset 3px 0 0 var(--accent); }
 .totals { margin-top: 5px; display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; }
 .tot { display: inline-flex; align-items: center; gap: 5px; }
 .tot.more { color: var(--warn); }

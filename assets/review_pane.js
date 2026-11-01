@@ -137,4 +137,19 @@
   }
 
   applyNoise();
+
+  // Opened from a chat's edit card (TRU-179): jump to that file, open.
+  // Rust sets data-focus only when this view lists the file.
+  const focusPath = body.dataset.focus;
+  if (focusPath) {
+    const section = Array.from(sections).find((s) => s.dataset.path === focusPath);
+    if (section) {
+      section.classList.remove('collapsed');
+      section.classList.add('focused');
+      markCurrent(treeItem(section.dataset.idx));
+      section.scrollIntoView({ block: 'start' });
+    } else {
+      console.warn('[review] focus file is not on the page', focusPath);
+    }
+  }
 })();

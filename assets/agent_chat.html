@@ -173,6 +173,27 @@
     overflow: auto;
   }
   .tool-body pre.err { color: var(--err); }
+  /* Edit, MultiEdit and Write cards: the change as a line diff (TRU-179). */
+  .tool-counts { font-family: var(--mono); font-size: 11.5px; white-space: nowrap; }
+  .tool-counts .ad, .ed-counts .ad { color: var(--user); }
+  .tool-counts .de, .ed-counts .de { color: var(--err); margin-left: 4px; }
+  .tool-review { font-size: 11px; padding: 0 7px; line-height: 17px; border-radius: 4px; align-self: center; }
+  .ed-block { border: 1px solid var(--border); border-radius: 4px; background: var(--bg-alt); overflow: hidden; }
+  .ed-block + .ed-block { margin-top: 6px; }
+  .ed-head { display: flex; gap: 8px; align-items: baseline; padding: 2px 8px; border-bottom: 1px solid var(--border); background: var(--bg-block); font-size: 11px; color: var(--fg-muted); }
+  .ed-head .ed-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ed-counts { font-family: var(--mono); white-space: nowrap; }
+  .ed-lines { font-family: var(--mono); font-size: 12px; line-height: 1.45; max-height: 480px; overflow: auto; }
+  .ed-line { display: flex; white-space: pre-wrap; word-break: break-word; }
+  .ed-sign { flex: none; width: 1.6em; text-align: center; color: var(--fg-muted); user-select: none; }
+  .ed-text { flex: 1; min-width: 0; padding-right: 8px; }
+  .ed-line.add { background: color-mix(in srgb, var(--user) 13%, transparent); }
+  .ed-line.add .ed-sign { color: var(--user); }
+  .ed-line.del { background: color-mix(in srgb, var(--err) 13%, transparent); }
+  .ed-line.del .ed-sign { color: var(--err); }
+  .ed-line.ctx .ed-text { color: var(--fg-muted); }
+  .ed-skip, .ed-note { padding: 1px 8px; font-size: 11px; color: var(--fg-muted); font-style: italic; }
+  .ed-more { display: block; margin: 4px 8px 6px; font-size: 11px; padding: 1px 10px; border-radius: 4px; }
 
   /* Subagent block nested in an Agent tool card */
   details.subagent {
@@ -954,9 +975,9 @@
     const brief = summary.appendChild(el('span', 'tool-brief'));
     const badge = summary.appendChild(el('span', 'tool-badge'));
     const body = d.appendChild(el('div', 'tool-body'));
-    body.appendChild(el('div', 'tool-label', 'Input'));
+    const inputLabel = body.appendChild(el('div', 'tool-label', 'Input'));
     const inputEl = body.appendChild(el('pre'));
-    const item = { card: d, name, brief, badge, body, inputEl, outputEl: null, raw: '', input: kind && kind.input, sub: null };
+    const item = { card: d, name, summary, brief, badge, body, inputLabel, inputEl, outputEl: null, raw: '', input: kind && kind.input, sub: null, edit: null };
     items.set(id, item);
     if (item.input && Object.keys(item.input).length) showInput(item, item.input);
     if (name === 'Agent' || name === 'Task') ensureSubagent(item);
@@ -966,7 +987,186 @@
     item.input = input;
     item.brief.textContent = salient(item.name, input);
     item.inputEl.textContent = JSON.stringify(input, null, 2);
+    showEdit(item, input);
     if (item.sub) renderSubagent(item.sub);
+  }
+
+  // ---- edit diffs (TRU-179) ------------------------------------------------
+  // Edit, MultiEdit and Write cards show the change as a line diff, not
+  // their JSON input. Everything is built with textContent.
+  const DIFF_CONTEXT = 3;     // unchanged lines kept before and after a change
+  const DIFF_LCS_CAP = 400;   // lines per side the LCS takes; past it, all removed then all added
+  const DIFF_COLLAPSE = 40;   // rows shown before "Show all"
+
+  // Lines of `s`; a final newline ends the last line rather than adding an
+  // empty one.
+  function diffLines(s) {
+    if (s === '') return [];
+    const lines = s.split('\n');
+    if (lines[lines.length - 1] === '') lines.pop();
+    return lines;
+  }
+  // The line diff of `a` -> `b`: rows {op: 'ctx' | 'del' | 'add', text}.
+  // The common prefix and suffix are trimmed to DIFF_CONTEXT lines of
+  // context each (`skippedBefore` / `skippedAfter` count the rest); the
+  // middle is an LCS over lines, or all removed then all added when a side
+  // is past DIFF_LCS_CAP lines (`capped`).
+  function lineDiff(a, b) {
+    const A = diffLines(String(a)), B = diffLines(String(b));
+    let pre = 0;
+    while (pre < A.length && pre < B.length && A[pre] === B[pre]) pre++;
+    let suf = 0;
+    while (suf < A.length - pre && suf < B.length - pre && A[A.length - 1 - suf] === B[B.length - 1 - suf]) suf++;
+    const rows = [];
+    const skippedBefore = Math.max(0, pre - DIFF_CONTEXT);
+    for (let i = skippedBefore; i < pre; i++) rows.push({ op: 'ctx', text: A[i] });
+    const midA = A.slice(pre, A.length - suf);
+    const midB = B.slice(pre, B.length - suf);
+    const capped = midA.length > DIFF_LCS_CAP || midB.length > DIFF_LCS_CAP;
+    if (capped || midA.length === 0 || midB.length === 0) {
+      for (const text of midA) rows.push({ op: 'del', text });
+      for (const text of midB) rows.push({ op: 'add', text });
+    } else {
+      // lcs[i * w + j]: LCS length of midA[i:] and midB[j:].
+      const n = midA.length, m = midB.length, w = m + 1;
+      const lcs = new Uint16Array((n + 1) * w);
+      for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+          lcs[i * w + j] = midA[i] === midB[j] ? lcs[(i + 1) * w + j + 1] + 1
+            : Math.max(lcs[(i + 1) * w + j], lcs[i * w + j + 1]);
+        }
+      }
+      let i = 0, j = 0;
+      while (i < n || j < m) {
+        if (i < n && j < m && midA[i] === midB[j]) { rows.push({ op: 'ctx', text: midA[i] }); i++; j++; }
+        else if (j >= m || (i < n && lcs[(i + 1) * w + j] >= lcs[i * w + j + 1])) { rows.push({ op: 'del', text: midA[i] }); i++; }
+        else { rows.push({ op: 'add', text: midB[j] }); j++; }
+      }
+    }
+    const shownAfter = Math.min(suf, DIFF_CONTEXT);
+    for (let k = 0; k < shownAfter; k++) rows.push({ op: 'ctx', text: A[A.length - suf + k] });
+    let added = 0, removed = 0;
+    for (const r of rows) { if (r.op === 'add') added++; else if (r.op === 'del') removed++; }
+    return { rows, added, removed, skippedBefore, skippedAfter: suf - shownAfter, capped };
+  }
+  window.__lineDiff = lineDiff; // for the page's headless checks
+
+  // The edits a card's input describes, or null when it is not a shape
+  // this renders (the JSON stays).
+  function editsOf(name, input) {
+    if (!input || typeof input !== 'object' || typeof input.file_path !== 'string' || !input.file_path) return null;
+    const isEdit = (e) => e && typeof e.old_string === 'string' && typeof e.new_string === 'string';
+    switch (name) {
+      case 'Edit':
+        return isEdit(input) ? [{ old: input.old_string, new: input.new_string, all: input.replace_all === true }] : null;
+      case 'MultiEdit':
+        if (!Array.isArray(input.edits) || !input.edits.length || !input.edits.every(isEdit)) return null;
+        return input.edits.map((e) => ({ old: e.old_string, new: e.new_string, all: e.replace_all === true }));
+      case 'Write':
+        return typeof input.content === 'string' ? [{ old: '', new: input.content, all: false }] : null;
+      default:
+        return null;
+    }
+  }
+  // The chat's working directory, when the page knows it (a Claude tab's
+  // checkout chip).
+  function chatCwd() {
+    const c = chips.checkout;
+    return c && typeof c.path === 'string' && c.path ? c.path.replace(/\/+$/, '') : null;
+  }
+  function displayPath(path) {
+    const cwd = chatCwd();
+    return cwd && path.startsWith(cwd + '/') ? path.slice(cwd.length + 1) : path;
+  }
+  function countsInto(node, added, removed) {
+    node.replaceChildren(el('span', 'ad', '+' + added), el('span', 'de', '−' + removed));
+  }
+  function diffRow(r) {
+    const row = el('div', 'ed-line ' + r.op);
+    // An empty line keeps its height with a zero-width space.
+    row.append(el('span', 'ed-sign', r.op === 'add' ? '+' : r.op === 'del' ? '-' : ' '), el('span', 'ed-text', r.text === '' ? '\u200b' : r.text));
+    return row;
+  }
+  function skipNote(n) { return el('div', 'ed-skip', '⋯ ' + n + ' unchanged line' + (n === 1 ? '' : 's')); }
+  function diffBlock(title, diff) {
+    const block = el('div', 'ed-block');
+    const head = block.appendChild(el('div', 'ed-head'));
+    const titleEl = head.appendChild(el('span', 'ed-title', title));
+    countsInto(head.appendChild(el('span', 'ed-counts')), diff.added, diff.removed);
+    const lines = block.appendChild(el('div', 'ed-lines'));
+    if (diff.skippedBefore) lines.appendChild(skipNote(diff.skippedBefore));
+    const rows = diff.rows;
+    const first = rows.length > DIFF_COLLAPSE ? DIFF_COLLAPSE : rows.length;
+    for (let k = 0; k < first; k++) lines.appendChild(diffRow(rows[k]));
+    const after = diff.skippedAfter ? skipNote(diff.skippedAfter) : null;
+    if (rows.length > first) {
+      const more = block.appendChild(el('button', 'ed-more', 'Show all ' + rows.length + ' lines'));
+      more.type = 'button';
+      more.addEventListener('click', () => {
+        const frag = document.createDocumentFragment();
+        for (let k = first; k < rows.length; k++) frag.appendChild(diffRow(rows[k]));
+        if (after) lines.insertBefore(frag, after); else lines.appendChild(frag);
+        more.remove();
+      });
+    }
+    if (after) lines.appendChild(after);
+    if (!diff.added && !diff.removed) block.appendChild(el('div', 'ed-note', 'No line changes'));
+    if (diff.capped) block.appendChild(el('div', 'ed-note', 'Too long to compare line by line: shown as all removed, then all added'));
+    return { block, titleEl };
+  }
+  function showEdit(item, input) {
+    const edits = editsOf(item.name, input);
+    if (item.edit) {
+      item.edit.view.remove(); item.edit.counts.remove();
+      if (item.edit.review) item.edit.review.remove();
+      item.edit = null;
+    }
+    item.inputLabel.textContent = 'Input';
+    item.inputEl.hidden = false;
+    if (!edits) return;
+    const path = input.file_path;
+    item.brief.textContent = displayPath(path);
+    item.brief.title = path;
+    const view = el('div', 'ed-view');
+    let added = 0, removed = 0, writeTitle = null;
+    edits.forEach((e, k) => {
+      const diff = lineDiff(e.old, e.new);
+      added += diff.added; removed += diff.removed;
+      let title;
+      if (item.name === 'Write') title = 'write';
+      else if (edits.length > 1) title = 'edit ' + (k + 1) + ' of ' + edits.length;
+      else title = 'edit';
+      if (e.all) title += ' · replace all';
+      const { block, titleEl } = diffBlock(title, diff);
+      if (item.name === 'Write') writeTitle = titleEl;
+      view.appendChild(block);
+    });
+    const counts = el('span', 'tool-counts');
+    countsInto(counts, added, removed);
+    item.summary.insertBefore(counts, item.badge);
+    // Opens the TRU-178 review pane on the checkout holding the file
+    // (Rust resolves it from the absolute path).
+    let review = null;
+    if (path.startsWith('/')) {
+      review = el('button', 'tool-review', 'Open in review');
+      review.type = 'button';
+      review.title = 'Open ' + path + ' in the review pane';
+      review.addEventListener('click', (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        postIpc({ type: 'open_review', path });
+      });
+      item.summary.insertBefore(review, item.badge);
+    }
+    item.inputLabel.textContent = 'Changes';
+    item.inputEl.hidden = true;
+    item.inputEl.after(view);
+    item.edit = { view, counts, review, writeTitle };
+    if (item.done != null) markWrite(item);
+  }
+  // A Write's result says whether it made the file.
+  function markWrite(item) {
+    if (!item.edit || !item.edit.writeTitle || item.done.isError) return;
+    item.edit.writeTitle.textContent = /\bcreated\b/i.test(item.done.output || '') ? 'new file' : 'overwrite';
   }
   function itemInputDelta(id, partial) {
     const item = items.get(id);
@@ -986,6 +1186,8 @@
     if (text.length > MAX_TOOL_OUTPUT) text = text.slice(0, MAX_TOOL_OUTPUT) + '\n… (' + (output.length - MAX_TOOL_OUTPUT) + ' more characters)';
     item.outputEl = item.body.appendChild(el('pre', isError ? 'err' : null, text));
     item.badge.textContent = '';
+    item.done = { output: output || '', isError: !!isError };
+    markWrite(item);
     item.card.open = false;
     // A foreground subagent is done when its Agent call returns, even if
     // the harness sent no completion of its own. A background one only

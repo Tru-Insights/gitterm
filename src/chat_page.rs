@@ -136,6 +136,18 @@ mod tests {
     }
 
     #[test]
+    fn page_renders_edit_cards_as_diffs_and_opens_them_in_review() {
+        let html = agent_chat_html();
+        // Edit, MultiEdit and Write; the rest keep their JSON.
+        assert!(html.contains("function lineDiff(a, b)"));
+        assert!(html.contains("function editsOf(name, input)"));
+        // Tool text only ever reaches the page as text.
+        assert!(html.contains("el('span', 'ed-text', r.text === '' ? '\\u200b' : r.text)"));
+        // The card's Open in review posts the absolute path to Rust.
+        assert!(html.contains("postIpc({ type: 'open_review', path });"));
+    }
+
+    #[test]
     fn page_inlines_vendored_renderers() {
         let html = agent_chat_html();
         assert!(!html.contains(AGENT_CHAT_VENDOR_SLOT));
