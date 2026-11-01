@@ -1,10 +1,9 @@
-//! Display order of the bottom workspace bar (TRU-175): work first, repos
-//! after. Inside each machine group the pieces of work (workspaces that
-//! own or claim chats) come first in their existing relative order, then a
-//! `Repos` toggle, then the plain folder workspaces. Collapsing the toggle
-//! hides the folders except the active one, which stays visible after the
-//! toggle. Folding the whole machine group hides every chip but the active
-//! one, as before.
+//! Display order of the bottom workspace bar (TRU-175, TRU-192): this
+//! Mac's work first in its existing relative order, then the `Repos ▾`
+//! menu, then this Mac's folder workspaces when they are shown on the bar.
+//! Other machines' workspaces live in the menu, one section per machine;
+//! the active workspace always stays on the bar, after the folders, so it
+//! never disappears out from under the user.
 //!
 //! This is display order only: `App::workspaces` keeps its order, so
 //! persisted indices and `active_workspace` are untouched. The bar,
@@ -12,7 +11,8 @@
 //! ([`next_attention`]) and the content slide ([`slide_order`]) all read
 //! [`visible_order`], so the nth key, dot and panel is the nth chip.
 
-use std::collections::HashSet;
+/// The machine group key of this Mac's workspaces.
+pub(crate) const LOCAL_GROUP: &str = "local";
 
 /// What the layout needs to know about one workspace, in `App::workspaces`
 /// order.
@@ -22,46 +22,40 @@ pub(crate) struct BarChip {
     pub group: String,
     /// A piece of work rather than a plain folder workspace.
     pub work: bool,
-    /// Parked while it keeps running (TRU-186): off the bar, the slide and
-    /// Ctrl+1-9 entirely, even when pinned.
+    /// Parked while it keeps running (TRU-186): off the bar, the menu, the
+    /// slide and Ctrl+1-9 entirely, even when pinned.
     pub parked: bool,
 }
 
-/// The `Repos` toggle of one machine group: present when the group has
-/// folder workspaces and is not folded.
+/// One machine's section of the `Repos ▾` menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReposToggle {
-    /// Folder workspaces in the group.
-    pub count: usize,
-    pub collapsed: bool,
-    /// Folder workspaces the collapse hides (never the active one).
+pub(crate) struct MachineSection {
+    pub key: String,
+    /// The workspaces the section lists: this Mac's folders, or every
+    /// workspace of another machine, work first.
+    pub workspaces: Vec<usize>,
+}
+
+/// The bar's chips as `App::workspaces` indices, and the `Repos ▾` menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BarLayout {
+    /// Chips before the menu: this Mac's work.
+    pub work: Vec<usize>,
+    /// Chips after the menu: this Mac's folders when they are on the bar,
+    /// then a pinned (active) workspace only the menu would list.
+    pub after: Vec<usize>,
+    /// The menu's sections, this Mac first (always present, maybe empty),
+    /// then the other machines in order of first appearance.
+    pub sections: Vec<MachineSection>,
+    /// Workspaces only the menu shows, never a pinned one: the menu
+    /// button's news dot reads these.
     pub hidden: Vec<usize>,
 }
 
-/// One machine group of the bar, chips as `App::workspaces` indices.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BarGroup {
-    pub key: String,
-    /// Workspaces in the group, shown on a folded machine label.
-    pub size: usize,
-    /// The machine group is folded.
-    pub folded: bool,
-    /// Visible chips before the toggle: the work.
-    pub work: Vec<usize>,
-    pub repos: Option<ReposToggle>,
-    /// Visible chips after the toggle: the folders.
-    pub folders: Vec<usize>,
-}
-
-/// The bar's groups in order of first appearance. `folded_machines` and
-/// `collapsed_repos` hold machine group keys.
-pub(crate) fn bar_layout(
-    chips: &[BarChip],
-    active: usize,
-    folded_machines: &HashSet<String>,
-    collapsed_repos: &HashSet<String>,
-) -> Vec<BarGroup> {
-    layout_pinned(chips, &[active], folded_machines, collapsed_repos)
+/// The bar's layout. `repos_on_bar` shows this Mac's folder workspaces on
+/// the bar as well as in the menu.
+pub(crate) fn bar_layout(chips: &[BarChip], active: usize, repos_on_bar: bool) -> BarLayout {
+    layout_pinned(chips, &[active], repos_on_bar)
 }
 
 /// The content slide's workspaces left to right: the visible order, also
@@ -71,84 +65,132 @@ pub(crate) fn slide_order(
     chips: &[BarChip],
     active: usize,
     from: Option<usize>,
-    folded_machines: &HashSet<String>,
-    collapsed_repos: &HashSet<String>,
+    repos_on_bar: bool,
 ) -> Vec<usize> {
     let pinned: Vec<usize> = std::iter::once(active).chain(from).collect();
-    visible_order(&layout_pinned(
-        chips,
-        &pinned,
-        folded_machines,
-        collapsed_repos,
-    ))
+    visible_order(&layout_pinned(chips, &pinned, repos_on_bar))
 }
 
 /// `bar_layout` where every index in `pinned` stays visible the way the
 /// active workspace does.
-fn layout_pinned(
-    chips: &[BarChip],
-    pinned: &[usize],
-    folded_machines: &HashSet<String>,
-    collapsed_repos: &HashSet<String>,
-) -> Vec<BarGroup> {
-    let mut groups: Vec<BarGroup> = Vec::new();
+fn layout_pinned(chips: &[BarChip], pinned: &[usize], repos_on_bar: bool) -> BarLayout {
+    let mut layout = BarLayout {
+        work: Vec::new(),
+        after: Vec::new(),
+        sections: vec![MachineSection {
+            key: LOCAL_GROUP.to_string(),
+            workspaces: Vec::new(),
+        }],
+        hidden: Vec::new(),
+    };
+    // Other machines list their work first, then their folders.
+    let mut remote_folders: Vec<(String, usize)> = Vec::new();
     for (idx, chip) in chips.iter().enumerate() {
         if chip.parked {
             continue;
         }
-        let pos = match groups.iter().position(|group| group.key == chip.group) {
-            Some(pos) => pos,
-            None => {
-                groups.push(BarGroup {
-                    key: chip.group.clone(),
-                    size: 0,
-                    folded: folded_machines.contains(&chip.group),
-                    work: Vec::new(),
-                    repos: None,
-                    folders: Vec::new(),
-                });
-                groups.len() - 1
-            }
-        };
-        let group = &mut groups[pos];
-        group.size += 1;
-        let is_active = pinned.contains(&idx);
-        if group.folded {
-            if is_active {
-                if chip.work {
-                    group.work.push(idx);
-                } else {
-                    group.folders.push(idx);
-                }
-            }
+        let local = chip.group == LOCAL_GROUP;
+        if local && chip.work {
+            layout.work.push(idx);
             continue;
         }
-        if chip.work {
-            group.work.push(idx);
-            continue;
-        }
-        let toggle = group.repos.get_or_insert_with(|| ReposToggle {
-            count: 0,
-            collapsed: collapsed_repos.contains(&chip.group),
-            hidden: Vec::new(),
-        });
-        toggle.count += 1;
-        if toggle.collapsed && !is_active {
-            toggle.hidden.push(idx);
+        if pinned.contains(&idx) || (local && repos_on_bar) {
+            layout.after.push(idx);
         } else {
-            group.folders.push(idx);
+            layout.hidden.push(idx);
+        }
+        if local || chip.work {
+            section_of(&mut layout.sections, &chip.group)
+                .workspaces
+                .push(idx);
+        } else {
+            section_of(&mut layout.sections, &chip.group);
+            remote_folders.push((chip.group.clone(), idx));
         }
     }
-    groups
+    for (group, idx) in remote_folders {
+        section_of(&mut layout.sections, &group)
+            .workspaces
+            .push(idx);
+    }
+    layout
+}
+
+fn section_of<'a>(sections: &'a mut Vec<MachineSection>, key: &str) -> &'a mut MachineSection {
+    let pos = match sections.iter().position(|section| section.key == key) {
+        Some(pos) => pos,
+        None => {
+            sections.push(MachineSection {
+                key: key.to_string(),
+                workspaces: Vec::new(),
+            });
+            sections.len() - 1
+        }
+    };
+    &mut sections[pos]
 }
 
 /// The visible chips left to right, as `App::workspaces` indices: the
 /// order Ctrl+1-9 follows.
-pub(crate) fn visible_order(groups: &[BarGroup]) -> Vec<usize> {
-    groups
+pub(crate) fn visible_order(layout: &BarLayout) -> Vec<usize> {
+    layout.work.iter().chain(&layout.after).copied().collect()
+}
+
+/// About how many characters an inactive chip's short label keeps.
+pub(crate) const SHORT_LABEL_CHARS: usize = 18;
+
+/// Words a short label drops first.
+const FILLER_WORDS: [&str; 11] = [
+    "from", "and", "the", "for", "of", "with", "a", "an", "to", "in", "&",
+];
+
+/// An inactive chip's label (TRU-192): the name itself when it fits in
+/// [`SHORT_LABEL_CHARS`], otherwise the name without filler words, cut at
+/// a word boundary (or mid-word when the first word alone is too long)
+/// and ended with `…`.
+pub(crate) fn short_label(name: &str) -> String {
+    let name = name.trim();
+    if name.chars().count() <= SHORT_LABEL_CHARS {
+        return name.to_string();
+    }
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let mut kept: Vec<&str> = words
         .iter()
-        .flat_map(|group| group.work.iter().chain(&group.folders).copied())
-        .collect()
+        .copied()
+        .filter(|word| {
+            !FILLER_WORDS
+                .iter()
+                .any(|filler| word.eq_ignore_ascii_case(filler))
+        })
+        .collect();
+    if kept.is_empty() {
+        kept = words;
+    }
+    let joined = kept.join(" ");
+    if joined.chars().count() <= SHORT_LABEL_CHARS {
+        return joined;
+    }
+    // Leave room for the ellipsis.
+    let budget = SHORT_LABEL_CHARS - 1;
+    let mut cut = String::new();
+    for word in &kept {
+        let len = cut.chars().count() + usize::from(!cut.is_empty()) + word.chars().count();
+        if len > budget {
+            break;
+        }
+        if !cut.is_empty() {
+            cut.push(' ');
+        }
+        cut.push_str(word);
+    }
+    // A word boundary that keeps less than half the budget reads worse
+    // than a cut word.
+    if cut.chars().count() < budget / 2 {
+        cut = joined.chars().take(budget).collect::<String>();
+        cut.truncate(cut.trim_end().len());
+    }
+    cut.push('\u{2026}');
+    cut
 }
 
 /// The next tab needing attention after the active one, as (workspace,
@@ -198,8 +240,15 @@ mod tests {
         }
     }
 
+    fn section(key: &str, workspaces: &[usize]) -> MachineSection {
+        MachineSection {
+            key: key.to_string(),
+            workspaces: workspaces.to_vec(),
+        }
+    }
+
     #[test]
-    fn a_running_parked_workspace_is_off_the_bar_and_the_slide() {
+    fn a_running_parked_workspace_is_off_the_bar_the_menu_and_the_slide() {
         let mut chips = [
             chip("local", true),
             chip("local", true),
@@ -207,21 +256,18 @@ mod tests {
         ];
         chips[1].parked = true;
         chips[2].parked = true;
-        let groups = bar_layout(&chips, 0, &set(&[]), &set(&[]));
-        // A group whose only chips are parked is not shown at all.
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].size, 1);
-        assert_eq!(visible_order(&groups), [0]);
+        let layout = bar_layout(&chips, 0, true);
+        // A machine whose only workspaces are parked has no section.
+        assert_eq!(layout.sections, [section("local", &[])]);
+        assert!(layout.hidden.is_empty());
+        assert_eq!(visible_order(&layout), [0]);
         // Even pinned (active or a slide's start), it stays off.
-        assert_eq!(slide_order(&chips, 0, Some(1), &set(&[]), &set(&[])), [0]);
-    }
-
-    fn set(keys: &[&str]) -> HashSet<String> {
-        keys.iter().map(|key| key.to_string()).collect()
+        assert_eq!(slide_order(&chips, 0, Some(1), true), [0]);
+        assert_eq!(slide_order(&chips, 0, Some(2), true), [0]);
     }
 
     #[test]
-    fn work_comes_before_folders_in_relative_order() {
+    fn work_comes_first_then_the_folders_on_the_bar() {
         // folder-a, work-x, folder-b, work-y on this mac.
         let chips = [
             chip("local", false),
@@ -229,53 +275,48 @@ mod tests {
             chip("local", false),
             chip("local", true),
         ];
-        let groups = bar_layout(&chips, 0, &set(&[]), &set(&[]));
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].work, [1, 3]);
-        assert_eq!(groups[0].folders, [0, 2]);
-        assert_eq!(
-            groups[0].repos,
-            Some(ReposToggle {
-                count: 2,
-                collapsed: false,
-                hidden: Vec::new(),
-            })
-        );
-        assert_eq!(visible_order(&groups), [1, 3, 0, 2]);
+        let layout = bar_layout(&chips, 0, true);
+        assert_eq!(layout.work, [1, 3]);
+        assert_eq!(layout.after, [0, 2]);
+        assert!(layout.hidden.is_empty());
+        // The menu lists this Mac's folders, not its work.
+        assert_eq!(layout.sections, [section("local", &[0, 2])]);
+        assert_eq!(visible_order(&layout), [1, 3, 0, 2]);
     }
 
     #[test]
-    fn collapsed_repos_keep_the_active_folder_visible() {
+    fn repos_off_the_bar_keep_the_active_folder_visible() {
         let chips = [
             chip("local", false),
             chip("local", true),
             chip("local", false),
             chip("local", false),
         ];
-        let groups = bar_layout(&chips, 2, &set(&[]), &set(&["local"]));
-        let toggle = groups[0].repos.as_ref().unwrap();
-        assert!(toggle.collapsed);
-        assert_eq!(toggle.count, 3);
-        assert_eq!(toggle.hidden, [0, 3]);
-        assert_eq!(groups[0].folders, [2]);
-        assert_eq!(visible_order(&groups), [1, 2]);
+        let layout = bar_layout(&chips, 2, false);
+        assert_eq!(layout.after, [2]);
+        assert_eq!(layout.hidden, [0, 3]);
+        assert_eq!(layout.sections, [section("local", &[0, 2, 3])]);
+        assert_eq!(visible_order(&layout), [1, 2]);
 
         // With work active, every folder hides.
-        let groups = bar_layout(&chips, 1, &set(&[]), &set(&["local"]));
-        assert_eq!(groups[0].repos.as_ref().unwrap().hidden, [0, 2, 3]);
-        assert_eq!(visible_order(&groups), [1]);
+        let layout = bar_layout(&chips, 1, false);
+        assert_eq!(layout.hidden, [0, 2, 3]);
+        assert_eq!(visible_order(&layout), [1]);
     }
 
     #[test]
-    fn groups_without_folders_have_no_toggle() {
+    fn this_mac_always_has_a_menu_section() {
         let chips = [chip("local", true), chip("local", true)];
-        let groups = bar_layout(&chips, 0, &set(&[]), &set(&["local"]));
-        assert_eq!(groups[0].repos, None);
-        assert_eq!(visible_order(&groups), [0, 1]);
+        let layout = bar_layout(&chips, 0, false);
+        assert_eq!(layout.sections, [section("local", &[])]);
+        assert_eq!(visible_order(&layout), [0, 1]);
+        let layout = bar_layout(&[], 0, true);
+        assert_eq!(layout.sections, [section("local", &[])]);
+        assert!(visible_order(&layout).is_empty());
     }
 
     #[test]
-    fn each_machine_group_orders_and_collapses_on_its_own() {
+    fn other_machines_live_in_the_menu_one_section_each() {
         // Vec order is machine-normalized: this mac, then two remotes.
         let chips = [
             chip("local", false),
@@ -286,39 +327,26 @@ mod tests {
             chip("agent:box-two", false),
             chip("agent:box-two", true),
         ];
-        let groups = bar_layout(&chips, 4, &set(&[]), &set(&["agent:box-one"]));
-        let keys: Vec<&str> = groups.iter().map(|group| group.key.as_str()).collect();
-        assert_eq!(keys, ["local", "agent:box-one", "agent:box-two"]);
-        assert_eq!(groups[0].folders, [0]);
-        assert_eq!(groups[1].repos.as_ref().unwrap().hidden, [2]);
-        assert_eq!(groups[1].folders, [4]);
-        assert!(!groups[2].repos.as_ref().unwrap().collapsed);
-        assert_eq!(visible_order(&groups), [1, 0, 3, 4, 6, 5]);
+        let layout = bar_layout(&chips, 1, true);
         assert_eq!(
-            groups.iter().map(|group| group.size).collect::<Vec<_>>(),
-            [2, 3, 2]
+            layout.sections,
+            [
+                section("local", &[0]),
+                // Work first, then folders.
+                section("agent:box-one", &[3, 2, 4]),
+                section("agent:box-two", &[6, 5]),
+            ]
         );
-    }
+        assert_eq!(layout.hidden, [2, 3, 4, 5, 6]);
+        assert_eq!(visible_order(&layout), [1, 0]);
 
-    #[test]
-    fn a_folded_machine_shows_only_its_active_chip_and_no_toggle() {
-        let chips = [
-            chip("local", true),
-            chip("agent:box-one", true),
-            chip("agent:box-one", false),
-            chip("agent:box-one", false),
-        ];
-        let groups = bar_layout(&chips, 3, &set(&["agent:box-one"]), &set(&[]));
-        assert!(groups[1].folded);
-        assert_eq!(groups[1].repos, None);
-        assert!(groups[1].work.is_empty());
-        assert_eq!(groups[1].folders, [3]);
-        assert_eq!(groups[1].size, 3);
-        assert_eq!(visible_order(&groups), [0, 3]);
-
-        // Active elsewhere: the folded group shows no chips.
-        let groups = bar_layout(&chips, 0, &set(&["agent:box-one"]), &set(&[]));
-        assert_eq!(visible_order(&groups), [0]);
+        // The active remote workspace stays on the bar, after the folders,
+        // and is still listed in its section.
+        let layout = bar_layout(&chips, 4, true);
+        assert_eq!(layout.after, [0, 4]);
+        assert_eq!(layout.hidden, [2, 3, 5, 6]);
+        assert_eq!(layout.sections[1], section("agent:box-one", &[3, 2, 4]));
+        assert_eq!(visible_order(&layout), [1, 0, 4]);
     }
 
     #[test]
@@ -329,24 +357,57 @@ mod tests {
             chip("local", false),
             chip("agent:box-one", true),
         ];
-        let collapsed = set(&["local"]);
         // Settled on hidden folder 2: it shows after the work.
+        assert_eq!(slide_order(&chips, 2, None, false), [1, 2]);
+        // Sliding from 2 to the remote 3: 2 stays in place until the
+        // slide settles.
+        assert_eq!(slide_order(&chips, 3, Some(2), false), [1, 2, 3]);
+        // Settled on 3: the hidden folders leave the slide.
+        assert_eq!(slide_order(&chips, 3, None, false), [1, 3]);
+        // Sliding to a hidden folder from the remote: both stay visible.
+        assert_eq!(slide_order(&chips, 0, Some(3), false), [1, 0, 3]);
+    }
+
+    #[test]
+    fn short_labels_keep_short_names_and_shorten_long_ones() {
+        // Fits: unchanged, filler words and all.
+        assert_eq!(short_label("Fixes for the app"), "Fixes for the app");
+        assert_eq!(short_label("  api  "), "api");
+        // Dropping filler words is enough.
+        assert_eq!(short_label("Docs and the release"), "Docs release");
+        // Otherwise cut at a word boundary, with an ellipsis.
         assert_eq!(
-            slide_order(&chips, 2, None, &set(&[]), &collapsed),
-            [1, 2, 3]
+            short_label("Scanner sizing migration from legacy hosts"),
+            "Scanner sizing\u{2026}"
         );
-        // Sliding from 2 to 3: 2 stays in place until the slide settles.
         assert_eq!(
-            slide_order(&chips, 3, Some(2), &set(&[]), &collapsed),
-            [1, 2, 3]
+            short_label("Invoicing fixes and enhancements"),
+            "Invoicing fixes\u{2026}"
         );
-        // Settled on 3: the collapsed folders leave the slide.
-        assert_eq!(slide_order(&chips, 3, None, &set(&[]), &collapsed), [1, 3]);
-        // Sliding to a hidden folder from work: both stay visible.
+        // Filler words are matched whole and in any case.
         assert_eq!(
-            slide_order(&chips, 0, Some(3), &set(&[]), &collapsed),
-            [1, 0, 3]
+            short_label("The Andes FOR offline maps"),
+            "Andes offline maps"
         );
+        // A first word too long for the budget is cut mid-word.
+        assert_eq!(
+            short_label("Internationalisation rollout"),
+            "Internationalisat\u{2026}"
+        );
+        // A name of filler words only keeps them.
+        let fillers = short_label("the and for of with from a an to");
+        assert!(fillers.ends_with('\u{2026}'), "{fillers}");
+        // Every derived label fits.
+        for name in [
+            "Scanner sizing migration from legacy hosts",
+            "the and for of with from a an to",
+            "\u{dc}n\u{ef}c\u{f6}d\u{e9} w\u{f6}rkspace with a very long name",
+            "a b c d e f g h i j k l m n o p q r s t",
+            "Internationalisation rollout",
+        ] {
+            let label = short_label(name);
+            assert!(label.chars().count() <= SHORT_LABEL_CHARS, "{label}");
+        }
     }
 
     #[test]

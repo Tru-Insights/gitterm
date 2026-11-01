@@ -6702,13 +6702,14 @@ pub enum Event {
     ChatOverviewGo(chat_overview::NavTarget),
     /// Fold or unfold the overview's "Idle but open" section.
     ToggleChatOverviewIdle,
-    /// Fold/unfold one machine group in the workspace bar.
-    ToggleMachineGroup(String),
-    /// The bar's `Repos` toggle of a machine group (TRU-175).
+    /// Show or hide a machine group's folder workspaces on the bar
+    /// (TRU-175); from the `Repos ▾` menu since TRU-192.
     ToggleReposZone(String),
-    /// Open/close the machine label menu in the workspace bar.
-    MachineMenuOpen(String),
-    MachineMenuClose,
+    /// Open or close one of the workspace bar's menus (TRU-192).
+    BarMenuToggle(BarMenu),
+    BarMenuClose,
+    /// A bar menu item: closes the menu, then runs the event.
+    BarMenuRun(Box<Event>),
     /// Jump the Chats panel to one machine's conversations.
     ShowMachineChats(String),
     /// Force a reconnect attempt to a remote agent.
@@ -6788,6 +6789,15 @@ enum BrowserAction {
     Opening,
     Focusing,
     Disconnecting,
+}
+
+/// The workspace bar's menus (TRU-192), anchored above the bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarMenu {
+    /// `Repos ▾`: this Mac's folder workspaces and a section per machine.
+    Repos,
+    /// `⋯`: help and the browser's less common actions.
+    More,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7094,13 +7104,12 @@ struct App {
     chat_backfill_note: Option<String>,
     /// The Chats panel's Open section is folded (TRU-148); per app run.
     chat_open_section_collapsed: bool,
-    /// Workspace-bar machine groups the user folded (session-only).
-    collapsed_machine_groups: std::collections::HashSet<String>,
-    /// Machine groups whose `Repos` zone on the bar is collapsed (TRU-175);
-    /// persisted in workspaces.json.
+    /// Machine groups whose folder workspaces are off the bar (TRU-175);
+    /// persisted in workspaces.json. Since TRU-192 only this Mac's key
+    /// matters: other machines always live in the `Repos ▾` menu.
     collapsed_repo_groups: std::collections::HashSet<String>,
-    /// Machine label menu open in the workspace bar (group key).
-    machine_menu: Option<String>,
+    /// The workspace bar menu that is open (TRU-192).
+    bar_menu: Option<BarMenu>,
     /// Per-remote chat indexes (TRU-78 slice 4), keyed by remote id.
     /// Kept when a machine becomes unreachable so Everywhere still shows
     /// its (stale) chats.
@@ -11841,13 +11850,21 @@ impl App {
             .collect()
     }
 
-    /// The bar's machine groups and chips in display order (TRU-175).
-    fn workspace_bar_layout(&self) -> Vec<workspace_bar::BarGroup> {
+    /// This Mac's folder workspaces are shown on the bar, not only in the
+    /// `Repos ▾` menu.
+    fn repos_on_bar(&self) -> bool {
+        !self
+            .collapsed_repo_groups
+            .contains(workspace_bar::LOCAL_GROUP)
+    }
+
+    /// The bar's chips in display order and the `Repos ▾` menu (TRU-175,
+    /// TRU-192).
+    fn workspace_bar_layout(&self) -> workspace_bar::BarLayout {
         workspace_bar::bar_layout(
             &self.workspace_bar_chips(),
             self.active_workspace_idx,
-            &self.collapsed_machine_groups,
-            &self.collapsed_repo_groups,
+            self.repos_on_bar(),
         )
     }
 
@@ -11873,8 +11890,7 @@ impl App {
             &self.workspace_bar_chips(),
             self.active_workspace_idx,
             from,
-            &self.collapsed_machine_groups,
-            &self.collapsed_repo_groups,
+            self.repos_on_bar(),
         )
     }
 
@@ -12290,7 +12306,7 @@ impl App {
         } else {
             String::new()
         };
-        self.machine_menu = None;
+        self.bar_menu = None;
         self.parked_list_open = false;
         self.park_sheet = Some(ParkSheet {
             uid,
@@ -14972,7 +14988,7 @@ impl App {
         purpose: FolderPickerPurpose,
         remote_id: Option<String>,
     ) -> Task<Event> {
-        self.machine_menu = None;
+        self.bar_menu = None;
         self.folder_picker = Some(FolderPicker {
             purpose,
             remote_id: None,
@@ -17263,9 +17279,8 @@ impl App {
             chat_backfill_running: false,
             chat_backfill_note: None,
             chat_open_section_collapsed: false,
-            collapsed_machine_groups: std::collections::HashSet::new(),
             collapsed_repo_groups: std::collections::HashSet::new(),
-            machine_menu: None,
+            bar_menu: None,
             remote_chat_indexes: HashMap::new(),
             remote_running_chats: HashMap::new(),
             remote_running_chats_revision: 0,
@@ -23517,12 +23532,11 @@ fi
                     return self.close_folder_picker();
                 }
 
-                // Machine menu: Escape closes
-                if self.machine_menu.is_some()
-                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                // A bar menu: Escape closes
+                if self.bar_menu.is_some() && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
-                    self.machine_menu = None;
-                    return Task::none();
+                    self.bar_menu = None;
+                    return self.apply_webview_surfaces();
                 }
 
                 // Tab picker: Escape closes
@@ -25874,12 +25888,6 @@ fi
                     }
                 }
             }
-            Event::ToggleMachineGroup(key) => {
-                self.machine_menu = None;
-                if !self.collapsed_machine_groups.remove(&key) {
-                    self.collapsed_machine_groups.insert(key);
-                }
-            }
             Event::ToggleReposZone(key) => {
                 if !self.collapsed_repo_groups.remove(&key) {
                     self.collapsed_repo_groups.insert(key);
@@ -25887,18 +25895,21 @@ fi
                 self.mark_workspaces_dirty();
                 return self.scroll_to_active_workspace_bar();
             }
-            Event::MachineMenuOpen(key) => {
-                self.machine_menu = if self.machine_menu.as_deref() == Some(key.as_str()) {
-                    None
-                } else {
-                    Some(key)
-                };
+            Event::BarMenuToggle(menu) => {
+                self.bar_menu = (self.bar_menu != Some(menu)).then_some(menu);
+                return self.apply_webview_surfaces();
             }
-            Event::MachineMenuClose => {
-                self.machine_menu = None;
+            Event::BarMenuClose => {
+                self.bar_menu = None;
+                return self.apply_webview_surfaces();
+            }
+            Event::BarMenuRun(event) => {
+                self.bar_menu = None;
+                let task = self.update(*event);
+                return Task::batch([task, self.apply_webview_surfaces()]);
             }
             Event::ShowMachineChats(key) => {
-                self.machine_menu = None;
+                self.bar_menu = None;
                 // Everywhere scope with only that machine's section open.
                 let machine = match key.split_once(':') {
                     Some(("agent", remote_id)) => remote_id.to_string(),
@@ -25910,11 +25921,16 @@ fi
                 return self.update(Event::SetSidebarMode(SidebarMode::Chats));
             }
             Event::MachineReconnect(key) => {
-                self.machine_menu = None;
+                self.bar_menu = None;
+                let surfaces = self.apply_webview_surfaces();
                 if let Some(("agent", remote_id)) = key.split_once(':') {
                     let remote_id = remote_id.to_string();
-                    return self.ensure_remote_agent_connection(&remote_id, true);
+                    return Task::batch([
+                        surfaces,
+                        self.ensure_remote_agent_connection(&remote_id, true),
+                    ]);
                 }
+                return surfaces;
             }
             Event::ToggleChatMachine(key) => {
                 if !self.chat_expanded_machines.remove(&key) {
@@ -26144,7 +26160,7 @@ fi
                 return self.focus_main_terminal();
             }
             Event::NewWorkOpen => {
-                self.machine_menu = None;
+                self.bar_menu = None;
                 let close = self.close_folder_picker();
                 self.new_work_form = Some(NewWorkForm::default());
                 return Task::batch([
@@ -27158,7 +27174,7 @@ fi
             Event::ParkedListToggle => {
                 self.parked_list_open = !self.parked_list_open;
                 if self.parked_list_open {
-                    self.machine_menu = None;
+                    self.bar_menu = None;
                 }
                 return self.apply_webview_surfaces();
             }
@@ -27207,7 +27223,7 @@ fi
                 return self.submit_remote_connect_form();
             }
             Event::PhonePanelOpen(remote_id) => {
-                self.machine_menu = None;
+                self.bar_menu = None;
                 let machine_name = self
                     .remote_agent_config_by_id(&remote_id)
                     .map(|agent| agent.name.clone())
@@ -27827,6 +27843,7 @@ fi
             || self.parked_list_open
             || self.prs.action.is_some()
             || self.prs.ready_open
+            || self.bar_menu.is_some()
     }
 
     fn visible_webview_surface(&self) -> VisibleSurface {
@@ -28213,11 +28230,12 @@ fi
         };
         let width = (self.window_size.0 - x).max(100.0);
 
-        // Subtract console panel height + workspace bar (reserved at the bottom)
+        // Subtract console panel height + workspace bar (reserved at the
+        // bottom). A folded panel takes no room (TRU-192).
         let console_h = if self.console_expanded {
             self.console_height + CONSOLE_DIVIDER_HEIGHT
         } else {
-            CONSOLE_HEADER_HEIGHT
+            0.0
         };
 
         // wry child-WebView coordinates behave bottom-origin on macOS in this app.
@@ -28930,10 +28948,10 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
-        } else if self.machine_menu.is_some() {
+        } else if self.bar_menu.is_some() {
             Stack::new()
                 .push(main_view)
-                .push(self.view_machine_menu())
+                .push(self.view_bar_menu())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -31192,299 +31210,6 @@ fi
         .into()
     }
 
-    fn machine_group_separator(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let sep_color = self.theme.surface1();
-        container(iced::widget::Space::new().width(0).height(0))
-            .width(Length::Fixed(1.0))
-            .height(Length::Fixed(20.0))
-            .style(move |_| container::Style {
-                background: Some(sep_color.into()),
-                ..Default::default()
-            })
-            .into()
-    }
-
-    /// Machine label chip: name, reachability, click to fold/unfold.
-    fn machine_group_label(
-        &self,
-        key: &str,
-        count: usize,
-        collapsed: bool,
-    ) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let (name, status) = match key.split_once(':') {
-            None => ("this mac".to_string(), None),
-            Some(("agent", remote_id)) => {
-                let name = self
-                    .remote_agent_config_by_id(remote_id)
-                    .map(|agent| agent.name.clone())
-                    .unwrap_or_else(|| remote_id.to_string());
-                let status = match self
-                    .remote_agent_connections
-                    .get(remote_id)
-                    .map(|c| &c.status)
-                {
-                    Some(RemoteAgentConnectionStatus::Connected(_)) => ("●", theme.green()),
-                    Some(RemoteAgentConnectionStatus::Connecting) => ("◐", theme.yellow()),
-                    Some(RemoteAgentConnectionStatus::Error(_)) => ("○", theme.red()),
-                    _ => ("○", theme.text_muted()),
-                };
-                (name, Some(status))
-            }
-            Some(("ssh", host)) => (host.to_string(), None),
-            Some((_, rest)) => (rest.to_string(), None),
-        };
-        let label_color = if key == "local" {
-            theme.text_secondary()
-        } else {
-            theme.accent()
-        };
-        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center);
-        if collapsed {
-            content = content.push(text("▸").size(9).color(theme.text_muted()));
-        }
-        content = content.push(
-            text(name.to_uppercase())
-                .size(9)
-                .color(label_color)
-                .font(iced::Font::with_name("Menlo")),
-        );
-        if let Some((glyph, color)) = status {
-            content = content.push(text(glyph).size(9).color(color));
-        }
-        if collapsed && count > 0 {
-            content = content.push(
-                text(format!("×{count}"))
-                    .size(9)
-                    .color(theme.text_muted())
-                    .font(iced::Font::with_name("Menlo")),
-            );
-        }
-        let hover_bg = theme.surface0();
-        button(content)
-            .style(move |_theme, status| button::Style {
-                background: Some(
-                    if matches!(status, button::Status::Hovered) {
-                        hover_bg
-                    } else {
-                        iced::Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                border: iced::Border {
-                    radius: 5.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .padding([4, 8])
-            .on_press(Event::MachineMenuOpen(key.to_string()))
-            .into()
-    }
-
-    /// Machine-scoped "+": opens the folder picker on that machine (local
-    /// or remote agent). Legacy ssh groups get none.
-    fn machine_group_plus(&self, key: &str) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
-        let event = match key.split_once(':') {
-            None => Event::WorkspaceCreateLocal,
-            Some(("agent", remote_id)) => Event::RemoteWorkspaceBrowse(remote_id.to_string()),
-            _ => return None,
-        };
-        let color = self.theme.text_muted();
-        let hover = self.theme.text_secondary();
-        Some(
-            button(
-                text("+")
-                    .size(12)
-                    .color(color)
-                    .font(iced::Font::with_name("Menlo")),
-            )
-            .style(move |_theme, status| button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                text_color: if matches!(status, button::Status::Hovered) {
-                    hover
-                } else {
-                    color
-                },
-                ..Default::default()
-            })
-            .padding([2, 6])
-            .on_press(event)
-            .into(),
-        )
-    }
-
-    /// The machine label menu: fold, new workspace, chats, reconnect.
-    /// Anchored above the bar (bottom-center card over a click-away
-    /// backdrop), following the app's modal overlay pattern.
-    fn view_machine_menu(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let Some(key) = self.machine_menu.clone() else {
-            return iced::widget::Space::new().into();
-        };
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-
-        let (name, is_agent, connected) = match key.split_once(':') {
-            Some(("agent", remote_id)) => {
-                let name = self
-                    .remote_agent_config_by_id(remote_id)
-                    .map(|agent| agent.name.clone())
-                    .unwrap_or_else(|| remote_id.to_string());
-                let connected = matches!(
-                    self.remote_agent_connections
-                        .get(remote_id)
-                        .map(|c| &c.status),
-                    Some(RemoteAgentConnectionStatus::Connected(_))
-                );
-                (name, true, connected)
-            }
-            Some(("ssh", host)) => (host.to_string(), false, true),
-            _ => ("this mac".to_string(), false, true),
-        };
-        let ws_count = self
-            .workspaces
-            .iter()
-            .filter(|ws| self.machine_group_key(ws) == key)
-            .count();
-        let folded = self.collapsed_machine_groups.contains(&key);
-
-        let item = |label: String, event: Event| {
-            let hover_bg = theme.surface0();
-            let color = theme.text_secondary();
-            let hover_color = theme.text_primary();
-            button(text(label).size(font))
-                .style(move |_theme, status| {
-                    let hovered = matches!(status, button::Status::Hovered);
-                    button::Style {
-                        background: Some(
-                            if hovered {
-                                hover_bg
-                            } else {
-                                iced::Color::TRANSPARENT
-                            }
-                            .into(),
-                        ),
-                        text_color: if hovered { hover_color } else { color },
-                        border: iced::Border {
-                            radius: 5.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }
-                })
-                .padding([6, 10])
-                .width(Length::Fill)
-                .on_press(event)
-        };
-
-        let mut card_col = Column::new().spacing(2).push(
-            text(format!(
-                "{} · {} workspace{}{}",
-                name.to_uppercase(),
-                ws_count,
-                if ws_count == 1 { "" } else { "s" },
-                if is_agent {
-                    if connected {
-                        " · ● connected"
-                    } else {
-                        " · ○ not connected"
-                    }
-                } else {
-                    ""
-                }
-            ))
-            .size(font_small - 1.0)
-            .color(theme.text_secondary()),
-        );
-        card_col = card_col.push(item(
-            if folded {
-                "Unfold workspaces".to_string()
-            } else {
-                "Fold workspaces".to_string()
-            },
-            Event::ToggleMachineGroup(key.clone()),
-        ));
-        if key == "local" {
-            card_col = card_col.push(item(
-                "New workspace on this mac…".to_string(),
-                Event::WorkspaceCreateLocal,
-            ));
-            card_col = card_col.push(item(
-                "New workspace, no repo…".to_string(),
-                Event::NewWorkOpen,
-            ));
-        } else if let Some(("agent", remote_id)) = key.split_once(':') {
-            card_col = card_col.push(item(
-                format!("New workspace on {name}…"),
-                Event::RemoteWorkspaceBrowse(remote_id.to_string()),
-            ));
-        }
-        card_col = card_col.push(item(
-            format!("Show {name} chats"),
-            Event::ShowMachineChats(key.clone()),
-        ));
-        if is_agent && !connected {
-            card_col = card_col.push(item(
-                "Reconnect…".to_string(),
-                Event::MachineReconnect(key.clone()),
-            ));
-        }
-        if let Some(("agent", remote_id)) = key.split_once(':') {
-            if self.remote_serves_phones(remote_id) {
-                card_col = card_col.push(item(
-                    "Pair a phone…".to_string(),
-                    Event::PhonePanelOpen(remote_id.to_string()),
-                ));
-            }
-        }
-
-        let card_bg = theme.bg_surface();
-        let card_border = theme.surface1();
-        let card = container(card_col.width(Length::Fixed(260.0)))
-            .style(move |_| container::Style {
-                background: Some(card_bg.into()),
-                border: iced::Border {
-                    color: card_border,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                shadow: iced::Shadow {
-                    color: iced::Color::BLACK,
-                    offset: iced::Vector::new(0.0, 6.0),
-                    blur_radius: 16.0,
-                },
-                ..Default::default()
-            })
-            .padding(8);
-
-        let backdrop = iced::widget::mouse_area(
-            container(iced::widget::Space::new())
-                .width(Length::Fill)
-                .height(Length::Fill),
-        )
-        .on_press(Event::MachineMenuClose);
-
-        Stack::new()
-            .push(backdrop)
-            .push(
-                container(card)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .align_bottom(Length::Fill)
-                    .padding(iced::Padding {
-                        top: 0.0,
-                        right: 0.0,
-                        bottom: 46.0,
-                        left: 0.0,
-                    }),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-
     fn view_browser_evidence(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let selected = paired_browser_evidence(&self.browser_telemetry.evidence);
         let Some(evidence) = selected.last().copied() else {
@@ -31754,49 +31479,16 @@ fi
             .into()
     }
 
-    fn browser_bar_button(
-        &self,
-        label: &'static str,
-        color: iced::Color,
-        event: Event,
-    ) -> Element<'_, Event, Theme, iced::Renderer> {
-        let hover_bg = self.theme.surface1();
-        let border_color = self.theme.surface2();
-        button(
-            text(label)
-                .size(9)
-                .color(color)
-                .font(iced::Font::with_name("Menlo")),
-        )
-        .style(move |_theme, status| button::Style {
-            background: matches!(status, button::Status::Hovered | button::Status::Pressed)
-                .then_some(hover_bg.into()),
-            text_color: color,
-            border: iced::Border {
-                color: border_color,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            ..Default::default()
-        })
-        .padding([2, 6])
-        .on_press(event)
-        .into()
-    }
-
-    fn view_browser_controls(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+    /// The browser's status for the bar icon's hover (TRU-192): its colour
+    /// and whether an agent is driving it right now.
+    fn browser_status(&self) -> (BrowserBarState, String, iced::Color, bool) {
         let state = browser_bar_state(
             self.browser_mcp.is_some(),
             self.browser_status.as_ref(),
             self.browser_action,
             self.browser_error.as_deref(),
         );
-        let is_running = self
-            .browser_status
-            .as_ref()
-            .is_some_and(|status| status.state == BrowserState::Running);
-
-        let (mut label, mut dot_color) = match state {
+        let (mut label, mut color) = match state {
             BrowserBarState::Unavailable => (
                 self.browser_error.as_deref().map_or_else(
                     || "Browser unavailable".to_string(),
@@ -31827,103 +31519,167 @@ fi
                 self.theme.danger(),
             ),
         };
-
+        let mut driving = false;
         if self.browser_action.is_none()
             && !matches!(state, BrowserBarState::Unavailable | BrowserBarState::Error)
         {
             if let Some(activity) = &self.browser_telemetry.active_agent_operation {
                 label = format!("Agent · {}", activity.operation.active_label());
-                dot_color = self.theme.mauve();
+                color = self.theme.mauve();
+                driving = true;
             } else if let Some(outcome) = &self.browser_telemetry.last_agent_operation {
                 let elapsed = outcome.finished_at.elapsed().unwrap_or_default();
                 if outcome.error.is_some() && elapsed <= Duration::from_secs(8) {
                     label = format!("Agent · {} failed", outcome.operation.active_label());
-                    dot_color = self.theme.danger();
+                    color = self.theme.danger();
                 } else if outcome.error.is_none() && elapsed <= Duration::from_secs(2) {
                     label = format!("Agent · {}", outcome.operation.completed_label());
-                    dot_color = self.theme.success();
+                    color = self.theme.success();
                 }
             }
         }
+        (state, label, color, driving)
+    }
 
-        let dot = container(iced::widget::Space::new().width(0).height(0))
-            .width(Length::Fixed(6.0))
-            .height(Length::Fixed(6.0))
-            .style(move |_| container::Style {
-                background: Some(dot_color.into()),
-                border: iced::Border {
-                    radius: 3.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-        let label_color = if matches!(state, BrowserBarState::Error | BrowserBarState::Unavailable)
-        {
-            self.theme.danger()
-        } else {
-            self.theme.text_secondary()
-        };
-        let mut content = Row::new()
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .push(dot)
-            .push(
-                text(label)
-                    .size(10)
-                    .color(label_color)
-                    .font(iced::Font::with_name("Menlo")),
-            );
-
-        if !matches!(
-            state,
-            BrowserBarState::Busy(_) | BrowserBarState::Unavailable
-        ) {
-            if is_running {
-                content = content
-                    .push(self.browser_bar_button(
-                        "Focus",
-                        self.theme.accent(),
-                        Event::BrowserFocus,
-                    ))
-                    .push(self.browser_bar_button(
-                        "Disconnect",
-                        self.theme.danger(),
-                        Event::BrowserDisconnect,
-                    ));
-            } else {
-                content = content.push(self.browser_bar_button(
-                    "Open",
-                    self.theme.accent(),
-                    Event::BrowserOpen,
-                ));
-            }
-        }
-        if self.browser_telemetry.latest_evidence.is_some() {
-            content = content.push(self.browser_bar_button(
-                "Evidence",
-                self.theme.mauve(),
-                Event::BrowserEvidenceOpen,
-            ));
-        }
-
-        let background = self.theme.surface0();
-        let border_color = self.theme.surface1();
-        container(content)
-            .padding([3, 7])
-            .style(move |_| container::Style {
-                background: Some(background.into()),
-                border: iced::Border {
-                    color: border_color,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                ..Default::default()
-            })
+    /// A one-line hover label beside a bar item. Beside, not above: with
+    /// the terminal panel folded a chat page sits right on top of the bar
+    /// and would cover anything drawn above it.
+    fn bar_tooltip<'a>(
+        &self,
+        content: impl Into<Element<'a, Event, Theme, iced::Renderer>>,
+        tip: String,
+        position: iced::widget::tooltip::Position,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let tip = self.rail_tooltip(
+            text(tip)
+                .size(10)
+                .color(self.theme.text_primary())
+                .font(iced::Font::with_name("Menlo")),
+        );
+        iced::widget::tooltip(content, tip, position)
+            .gap(4.0)
             .into()
     }
 
+    /// A small text button on the bar.
+    fn bar_text_button(
+        &self,
+        label: String,
+        color: iced::Color,
+        event: Option<Event>,
+    ) -> button::Button<'_, Event, Theme, iced::Renderer> {
+        let hover = self.theme.text_secondary();
+        let hover_bg = self.theme.surface0();
+        button(text(label).size(11).font(iced::Font::with_name("Menlo")))
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: Some(
+                        if hovered {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: if hovered { hover } else { color },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })
+            .padding([6, 8])
+            .on_press_maybe(event)
+    }
+
+    /// The browser as a small window glyph (TRU-192): lit while an agent
+    /// drives it, coloured by state; a click opens (or brings forward) the
+    /// browser and the hover says what it is doing.
+    fn view_browser_icon(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let (state, label, color, driving) = self.browser_status();
+        let fill = if driving {
+            iced::Color { a: 0.35, ..color }
+        } else {
+            iced::Color::TRANSPARENT
+        };
+        let glyph = container(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fixed(2.0))
+                .style(move |_| container::Style {
+                    background: Some(color.into()),
+                    ..Default::default()
+                }),
+        )
+        .width(Length::Fixed(13.0))
+        .height(Length::Fixed(10.0))
+        .style(move |_| container::Style {
+            background: Some(fill.into()),
+            border: iced::Border {
+                color,
+                width: 1.0,
+                radius: 2.0.into(),
+            },
+            ..Default::default()
+        });
+        let event = match state {
+            BrowserBarState::Running => Some(Event::BrowserFocus),
+            BrowserBarState::Stopped | BrowserBarState::Error => Some(Event::BrowserOpen),
+            BrowserBarState::Busy(_) | BrowserBarState::Unavailable => None,
+        };
+        let hover_bg = self.theme.surface0();
+        let btn = button(glyph)
+            .style(move |_theme, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        hover_bg
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .padding([7, 7])
+            .on_press_maybe(event);
+        self.bar_tooltip(btn, label, iced::widget::tooltip::Position::Left)
+    }
+
+    /// The bar's terminal toggle (TRU-192): opens or folds the bottom
+    /// terminal panel, which has no header row while folded.
+    fn view_terminal_toggle(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let running = self.active_workspace().is_some_and(|ws| {
+            ws.bottom_terminals
+                .iter()
+                .any(|bt| bt.run.is_some() && bt.alive)
+        });
+        let color = if self.console_expanded {
+            theme.accent()
+        } else if running {
+            theme.success()
+        } else {
+            theme.text_muted()
+        };
+        let tip = match (self.console_expanded, running) {
+            (true, _) => "Fold the terminal panel (\u{2318}J)",
+            (false, true) => "Terminal panel, a command is running (\u{2318}J)",
+            (false, false) => "Terminal panel (\u{2318}J)",
+        };
+        let btn = self.bar_text_button(">_".to_string(), color, Some(Event::ConsoleToggle));
+        self.bar_tooltip(btn, tip.to_string(), iced::widget::tooltip::Position::Left)
+    }
+
     /// One workspace chip on the bar: dot, name (double-click renames),
-    /// the active one's gear, attention and PR news.
+    /// the active one's gear, attention and PR news. An inactive chip
+    /// shows its short label (TRU-192); every chip shows the full name on
+    /// hover.
     fn view_workspace_chip(&self, idx: usize) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let pulse_bright = self.attention_pulse_bright;
@@ -31975,11 +31731,11 @@ fi
             });
 
         // Double-click the name to rename inline (TRU-169).
-        let label: Element<'_, Event, Theme, iced::Renderer> = match self
+        let renaming = self
             .workspace_rename
             .as_ref()
-            .filter(|rename| rename.site == RenameSite::Chip && rename.uid == ws.uid)
-        {
+            .filter(|rename| rename.site == RenameSite::Chip && rename.uid == ws.uid);
+        let label: Element<'_, Event, Theme, iced::Renderer> = match renaming {
             Some(rename) => text_input("Workspace name", &rename.draft)
                 .id(workspace_rename_input_id())
                 .on_input(Event::WorkspaceRenameInput)
@@ -31990,10 +31746,14 @@ fi
                 .font(iced::Font::with_name("Menlo"))
                 .into(),
             None => iced::widget::mouse_area(
-                text(&ws.name)
-                    .size(11)
-                    .color(text_color)
-                    .font(iced::Font::with_name("Menlo")),
+                text(if is_active {
+                    ws.name.clone()
+                } else {
+                    workspace_bar::short_label(&ws.name)
+                })
+                .size(11)
+                .color(text_color)
+                .font(iced::Font::with_name("Menlo")),
             )
             .on_press(Event::WorkspaceSelect(idx))
             .on_double_click(Event::WorkspaceRenameStart(idx, RenameSite::Chip))
@@ -32084,7 +31844,7 @@ fi
         }
 
         // Active workspace: colored top accent line above the button
-        if is_active {
+        let chip: Element<'_, Event, Theme, iced::Renderer> = if is_active {
             let accent_line = container(iced::widget::Space::new().width(0).height(0))
                 .width(Length::Fill)
                 .height(Length::Fixed(2.0))
@@ -32105,7 +31865,7 @@ fi
 
             column![accent_line, ws_btn].spacing(0).into()
         } else {
-            let ws_btn = button(btn_content)
+            button(btn_content)
                 .style(move |_theme, status| {
                     let bg = if matches!(status, button::Status::Hovered) {
                         hover_bg
@@ -32120,57 +31880,151 @@ fi
                     }
                 })
                 .padding([6, 12])
-                .on_press(Event::WorkspaceSelect(idx));
-            ws_btn.into()
+                .on_press(Event::WorkspaceSelect(idx))
+                .into()
+        };
+        if renaming.is_some() {
+            return chip;
+        }
+        self.bar_tooltip(
+            chip,
+            ws.name.clone(),
+            iced::widget::tooltip::Position::Right,
+        )
+    }
+
+    /// A machine's display name and, for a remote agent, its connection
+    /// state as a colour and a word.
+    fn machine_name_and_status(&self, key: &str) -> (String, Option<(iced::Color, &'static str)>) {
+        let theme = &self.theme;
+        match key.split_once(':') {
+            None => ("this Mac".to_string(), None),
+            Some(("agent", remote_id)) => {
+                let name = self
+                    .remote_agent_config_by_id(remote_id)
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_else(|| remote_id.to_string());
+                let status = match self
+                    .remote_agent_connections
+                    .get(remote_id)
+                    .map(|c| &c.status)
+                {
+                    Some(RemoteAgentConnectionStatus::Connected(_)) => (theme.green(), "connected"),
+                    Some(RemoteAgentConnectionStatus::Connecting) => (theme.yellow(), "connecting"),
+                    Some(RemoteAgentConnectionStatus::Error(_)) => (theme.red(), "unreachable"),
+                    Some(RemoteAgentConnectionStatus::Disconnected) | None => {
+                        (theme.text_muted(), "not connected")
+                    }
+                };
+                (name, Some(status))
+            }
+            Some((_, rest)) => (rest.to_string(), None),
         }
     }
 
-    /// The `Repos ▸ n` / `Repos ▾` toggle of a machine group's folder
-    /// workspaces (TRU-175). Collapsed, a dot says a hidden chip has
-    /// attention, an error or PR news.
-    fn view_repos_toggle(
+    /// The other machines the `Repos ▾` menu has a section for: those with
+    /// open workspaces in layout order, then configured remotes with none.
+    fn bar_machine_keys(&self, layout: &workspace_bar::BarLayout) -> Vec<String> {
+        let mut keys: Vec<String> = layout
+            .sections
+            .iter()
+            .filter(|section| section.key != workspace_bar::LOCAL_GROUP)
+            .map(|section| section.key.clone())
+            .collect();
+        for def in &self.remote_agent_defs {
+            let key = format!("agent:{}", def.id);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    /// Unopened legacy remote sessions, listed at the end of the menu.
+    fn unopened_remote_sessions(&self) -> Vec<&RemoteSessionDefinition> {
+        self.remote_session_defs
+            .iter()
+            .filter(|session| {
+                !self.workspaces.iter().any(|workspace| {
+                    workspace
+                        .remote_session
+                        .as_ref()
+                        .is_some_and(|open| open.session_name == session.session_name)
+                })
+            })
+            .collect()
+    }
+
+    fn status_dot(color: iced::Color, size: f32) -> Element<'static, Event, Theme, iced::Renderer> {
+        container(iced::widget::Space::new().width(0).height(0))
+            .width(Length::Fixed(size))
+            .height(Length::Fixed(size))
+            .style(move |_| container::Style {
+                background: Some(color.into()),
+                border: iced::Border {
+                    radius: (size / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// `Repos ▾` (TRU-192): opens the menu of this Mac's folder workspaces
+    /// and a section per machine. A peach dot says a workspace only the
+    /// menu shows has attention or PR news; then one small dot per other
+    /// machine, coloured by its connection.
+    fn view_repos_menu_button(
         &self,
-        key: &str,
-        toggle: &workspace_bar::ReposToggle,
+        layout: &workspace_bar::BarLayout,
     ) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let label = if toggle.collapsed {
-            format!("Repos \u{25B8} {}", toggle.count)
-        } else {
-            "Repos \u{25BE}".to_string()
-        };
-        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center);
-        content = content.push(text(label).size(11).font(iced::Font::with_name("Menlo")));
-        let hidden_news = toggle.hidden.iter().any(|&idx| {
+        let open = self.bar_menu == Some(BarMenu::Repos);
+        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center).push(
+            text(if open {
+                "Repos \u{25B4}"
+            } else {
+                "Repos \u{25BE}"
+            })
+            .size(11)
+            .font(iced::Font::with_name("Menlo")),
+        );
+        let hidden_news = layout.hidden.iter().any(|&idx| {
             self.workspaces.get(idx).is_some_and(|ws| {
                 ws.attention_count() > 0 || self.workspace_pr_badge(ws.uid).is_some()
             })
         });
         if hidden_news {
-            let dot_color = theme.peach();
-            content = content.push(
-                container(iced::widget::Space::new().width(0).height(0))
-                    .width(Length::Fixed(6.0))
-                    .height(Length::Fixed(6.0))
-                    .style(move |_| container::Style {
-                        background: Some(dot_color.into()),
-                        border: iced::Border {
-                            radius: 3.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-            );
+            content = content.push(Self::status_dot(theme.peach(), 6.0));
         }
-        let color = theme.text_muted();
+        let mut tip_parts: Vec<String> = vec!["Repos and machines".to_string()];
+        let machines = self.bar_machine_keys(layout);
+        if !machines.is_empty() {
+            let mut dots = Row::new().spacing(3).align_y(iced::Alignment::Center);
+            for key in &machines {
+                let (name, status) = self.machine_name_and_status(key);
+                let (color, word) = status.unwrap_or((theme.overlay0(), "remote session"));
+                dots = dots.push(Self::status_dot(color, 5.0));
+                tip_parts.push(format!("{name} {word}"));
+            }
+            content = content.push(dots);
+        }
+        if hidden_news {
+            tip_parts.push("news inside".to_string());
+        }
+        let color = if open {
+            theme.text_primary()
+        } else {
+            theme.text_muted()
+        };
         let hover = theme.text_secondary();
         let hover_bg = theme.surface0();
-        button(content)
+        let btn = button(content)
             .style(move |_theme, status| {
                 let hovered = matches!(status, button::Status::Hovered);
                 button::Style {
                     background: Some(
-                        if hovered {
+                        if hovered || open {
                             hover_bg
                         } else {
                             iced::Color::TRANSPARENT
@@ -32183,138 +32037,58 @@ fi
                 }
             })
             .padding([6, 12])
-            .on_press(Event::ToggleReposZone(key.to_string()))
-            .into()
+            .on_press(Event::BarMenuToggle(BarMenu::Repos));
+        self.bar_tooltip(
+            btn,
+            tip_parts.join(" \u{00B7} "),
+            iced::widget::tooltip::Position::Right,
+        )
     }
 
     fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
+        let layout = self.workspace_bar_layout();
+        let chip_separator = || {
+            let sep_color = theme.surface0();
+            container(iced::widget::Space::new().width(0).height(0))
+                .width(Length::Fixed(1.0))
+                .height(Length::Fixed(14.0))
+                .style(move |_| container::Style {
+                    background: Some(sep_color.into()),
+                    ..Default::default()
+                })
+        };
+
+        // This Mac's work, the Repos menu, then the folders on the bar and
+        // the active workspace when only the menu would list it.
         let mut bar_row = Row::new().spacing(0).align_y(iced::Alignment::Center);
-
-        // 4b: the Vec is machine-normalized, so groups are contiguous;
-        // within a group work comes first, then the Repos zone (TRU-175).
-        let groups = self.workspace_bar_layout();
-        for (group_idx, group) in groups.iter().enumerate() {
-            if group_idx > 0 {
-                bar_row = bar_row.push(self.machine_group_separator());
+        for (pos, &idx) in layout.work.iter().enumerate() {
+            if pos > 0 {
+                bar_row = bar_row.push(chip_separator());
             }
-            bar_row = bar_row.push(self.machine_group_label(&group.key, group.size, group.folded));
-            // Folded groups hide their chips — except the active one,
-            // which never disappears out from under the user.
-            let mut items: Vec<Element<'_, Event, Theme, iced::Renderer>> = group
-                .work
-                .iter()
-                .map(|&idx| self.view_workspace_chip(idx))
-                .collect();
-            if let Some(toggle) = &group.repos {
-                items.push(self.view_repos_toggle(&group.key, toggle));
-            }
-            items.extend(
-                group
-                    .folders
-                    .iter()
-                    .map(|&idx| self.view_workspace_chip(idx)),
-            );
-            for (item_idx, item) in items.into_iter().enumerate() {
-                // Separator between chips of the same machine group
-                if item_idx > 0 {
-                    let sep_color = theme.surface0();
-                    bar_row = bar_row.push(
-                        container(iced::widget::Space::new().width(0).height(0))
-                            .width(Length::Fixed(1.0))
-                            .height(Length::Fixed(14.0))
-                            .style(move |_| container::Style {
-                                background: Some(sep_color.into()),
-                                ..Default::default()
-                            }),
-                    );
-                }
-                bar_row = bar_row.push(item);
-            }
-            // Close the group with its machine-scoped "+".
-            if let Some(plus) = self.machine_group_plus(&group.key) {
-                bar_row = bar_row.push(plus);
-            }
+            bar_row = bar_row.push(self.view_workspace_chip(idx));
         }
-        let group_keys: Vec<&str> = groups.iter().map(|group| group.key.as_str()).collect();
-
-        // Configured remotes with no open workspace stay visible: label
-        // plus a "+" to open their first one (the always-visible rule).
-        for def in &self.remote_agent_defs {
-            let key = format!("agent:{}", def.id);
-            if group_keys.contains(&key.as_str()) {
-                continue;
-            }
-            bar_row = bar_row.push(self.machine_group_separator());
-            bar_row = bar_row.push(self.machine_group_label(&key, 0, false));
-            if let Some(plus) = self.machine_group_plus(&key) {
-                bar_row = bar_row.push(plus);
-            }
+        if !layout.work.is_empty() {
+            bar_row = bar_row.push(chip_separator());
+        }
+        bar_row = bar_row.push(self.view_repos_menu_button(&layout));
+        for &idx in &layout.after {
+            bar_row = bar_row.push(chip_separator());
+            bar_row = bar_row.push(self.view_workspace_chip(idx));
         }
 
-        let unopened_remote_sessions: Vec<&RemoteSessionDefinition> = self
-            .remote_session_defs
-            .iter()
-            .filter(|session| {
-                !self.workspaces.iter().any(|workspace| {
-                    workspace
-                        .remote_session
-                        .as_ref()
-                        .is_some_and(|open| open.session_name == session.session_name)
-                })
-            })
-            .collect();
-
-        for session in unopened_remote_sessions {
-            let remote_color = theme.accent();
-            let remote_hover = theme.surface0();
-            let label = text(format!("+ {}", remote_workspace_name(session)))
-                .size(11)
-                .color(remote_color)
-                .font(iced::Font::with_name("Menlo"));
-            let remote_btn = button(label)
-                .style(move |_theme, status| {
-                    let bg = if matches!(status, button::Status::Hovered) {
-                        remote_hover
-                    } else {
-                        iced::Color::TRANSPARENT
-                    };
-                    button::Style {
-                        background: Some(bg.into()),
-                        text_color: remote_color,
-                        border: iced::Border::default(),
-                        ..Default::default()
-                    }
-                })
-                .padding([6, 12])
-                .on_press(Event::RemoteWorkspaceOpen(session.session_name.clone()));
-            bar_row = bar_row.push(remote_btn);
-        }
-
-        // "+ workspace" button at the end
-        let ws_add_color = theme.text_muted();
-        let ws_add_hover = theme.text_secondary();
-        let ws_add_btn = button(
-            text("+ workspace")
-                .size(11)
-                .color(ws_add_color)
-                .font(iced::Font::with_name("Menlo")),
-        )
-        .style(move |_theme, status| {
-            let tc = if matches!(status, button::Status::Hovered) {
-                ws_add_hover
-            } else {
-                ws_add_color
-            };
-            button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                text_color: tc,
-                ..Default::default()
-            }
-        })
-        .padding([6, 12])
-        .on_press(Event::WorkspaceCreate);
-        bar_row = bar_row.push(ws_add_btn);
+        // The one "+": a new workspace, on any machine, from the folder
+        // picker's machine selector.
+        let plus = self.bar_text_button(
+            "+".to_string(),
+            theme.text_muted(),
+            Some(Event::WorkspaceCreate),
+        );
+        bar_row = bar_row.push(self.bar_tooltip(
+            plus,
+            "New workspace".to_string(),
+            iced::widget::tooltip::Position::Right,
+        ));
 
         let scrollable_bar = scrollable(bar_row.padding([0, 4]).align_y(iced::Alignment::Center))
             .direction(scrollable::Direction::Horizontal(
@@ -32356,31 +32130,6 @@ fi
                 ..Default::default()
             });
 
-        // Help button (?) pinned to the right
-        let help_color = theme.text_muted();
-        let help_hover = theme.text_secondary();
-        let help_btn = button(
-            text("?")
-                .size(11)
-                .color(help_color)
-                .font(iced::Font::with_name("Menlo")),
-        )
-        .style(move |_theme, status| {
-            let tc = if matches!(status, button::Status::Hovered) {
-                help_hover
-            } else {
-                help_color
-            };
-            button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                text_color: tc,
-                ..Default::default()
-            }
-        })
-        .padding([6, 10])
-        .on_press(Event::ToggleHelp);
-
-        let browser_controls = self.view_browser_controls();
         let control_separator_color = theme.surface0();
         let control_separator = container(iced::widget::Space::new().width(0).height(0))
             .width(Length::Fixed(1.0))
@@ -32390,46 +32139,50 @@ fi
                 ..Default::default()
             });
 
-        // `⏸ n parked` opens the Parked list (TRU-171); hidden at none.
+        let mut bar_inner = row![scrollable_bar];
+        // `↑n` opens Ready to merge (TRU-173); hidden at none.
+        if let Some(ready_btn) = self.view_ready_button() {
+            bar_inner = bar_inner.push(ready_btn);
+        }
+        // `⏸n` opens the Parked list (TRU-171); hidden at none.
         let parked_count = self
             .closed_workspace_configs
             .iter()
             .filter(|cfg| cfg.is_parked())
             .count()
             + (self.workspaces.len() - self.bar_workspace_count());
-        let parked_btn = (parked_count > 0).then(|| {
-            let parked_color = theme.text_muted();
-            let parked_hover = theme.text_secondary();
-            button(
-                text(format!("\u{23F8} {parked_count} parked"))
-                    .size(11)
-                    .font(iced::Font::with_name("Menlo")),
-            )
-            .style(move |_theme, status| button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                text_color: if matches!(status, button::Status::Hovered) {
-                    parked_hover
-                } else {
-                    parked_color
-                },
-                ..Default::default()
-            })
-            .padding([6, 10])
-            .on_press(Event::ParkedListToggle)
-        });
-
-        let mut bar_inner = row![scrollable_bar];
-        // `⇡ n to merge` opens Ready to merge (TRU-173); hidden at none.
-        if let Some(ready_btn) = self.view_ready_button() {
-            bar_inner = bar_inner.push(ready_btn);
+        if parked_count > 0 {
+            let parked = self.bar_text_button(
+                format!("\u{23F8}{parked_count}"),
+                theme.text_muted(),
+                Some(Event::ParkedListToggle),
+            );
+            bar_inner = bar_inner.push(self.bar_tooltip(
+                parked,
+                format!("{parked_count} parked"),
+                iced::widget::tooltip::Position::Left,
+            ));
         }
-        if let Some(parked_btn) = parked_btn {
-            bar_inner = bar_inner.push(parked_btn);
-        }
+        let more_open = self.bar_menu == Some(BarMenu::More);
+        let more = self.bar_text_button(
+            "\u{22EF}".to_string(),
+            if more_open {
+                theme.text_primary()
+            } else {
+                theme.text_muted()
+            },
+            Some(Event::BarMenuToggle(BarMenu::More)),
+        );
         let bar_inner = bar_inner
             .push(control_separator)
-            .push(container(browser_controls).padding([0, 6]))
-            .push(help_btn)
+            .push(self.view_terminal_toggle())
+            .push(self.view_browser_icon())
+            .push(self.bar_tooltip(
+                more,
+                "Help and browser actions".to_string(),
+                iced::widget::tooltip::Position::Left,
+            ))
+            .push(iced::widget::Space::new().width(Length::Fixed(4.0)))
             .spacing(0)
             .align_y(iced::Alignment::Center)
             .width(Length::Fill);
@@ -32443,6 +32196,360 @@ fi
                 });
 
         column![top_border, bar_container].into()
+    }
+
+    /// One row of a bar menu.
+    fn bar_menu_item(
+        &self,
+        content: impl Into<Element<'static, Event, Theme, iced::Renderer>>,
+        event: Event,
+    ) -> Element<'static, Event, Theme, iced::Renderer> {
+        let hover_bg = self.theme.surface0();
+        let color = self.theme.text_secondary();
+        let hover_color = self.theme.text_primary();
+        button(content)
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: Some(
+                        if hovered {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: if hovered { hover_color } else { color },
+                    border: iced::Border {
+                        radius: 5.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })
+            .padding([5, 10])
+            .width(Length::Fill)
+            .on_press(Event::BarMenuRun(Box::new(event)))
+            .into()
+    }
+
+    /// A workspace row of the `Repos ▾` menu: its dot, full name and
+    /// attention count; the active one in its colour.
+    fn view_menu_workspace_row(
+        &self,
+        idx: usize,
+    ) -> Element<'static, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let ws = &self.workspaces[idx];
+        let is_active = idx == self.active_workspace_idx;
+        let attention = ws.attention_count();
+        let dot_color = if attention > 0 {
+            theme.peach()
+        } else if is_active {
+            ws.color.color(theme)
+        } else {
+            theme.surface2()
+        };
+        let mut row_content = Row::new()
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .push(Self::status_dot(dot_color, 6.0))
+            .push(
+                text(ws.name.clone())
+                    .size(self.ui_font())
+                    .color(if is_active {
+                        ws.color.color(theme)
+                    } else {
+                        theme.text_secondary()
+                    })
+                    .width(Length::Fill),
+            );
+        if attention > 0 {
+            row_content = row_content.push(
+                text(attention.to_string())
+                    .size(self.ui_font_small())
+                    .color(theme.peach())
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+        if let Some((label, color)) = self.workspace_pr_badge(ws.uid) {
+            row_content = row_content.push(
+                text(label)
+                    .size(self.ui_font_small())
+                    .color(color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+        self.bar_menu_item(row_content, Event::WorkspaceSelect(idx))
+    }
+
+    /// The open bar menu over a click-away backdrop, anchored above the
+    /// bar: `Repos ▾` on the left, `⋯` on the right.
+    fn view_bar_menu(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let Some(menu) = self.bar_menu else {
+            return iced::widget::Space::new().into();
+        };
+        let theme = &self.theme;
+        let content = match menu {
+            BarMenu::Repos => self.view_repos_menu(),
+            BarMenu::More => self.view_more_menu(),
+        };
+        let card_bg = theme.bg_surface();
+        let card_border = theme.surface1();
+        let max_height = (self.window_size.1 - 120.0).max(160.0);
+        let card = container(
+            scrollable(content)
+                .height(Length::Shrink)
+                .width(Length::Fixed(300.0)),
+        )
+        .max_height(max_height)
+        .style(move |_| container::Style {
+            background: Some(card_bg.into()),
+            border: iced::Border {
+                color: card_border,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: iced::Color::BLACK,
+                offset: iced::Vector::new(0.0, 6.0),
+                blur_radius: 16.0,
+            },
+            ..Default::default()
+        })
+        .padding(8);
+
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Event::BarMenuClose);
+
+        let anchored = container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_bottom(Length::Fill);
+        let anchored = match menu {
+            BarMenu::Repos => anchored.align_left(Length::Fill).padding(iced::Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 34.0,
+                left: SPINE_WIDTH + 8.0,
+            }),
+            BarMenu::More => anchored.align_right(Length::Fill).padding(iced::Padding {
+                top: 0.0,
+                right: 8.0,
+                bottom: 34.0,
+                left: 0.0,
+            }),
+        };
+        Stack::new()
+            .push(backdrop)
+            .push(anchored)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// `Repos ▾` (TRU-192): a section per machine, this Mac first. Each
+    /// has its name (a remote's connection), its `+`, its workspaces (this
+    /// Mac's folders; every workspace of another machine) and its actions.
+    /// Unopened legacy remote sessions come last.
+    fn view_repos_menu(&self) -> Element<'static, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let layout = self.workspace_bar_layout();
+        let mut keys = vec![workspace_bar::LOCAL_GROUP.to_string()];
+        keys.extend(self.bar_machine_keys(&layout));
+
+        let mut col = Column::new().spacing(2);
+        for (pos, key) in keys.iter().enumerate() {
+            if pos > 0 {
+                let line = theme.surface1();
+                col = col.push(
+                    container(iced::widget::Space::new())
+                        .width(Length::Fill)
+                        .height(Length::Fixed(1.0))
+                        .style(move |_| container::Style {
+                            background: Some(line.into()),
+                            ..Default::default()
+                        }),
+                );
+            }
+            let (name, status) = self.machine_name_and_status(key);
+            let mut header = Row::new()
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .padding([4, 10])
+                .push(
+                    text(name.to_uppercase())
+                        .size(font_small - 1.0)
+                        .color(theme.text_secondary())
+                        .font(iced::Font::with_name("Menlo")),
+                );
+            if let Some((color, word)) = status {
+                header = header
+                    .push(Self::status_dot(color, 6.0))
+                    .push(text(word).size(font_small - 1.0).color(theme.text_muted()));
+            }
+            header = header.push(iced::widget::Space::new().width(Length::Fill));
+            let create = match key.split_once(':') {
+                None => Some(Event::WorkspaceCreateLocal),
+                Some(("agent", remote_id)) => {
+                    Some(Event::RemoteWorkspaceBrowse(remote_id.to_string()))
+                }
+                _ => None,
+            };
+            if let Some(create) = create {
+                let color = theme.text_muted();
+                let hover = theme.text_primary();
+                header = header.push(
+                    button(text("+").size(font).font(iced::Font::with_name("Menlo")))
+                        .style(move |_theme, status| button::Style {
+                            background: Some(iced::Color::TRANSPARENT.into()),
+                            text_color: if matches!(status, button::Status::Hovered) {
+                                hover
+                            } else {
+                                color
+                            },
+                            ..Default::default()
+                        })
+                        .padding([0, 4])
+                        .on_press(Event::BarMenuRun(Box::new(create))),
+                );
+            }
+            col = col.push(header);
+
+            let workspaces = layout
+                .sections
+                .iter()
+                .find(|section| &section.key == key)
+                .map(|section| section.workspaces.as_slice())
+                .unwrap_or_default();
+            for &idx in workspaces {
+                col = col.push(self.view_menu_workspace_row(idx));
+            }
+
+            let action = |label: String| text(label).size(font_small).color(theme.text_muted());
+            if key == workspace_bar::LOCAL_GROUP {
+                col = col.push(self.bar_menu_item(
+                    action("New workspace, no repo\u{2026}".to_string()),
+                    Event::NewWorkOpen,
+                ));
+                if !workspaces.is_empty() {
+                    col = col.push(self.bar_menu_item(
+                        action(if self.repos_on_bar() {
+                            "Keep repos in this menu only".to_string()
+                        } else {
+                            "Show repos on the bar too".to_string()
+                        }),
+                        Event::ToggleReposZone(key.clone()),
+                    ));
+                }
+            }
+            col = col.push(self.bar_menu_item(
+                action(format!("Show {name} chats")),
+                Event::ShowMachineChats(key.clone()),
+            ));
+            if let Some(("agent", remote_id)) = key.split_once(':') {
+                let connected = matches!(
+                    self.remote_agent_connections
+                        .get(remote_id)
+                        .map(|c| &c.status),
+                    Some(RemoteAgentConnectionStatus::Connected(_))
+                );
+                if !connected {
+                    col = col.push(self.bar_menu_item(
+                        action("Reconnect\u{2026}".to_string()),
+                        Event::MachineReconnect(key.clone()),
+                    ));
+                }
+                if self.remote_serves_phones(remote_id) {
+                    col = col.push(self.bar_menu_item(
+                        action("Pair a phone\u{2026}".to_string()),
+                        Event::PhonePanelOpen(remote_id.to_string()),
+                    ));
+                }
+            }
+        }
+
+        let sessions = self.unopened_remote_sessions();
+        if !sessions.is_empty() {
+            col = col.push(
+                container(
+                    text("REMOTE SESSIONS")
+                        .size(font_small - 1.0)
+                        .color(theme.text_secondary())
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .padding([4, 10]),
+            );
+            for session in sessions {
+                col = col.push(
+                    self.bar_menu_item(
+                        text(format!("+ {}", remote_workspace_name(session)))
+                            .size(font)
+                            .color(theme.accent()),
+                        Event::RemoteWorkspaceOpen(session.session_name.clone()),
+                    ),
+                );
+            }
+        }
+        col.into()
+    }
+
+    /// `⋯` (TRU-192): help, and the browser actions the bar icon does not
+    /// cover.
+    fn view_more_menu(&self) -> Element<'static, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let item = |label: &str, hint: &str| {
+            row![
+                text(label.to_string()).size(font).width(Length::Fill),
+                text(hint.to_string())
+                    .size(font_small)
+                    .color(theme.text_muted())
+                    .font(iced::Font::with_name("Menlo")),
+            ]
+            .align_y(iced::Alignment::Center)
+        };
+        let (state, label, color, _) = self.browser_status();
+        let mut col = Column::new()
+            .spacing(2)
+            .push(self.bar_menu_item(item("Keyboard shortcuts", "\u{2325}/"), Event::ToggleHelp))
+            .push(
+                container(
+                    row![
+                        Self::status_dot(color, 6.0),
+                        text(label).size(font_small).color(theme.text_muted()),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([6, 10]),
+            );
+        match state {
+            BrowserBarState::Running => {
+                col =
+                    col.push(self.bar_menu_item(item("Focus browser", ""), Event::BrowserFocus))
+                        .push(self.bar_menu_item(
+                            item("Disconnect browser", ""),
+                            Event::BrowserDisconnect,
+                        ));
+            }
+            BrowserBarState::Stopped | BrowserBarState::Error => {
+                col = col.push(self.bar_menu_item(item("Open browser", ""), Event::BrowserOpen));
+            }
+            BrowserBarState::Busy(_) | BrowserBarState::Unavailable => {}
+        }
+        if self.browser_telemetry.latest_evidence.is_some() {
+            col = col
+                .push(self.bar_menu_item(item("Browser evidence", ""), Event::BrowserEvidenceOpen));
+        }
+        col.into()
     }
 
     fn view_spine(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -43330,26 +43437,14 @@ fi
         let Some(ws) = self.active_workspace() else {
             return iced::widget::Space::new().width(0).height(0).into();
         };
+        // Folded, the panel has no header row (TRU-192): the bar's
+        // terminal toggle opens it.
+        if !self.console_expanded {
+            return iced::widget::Space::new().width(0).height(0).into();
+        }
 
         // --- Tab bar ---
         let tab_bar = self.view_bottom_tab_bar(ws);
-
-        if !self.console_expanded {
-            let border_color = theme.surface0();
-            return container(tab_bar)
-                .width(Length::Fill)
-                .height(Length::Fixed(CONSOLE_HEADER_HEIGHT))
-                .style(move |_| container::Style {
-                    background: None,
-                    border: iced::Border {
-                        width: 1.0,
-                        color: border_color,
-                        radius: 0.0.into(),
-                    },
-                    ..Default::default()
-                })
-                .into();
-        }
 
         // --- Content area ---
         let placeholder = |message: &'static str| -> Element<'_, Event, Theme, iced::Renderer> {
