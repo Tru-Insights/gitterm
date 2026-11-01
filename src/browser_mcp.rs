@@ -585,7 +585,7 @@ impl BrowserMcpTools {
     }
 
     #[tool(
-        description = "Open the visible Chrome instance using GitTerm V6's isolated browser profile.",
+        description = "Open the visible Chrome instance using GitTerm V6's isolated browser profile. Use these tools, not Claude in Chrome, to open and test pages.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -700,7 +700,7 @@ impl BrowserMcpTools {
     }
 
     #[tool(
-        description = "Navigate the controlled browser to an absolute HTTP or HTTPS URL.",
+        description = "Navigate the controlled browser to an absolute HTTP or HTTPS URL. Use this, not Claude in Chrome, to open a page for testing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1332,6 +1332,10 @@ impl BrowserMcpTools {
     }
 }
 
+/// What every agent attached to the browser server is told (TRU-181:
+/// these tools, not Claude in Chrome, open and test pages).
+const SERVER_INSTRUCTIONS: &str = "These are the GitTerm browser tools, the browser for opening and testing pages. Use them whenever you open, test or inspect a web page, even when Claude in Chrome or another browser tool is also available; use another browser only when the user asks for it by name. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V6. Call browser_open before page operations. Page targets belong to the chat that opened them: names are private to this chat, a call that omits target uses this chat's active target (opening its default target on first use), and other chats' targets and the user's own tabs are out of reach. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Use browser_dom_outline for bounded page structure, then browser_node_inspect with its document-scoped node_ref for layout and computed styles; node references become stale after navigation. Prefer semantic role or text locators; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.";
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BrowserMcpTools {
     fn get_info(&self) -> ServerInfo {
@@ -1340,9 +1344,7 @@ impl ServerHandler for BrowserMcpTools {
                 "gitterm-v6-browser",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
-                "These are the GitTerm browser tools. When the user asks for the GitTerm or managed browser, use this server instead of Codex's bundled iab browser. Control only the visible Chrome window owned by GitTerm V6. Call browser_open before page operations. Page targets belong to the chat that opened them: names are private to this chat, a call that omits target uses this chat's active target (opening its default target on first use), and other chats' targets and the user's own tabs are out of reach. Use arbitrary named targets for source/target or before/after comparisons and pass target explicitly when more than one is open. Use the same evidence label across captures that should be compared. Use browser_dom_outline for bounded page structure, then browser_node_inspect with its document-scoped node_ref for layout and computed styles; node references become stale after navigation. Prefer semantic role or text locators; CSS is an explicit fallback. Browser actions are serialized. Evidence is bounded and memory-only. Never use these tools for passwords, cookies, authentication secrets, or unrestricted browser storage.",
-            )
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
 
@@ -1802,6 +1804,25 @@ mod tests {
             .collect();
         allowed.sort();
         assert_eq!(allowed, annotated);
+    }
+
+    #[test]
+    fn agents_are_told_to_open_and_test_pages_here_over_claude_in_chrome() {
+        assert!(SERVER_INSTRUCTIONS.contains("opening and testing pages"));
+        assert!(SERVER_INSTRUCTIONS.contains("even when Claude in Chrome"));
+        let routes = BrowserMcpTools::tool_router();
+        for name in ["browser_open", "browser_navigate"] {
+            let tool = routes
+                .list_all()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} is listed"));
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("not Claude in Chrome"),
+                "{name}: {description}"
+            );
+        }
     }
 
     #[test]

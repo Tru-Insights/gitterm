@@ -173,6 +173,23 @@ mod tests {
             serde_json::to_value(&off).unwrap()["guidelines_off"],
             serde_json::json!(true)
         );
+        // Claude in Chrome is off unless the workspace switched it on
+        // (TRU-181); off writes nothing.
+        assert!(!cfg.claude_in_chrome);
+        assert!(written.get("claude_in_chrome").is_none());
+        let chrome: WorkspaceConfig = serde_json::from_str(&old.replace(
+            r#""active": false"#,
+            r#""active": false, "claude_in_chrome": true"#,
+        ))
+        .unwrap();
+        assert!(chrome.claude_in_chrome);
+        let json = serde_json::to_string(&chrome).unwrap();
+        let back: WorkspaceConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.claude_in_chrome);
+        assert_eq!(
+            serde_json::to_value(&back).unwrap()["claude_in_chrome"],
+            serde_json::json!(true)
+        );
 
         // An open workspace is never on the Parked list.
         let open: WorkspaceConfig =
@@ -508,6 +525,7 @@ mod tests {
         let old: WorkspacesFile = serde_json::from_str(OLD_WORKSPACES_JSON).unwrap();
         assert_eq!(old.workspaces.len(), 2);
         assert!(old.workspaces.iter().all(|ws| ws.chats.is_empty()));
+        assert!(old.workspaces.iter().all(|ws| !ws.claude_in_chrome));
         assert_eq!(old.workspaces[0].env["LINEAR_TEAM"], "PRJ");
         assert!(!old.workspaces[1].active);
         // Without chats nothing new is written.
@@ -973,6 +991,15 @@ mod tests {
     fn acp_chat_models_default_and_parse() {
         let chat: ChatDefaults = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(chat.gemini_model, "gemini-4-argon");
+        // The global Claude in Chrome switch of earlier builds is ignored
+        // (it is per workspace now) and not written back.
+        let earlier: ChatDefaults =
+            serde_json::from_value(serde_json::json!({"claude_in_chrome": true})).unwrap();
+        assert_eq!(earlier, ChatDefaults::default());
+        assert!(serde_json::to_value(&earlier)
+            .unwrap()
+            .get("claude_in_chrome")
+            .is_none());
         assert_eq!(chat.opencode_model, "");
         let chat: ChatDefaults = serde_json::from_value(serde_json::json!({
             "gemini_model": "gemini-3.8-flash",
@@ -1242,8 +1269,7 @@ fn default_gemini_model() -> String {
 /// panel; edit the `chat` object in `settings.json`:
 ///
 /// ```json
-/// "chat": { "default_model": "opus", "default_effort": "high", "remember_last": true,
-///           "claude_in_chrome": true }
+/// "chat": { "default_model": "opus", "default_effort": "high", "remember_last": true }
 /// ```
 ///
 /// `default_model` is a Claude model alias (`default` leaves the choice to
@@ -1251,11 +1277,11 @@ fn default_gemini_model() -> String {
 /// levels (`low`, `medium`, `high`, `xhigh`, `max`), or absent for the
 /// model's own default. With `remember_last`, a new chat starts with the
 /// model and effort last picked on any chat (`last`, written by the app)
-/// instead of the defaults. `claude_in_chrome` starts chats with Claude in
-/// Chrome (the CLI's `--chrome`), which drives the user's own Chrome through
-/// the extension; headless Claude ignores the CLI's own "on by default"
-/// setting, so GitTerm passes the flag. Chats also keep GitTerm's browser,
-/// a separate Chrome profile.
+/// instead of the defaults.
+///
+/// Claude in Chrome is per workspace (`WorkspaceConfig::claude_in_chrome`,
+/// TRU-181); a `claude_in_chrome` key here, from an earlier build, is
+/// ignored.
 ///
 /// `gemini_model` and `opencode_model` are what new Gemini and OpenCode
 /// chats start on (TRU-153): a model id as the agent lists it, such as
@@ -1273,8 +1299,6 @@ pub struct ChatDefaults {
     /// not per workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<ChatSelection>,
-    #[serde(default = "default_true")]
-    pub claude_in_chrome: bool,
     #[serde(default = "default_gemini_model")]
     pub gemini_model: String,
     #[serde(default)]
@@ -1296,7 +1320,6 @@ impl Default for ChatDefaults {
             default_effort: None,
             remember_last: true,
             last: None,
-            claude_in_chrome: true,
             gemini_model: default_gemini_model(),
             opencode_model: String::new(),
         }
@@ -1904,6 +1927,12 @@ pub struct WorkspaceConfig {
     /// (TRU-174). See `gitterm::guidelines`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guidelines_off: bool,
+    /// Claude sessions started in this workspace get Claude in Chrome
+    /// (`--chrome`); off (`--no-chrome`) by default, so agents use GitTerm's
+    /// own browser tools (TRU-181). Read when a Claude process starts; a
+    /// running one keeps what it started with.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claude_in_chrome: bool,
     /// The repos this workspace lists, by dir on its machine, home first
     /// (TRU-180). Their settings live in `WorkspacesFile::repos`. Files
     /// written before TRU-180 have none: `normalize_repos` makes `[dir]`.

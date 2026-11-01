@@ -392,7 +392,8 @@ impl AgentSession {
     /// The Claude process settings for this tab. `model` "default" (or
     /// empty) leaves the model to the user's Claude settings. `mcp_servers`
     /// are the GitTerm MCP servers the app attaches (task and browser);
-    /// `chrome` attaches Claude in Chrome (`chat.claude_in_chrome`);
+    /// `chrome` attaches Claude in Chrome, the chat's workspace switch
+    /// (`claude_in_chrome` in workspaces.json, off by default, TRU-181);
     /// `guidelines_file` appends GitTerm's change guidelines (TRU-174).
     pub(crate) fn claude_session_config(
         &self,
