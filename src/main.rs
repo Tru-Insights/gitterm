@@ -8099,6 +8099,12 @@ struct RemoteConnectForm {
     saved_remote_id: Option<String>,
 }
 
+/// Whether a handshake for `remote_id` finishes the Connect form: the host
+/// it saved connected. Any other host, or a failed connect, leaves it open.
+fn remote_connect_form_done(form: &RemoteConnectForm, remote_id: &str, connected: bool) -> bool {
+    connected && form.saved_remote_id.as_deref() == Some(remote_id)
+}
+
 /// The "Pair a phone" panel (TRU-151) for one remote agent: a pairing QR
 /// code and the phones already paired, with Revoke.
 #[derive(Debug, Clone)]
@@ -18402,8 +18408,8 @@ fi
     }
 
     /// Validate the connect form, persist the agent (token file + upsert
-    /// into remote-agents.json), and kick a handshake so the form shows
-    /// live connect/error feedback.
+    /// into remote-agents.json), and kick a handshake: the form shows
+    /// "Connecting…", closes when the host connects and keeps a failure.
     fn submit_remote_connect_form(&mut self) -> Task<Event> {
         let Some(form) = self.remote_connect_form.as_ref() else {
             return Task::none();
@@ -25279,6 +25285,7 @@ fi
                         .and_then(|connection| connection.last_connected),
                 };
 
+                let connected = matches!(status, RemoteAgentConnectionStatus::Connected(_));
                 let remote_id = snapshot.remote_id.clone();
                 self.remote_agent_connections.insert(
                     snapshot.remote_id,
@@ -25290,11 +25297,25 @@ fi
                         last_connected,
                     },
                 );
+                // The Connect form closes once the host it saved connects
+                // (TRU-196); the host then shows where the form was opened
+                // from. A failed connect keeps it open with the error.
+                let form_task = if self
+                    .remote_connect_form
+                    .as_ref()
+                    .is_some_and(|form| remote_connect_form_done(form, &remote_id, connected))
+                {
+                    self.remote_connect_form = None;
+                    self.apply_webview_surfaces()
+                } else {
+                    Task::none()
+                };
                 let picker_task = self.folder_picker_home_arrived(&remote_id);
                 // Its running chats: restored chat tabs reattach to theirs.
                 let running_task = self.request_remote_running_chats(&remote_id);
                 return Task::batch([
                     pending_refresh.unwrap_or_else(Task::none),
+                    form_task,
                     picker_task,
                     running_task,
                 ]);
@@ -29707,7 +29728,7 @@ fi
             .push(iced::widget::Space::new().width(Length::Fill))
             .push(
                 button(text("Cancel").size(font_small))
-                    .style(button::text)
+                    .style(button::secondary)
                     .padding([6, 12])
                     .on_press(Event::FolderPickerCancel),
             )
@@ -30363,9 +30384,17 @@ fi
         // Footer
         content_col = content_col.push(
             container(
-                text("Press Option+/ or Esc to close")
-                    .size(12)
-                    .color(text_muted),
+                row![
+                    text("Press Option+/ or Esc to close")
+                        .size(12)
+                        .color(text_muted),
+                    iced::widget::Space::new().width(Length::Fill),
+                    button(text("Close").size(12).font(mono))
+                        .style(self.ghost_button_style())
+                        .padding([5, 12])
+                        .on_press(Event::ToggleHelp),
+                ]
+                .align_y(iced::Alignment::Center),
             )
             .padding(iced::Padding {
                 top: 12.0,
@@ -30758,7 +30787,7 @@ fi
                 row![
                     iced::widget::Space::new().width(Length::Fill),
                     button(text("Close").size(font_small))
-                        .style(button::text)
+                        .style(button::secondary)
                         .padding([6, 12])
                         .on_press(Event::ParkedListToggle),
                 ]
@@ -43336,6 +43365,21 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn connect_form_closes_only_when_its_saved_host_connects() {
+        let unsaved = RemoteConnectForm::default();
+        assert!(!remote_connect_form_done(&unsaved, "build-host", true));
+        let saved = RemoteConnectForm {
+            saved_remote_id: Some("build-host".to_string()),
+            ..RemoteConnectForm::default()
+        };
+        assert!(remote_connect_form_done(&saved, "build-host", true));
+        // A failed connect keeps the form open with its error.
+        assert!(!remote_connect_form_done(&saved, "build-host", false));
+        // Another host's handshake is not this form's result.
+        assert!(!remote_connect_form_done(&saved, "other-host", true));
+    }
 
     #[test]
     fn bar_hint_centre_is_clamped_to_the_window_or_page() {
