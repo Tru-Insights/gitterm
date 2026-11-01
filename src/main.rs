@@ -62,6 +62,7 @@ use gitterm::gh_identity::GH_ACCOUNT_ENV_KEY;
 use gitterm::harness::{
     HarnessCommand, HarnessEvent, ImageAttachment, RuntimeDecision, TurnStatus, UserPrompt,
 };
+use gitterm::review_pane;
 use gitterm::task_mcp::{
     self, CreateTaskRequest as McpCreateTaskRequest, TaskControlEnvelope, TaskControlOperation,
     TaskControlReply, TaskMcpConnection, TaskStoppingBoundary,
@@ -212,6 +213,8 @@ pub enum AgentIpcMessage {
         tab_id: usize,
         path: PathBuf,
     },
+    /// A message from the review pane's page on the Viewer (TRU-178).
+    Review(gitterm::review_pane::ReviewIpc),
     /// A global shortcut typed while the chat page had keyboard focus, so
     /// the key never reached the Iced key handler (TRU-140). Only chords
     /// `global_shortcut` knows get here.
@@ -1024,6 +1027,27 @@ fn agent_ipc_handler() -> webview::IpcHandler {
     })
 }
 
+/// The Viewer surface's IPC handler, installed whatever the Viewer shows
+/// first (wry cannot add one later). Only the review pane's page posts
+/// (TRU-178); its messages join the agent IPC channel, and main.rs acts on
+/// them only while that pane, with that token, is showing.
+fn viewer_ipc_handler() -> webview::IpcHandler {
+    Box::new(|body: String| {
+        let Some(tx) = AGENT_IPC_TX.get() else {
+            eprintln!("[review-ipc] tx not initialized; dropping {body}");
+            return;
+        };
+        match gitterm::review_pane::parse_ipc(&body) {
+            Ok(message) => {
+                if tx.send(AgentIpcMessage::Review(message)).is_err() {
+                    eprintln!("[review-ipc] channel closed; dropping {body}");
+                }
+            }
+            Err(error) => eprintln!("[review-ipc] {error}"),
+        }
+    })
+}
+
 fn start_freeze_watchdog() {
     if !freeze_debug_enabled() {
         return;
@@ -1736,30 +1760,24 @@ enum GitSelection {
     Branch(String),
 }
 
-/// A whole-checkout diff opened from a Workspace overview branch row
-/// (TRU-167). Shown by the diff panel, its lines in the tab's `diff_lines`.
+/// The review pane (TRU-178): a Workspace overview branch row's checkout,
+/// read as a structured diff and shown on the Viewer surface. Lives while
+/// the Viewer shows it (`ViewerWebview::Review`).
 #[derive(Debug, Clone)]
-struct BranchDiffView {
-    checkout: PathBuf,
-    repo_name: String,
-    branch: String,
-    owner: String,
-    base: Option<overview::BaseChoice>,
+struct ReviewPaneState {
+    target: review_pane::ReviewTarget,
     source: overview::DiffSource,
+    /// Which load this pane waits for.
     generation: u64,
-    files: usize,
-    truncated: bool,
-    merge_base: Option<String>,
+    /// Stamped on every message from this page; others are dropped.
+    token: String,
+    /// The page's CSP nonce.
+    nonce: String,
+    /// "Hide tests & generated", kept across a source switch.
+    hide_noise: bool,
+    /// The diff and the canonical checkout its viewed marks are keyed by.
+    loaded: Option<(review_pane::ReviewDiff, PathBuf)>,
     error: Option<String>,
-}
-
-/// A loaded branch diff, already shaped for the diff panel.
-#[derive(Debug, Clone)]
-pub struct BranchDiffPayload {
-    lines: Vec<DiffLine>,
-    files: usize,
-    truncated: bool,
-    merge_base: Option<String>,
 }
 
 /// Whose overview a state is. A folder-scoped workspace reads the chats in
@@ -4291,9 +4309,6 @@ struct TabState {
     diff_load_started_at: Option<Instant>,
     diff_syntax_lines: Option<Vec<Vec<SyntaxHighlightSegment>>>,
     diff_syntax_notice: Option<String>,
-    /// Workspace overview branch diff on screen (TRU-167); `selected_file`
-    /// is then None.
-    branch_diff: Option<BranchDiffView>,
     // For keyboard navigation
     file_index: i32,
     // Track when tab was created for delayed terminal display
@@ -4393,7 +4408,6 @@ impl TabState {
             diff_load_started_at: None,
             diff_syntax_lines: None,
             diff_syntax_notice: None,
-            branch_diff: None,
             file_index: -1,
             created_at: Instant::now(),
             sidebar_mode: SidebarMode::Git,
@@ -4571,10 +4585,9 @@ impl TabState {
         self.sidebar_mode == SidebarMode::Chats && self.selected_chat.is_none()
     }
 
-    /// The diff panel covers the main pane: a Git file diff or a Workspace
-    /// overview branch diff (TRU-167).
+    /// The diff panel covers the main pane: a Git file diff.
     fn diff_panel_open(&self) -> bool {
-        self.selected_file.is_some() || self.branch_diff.is_some()
+        self.selected_file.is_some()
     }
 
     fn viewing_file_path(&self) -> Option<&Path> {
@@ -6242,9 +6255,12 @@ pub enum Event {
     NewWorkCancel,
     /// PRs of the work: watch, merge plans, Approve / Merge (TRU-173).
     Pr(PrEvent),
-    /// Open the diff panel on an owned checkout.
-    BranchDiffOpen(PathBuf, overview::DiffSource),
-    BranchDiffLoaded(usize, u64, Result<BranchDiffPayload, String>),
+    /// Open the review pane on an owned checkout (TRU-178).
+    ReviewOpen(PathBuf, overview::DiffSource),
+    /// A review load finished, for this generation.
+    ReviewLoaded(u64, Box<Result<review_pane::ReviewLoad, String>>),
+    /// The review pane's Close (the Iced header or Escape).
+    ReviewClose,
     /// Fold or unfold a root chat's children in the Chats panel.
     ToggleChatChildren(chats::ChatRef),
     ChatsQueryChanged(String),
@@ -6635,8 +6651,12 @@ struct App {
     prs: work_prs::PrsState,
     /// `github-accounts.json` (shared config dir): gh account per GitHub owner.
     github_accounts: std::collections::BTreeMap<String, String>,
-    /// Generation counter for branch diff loads.
-    branch_diff_generation: u64,
+    /// The review pane (TRU-178) while the Viewer shows it.
+    review_pane: Option<ReviewPaneState>,
+    /// Generation counter for review loads.
+    review_generation: u64,
+    /// `review-viewed.json`, read on first use; an `Err` is never written.
+    review_marks: Option<Result<review_pane::ViewedMarks, String>>,
     chat_index_loading: bool,
     chat_index_loaded_at: Option<Instant>,
     chat_query: String,
@@ -6793,6 +6813,8 @@ enum ViewerWebview {
     File,
     /// Plans viewer — URL-loaded surface served by warp on localhost.
     PlansViewer,
+    /// The review pane (TRU-178), state in `App::review_pane`.
+    Review,
 }
 
 /// What the active tab needs from the webview surfaces.
@@ -12971,9 +12993,10 @@ impl App {
         self.start_workspace_overview_refresh(&dir, mode)
     }
 
-    /// Opens the diff panel on an owned checkout of the active workspace's
-    /// overview. The diff is read and shaped off the UI thread.
-    fn open_branch_diff(&mut self, checkout: PathBuf, source: overview::DiffSource) -> Task<Event> {
+    /// Opens the review pane (TRU-178) on an owned checkout of the active
+    /// workspace's overview: a loading page at once in the Viewer surface,
+    /// the diff read off the UI thread.
+    fn open_review(&mut self, checkout: PathBuf, source: overview::DiffSource) -> Task<Event> {
         let Some(row) = self.overview_key().and_then(|dir| {
             self.workspace_overviews.get(&dir).and_then(|state| {
                 state
@@ -12985,23 +13008,15 @@ impl App {
         }) else {
             return Task::none();
         };
-        self.dismiss_viewer_surface();
-        self.branch_diff_generation += 1;
-        let generation = self.branch_diff_generation;
-        let Some(tab) = self.active_tab_mut() else {
-            return Task::none();
-        };
-        tab.close_file_viewer();
-        tab.selected_file = None;
-        tab.file_index = -1;
-        tab.diff_lines.clear();
-        tab.diff_syntax_lines = None;
-        tab.diff_syntax_notice = None;
-        tab.diff_load_in_progress = true;
-        tab.diff_load_started_at = Some(Instant::now());
-        tab.branch_diff = Some(BranchDiffView {
-            checkout: checkout.clone(),
-            repo_name: overview::folder_name(&row.owned.repo),
+        // Reopening the same checkout keeps the toggle where it was.
+        let hide_noise = self
+            .review_pane
+            .as_ref()
+            .filter(|pane| pane.target.checkout == checkout)
+            .is_none_or(|pane| pane.hide_noise);
+        let target = review_pane::ReviewTarget {
+            checkout,
+            repo: overview::folder_name(&row.owned.repo),
             branch: row
                 .owned
                 .branch
@@ -13009,35 +13024,222 @@ impl App {
                 .unwrap_or_else(|| "(detached)".to_string()),
             owner: row.owner_label(),
             base: row.base.clone(),
+        };
+        self.start_review(target, source, hide_noise)
+    }
+
+    /// Shows the review pane's loading page for `target` and starts reading
+    /// its diff for `source`. A newer start supersedes an older load.
+    fn start_review(
+        &mut self,
+        target: review_pane::ReviewTarget,
+        source: overview::DiffSource,
+        hide_noise: bool,
+    ) -> Task<Event> {
+        self.review_generation += 1;
+        let generation = self.review_generation;
+        self.review_pane = Some(ReviewPaneState {
+            target: target.clone(),
             source,
             generation,
-            files: 0,
-            truncated: false,
-            merge_base: None,
+            token: uuid::Uuid::new_v4().simple().to_string(),
+            nonce: uuid::Uuid::new_v4().simple().to_string(),
+            hide_noise,
+            loaded: None,
             error: None,
         });
-        let tab_id = tab.id;
-        self.settle_agent_surface();
-        let base = row.base.map(|base| base.reference);
-        Task::perform(
-            async move {
-                let diff = overview::load_branch_diff(checkout, source, base).await?;
-                tokio::task::spawn_blocking(move || {
-                    let mut lines: Vec<DiffLine> =
-                        diff.lines.into_iter().map(services::diff_line).collect();
-                    add_word_diffs_to_lines(&mut lines);
-                    BranchDiffPayload {
-                        lines,
-                        files: diff.files,
-                        truncated: diff.truncated,
-                        merge_base: diff.merge_base,
+        let show = self.show_review_page();
+        let load = Task::perform(review_pane::load_review(target, source), move |result| {
+            Event::ReviewLoaded(generation, Box::new(result))
+        });
+        Task::batch([show, load])
+    }
+
+    /// The checkout the open review pane shows, for the overview's
+    /// selected row.
+    fn open_review_checkout(&self) -> Option<&Path> {
+        self.review_pane
+            .as_ref()
+            .filter(|_| self.viewer_webview == ViewerWebview::Review)
+            .map(|pane| pane.target.checkout.as_path())
+    }
+
+    fn review_loaded(
+        &mut self,
+        generation: u64,
+        result: Result<review_pane::ReviewLoad, String>,
+    ) -> Task<Event> {
+        if self.viewer_webview != ViewerWebview::Review
+            || self
+                .review_pane
+                .as_ref()
+                .is_none_or(|pane| pane.generation != generation)
+        {
+            return Task::none();
+        }
+        let loaded = match result {
+            Ok(load) => {
+                if let Some(live) = &load.live_paths {
+                    match self.review_marks() {
+                        Ok(marks) => {
+                            if marks.prune(&load.canonical_checkout, live) {
+                                if let Err(error) = marks.save(&config::global_config_dir()) {
+                                    eprintln!("[review] {error}");
+                                }
+                            }
+                        }
+                        Err(error) => eprintln!("[review] viewed marks unavailable: {error}"),
                     }
+                }
+                Ok((load.diff, load.canonical_checkout))
+            }
+            Err(error) => {
+                eprintln!("[review] loading the review failed: {error}");
+                Err(error)
+            }
+        };
+        if let Some(pane) = self.review_pane.as_mut() {
+            match loaded {
+                Ok(loaded) => {
+                    pane.loaded = Some(loaded);
+                    pane.error = None;
+                }
+                Err(error) => {
+                    pane.loaded = None;
+                    pane.error = Some(error);
+                }
+            }
+        }
+        self.show_review_page()
+    }
+
+    /// The viewed marks, read from the shared config dir on first use (and
+    /// again after a failure). `Err` when the file cannot be read or parsed:
+    /// marks are then neither shown nor written, so it is never overwritten.
+    fn review_marks(&mut self) -> Result<&mut review_pane::ViewedMarks, String> {
+        if !matches!(self.review_marks, Some(Ok(_))) {
+            self.review_marks = Some(review_pane::ViewedMarks::load(&config::global_config_dir()));
+        }
+        match self.review_marks.as_mut() {
+            Some(Ok(marks)) => Ok(marks),
+            Some(Err(error)) => Err(error.clone()),
+            None => unreachable!("review marks were just loaded"),
+        }
+    }
+
+    /// Renders the open review pane into the Viewer surface.
+    fn show_review_page(&mut self) -> Task<Event> {
+        if let Err(error) = self.review_marks() {
+            eprintln!("[review] viewed marks unavailable: {error}");
+        }
+        let Some(pane) = self.review_pane.as_ref() else {
+            return Task::none();
+        };
+        let marks = self
+            .review_marks
+            .as_ref()
+            .and_then(|marks| marks.as_ref().ok());
+        let viewed: Vec<review_pane::ViewedState> = match &pane.loaded {
+            Some((diff, canonical)) => diff
+                .files
+                .iter()
+                .map(|file| {
+                    marks.map_or(review_pane::ViewedState::Unviewed, |marks| {
+                        marks.state(canonical, file)
+                    })
                 })
-                .await
-                .map_err(|error| format!("shaping the diff failed: {error}"))
+                .collect(),
+            None => Vec::new(),
+        };
+        let state = match (&pane.loaded, &pane.error) {
+            (Some((diff, _)), _) => review_pane::PageState::Ready {
+                diff,
+                viewed: &viewed,
             },
-            move |result| Event::BranchDiffLoaded(tab_id, generation, result),
-        )
+            (None, Some(error)) => review_pane::PageState::Error(error),
+            (None, None) => review_pane::PageState::Loading,
+        };
+        let html = review_pane::render_page(&review_pane::ReviewPage {
+            target: &pane.target,
+            source: pane.source,
+            state,
+            dark: self.theme == AppTheme::Dark,
+            hide_noise: pane.hide_noise,
+            token: &pane.token,
+            nonce: &pane.nonce,
+        });
+        let bounds = self.calculate_webview_bounds();
+        self.show_viewer_html(html, bounds, ViewerWebview::Review)
+    }
+
+    /// A message from the review page. Dropped unless the pane is showing
+    /// and the message carries its token.
+    fn handle_review_ipc(&mut self, message: review_pane::ReviewIpc) -> Task<Event> {
+        use review_pane::ReviewIpc;
+        let Some(pane) = self
+            .review_pane
+            .as_ref()
+            .filter(|_| self.viewer_webview == ViewerWebview::Review)
+            .filter(|pane| pane.token == message.token())
+        else {
+            eprintln!(
+                "[review] dropping a message for a review pane that is not open: {message:?}"
+            );
+            return Task::none();
+        };
+        match message {
+            ReviewIpc::SetSource {
+                source, hide_noise, ..
+            } => {
+                if source == overview::DiffSource::VsBase && pane.target.base.is_none() {
+                    eprintln!(
+                        "[review] {} has no base to compare with",
+                        pane.target.checkout.display()
+                    );
+                    return Task::none();
+                }
+                let target = pane.target.clone();
+                self.start_review(target, source, hide_noise)
+            }
+            ReviewIpc::SetViewed { path, viewed, .. } => {
+                let Some((file, canonical)) = pane.loaded.as_ref().and_then(|(diff, canonical)| {
+                    diff.file(&path)
+                        .map(|file| (file.clone(), canonical.clone()))
+                }) else {
+                    eprintln!("[review] viewed: {path} is not in the review");
+                    return Task::none();
+                };
+                match self.review_marks() {
+                    Ok(marks) => {
+                        if !marks.set(&canonical, &file, viewed) {
+                            eprintln!("[review] {path} has no content hash; not marked viewed");
+                        } else if let Err(error) = marks.save(&config::global_config_dir()) {
+                            eprintln!("[review] {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("[review] viewed marks unavailable: {error}"),
+                }
+                Task::none()
+            }
+            ReviewIpc::Close { .. } => self.present_active_tab_surfaces(),
+            ReviewIpc::OpenFile { path, .. } => {
+                let Some(file) = pane.loaded.as_ref().and_then(|(diff, _)| diff.file(&path)) else {
+                    eprintln!("[review] open: {path} is not in the review");
+                    return Task::none();
+                };
+                if file.status == review_pane::FileStatus::Deleted {
+                    eprintln!("[review] open: {path} was deleted");
+                    return Task::none();
+                }
+                let full = pane.target.checkout.join(&path);
+                if !full.is_file() {
+                    eprintln!("[review] open: {} is not a file", full.display());
+                    return Task::none();
+                }
+                let close = self.present_active_tab_surfaces();
+                Task::batch([close, Task::done(Event::ViewFile(SourcePath::Local(full)))])
+            }
+        }
     }
 
     fn request_chat_preview(
@@ -15615,7 +15817,9 @@ impl App {
             parked_list_open: false,
             prs: work_prs::PrsState::load(&config::global_config_dir()),
             github_accounts: config::load_github_accounts(),
-            branch_diff_generation: 0,
+            review_pane: None,
+            review_generation: 0,
+            review_marks: None,
             chat_index_loading: false,
             chat_index_loaded_at: None,
             chat_query: String::new(),
@@ -19534,6 +19738,7 @@ fi
                         webview::paste_into_agent_page(tab_id);
                         Task::none()
                     }
+                    AgentIpcMessage::Review(message) => self.handle_review_ipc(message),
                 };
             }
             Event::AgentSubmitPrompt(tab_id, prompt) => {
@@ -21671,7 +21876,6 @@ fi
             Event::ClearSelection => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.selected_file = None;
-                    tab.branch_diff = None;
                     tab.file_index = -1;
                     tab.diff_lines.clear();
                     tab.diff_load_in_progress = false;
@@ -21847,6 +22051,14 @@ fi
                     return self.update(Event::ClosePlansViewer);
                 }
 
+                // Review pane: Escape closes it (the page handles Escape
+                // itself while it has keyboard focus).
+                if self.viewer_webview == ViewerWebview::Review
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    return self.update(Event::ReviewClose);
+                }
+
                 if self.task_tab_close_prompt.is_some() {
                     if matches!(key.as_ref(), Key::Named(key::Named::Escape)) {
                         self.task_tab_close_prompt = None;
@@ -22008,13 +22220,6 @@ fi
                     if tab.sidebar_mode == SidebarMode::Chats && tab.selected_chat.is_some() {
                         if let Key::Named(key::Named::Escape) = key.as_ref() {
                             return Task::done(Event::CloseChatPreview);
-                        }
-                    }
-
-                    // Escape closes a Workspace overview branch diff.
-                    if tab.branch_diff.is_some() {
-                        if let Key::Named(key::Named::Escape) = key.as_ref() {
-                            return Task::done(Event::ClearSelection);
                         }
                     }
 
@@ -24445,43 +24650,18 @@ fi
                 self.new_work_form = None;
                 return Task::batch([self.apply_webview_surfaces(), self.focus_main_terminal()]);
             }
-            Event::BranchDiffOpen(checkout, source) => {
-                return self.open_branch_diff(checkout, source);
+            Event::ReviewOpen(checkout, source) => {
+                return self.open_review(checkout, source);
             }
-            Event::Pr(event) => return self.update_prs(event),
-            Event::BranchDiffLoaded(tab_id, generation, result) => {
-                let Some(tab) = self
-                    .workspaces
-                    .iter_mut()
-                    .flat_map(|ws| ws.tabs.iter_mut())
-                    .find(|tab| tab.id == tab_id)
-                else {
-                    return Task::none();
-                };
-                let Some(view) = tab
-                    .branch_diff
-                    .as_mut()
-                    .filter(|view| view.generation == generation)
-                else {
-                    return Task::none();
-                };
-                tab.diff_load_in_progress = false;
-                tab.diff_load_started_at = None;
-                match result {
-                    Ok(payload) => {
-                        view.files = payload.files;
-                        view.truncated = payload.truncated;
-                        view.merge_base = payload.merge_base;
-                        view.error = None;
-                        tab.diff_lines = payload.lines;
-                    }
-                    Err(error) => {
-                        eprintln!("[workspace-overview] branch diff: {error}");
-                        view.error = Some(error);
-                        tab.diff_lines.clear();
-                    }
+            Event::ReviewLoaded(generation, result) => {
+                return self.review_loaded(generation, *result);
+            }
+            Event::ReviewClose => {
+                if self.viewer_webview == ViewerWebview::Review {
+                    return self.present_active_tab_surfaces();
                 }
             }
+            Event::Pr(event) => return self.update_prs(event),
             Event::ToggleChatOpenSection => {
                 self.chat_open_section_collapsed = !self.chat_open_section_collapsed;
             }
@@ -26199,8 +26379,17 @@ fi
     /// file HTML loaded or its chat created / replayed.
     fn dismiss_viewer_surface(&mut self) {
         webview::set_visible(WebviewSurface::Viewer, false);
-        self.viewer_webview = ViewerWebview::None;
+        self.set_viewer_webview(ViewerWebview::None);
         self.settle_agent_surface();
+    }
+
+    /// Record what the Viewer surface presents. The review pane's state
+    /// (TRU-178) lives only while the Viewer shows it.
+    fn set_viewer_webview(&mut self, viewer: ViewerWebview) {
+        self.viewer_webview = viewer;
+        if viewer != ViewerWebview::Review {
+            self.review_pane = None;
+        }
     }
 
     /// Body of `Event::SetSidebarMode`; the caller settles the Agent
@@ -26234,12 +26423,6 @@ fi
             if tab.sidebar_mode != mode {
                 if mode == SidebarMode::Chats {
                     tab.sidebar_mode_before_chats = tab.sidebar_mode;
-                }
-                // A branch diff belongs to the Workspace overview.
-                if tab.branch_diff.take().is_some() {
-                    tab.diff_lines.clear();
-                    tab.diff_load_in_progress = false;
-                    tab.diff_load_started_at = None;
                 }
                 if active_workspace_is_remote
                     && !active_workspace_is_remote_agent
@@ -26517,7 +26700,7 @@ fi
             return self.show_webview(html, bounds);
         }
         webview::set_visible(WebviewSurface::Viewer, false);
-        self.viewer_webview = ViewerWebview::None;
+        self.set_viewer_webview(ViewerWebview::None);
         self.apply_webview_surfaces()
     }
 
@@ -26575,6 +26758,18 @@ fi
     /// (markdown, excalidraw, html file viewer). The agent pages are only
     /// hidden, never destroyed, so their chat DOM survives the visit.
     fn show_webview(&mut self, html: String, bounds: (f32, f32, f32, f32)) -> Task<Event> {
+        self.show_viewer_html(html, bounds, ViewerWebview::File)
+    }
+
+    /// `show_webview` for any HTML the Viewer presents (`viewer` says what).
+    /// The Viewer is always built with `viewer_ipc_handler`, which only the
+    /// review pane's page uses (TRU-178).
+    fn show_viewer_html(
+        &mut self,
+        html: String,
+        bounds: (f32, f32, f32, f32),
+        viewer: ViewerWebview,
+    ) -> Task<Event> {
         perf_log!(
             "webview mode={} html_bytes={} bounds=({}, {}, {}, {})",
             if webview::is_active(WebviewSurface::Viewer) {
@@ -26589,7 +26784,7 @@ fi
             bounds.3
         );
         webview::hide_agent_pages();
-        self.viewer_webview = ViewerWebview::File;
+        self.set_viewer_webview(viewer);
         // Reuse the existing WebView when possible to avoid expensive recreation churn.
         if webview::is_active(WebviewSurface::Viewer) {
             webview::update_bounds(
@@ -26605,7 +26800,12 @@ fi
             return Task::none();
         }
 
-        webview::set_pending_content(WebviewSurface::Viewer, html, bounds);
+        webview::set_pending_content_with_ipc(
+            WebviewSurface::Viewer,
+            html,
+            bounds,
+            Some(viewer_ipc_handler()),
+        );
         Self::create_staged_viewer_surface()
     }
 
@@ -26679,7 +26879,7 @@ fi
             bounds.3
         );
         webview::hide_agent_pages();
-        self.viewer_webview = ViewerWebview::PlansViewer;
+        self.set_viewer_webview(ViewerWebview::PlansViewer);
         if webview::is_active(WebviewSurface::Viewer) {
             webview::update_bounds(
                 WebviewSurface::Viewer,
@@ -26693,7 +26893,12 @@ fi
             return Task::none();
         }
 
-        webview::set_pending_url(WebviewSurface::Viewer, url, bounds);
+        webview::set_pending_url_with_ipc(
+            WebviewSurface::Viewer,
+            url,
+            bounds,
+            Some(viewer_ipc_handler()),
+        );
         Self::create_staged_viewer_surface()
     }
 
@@ -27092,6 +27297,9 @@ fi
         main_col = main_col.push(tab_bar);
         if self.viewer_webview == ViewerWebview::PlansViewer {
             main_col = main_col.push(self.view_plans_viewer_header());
+        }
+        if self.viewer_webview == ViewerWebview::Review {
+            main_col = main_col.push(self.view_review_header());
         }
         main_col = main_col.push(content);
 
@@ -28011,6 +28219,44 @@ fi
                 .style(ghost)
                 .padding([4, 12])
                 .on_press(Event::ClosePlansViewer),
+        ]
+        .padding(8)
+        .spacing(8);
+        container(header)
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(header_bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// Header strip above the review pane (TRU-178), in the 40px
+    /// `calculate_webview_bounds` reserves, like the plans viewer's. The
+    /// page's own toolbar carries the branch, base, switch and totals.
+    fn view_review_header(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let header_bg = theme.bg_overlay();
+        let title = match &self.review_pane {
+            Some(pane) => format!(
+                "Review \u{00B7} {} \u{00B7} {}",
+                pane.target.repo, pane.target.branch
+            ),
+            None => "Review".to_string(),
+        };
+        let header = row![
+            text(title).size(font).color(theme.text_primary()),
+            iced::widget::Space::new().width(Length::Fill),
+            text("Esc: close")
+                .size(font_small)
+                .color(theme.text_secondary()),
+            iced::widget::Space::new().width(Length::Fixed(8.0)),
+            button(text("Close").size(font))
+                .style(self.ghost_button_style())
+                .padding([4, 12])
+                .on_press(Event::ReviewClose),
         ]
         .padding(8)
         .spacing(8);
@@ -32241,7 +32487,7 @@ fi
             }
             SidebarMode::Workspace => {
                 freeze_time!("view_workspace_overview", {
-                    self.view_workspace_overview(tab)
+                    self.view_workspace_overview()
                 })
             }
         };
@@ -32494,10 +32740,7 @@ fi
     /// screen h's branch rows): the workspace's coordinators and fan-out,
     /// the repos it edited with the branches it owns, and its issue keys.
     /// A pure render over `workspace_overviews`; git is read by the poller.
-    fn view_workspace_overview<'a>(
-        &'a self,
-        tab: &'a TabState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
+    fn view_workspace_overview<'a>(&'a self) -> Element<'a, Event, Theme, iced::Renderer> {
         const COORDINATOR_ROWS: usize = 12;
         const OLDER_ROWS: usize = 20;
         let theme = &self.theme;
@@ -32847,7 +33090,7 @@ fi
                 groups.len()
             )));
             let home = dirs::home_dir();
-            let selected = tab.branch_diff.as_ref().map(|view| view.checkout.as_path());
+            let selected = self.open_review_checkout();
             let mut repos = Column::new().spacing(6);
             for (repo, edits, rows) in groups {
                 // Worktrees git still lists whose folder is gone: one dim
@@ -33114,7 +33357,7 @@ fi
 
     /// One owned checkout: branch and dirty count, then checkout, ahead and
     /// behind its base, push state, PR when known, owner and last activity.
-    /// Opens the branch diff: Uncommitted when dirty, else vs base.
+    /// Opens the review pane (TRU-178): Uncommitted when dirty, else vs base.
     fn view_overview_branch_row<'a>(
         &'a self,
         row: &'a overview::BranchStatus,
@@ -33191,7 +33434,7 @@ fi
                 },
                 ..Default::default()
             })
-            .on_press(Event::BranchDiffOpen(row.owned.checkout.clone(), source))
+            .on_press(Event::ReviewOpen(row.owned.checkout.clone(), source))
             .into()
     }
 
@@ -40862,26 +41105,22 @@ fi
 
         // Header
         let header_bg = theme.bg_overlay();
-        let header: Element<'_, Event, Theme, iced::Renderer> = match &tab.branch_diff {
-            Some(view) => self.view_branch_diff_header(view),
-            None => row![
-                text(tab.selected_file.as_deref().unwrap_or(""))
-                    .size(font)
-                    .color(theme.text_primary()),
-                iced::widget::Space::new().width(Length::Fill),
-                text("j/k: navigate  Esc: back")
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-                iced::widget::Space::new().width(Length::Fixed(16.0)),
-                button(text("Back to Terminal").size(font))
-                    .style(self.ghost_button_style())
-                    .padding([4, 12])
-                    .on_press(Event::ClearSelection),
-            ]
-            .padding(8)
-            .spacing(8)
-            .into(),
-        };
+        let header = row![
+            text(tab.selected_file.as_deref().unwrap_or(""))
+                .size(font)
+                .color(theme.text_primary()),
+            iced::widget::Space::new().width(Length::Fill),
+            text("j/k: navigate  Esc: back")
+                .size(font_small)
+                .color(theme.text_secondary()),
+            iced::widget::Space::new().width(Length::Fixed(16.0)),
+            button(text("Back to Terminal").size(font))
+                .style(self.ghost_button_style())
+                .padding([4, 12])
+                .on_press(Event::ClearSelection),
+        ]
+        .padding(8)
+        .spacing(8);
 
         content =
             content.push(
@@ -40908,35 +41147,13 @@ fi
                         .color(theme.text_secondary()),
                 );
             }
-        } else if let Some(error) = tab
-            .branch_diff
-            .as_ref()
-            .and_then(|view| view.error.as_ref())
-        {
-            diff_column = diff_column.push(text(error.clone()).size(font).color(theme.danger()));
         } else if tab.diff_lines.is_empty() {
-            let empty = match tab.branch_diff.as_ref() {
-                Some(view) => match (view.source, &view.base) {
-                    (overview::DiffSource::Uncommitted, _) => "No uncommitted changes".to_string(),
-                    (overview::DiffSource::VsBase, Some(base)) => {
-                        format!("No changes against {}", base.reference)
-                    }
-                    (overview::DiffSource::VsBase, None) => "No base branch".to_string(),
-                },
-                None => "No diff available".to_string(),
-            };
-            diff_column = diff_column.push(text(empty).size(font).color(theme.text_secondary()));
+            diff_column = diff_column.push(
+                text("No diff available")
+                    .size(font)
+                    .color(theme.text_secondary()),
+            );
         } else {
-            if tab.branch_diff.as_ref().is_some_and(|view| view.truncated) {
-                diff_column = diff_column.push(
-                    text(format!(
-                        "Diff cut at its first {} lines.",
-                        overview::DIFF_LINE_CAP
-                    ))
-                    .size(font_small)
-                    .color(theme.warning()),
-                );
-            }
             let total_lines = tab.diff_lines.len();
             let rendered_lines = total_lines.min(MAX_DIFF_VIEW_RENDER_LINES);
             if total_lines > rendered_lines {
@@ -41003,117 +41220,6 @@ fi
                 ..Default::default()
             })
             .into()
-    }
-
-    /// Diff panel header for a Workspace overview branch diff (TRU-167):
-    /// branch and repo, the two sources, owner and the base with where it
-    /// came from, so the comparison is never a guess.
-    fn view_branch_diff_header<'a>(
-        &'a self,
-        view: &'a BranchDiffView,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-        let mono = iced::Font::with_name("Menlo");
-        let surface0 = theme.surface0();
-        let hover = theme.bg_crust();
-        let border = theme.border();
-        let text_primary = theme.text_primary();
-        let text_muted = theme.text_muted();
-        let source_button = |label: String, source: overview::DiffSource, enabled: bool| {
-            let active = view.source == source;
-            let mut btn = button(text(label).size(font_small).font(mono))
-                .style(move |_, status| button::Style {
-                    background: Some(
-                        if active {
-                            surface0
-                        } else if matches!(status, button::Status::Hovered) {
-                            hover
-                        } else {
-                            iced::Color::TRANSPARENT
-                        }
-                        .into(),
-                    ),
-                    text_color: if active { text_primary } else { text_muted },
-                    border: iced::Border {
-                        color: border,
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                })
-                .padding([3, 8]);
-            if enabled && !active {
-                btn = btn.on_press(Event::BranchDiffOpen(view.checkout.clone(), source));
-            }
-            btn
-        };
-        let vs_label = match &view.base {
-            Some(base) => format!("vs {}", base.reference),
-            None => "vs base".to_string(),
-        };
-        let top = row![
-            text(format!("\u{2387} {}", view.branch))
-                .size(font)
-                .color(text_primary)
-                .font(mono),
-            text(format!("\u{00B7} {}", view.repo_name))
-                .size(font_small)
-                .color(text_muted),
-            iced::widget::Space::new().width(Length::Fill),
-            source_button(
-                "Uncommitted".to_string(),
-                overview::DiffSource::Uncommitted,
-                true
-            ),
-            source_button(vs_label, overview::DiffSource::VsBase, view.base.is_some()),
-            iced::widget::Space::new().width(Length::Fixed(12.0)),
-            text("Esc: back")
-                .size(font_small)
-                .color(theme.text_secondary()),
-            button(text("Back").size(font))
-                .style(self.ghost_button_style())
-                .padding([4, 12])
-                .on_press(Event::ClearSelection),
-        ]
-        .spacing(6)
-        .align_y(iced::Alignment::Center);
-        let mut facts = vec![
-            view.checkout.display().to_string(),
-            format!("owner: {}", view.owner),
-        ];
-        match &view.base {
-            Some(base) => {
-                let mut copy = format!("base {} ({})", base.reference, base.describe());
-                if let (overview::DiffSource::VsBase, Some(merge_base)) =
-                    (view.source, &view.merge_base)
-                {
-                    copy.push_str(&format!(" @ {merge_base} (merge-base)"));
-                }
-                facts.push(copy);
-            }
-            None => facts.push(
-                "no base: no task base, tracked branch, or develop/main/master/trunk here"
-                    .to_string(),
-            ),
-        }
-        if view.files > 0 {
-            facts.push(format!(
-                "{} file{}",
-                view.files,
-                if view.files == 1 { "" } else { "s" }
-            ));
-        }
-        column![
-            top,
-            text(facts.join(" \u{00B7} "))
-                .size(font_small - 1.0)
-                .color(text_muted),
-        ]
-        .spacing(4)
-        .padding(8)
-        .into()
     }
 
     fn view_diff_line<'a>(
@@ -44636,7 +44742,11 @@ mod tests {
 
     #[test]
     fn viewer_surface_wins_over_agent_chat() {
-        for viewer in [ViewerWebview::File, ViewerWebview::PlansViewer] {
+        for viewer in [
+            ViewerWebview::File,
+            ViewerWebview::PlansViewer,
+            ViewerWebview::Review,
+        ] {
             for active in [
                 ActiveTabSurface::Other,
                 ActiveTabSurface::AgentChat(7),
@@ -44678,6 +44788,7 @@ mod tests {
             ViewerWebview::None,
             ViewerWebview::File,
             ViewerWebview::PlansViewer,
+            ViewerWebview::Review,
         ] {
             assert_eq!(
                 visible_webview_surface(viewer, ActiveTabSurface::AgentChat(1), true),
@@ -44731,7 +44842,11 @@ mod tests {
     fn the_usage_view_hides_every_surface_like_the_attention_view() {
         // App::visible_webview_surface passes attention || usage open.
         for active in [ActiveTabSurface::AgentChat(2), ActiveTabSurface::Other] {
-            for viewer in [ViewerWebview::File, ViewerWebview::PlansViewer] {
+            for viewer in [
+                ViewerWebview::File,
+                ViewerWebview::PlansViewer,
+                ViewerWebview::Review,
+            ] {
                 assert_eq!(
                     visible_webview_surface(viewer, active, true),
                     VisibleSurface::None
