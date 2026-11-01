@@ -34,7 +34,6 @@ mod source;
 mod webview;
 
 // New modules
-mod agent;
 mod chat_overview;
 mod chat_rank;
 mod chat_summary;
@@ -89,9 +88,7 @@ use gitterm::worktree_follow::{
     self, CacheLookup, WorktreeFollow, WorktreeInfo, WorktreeListCache,
 };
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
-use tab::{
-    AgentActivityState, AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab,
-};
+use tab::{AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab};
 use webview::WebviewSurface;
 use work_prs::PrEvent;
 
@@ -1929,11 +1926,64 @@ struct WorkspaceRename {
 /// piece of work rather than a repo (TRU-169).
 const WORK_FOLDER: &str = "Work";
 
-/// "New workspace…": a piece of work that needs no repo.
+/// "New workspace" (TRU-194, `+`): a sheet for a piece of work. Its
+/// name, optional starting repos (from `known`, filtered by `query`) and
+/// a decisions repo among them.
 #[derive(Debug, Clone, Default)]
-struct NewWorkForm {
+struct NewWorkSheet {
     name: String,
     error: Option<String>,
+    /// This Mac's known repos, read when the sheet opens.
+    known: Vec<PathBuf>,
+    query: String,
+    /// The starting repos, in the order picked.
+    repos: Vec<PathBuf>,
+    decisions_repo: Option<PathBuf>,
+}
+
+/// The New workspace sheet's home preview: `~/Work/<slug>`, live from
+/// the name.
+fn new_work_home_preview(name: &str) -> String {
+    if name.trim().is_empty() {
+        return format!("~/{WORK_FOLDER}/\u{2026}");
+    }
+    format!("~/{WORK_FOLDER}/{}", overview::work_folder_slug(name))
+}
+
+/// What a new piece of work starts with (TRU-194): repos added by hand,
+/// and a decisions repo among them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorkStart {
+    repos: Vec<PathBuf>,
+    decisions_repo: Option<PathBuf>,
+}
+
+impl WorkStart {
+    /// Rejects a decisions repo that is not one of `repos`.
+    fn new(repos: Vec<PathBuf>, decisions_repo: Option<PathBuf>) -> Result<Self, String> {
+        if let Some(dir) = &decisions_repo {
+            if !repos.contains(dir) {
+                return Err(format!(
+                    "The decisions repo {} is not one of the starting repos.",
+                    dir.display()
+                ));
+            }
+        }
+        Ok(Self {
+            repos,
+            decisions_repo,
+        })
+    }
+
+    /// Sets up work `ws` before it opens: each repo is added by hand (so
+    /// it persists) and listed when it opens; the decisions repo is set.
+    fn apply(self, ws: &mut Workspace) {
+        for dir in &self.repos {
+            gitterm::workspace_repos::add_manually(dir, &mut ws.repos_added, &mut ws.repos_removed);
+        }
+        ws.pending_repos = self.repos;
+        ws.decisions_repo = self.decisions_repo;
+    }
 }
 
 fn new_work_name_input_id() -> iced::widget::Id {
@@ -1950,6 +2000,9 @@ struct ParkSheet {
     /// The note as prefilled; while `note` still equals it, a chat index
     /// that lands later may refill it.
     prefilled: String,
+    /// "Keep running" (TRU-186): off by default; only the work Park sheet
+    /// shows it.
+    keep_running: bool,
 }
 
 /// Which sheet × opens (TRU-190). A work workspace parks with a note; a
@@ -1968,6 +2021,110 @@ impl CloseSheetKind {
             Self::Close
         }
     }
+}
+
+/// What parking does with a workspace's processes (TRU-186).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkMode {
+    /// The park of TRU-171: the tabs are kept as config and their
+    /// terminals and chats stop.
+    Stop,
+    /// The workspace leaves the bar with its tabs and processes alive, and
+    /// comes back when one of its chats needs you.
+    KeepRunning,
+}
+
+impl ParkMode {
+    /// Only the work Park sheet offers Keep running; the folder Close
+    /// sheet's Park always stops.
+    fn for_sheet(kind: CloseSheetKind, keep_running: bool) -> Self {
+        if kind == CloseSheetKind::Park && keep_running {
+            Self::KeepRunning
+        } else {
+            Self::Stop
+        }
+    }
+
+    fn stops_processes(self) -> bool {
+        self == Self::Stop
+    }
+}
+
+/// Why a running parked workspace came back to the bar (TRU-186), shown
+/// on its chip until it is visited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeReason {
+    NeedsYou,
+    Finished,
+    Failed,
+}
+
+impl WakeReason {
+    /// The chat attention marks that wake it: a question or permission
+    /// request, a finished turn, an error. Delegation results are not a
+    /// chat of its own asking.
+    fn for_attention(reason: AttentionReason) -> Option<Self> {
+        match reason {
+            AttentionReason::HumanInputRequired => Some(Self::NeedsYou),
+            AttentionReason::CompletedUnread => Some(Self::Finished),
+            AttentionReason::AgentFailed => Some(Self::Failed),
+            AttentionReason::DelegationReady(_)
+            | AttentionReason::DelegationFailed(_)
+            | AttentionReason::DelegationBlocked(_) => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "needs you",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The wake a chat event raises: the attention mark it drives today
+/// (`agent_event_attention_reason`), no detection of its own.
+fn chat_event_wake(event: &tab::AgentEvent) -> Option<WakeReason> {
+    agent_event_attention_reason(event).and_then(WakeReason::for_attention)
+}
+
+/// A running parked workspace as `workspaces.json` stores it (TRU-186):
+/// an ordinary parked entry, since quitting GitTerm stops its processes.
+fn running_parked_config(mut cfg: WorkspaceConfig, info: &ParkedInfo) -> WorkspaceConfig {
+    cfg.active = false;
+    cfg.parked = Some(info.clone());
+    cfg
+}
+
+/// The saved `active_workspace`: the active workspace's index among the
+/// ones the file reopens, which skips the running parked (`parked`, in
+/// Vec order).
+fn persisted_active_index(active: usize, parked: &[bool]) -> usize {
+    parked
+        .iter()
+        .take(active)
+        .filter(|parked| !**parked)
+        .count()
+}
+
+/// The workspace that becomes active when the one at `from` leaves the
+/// bar, by Vec index after the change: the first one on the bar from
+/// `from` on, else the last before it. `parked` marks the ones off the
+/// bar (the leaving one, when it stays in the Vec). With nothing parked
+/// this is what park always did: the next workspace, else the last.
+fn next_on_bar(from: usize, parked: &[bool]) -> Option<usize> {
+    (from..parked.len())
+        .find(|&idx| !parked[idx])
+        .or_else(|| (0..from.min(parked.len())).rev().find(|&idx| !parked[idx]))
+}
+
+/// The open workspace a Parked list row names when it is parked running
+/// (TRU-186).
+fn running_parked_index(workspaces: &[Workspace], key: &ParkedKey) -> Option<usize> {
+    workspaces.iter().position(|ws| {
+        ws.running_park.is_some() && ws.name == key.name && workspace_config_dir(ws) == key.dir
+    })
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -2132,7 +2289,7 @@ fn workspace_rename_input_id() -> iced::widget::Id {
 }
 
 /// A workspace's documents (TRU-191), gathered off the UI thread for the
-/// overview's Documents section and the Plans mode.
+/// overview's Documents section (Work).
 #[derive(Debug, Default)]
 struct WorkDocumentsState {
     result: Option<gitterm::work_documents::ScanResult>,
@@ -2144,8 +2301,6 @@ struct WorkDocumentsState {
 
 /// Visible documents are gathered again after this long.
 const WORK_DOCUMENTS_POLL: Duration = Duration::from_secs(60);
-/// Documents the overview lists before "more in Plans".
-const OVERVIEW_DOCUMENT_ROWS: usize = 8;
 
 /// One workspace's overview (TRU-167): the summary from the chat index and
 /// tasks, and the owned branches' git state from the background poller.
@@ -4314,8 +4469,6 @@ struct TabState {
     attention: Option<TabAttention>,
     // Claude config tree view
     claude_config: ClaudeConfig,
-    // Agent activity sidebar state (shared across tab kinds — see AgentActivityState).
-    agent_sidebar: AgentActivityState,
     // Chat selected in the Chats sidebar; the main pane shows its preview
     // while the Chats mode is active.
     selected_chat: Option<chats::ChatRef>,
@@ -4393,8 +4546,8 @@ impl TabState {
             diff_syntax_notice: None,
             file_index: -1,
             created_at: Instant::now(),
-            sidebar_mode: SidebarMode::Git,
-            sidebar_mode_before_chats: SidebarMode::Git,
+            sidebar_mode: SidebarMode::Workspace,
+            sidebar_mode_before_chats: SidebarMode::Workspace,
             files: FilesState::at(SourcePath::Local(current_dir.clone())),
             current_dir,
             search: SearchState::default(),
@@ -4407,7 +4560,6 @@ impl TabState {
             task_last_activity: None,
             attention: None,
             claude_config: ClaudeConfig::default(),
-            agent_sidebar: AgentActivityState::default(),
             worktree_follow: WorktreeFollow::default(),
             chat_facts: chat_facts::LiveFacts::default(),
             is_git_repo,
@@ -4910,25 +5062,6 @@ impl TabState {
             }
         }
         self.last_poll = Instant::now();
-    }
-
-    fn fetch_agent_activity(&mut self) -> Task<Event> {
-        self.agent_sidebar.loading = true;
-        let tab_id = self.id;
-        let repo_path = self.repo_path.clone();
-        Task::perform(
-            async move {
-                match tokio::task::spawn_blocking(move || {
-                    agent::AgentActivity::load_from_repo(&repo_path)
-                })
-                .await
-                {
-                    Ok(result) => (tab_id, result),
-                    Err(e) => (tab_id, Err(format!("spawn_blocking failed: {}", e))),
-                }
-            },
-            |(tab_id, result)| Event::AgentActivityLoaded(tab_id, result),
-        )
     }
 
     fn fetch_claude_config(&mut self) {
@@ -5698,6 +5831,11 @@ struct Workspace {
     /// The repo team-facing decisions go to (TRU-191), named to the
     /// agents started in this work beside its docs folder.
     decisions_repo: Option<PathBuf>,
+    /// Parked with Keep running (TRU-186): off the bar with its tabs and
+    /// processes alive. Runtime only; saved as an ordinary parked entry.
+    running_park: Option<ParkedInfo>,
+    /// Why it came back from a running park, until it is visited.
+    woke: Option<WakeReason>,
 }
 
 impl Workspace {
@@ -5729,6 +5867,8 @@ impl Workspace {
             guidelines_off: false,
             claude_in_chrome: false,
             decisions_repo: None,
+            running_park: None,
+            woke: None,
         }
     }
 
@@ -5764,6 +5904,8 @@ impl Workspace {
             guidelines_off: false,
             claude_in_chrome: false,
             decisions_repo: None,
+            running_park: None,
+            woke: None,
         }
     }
 
@@ -6143,6 +6285,9 @@ pub enum Event {
     // Sidebar
     ToggleSidebar,
     SetSidebarMode(SidebarMode),
+    /// Open the Git or Files panel on a listed repo (`None`: back to the
+    /// Files roots) (TRU-192).
+    OpenRepoPanel(SidebarMode, Option<PathBuf>),
     TaskCreateOpen,
     TaskCreateCancel,
     TaskTitleChanged(String),
@@ -6246,6 +6391,8 @@ pub enum Event {
     /// × on a workspace: opens the Park sheet (TRU-171).
     WorkspaceClose(usize),
     ParkNoteChanged(String),
+    /// The Park sheet's "Keep running" checkbox (TRU-186).
+    ParkKeepRunningToggled(bool),
     ParkSubmit,
     ParkCancel,
     /// `⏸ n parked`: open or close the Parked list.
@@ -6332,9 +6479,6 @@ pub enum Event {
     /// A workspace dot on the rail was clicked (TRU-148).
     WorkspaceDotPressed(usize),
     // Launch agent preset by index
-    AgentActivityLoaded(usize, Result<agent::AgentActivity, String>),
-    AgentConversationLoaded(usize, agent::Conversation),
-    SelectAgentCapture(usize),
     LaunchAgentPreset(usize),
     RemoteSessionLaunched(Result<(String, String, Option<String>), String>),
     LaunchSessionKind(Option<String>),
@@ -6529,9 +6673,15 @@ pub enum Event {
     WorkspaceRenameInput(String),
     WorkspaceRenameSubmit,
     WorkspaceRenameCancel,
-    /// "New workspace…" (no repo needed): open the name form.
+    /// `+` or "New workspace…": open the New workspace sheet (TRU-194).
     NewWorkOpen,
     NewWorkNameChanged(String),
+    NewWorkQueryChanged(String),
+    /// A known repo was picked (true) or unpicked as a starting repo.
+    NewWorkRepoToggled(PathBuf, bool),
+    NewWorkDecisionsPicked(DecisionsRepoChoice),
+    /// "Open a folder as a repo workspace…": the folder picker instead.
+    NewWorkOpenFolder,
     NewWorkSubmit,
     NewWorkCancel,
     /// PRs of the work: watch, merge plans, Approve / Merge (TRU-173).
@@ -6584,13 +6734,20 @@ pub enum Event {
     ChatOverviewGo(chat_overview::NavTarget),
     /// Fold or unfold the overview's "Idle but open" section.
     ToggleChatOverviewIdle,
-    /// Fold/unfold one machine group in the workspace bar.
-    ToggleMachineGroup(String),
-    /// The bar's `Repos` toggle of a machine group (TRU-175).
+    /// Show or hide a machine group's folder workspaces on the bar
+    /// (TRU-175); from the `Repos ▾` menu since TRU-192.
     ToggleReposZone(String),
-    /// Open/close the machine label menu in the workspace bar.
-    MachineMenuOpen(String),
-    MachineMenuClose,
+    /// Open or close one of the workspace bar's menus (TRU-192).
+    BarMenuToggle(BarMenu),
+    /// The pointer entered a bar item with this hint text (TRU-192).
+    BarHintEnter(String),
+    /// The pointer left the bar item with this hint text.
+    BarHintExit(String),
+    /// The hint delay for this hover has passed.
+    BarHintDue(u64),
+    BarMenuClose,
+    /// A bar menu item: closes the menu, then runs the event.
+    BarMenuRun(Box<Event>),
     /// Jump the Chats panel to one machine's conversations.
     ShowMachineChats(String),
     /// Force a reconnect attempt to a remote agent.
@@ -6670,6 +6827,15 @@ enum BrowserAction {
     Opening,
     Focusing,
     Disconnecting,
+}
+
+/// The workspace bar's menus (TRU-192), anchored above the bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarMenu {
+    /// `Repos ▾`: this Mac's folder workspaces and a section per machine.
+    Repos,
+    /// `⋯`: help and the browser's less common actions.
+    More,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6916,7 +7082,6 @@ struct App {
     remote_sessions: Vec<RemoteSessionEntry>,
     remote_sessions_loading: bool,
     remote_sessions_error: Option<String>,
-    remote_sessions_loaded_at: Option<Instant>,
     // Chats panel (TRU-78): machine-wide conversation index + UI state.
     // App-level because the index spans workspaces; selection is per-tab.
     chat_index: Vec<chats::ChatIndexEntry>,
@@ -6934,8 +7099,8 @@ struct App {
     workspace_rename: Option<WorkspaceRename>,
     /// The Chats preview's "Add to workspace…" picker is open.
     chat_add_to_workspace_open: bool,
-    /// The "New workspace…" name form (TRU-169), when open.
-    new_work_form: Option<NewWorkForm>,
+    /// The New workspace sheet (TRU-194), when open.
+    new_work_sheet: Option<NewWorkSheet>,
     /// The Park sheet × opened (TRU-171), when open.
     park_sheet: Option<ParkSheet>,
     /// The Parked list `⏸ n parked` opens (TRU-171).
@@ -6976,13 +7141,23 @@ struct App {
     chat_backfill_note: Option<String>,
     /// The Chats panel's Open section is folded (TRU-148); per app run.
     chat_open_section_collapsed: bool,
-    /// Workspace-bar machine groups the user folded (session-only).
-    collapsed_machine_groups: std::collections::HashSet<String>,
-    /// Machine groups whose `Repos` zone on the bar is collapsed (TRU-175);
-    /// persisted in workspaces.json.
+    /// Machine groups whose folder workspaces are off the bar (TRU-175);
+    /// persisted in workspaces.json. Since TRU-192 only this Mac's key
+    /// matters: other machines always live in the `Repos ▾` menu.
     collapsed_repo_groups: std::collections::HashSet<String>,
-    /// Machine label menu open in the workspace bar (group key).
-    machine_menu: Option<String>,
+    /// The workspace bar menu that is open (TRU-192).
+    bar_menu: Option<BarMenu>,
+    /// The bar item under the pointer and its hint (TRU-192).
+    bar_hint: Option<BarHint>,
+    /// Bumped on each hover change so a stale delay is ignored.
+    bar_hint_seq: u64,
+    /// The page currently showing the hint, to hide it there.
+    bar_hint_in: Option<WebviewSurface>,
+    /// The pointer's x in window coordinates.
+    cursor_x: f32,
+    /// The listed repo (and the tab) the Git or Files panel shows,
+    /// picked from a repo row in Work or the Files roots (TRU-192).
+    panel_repo: Option<(usize, PathBuf)>,
     /// Per-remote chat indexes (TRU-78 slice 4), keyed by remote id.
     /// Kept when a machine becomes unreachable so Everywhere still shows
     /// its (stale) chats.
@@ -7130,6 +7305,69 @@ enum ActiveTabSurface {
     /// An agent tab whose chat is covered by its file viewer overlay or by
     /// the git diff panel for a selected file.
     AgentFileOverlay,
+}
+
+/// The workspace bar's height in logical pixels, border included.
+const BAR_HEIGHT: f32 = 28.0;
+/// How long the pointer rests on a bar item before its hint shows.
+const BAR_HINT_DELAY: Duration = Duration::from_millis(400);
+const BAR_HINT_HIDE_SCRIPT: &str = "window.__gittermHint && window.__gittermHint(null)";
+
+/// The hover hint of a bar item (TRU-192): its text and the pointer's x in
+/// window coordinates when the pointer entered, which stands for the item's
+/// centre.
+#[derive(Debug, Clone, PartialEq)]
+struct BarHint {
+    text: String,
+    center_x: f32,
+    /// The delay has passed, so the hint is on screen.
+    shown: bool,
+}
+
+/// What draws the bar hint: an Iced overlay, or a page's `__gittermHint`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarHintTarget {
+    Iced,
+    Webview(WebviewSurface),
+}
+
+/// A webview covers anything Iced draws above the bar only when it sits
+/// directly on top of it, so with the terminal panel open (Iced content
+/// between the two) or no webview showing, Iced draws the bubble.
+fn bar_hint_target(visible: VisibleSurface, console_expanded: bool) -> BarHintTarget {
+    if console_expanded {
+        return BarHintTarget::Iced;
+    }
+    match visible {
+        VisibleSurface::None => BarHintTarget::Iced,
+        VisibleSurface::Viewer => BarHintTarget::Webview(WebviewSurface::Viewer),
+        VisibleSurface::AgentChat(tab_id) => BarHintTarget::Webview(WebviewSurface::Agent(tab_id)),
+    }
+}
+
+/// A rough bubble width for 12px Menlo text, enough to keep it on screen.
+fn bar_hint_width(text: &str) -> f32 {
+    text.chars().count() as f32 * 7.3 + 16.0
+}
+
+/// Move a bubble's centre so a bubble `width` wide stays inside `0..bound`
+/// with a 4px margin (the page's or window's width).
+fn clamp_hint_center(center: f32, width: f32, bound: f32) -> f32 {
+    const MARGIN: f32 = 4.0;
+    let half = width / 2.0;
+    let low = half + MARGIN;
+    let high = bound - half - MARGIN;
+    if high < low {
+        return bound / 2.0;
+    }
+    center.clamp(low, high)
+}
+
+/// The script that shows the hint on a page; the text goes in as a JSON
+/// string so the page treats it as text.
+fn bar_hint_show_script(text: &str, x: f32) -> String {
+    let text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    format!("window.__gittermHint && window.__gittermHint({text}, {x})")
 }
 
 /// The one webview surface that should be on screen.
@@ -8330,10 +8568,15 @@ impl App {
 
     fn save_workspaces(&self) {
         // Active workspaces from runtime state
+        // A running parked workspace is saved parked (TRU-186): quitting
+        // stops its processes.
         let mut configs: Vec<WorkspaceConfig> = self
             .workspaces
             .iter()
-            .map(|ws| self.workspace_config(ws))
+            .map(|ws| match &ws.running_park {
+                Some(info) => running_parked_config(self.workspace_config(ws), info),
+                None => self.workspace_config(ws),
+            })
             .collect();
 
         // Append closed workspace configs so their env/settings survive
@@ -8341,9 +8584,9 @@ impl App {
         // A workspace that owns chats is not its folder: one sharing a dir
         // with another is a different workspace and is kept.
         for closed in &self.closed_workspace_configs {
-            let already_active = configs
-                .iter()
-                .any(|c| c.dir == closed.dir && c.chats.is_empty() && closed.chats.is_empty());
+            let already_active = configs.iter().any(|c| {
+                c.active && c.dir == closed.dir && c.chats.is_empty() && closed.chats.is_empty()
+            });
             if !already_active {
                 configs.push(closed.clone());
             }
@@ -8487,7 +8730,10 @@ impl App {
         let ws_file = WorkspacesFile {
             workspaces: configs,
             repos,
-            active_workspace: self.active_workspace_idx,
+            active_workspace: persisted_active_index(
+                self.active_workspace_idx,
+                &self.running_parked_flags(),
+            ),
             remote_sessions,
             remote_agents: remote_agent_defs,
             collapsed_repo_groups: {
@@ -9829,7 +10075,16 @@ impl App {
     /// the worktree a chat tab's agent works in.
     fn panel_context_root(&self) -> Option<PathBuf> {
         self.task_context_worktree_root()
+            .or_else(|| self.panel_repo_root())
             .or_else(|| self.followed_worktree_root())
+    }
+
+    /// The listed repo picked for the active tab's Git or Files panel
+    /// (TRU-192). Local workspaces only.
+    fn panel_repo_root(&self) -> Option<PathBuf> {
+        let (tab_id, dir) = self.panel_repo.as_ref()?;
+        (self.active_tab()?.id == *tab_id && !self.active_workspace_is_remote())
+            .then(|| dir.clone())
     }
 
     /// Resolve a chat tab's candidate paths against its repository's
@@ -11695,17 +11950,41 @@ impl App {
             .map(|ws| workspace_bar::BarChip {
                 group: self.machine_group_key(ws),
                 work: ws.is_work(),
+                parked: ws.running_park.is_some(),
             })
             .collect()
     }
 
-    /// The bar's machine groups and chips in display order (TRU-175).
-    fn workspace_bar_layout(&self) -> Vec<workspace_bar::BarGroup> {
+    /// The open workspaces on the bar: all but the running parked.
+    fn bar_workspace_count(&self) -> usize {
+        self.workspaces
+            .iter()
+            .filter(|ws| ws.running_park.is_none())
+            .count()
+    }
+
+    fn running_parked_flags(&self) -> Vec<bool> {
+        self.workspaces
+            .iter()
+            .map(|ws| ws.running_park.is_some())
+            .collect()
+    }
+
+    /// This Mac's folder workspaces are shown on the bar, not only in the
+    /// `Repos ▾` menu.
+    fn repos_on_bar(&self) -> bool {
+        !self
+            .collapsed_repo_groups
+            .contains(workspace_bar::LOCAL_GROUP)
+    }
+
+    /// The bar's chips in display order and the `Repos ▾` menu (TRU-175,
+    /// TRU-192).
+    fn workspace_bar_layout(&self) -> workspace_bar::BarLayout {
         workspace_bar::bar_layout(
             &self.workspace_bar_chips(),
             self.active_workspace_idx,
-            &self.collapsed_machine_groups,
-            &self.collapsed_repo_groups,
+            self.repos_on_bar(),
         )
     }
 
@@ -11731,8 +12010,7 @@ impl App {
             &self.workspace_bar_chips(),
             self.active_workspace_idx,
             from,
-            &self.collapsed_machine_groups,
-            &self.collapsed_repo_groups,
+            self.repos_on_bar(),
         )
     }
 
@@ -12136,7 +12414,7 @@ impl App {
     /// workspace's most recent chat. The last open workspace cannot be
     /// parked (the bar always shows one).
     fn open_park_sheet(&mut self, idx: usize) -> Task<Event> {
-        if idx >= self.workspaces.len() || self.workspaces.len() <= 1 {
+        if idx >= self.workspaces.len() || self.bar_workspace_count() <= 1 {
             return Task::none();
         }
         let ws = &self.workspaces[idx];
@@ -12148,13 +12426,14 @@ impl App {
         } else {
             String::new()
         };
-        self.machine_menu = None;
+        self.bar_menu = None;
         self.parked_list_open = false;
         self.park_sheet = Some(ParkSheet {
             uid,
             kind,
             note: note.clone(),
             prefilled: note,
+            keep_running: false,
         });
         // A stale index refills the note when it lands (`refill_park_note`).
         let index = if remote {
@@ -12202,23 +12481,42 @@ impl App {
 
     /// Park: what closing did, keeping the tabs. The entry stays in
     /// `workspaces.json` (`active: false`) with its tabs, bottom terminals
-    /// and the note; its processes stop with the tabs.
-    fn park_workspace(&mut self, uid: u64, note: &str) -> Task<Event> {
+    /// and the note. With `ParkMode::Stop` its processes stop with the
+    /// tabs; with `KeepRunning` (TRU-186) it only leaves the bar.
+    fn park_workspace(&mut self, uid: u64, note: &str, mode: ParkMode) -> Task<Event> {
         let Some(idx) = self.workspace_index_by_uid(uid) else {
             eprintln!("[workspace] cannot park uid={uid}: no longer open");
             return self.apply_webview_surfaces();
         };
-        if self.workspaces.len() <= 1 {
+        let on_bar = self.workspaces[idx].running_park.is_none();
+        if on_bar && self.bar_workspace_count() <= 1 {
             eprintln!("[workspace] cannot park uid={uid}: it is the last open workspace");
             return self.apply_webview_surfaces();
         }
-        self.dismiss_viewer_surface();
-        let mut cfg = self.workspace_config(&self.workspaces[idx]);
-        cfg.active = false;
-        cfg.parked = Some(ParkedInfo {
+        let info = ParkedInfo {
             note: note.trim().to_string(),
             parked_at: chrono::Utc::now().to_rfc3339(),
-        });
+        };
+        if mode.stops_processes() {
+            self.park_stopping(idx, info)
+        } else {
+            self.park_keep_running(idx, info)
+        }
+    }
+
+    /// Stops workspace `idx` into a parked entry with `info`: its tabs
+    /// drop, so its terminals and chats stop. The active workspace stays
+    /// active unless it is the one parked.
+    fn park_stopping(&mut self, idx: usize, info: ParkedInfo) -> Task<Event> {
+        self.dismiss_viewer_surface();
+        let uid = self.workspaces[idx].uid;
+        let active_uid = self
+            .active_workspace()
+            .map(|ws| ws.uid)
+            .filter(|&active| active != uid);
+        let mut cfg = self.workspace_config(&self.workspaces[idx]);
+        cfg.active = false;
+        cfg.parked = Some(info);
         eprintln!(
             "[workspace] parked {:?} with {} tab(s)",
             cfg.name,
@@ -12233,9 +12531,45 @@ impl App {
         // Its repos stop unless another open workspace lists them.
         self.workspaces.remove(idx);
         self.release_unlisted_repos();
-        if self.active_workspace_idx >= self.workspaces.len() {
-            self.active_workspace_idx = self.workspaces.len() - 1;
+        let kept_active = active_uid.and_then(|active| self.workspace_index_by_uid(active));
+        match kept_active.or_else(|| next_on_bar(idx, &self.running_parked_flags())) {
+            Some(active) => self.active_workspace_idx = active,
+            None => {
+                eprintln!("[workspace] no workspace is left on the bar after parking uid={uid}");
+                self.active_workspace_idx = self.workspaces.len().saturating_sub(1);
+            }
         }
+        self.after_workspace_left_bar()
+    }
+
+    /// Keep running (TRU-186): workspace `idx` leaves the bar with its tabs
+    /// and processes alive; the file saves it as an ordinary parked entry
+    /// (`running_parked_config`).
+    fn park_keep_running(&mut self, idx: usize, info: ParkedInfo) -> Task<Event> {
+        self.dismiss_viewer_surface();
+        let ws = &mut self.workspaces[idx];
+        ws.running_park = Some(info);
+        ws.woke = None;
+        eprintln!(
+            "[workspace] parked {:?} with {} tab(s), still running",
+            ws.name,
+            ws.tabs.len()
+        );
+        if self.active_workspace_idx == idx {
+            match next_on_bar(idx, &self.running_parked_flags()) {
+                Some(active) => self.active_workspace_idx = active,
+                None => eprintln!(
+                    "[workspace] no workspace is left on the bar after parking {:?}",
+                    self.workspaces[idx].name
+                ),
+            }
+        }
+        self.after_workspace_left_bar()
+    }
+
+    /// The bar and content after a workspace left the bar: the now-active
+    /// workspace's slide, chat page and remote connection.
+    fn after_workspace_left_bar(&mut self) -> Task<Event> {
         self.sync_visible_terminals();
         self.mark_workspaces_dirty();
         self.mark_log_server_dirty();
@@ -12243,29 +12577,99 @@ impl App {
 
         // Snap slide to new active workspace (no animation)
         self.snap_slide_to_active_workspace();
-        let new_target = self.slide_target;
-
-        let scroll_task = iced::advanced::widget::operate(
-            iced::advanced::widget::operation::scrollable::scroll_to(
-                workspace_scrollable_id(),
-                scrollable::AbsoluteOffset {
-                    x: Some(new_target),
-                    y: None,
-                },
-            ),
-        );
         let remote_agent_task = self.ensure_active_remote_agent_connection(false);
         // The sheet is gone: show the now-active workspace's chat page.
         Task::batch([
-            scroll_task,
+            self.scroll_content_slide_to_target(),
             remote_agent_task,
             self.present_active_tab_surfaces(),
         ])
     }
 
-    /// Resume: the parked entry comes back with its tabs through the path
-    /// startup restores workspaces with, and becomes active.
+    /// Scrolls the content slide to `slide_target` at once.
+    fn scroll_content_slide_to_target(&self) -> Task<Event> {
+        iced::advanced::widget::operate(iced::advanced::widget::operation::scrollable::scroll_to(
+            workspace_scrollable_id(),
+            scrollable::AbsoluteOffset {
+                x: Some(self.slide_target),
+                y: None,
+            },
+        ))
+    }
+
+    /// A running parked workspace returns to the bar as it is (TRU-186):
+    /// nothing restarts. `woke` is why, when it came back on its own.
+    fn return_running_parked(&mut self, idx: usize, woke: Option<WakeReason>) {
+        let ws = &mut self.workspaces[idx];
+        if ws.running_park.take().is_none() {
+            return;
+        }
+        ws.woke = woke;
+        eprintln!(
+            "[workspace] {:?} is back on the bar{}",
+            ws.name,
+            woke.map(|reason| format!(": {}", reason.label()))
+                .unwrap_or_default()
+        );
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+    }
+
+    /// Wake (TRU-186): a chat of running parked workspace `uid` asked,
+    /// finished or failed. It comes back without taking focus: the active
+    /// workspace stays, and the chip says why until it is visited. A
+    /// request is announced by the needs-you notifier, which sees the tab
+    /// like any other background tab; a finished or failed turn posts
+    /// through the same notification, under the same setting.
+    fn wake_running_parked(&mut self, uid: u64, reason: WakeReason) -> Task<Event> {
+        let Some(idx) = self.workspace_index_by_uid(uid) else {
+            eprintln!("[workspace] cannot wake uid={uid}: no longer open");
+            return Task::none();
+        };
+        if self.workspaces[idx].running_park.is_none() {
+            return Task::none();
+        }
+        self.return_running_parked(idx, Some(reason));
+        if reason != WakeReason::NeedsYou && self.notifications_config.needs_you {
+            post_needs_you_notification(
+                &self.workspaces[idx].name,
+                &format!("Back from parked: {}", reason.label()),
+            );
+        }
+        // Its chip joins the bar: the active panel's place may move.
+        self.snap_slide_to_active_workspace();
+        self.scroll_content_slide_to_target()
+    }
+
+    /// After each update: the active workspace is visited, so its wake
+    /// label goes; a running parked one something went to (a chat, a task,
+    /// an attention target) comes back to the bar (TRU-186).
+    fn settle_active_workspace(&mut self) -> Option<Task<Event>> {
+        let idx = self.active_workspace_idx;
+        let ws = self.workspaces.get_mut(idx)?;
+        ws.woke = None;
+        ws.running_park.as_ref()?;
+        self.return_running_parked(idx, None);
+        self.snap_slide_to_active_workspace();
+        Some(Task::batch([
+            self.scroll_content_slide_to_target(),
+            self.scroll_to_active_workspace_bar(),
+        ]))
+    }
+
+    /// Resume: a running parked entry comes back as it is (TRU-186); a
+    /// stopped one comes back with its tabs through the path startup
+    /// restores workspaces with. Either becomes active.
     fn resume_parked_workspace(&mut self, key: &ParkedKey) -> Task<Event> {
+        if let Some(idx) = running_parked_index(&self.workspaces, key) {
+            self.return_running_parked(idx, None);
+            self.parked_list_open = false;
+            self.active_workspace_idx = idx;
+            self.snap_slide_to_active_workspace();
+            self.sync_visible_terminals();
+            self.sync_plans_dir();
+            return Task::batch([self.after_resume(), self.scroll_content_slide_to_target()]);
+        }
         let Some(pos) = self
             .closed_workspace_configs
             .iter()
@@ -12288,6 +12692,11 @@ impl App {
         self.parked_list_open = false;
         self.push_and_activate_workspace(ws);
         self.sync_visible_terminals();
+        self.after_resume()
+    }
+
+    /// The resumed, now-active workspace's git, files, connection and page.
+    fn after_resume(&mut self) -> Task<Event> {
         let git_task = match self.active_tab().map(|tab| (tab.id, tab.repo_path.clone())) {
             Some((tab_id, repo_path)) => {
                 self.request_git_status_for_active_source(tab_id, repo_path)
@@ -12304,8 +12713,19 @@ impl App {
         ])
     }
 
-    /// Done: the entry leaves the Parked list and stays in the file.
-    fn mark_parked_done(&mut self, key: &ParkedKey) {
+    /// Done: the entry leaves the Parked list and stays in the file. A
+    /// running parked one stops first, the way park stops (TRU-186).
+    fn mark_parked_done(&mut self, key: &ParkedKey) -> Task<Event> {
+        let task = match running_parked_index(&self.workspaces, key) {
+            Some(idx) => {
+                let info = self.workspaces[idx]
+                    .running_park
+                    .clone()
+                    .expect("running_parked_index finds only running parked workspaces");
+                self.park_stopping(idx, info)
+            }
+            None => Task::none(),
+        };
         if finish_parked(
             &mut self.closed_workspace_configs,
             key,
@@ -12319,10 +12739,11 @@ impl App {
                 key.name, key.dir
             );
         }
+        task
     }
 
-    /// Close (TRU-190): park the workspace, then mark that entry done, the
-    /// same as Done in the Parked list.
+    /// Close (TRU-190): park the workspace, stopping it, then mark that
+    /// entry done, the same as Done in the Parked list.
     fn close_workspace(&mut self, uid: u64) -> Task<Event> {
         let Some(idx) = self.workspace_index_by_uid(uid) else {
             eprintln!("[workspace] cannot close uid={uid}: no longer open");
@@ -12331,9 +12752,9 @@ impl App {
         let cfg = self.workspace_config(&self.workspaces[idx]);
         let key = ParkedKey::of(&cfg);
         let before = self.closed_workspace_configs.len();
-        let task = self.park_workspace(uid, "");
+        let task = self.park_workspace(uid, "", ParkMode::Stop);
         if self.closed_workspace_configs.len() > before {
-            self.mark_parked_done(&key);
+            return Task::batch([task, self.mark_parked_done(&key)]);
         }
         task
     }
@@ -12509,17 +12930,7 @@ impl App {
     /// chat index lands; a folder-scoped workspace lists only its home
     /// and what was added by hand.
     fn sync_workspace_repos(&mut self) {
-        let task_worktrees: Vec<PathBuf> = self
-            .task_store
-            .as_ref()
-            .map(|store| {
-                store
-                    .tasks()
-                    .iter()
-                    .filter_map(|task| task.worktree.path.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let task_worktrees = self.task_worktree_dirs();
         let canonical =
             |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let mut joins: Vec<(u64, Vec<PathBuf>)> = Vec::new();
@@ -13523,7 +13934,8 @@ impl App {
             return self.go_to_chat_owner(id);
         }
         let name = overview::workspace_name_from_title(&entry.title);
-        let (idx, uid) = match self.create_work_workspace(&name, vec![id.to_string()]) {
+        let made = self.create_work_workspace(&name, vec![id.to_string()], WorkStart::default());
+        let (idx, uid) = match made {
             Ok(made) => made,
             Err(error) => {
                 eprintln!("[workspace] cannot make a workspace from {id}: {error}");
@@ -13568,12 +13980,13 @@ impl App {
 
     /// A workspace that is a piece of work, not a folder: named `name`,
     /// homed in a new `~/Work/<slug>` folder (created here), owning
-    /// `chats`, claiming the chats started in it, on the bar and active.
-    /// Returns its index and uid.
+    /// `chats`, claiming the chats started in it, listing `start`'s repos,
+    /// on the bar and active. Returns its index and uid.
     fn create_work_workspace(
         &mut self,
         name: &str,
         chats: Vec<String>,
+        start: WorkStart,
     ) -> Result<(usize, u64), String> {
         let home = dirs::home_dir().ok_or("no home directory to put ~/Work in")?;
         let base = home.join(WORK_FOLDER);
@@ -13587,38 +14000,94 @@ impl App {
         );
         workspace.chats = chats;
         workspace.claims_new_chats = true;
+        start.apply(&mut workspace);
         let uid = workspace.uid;
         let idx = self.push_and_activate_workspace(workspace);
         Ok((idx, uid))
     }
 
-    /// "New workspace…" confirmed: the `~/Work/<slug>` folder is created
-    /// now, the workspace joins the bar and becomes active, and a new
-    /// Claude chat opens there; that chat joins the workspace's chats once
-    /// it has a session id. No repo is needed.
+    /// The New workspace sheet's Create: the `~/Work/<slug>` folder is
+    /// created now, the workspace joins the bar and becomes active with
+    /// its starting repos and decisions repo, and a new Claude chat opens
+    /// there; that chat joins the workspace's chats once it has a session
+    /// id.
     fn submit_new_work(&mut self) -> Task<Event> {
-        let Some(form) = self.new_work_form.as_mut() else {
+        let Some(sheet) = self.new_work_sheet.as_mut() else {
             return Task::none();
         };
-        let name = form.name.split_whitespace().collect::<Vec<_>>().join(" ");
+        let name = sheet.name.split_whitespace().collect::<Vec<_>>().join(" ");
         if name.is_empty() {
-            form.error = Some("Name the work, for example \"Cloud migration\".".to_string());
+            sheet.error = Some("Name the work, for example \"Cloud migration\".".to_string());
             return Task::none();
         }
-        let (_, uid) = match self.create_work_workspace(&name, Vec::new()) {
+        let start = match WorkStart::new(sheet.repos.clone(), sheet.decisions_repo.clone()) {
+            Ok(start) => start,
+            Err(error) => {
+                sheet.error = Some(error);
+                return Task::none();
+            }
+        };
+        let (_, uid) = match self.create_work_workspace(&name, Vec::new(), start) {
             Ok(made) => made,
             Err(error) => {
                 eprintln!("[workspace] new workspace {name:?}: {error}");
-                if let Some(form) = self.new_work_form.as_mut() {
-                    form.error = Some(error);
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.error = Some(error);
                 }
                 return Task::none();
             }
         };
         eprintln!("[workspace] new workspace uid={uid} {name:?}");
-        self.new_work_form = None;
+        self.new_work_sheet = None;
         let chat = self.update(Event::NewClaudeChatTab);
         Task::batch([chat, self.apply_webview_surfaces()])
+    }
+
+    /// The repos the New workspace sheet offers: this Mac's repo
+    /// workspaces, open or parked, and the repos its chats edited in.
+    fn known_local_repos(&self) -> Vec<PathBuf> {
+        let open = self
+            .workspaces
+            .iter()
+            .filter(|ws| {
+                !ws.is_work()
+                    && ws.remote_session.is_none()
+                    && matches!(ws.location, WorkspaceLocation::Local { .. })
+            })
+            .map(|ws| ws.dir.clone());
+        let parked = self
+            .closed_workspace_configs
+            .iter()
+            .filter(|cfg| {
+                cfg.is_parked()
+                    && cfg.chats.is_empty()
+                    && cfg.remote_session.is_none()
+                    && matches!(
+                        cfg.location,
+                        None | Some(config::WorkspaceLocationConfig::Local { .. })
+                    )
+            })
+            .map(|cfg| PathBuf::from(cfg.home_dir()));
+        let chats: Vec<&chats::ChatIndexEntry> = self.chat_index.iter().collect();
+        gitterm::workspace_repos::known_repos(
+            open.chain(parked).collect(),
+            &chats,
+            &self.task_worktree_dirs(),
+        )
+    }
+
+    /// Every task's worktree folder: never a repo of a workspace.
+    fn task_worktree_dirs(&self) -> Vec<PathBuf> {
+        self.task_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .tasks()
+                    .iter()
+                    .filter_map(|task| task.worktree.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// "Go to <name>": switches to (or reopens) the workspace owning local
@@ -13965,6 +14434,7 @@ impl App {
             docs_dir: ws.dir.join("docs"),
             written,
             repos,
+            task_worktrees: self.task_worktree_dirs(),
         })
     }
 
@@ -13993,20 +14463,10 @@ impl App {
         )
     }
 
-    /// The overview or the Plans mode shows the active workspace's
-    /// documents.
-    fn work_documents_visible(&self) -> bool {
-        self.workspace_overview_visible()
-            || (!self.sidebar_is_collapsed()
-                && self
-                    .active_tab()
-                    .is_some_and(|tab| tab.sidebar_mode == SidebarMode::Plans))
-    }
-
-    /// Tick: shown documents are gathered when never read or older than
-    /// [`WORK_DOCUMENTS_POLL`].
+    /// Tick: shown documents (Work's Documents section) are gathered when
+    /// never read or older than [`WORK_DOCUMENTS_POLL`].
     fn poll_work_documents(&mut self) -> Task<Event> {
-        if !self.work_documents_visible() {
+        if !self.workspace_overview_visible() {
             return Task::none();
         }
         let Some(uid) = self.active_workspace().map(|ws| ws.uid) else {
@@ -14687,7 +15147,7 @@ impl App {
         purpose: FolderPickerPurpose,
         remote_id: Option<String>,
     ) -> Task<Event> {
-        self.machine_menu = None;
+        self.bar_menu = None;
         self.folder_picker = Some(FolderPicker {
             purpose,
             remote_id: None,
@@ -16918,7 +17378,6 @@ impl App {
             remote_sessions: Vec::new(),
             remote_sessions_loading: false,
             remote_sessions_error: None,
-            remote_sessions_loaded_at: None,
             window_focused: true,
             terminal_redraws: TerminalRedrawQueue::default(),
             bottom_panel_focused: false,
@@ -16958,7 +17417,7 @@ impl App {
             )),
             workspace_rename: None,
             chat_add_to_workspace_open: false,
-            new_work_form: None,
+            new_work_sheet: None,
             park_sheet: None,
             parked_list_open: false,
             prs: work_prs::PrsState::load(&config::global_config_dir()),
@@ -16978,9 +17437,13 @@ impl App {
             chat_backfill_running: false,
             chat_backfill_note: None,
             chat_open_section_collapsed: false,
-            collapsed_machine_groups: std::collections::HashSet::new(),
             collapsed_repo_groups: std::collections::HashSet::new(),
-            machine_menu: None,
+            bar_menu: None,
+            bar_hint: None,
+            bar_hint_seq: 0,
+            bar_hint_in: None,
+            cursor_x: 0.0,
+            panel_repo: None,
             remote_chat_indexes: HashMap::new(),
             remote_running_chats: HashMap::new(),
             remote_running_chats_revision: 0,
@@ -17195,7 +17658,6 @@ impl App {
                 remote_tab_title_for_startup_command(session, startup_command_for_title.as_deref());
             tab.repo_name = title.clone();
             tab.set_terminal_title(Some(title));
-            tab.sidebar_mode = SidebarMode::Remote;
         }
         workspace.tabs.push(tab);
         workspace.active_tab = workspace.tabs.len() - 1;
@@ -18181,7 +18643,9 @@ fi
     fn browse_active_tab_to(&mut self, dir: SourcePath) -> Task<Event> {
         let source = self.source_for_active_tab();
         let show_hidden = self.show_hidden;
-        let followed_root = self.followed_worktree_root();
+        let followed_root = self
+            .followed_worktree_root()
+            .or_else(|| self.panel_repo_root());
         let Some(tab) = self.active_tab_mut() else {
             return Task::none();
         };
@@ -18478,7 +18942,6 @@ fi
             if let Some(tab) = self.workspaces[ws_idx].tabs.get_mut(idx) {
                 tab.repo_name = title.clone();
                 tab.set_terminal_title(Some(title));
-                tab.sidebar_mode = SidebarMode::Remote;
             }
             self.workspaces[ws_idx].active_tab = idx;
             self.mark_workspaces_dirty();
@@ -18495,7 +18958,6 @@ fi
             self.create_tab_for_workspace(local_cwd, Some(startup_command), Some(&workspace_name));
         tab.repo_name = title.clone();
         tab.set_terminal_title(Some(title));
-        tab.sidebar_mode = SidebarMode::Remote;
         self.workspaces[ws_idx].tabs.push(tab);
         self.workspaces[ws_idx].active_tab = self.workspaces[ws_idx].tabs.len() - 1;
         self.mark_workspaces_dirty();
@@ -19600,6 +20062,14 @@ fi
     }
 
     fn update(&mut self, event: Event) -> Task<Event> {
+        let task = self.update_event(event);
+        match self.settle_active_workspace() {
+            Some(settle) => Task::batch([task, settle]),
+            None => task,
+        }
+    }
+
+    fn update_event(&mut self, event: Event) -> Task<Event> {
         // Heartbeat for freeze watchdog — skip high-frequency terminal events
         match &event {
             Event::Terminal(_, _)
@@ -20116,7 +20586,7 @@ fi
                 // keystrokes into the focused PTY.
                 if self.task_switcher_open
                     || self.new_task_form.is_some()
-                    || self.new_work_form.is_some()
+                    || self.new_work_sheet.is_some()
                     || self.park_sheet.is_some()
                     || self.prs.action.is_some()
                     || self.task_tab_close_prompt.is_some()
@@ -20672,77 +21142,6 @@ fi
                     self.refresh_task_conversation_history(),
                     self.present_active_tab_surfaces(),
                 ]);
-            }
-            Event::AgentActivityLoaded(tab_id, result) => {
-                // Find the tab by id and apply the loaded activity
-                'outer_activity: for ws in &mut self.workspaces {
-                    for tab in &mut ws.tabs {
-                        if tab.id == tab_id {
-                            tab.agent_sidebar.loading = false;
-                            match result {
-                                Ok(activity) => tab.agent_sidebar.activity = Some(activity),
-                                Err(e) => {
-                                    eprintln!("Failed to load agent activity: {}", e);
-                                    tab.agent_sidebar.activity = Some(agent::AgentActivity::new());
-                                }
-                            }
-                            break 'outer_activity;
-                        }
-                    }
-                }
-                return Task::none();
-            }
-            Event::AgentConversationLoaded(tab_id, conversation) => {
-                'outer_conv: for ws in &mut self.workspaces {
-                    for tab in &mut ws.tabs {
-                        if tab.id == tab_id {
-                            tab.agent_sidebar.conversation = Some(conversation);
-                            break 'outer_conv;
-                        }
-                    }
-                }
-                return Task::none();
-            }
-            Event::SelectAgentCapture(idx) => {
-                if let Some(tab) = self.active_tab_mut() {
-                    if tab.agent_sidebar.selected_capture_idx == Some(idx) {
-                        // Deselect if clicking the same one
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                    } else {
-                        tab.agent_sidebar.selected_capture_idx = Some(idx);
-                        tab.agent_sidebar.conversation = None; // Clear while loading
-                                                               // Load conversation async
-                        if let Some(activity) = &tab.agent_sidebar.activity {
-                            if let Some(capture) = activity.captures.get(idx) {
-                                let capture = capture.clone();
-                                let tab_id = tab.id;
-                                return Task::perform(
-                                    async move {
-                                        match tokio::task::spawn_blocking(move || {
-                                            agent::Conversation::load_for_capture(&capture)
-                                        })
-                                        .await
-                                        {
-                                            Ok(conv) => (tab_id, conv),
-                                            Err(_) => (
-                                                tab_id,
-                                                agent::Conversation {
-                                                    entries: Vec::new(),
-                                                    error: Some(
-                                                        "Failed to load conversation".to_string(),
-                                                    ),
-                                                },
-                                            ),
-                                        }
-                                    },
-                                    |(tab_id, conv)| Event::AgentConversationLoaded(tab_id, conv),
-                                );
-                            }
-                        }
-                    }
-                }
-                return Task::none();
             }
             Event::LaunchAgentPreset(idx) => {
                 // Option+click on "+" shows tab picker (but not if picker is already open)
@@ -22177,6 +22576,10 @@ fi
                 // shown last counts as being read (completion is not unread).
                 let is_front_page = self.agent_pages.first() == Some(&tab_id);
                 let attention_reason = agent_event_attention_reason(&ev);
+                // A running parked workspace comes back when its chat asks,
+                // finishes or fails (TRU-186): the uid it wakes.
+                let wake = chat_event_wake(&ev);
+                let mut woken: Option<u64> = None;
                 // A held Send-to-Claude goes out when the turn ends (TRU-142).
                 let turn_ended = matches!(
                     &ev,
@@ -22227,8 +22630,12 @@ fi
                     let local_workspace = matches!(ws.location, WorkspaceLocation::Local { .. });
                     let owning_workspace =
                         (ws.owns_chats() || ws.claims_new_chats).then_some(ws.uid);
+                    let parked_running = ws.running_park.is_some().then_some(ws.uid);
                     for t in &mut ws.tabs {
                         if t.id == tab_id {
+                            if wake.is_some() {
+                                woken = parked_running;
+                            }
                             if t.task_id.is_some() {
                                 t.task_last_activity = Some(Instant::now());
                                 progress_task = t.task_id.clone();
@@ -22522,6 +22929,12 @@ fi
                     Task::batch([follow_task, self.flush_chat_facts(tab_id, facts_force)])
                 } else {
                     follow_task
+                };
+                let follow_task = match (woken, wake) {
+                    (Some(uid), Some(reason)) => {
+                        Task::batch([follow_task, self.wake_running_parked(uid, reason)])
+                    }
+                    _ => follow_task,
                 };
                 if turn_ended {
                     // A chat's first turn gives it a title; index it so
@@ -22837,7 +23250,7 @@ fi
                 // Modal capture layers must never leak keystrokes into the PTY
                 if self.task_switcher_open
                     || self.new_task_form.is_some()
-                    || self.new_work_form.is_some()
+                    || self.new_work_sheet.is_some()
                     || self.park_sheet.is_some()
                     || self.prs.action.is_some()
                     || self.task_tab_close_prompt.is_some()
@@ -23134,8 +23547,8 @@ fi
                     return Task::none();
                 }
 
-                // New workspace form: Escape closes
-                if self.new_work_form.is_some()
+                // New workspace sheet: Escape closes
+                if self.new_work_sheet.is_some()
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     return self.update(Event::NewWorkCancel);
@@ -23210,12 +23623,11 @@ fi
                     return self.close_folder_picker();
                 }
 
-                // Machine menu: Escape closes
-                if self.machine_menu.is_some()
-                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                // A bar menu: Escape closes
+                if self.bar_menu.is_some() && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
-                    self.machine_menu = None;
-                    return Task::none();
+                    self.bar_menu = None;
+                    return self.apply_webview_surfaces();
                 }
 
                 // Tab picker: Escape closes
@@ -24658,7 +25070,26 @@ fi
                 };
                 return self.close_task_tab(prompt);
             }
+            Event::OpenRepoPanel(mode, dir) => {
+                self.panel_repo = dir
+                    .zip(self.active_tab().map(|tab| tab.id))
+                    .map(|(dir, tab_id)| (tab_id, dir));
+                if self
+                    .active_tab()
+                    .is_some_and(|tab| tab.sidebar_mode == mode)
+                {
+                    // Files roots to a root: list it.
+                    return match self.panel_repo_root() {
+                        Some(root) => self.browse_active_tab_to(SourcePath::Local(root)),
+                        None => Task::none(),
+                    };
+                }
+                let task = self.set_sidebar_mode(mode);
+                self.settle_agent_surface();
+                return task;
+            }
             Event::SetSidebarMode(mode) => {
+                self.panel_repo = None;
                 let leaving_chats = mode != SidebarMode::Chats
                     && self
                         .active_tab()
@@ -24671,10 +25102,6 @@ fi
                     return Task::batch([task, self.present_active_tab_surfaces()]);
                 }
                 self.settle_agent_surface();
-                if mode == SidebarMode::Plans {
-                    // The Plans mode lists the work's documents (TRU-191).
-                    return Task::batch([task, self.poll_work_documents()]);
-                }
                 return task;
             }
             Event::SetGitViewMode(mode) => {
@@ -24789,7 +25216,6 @@ fi
             }
             Event::RemoteSessionsLoaded(snapshot) => {
                 self.remote_sessions_loading = false;
-                self.remote_sessions_loaded_at = Some(Instant::now());
                 if let Some(error) = snapshot.error {
                     self.remote_sessions.clear();
                     self.remote_sessions_error = Some(format!("{}: {}", snapshot.host_name, error));
@@ -24961,7 +25387,18 @@ fi
                     self.save_config();
                 }
             }
+            Event::BarHintEnter(text) => {
+                self.bar_hint_exit(None);
+                return self.bar_hint_enter(text);
+            }
+            Event::BarHintExit(text) => {
+                self.bar_hint_exit(Some(&text));
+            }
+            Event::BarHintDue(seq) => {
+                self.bar_hint_due(seq);
+            }
             Event::MouseMoved(x, y) => {
+                self.cursor_x = x;
                 if self.dragging_divider {
                     // Clamp sidebar width between 150 and 600 pixels (subtract rail width)
                     self.sidebar_width = (x - SPINE_WIDTH).clamp(150.0, 600.0);
@@ -25567,12 +26004,6 @@ fi
                     }
                 }
             }
-            Event::ToggleMachineGroup(key) => {
-                self.machine_menu = None;
-                if !self.collapsed_machine_groups.remove(&key) {
-                    self.collapsed_machine_groups.insert(key);
-                }
-            }
             Event::ToggleReposZone(key) => {
                 if !self.collapsed_repo_groups.remove(&key) {
                     self.collapsed_repo_groups.insert(key);
@@ -25580,18 +26011,21 @@ fi
                 self.mark_workspaces_dirty();
                 return self.scroll_to_active_workspace_bar();
             }
-            Event::MachineMenuOpen(key) => {
-                self.machine_menu = if self.machine_menu.as_deref() == Some(key.as_str()) {
-                    None
-                } else {
-                    Some(key)
-                };
+            Event::BarMenuToggle(menu) => {
+                self.bar_menu = (self.bar_menu != Some(menu)).then_some(menu);
+                return self.apply_webview_surfaces();
             }
-            Event::MachineMenuClose => {
-                self.machine_menu = None;
+            Event::BarMenuClose => {
+                self.bar_menu = None;
+                return self.apply_webview_surfaces();
+            }
+            Event::BarMenuRun(event) => {
+                self.bar_menu = None;
+                let task = self.update(*event);
+                return Task::batch([task, self.apply_webview_surfaces()]);
             }
             Event::ShowMachineChats(key) => {
-                self.machine_menu = None;
+                self.bar_menu = None;
                 // Everywhere scope with only that machine's section open.
                 let machine = match key.split_once(':') {
                     Some(("agent", remote_id)) => remote_id.to_string(),
@@ -25603,11 +26037,16 @@ fi
                 return self.update(Event::SetSidebarMode(SidebarMode::Chats));
             }
             Event::MachineReconnect(key) => {
-                self.machine_menu = None;
+                self.bar_menu = None;
+                let surfaces = self.apply_webview_surfaces();
                 if let Some(("agent", remote_id)) = key.split_once(':') {
                     let remote_id = remote_id.to_string();
-                    return self.ensure_remote_agent_connection(&remote_id, true);
+                    return Task::batch([
+                        surfaces,
+                        self.ensure_remote_agent_connection(&remote_id, true),
+                    ]);
                 }
+                return surfaces;
             }
             Event::ToggleChatMachine(key) => {
                 if !self.chat_expanded_machines.remove(&key) {
@@ -25837,9 +26276,12 @@ fi
                 return self.focus_main_terminal();
             }
             Event::NewWorkOpen => {
-                self.machine_menu = None;
+                self.bar_menu = None;
                 let close = self.close_folder_picker();
-                self.new_work_form = Some(NewWorkForm::default());
+                self.new_work_sheet = Some(NewWorkSheet {
+                    known: self.known_local_repos(),
+                    ..NewWorkSheet::default()
+                });
                 return Task::batch([
                     close,
                     self.apply_webview_surfaces(),
@@ -25847,16 +26289,42 @@ fi
                 ]);
             }
             Event::NewWorkNameChanged(name) => {
-                if let Some(form) = self.new_work_form.as_mut() {
-                    form.name = name;
-                    form.error = None;
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.name = name;
+                    sheet.error = None;
                 }
+            }
+            Event::NewWorkQueryChanged(query) => {
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.query = query;
+                }
+            }
+            Event::NewWorkRepoToggled(dir, picked) => {
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.repos.retain(|repo| *repo != dir);
+                    if picked {
+                        sheet.repos.push(dir);
+                    } else if sheet.decisions_repo.as_ref() == Some(&dir) {
+                        sheet.decisions_repo = None;
+                    }
+                    sheet.error = None;
+                }
+            }
+            Event::NewWorkDecisionsPicked(choice) => {
+                if let Some(sheet) = self.new_work_sheet.as_mut() {
+                    sheet.decisions_repo = choice.dir;
+                    sheet.error = None;
+                }
+            }
+            Event::NewWorkOpenFolder => {
+                self.new_work_sheet = None;
+                return self.update(Event::WorkspaceCreate);
             }
             Event::NewWorkSubmit => {
                 return self.submit_new_work();
             }
             Event::NewWorkCancel => {
-                self.new_work_form = None;
+                self.new_work_sheet = None;
                 return Task::batch([self.apply_webview_surfaces(), self.focus_main_terminal()]);
             }
             Event::ReviewOpen(checkout, source) => {
@@ -26029,6 +26497,10 @@ fi
                         })
                     });
                 let is_active_tab = self.active_tab().is_some_and(|t| t.id == snapshot.tab_id);
+                // Nor a repo picked from Work or the Files roots (TRU-192).
+                let snapshot_root_is_panel_repo = self
+                    .panel_repo_root()
+                    .is_some_and(|dir| paths_equal(&dir, &snapshot.repo_path));
                 let context_root_before = self.panel_context_root();
                 if let Some(tab) = self
                     .workspaces
@@ -26065,6 +26537,7 @@ fi
                         if snapshot.repo_path != tab.repo_path
                             && snapshot.is_git_repo
                             && !(tab.task_id.is_none() && snapshot_root_is_task_worktree)
+                            && !snapshot_root_is_panel_repo
                             && !tab
                                 .worktree_follow
                                 .followed_paths()
@@ -26826,11 +27299,17 @@ fi
                     sheet.note = note;
                 }
             }
+            Event::ParkKeepRunningToggled(keep_running) => {
+                if let Some(sheet) = self.park_sheet.as_mut() {
+                    sheet.keep_running = keep_running;
+                }
+            }
             Event::ParkSubmit => {
                 let Some(sheet) = self.park_sheet.take() else {
                     return Task::none();
                 };
-                return self.park_workspace(sheet.uid, &sheet.note);
+                let mode = ParkMode::for_sheet(sheet.kind, sheet.keep_running);
+                return self.park_workspace(sheet.uid, &sheet.note, mode);
             }
             Event::CloseConfirm => {
                 let Some(sheet) = self.park_sheet.take() else {
@@ -26845,7 +27324,7 @@ fi
             Event::ParkedListToggle => {
                 self.parked_list_open = !self.parked_list_open;
                 if self.parked_list_open {
-                    self.machine_menu = None;
+                    self.bar_menu = None;
                 }
                 return self.apply_webview_surfaces();
             }
@@ -26853,7 +27332,7 @@ fi
                 return self.resume_parked_workspace(&key);
             }
             Event::ParkedDone(key) => {
-                self.mark_parked_done(&key);
+                return self.mark_parked_done(&key);
             }
             Event::WorkspaceCreate => {
                 // The picker's machine selector (with its "connect a
@@ -26894,7 +27373,7 @@ fi
                 return self.submit_remote_connect_form();
             }
             Event::PhonePanelOpen(remote_id) => {
-                self.machine_menu = None;
+                self.bar_menu = None;
                 let machine_name = self
                     .remote_agent_config_by_id(&remote_id)
                     .map(|agent| agent.name.clone())
@@ -27509,11 +27988,12 @@ fi
             || self.folder_picker.is_some()
             || self.phone_panel.is_some()
             || self.remote_connect_form.is_some()
-            || self.new_work_form.is_some()
+            || self.new_work_sheet.is_some()
             || self.park_sheet.is_some()
             || self.parked_list_open
             || self.prs.action.is_some()
             || self.prs.ready_open
+            || self.bar_menu.is_some()
     }
 
     fn visible_webview_surface(&self) -> VisibleSurface {
@@ -27563,192 +28043,92 @@ fi
             .as_ref()
             .map(|source| source.capabilities())
             .unwrap_or_else(SourceCapabilities::none);
-        let active_workspace_is_remote = self.active_workspace_is_remote();
-        let active_workspace_is_remote_agent = self
-            .active_workspace()
-            .is_some_and(|workspace| self.remote_agent_id_for_workspace(workspace).is_some());
-        if mode == SidebarMode::Remote && !active_workspace_is_remote {
-            return Task::none();
-        }
+        let legacy_remote = self.active_workspace_is_remote()
+            && self
+                .active_workspace()
+                .is_none_or(|workspace| self.remote_agent_id_for_workspace(workspace).is_none());
 
         // Expand sidebar if collapsed when switching modes
-        if self.sidebar_collapsed {
-            self.sidebar_collapsed = false;
-        }
+        self.sidebar_collapsed = false;
         // Hide WebView when switching modes (but keep agent webview alive
         // — it's the agent tab's primary content, not a modal overlay).
         self.dismiss_viewer_surface();
 
         let active_workspace_dir = self.active_workspace().map(|ws| ws.dir.clone());
-        if let Some(tab) = self.active_tab_mut() {
-            if tab.sidebar_mode != mode {
-                if mode == SidebarMode::Chats {
-                    tab.sidebar_mode_before_chats = tab.sidebar_mode;
+        let Some(tab) = self.active_tab_mut() else {
+            return Task::none();
+        };
+        if tab.sidebar_mode == mode {
+            return Task::none();
+        }
+        if mode == SidebarMode::Chats {
+            tab.sidebar_mode_before_chats = tab.sidebar_mode;
+        }
+        // Files keeps the file viewer open; Git keeps the selected diff.
+        if mode != SidebarMode::Files || legacy_remote {
+            tab.close_file_viewer();
+        }
+        if mode != SidebarMode::Git || legacy_remote {
+            tab.selected_file = None;
+            tab.diff_lines.clear();
+            tab.diff_syntax_lines = None;
+            tab.diff_syntax_notice = None;
+        }
+        tab.diff_load_in_progress = false;
+        tab.diff_load_started_at = None;
+        tab.sidebar_mode = mode;
+        if legacy_remote {
+            return Task::none();
+        }
+        match mode {
+            SidebarMode::Git => {
+                tab.last_poll = Instant::now();
+                tab.git_status_loading = true;
+                let tab_id = tab.id;
+                let repo_path = tab.repo_path.clone();
+                let load_worktrees =
+                    tab.git_view_mode == GitViewMode::Worktrees && active_caps.git_worktrees;
+                if load_worktrees {
+                    tab.worktrees_loading = true;
+                    tab.last_worktrees_poll = Instant::now();
                 }
-                if active_workspace_is_remote
-                    && !active_workspace_is_remote_agent
-                    && mode != SidebarMode::Remote
-                {
-                    tab.agent_sidebar.selected_capture_idx = None;
-                    tab.agent_sidebar.conversation = None;
-                    tab.close_file_viewer();
-                    tab.selected_file = None;
-                    tab.diff_lines.clear();
-                    tab.diff_load_in_progress = false;
-                    tab.diff_load_started_at = None;
-                    tab.diff_syntax_lines = None;
-                    tab.diff_syntax_notice = None;
-                    tab.sidebar_mode = mode;
+                let Some(source) = active_source else {
+                    tab.git_status_loading = false;
                     return Task::none();
+                };
+                self.mark_log_server_dirty();
+                let status_task =
+                    Self::request_source_git_status(source, tab_id, repo_path.clone());
+                if load_worktrees {
+                    let worktrees_repo_path = active_workspace_dir.unwrap_or(repo_path);
+                    return Task::batch([
+                        status_task,
+                        Self::request_git_worktrees(tab_id, worktrees_repo_path),
+                    ]);
                 }
-                match mode {
-                    SidebarMode::Git => {
-                        // Switching to Git mode - clear file viewer and refresh status
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.last_poll = Instant::now();
-                        tab.git_status_loading = true;
-                        let tab_id = tab.id;
-                        let repo_path = tab.repo_path.clone();
-                        let load_worktrees = tab.git_view_mode == GitViewMode::Worktrees
-                            && active_caps.git_worktrees;
-                        if load_worktrees {
-                            tab.worktrees_loading = true;
-                            tab.last_worktrees_poll = Instant::now();
-                        }
-                        let Some(source) = active_source else {
-                            tab.git_status_loading = false;
-                            tab.sidebar_mode = mode;
-                            return Task::none();
-                        };
-                        tab.sidebar_mode = mode;
-                        self.mark_log_server_dirty();
-                        let status_task =
-                            Self::request_source_git_status(source, tab_id, repo_path.clone());
-                        if load_worktrees {
-                            let worktrees_repo_path =
-                                active_workspace_dir.unwrap_or_else(|| repo_path.clone());
-                            return Task::batch([
-                                status_task,
-                                Self::request_git_worktrees(tab_id, worktrees_repo_path),
-                            ]);
-                        }
-                        return status_task;
-                    }
-                    SidebarMode::Files => {
-                        // Switching to Files mode - clear git selection
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.sidebar_mode = mode;
-                        let dir = tab.files.dir.clone();
-                        return self.browse_active_tab_to(dir);
-                    }
-                    SidebarMode::Claude => {
-                        // Switching to Claude mode - clear file viewer and git selection
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.fetch_claude_config();
-                    }
-                    SidebarMode::Agent => {
-                        // Switching to Agent mode - clear file viewer and git selection
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        let task = tab.fetch_agent_activity();
-                        tab.sidebar_mode = mode;
-                        return task;
-                    }
-                    SidebarMode::Plans => {
-                        // Switching to Plans mode - clear file viewer and git selection.
-                        // Plan list is read fresh in view_plans_sidebar on each render.
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                    }
-                    SidebarMode::Chats => {
-                        // Switching to Chats mode - clear other detail panes;
-                        // the index refreshes in the background if stale.
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.sidebar_mode = mode;
-                        self.chat_rank.panel_opened();
-                        let refresh = self.refresh_chat_index_if_stale();
-                        return Task::batch([refresh, self.request_chat_rank()]);
-                    }
-                    SidebarMode::Tasks => {
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                    }
-                    SidebarMode::Remote => {
-                        // Switching to Remote mode - clear local file/git detail panes.
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.sidebar_mode = mode;
-                        return self.refresh_remote_sessions();
-                    }
-                    SidebarMode::Workspace => {
-                        tab.agent_sidebar.selected_capture_idx = None;
-                        tab.agent_sidebar.conversation = None;
-                        tab.close_file_viewer();
-                        tab.selected_file = None;
-                        tab.diff_lines.clear();
-                        tab.diff_load_in_progress = false;
-                        tab.diff_load_started_at = None;
-                        tab.diff_syntax_lines = None;
-                        tab.diff_syntax_notice = None;
-                        tab.sidebar_mode = mode;
-                        return self.open_workspace_overview();
-                    }
-                }
-                tab.sidebar_mode = mode;
+                status_task
+            }
+            SidebarMode::Files => {
+                let dir = tab.files.dir.clone();
+                self.browse_active_tab_to(dir)
+            }
+            SidebarMode::Claude => {
+                tab.fetch_claude_config();
+                Task::none()
+            }
+            SidebarMode::Chats => {
+                // The index refreshes in the background if stale.
+                self.chat_rank.panel_opened();
+                let refresh = self.refresh_chat_index_if_stale();
+                Task::batch([refresh, self.request_chat_rank()])
+            }
+            SidebarMode::Tasks => Task::none(),
+            SidebarMode::Workspace => {
+                // For Work's "skills · MCPs · hooks" line.
+                tab.fetch_claude_config();
+                self.open_workspace_overview()
             }
         }
-        Task::none()
     }
 
     /// Synchronously show or hide the agent pages per
@@ -27900,11 +28280,12 @@ fi
         };
         let width = (self.window_size.0 - x).max(100.0);
 
-        // Subtract console panel height + workspace bar (reserved at the bottom)
+        // Subtract console panel height + workspace bar (reserved at the
+        // bottom). A folded panel takes no room (TRU-192).
         let console_h = if self.console_expanded {
             self.console_height + CONSOLE_DIVIDER_HEIGHT
         } else {
-            CONSOLE_HEADER_HEIGHT
+            0.0
         };
 
         // wry child-WebView coordinates behave bottom-origin on macOS in this app.
@@ -28511,6 +28892,19 @@ fi
     }
 
     fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let base = self.view_base();
+        match self.view_bar_hint() {
+            Some(hint) => Stack::new()
+                .push(base)
+                .push(hint)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            None => base,
+        }
+    }
+
+    fn view_base(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         heartbeat("view");
         let spine = freeze_time!("view_spine", { self.view_spine() });
 
@@ -28575,7 +28969,7 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
-        } else if self.new_work_form.is_some() {
+        } else if self.new_work_sheet.is_some() {
             Stack::new()
                 .push(main_view)
                 .push(self.view_new_work_modal())
@@ -28617,10 +29011,10 @@ fi
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
-        } else if self.machine_menu.is_some() {
+        } else if self.bar_menu.is_some() {
             Stack::new()
                 .push(main_view)
-                .push(self.view_machine_menu())
+                .push(self.view_bar_menu())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -29310,15 +29704,6 @@ fi
                     .padding([6, 12])
                     .on_press(Event::FolderPickerNativeDialog),
             );
-            // A piece of work that needs no repo (TRU-169).
-            if picker.purpose == FolderPickerPurpose::NewWorkspace {
-                actions = actions.push(
-                    button(text("New workspace, no repo…").size(font_small))
-                        .style(button::text)
-                        .padding([6, 12])
-                        .on_press(Event::NewWorkOpen),
-                );
-            }
         }
         actions = actions
             .push(iced::widget::Space::new().width(Length::Fill))
@@ -29939,7 +30324,7 @@ fi
         content_col = content_col.push(shortcut_row("Cmd + ↑", "Return to General"));
         content_col = content_col.push(shortcut_row("Cmd + 0", "Open task overview"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + U", "Open usage view"));
-        content_col = content_col.push(shortcut_row("Cmd + Shift + O", "Chats overview"));
+        content_col = content_col.push(shortcut_row("Cmd + Shift + O", "Find: the chats overview"));
         content_col = content_col.push(shortcut_row("Ctrl + `", "Jump to next needs-you"));
         content_col = content_col.push(shortcut_row("Cmd + Shift + W", "Close workspace"));
         content_col = content_col.push(shortcut_row("Cmd + B", "Toggle sidebar"));
@@ -30021,52 +30406,139 @@ fi
         .into()
     }
 
-    /// "New workspace…" (TRU-169): a name, the `~/Work/<slug>` folder it
-    /// will get, and Create. Nothing is created until Create.
+    /// The New workspace sheet (TRU-194): a name, where it runs, optional
+    /// starting repos and a decisions repo among them, and the
+    /// `~/Work/<slug>` home it will get. Nothing is created until Create.
     fn view_new_work_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
         let font_small = self.ui_font_small();
-        let Some(form) = &self.new_work_form else {
+        let Some(sheet) = &self.new_work_sheet else {
             return iced::widget::Space::new().into();
         };
-        let bg_surface = theme.bg_surface();
-        let border_color = theme.border();
-        let bg_crust = theme.bg_crust();
-        let slug = overview::work_folder_slug(&form.name);
+        let home = dirs::home_dir().map(|home| home.to_string_lossy().into_owned());
+        let shown = |dir: &Path| folder_picker_tilde(&dir.to_string_lossy(), home.as_deref());
+        let field = |label: &str, value: Element<'static, Event, Theme, iced::Renderer>| {
+            row![
+                text(label.to_string())
+                    .size(font_small)
+                    .color(theme.text_secondary())
+                    .width(Length::Fixed(110.0)),
+                value,
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+        };
+        let muted = |line: String| -> Element<'static, Event, Theme, iced::Renderer> {
+            text(line).size(font_small).color(theme.text_muted()).into()
+        };
+
+        let mut repos = Column::new().spacing(2);
+        let matching = gitterm::workspace_repos::filter_repos(&sheet.known, &sheet.query);
+        if sheet.known.is_empty() {
+            repos = repos.push(muted("No repos known on this Mac yet.".to_string()));
+        } else if matching.is_empty() {
+            repos = repos.push(muted("No repo matches.".to_string()));
+        }
+        for dir in matching {
+            let picked = sheet.repos.contains(dir);
+            let toggled = dir.clone();
+            repos = repos.push(
+                checkbox(picked)
+                    .label(format!(
+                        "{} \u{00B7} {}",
+                        gitterm::workspace_repos::repo_name(dir),
+                        shown(dir)
+                    ))
+                    .on_toggle(move |on| Event::NewWorkRepoToggled(toggled.clone(), on))
+                    .size(14)
+                    .text_size(font_small),
+            );
+        }
+        let picked_note = match sheet.repos.len() {
+            0 => "Optional. Repos also join as the work's chats edit them.".to_string(),
+            n => format!("{n} picked"),
+        };
+
+        let decisions: Element<'static, Event, Theme, iced::Renderer> = if sheet.repos.is_empty() {
+            muted("Optional, from the starting repos.".to_string())
+        } else {
+            let choice = |dir: &Path| DecisionsRepoChoice {
+                dir: Some(dir.to_path_buf()),
+                label: format!(
+                    "{} \u{00B7} {}",
+                    gitterm::workspace_repos::repo_name(dir),
+                    shown(dir)
+                ),
+            };
+            let mut choices = vec![DecisionsRepoChoice::none()];
+            choices.extend(sheet.repos.iter().map(|dir| choice(dir)));
+            let selected = sheet
+                .decisions_repo
+                .as_deref()
+                .map_or_else(DecisionsRepoChoice::none, choice);
+            pick_list(choices, Some(selected), Event::NewWorkDecisionsPicked)
+                .width(Length::Fill)
+                .padding([4, 8])
+                .text_size(font_small)
+                .into()
+        };
+
         let mut card = Column::new()
             .spacing(10)
-            .width(Length::Fixed(440.0))
+            .width(Length::Fixed(520.0))
             .push(text("New workspace").size(font).color(theme.text_primary()))
             .push(
-                text("A piece of work, not a repo. Repos join as the work touches them.")
+                text("A piece of work. Its home folder is made on Create and a new Claude chat opens there.")
                     .size(font_small)
                     .color(theme.text_secondary()),
             )
-            .push(
-                text_input("Cloud migration", &form.name)
+            .push(field(
+                "Name",
+                text_input("Cloud migration", &sheet.name)
                     .id(new_work_name_input_id())
                     .on_input(Event::NewWorkNameChanged)
                     .on_submit(Event::NewWorkSubmit)
                     .size(font_small)
-                    .padding([6, 8]),
-            )
+                    .padding([6, 8])
+                    .into(),
+            ))
+            .push(field(
+                "Runs on",
+                text("This Mac")
+                    .size(font_small)
+                    .color(theme.text_primary())
+                    .into(),
+            ))
+            .push(field("Starting repos", muted(picked_note)))
             .push(
-                text(format!(
-                    "Home: ~/{WORK_FOLDER}/{slug} (a -2, -3 suffix if taken), made on Create; a new Claude chat opens there."
-                ))
-                .size(font_small - 1.0)
-                .color(theme.text_muted()),
-            );
-        if let Some(error) = &form.error {
+                text_input("Filter repos", &sheet.query)
+                    .on_input(Event::NewWorkQueryChanged)
+                    .size(font_small)
+                    .padding([4, 8]),
+            )
+            .push(container(scrollable(repos)).max_height(132.0))
+            .push(field("Decisions repo", decisions))
+            .push(field(
+                "Home folder",
+                muted(format!(
+                    "{} (a -2, -3 suffix if taken)",
+                    new_work_home_preview(&sheet.name)
+                )),
+            ));
+        if let Some(error) = &sheet.error {
             card = card.push(text(error.clone()).size(font_small).color(theme.danger()));
         }
-        let can_create = !form.name.trim().is_empty();
+        let can_create = !sheet.name.trim().is_empty();
         card = card.push(
             row![
+                button(text("Open a folder as a repo workspace\u{2026}").size(font_small))
+                    .style(button::text)
+                    .padding([6, 0])
+                    .on_press(Event::NewWorkOpenFolder),
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("Cancel").size(font_small))
-                    .style(button::text)
+                    .style(button::secondary)
                     .padding([6, 12])
                     .on_press(Event::NewWorkCancel),
                 button(text("Create").size(font_small))
@@ -30077,30 +30549,7 @@ fi
             .spacing(8)
             .align_y(iced::Alignment::Center),
         );
-        let card = container(card)
-            .padding([20, 24])
-            .style(move |_| container::Style {
-                background: Some(bg_surface.into()),
-                border: iced::Border {
-                    color: border_color,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                ..Default::default()
-            });
-        let backdrop_color = iced::Color { a: 0.8, ..bg_crust };
-        container(
-            container(card)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(backdrop_color.into()),
-            ..Default::default()
-        })
-        .into()
+        self.view_sheet_card(card)
     }
 
     /// A centred card over a dimmed backdrop, as the other sheets draw.
@@ -30142,7 +30591,8 @@ fi
 
     /// × on a workspace (TRU-171): a note, prefilled from its most recent
     /// chat, and Park. Parking stops the workspace's processes; a chat
-    /// mid-turn is named, not blocking.
+    /// mid-turn is named, not blocking. Keep running (TRU-186) parks it
+    /// with its processes alive.
     fn view_park_sheet(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
@@ -30202,9 +30652,13 @@ fi
                     .color(theme.text_primary()),
             )
             .push(
-                text("It leaves the bar and keeps its tabs. Its terminals and chats stop; Resume from ⏸ parked brings them back.")
-                    .size(font_small)
-                    .color(theme.text_secondary()),
+                text(if sheet.keep_running {
+                    "It leaves the bar and keeps its tabs. Its terminals and chats keep running; it comes back to the bar when a chat needs you, finishes or fails."
+                } else {
+                    "It leaves the bar and keeps its tabs. Its terminals and chats stop; Resume from ⏸ parked brings them back."
+                })
+                .size(font_small)
+                .color(theme.text_secondary()),
             )
             .push(
                 text_input("Where you left off", &sheet.note)
@@ -30213,8 +30667,15 @@ fi
                     .on_submit(Event::ParkSubmit)
                     .size(font_small)
                     .padding([6, 8]),
+            )
+            .push(
+                checkbox(sheet.keep_running)
+                    .label("Keep running")
+                    .on_toggle(Event::ParkKeepRunningToggled)
+                    .size(14)
+                    .text_size(font_small),
             );
-        if Self::workspace_chat_working(ws) {
+        if !sheet.keep_running && Self::workspace_chat_working(ws) {
             card = card.push(
                 text("● a chat is still working; parking stops it")
                     .size(font_small)
@@ -30247,7 +30708,27 @@ fi
         let font_small = self.ui_font_small();
         let order = parked_order(&self.closed_workspace_configs);
         let mut rows = Column::new().spacing(8);
-        if order.is_empty() {
+        // Running parked workspaces first (TRU-186): they are live.
+        let running: Vec<&Workspace> = self
+            .workspaces
+            .iter()
+            .filter(|ws| ws.running_park.is_some())
+            .collect();
+        for ws in &running {
+            let key = ParkedKey {
+                name: ws.name.clone(),
+                dir: workspace_config_dir(ws),
+            };
+            rows = rows.push(self.view_parked_row(
+                &ws.name,
+                ws.color,
+                ws.chats.len(),
+                ws.running_park.as_ref(),
+                key,
+                true,
+            ));
+        }
+        if order.is_empty() && running.is_empty() {
             rows = rows.push(
                 text("Nothing parked.")
                     .size(font_small)
@@ -30256,70 +30737,14 @@ fi
         }
         for idx in order {
             let cfg = &self.closed_workspace_configs[idx];
-            let key = ParkedKey::of(cfg);
-            let age = cfg
-                .parked
-                .as_ref()
-                .and_then(|parked| overview::parse_stamp(&parked.parked_at))
-                .map(overview::age_label);
-            let note = cfg
-                .parked
-                .as_ref()
-                .map(|parked| parked.note.as_str())
-                .filter(|note| !note.is_empty());
-            let owned = match cfg.chats.len() {
-                0 => "folder".to_string(),
-                1 => "1 chat".to_string(),
-                n => format!("{n} chats"),
-            };
-            let mut head = Row::new()
-                .spacing(8)
-                .align_y(iced::Alignment::Center)
-                .push(
-                    text(cfg.name.clone())
-                        .size(font_small)
-                        .color(cfg.color.color(theme))
-                        .font(iced::Font::with_name("Menlo")),
-                )
-                .push(text(owned).size(font_small - 1.0).color(theme.text_muted()));
-            if let Some(age) = age {
-                head = head.push(text(age).size(font_small - 1.0).color(theme.text_muted()));
-            }
-            let note_line = match note {
-                Some(note) => text(note.to_string())
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-                None => text("No note").size(font_small).color(theme.text_muted()),
-            };
-            let mut lines = column![head, note_line].spacing(2).width(Length::Fill);
-            // PR news of the parked work (TRU-173).
-            if let Some((news, color)) = self.parked_pr_news(&key) {
-                lines = lines.push(text(news).size(font_small - 1.0).color(color));
-            }
-            let row_content = row![
-                lines,
-                button(text("Resume").size(font_small))
-                    .style(button::primary)
-                    .padding([4, 10])
-                    .on_press(Event::ParkedResume(key.clone())),
-                button(text("Done").size(font_small))
-                    .style(button::text)
-                    .padding([4, 10])
-                    .on_press(Event::ParkedDone(key)),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center);
-            let row_bg = theme.bg_base();
-            rows = rows.push(container(row_content).padding([6, 8]).style(move |_| {
-                container::Style {
-                    background: Some(row_bg.into()),
-                    border: iced::Border {
-                        radius: 6.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            }));
+            rows = rows.push(self.view_parked_row(
+                &cfg.name,
+                cfg.color,
+                cfg.chats.len(),
+                cfg.parked.as_ref(),
+                ParkedKey::of(cfg),
+                false,
+            ));
         }
         let card = Column::new()
             .spacing(10)
@@ -30342,6 +30767,89 @@ fi
                 .align_y(iced::Alignment::Center),
             );
         self.view_sheet_card(card)
+    }
+
+    /// One Parked list row: name, chats, age, note and PR news, with
+    /// Resume and Done. `running` (TRU-186) marks one parked with its
+    /// processes alive.
+    fn view_parked_row(
+        &self,
+        name: &str,
+        color: WorkspaceColor,
+        chats: usize,
+        parked: Option<&ParkedInfo>,
+        key: ParkedKey,
+        running: bool,
+    ) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font_small = self.ui_font_small();
+        let age = parked
+            .and_then(|parked| overview::parse_stamp(&parked.parked_at))
+            .map(overview::age_label);
+        let note = parked
+            .map(|parked| parked.note.as_str())
+            .filter(|note| !note.is_empty());
+        let owned = match chats {
+            0 => "folder".to_string(),
+            1 => "1 chat".to_string(),
+            n => format!("{n} chats"),
+        };
+        let mut head = Row::new()
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .push(
+                text(name.to_string())
+                    .size(font_small)
+                    .color(color.color(theme))
+                    .font(iced::Font::with_name("Menlo")),
+            )
+            .push(text(owned).size(font_small - 1.0).color(theme.text_muted()));
+        if running {
+            head = head.push(
+                text("\u{25CF} running")
+                    .size(font_small - 1.0)
+                    .color(theme.success()),
+            );
+        }
+        if let Some(age) = age {
+            head = head.push(text(age).size(font_small - 1.0).color(theme.text_muted()));
+        }
+        let note_line = match note {
+            Some(note) => text(note.to_string())
+                .size(font_small)
+                .color(theme.text_secondary()),
+            None => text("No note").size(font_small).color(theme.text_muted()),
+        };
+        let mut lines = column![head, note_line].spacing(2).width(Length::Fill);
+        // PR news of the parked work (TRU-173).
+        if let Some((news, color)) = self.parked_pr_news(&key) {
+            lines = lines.push(text(news).size(font_small - 1.0).color(color));
+        }
+        let row_content = row![
+            lines,
+            button(text("Resume").size(font_small))
+                .style(button::primary)
+                .padding([4, 10])
+                .on_press(Event::ParkedResume(key.clone())),
+            button(text("Done").size(font_small))
+                .style(button::text)
+                .padding([4, 10])
+                .on_press(Event::ParkedDone(key)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        let row_bg = theme.bg_base();
+        container(row_content)
+            .padding([6, 8])
+            .style(move |_| container::Style {
+                background: Some(row_bg.into()),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
     }
 
     fn view_workspace_settings_modal(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -30820,299 +31328,6 @@ fi
         .into()
     }
 
-    fn machine_group_separator(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let sep_color = self.theme.surface1();
-        container(iced::widget::Space::new().width(0).height(0))
-            .width(Length::Fixed(1.0))
-            .height(Length::Fixed(20.0))
-            .style(move |_| container::Style {
-                background: Some(sep_color.into()),
-                ..Default::default()
-            })
-            .into()
-    }
-
-    /// Machine label chip: name, reachability, click to fold/unfold.
-    fn machine_group_label(
-        &self,
-        key: &str,
-        count: usize,
-        collapsed: bool,
-    ) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let (name, status) = match key.split_once(':') {
-            None => ("this mac".to_string(), None),
-            Some(("agent", remote_id)) => {
-                let name = self
-                    .remote_agent_config_by_id(remote_id)
-                    .map(|agent| agent.name.clone())
-                    .unwrap_or_else(|| remote_id.to_string());
-                let status = match self
-                    .remote_agent_connections
-                    .get(remote_id)
-                    .map(|c| &c.status)
-                {
-                    Some(RemoteAgentConnectionStatus::Connected(_)) => ("●", theme.green()),
-                    Some(RemoteAgentConnectionStatus::Connecting) => ("◐", theme.yellow()),
-                    Some(RemoteAgentConnectionStatus::Error(_)) => ("○", theme.red()),
-                    _ => ("○", theme.text_muted()),
-                };
-                (name, Some(status))
-            }
-            Some(("ssh", host)) => (host.to_string(), None),
-            Some((_, rest)) => (rest.to_string(), None),
-        };
-        let label_color = if key == "local" {
-            theme.text_secondary()
-        } else {
-            theme.accent()
-        };
-        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center);
-        if collapsed {
-            content = content.push(text("▸").size(9).color(theme.text_muted()));
-        }
-        content = content.push(
-            text(name.to_uppercase())
-                .size(9)
-                .color(label_color)
-                .font(iced::Font::with_name("Menlo")),
-        );
-        if let Some((glyph, color)) = status {
-            content = content.push(text(glyph).size(9).color(color));
-        }
-        if collapsed && count > 0 {
-            content = content.push(
-                text(format!("×{count}"))
-                    .size(9)
-                    .color(theme.text_muted())
-                    .font(iced::Font::with_name("Menlo")),
-            );
-        }
-        let hover_bg = theme.surface0();
-        button(content)
-            .style(move |_theme, status| button::Style {
-                background: Some(
-                    if matches!(status, button::Status::Hovered) {
-                        hover_bg
-                    } else {
-                        iced::Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                border: iced::Border {
-                    radius: 5.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .padding([4, 8])
-            .on_press(Event::MachineMenuOpen(key.to_string()))
-            .into()
-    }
-
-    /// Machine-scoped "+": opens the folder picker on that machine (local
-    /// or remote agent). Legacy ssh groups get none.
-    fn machine_group_plus(&self, key: &str) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
-        let event = match key.split_once(':') {
-            None => Event::WorkspaceCreateLocal,
-            Some(("agent", remote_id)) => Event::RemoteWorkspaceBrowse(remote_id.to_string()),
-            _ => return None,
-        };
-        let color = self.theme.text_muted();
-        let hover = self.theme.text_secondary();
-        Some(
-            button(
-                text("+")
-                    .size(12)
-                    .color(color)
-                    .font(iced::Font::with_name("Menlo")),
-            )
-            .style(move |_theme, status| button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                text_color: if matches!(status, button::Status::Hovered) {
-                    hover
-                } else {
-                    color
-                },
-                ..Default::default()
-            })
-            .padding([2, 6])
-            .on_press(event)
-            .into(),
-        )
-    }
-
-    /// The machine label menu: fold, new workspace, chats, reconnect.
-    /// Anchored above the bar (bottom-center card over a click-away
-    /// backdrop), following the app's modal overlay pattern.
-    fn view_machine_menu(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let Some(key) = self.machine_menu.clone() else {
-            return iced::widget::Space::new().into();
-        };
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-
-        let (name, is_agent, connected) = match key.split_once(':') {
-            Some(("agent", remote_id)) => {
-                let name = self
-                    .remote_agent_config_by_id(remote_id)
-                    .map(|agent| agent.name.clone())
-                    .unwrap_or_else(|| remote_id.to_string());
-                let connected = matches!(
-                    self.remote_agent_connections
-                        .get(remote_id)
-                        .map(|c| &c.status),
-                    Some(RemoteAgentConnectionStatus::Connected(_))
-                );
-                (name, true, connected)
-            }
-            Some(("ssh", host)) => (host.to_string(), false, true),
-            _ => ("this mac".to_string(), false, true),
-        };
-        let ws_count = self
-            .workspaces
-            .iter()
-            .filter(|ws| self.machine_group_key(ws) == key)
-            .count();
-        let folded = self.collapsed_machine_groups.contains(&key);
-
-        let item = |label: String, event: Event| {
-            let hover_bg = theme.surface0();
-            let color = theme.text_secondary();
-            let hover_color = theme.text_primary();
-            button(text(label).size(font))
-                .style(move |_theme, status| {
-                    let hovered = matches!(status, button::Status::Hovered);
-                    button::Style {
-                        background: Some(
-                            if hovered {
-                                hover_bg
-                            } else {
-                                iced::Color::TRANSPARENT
-                            }
-                            .into(),
-                        ),
-                        text_color: if hovered { hover_color } else { color },
-                        border: iced::Border {
-                            radius: 5.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }
-                })
-                .padding([6, 10])
-                .width(Length::Fill)
-                .on_press(event)
-        };
-
-        let mut card_col = Column::new().spacing(2).push(
-            text(format!(
-                "{} · {} workspace{}{}",
-                name.to_uppercase(),
-                ws_count,
-                if ws_count == 1 { "" } else { "s" },
-                if is_agent {
-                    if connected {
-                        " · ● connected"
-                    } else {
-                        " · ○ not connected"
-                    }
-                } else {
-                    ""
-                }
-            ))
-            .size(font_small - 1.0)
-            .color(theme.text_secondary()),
-        );
-        card_col = card_col.push(item(
-            if folded {
-                "Unfold workspaces".to_string()
-            } else {
-                "Fold workspaces".to_string()
-            },
-            Event::ToggleMachineGroup(key.clone()),
-        ));
-        if key == "local" {
-            card_col = card_col.push(item(
-                "New workspace on this mac…".to_string(),
-                Event::WorkspaceCreateLocal,
-            ));
-            card_col = card_col.push(item(
-                "New workspace, no repo…".to_string(),
-                Event::NewWorkOpen,
-            ));
-        } else if let Some(("agent", remote_id)) = key.split_once(':') {
-            card_col = card_col.push(item(
-                format!("New workspace on {name}…"),
-                Event::RemoteWorkspaceBrowse(remote_id.to_string()),
-            ));
-        }
-        card_col = card_col.push(item(
-            format!("Show {name} chats"),
-            Event::ShowMachineChats(key.clone()),
-        ));
-        if is_agent && !connected {
-            card_col = card_col.push(item(
-                "Reconnect…".to_string(),
-                Event::MachineReconnect(key.clone()),
-            ));
-        }
-        if let Some(("agent", remote_id)) = key.split_once(':') {
-            if self.remote_serves_phones(remote_id) {
-                card_col = card_col.push(item(
-                    "Pair a phone…".to_string(),
-                    Event::PhonePanelOpen(remote_id.to_string()),
-                ));
-            }
-        }
-
-        let card_bg = theme.bg_surface();
-        let card_border = theme.surface1();
-        let card = container(card_col.width(Length::Fixed(260.0)))
-            .style(move |_| container::Style {
-                background: Some(card_bg.into()),
-                border: iced::Border {
-                    color: card_border,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                shadow: iced::Shadow {
-                    color: iced::Color::BLACK,
-                    offset: iced::Vector::new(0.0, 6.0),
-                    blur_radius: 16.0,
-                },
-                ..Default::default()
-            })
-            .padding(8);
-
-        let backdrop = iced::widget::mouse_area(
-            container(iced::widget::Space::new())
-                .width(Length::Fill)
-                .height(Length::Fill),
-        )
-        .on_press(Event::MachineMenuClose);
-
-        Stack::new()
-            .push(backdrop)
-            .push(
-                container(card)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .align_bottom(Length::Fill)
-                    .padding(iced::Padding {
-                        top: 0.0,
-                        right: 0.0,
-                        bottom: 46.0,
-                        left: 0.0,
-                    }),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-
     fn view_browser_evidence(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let selected = paired_browser_evidence(&self.browser_telemetry.evidence);
         let Some(evidence) = selected.last().copied() else {
@@ -31382,49 +31597,16 @@ fi
             .into()
     }
 
-    fn browser_bar_button(
-        &self,
-        label: &'static str,
-        color: iced::Color,
-        event: Event,
-    ) -> Element<'_, Event, Theme, iced::Renderer> {
-        let hover_bg = self.theme.surface1();
-        let border_color = self.theme.surface2();
-        button(
-            text(label)
-                .size(9)
-                .color(color)
-                .font(iced::Font::with_name("Menlo")),
-        )
-        .style(move |_theme, status| button::Style {
-            background: matches!(status, button::Status::Hovered | button::Status::Pressed)
-                .then_some(hover_bg.into()),
-            text_color: color,
-            border: iced::Border {
-                color: border_color,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            ..Default::default()
-        })
-        .padding([2, 6])
-        .on_press(event)
-        .into()
-    }
-
-    fn view_browser_controls(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+    /// The browser's status for the bar icon's hover (TRU-192): its colour
+    /// and whether an agent is driving it right now.
+    fn browser_status(&self) -> (BrowserBarState, String, iced::Color, bool) {
         let state = browser_bar_state(
             self.browser_mcp.is_some(),
             self.browser_status.as_ref(),
             self.browser_action,
             self.browser_error.as_deref(),
         );
-        let is_running = self
-            .browser_status
-            .as_ref()
-            .is_some_and(|status| status.state == BrowserState::Running);
-
-        let (mut label, mut dot_color) = match state {
+        let (mut label, mut color) = match state {
             BrowserBarState::Unavailable => (
                 self.browser_error.as_deref().map_or_else(
                     || "Browser unavailable".to_string(),
@@ -31455,103 +31637,271 @@ fi
                 self.theme.danger(),
             ),
         };
-
+        let mut driving = false;
         if self.browser_action.is_none()
             && !matches!(state, BrowserBarState::Unavailable | BrowserBarState::Error)
         {
             if let Some(activity) = &self.browser_telemetry.active_agent_operation {
                 label = format!("Agent · {}", activity.operation.active_label());
-                dot_color = self.theme.mauve();
+                color = self.theme.mauve();
+                driving = true;
             } else if let Some(outcome) = &self.browser_telemetry.last_agent_operation {
                 let elapsed = outcome.finished_at.elapsed().unwrap_or_default();
                 if outcome.error.is_some() && elapsed <= Duration::from_secs(8) {
                     label = format!("Agent · {} failed", outcome.operation.active_label());
-                    dot_color = self.theme.danger();
+                    color = self.theme.danger();
                 } else if outcome.error.is_none() && elapsed <= Duration::from_secs(2) {
                     label = format!("Agent · {}", outcome.operation.completed_label());
-                    dot_color = self.theme.success();
+                    color = self.theme.success();
                 }
             }
         }
+        (state, label, color, driving)
+    }
 
-        let dot = container(iced::widget::Space::new().width(0).height(0))
-            .width(Length::Fixed(6.0))
-            .height(Length::Fixed(6.0))
-            .style(move |_| container::Style {
-                background: Some(dot_color.into()),
-                border: iced::Border {
-                    radius: 3.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-        let label_color = if matches!(state, BrowserBarState::Error | BrowserBarState::Unavailable)
-        {
-            self.theme.danger()
-        } else {
-            self.theme.text_secondary()
-        };
-        let mut content = Row::new()
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .push(dot)
-            .push(
-                text(label)
-                    .size(10)
-                    .color(label_color)
-                    .font(iced::Font::with_name("Menlo")),
-            );
-
-        if !matches!(
-            state,
-            BrowserBarState::Busy(_) | BrowserBarState::Unavailable
-        ) {
-            if is_running {
-                content = content
-                    .push(self.browser_bar_button(
-                        "Focus",
-                        self.theme.accent(),
-                        Event::BrowserFocus,
-                    ))
-                    .push(self.browser_bar_button(
-                        "Disconnect",
-                        self.theme.danger(),
-                        Event::BrowserDisconnect,
-                    ));
-            } else {
-                content = content.push(self.browser_bar_button(
-                    "Open",
-                    self.theme.accent(),
-                    Event::BrowserOpen,
-                ));
-            }
-        }
-        if self.browser_telemetry.latest_evidence.is_some() {
-            content = content.push(self.browser_bar_button(
-                "Evidence",
-                self.theme.mauve(),
-                Event::BrowserEvidenceOpen,
-            ));
-        }
-
-        let background = self.theme.surface0();
-        let border_color = self.theme.surface1();
-        container(content)
-            .padding([3, 7])
-            .style(move |_| container::Style {
-                background: Some(background.into()),
-                border: iced::Border {
-                    color: border_color,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                ..Default::default()
-            })
+    /// Track hover on a bar item so its hint can pop up above it
+    /// (`BarHint`). The bubble is drawn by `view_bar_hint` over Iced
+    /// content, or by the page's `__gittermHint` when a webview sits above
+    /// the bar, which would cover anything Iced draws there.
+    fn bar_hint_area<'a>(
+        &self,
+        content: impl Into<Element<'a, Event, Theme, iced::Renderer>>,
+        tip: String,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        iced::widget::mouse_area(content)
+            .on_enter(Event::BarHintEnter(tip.clone()))
+            .on_exit(Event::BarHintExit(tip))
             .into()
     }
 
+    /// Where the hover hint is drawn right now.
+    fn bar_hint_target(&self) -> BarHintTarget {
+        let target = bar_hint_target(self.visible_webview_surface(), self.console_expanded);
+        match target {
+            BarHintTarget::Webview(surface) if !webview::is_active(surface) => BarHintTarget::Iced,
+            other => other,
+        }
+    }
+
+    /// The Iced bubble for a shown hint, anchored just above the bar at the
+    /// hovered item's x. `None` unless the hint is due and Iced draws it.
+    fn view_bar_hint(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+        let hint = self.bar_hint.as_ref().filter(|hint| hint.shown)?;
+        if self.bar_hint_target() != BarHintTarget::Iced {
+            return None;
+        }
+        let bubble_w = bar_hint_width(&hint.text);
+        let center = clamp_hint_center(hint.center_x, bubble_w, self.window_size.0);
+        let bg = self.theme.text_primary();
+        let fg = self.theme.bg_base();
+        let bubble = container(
+            text(hint.text.clone())
+                .size(12)
+                .color(fg)
+                .font(iced::Font::with_name("Menlo")),
+        )
+        .padding([4, 8])
+        .style(move |_| container::Style {
+            background: Some(bg.into()),
+            border: iced::Border {
+                radius: 5.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let pointer_offset = (hint.center_x - (center - bubble_w / 2.0) - 4.0)
+            .clamp(6.0, (bubble_w - 14.0).max(6.0));
+        let pointer = row![
+            iced::widget::Space::new().width(Length::Fixed(pointer_offset)),
+            text("\u{25BE}").size(9).color(bg)
+        ];
+        let card = column![bubble, pointer].spacing(0);
+        let positioned = row![
+            iced::widget::Space::new().width(Length::Fixed(center - bubble_w / 2.0)),
+            card
+        ];
+        Some(
+            column![
+                iced::widget::Space::new().height(Length::Fill),
+                positioned,
+                iced::widget::Space::new().height(Length::Fixed(BAR_HEIGHT + 1.0)),
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        )
+    }
+
+    /// Hover entered a bar item: remember it and, after the delay, show it.
+    fn bar_hint_enter(&mut self, text: String) -> Task<Event> {
+        self.bar_hint_seq += 1;
+        let seq = self.bar_hint_seq;
+        self.bar_hint = Some(BarHint {
+            text,
+            center_x: self.cursor_x,
+            shown: false,
+        });
+        Task::perform(
+            async move {
+                tokio::time::sleep(BAR_HINT_DELAY).await;
+                seq
+            },
+            Event::BarHintDue,
+        )
+    }
+
+    /// The delay passed: show the hint if it is still the one hovered.
+    fn bar_hint_due(&mut self, seq: u64) {
+        if seq != self.bar_hint_seq {
+            return;
+        }
+        let target = self.bar_hint_target();
+        let (x, _, page_w, _) = self.calculate_webview_bounds();
+        let Some(hint) = self.bar_hint.as_mut().filter(|hint| !hint.shown) else {
+            return;
+        };
+        hint.shown = true;
+        if let BarHintTarget::Webview(surface) = target {
+            let bubble_w = bar_hint_width(&hint.text);
+            let in_page = clamp_hint_center(hint.center_x - x, bubble_w, page_w);
+            webview::evaluate_script(surface, &bar_hint_show_script(&hint.text, in_page));
+            self.bar_hint_in = Some(surface);
+        }
+    }
+
+    /// Hover left `text`'s item (or something else took over): hide at once.
+    fn bar_hint_exit(&mut self, text: Option<&str>) {
+        if let Some(text) = text {
+            if self.bar_hint.as_ref().is_none_or(|hint| hint.text != text) {
+                return;
+            }
+        }
+        self.bar_hint_seq += 1;
+        self.bar_hint = None;
+        if let Some(surface) = self.bar_hint_in.take() {
+            webview::evaluate_script(surface, BAR_HINT_HIDE_SCRIPT);
+        }
+    }
+
+    /// A small text button on the bar.
+    fn bar_text_button(
+        &self,
+        label: String,
+        color: iced::Color,
+        event: Option<Event>,
+    ) -> button::Button<'_, Event, Theme, iced::Renderer> {
+        let hover = self.theme.text_secondary();
+        let hover_bg = self.theme.surface0();
+        button(text(label).size(11).font(iced::Font::with_name("Menlo")))
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: Some(
+                        if hovered {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: if hovered { hover } else { color },
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })
+            .padding([6, 8])
+            .on_press_maybe(event)
+    }
+
+    /// The browser as a small window glyph (TRU-192): lit while an agent
+    /// drives it, coloured by state; a click opens (or brings forward) the
+    /// browser and the hover says what it is doing.
+    fn view_browser_icon(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let (state, label, color, driving) = self.browser_status();
+        let fill = if driving {
+            iced::Color { a: 0.35, ..color }
+        } else {
+            iced::Color::TRANSPARENT
+        };
+        let glyph = container(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fixed(2.0))
+                .style(move |_| container::Style {
+                    background: Some(color.into()),
+                    ..Default::default()
+                }),
+        )
+        .width(Length::Fixed(13.0))
+        .height(Length::Fixed(10.0))
+        .style(move |_| container::Style {
+            background: Some(fill.into()),
+            border: iced::Border {
+                color,
+                width: 1.0,
+                radius: 2.0.into(),
+            },
+            ..Default::default()
+        });
+        let event = match state {
+            BrowserBarState::Running => Some(Event::BrowserFocus),
+            BrowserBarState::Stopped | BrowserBarState::Error => Some(Event::BrowserOpen),
+            BrowserBarState::Busy(_) | BrowserBarState::Unavailable => None,
+        };
+        let hover_bg = self.theme.surface0();
+        let btn = button(glyph)
+            .style(move |_theme, status| button::Style {
+                background: Some(
+                    if matches!(status, button::Status::Hovered) {
+                        hover_bg
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .padding([7, 7])
+            .on_press_maybe(event);
+        self.bar_hint_area(btn, label)
+    }
+
+    /// The bar's terminal toggle (TRU-192): opens or folds the bottom
+    /// terminal panel, which has no header row while folded.
+    fn view_terminal_toggle(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let running = self.active_workspace().is_some_and(|ws| {
+            ws.bottom_terminals
+                .iter()
+                .any(|bt| bt.run.is_some() && bt.alive)
+        });
+        let color = if self.console_expanded {
+            theme.accent()
+        } else if running {
+            theme.success()
+        } else {
+            theme.text_muted()
+        };
+        let tip = match (self.console_expanded, running) {
+            (true, _) => "Fold the terminal panel (\u{2318}J)",
+            (false, true) => "Terminal panel, a command is running (\u{2318}J)",
+            (false, false) => "Terminal panel (\u{2318}J)",
+        };
+        let btn = self.bar_text_button(">_".to_string(), color, Some(Event::ConsoleToggle));
+        self.bar_hint_area(btn, tip.to_string())
+    }
+
     /// One workspace chip on the bar: dot, name (double-click renames),
-    /// the active one's gear, attention and PR news.
+    /// the active one's gear, attention and PR news. An inactive chip
+    /// shows its short label (TRU-192); every chip shows the full name on
+    /// hover.
     fn view_workspace_chip(&self, idx: usize) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let pulse_bright = self.attention_pulse_bright;
@@ -31603,11 +31953,11 @@ fi
             });
 
         // Double-click the name to rename inline (TRU-169).
-        let label: Element<'_, Event, Theme, iced::Renderer> = match self
+        let renaming = self
             .workspace_rename
             .as_ref()
-            .filter(|rename| rename.site == RenameSite::Chip && rename.uid == ws.uid)
-        {
+            .filter(|rename| rename.site == RenameSite::Chip && rename.uid == ws.uid);
+        let label: Element<'_, Event, Theme, iced::Renderer> = match renaming {
             Some(rename) => text_input("Workspace name", &rename.draft)
                 .id(workspace_rename_input_id())
                 .on_input(Event::WorkspaceRenameInput)
@@ -31618,10 +31968,14 @@ fi
                 .font(iced::Font::with_name("Menlo"))
                 .into(),
             None => iced::widget::mouse_area(
-                text(&ws.name)
-                    .size(11)
-                    .color(text_color)
-                    .font(iced::Font::with_name("Menlo")),
+                text(if is_active {
+                    ws.name.clone()
+                } else {
+                    workspace_bar::short_label(&ws.name)
+                })
+                .size(11)
+                .color(text_color)
+                .font(iced::Font::with_name("Menlo")),
             )
             .on_press(Event::WorkspaceSelect(idx))
             .on_double_click(Event::WorkspaceRenameStart(idx, RenameSite::Chip))
@@ -31686,6 +32040,21 @@ fi
             );
         }
 
+        // Back from a running park (TRU-186): why, until it is visited.
+        if let Some(reason) = ws.woke.filter(|_| !is_active) {
+            let color = match reason {
+                WakeReason::NeedsYou => theme.peach(),
+                WakeReason::Finished => theme.success(),
+                WakeReason::Failed => theme.danger(),
+            };
+            btn_content = btn_content.push(
+                text(reason.label())
+                    .size(9)
+                    .color(color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+
         // PR news (TRU-173): the newest, e.g. "#841 checks failed".
         if let Some((label, color)) = self.workspace_pr_badge(ws.uid) {
             btn_content = btn_content.push(
@@ -31697,7 +32066,7 @@ fi
         }
 
         // Active workspace: colored top accent line above the button
-        if is_active {
+        let chip: Element<'_, Event, Theme, iced::Renderer> = if is_active {
             let accent_line = container(iced::widget::Space::new().width(0).height(0))
                 .width(Length::Fill)
                 .height(Length::Fixed(2.0))
@@ -31718,7 +32087,7 @@ fi
 
             column![accent_line, ws_btn].spacing(0).into()
         } else {
-            let ws_btn = button(btn_content)
+            button(btn_content)
                 .style(move |_theme, status| {
                     let bg = if matches!(status, button::Status::Hovered) {
                         hover_bg
@@ -31733,57 +32102,147 @@ fi
                     }
                 })
                 .padding([6, 12])
-                .on_press(Event::WorkspaceSelect(idx));
-            ws_btn.into()
+                .on_press(Event::WorkspaceSelect(idx))
+                .into()
+        };
+        if renaming.is_some() {
+            return chip;
+        }
+        self.bar_hint_area(chip, ws.name.clone())
+    }
+
+    /// A machine's display name and, for a remote agent, its connection
+    /// state as a colour and a word.
+    fn machine_name_and_status(&self, key: &str) -> (String, Option<(iced::Color, &'static str)>) {
+        let theme = &self.theme;
+        match key.split_once(':') {
+            None => ("this Mac".to_string(), None),
+            Some(("agent", remote_id)) => {
+                let name = self
+                    .remote_agent_config_by_id(remote_id)
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_else(|| remote_id.to_string());
+                let status = match self
+                    .remote_agent_connections
+                    .get(remote_id)
+                    .map(|c| &c.status)
+                {
+                    Some(RemoteAgentConnectionStatus::Connected(_)) => (theme.green(), "connected"),
+                    Some(RemoteAgentConnectionStatus::Connecting) => (theme.yellow(), "connecting"),
+                    Some(RemoteAgentConnectionStatus::Error(_)) => (theme.red(), "unreachable"),
+                    Some(RemoteAgentConnectionStatus::Disconnected) | None => {
+                        (theme.text_muted(), "not connected")
+                    }
+                };
+                (name, Some(status))
+            }
+            Some((_, rest)) => (rest.to_string(), None),
         }
     }
 
-    /// The `Repos ▸ n` / `Repos ▾` toggle of a machine group's folder
-    /// workspaces (TRU-175). Collapsed, a dot says a hidden chip has
-    /// attention, an error or PR news.
-    fn view_repos_toggle(
+    /// The other machines the `Repos ▾` menu has a section for: those with
+    /// open workspaces in layout order, then configured remotes with none.
+    fn bar_machine_keys(&self, layout: &workspace_bar::BarLayout) -> Vec<String> {
+        let mut keys: Vec<String> = layout
+            .sections
+            .iter()
+            .filter(|section| section.key != workspace_bar::LOCAL_GROUP)
+            .map(|section| section.key.clone())
+            .collect();
+        for def in &self.remote_agent_defs {
+            let key = format!("agent:{}", def.id);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    /// Unopened legacy remote sessions, listed at the end of the menu.
+    fn unopened_remote_sessions(&self) -> Vec<&RemoteSessionDefinition> {
+        self.remote_session_defs
+            .iter()
+            .filter(|session| {
+                !self.workspaces.iter().any(|workspace| {
+                    workspace
+                        .remote_session
+                        .as_ref()
+                        .is_some_and(|open| open.session_name == session.session_name)
+                })
+            })
+            .collect()
+    }
+
+    fn status_dot(color: iced::Color, size: f32) -> Element<'static, Event, Theme, iced::Renderer> {
+        container(iced::widget::Space::new().width(0).height(0))
+            .width(Length::Fixed(size))
+            .height(Length::Fixed(size))
+            .style(move |_| container::Style {
+                background: Some(color.into()),
+                border: iced::Border {
+                    radius: (size / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// `Repos ▾` (TRU-192): opens the menu of this Mac's folder workspaces
+    /// and a section per machine. A peach dot says a workspace only the
+    /// menu shows has attention or PR news; then one small dot per other
+    /// machine, coloured by its connection.
+    fn view_repos_menu_button(
         &self,
-        key: &str,
-        toggle: &workspace_bar::ReposToggle,
+        layout: &workspace_bar::BarLayout,
     ) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let label = if toggle.collapsed {
-            format!("Repos \u{25B8} {}", toggle.count)
-        } else {
-            "Repos \u{25BE}".to_string()
-        };
-        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center);
-        content = content.push(text(label).size(11).font(iced::Font::with_name("Menlo")));
-        let hidden_news = toggle.hidden.iter().any(|&idx| {
+        let open = self.bar_menu == Some(BarMenu::Repos);
+        let mut content = Row::new().spacing(5).align_y(iced::Alignment::Center).push(
+            text(if open {
+                "Repos \u{25B4}"
+            } else {
+                "Repos \u{25BE}"
+            })
+            .size(11)
+            .font(iced::Font::with_name("Menlo")),
+        );
+        let hidden_news = layout.hidden.iter().any(|&idx| {
             self.workspaces.get(idx).is_some_and(|ws| {
                 ws.attention_count() > 0 || self.workspace_pr_badge(ws.uid).is_some()
             })
         });
         if hidden_news {
-            let dot_color = theme.peach();
-            content = content.push(
-                container(iced::widget::Space::new().width(0).height(0))
-                    .width(Length::Fixed(6.0))
-                    .height(Length::Fixed(6.0))
-                    .style(move |_| container::Style {
-                        background: Some(dot_color.into()),
-                        border: iced::Border {
-                            radius: 3.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-            );
+            content = content.push(Self::status_dot(theme.peach(), 6.0));
         }
-        let color = theme.text_muted();
+        let mut tip_parts: Vec<String> = vec!["Repos and machines".to_string()];
+        let machines = self.bar_machine_keys(layout);
+        if !machines.is_empty() {
+            let mut dots = Row::new().spacing(3).align_y(iced::Alignment::Center);
+            for key in &machines {
+                let (name, status) = self.machine_name_and_status(key);
+                let (color, word) = status.unwrap_or((theme.overlay0(), "remote session"));
+                dots = dots.push(Self::status_dot(color, 5.0));
+                tip_parts.push(format!("{name} {word}"));
+            }
+            content = content.push(dots);
+        }
+        if hidden_news {
+            tip_parts.push("news inside".to_string());
+        }
+        let color = if open {
+            theme.text_primary()
+        } else {
+            theme.text_muted()
+        };
         let hover = theme.text_secondary();
         let hover_bg = theme.surface0();
-        button(content)
+        let btn = button(content)
             .style(move |_theme, status| {
                 let hovered = matches!(status, button::Status::Hovered);
                 button::Style {
                     background: Some(
-                        if hovered {
+                        if hovered || open {
                             hover_bg
                         } else {
                             iced::Color::TRANSPARENT
@@ -31796,138 +32255,50 @@ fi
                 }
             })
             .padding([6, 12])
-            .on_press(Event::ToggleReposZone(key.to_string()))
-            .into()
+            .on_press(Event::BarMenuToggle(BarMenu::Repos));
+        self.bar_hint_area(btn, tip_parts.join(" \u{00B7} "))
     }
 
     fn view_workspace_bar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
+        let layout = self.workspace_bar_layout();
+        let chip_separator = || {
+            let sep_color = theme.surface0();
+            container(iced::widget::Space::new().width(0).height(0))
+                .width(Length::Fixed(1.0))
+                .height(Length::Fixed(14.0))
+                .style(move |_| container::Style {
+                    background: Some(sep_color.into()),
+                    ..Default::default()
+                })
+        };
+
+        // This Mac's work, the Repos menu, then the folders on the bar and
+        // the active workspace when only the menu would list it.
         let mut bar_row = Row::new().spacing(0).align_y(iced::Alignment::Center);
-
-        // 4b: the Vec is machine-normalized, so groups are contiguous;
-        // within a group work comes first, then the Repos zone (TRU-175).
-        let groups = self.workspace_bar_layout();
-        for (group_idx, group) in groups.iter().enumerate() {
-            if group_idx > 0 {
-                bar_row = bar_row.push(self.machine_group_separator());
+        for (pos, &idx) in layout.work.iter().enumerate() {
+            if pos > 0 {
+                bar_row = bar_row.push(chip_separator());
             }
-            bar_row = bar_row.push(self.machine_group_label(&group.key, group.size, group.folded));
-            // Folded groups hide their chips — except the active one,
-            // which never disappears out from under the user.
-            let mut items: Vec<Element<'_, Event, Theme, iced::Renderer>> = group
-                .work
-                .iter()
-                .map(|&idx| self.view_workspace_chip(idx))
-                .collect();
-            if let Some(toggle) = &group.repos {
-                items.push(self.view_repos_toggle(&group.key, toggle));
-            }
-            items.extend(
-                group
-                    .folders
-                    .iter()
-                    .map(|&idx| self.view_workspace_chip(idx)),
-            );
-            for (item_idx, item) in items.into_iter().enumerate() {
-                // Separator between chips of the same machine group
-                if item_idx > 0 {
-                    let sep_color = theme.surface0();
-                    bar_row = bar_row.push(
-                        container(iced::widget::Space::new().width(0).height(0))
-                            .width(Length::Fixed(1.0))
-                            .height(Length::Fixed(14.0))
-                            .style(move |_| container::Style {
-                                background: Some(sep_color.into()),
-                                ..Default::default()
-                            }),
-                    );
-                }
-                bar_row = bar_row.push(item);
-            }
-            // Close the group with its machine-scoped "+".
-            if let Some(plus) = self.machine_group_plus(&group.key) {
-                bar_row = bar_row.push(plus);
-            }
+            bar_row = bar_row.push(self.view_workspace_chip(idx));
         }
-        let group_keys: Vec<&str> = groups.iter().map(|group| group.key.as_str()).collect();
-
-        // Configured remotes with no open workspace stay visible: label
-        // plus a "+" to open their first one (the always-visible rule).
-        for def in &self.remote_agent_defs {
-            let key = format!("agent:{}", def.id);
-            if group_keys.contains(&key.as_str()) {
-                continue;
-            }
-            bar_row = bar_row.push(self.machine_group_separator());
-            bar_row = bar_row.push(self.machine_group_label(&key, 0, false));
-            if let Some(plus) = self.machine_group_plus(&key) {
-                bar_row = bar_row.push(plus);
-            }
+        if !layout.work.is_empty() {
+            bar_row = bar_row.push(chip_separator());
+        }
+        bar_row = bar_row.push(self.view_repos_menu_button(&layout));
+        for &idx in &layout.after {
+            bar_row = bar_row.push(chip_separator());
+            bar_row = bar_row.push(self.view_workspace_chip(idx));
         }
 
-        let unopened_remote_sessions: Vec<&RemoteSessionDefinition> = self
-            .remote_session_defs
-            .iter()
-            .filter(|session| {
-                !self.workspaces.iter().any(|workspace| {
-                    workspace
-                        .remote_session
-                        .as_ref()
-                        .is_some_and(|open| open.session_name == session.session_name)
-                })
-            })
-            .collect();
-
-        for session in unopened_remote_sessions {
-            let remote_color = theme.accent();
-            let remote_hover = theme.surface0();
-            let label = text(format!("+ {}", remote_workspace_name(session)))
-                .size(11)
-                .color(remote_color)
-                .font(iced::Font::with_name("Menlo"));
-            let remote_btn = button(label)
-                .style(move |_theme, status| {
-                    let bg = if matches!(status, button::Status::Hovered) {
-                        remote_hover
-                    } else {
-                        iced::Color::TRANSPARENT
-                    };
-                    button::Style {
-                        background: Some(bg.into()),
-                        text_color: remote_color,
-                        border: iced::Border::default(),
-                        ..Default::default()
-                    }
-                })
-                .padding([6, 12])
-                .on_press(Event::RemoteWorkspaceOpen(session.session_name.clone()));
-            bar_row = bar_row.push(remote_btn);
-        }
-
-        // "+ workspace" button at the end
-        let ws_add_color = theme.text_muted();
-        let ws_add_hover = theme.text_secondary();
-        let ws_add_btn = button(
-            text("+ workspace")
-                .size(11)
-                .color(ws_add_color)
-                .font(iced::Font::with_name("Menlo")),
-        )
-        .style(move |_theme, status| {
-            let tc = if matches!(status, button::Status::Hovered) {
-                ws_add_hover
-            } else {
-                ws_add_color
-            };
-            button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                text_color: tc,
-                ..Default::default()
-            }
-        })
-        .padding([6, 12])
-        .on_press(Event::WorkspaceCreate);
-        bar_row = bar_row.push(ws_add_btn);
+        // The one "+": the New workspace sheet for a piece of work
+        // (TRU-194); its link opens the folder picker for a repo.
+        let plus = self.bar_text_button(
+            "+".to_string(),
+            theme.text_muted(),
+            Some(Event::NewWorkOpen),
+        );
+        bar_row = bar_row.push(self.bar_hint_area(plus, "New workspace".to_string()));
 
         let scrollable_bar = scrollable(bar_row.padding([0, 4]).align_y(iced::Alignment::Center))
             .direction(scrollable::Direction::Horizontal(
@@ -31969,31 +32340,6 @@ fi
                 ..Default::default()
             });
 
-        // Help button (?) pinned to the right
-        let help_color = theme.text_muted();
-        let help_hover = theme.text_secondary();
-        let help_btn = button(
-            text("?")
-                .size(11)
-                .color(help_color)
-                .font(iced::Font::with_name("Menlo")),
-        )
-        .style(move |_theme, status| {
-            let tc = if matches!(status, button::Status::Hovered) {
-                help_hover
-            } else {
-                help_color
-            };
-            button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                text_color: tc,
-                ..Default::default()
-            }
-        })
-        .padding([6, 10])
-        .on_press(Event::ToggleHelp);
-
-        let browser_controls = self.view_browser_controls();
         let control_separator_color = theme.surface0();
         let control_separator = container(iced::widget::Space::new().width(0).height(0))
             .width(Length::Fixed(1.0))
@@ -32003,45 +32349,43 @@ fi
                 ..Default::default()
             });
 
-        // `⏸ n parked` opens the Parked list (TRU-171); hidden at none.
+        let mut bar_inner = row![scrollable_bar];
+        // `↑n` opens Ready to merge (TRU-173); hidden at none.
+        if let Some(ready_btn) = self.view_ready_button() {
+            bar_inner = bar_inner.push(ready_btn);
+        }
+        // `⏸n` opens the Parked list (TRU-171); hidden at none.
         let parked_count = self
             .closed_workspace_configs
             .iter()
             .filter(|cfg| cfg.is_parked())
-            .count();
-        let parked_btn = (parked_count > 0).then(|| {
-            let parked_color = theme.text_muted();
-            let parked_hover = theme.text_secondary();
-            button(
-                text(format!("\u{23F8} {parked_count} parked"))
-                    .size(11)
-                    .font(iced::Font::with_name("Menlo")),
-            )
-            .style(move |_theme, status| button::Style {
-                background: Some(iced::Color::TRANSPARENT.into()),
-                text_color: if matches!(status, button::Status::Hovered) {
-                    parked_hover
-                } else {
-                    parked_color
-                },
-                ..Default::default()
-            })
-            .padding([6, 10])
-            .on_press(Event::ParkedListToggle)
-        });
-
-        let mut bar_inner = row![scrollable_bar];
-        // `⇡ n to merge` opens Ready to merge (TRU-173); hidden at none.
-        if let Some(ready_btn) = self.view_ready_button() {
-            bar_inner = bar_inner.push(ready_btn);
+            .count()
+            + (self.workspaces.len() - self.bar_workspace_count());
+        if parked_count > 0 {
+            let parked = self.bar_text_button(
+                format!("\u{23F8}{parked_count}"),
+                theme.text_muted(),
+                Some(Event::ParkedListToggle),
+            );
+            bar_inner =
+                bar_inner.push(self.bar_hint_area(parked, format!("{parked_count} parked")));
         }
-        if let Some(parked_btn) = parked_btn {
-            bar_inner = bar_inner.push(parked_btn);
-        }
+        let more_open = self.bar_menu == Some(BarMenu::More);
+        let more = self.bar_text_button(
+            "\u{22EF}".to_string(),
+            if more_open {
+                theme.text_primary()
+            } else {
+                theme.text_muted()
+            },
+            Some(Event::BarMenuToggle(BarMenu::More)),
+        );
         let bar_inner = bar_inner
             .push(control_separator)
-            .push(container(browser_controls).padding([0, 6]))
-            .push(help_btn)
+            .push(self.view_terminal_toggle())
+            .push(self.view_browser_icon())
+            .push(self.bar_hint_area(more, "Help and browser actions".to_string()))
+            .push(iced::widget::Space::new().width(Length::Fixed(4.0)))
             .spacing(0)
             .align_y(iced::Alignment::Center)
             .width(Length::Fill);
@@ -32055,6 +32399,360 @@ fi
                 });
 
         column![top_border, bar_container].into()
+    }
+
+    /// One row of a bar menu.
+    fn bar_menu_item(
+        &self,
+        content: impl Into<Element<'static, Event, Theme, iced::Renderer>>,
+        event: Event,
+    ) -> Element<'static, Event, Theme, iced::Renderer> {
+        let hover_bg = self.theme.surface0();
+        let color = self.theme.text_secondary();
+        let hover_color = self.theme.text_primary();
+        button(content)
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: Some(
+                        if hovered {
+                            hover_bg
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    text_color: if hovered { hover_color } else { color },
+                    border: iced::Border {
+                        radius: 5.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })
+            .padding([5, 10])
+            .width(Length::Fill)
+            .on_press(Event::BarMenuRun(Box::new(event)))
+            .into()
+    }
+
+    /// A workspace row of the `Repos ▾` menu: its dot, full name and
+    /// attention count; the active one in its colour.
+    fn view_menu_workspace_row(
+        &self,
+        idx: usize,
+    ) -> Element<'static, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let ws = &self.workspaces[idx];
+        let is_active = idx == self.active_workspace_idx;
+        let attention = ws.attention_count();
+        let dot_color = if attention > 0 {
+            theme.peach()
+        } else if is_active {
+            ws.color.color(theme)
+        } else {
+            theme.surface2()
+        };
+        let mut row_content = Row::new()
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .push(Self::status_dot(dot_color, 6.0))
+            .push(
+                text(ws.name.clone())
+                    .size(self.ui_font())
+                    .color(if is_active {
+                        ws.color.color(theme)
+                    } else {
+                        theme.text_secondary()
+                    })
+                    .width(Length::Fill),
+            );
+        if attention > 0 {
+            row_content = row_content.push(
+                text(attention.to_string())
+                    .size(self.ui_font_small())
+                    .color(theme.peach())
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+        if let Some((label, color)) = self.workspace_pr_badge(ws.uid) {
+            row_content = row_content.push(
+                text(label)
+                    .size(self.ui_font_small())
+                    .color(color)
+                    .font(iced::Font::with_name("Menlo")),
+            );
+        }
+        self.bar_menu_item(row_content, Event::WorkspaceSelect(idx))
+    }
+
+    /// The open bar menu over a click-away backdrop, anchored above the
+    /// bar: `Repos ▾` on the left, `⋯` on the right.
+    fn view_bar_menu(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let Some(menu) = self.bar_menu else {
+            return iced::widget::Space::new().into();
+        };
+        let theme = &self.theme;
+        let content = match menu {
+            BarMenu::Repos => self.view_repos_menu(),
+            BarMenu::More => self.view_more_menu(),
+        };
+        let card_bg = theme.bg_surface();
+        let card_border = theme.surface1();
+        let max_height = (self.window_size.1 - 120.0).max(160.0);
+        let card = container(
+            scrollable(content)
+                .height(Length::Shrink)
+                .width(Length::Fixed(300.0)),
+        )
+        .max_height(max_height)
+        .style(move |_| container::Style {
+            background: Some(card_bg.into()),
+            border: iced::Border {
+                color: card_border,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: iced::Color::BLACK,
+                offset: iced::Vector::new(0.0, 6.0),
+                blur_radius: 16.0,
+            },
+            ..Default::default()
+        })
+        .padding(8);
+
+        let backdrop = iced::widget::mouse_area(
+            container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Event::BarMenuClose);
+
+        let anchored = container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_bottom(Length::Fill);
+        let anchored = match menu {
+            BarMenu::Repos => anchored.align_left(Length::Fill).padding(iced::Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 34.0,
+                left: SPINE_WIDTH + 8.0,
+            }),
+            BarMenu::More => anchored.align_right(Length::Fill).padding(iced::Padding {
+                top: 0.0,
+                right: 8.0,
+                bottom: 34.0,
+                left: 0.0,
+            }),
+        };
+        Stack::new()
+            .push(backdrop)
+            .push(anchored)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// `Repos ▾` (TRU-192): a section per machine, this Mac first. Each
+    /// has its name (a remote's connection), its `+`, its workspaces (this
+    /// Mac's folders; every workspace of another machine) and its actions.
+    /// Unopened legacy remote sessions come last.
+    fn view_repos_menu(&self) -> Element<'static, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let layout = self.workspace_bar_layout();
+        let mut keys = vec![workspace_bar::LOCAL_GROUP.to_string()];
+        keys.extend(self.bar_machine_keys(&layout));
+
+        let mut col = Column::new().spacing(2);
+        for (pos, key) in keys.iter().enumerate() {
+            if pos > 0 {
+                let line = theme.surface1();
+                col = col.push(
+                    container(iced::widget::Space::new())
+                        .width(Length::Fill)
+                        .height(Length::Fixed(1.0))
+                        .style(move |_| container::Style {
+                            background: Some(line.into()),
+                            ..Default::default()
+                        }),
+                );
+            }
+            let (name, status) = self.machine_name_and_status(key);
+            let mut header = Row::new()
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .padding([4, 10])
+                .push(
+                    text(name.to_uppercase())
+                        .size(font_small - 1.0)
+                        .color(theme.text_secondary())
+                        .font(iced::Font::with_name("Menlo")),
+                );
+            if let Some((color, word)) = status {
+                header = header
+                    .push(Self::status_dot(color, 6.0))
+                    .push(text(word).size(font_small - 1.0).color(theme.text_muted()));
+            }
+            header = header.push(iced::widget::Space::new().width(Length::Fill));
+            let create = match key.split_once(':') {
+                None => Some(Event::WorkspaceCreateLocal),
+                Some(("agent", remote_id)) => {
+                    Some(Event::RemoteWorkspaceBrowse(remote_id.to_string()))
+                }
+                _ => None,
+            };
+            if let Some(create) = create {
+                let color = theme.text_muted();
+                let hover = theme.text_primary();
+                header = header.push(
+                    button(text("+").size(font).font(iced::Font::with_name("Menlo")))
+                        .style(move |_theme, status| button::Style {
+                            background: Some(iced::Color::TRANSPARENT.into()),
+                            text_color: if matches!(status, button::Status::Hovered) {
+                                hover
+                            } else {
+                                color
+                            },
+                            ..Default::default()
+                        })
+                        .padding([0, 4])
+                        .on_press(Event::BarMenuRun(Box::new(create))),
+                );
+            }
+            col = col.push(header);
+
+            let workspaces = layout
+                .sections
+                .iter()
+                .find(|section| &section.key == key)
+                .map(|section| section.workspaces.as_slice())
+                .unwrap_or_default();
+            for &idx in workspaces {
+                col = col.push(self.view_menu_workspace_row(idx));
+            }
+
+            let action = |label: String| text(label).size(font_small).color(theme.text_muted());
+            if key == workspace_bar::LOCAL_GROUP {
+                col = col.push(self.bar_menu_item(
+                    action("New workspace\u{2026}".to_string()),
+                    Event::NewWorkOpen,
+                ));
+                if !workspaces.is_empty() {
+                    col = col.push(self.bar_menu_item(
+                        action(if self.repos_on_bar() {
+                            "Keep repos in this menu only".to_string()
+                        } else {
+                            "Show repos on the bar too".to_string()
+                        }),
+                        Event::ToggleReposZone(key.clone()),
+                    ));
+                }
+            }
+            col = col.push(self.bar_menu_item(
+                action(format!("Show {name} chats")),
+                Event::ShowMachineChats(key.clone()),
+            ));
+            if let Some(("agent", remote_id)) = key.split_once(':') {
+                let connected = matches!(
+                    self.remote_agent_connections
+                        .get(remote_id)
+                        .map(|c| &c.status),
+                    Some(RemoteAgentConnectionStatus::Connected(_))
+                );
+                if !connected {
+                    col = col.push(self.bar_menu_item(
+                        action("Reconnect\u{2026}".to_string()),
+                        Event::MachineReconnect(key.clone()),
+                    ));
+                }
+                if self.remote_serves_phones(remote_id) {
+                    col = col.push(self.bar_menu_item(
+                        action("Pair a phone\u{2026}".to_string()),
+                        Event::PhonePanelOpen(remote_id.to_string()),
+                    ));
+                }
+            }
+        }
+
+        let sessions = self.unopened_remote_sessions();
+        if !sessions.is_empty() {
+            col = col.push(
+                container(
+                    text("REMOTE SESSIONS")
+                        .size(font_small - 1.0)
+                        .color(theme.text_secondary())
+                        .font(iced::Font::with_name("Menlo")),
+                )
+                .padding([4, 10]),
+            );
+            for session in sessions {
+                col = col.push(
+                    self.bar_menu_item(
+                        text(format!("+ {}", remote_workspace_name(session)))
+                            .size(font)
+                            .color(theme.accent()),
+                        Event::RemoteWorkspaceOpen(session.session_name.clone()),
+                    ),
+                );
+            }
+        }
+        col.into()
+    }
+
+    /// `⋯` (TRU-192): help, and the browser actions the bar icon does not
+    /// cover.
+    fn view_more_menu(&self) -> Element<'static, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let item = |label: &str, hint: &str| {
+            row![
+                text(label.to_string()).size(font).width(Length::Fill),
+                text(hint.to_string())
+                    .size(font_small)
+                    .color(theme.text_muted())
+                    .font(iced::Font::with_name("Menlo")),
+            ]
+            .align_y(iced::Alignment::Center)
+        };
+        let (state, label, color, _) = self.browser_status();
+        let mut col = Column::new()
+            .spacing(2)
+            .push(self.bar_menu_item(item("Keyboard shortcuts", "\u{2325}/"), Event::ToggleHelp))
+            .push(
+                container(
+                    row![
+                        Self::status_dot(color, 6.0),
+                        text(label).size(font_small).color(theme.text_muted()),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([6, 10]),
+            );
+        match state {
+            BrowserBarState::Running => {
+                col =
+                    col.push(self.bar_menu_item(item("Focus browser", ""), Event::BrowserFocus))
+                        .push(self.bar_menu_item(
+                            item("Disconnect browser", ""),
+                            Event::BrowserDisconnect,
+                        ));
+            }
+            BrowserBarState::Stopped | BrowserBarState::Error => {
+                col = col.push(self.bar_menu_item(item("Open browser", ""), Event::BrowserOpen));
+            }
+            BrowserBarState::Busy(_) | BrowserBarState::Unavailable => {}
+        }
+        if self.browser_telemetry.latest_evidence.is_some() {
+            col = col
+                .push(self.bar_menu_item(item("Browser evidence", ""), Event::BrowserEvidenceOpen));
+        }
+        col.into()
     }
 
     fn view_spine(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -32829,7 +33527,7 @@ fi
 
             // Close workspace button (only if more than one workspace, matching
             // the WorkspaceClose handler's guard so the button never no-ops)
-            if self.workspaces.len() > 1 {
+            if self.bar_workspace_count() > 1 {
                 let close_color = theme.overlay0();
                 let close_hover = theme.text_primary();
                 let ws_idx = self.active_workspace_idx;
@@ -32972,12 +33670,6 @@ fi
                     // background that lets the webview occupy the same area.
                     freeze_time!("view_agent_tab", { self.view_agent_tab(tab) })
                 }
-            } else if tab.agent_sidebar.selected_capture_idx.is_some()
-                && tab.sidebar_mode == SidebarMode::Agent
-            {
-                freeze_time!("view_agent_conversation", {
-                    self.view_agent_conversation(tab)
-                })
             } else if tab.sidebar_mode == SidebarMode::Chats {
                 // The whole main pane belongs to Chats while the panel is
                 // open — also keeps the terminal out of the widget tree so
@@ -33525,177 +34217,48 @@ fi
             .into()
     }
 
+    /// The sidebar header (TRU-192): Work, Files, Find, then the collapse
+    /// chevron. Git and the agent view show under Work.
     fn view_sidebar_toggle<'a>(
         &'a self,
         tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font = self.ui_font();
-        let changes = tab.total_changes();
-
-        let git_active = tab.sidebar_mode == SidebarMode::Git;
-        let files_active = tab.sidebar_mode == SidebarMode::Files;
-        let tasks_active = tab.sidebar_mode == SidebarMode::Tasks;
-        let claude_active = tab.sidebar_mode == SidebarMode::Claude;
-        let workspace_is_remote = self.active_workspace_is_remote();
-        let remote_active = workspace_is_remote && tab.sidebar_mode == SidebarMode::Remote;
-        let _agent_active = tab.sidebar_mode == SidebarMode::Agent;
-
-        // Git tab label with optional badge
-        // Inactive nav items use subtext0, not the overlay tier: overlay grays
-        // sit too close to the dark surface for small text to stay readable.
-        let git_text_color = if git_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let mut git_label: Row<'_, Event, Theme, iced::Renderer> =
-            Row::new().spacing(4).align_y(iced::Alignment::Center);
-        git_label = git_label.push(text("Git").size(font).color(git_text_color));
-
-        if changes > 0 {
-            let badge_bg = iced::Color {
-                a: 0.2,
-                ..theme.warning()
-            };
-            let warning_color = theme.warning();
-            let badge = container(text(format!("{}", changes)).size(10).color(warning_color))
-                .padding([1, 6])
-                .style(move |_| container::Style {
-                    background: Some(badge_bg.into()),
-                    border: iced::Border {
-                        radius: 8.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                });
-            git_label = git_label.push(badge);
-        }
-
-        let git_tab = self.view_sidebar_tab(
-            git_label.into(),
-            git_active,
-            Event::SetSidebarMode(SidebarMode::Git),
-        );
-
-        // Files tab
-        let files_text_color = if files_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let files_tab = self.view_sidebar_tab(
-            text("Files").size(font).color(files_text_color).into(),
-            files_active,
-            Event::SetSidebarMode(SidebarMode::Files),
-        );
-
-        let tasks_text_color = if tasks_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let tasks_tab = self.view_sidebar_tab(
-            text("Tasks").size(font).color(tasks_text_color).into(),
-            tasks_active,
-            Event::SetSidebarMode(SidebarMode::Tasks),
-        );
-
-        // Agent tab (was "Claude" — same SidebarMode::Claude variant, shows skills/plugins/hooks)
-        let agent_text_color = if claude_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let agent_tab = self.view_sidebar_tab(
-            text("Agent").size(font).color(agent_text_color).into(),
-            claude_active,
-            Event::SetSidebarMode(SidebarMode::Claude),
-        );
-
-        let bg = theme.bg_crust();
-        let border_color = theme.surface0();
-
-        // Collapse chevron (same style as console toggle)
-        let chevron_color = theme.subtext0();
-        let collapse_chevron = button(
-            text("\u{25C0}").size(10).color(chevron_color), // ◀ left-pointing
-        )
-        .style(|_theme, _status| button::Style {
-            background: Some(iced::Color::TRANSPARENT.into()),
-            ..Default::default()
-        })
-        .padding([4, 4])
-        .on_press(Event::ToggleSidebar);
-
-        // Plans tab (replaces the legacy "Agent" sidebar tab)
-        let plans_active = tab.sidebar_mode == SidebarMode::Plans;
-        let plans_text_color = if plans_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let plans_tab = self.view_sidebar_tab(
-            text("Plans").size(font).color(plans_text_color).into(),
-            plans_active,
-            Event::SetSidebarMode(SidebarMode::Plans),
-        );
-
-        let chats_active = tab.sidebar_mode == SidebarMode::Chats;
-        let chats_text_color = if chats_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let chats_tab = self.view_sidebar_tab(
-            text("Chats").size(font).color(chats_text_color).into(),
-            chats_active,
-            Event::SetSidebarMode(SidebarMode::Chats),
-        );
-
-        // Workspace overview (TRU-167): a glyph, as the spine shows it, so
-        // the text row keeps its width.
-        let workspace_active = tab.sidebar_mode == SidebarMode::Workspace;
-        let workspace_text_color = if workspace_active {
-            theme.text_primary()
-        } else {
-            theme.subtext0()
-        };
-        let workspace_tab = self.view_sidebar_tab(
-            text("\u{25A6}")
-                .size(font)
-                .color(workspace_text_color)
-                .into(),
-            workspace_active,
-            Event::SetSidebarMode(SidebarMode::Workspace),
-        );
-
-        let mut tabs = Row::new()
-            .spacing(0)
-            .push(git_tab)
-            .push(files_tab)
-            .push(tasks_tab)
-            .push(agent_tab)
-            .push(chats_tab)
-            .push(plans_tab)
-            .push(workspace_tab);
-
-        if workspace_is_remote {
-            let remote_text_color = if remote_active {
+        let active = tab.sidebar_mode.header_mode();
+        let mut tabs = Row::new().spacing(0);
+        for mode in SidebarMode::header_modes() {
+            // Inactive nav items use subtext0, not the overlay tier: overlay
+            // grays sit too close to the dark surface for small text.
+            let color = if mode == active {
                 theme.text_primary()
             } else {
                 theme.subtext0()
             };
-            let remote_tab = self.view_sidebar_tab(
-                text("Remote").size(font).color(remote_text_color).into(),
-                remote_active,
-                Event::SetSidebarMode(SidebarMode::Remote),
+            tabs = tabs.push(
+                self.view_sidebar_tab(
+                    text(mode.label_and_glyph().0)
+                        .size(font)
+                        .color(color)
+                        .into(),
+                    mode == active,
+                    Event::SetSidebarMode(mode),
+                ),
             );
-            tabs = tabs.push(remote_tab);
         }
+        let chevron_color = theme.subtext0();
+        tabs = tabs.push(
+            button(text("\u{25C0}").size(10).color(chevron_color))
+                .style(|_theme, _status| button::Style {
+                    background: Some(iced::Color::TRANSPARENT.into()),
+                    ..Default::default()
+                })
+                .padding([4, 4])
+                .on_press(Event::ToggleSidebar),
+        );
 
-        tabs = tabs.push(collapse_chevron);
-
+        let bg = theme.bg_crust();
+        let border_color = theme.surface0();
         let tab_row = container(tabs)
             .padding([4, 4])
             .width(Length::Fill)
@@ -33703,7 +34266,6 @@ fi
                 background: Some(bg.into()),
                 ..Default::default()
             });
-
         let separator = container(iced::widget::Space::new().height(0))
             .width(Length::Fill)
             .height(Length::Fixed(1.0))
@@ -33711,33 +34273,103 @@ fi
                 background: Some(border_color.into()),
                 ..Default::default()
             });
-
         column![tab_row, separator].into()
+    }
+
+    /// The Files panel's top-level folders for the active workspace
+    /// (TRU-192): a local piece of work's listed repos and its docs folder.
+    fn files_roots_for_active(&self) -> Option<Vec<PathBuf>> {
+        let ws = self
+            .active_workspace()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))?;
+        let repos: Vec<PathBuf> = ws
+            .repos
+            .iter()
+            .filter_map(|id| self.repo(*id))
+            .map(|repo| repo.dir.clone())
+            .collect();
+        let docs = Some(ws.dir.join("docs")).filter(|docs| docs.is_dir());
+        gitterm::workspace_repos::files_roots(ws.is_work(), &repos, docs)
+    }
+
+    /// The Files roots of a piece of work: each opens the file tree in it.
+    fn view_files_roots<'a>(
+        &'a self,
+        dirs: &[PathBuf],
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let mut col = Column::new().spacing(2).padding(8);
+        for dir in dirs {
+            col = col.push(
+                button(
+                    row![
+                        text("📁")
+                            .size(font)
+                            .color(theme.accent())
+                            .width(Length::Fixed(24.0)),
+                        text(format!("{}/", gitterm::workspace_repos::repo_name(dir)))
+                            .size(font)
+                            .color(theme.accent()),
+                    ]
+                    .spacing(4),
+                )
+                .style(button::text)
+                .padding([4, 8])
+                .width(Length::Fill)
+                .on_press(Event::OpenRepoPanel(SidebarMode::Files, Some(dir.clone()))),
+            );
+        }
+        scrollable(col)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
     }
 
     fn view_sidebar<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
-        let mut content = Column::new().spacing(0);
         let workspace_is_remote = self.active_workspace_is_remote();
         let workspace_is_remote_agent = self.tab_belongs_to_remote_agent_workspace(tab.id);
-
-        // Mode toggle buttons
-        let toggle = self.view_sidebar_toggle(tab);
-        content = content.push(toggle);
-
-        let sidebar_mode = if tab.sidebar_mode == SidebarMode::Remote && !workspace_is_remote {
-            SidebarMode::Git
-        } else {
-            tab.sidebar_mode
-        };
+        let mut content = Column::new().spacing(0).push(self.view_sidebar_toggle(tab));
 
         let sidebar_caps = self
             .source_for_active_tab()
             .map(|source| source.capabilities())
             .unwrap_or_else(|_| SourceCapabilities::none());
 
+        // Git and the agent view open from Work, and go back to it; Files
+        // in a piece of work goes back to its roots.
+        let back = |label: &'static str, event: Event| {
+            button(text(label).size(self.ui_font_small()).color(theme.accent()))
+                .style(self.ghost_button_style())
+                .padding([4, 8])
+                .on_press(event)
+        };
+        let files_roots = self.files_roots_for_active();
+        match tab.sidebar_mode {
+            SidebarMode::Git | SidebarMode::Claude => {
+                content = content.push(
+                    container(back(
+                        "\u{2190} Work",
+                        Event::SetSidebarMode(SidebarMode::Workspace),
+                    ))
+                    .padding([4, 4]),
+                );
+            }
+            SidebarMode::Files if files_roots.is_some() && self.panel_repo_root().is_some() => {
+                content = content.push(
+                    container(back(
+                        "\u{2190} All folders",
+                        Event::OpenRepoPanel(SidebarMode::Files, None),
+                    ))
+                    .padding([4, 4]),
+                );
+            }
+            _ => {}
+        }
+
         // Content based on mode
-        let mode_content: Element<'_, Event, Theme, iced::Renderer> = match sidebar_mode {
+        let mode_content: Element<'_, Event, Theme, iced::Renderer> = match tab.sidebar_mode {
             SidebarMode::Git if !sidebar_caps.git_status => {
                 self.view_remote_local_mode_placeholder("Git")
             }
@@ -33745,33 +34377,21 @@ fi
             SidebarMode::Files if workspace_is_remote && !workspace_is_remote_agent => {
                 self.view_remote_local_mode_placeholder("Files")
             }
-            SidebarMode::Files => freeze_time!("view_file_tree", { self.view_file_tree(tab) }),
+            SidebarMode::Files => match files_roots {
+                Some(roots) if self.panel_repo_root().is_none() => self.view_files_roots(&roots),
+                _ => freeze_time!("view_file_tree", { self.view_file_tree(tab) }),
+            },
             SidebarMode::Claude if workspace_is_remote => {
                 self.view_remote_local_mode_placeholder("Agent")
             }
             SidebarMode::Claude => {
                 freeze_time!("view_claude_sidebar", { self.view_claude_sidebar(tab) })
             }
-            SidebarMode::Agent if workspace_is_remote => {
-                self.view_remote_local_mode_placeholder("Agent")
-            }
-            SidebarMode::Agent => {
-                freeze_time!("view_agent_sidebar", { self.view_agent_sidebar(tab) })
-            }
-            SidebarMode::Plans if workspace_is_remote => {
-                self.view_remote_local_mode_placeholder("Plans")
-            }
-            SidebarMode::Plans => {
-                freeze_time!("view_plans_sidebar", { self.view_plans_sidebar() })
-            }
             SidebarMode::Chats => {
                 freeze_time!("view_chats_sidebar", { self.view_chats_sidebar(tab) })
             }
             SidebarMode::Tasks => {
                 freeze_time!("view_task_rail", { self.view_task_rail() })
-            }
-            SidebarMode::Remote => {
-                freeze_time!("view_remote_sidebar", { self.view_remote_sidebar() })
             }
             SidebarMode::Workspace => {
                 freeze_time!("view_workspace_overview", {
@@ -33843,63 +34463,12 @@ fi
         let font = self.ui_font();
 
         let rail_width = SPINE_WIDTH;
-        let workspace_is_remote = self.active_workspace_is_remote();
-        let mut task_dots = self
-            .active_workspace()
-            .and_then(|workspace| {
-                self.task_store.as_ref().map(|store| {
-                    store
-                        .tasks()
-                        .iter()
-                        .filter(|task| {
-                            task.lifecycle != TaskLifecycle::Archived
-                                && self.task_belongs_to_workspace(task, workspace)
-                        })
-                        .filter_map(|task| {
-                            let (priority, color) = match task.attention.reason {
-                                Some(TaskAttentionReason::ExecutionFailed) => (0, theme.danger()),
-                                Some(TaskAttentionReason::RequiresInput)
-                                | Some(TaskAttentionReason::Interrupted)
-                                | Some(TaskAttentionReason::RemoteUnavailable) => {
-                                    (1, theme.peach())
-                                }
-                                Some(TaskAttentionReason::CompletedUnread)
-                                | Some(TaskAttentionReason::ReadyForReview) => (2, theme.green()),
-                                None if task.lifecycle == TaskLifecycle::Failed => {
-                                    (0, theme.danger())
-                                }
-                                None if task.lifecycle == TaskLifecycle::Interrupted => {
-                                    (1, theme.peach())
-                                }
-                                None if task.lifecycle.is_active() => (3, theme.blue()),
-                                _ => return None,
-                            };
-                            Some((priority, color))
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .unwrap_or_default();
-        task_dots.sort_by_key(|(priority, _)| *priority);
-        task_dots.truncate(3);
-
-        let mut modes = vec![
-            ("\u{2387}", SidebarMode::Git),       // ⎇ branch symbol
-            ("\u{1F4C1}", SidebarMode::Files),    // 📁 folder
-            ("\u{25C8}", SidebarMode::Tasks),     // ◈ task dispatch
-            ("\u{2726}", SidebarMode::Claude),    // ✦ sparkle
-            ("\u{224B}", SidebarMode::Chats),     // ≋ conversation history
-            ("\u{25A4}", SidebarMode::Plans),     // ▤ plans
-            ("\u{25A6}", SidebarMode::Workspace), // ▦ workspace overview
-        ];
-        if workspace_is_remote {
-            modes.push(("\u{2601}", SidebarMode::Remote)); // cloud
-        }
 
         let mut rail_col = Column::new().spacing(0).width(Length::Fixed(rail_width));
 
-        for (label, mode) in &modes {
-            let is_active = tab.sidebar_mode == *mode;
+        for mode in SidebarMode::header_modes() {
+            let label = mode.label_and_glyph().1;
+            let is_active = tab.sidebar_mode.header_mode() == mode;
             let text_color = if is_active {
                 theme.text_primary()
             } else {
@@ -33926,36 +34495,9 @@ fi
                     ..Default::default()
                 });
 
-            let glyph: Element<'_, Event, Theme, iced::Renderer> =
-                if *mode == SidebarMode::Tasks && !task_dots.is_empty() {
-                    let mut dots = Column::new().spacing(2);
-                    for (_, color) in &task_dots {
-                        let dot_color = *color;
-                        dots = dots.push(
-                            container(iced::widget::Space::new())
-                                .width(Length::Fixed(4.0))
-                                .height(Length::Fixed(4.0))
-                                .style(move |_| container::Style {
-                                    background: Some(dot_color.into()),
-                                    border: iced::Border {
-                                        radius: 2.0.into(),
-                                        ..Default::default()
-                                    },
-                                    ..Default::default()
-                                }),
-                        );
-                    }
-                    row![text(*label).size(font).color(text_color), dots]
-                        .spacing(3)
-                        .align_y(iced::Alignment::Center)
-                        .into()
-                } else {
-                    text(*label).size(font).color(text_color).into()
-                };
-
             let btn_content = row![
                 indicator,
-                container(glyph)
+                container(text(label).size(font).color(text_color))
                     .center_x(Length::Fill)
                     .center_y(Length::Fixed(24.0))
             ]
@@ -33963,7 +34505,6 @@ fi
             .align_y(iced::Alignment::Center)
             .width(Length::Fixed(rail_width));
 
-            let mode_clone = *mode;
             let mode_btn = button(btn_content)
                 .style(move |_theme, status| {
                     let bg = if matches!(status, button::Status::Hovered) {
@@ -33980,7 +34521,7 @@ fi
                 })
                 .padding([8, 0])
                 .width(Length::Fixed(rail_width))
-                .on_press(Event::SetSidebarMode(mode_clone));
+                .on_press(Event::SetSidebarMode(mode));
 
             rail_col = rail_col.push(mode_btn);
         }
@@ -34024,16 +34565,16 @@ fi
             .into()
     }
 
-    /// The Workspace overview (TRU-167; mockups screen b's sidebar with
-    /// screen h's branch rows): the workspace's coordinators and fan-out,
-    /// the repos it edited with the branches it owns, and its issue keys.
-    /// A pure render over `workspace_overviews`; git is read by the poller.
-    /// The overview's Repos section (TRU-180): each repo the workspace
-    /// lists with its console state; selecting a row makes it current
-    /// (where new bottom terminals open); × removes one (not the home);
-    /// `+ add repo` picks a folder. A note offers undo when repos joined
-    /// from the chats' touches.
-    fn view_overview_repos(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+    /// The overview's one Repos section (TRU-167, TRU-180, TRU-192): every
+    /// repo the workspace lists or the work touched, each with its edit
+    /// count and the owned branches under it. The header carries the repo's
+    /// run command, a remove control (not the home) and opens the Git view
+    /// on a click; `+ add repo` picks a folder. A note offers undo when
+    /// repos joined from the chats' touches. A pure render over `state`.
+    fn view_overview_repos<'a>(
+        &'a self,
+        state: Option<&'a WorkspaceOverviewState>,
+    ) -> Option<Element<'a, Event, Theme, iced::Renderer>> {
         let ws = self.active_workspace()?;
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
@@ -34041,9 +34582,45 @@ fi
         let text_primary = theme.text_primary();
         let text_muted = theme.text_muted();
         let uid = ws.uid;
-        let mut section = Column::new()
-            .spacing(3)
-            .push(text("REPOS").size(10).color(text_muted).font(mono));
+
+        let listed: Vec<&RepoState> = ws.repos.iter().filter_map(|id| self.repo(*id)).collect();
+        let listed_dirs: Vec<PathBuf> = listed.iter().map(|repo| repo.dir.clone()).collect();
+        let groups = overview::merge_repo_groups(
+            &listed_dirs,
+            state.map_or(&[][..], |state| &state.summary.repos),
+            state.map_or(&[][..], |state| &state.branches),
+        );
+        let owned_count: usize = groups
+            .iter()
+            .map(|group| group.rows.iter().filter(|row| !row.owned.gone).count())
+            .sum();
+
+        let mut header = Row::new()
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .push(
+                text(format!(
+                    "REPOS \u{00B7} {} \u{00B7} BRANCHES \u{00B7} {owned_count}",
+                    groups.len()
+                ))
+                .size(10)
+                .color(text_muted)
+                .font(mono),
+            )
+            .push(iced::widget::Space::new().width(Length::Fill));
+        if matches!(ws.location, WorkspaceLocation::Local { .. }) {
+            header = header.push(
+                button(
+                    text("+ add repo")
+                        .size(font_small - 1.0)
+                        .color(theme.accent()),
+                )
+                .style(self.ghost_button_style())
+                .padding([2, 6])
+                .on_press(Event::WorkspaceRepoAdd(uid)),
+            );
+        }
+        let mut section = Column::new().spacing(3).push(header);
 
         if !ws.joined_note.is_empty() {
             let names: Vec<String> = ws
@@ -34073,26 +34650,50 @@ fi
             );
         }
 
-        for repo in ws.repos.iter().filter_map(|id| self.repo(*id)) {
-            let mut name = gitterm::workspace_repos::repo_name(&repo.dir);
-            if repo.id == ws.home {
+        let home = dirs::home_dir();
+        let selected = self.open_review_checkout();
+        let mut repos = Column::new().spacing(6);
+        for group in groups {
+            let repo_state = listed.iter().find(|repo| repo.dir == group.dir);
+            // Worktrees git still lists whose folder is gone: one dim
+            // line per repo, never read.
+            let (gone, rows): (Vec<_>, Vec<_>) =
+                group.rows.into_iter().partition(|row| row.owned.gone);
+            let oldest = rows.iter().map(|row| row.checked_at).min();
+            let mut name = overview::folder_name(&group.dir);
+            if repo_state.is_some_and(|repo| repo.id == ws.home) {
                 name.push_str(" \u{00B7} home");
             }
-            let mut line = Row::new().spacing(4).align_y(iced::Alignment::Center).push(
-                text(name)
-                    .size(font_small)
-                    .color(text_primary)
-                    .width(Length::Fill),
-            );
+            // The name opens the Git view on the repo (TRU-192).
+            let local = repo_state.is_none_or(|repo| repo.key.is_local());
+            let mut head = row![
+                button(text(name).size(font_small).color(text_primary).font(mono))
+                    .style(self.ghost_button_style())
+                    .padding([0, 2])
+                    .on_press_maybe(local.then(|| {
+                        Event::OpenRepoPanel(SidebarMode::Git, Some(group.dir.clone()))
+                    }))
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            if let Some(edits) = group.edits {
+                head = head.push(
+                    text(format!("{edits} edits"))
+                        .size(10)
+                        .color(text_muted)
+                        .font(mono),
+                );
+            }
+            head = head.push(iced::widget::Space::new().width(Length::Fill));
             // Its run command (TRU-180): `▶` opens it as a terminal tab
             // below; ✎ edits it. Only this Mac's folders run.
-            if repo.key.is_local() {
+            if let Some(repo) = repo_state.filter(|repo| repo.key.is_local()) {
                 let editing = self
                     .editing_run_command
                     .as_ref()
                     .filter(|(id, _)| *id == repo.id);
-                line = match (editing, &repo.run_command) {
-                    (Some((_, draft)), _) => line.push(
+                head = match (editing, &repo.run_command) {
+                    (Some((_, draft)), _) => head.push(
                         text_input("npm run dev", draft)
                             .on_input(Event::RunCommandChanged)
                             .on_submit(Event::RunCommandSubmit)
@@ -34101,7 +34702,7 @@ fi
                             .width(Length::Fixed(160.0))
                             .font(mono),
                     ),
-                    (None, Some(command)) => line
+                    (None, Some(command)) => head
                         .push(
                             button(
                                 text(format!("\u{25B6} {command}"))
@@ -34110,48 +34711,82 @@ fi
                                     .font(mono),
                             )
                             .style(self.ghost_button_style())
-                            .padding([2, 4])
+                            .padding([0, 4])
                             .on_press(Event::RunRepoCommand(repo.id)),
                         )
                         .push(
                             button(text("\u{270E}").size(10).color(text_muted))
                                 .style(self.ghost_button_style())
-                                .padding([2, 4])
+                                .padding([0, 4])
                                 .on_press(Event::RunCommandEditStart(repo.id)),
                         ),
-                    (None, None) => line.push(
+                    (None, None) => head.push(
                         button(text("+ run command").size(10).color(text_muted).font(mono))
                             .style(self.ghost_button_style())
-                            .padding([2, 4])
+                            .padding([0, 4])
                             .on_press(Event::RunCommandEditStart(repo.id)),
                     ),
                 };
             }
-            if repo.id != ws.home {
-                line = line.push(
+            if let Some(oldest) = oldest {
+                head = head.push(
+                    text(overview::age_label(oldest))
+                        .size(10)
+                        .color(text_muted)
+                        .font(mono),
+                );
+            }
+            if let Some(repo) = repo_state.filter(|repo| repo.id != ws.home) {
+                head = head.push(
                     button(text("\u{00D7}").size(font_small).color(text_muted))
                         .style(self.ghost_button_style())
-                        .padding([2, 4])
+                        .padding([0, 4])
                         .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
                 );
             }
-            section = section.push(container(line).padding([3, 6]));
+            let mut column = Column::new().spacing(2).push(head);
+            if rows.is_empty() && gone.is_empty() {
+                let note = if group.edits.is_none() {
+                    "no edits yet"
+                } else if state.is_some_and(|state| state.last_full_refresh.is_none()) {
+                    "reading\u{2026}"
+                } else {
+                    "no live checkout of this work"
+                };
+                column = column.push(text(note).size(10).color(text_muted));
+            }
+            for row in rows {
+                column = column.push(self.view_overview_branch_row(
+                    row,
+                    home.as_deref(),
+                    selected == Some(row.owned.checkout.as_path()),
+                ));
+            }
+            if !gone.is_empty() {
+                let names: Vec<&str> = gone
+                    .iter()
+                    .map(|row| row.owned.branch.as_deref().unwrap_or("(detached)"))
+                    .collect();
+                column = column.push(
+                    text(format!(
+                        "\u{25B8} {} folder{} gone \u{00B7} {}",
+                        gone.len(),
+                        if gone.len() == 1 { "" } else { "s" },
+                        overview::shorten(&names.join(", "), 60)
+                    ))
+                    .size(10)
+                    .color(theme.overlay0()),
+                );
+            }
+            repos = repos.push(column);
         }
-        if matches!(ws.location, WorkspaceLocation::Local { .. }) {
-            section = section.push(
-                button(
-                    text("+ add repo")
-                        .size(font_small - 1.0)
-                        .color(theme.accent()),
-                )
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::WorkspaceRepoAdd(uid)),
-            );
-        }
-        Some(section.into())
+        Some(section.push(repos).into())
     }
 
+    /// The Workspace overview (TRU-167; mockups screen b's sidebar with
+    /// screen h's branch rows): the workspace's coordinators and fan-out,
+    /// the repos it edited with the branches it owns, and its issue keys.
+    /// A pure render over `workspace_overviews`; git is read by the poller.
     fn view_workspace_overview<'a>(&'a self) -> Element<'a, Event, Theme, iced::Renderer> {
         const COORDINATOR_ROWS: usize = 12;
         const OLDER_ROWS: usize = 20;
@@ -34249,20 +34884,33 @@ fi
                 ),
             );
         }
-        // Repos: the checkouts this workspace lists (TRU-180).
-        if let Some(repos) = self.view_overview_repos() {
+        // PRs of the work in merge order (TRU-173).
+        if let Some(prs) = self.view_overview_prs() {
+            content = content.push(prs);
+        }
+
+        // Repos with their branches (TRU-167, TRU-180, TRU-192).
+        if let Some(repos) = self.view_overview_repos(state) {
             content = content.push(repos);
         }
-        // Documents of the work (TRU-191), newest first.
-        if let Some(documents) = self.view_work_documents(Some(OVERVIEW_DOCUMENT_ROWS)) {
-            let count = self
-                .active_workspace()
-                .and_then(|ws| self.work_documents.get(&ws.uid))
-                .and_then(|state| state.result.as_ref())
-                .map_or(0, |result| result.documents.len());
-            content = content
-                .push(section(format!("DOCUMENTS \u{00B7} {count}")))
-                .push(documents);
+        // What the agent has here (TRU-192): opens the Agent view.
+        if let Some(config) = self.active_tab().map(|tab| &tab.claude_config) {
+            content = content.push(
+                button(
+                    text(format!(
+                        "skills {} \u{00B7} MCPs {} \u{00B7} hooks {}",
+                        config.skills.len(),
+                        config.mcp_servers.len(),
+                        config.hooks.len()
+                    ))
+                    .size(10)
+                    .color(theme.accent())
+                    .font(mono),
+                )
+                .style(self.ghost_button_style())
+                .padding([2, 6])
+                .on_press(Event::SetSidebarMode(SidebarMode::Claude)),
+            );
         }
         let Some(state) = state else {
             return finish(
@@ -34424,7 +35072,7 @@ fi
             }
             let more_in_chats = |count: usize| {
                 button(
-                    text(format!("\u{2026} {count} more in Chats"))
+                    text(format!("\u{2026} {count} more in Find"))
                         .size(10)
                         .color(theme.accent()),
                 )
@@ -34470,6 +35118,18 @@ fi
             content = content.push(chats);
         }
 
+        // Documents of the work (TRU-191), newest first.
+        if let Some(documents) = self.view_work_documents() {
+            let count = self
+                .active_workspace()
+                .and_then(|ws| self.work_documents.get(&ws.uid))
+                .and_then(|state| state.result.as_ref())
+                .map_or(0, |result| result.documents.len());
+            content = content
+                .push(section(format!("DOCUMENTS \u{00B7} {count}")))
+                .push(documents);
+        }
+
         // Coordinators that live in another workspace but edited here.
         if !summary.also_worked.is_empty() {
             content = content.push(section(format!(
@@ -34485,110 +35145,6 @@ fi
                 ));
             }
             content = content.push(also);
-        }
-
-        // PRs of the work in merge order (TRU-173).
-        if let Some(prs) = self.view_overview_prs() {
-            content = content.push(prs);
-        }
-
-        // Repos touched, each with the branches the work owns there.
-        let mut groups: Vec<(&Path, Option<u64>, Vec<&overview::BranchStatus>)> = summary
-            .repos
-            .iter()
-            .map(|repo| (repo.dir.as_path(), Some(repo.edits), Vec::new()))
-            .collect();
-        for row in &state.branches {
-            match groups
-                .iter_mut()
-                .find(|(repo, _, _)| *repo == row.owned.repo.as_path())
-            {
-                Some((_, _, rows)) => rows.push(row),
-                None => groups.push((row.owned.repo.as_path(), None, vec![row])),
-            }
-        }
-        if !groups.is_empty() {
-            let owned_count: usize = groups
-                .iter()
-                .map(|(_, _, rows)| rows.iter().filter(|row| !row.owned.gone).count())
-                .sum();
-            content = content.push(section(format!(
-                "REPOS \u{00B7} {} \u{00B7} BRANCHES \u{00B7} {owned_count}",
-                groups.len()
-            )));
-            let home = dirs::home_dir();
-            let selected = self.open_review_checkout();
-            let mut repos = Column::new().spacing(6);
-            for (repo, edits, rows) in groups {
-                // Worktrees git still lists whose folder is gone: one dim
-                // line per repo, never read.
-                let (gone, rows): (Vec<_>, Vec<_>) =
-                    rows.into_iter().partition(|row| row.owned.gone);
-                let oldest = rows.iter().map(|row| row.checked_at).min();
-                let mut head = row![text(overview::folder_name(repo))
-                    .size(font_small)
-                    .color(text_primary)
-                    .font(mono)]
-                .spacing(6)
-                .align_y(iced::Alignment::Center);
-                if let Some(edits) = edits {
-                    head = head.push(
-                        text(format!("{edits} edits"))
-                            .size(10)
-                            .color(text_muted)
-                            .font(mono),
-                    );
-                }
-                head = head.push(iced::widget::Space::new().width(Length::Fill));
-                if let Some(oldest) = oldest {
-                    head = head.push(
-                        text(overview::age_label(oldest))
-                            .size(10)
-                            .color(text_muted)
-                            .font(mono),
-                    );
-                }
-                let mut group = Column::new().spacing(2).push(head);
-                if rows.is_empty() && gone.is_empty() {
-                    let note = if state.last_full_refresh.is_none() {
-                        "reading\u{2026}"
-                    } else {
-                        "no live checkout of this work"
-                    };
-                    group = group.push(text(note).size(10).color(text_muted));
-                }
-                for row in rows {
-                    group = group.push(self.view_overview_branch_row(
-                        row,
-                        home.as_deref(),
-                        selected == Some(row.owned.checkout.as_path()),
-                    ));
-                }
-                if !gone.is_empty() {
-                    let names: Vec<&str> = gone
-                        .iter()
-                        .map(|row| row.owned.branch.as_deref().unwrap_or("(detached)"))
-                        .collect();
-                    group = group.push(
-                        text(format!(
-                            "\u{25B8} {} folder{} gone \u{00B7} {}",
-                            gone.len(),
-                            if gone.len() == 1 { "" } else { "s" },
-                            overview::shorten(&names.join(", "), 60)
-                        ))
-                        .size(10)
-                        .color(theme.overlay0()),
-                    );
-                }
-                repos = repos.push(group);
-            }
-            content = content.push(repos);
-        } else if summary.has_facts {
-            content = content.push(
-                text("No repo edits recorded for this workspace's chats.")
-                    .size(font_small)
-                    .color(text_muted),
-            );
         }
 
         if !summary.issue_keys.is_empty() {
@@ -36472,140 +37028,6 @@ fi
             ..Default::default()
         })
         .into()
-    }
-
-    fn view_remote_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-        let mut content = Column::new().spacing(8).padding(8);
-        let active_remote_agent_workspace = self
-            .active_workspace()
-            .filter(|workspace| self.remote_agent_id_for_workspace(workspace).is_some());
-
-        let header = row![
-            text(if active_remote_agent_workspace.is_some() {
-                "Remote agent"
-            } else {
-                "Remote sessions"
-            })
-            .size(font)
-            .color(theme.text_primary())
-            .width(Length::Fill),
-            button(
-                text(if active_remote_agent_workspace.is_some() {
-                    "Reconnect"
-                } else {
-                    "Refresh"
-                })
-                .size(font_small)
-            )
-            .style(self.ghost_button_style())
-            .padding([3, 8])
-            .on_press_maybe(active_remote_agent_workspace.map_or(
-                Some(Event::RefreshRemoteSessions),
-                |workspace| {
-                    self.remote_agent_id_for_workspace(workspace)
-                        .map(|remote_id| Event::RemoteAgentConnect(remote_id.to_string()))
-                },
-            )),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
-        content = content.push(header);
-
-        if let Some(workspace) = active_remote_agent_workspace {
-            content = content.push(self.view_remote_agent_connection_panel(workspace));
-            if let Some(actions) = self.view_remote_agent_session_actions(workspace) {
-                content = content.push(actions);
-            }
-            return scrollable(content)
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into();
-        }
-
-        if self.remote_sessions_loading {
-            content = content.push(
-                text("Loading remote sessions...")
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-            );
-        }
-
-        if let Some(error) = &self.remote_sessions_error {
-            let error_bg = iced::Color {
-                a: 0.12,
-                ..theme.danger()
-            };
-            content = content.push(
-                container(text(error).size(font_small).color(theme.danger()))
-                    .padding([6, 8])
-                    .width(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(error_bg.into()),
-                        border: iced::Border {
-                            radius: 6.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-            );
-        }
-
-        if let Some(loaded_at) = self.remote_sessions_loaded_at {
-            content = content.push(
-                text(format!("Updated {}s ago", loaded_at.elapsed().as_secs()))
-                    .size(10)
-                    .color(theme.text_muted()),
-            );
-        }
-
-        let active_remote_session = self
-            .active_workspace()
-            .and_then(|workspace| self.remote_session_for_workspace(workspace));
-        let Some(session) = active_remote_session else {
-            content = content.push(
-                text("Remote sessions are scoped to remote workspaces.")
-                    .size(font)
-                    .color(theme.text_secondary()),
-            );
-            content = content.push(
-                text("Use the workspace bar to open a mac-mini:* workspace.")
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-            );
-            return scrollable(content)
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into();
-        };
-
-        let runtime = self
-            .remote_sessions
-            .iter()
-            .find(|entry| entry.name == session.session_name);
-        let codex_session_name = remote_codex_session_name(session);
-        let codex_runtime = self
-            .remote_sessions
-            .iter()
-            .find(|entry| entry.name == codex_session_name);
-        let claude_session_name = remote_claude_session_name(session);
-        let claude_runtime = self
-            .remote_sessions
-            .iter()
-            .find(|entry| entry.name == claude_session_name);
-        content = content.push(self.view_remote_session_item(
-            session,
-            runtime,
-            codex_runtime,
-            claude_runtime,
-        ));
-
-        scrollable(content)
-            .height(Length::Fill)
-            .width(Length::Fill)
-            .into()
     }
 
     fn view_remote_session_item<'a>(
@@ -39521,117 +39943,12 @@ fi
         .into()
     }
 
-    fn view_plans_sidebar(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font_small = self.ui_font_small();
-
-        let Some(workspace_dir) = self
-            .workspaces
-            .get(self.active_workspace_idx)
-            .map(|ws| &ws.dir)
-        else {
-            return container(
-                text("No active workspace")
-                    .size(font_small)
-                    .color(theme.text_secondary()),
-            )
-            .padding(16)
-            .into();
-        };
-
-        // The work's documents (TRU-191): the same list as the overview's
-        // Documents section, in full.
-        let docs_dir = workspace_dir.join("docs");
-        let mono = iced::Font::with_name("Menlo");
-        let state = self
-            .active_workspace()
-            .and_then(|ws| self.work_documents.get(&ws.uid));
-        let reading = state.is_some_and(|state| state.in_flight);
-        let mut refresh = button(
-            text(if reading {
-                "reading\u{2026}"
-            } else {
-                "\u{21BB} Refresh"
-            })
-            .size(11)
-            .color(theme.blue())
-            .font(mono),
-        )
-        .style(self.ghost_button_style())
-        .padding([4, 5]);
-        if !reading {
-            refresh = refresh.on_press(Event::WorkDocumentsRefresh);
-        }
-        let count = state
-            .and_then(|state| state.result.as_ref())
-            .map(|result| result.documents.len());
-        let mut list = Column::new().spacing(4).padding(8).push(
-            row![
-                text(match count {
-                    Some(count) => format!("DOCUMENTS \u{00B7} {count}"),
-                    None => "DOCUMENTS".to_string(),
-                })
-                .size(10)
-                .color(theme.text_muted())
-                .font(mono),
-                iced::widget::Space::new().width(Length::Fill),
-                refresh,
-            ]
-            .align_y(iced::Alignment::Center),
-        );
-        match self.view_work_documents(None) {
-            Some(documents) => list = list.push(documents),
-            None if count.is_none() && state.is_none_or(|state| state.error.is_none()) => {
-                list = list.push(
-                    text("Reading\u{2026}")
-                        .size(font_small)
-                        .color(theme.text_muted()),
-                );
-            }
-            None => {
-                list = list.push(
-                    column![
-                        text("No documents found")
-                            .size(font_small)
-                            .color(theme.text_secondary()),
-                        text(format!(
-                            "Looked in {}, the chats' writes, and .plans/ and docs/ of each listed repo",
-                            docs_dir.display()
-                        ))
-                        .size(font_small)
-                        .color(theme.text_muted()),
-                    ]
-                    .spacing(2)
-                    .padding([2, 8]),
-                );
-            }
-        }
-        if let Some(error) = state.and_then(|state| state.error.as_ref()) {
-            if count.is_none() {
-                list = list.push(
-                    text(overview::shorten(error, 200))
-                        .size(10)
-                        .color(theme.danger()),
-                );
-            }
-        }
-
-        iced::widget::scrollable(list)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-
-    /// The active workspace's documents (TRU-191), newest first, at most
-    /// `limit` of them. Each row: title and age, then the newest copy's
+    /// The active workspace's documents (TRU-191), newest first. Each row: title and age, then the newest copy's
     /// source and the path within its checkout, and "N copies" (with
     /// "copies differ") when there are more; clicking opens the newest copy
     /// in the markdown viewer and the copies line lists each copy to open.
     /// `None` while nothing has been read or nothing was found.
-    fn view_work_documents(
-        &self,
-        limit: Option<usize>,
-    ) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
+    fn view_work_documents(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
         let font_small = self.ui_font_small();
@@ -39642,9 +39959,8 @@ fi
         if result.documents.is_empty() {
             return None;
         }
-        let shown = limit.unwrap_or(usize::MAX);
         let mut col = Column::new().spacing(2);
-        for doc in result.documents.iter().take(shown) {
+        for doc in &result.documents {
             let newest = doc.newest();
             let head = row![
                 text(overview::shorten(&doc.title, 60))
@@ -39717,21 +40033,6 @@ fi
             }
             col = col.push(entry);
         }
-        if result.documents.len() > shown {
-            col = col.push(
-                button(
-                    text(format!(
-                        "\u{2026} {} more in Plans",
-                        result.documents.len() - shown
-                    ))
-                    .size(10)
-                    .color(theme.accent()),
-                )
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::SetSidebarMode(SidebarMode::Plans)),
-            );
-        }
         if result.truncated {
             col = col.push(
                 text("Stopped reading at the scan's limit; some documents may be missing.")
@@ -39747,646 +40048,6 @@ fi
             );
         }
         Some(col.into())
-    }
-
-    fn view_agent_sidebar<'a>(
-        &'a self,
-        tab: &'a TabState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-
-        if tab.agent_sidebar.loading {
-            let spinner = container(
-                text("Loading agent activity...")
-                    .size(font_small)
-                    .color(theme.subtext0()),
-            )
-            .padding(20)
-            .center_x(Length::Fill);
-
-            return spinner.into();
-        }
-
-        let activity = match &tab.agent_sidebar.activity {
-            Some(activity) => activity,
-            None => {
-                let no_data = container(
-                    column![
-                        text("No Agent Activity")
-                            .size(font)
-                            .color(theme.text_primary()),
-                        text("No captured sessions found for this repository")
-                            .size(font_small)
-                            .color(theme.subtext0())
-                    ]
-                    .spacing(4),
-                )
-                .padding(20)
-                .center_x(Length::Fill);
-
-                return no_data.into();
-            }
-        };
-
-        let mut content = Column::new().spacing(0);
-
-        // Header with overview stats
-        let header_bg = theme.surface0();
-        let accent_glow = iced::Color {
-            a: 0.1,
-            ..theme.mauve()
-        };
-
-        let commits_count = activity.total_commits;
-        let live_count = activity.live_capture_count();
-        let git_count = commits_count - live_count;
-        let cost_display = activity.format_total_cost();
-
-        let mut stats_row = Row::new().spacing(8);
-
-        // Agent sessions badge (live captures)
-        if live_count > 0 {
-            stats_row = stats_row.push(
-                container(
-                    text(format!("{} sessions", live_count))
-                        .size(font_small)
-                        .color(theme.mauve()),
-                )
-                .padding([2, 8])
-                .style(move |_| container::Style {
-                    background: Some(
-                        iced::Color {
-                            a: 0.15,
-                            ..theme.mauve()
-                        }
-                        .into(),
-                    ),
-                    border: iced::Border::default().rounded(8),
-                    ..Default::default()
-                }),
-            );
-        }
-
-        // Git commits badge (reconstructed)
-        if git_count > 0 {
-            stats_row = stats_row.push(
-                container(
-                    text(format!("{} commits", git_count))
-                        .size(font_small)
-                        .color(theme.text_secondary()),
-                )
-                .padding([2, 8])
-                .style(move |_| container::Style {
-                    background: Some(
-                        iced::Color {
-                            a: 0.12,
-                            ..theme.text_secondary()
-                        }
-                        .into(),
-                    ),
-                    border: iced::Border::default().rounded(8),
-                    ..Default::default()
-                }),
-            );
-        }
-
-        // Cost badge (only if there are live captures with cost)
-        if activity.total_cost > 0.0 {
-            stats_row = stats_row.push(
-                container(text(cost_display).size(font_small).color(theme.peach()))
-                    .padding([2, 8])
-                    .style(move |_| container::Style {
-                        background: Some(
-                            iced::Color {
-                                a: 0.15,
-                                ..theme.peach()
-                            }
-                            .into(),
-                        ),
-                        border: iced::Border::default().rounded(8),
-                        ..Default::default()
-                    }),
-            );
-        }
-
-        let header_stats = container(
-            column![
-                text("Agent Activity Journal")
-                    .size(font)
-                    .color(theme.text_primary()),
-                stats_row
-            ]
-            .spacing(6),
-        )
-        .padding(12)
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(header_bg.into()),
-            border: iced::Border {
-                width: 1.0,
-                color: accent_glow,
-                radius: iced::border::Radius::from(6),
-            },
-            ..Default::default()
-        });
-
-        content = content.push(header_stats);
-        content = content.push(iced::widget::Space::new().height(8));
-
-        // Recent captures timeline
-        if activity.captures.is_empty() {
-            let empty_state = container(
-                column![
-                    text("✨ Ready for your first agent session")
-                        .size(font)
-                        .color(theme.subtext1()),
-                    text("Commit with an agent to see activity here")
-                        .size(font_small)
-                        .color(theme.subtext0())
-                ]
-                .spacing(4)
-                .align_x(iced::Alignment::Center),
-            )
-            .padding(20)
-            .width(Length::Fill)
-            .center_x(Length::Fill);
-
-            content = content.push(empty_state);
-        } else {
-            // Show recent captures
-            let recent_captures = activity.recent_captures(50);
-            let selected_idx = tab.agent_sidebar.selected_capture_idx;
-
-            for (idx, capture) in recent_captures.iter().enumerate() {
-                let is_selected = selected_idx == Some(idx);
-                content =
-                    content.push(self.view_agent_capture_entry(capture, theme, idx, is_selected));
-            }
-        }
-
-        scrollable(content).into()
-    }
-
-    fn view_agent_capture_entry<'a>(
-        &'a self,
-        capture: &'a agent::AgentCapture,
-        theme: &'a AppTheme,
-        idx: usize,
-        is_selected: bool,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let font_small = self.ui_font_small();
-        let font_tiny = font_small * 0.9;
-
-        let is_reconstructed = capture.is_reconstructed();
-        let is_live = !is_reconstructed;
-
-        // Container styling — highlight selected
-        let entry_bg = if is_selected {
-            theme.surface0()
-        } else if is_reconstructed {
-            theme.bg_base()
-        } else {
-            theme.bg_overlay()
-        };
-        let border_color = if is_selected {
-            theme.accent()
-        } else if is_reconstructed {
-            theme.surface0()
-        } else {
-            theme.surface1()
-        };
-
-        // Format timestamp
-        let time_display = if let Some(timestamp) = capture.timestamp_parsed() {
-            let elapsed = timestamp.elapsed().unwrap_or(Duration::from_secs(0));
-            let secs = elapsed.as_secs();
-            if secs >= 24 * 3600 {
-                format!("{}d", secs / (24 * 3600))
-            } else if secs >= 3600 {
-                format!("{}h", secs / 3600)
-            } else {
-                format!("{}m", secs / 60)
-            }
-        } else {
-            "now".to_string()
-        };
-
-        let mut entry_content = Column::new().spacing(2);
-
-        // === Row 1: Description (the most important thing) ===
-        if let Some(desc) = capture.description() {
-            let truncated: String = if desc.len() > 72 {
-                format!("{}…", truncate_str(&desc, 71))
-            } else {
-                desc
-            };
-            let desc_color = if is_live {
-                theme.text_primary()
-            } else {
-                theme.subtext1()
-            };
-            entry_content = entry_content.push(text(truncated).size(font_small).color(desc_color));
-        }
-
-        // === Row 2: Badges row — hash, type badge, key stat, timestamp ===
-        let mut badges_row = Row::new().spacing(6).align_y(iced::Alignment::Center);
-
-        // Commit hash
-        let hash_color = if is_live {
-            theme.blue()
-        } else {
-            theme.text_muted()
-        };
-        badges_row = badges_row.push(text(capture.short_hash()).size(font_tiny).color(hash_color));
-
-        if is_live {
-            // Model badge
-            let (model_name, model_badge_color) = if let Some((name, _)) = capture.primary_model() {
-                let color = if name.contains("opus") {
-                    theme.mauve()
-                } else if name.contains("sonnet") {
-                    theme.blue()
-                } else if name.contains("haiku") || name.contains("gpt") {
-                    theme.green()
-                } else {
-                    theme.text_secondary()
-                };
-                // Short name: "opus-4-6" from "claude-opus-4-6"
-                let short = name.split('/').next_back().unwrap_or(name);
-                let short = short.strip_prefix("claude-").unwrap_or(short);
-                (short, color)
-            } else {
-                ("unknown", theme.text_secondary())
-            };
-            badges_row = badges_row.push(
-                container(text(model_name).size(font_tiny).color(model_badge_color))
-                    .padding([1, 5])
-                    .style(move |_| container::Style {
-                        background: Some(
-                            iced::Color {
-                                a: 0.15,
-                                ..model_badge_color
-                            }
-                            .into(),
-                        ),
-                        border: iced::Border::default().rounded(4),
-                        ..Default::default()
-                    }),
-            );
-
-            // Turns count
-            badges_row = badges_row.push(
-                text(format!("{}t", capture.turns))
-                    .size(font_tiny)
-                    .color(theme.subtext0()),
-            );
-
-            // Duration
-            badges_row = badges_row.push(
-                text(capture.format_duration())
-                    .size(font_tiny)
-                    .color(theme.subtext0()),
-            );
-        } else {
-            // Git badge for reconstructed
-            let git_color = theme.text_secondary();
-            badges_row = badges_row.push(
-                container(text("git").size(font_tiny).color(git_color))
-                    .padding([1, 5])
-                    .style(move |_| container::Style {
-                        background: Some(
-                            iced::Color {
-                                a: 0.12,
-                                ..git_color
-                            }
-                            .into(),
-                        ),
-                        border: iced::Border::default().rounded(4),
-                        ..Default::default()
-                    }),
-            );
-
-            // Diff summary
-            let diff = capture.diff_summary();
-            if !diff.is_empty() {
-                badges_row = badges_row.push(text(diff).size(font_tiny).color(theme.text_muted()));
-            }
-        }
-
-        // Timestamp pushed to the right
-        badges_row = badges_row.push(iced::widget::Space::new().width(Length::Fill));
-        badges_row = badges_row.push(text(time_display).size(font_tiny).color(theme.text_muted()));
-
-        entry_content = entry_content.push(badges_row);
-
-        let entry_container = container(entry_content)
-            .padding([6, 12])
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(entry_bg.into()),
-                border: iced::Border {
-                    width: 1.0,
-                    color: border_color,
-                    radius: iced::border::Radius::from(4),
-                },
-                ..Default::default()
-            });
-
-        // Only make live captures clickable (they have conversations)
-        if is_live {
-            iced::widget::mouse_area(entry_container)
-                .on_press(Event::SelectAgentCapture(idx))
-                .into()
-        } else {
-            entry_container.into()
-        }
-    }
-
-    fn view_agent_conversation<'a>(
-        &'a self,
-        tab: &'a TabState,
-    ) -> Element<'a, Event, Theme, iced::Renderer> {
-        let theme = &self.theme;
-        let font = self.ui_font();
-        let font_small = self.ui_font_small();
-        let font_tiny = font_small * 0.9;
-
-        let conversation = match &tab.agent_sidebar.conversation {
-            Some(c) => c,
-            None => {
-                return container(
-                    text("Select a session to view its conversation")
-                        .size(font_small)
-                        .color(theme.subtext0()),
-                )
-                .padding(20)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .into();
-            }
-        };
-
-        // Get capture info for the header
-        let capture = tab
-            .agent_sidebar
-            .selected_capture_idx
-            .and_then(|idx| tab.agent_sidebar.activity.as_ref()?.captures.get(idx));
-
-        let mut content = Column::new().spacing(0);
-
-        // Header with capture info
-        if let Some(cap) = capture {
-            let header_bg = theme.surface0();
-            let desc = cap
-                .description()
-                .unwrap_or_else(|| cap.short_hash().to_string());
-            let desc_truncated: String = if desc.len() > 80 {
-                format!("{}…", truncate_str(&desc, 79))
-            } else {
-                desc
-            };
-
-            let mut header_col = Column::new().spacing(4);
-            header_col =
-                header_col.push(text(desc_truncated).size(font).color(theme.text_primary()));
-
-            // Stats line
-            let mut stats_parts = Vec::new();
-            stats_parts.push(cap.short_hash().to_string());
-            if let Some((name, _)) = cap.primary_model() {
-                let short = name.split('/').next_back().unwrap_or(name);
-                let short = short.strip_prefix("claude-").unwrap_or(short);
-                stats_parts.push(short.to_string());
-            }
-            stats_parts.push(format!("{}t", cap.turns));
-            stats_parts.push(cap.format_duration());
-            stats_parts.push(cap.format_cost());
-
-            header_col = header_col.push(
-                text(stats_parts.join(" · "))
-                    .size(font_tiny)
-                    .color(theme.subtext0()),
-            );
-
-            content = content.push(
-                container(header_col)
-                    .padding([10, 16])
-                    .width(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(header_bg.into()),
-                        ..Default::default()
-                    }),
-            );
-        }
-
-        // Error state
-        if let Some(err) = &conversation.error {
-            content = content.push(
-                container(text(err).size(font_small).color(theme.subtext0()))
-                    .padding([16, 16])
-                    .width(Length::Fill)
-                    .center_x(Length::Fill),
-            );
-            return scrollable(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-        }
-
-        if conversation.entries.is_empty() {
-            content = content.push(
-                container(
-                    text("No conversation entries found")
-                        .size(font_small)
-                        .color(theme.subtext0()),
-                )
-                .padding([16, 16])
-                .width(Length::Fill),
-            );
-            return scrollable(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-        }
-
-        // Render conversation entries
-        let mut thread = Column::new().spacing(2).padding([8, 12]);
-
-        for entry in &conversation.entries {
-            match entry {
-                agent::ConversationEntry::User { text: user_text } => {
-                    let user_color = theme.blue();
-                    let bg = iced::Color {
-                        a: 0.08,
-                        ..user_color
-                    };
-
-                    let display_text: String = if user_text.len() > 500 {
-                        format!("{}…", truncate_str(user_text, 497))
-                    } else {
-                        user_text.clone()
-                    };
-
-                    thread = thread.push(
-                        container(
-                            column![
-                                text("You").size(font_tiny).color(user_color),
-                                text(display_text)
-                                    .size(font_small)
-                                    .color(theme.text_primary())
-                            ]
-                            .spacing(2),
-                        )
-                        .padding([8, 12])
-                        .width(Length::Fill)
-                        .style(move |_| container::Style {
-                            background: Some(bg.into()),
-                            border: iced::Border {
-                                width: 0.0,
-                                color: iced::Color::TRANSPARENT,
-                                radius: iced::border::Radius::from(6),
-                            },
-                            ..Default::default()
-                        }),
-                    );
-                }
-                agent::ConversationEntry::Assistant {
-                    text: asst_text,
-                    model,
-                } => {
-                    let model_short = model.strip_prefix("claude-").unwrap_or(model);
-                    let asst_color = theme.mauve();
-                    let bg = iced::Color {
-                        a: 0.05,
-                        ..asst_color
-                    };
-
-                    let display_text: String = if asst_text.len() > 1000 {
-                        format!("{}…", truncate_str(asst_text, 997))
-                    } else {
-                        asst_text.clone()
-                    };
-
-                    thread = thread.push(
-                        container(
-                            column![
-                                text(model_short).size(font_tiny).color(asst_color),
-                                text(display_text)
-                                    .size(font_small)
-                                    .color(theme.text_secondary())
-                            ]
-                            .spacing(2),
-                        )
-                        .padding([8, 12])
-                        .width(Length::Fill)
-                        .style(move |_| container::Style {
-                            background: Some(bg.into()),
-                            border: iced::Border {
-                                width: 0.0,
-                                color: iced::Color::TRANSPARENT,
-                                radius: iced::border::Radius::from(6),
-                            },
-                            ..Default::default()
-                        }),
-                    );
-                }
-                agent::ConversationEntry::ToolCall { tool, summary } => {
-                    let tool_color = theme.yellow();
-
-                    let label = format!("→ {} {}", tool, summary);
-                    let label_truncated: String = if label.len() > 100 {
-                        format!("{}…", truncate_str(&label, 97))
-                    } else {
-                        label
-                    };
-
-                    thread = thread.push(
-                        container(text(label_truncated).size(font_tiny).color(tool_color))
-                            .padding([3, 12]),
-                    );
-                }
-                agent::ConversationEntry::ToolResult {
-                    tool: _,
-                    output,
-                    is_error,
-                } => {
-                    if !output.is_empty() {
-                        let result_color = if *is_error {
-                            theme.red()
-                        } else {
-                            theme.text_secondary()
-                        };
-                        let prefix = if *is_error { "✗ " } else { "" };
-                        let bg = if *is_error {
-                            iced::Color {
-                                a: 0.06,
-                                ..theme.red()
-                            }
-                        } else {
-                            theme.bg_base()
-                        };
-
-                        // Only show first few lines of output
-                        let lines: Vec<&str> = output.lines().take(6).collect();
-                        let display = if output.lines().count() > 6 {
-                            format!("{}{}…", prefix, lines.join("\n"))
-                        } else {
-                            format!("{}{}", prefix, lines.join("\n"))
-                        };
-
-                        thread = thread.push(
-                            container(text(display).size(font_tiny).color(result_color))
-                                .padding([4, 12])
-                                .width(Length::Fill)
-                                .style(move |_| container::Style {
-                                    background: Some(bg.into()),
-                                    border: iced::Border {
-                                        width: 0.0,
-                                        color: iced::Color::TRANSPARENT,
-                                        radius: iced::border::Radius::from(4),
-                                    },
-                                    ..Default::default()
-                                }),
-                        );
-                    }
-                }
-                agent::ConversationEntry::Thinking { text: think_text } => {
-                    let think_color = theme.text_muted();
-                    let display: String = if think_text.len() > 300 {
-                        format!("💭 {}…", truncate_str(think_text, 297))
-                    } else {
-                        format!("💭 {}", think_text)
-                    };
-
-                    thread = thread.push(
-                        container(text(display).size(font_tiny).color(think_color))
-                            .padding([3, 12]),
-                    );
-                }
-                agent::ConversationEntry::Compaction { summary } => {
-                    let compact_color = theme.peach();
-                    let display: String = if summary.len() > 200 {
-                        format!("⟳ Context compacted: {}…", truncate_str(summary, 197))
-                    } else {
-                        format!("⟳ Context compacted: {}", summary)
-                    };
-
-                    thread = thread.push(
-                        container(text(display).size(font_tiny).color(compact_color))
-                            .padding([6, 12]),
-                    );
-                }
-            }
-        }
-
-        content = content.push(thread);
-
-        scrollable(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
     }
 
     fn view_claude_sidebar<'a>(
@@ -42942,26 +42603,14 @@ fi
         let Some(ws) = self.active_workspace() else {
             return iced::widget::Space::new().width(0).height(0).into();
         };
+        // Folded, the panel has no header row (TRU-192): the bar's
+        // terminal toggle opens it.
+        if !self.console_expanded {
+            return iced::widget::Space::new().width(0).height(0).into();
+        }
 
         // --- Tab bar ---
         let tab_bar = self.view_bottom_tab_bar(ws);
-
-        if !self.console_expanded {
-            let border_color = theme.surface0();
-            return container(tab_bar)
-                .width(Length::Fill)
-                .height(Length::Fixed(CONSOLE_HEADER_HEIGHT))
-                .style(move |_| container::Style {
-                    background: None,
-                    border: iced::Border {
-                        width: 1.0,
-                        color: border_color,
-                        radius: 0.0.into(),
-                    },
-                    ..Default::default()
-                })
-                .into();
-        }
 
         // --- Content area ---
         let placeholder = |message: &'static str| -> Element<'_, Event, Theme, iced::Renderer> {
@@ -43686,6 +43335,43 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn bar_hint_centre_is_clamped_to_the_window_or_page() {
+        // Inside: untouched.
+        assert_eq!(clamp_hint_center(500.0, 100.0, 1000.0), 500.0);
+        // Near the left edge: the bubble's left side keeps a 4px margin.
+        assert_eq!(clamp_hint_center(10.0, 100.0, 1000.0), 54.0);
+        // Near the right edge.
+        assert_eq!(clamp_hint_center(995.0, 100.0, 1000.0), 946.0);
+        // A page narrower than the bubble centres it.
+        assert_eq!(clamp_hint_center(10.0, 100.0, 80.0), 40.0);
+    }
+
+    #[test]
+    fn bar_hint_draws_in_iced_unless_a_webview_sits_on_the_bar() {
+        use BarHintTarget::{Iced, Webview};
+        assert_eq!(bar_hint_target(VisibleSurface::None, false), Iced);
+        assert_eq!(
+            bar_hint_target(VisibleSurface::Viewer, false),
+            Webview(WebviewSurface::Viewer)
+        );
+        assert_eq!(
+            bar_hint_target(VisibleSurface::AgentChat(3), false),
+            Webview(WebviewSurface::Agent(3))
+        );
+        // The open terminal panel is Iced content between page and bar.
+        assert_eq!(bar_hint_target(VisibleSurface::Viewer, true), Iced);
+        assert_eq!(bar_hint_target(VisibleSurface::AgentChat(3), true), Iced);
+    }
+
+    #[test]
+    fn bar_hint_script_passes_the_text_as_a_json_string() {
+        assert_eq!(
+            bar_hint_show_script("a \"b\" </script>", 12.5),
+            "window.__gittermHint && window.__gittermHint(\"a \\\"b\\\" </script>\", 12.5)"
+        );
+    }
 
     #[test]
     fn overview_transcript_reads_resume_after_the_last_whole_line() {
@@ -46744,6 +46430,185 @@ mod tests {
         assert!(!finish_parked(&mut configs, &key, "later".into()));
     }
 
+    #[test]
+    fn park_keeps_processes_only_with_keep_running_on_the_work_sheet() {
+        let keep = ParkMode::for_sheet(CloseSheetKind::Park, true);
+        assert_eq!(keep, ParkMode::KeepRunning);
+        assert!(!keep.stops_processes());
+        // Unchecked: today's park.
+        let stop = ParkMode::for_sheet(CloseSheetKind::Park, false);
+        assert_eq!(stop, ParkMode::Stop);
+        assert!(stop.stops_processes());
+        // The folder Close sheet's Park has no Keep running.
+        assert_eq!(
+            ParkMode::for_sheet(CloseSheetKind::Close, true),
+            ParkMode::Stop
+        );
+    }
+
+    #[test]
+    fn the_next_active_workspace_skips_running_parked_ones() {
+        // Nothing parked: what park always did, the next else the last.
+        assert_eq!(next_on_bar(1, &[false, false, false]), Some(1));
+        assert_eq!(next_on_bar(3, &[false, false, false]), Some(2));
+        // Keep running leaves 1 in the Vec, parked: 2 takes over.
+        assert_eq!(next_on_bar(1, &[false, true, false]), Some(2));
+        // A running parked one is never picked; else the last before.
+        assert_eq!(next_on_bar(1, &[false, true, true]), Some(0));
+        assert_eq!(next_on_bar(0, &[true, true]), None);
+    }
+
+    #[test]
+    fn chats_wake_a_running_parked_workspace_when_they_ask_finish_or_fail() {
+        let harness = |ev| chat_event_wake(&tab::AgentEvent::Harness(ev));
+        // A question or a permission request.
+        assert_eq!(
+            harness(HarnessEvent::RuntimeRequest {
+                request_id: "r1".into(),
+                tool_use_id: "t1".into(),
+                kind: gitterm::harness::RuntimeRequestKind::Question {
+                    questions: serde_json::json!([]),
+                },
+            }),
+            Some(WakeReason::NeedsYou)
+        );
+        let completed = |status| HarnessEvent::TurnCompleted {
+            status,
+            usage: serde_json::Value::Null,
+            cost_usd: None,
+        };
+        assert_eq!(
+            harness(completed(TurnStatus::Completed)),
+            Some(WakeReason::Finished)
+        );
+        assert_eq!(
+            harness(completed(TurnStatus::Failed("x".into()))),
+            Some(WakeReason::Failed)
+        );
+        assert_eq!(
+            harness(HarnessEvent::Error("boom".into())),
+            Some(WakeReason::Failed)
+        );
+        // An interrupted turn or streaming text does not wake it.
+        assert_eq!(harness(completed(TurnStatus::Interrupted)), None);
+        assert_eq!(harness(HarnessEvent::TextDelta("hi".into())), None);
+        assert_eq!(
+            chat_event_wake(&tab::AgentEvent::AssistantText("working".into())),
+            None
+        );
+        // Older stream sentinels drive the same marks.
+        assert_eq!(
+            chat_event_wake(&tab::AgentEvent::Result(serde_json::json!({}))),
+            Some(WakeReason::Finished)
+        );
+        assert_eq!(
+            chat_event_wake(&tab::AgentEvent::Other(
+                serde_json::json!({ "type": "error" })
+            )),
+            Some(WakeReason::Failed)
+        );
+        // A delegation result is another chat's news, not a wake.
+        assert_eq!(
+            WakeReason::for_attention(AttentionReason::DelegationReady(
+                gitterm::tasks::DelegationKind::Review
+            )),
+            None
+        );
+        // What the bar shows.
+        assert_eq!(WakeReason::NeedsYou.label(), "needs you");
+        assert_eq!(WakeReason::Finished.label(), "finished");
+        assert_eq!(WakeReason::Failed.label(), "failed");
+    }
+
+    #[test]
+    fn a_running_parked_workspace_loads_as_a_plain_parked_one_after_a_restart() {
+        let mut open = closed_config("Coordinator", None);
+        open.active = true;
+        open.chats = vec!["chat-1".to_string()];
+        open.tabs = vec![serde_json::from_value(serde_json::json!({
+            "dir": "/tmp/Coordinator",
+            "tab_kind": "agent",
+            "chat_session_id": "chat-1",
+        }))
+        .expect("tab config")];
+        let info = ParkedInfo {
+            note: "waiting on review".to_string(),
+            parked_at: "2026-11-01T09:00:00Z".to_string(),
+        };
+        let saved = running_parked_config(open, &info);
+        let json = serde_json::to_value(&saved).expect("serialize");
+        // Nothing says it was running: the file is an ordinary parked entry.
+        let mut plain = closed_config("Coordinator", Some("x"));
+        plain.chats = vec!["chat-1".to_string()];
+        plain.tabs = saved.tabs.clone();
+        let plain = serde_json::to_value(plain).expect("serialize");
+        let keys = |value: &serde_json::Value| {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&json), keys(&plain));
+        let loaded: WorkspaceConfig = serde_json::from_value(json).expect("deserialize");
+        assert!(!loaded.active);
+        assert!(loaded.is_parked());
+        assert_eq!(loaded.parked, Some(info));
+        // Its tabs come back on Resume, as any parked entry's do.
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].chat_session_id.as_deref(), Some("chat-1"));
+
+        // The saved active index skips running parked ones, which the
+        // file does not reopen.
+        assert_eq!(persisted_active_index(2, &[false, true, false]), 1);
+        assert_eq!(persisted_active_index(0, &[true, false]), 0);
+        assert_eq!(persisted_active_index(2, &[false, false, false]), 2);
+    }
+
+    #[test]
+    fn done_or_close_on_a_running_parked_workspace_stops_it() {
+        let mut workspaces = vec![
+            Workspace::new(
+                "acme-bar".into(),
+                PathBuf::from("/tmp/acme-bar"),
+                WorkspaceColor::Blue,
+            ),
+            Workspace::new(
+                "acme-work".into(),
+                PathBuf::from("/tmp/acme-work"),
+                WorkspaceColor::Green,
+            ),
+        ];
+        let info = ParkedInfo {
+            note: String::new(),
+            parked_at: "2026-11-01T09:00:00Z".to_string(),
+        };
+        workspaces[1].running_park = Some(info.clone());
+        let key = |ws: &Workspace| ParkedKey {
+            name: ws.name.clone(),
+            dir: workspace_config_dir(ws),
+        };
+        let running_key = key(&workspaces[1]);
+        // Only the running parked one is a Parked list entry; the one on
+        // the bar is not.
+        assert_eq!(running_parked_index(&workspaces, &running_key), Some(1));
+        assert_eq!(
+            running_parked_index(&workspaces, &key(&workspaces[0])),
+            None
+        );
+
+        // Done stops it the way park does: it leaves the open workspaces
+        // (its tabs and their processes drop) for a stopped parked entry,
+        // which is then done. Close parks with `ParkMode::Stop` the same.
+        assert!(ParkMode::Stop.stops_processes());
+        let mut stopped = closed_config("acme-work", None);
+        stopped.dir = running_key.dir.clone();
+        let mut closed = vec![running_parked_config(stopped, &info)];
+        workspaces.remove(1);
+        assert!(closed[0].is_parked());
+        assert!(finish_parked(&mut closed, &running_key, "later".into()));
+        assert!(!closed[0].is_parked());
+        assert_eq!(running_parked_index(&workspaces, &running_key), None);
+    }
+
     fn closed_config(name: &str, parked_at: Option<&str>) -> WorkspaceConfig {
         WorkspaceConfig {
             name: name.to_string(),
@@ -47047,5 +46912,57 @@ mod tests {
         assert_eq!(dirs, ["/tmp/tru180-open", "/tmp/acme-parked"]);
         assert_eq!(section[0].run_command, None);
         assert_eq!(section[1].run_command.as_deref(), Some("make"));
+    }
+
+    /// The New workspace sheet's home preview follows the name (TRU-194).
+    #[test]
+    fn new_work_home_preview_is_the_slug_under_work() {
+        assert_eq!(new_work_home_preview(""), "~/Work/\u{2026}");
+        assert_eq!(new_work_home_preview("   "), "~/Work/\u{2026}");
+        assert_eq!(
+            new_work_home_preview("Cloud migration"),
+            "~/Work/cloud-migration"
+        );
+        assert_eq!(
+            new_work_home_preview("PRJ-101: ship!"),
+            "~/Work/prj-101-ship"
+        );
+    }
+
+    /// Create lists the starting repos as added by hand, so they persist,
+    /// and sets the decisions repo; one not among them is rejected.
+    #[test]
+    fn new_work_starts_with_its_repos_and_decisions_repo() {
+        let api = PathBuf::from("/w/api");
+        let web = PathBuf::from("/w/web");
+        let mut ws = Workspace::new(
+            "Cloud migration".to_string(),
+            PathBuf::from("/w/work/cloud-migration"),
+            WorkspaceColor::Blue,
+        );
+        WorkStart::new(vec![web.clone(), api.clone()], Some(api.clone()))
+            .unwrap()
+            .apply(&mut ws);
+        assert_eq!(ws.repos_added, vec![web.clone(), api.clone()]);
+        assert_eq!(ws.pending_repos, vec![web.clone(), api.clone()]);
+        assert!(ws.repos_removed.is_empty());
+        assert_eq!(ws.decisions_repo, Some(api.clone()));
+        assert_eq!(
+            path_strings(&ws.repos_added),
+            vec!["/w/web".to_string(), "/w/api".to_string()]
+        );
+
+        // No repos, no decisions repo: as before.
+        let mut bare = Workspace::new(
+            "Bare".to_string(),
+            PathBuf::from("/w/work/bare"),
+            WorkspaceColor::Blue,
+        );
+        WorkStart::new(Vec::new(), None).unwrap().apply(&mut bare);
+        assert!(bare.repos_added.is_empty() && bare.pending_repos.is_empty());
+        assert_eq!(bare.decisions_repo, None);
+
+        let error = WorkStart::new(vec![web], Some(api)).unwrap_err();
+        assert!(error.contains("/w/api"), "{error}");
     }
 }
