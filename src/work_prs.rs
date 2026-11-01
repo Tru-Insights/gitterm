@@ -1428,7 +1428,7 @@ impl App {
         Some(section.into())
     }
 
-    /// The bar's "⇡ n to merge" button for the Ready to merge list; hidden
+    /// The bar's "↑n" (n to merge) button for the Ready to merge list; hidden
     /// when no plan has a next PR and there is no news.
     pub(super) fn view_ready_button<'a>(
         &'a self,
@@ -1442,31 +1442,22 @@ impl App {
         if next == 0 && news == 0 {
             return None;
         }
-        let mut label = format!("\u{21E1} {next} to merge");
+        // Short on the bar (TRU-192), the full text on hover.
+        let mut full = format!("{next} to merge");
         if news > 0 {
-            label.push_str(&format!(" \u{00B7} {news} new"));
+            full.push_str(&format!(" \u{00B7} {news} new"));
         }
         let color = if news > 0 {
             self.theme.accent()
         } else {
             self.theme.text_muted()
         };
-        let hover = self.theme.text_secondary();
-        Some(
-            button(text(label).size(11).font(iced::Font::with_name("Menlo")))
-                .style(move |_theme, status| button::Style {
-                    background: Some(iced::Color::TRANSPARENT.into()),
-                    text_color: if matches!(status, button::Status::Hovered) {
-                        hover
-                    } else {
-                        color
-                    },
-                    ..Default::default()
-                })
-                .padding([6, 10])
-                .on_press(Event::Pr(PrEvent::ReadyListToggle))
-                .into(),
-        )
+        let btn = self.bar_text_button(
+            format!("\u{2191}{next}"),
+            color,
+            Some(Event::Pr(PrEvent::ReadyListToggle)),
+        );
+        Some(self.bar_tooltip(btn, full, iced::widget::tooltip::Position::Left))
     }
 
     /// "Ready to merge" across this Mac's workspaces, open and parked: each
