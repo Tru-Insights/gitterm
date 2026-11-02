@@ -116,6 +116,49 @@ impl RepoTouched {
     }
 }
 
+/// One repo header of the Repos section (TRU-192): its edits by the work
+/// (`None` when the work has not edited it) and the owned checkouts there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepoGroup<'a> {
+    pub dir: PathBuf,
+    pub edits: Option<u64>,
+    pub rows: Vec<&'a BranchStatus>,
+}
+
+/// One list from the repos the workspace lists (in its order), the repos the
+/// work edited, and the owned checkouts: listed repos come first even when
+/// untouched, then edited or branch-only repos; a repo appears once.
+pub fn merge_repo_groups<'a>(
+    listed: &[PathBuf],
+    touched: &[RepoTouched],
+    branches: &'a [BranchStatus],
+) -> Vec<RepoGroup<'a>> {
+    fn slot(dir: &Path, groups: &mut Vec<RepoGroup<'_>>) -> usize {
+        if let Some(idx) = groups.iter().position(|group| group.dir == dir) {
+            return idx;
+        }
+        groups.push(RepoGroup {
+            dir: dir.to_path_buf(),
+            edits: None,
+            rows: Vec::new(),
+        });
+        groups.len() - 1
+    }
+    let mut groups: Vec<RepoGroup<'a>> = Vec::new();
+    for dir in listed {
+        slot(dir, &mut groups);
+    }
+    for repo in touched {
+        let idx = slot(&repo.dir, &mut groups);
+        groups[idx].edits = Some(repo.edits);
+    }
+    for row in branches {
+        let idx = slot(&row.owned.repo, &mut groups);
+        groups[idx].rows.push(row);
+    }
+    groups
+}
+
 pub fn folder_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -3396,5 +3439,62 @@ mod tests {
                 candidate.checkout.display()
             );
         }
+    }
+
+    fn branch_in(repo: &str, checkout: &str) -> BranchStatus {
+        BranchStatus {
+            owned: OwnedBranch {
+                repo: PathBuf::from(repo),
+                checkout: PathBuf::from(checkout),
+                branch: Some("topic".into()),
+                is_main: false,
+                ownership: Ownership::Edited,
+                owner: String::new(),
+                last: None,
+                edits: 1,
+                task: None,
+                gone: false,
+            },
+            base: None,
+            status: None,
+            vs_base: None,
+            error: None,
+            stamp: GitdirStamp::default(),
+            checked_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn merged_repo_groups_keep_listed_untouched_repos_in_order_once() {
+        let listed = vec![
+            PathBuf::from("/r/a"),
+            PathBuf::from("/r/b"),
+            PathBuf::from("/r/c"),
+        ];
+        let touched = vec![
+            RepoTouched {
+                dir: PathBuf::from("/r/c"),
+                edits: 4,
+            },
+            RepoTouched {
+                dir: PathBuf::from("/r/d"),
+                edits: 2,
+            },
+        ];
+        let branches = vec![
+            branch_in("/r/c", "/r/c"),
+            branch_in("/r/c", "/r/c-wt"),
+            branch_in("/r/e", "/r/e"),
+        ];
+        let groups = merge_repo_groups(&listed, &touched, &branches);
+        let dirs: Vec<&str> = groups.iter().map(|g| g.dir.to_str().unwrap()).collect();
+        assert_eq!(dirs, ["/r/a", "/r/b", "/r/c", "/r/d", "/r/e"]);
+        assert_eq!(groups[0].edits, None);
+        assert!(groups[0].rows.is_empty());
+        assert_eq!(groups[2].edits, Some(4));
+        assert_eq!(groups[2].rows.len(), 2);
+        assert_eq!(groups[3].edits, Some(2));
+        assert_eq!(groups[4].edits, None);
+        assert_eq!(groups[4].rows.len(), 1);
     }
 }

@@ -11,7 +11,7 @@ window.__gittermHint = function (text, x) {
   if (!el) {
     el = document.createElement('div');
     el.id = '__gitterm-hint';
-    el.style.cssText = 'position:fixed;bottom:4px;z-index:2147483647;pointer-events:none;padding:3px 7px;border-radius:5px;font:10.5px Menlo,monospace;white-space:nowrap;background:__BG__;color:__FG__;';
+    el.style.cssText = 'position:fixed;bottom:4px;z-index:2147483647;pointer-events:none;padding:4px 8px;border-radius:5px;font:12px Menlo,monospace;white-space:nowrap;background:__BG__;color:__FG__;';
     var label = document.createElement('span');
     var arrow = document.createElement('div');
     arrow.style.cssText = 'position:absolute;bottom:-3px;width:6px;height:6px;transform:rotate(45deg);background:__BG__;';
