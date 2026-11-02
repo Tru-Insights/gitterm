@@ -6669,8 +6669,9 @@ pub enum Event {
     // Chats panel (TRU-78)
     RefreshChatIndex,
     ChatIndexLoaded(Vec<chats::ChatIndexEntry>),
-    /// A chat tab's facts write landed (TRU-166).
-    ChatFactsFlushed(usize, Result<(), String>),
+    /// A chat tab's facts write landed (TRU-166), with the PRs a catch-up
+    /// scan found in its transcript (TRU-201).
+    ChatFactsFlushed(usize, Result<Vec<gitterm::merge_plan::PrRef>, String>),
     /// "Index older chats" in the Chats panel (TRU-166).
     ChatFactsBackfill,
     ChatFactsBackfilled(Result<chat_facts::BackfillReport, String>),
@@ -13689,7 +13690,9 @@ impl App {
 
     /// Write a chat tab's facts when they are due (TRU-166): debounced while
     /// a turn runs, at once when `force` (the turn ended). The write runs
-    /// on a blocking thread; one per tab at a time.
+    /// on a blocking thread; one per tab at a time. A requested catch-up
+    /// (TRU-201) goes first, in that same slot, so its transcript scan and
+    /// the live observations are merged in one read and write.
     fn flush_chat_facts(&mut self, tab_id: usize, force: bool) -> Task<Event> {
         let Some(tab) = self
             .workspaces
@@ -13704,8 +13707,13 @@ impl App {
         let Some(session_id) = tab.chat_session_id.clone() else {
             return Task::none();
         };
-        let Some(pending) = tab.chat_facts.take_due(Instant::now(), force) else {
-            return Task::none();
+        let now = Instant::now();
+        let (pending, catch_up) = match tab.chat_facts.take_catch_up(now) {
+            Some(pending) => (pending, true),
+            None => match tab.chat_facts.take_due(now, force) {
+                Some(pending) => (pending, false),
+                None => return Task::none(),
+            },
         };
         // PRs show in the overview before the index rereads the file.
         if !pending.prs.is_empty() {
@@ -13716,12 +13724,26 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
+                    let transcript = if catch_up {
+                        let found = chats::claude_session_path(&session_id);
+                        if found.is_none() {
+                            eprintln!(
+                                "[chat-facts] Claude session {session_id} has no transcript to catch up from"
+                            );
+                        }
+                        found
+                    } else {
+                        None
+                    };
+                    let home = dirs::home_dir();
                     chat_facts::flush_live(
                         &dir,
                         chats::ChatBackend::Claude,
                         &session_id,
                         pending,
                         children,
+                        transcript.as_deref(),
+                        home.as_deref(),
                     )
                 })
                 .await
@@ -26168,9 +26190,13 @@ fi
                 }
             }
             Event::ChatFactsFlushed(tab_id, result) => {
-                if let Err(error) = result {
-                    eprintln!("[chat-facts] tab {tab_id}: facts not written: {error}");
-                }
+                let caught_up_prs = match result {
+                    Ok(prs) => prs,
+                    Err(error) => {
+                        eprintln!("[chat-facts] tab {tab_id}: facts not written: {error}");
+                        Vec::new()
+                    }
+                };
                 let tab = self
                     .workspaces
                     .iter_mut()
@@ -26180,6 +26206,13 @@ fi
                     return Task::none();
                 };
                 tab.chat_facts.flush_done();
+                // PRs opened while the chat ran elsewhere (TRU-201) show
+                // before the index rereads the file, as live ones do.
+                if let (false, Some(session_id)) =
+                    (caught_up_prs.is_empty(), tab.chat_session_id.as_deref())
+                {
+                    self.prs.note_live_prs(session_id, &caught_up_prs);
+                }
                 // What arrived during the write: at once when the turn has
                 // ended meanwhile, else on the debounce.
                 let idle = tab.agent_session().is_some_and(|session| {
@@ -28818,7 +28851,8 @@ fi
                 },
             );
         }
-        Task::perform(
+        let claude = session.backend() == tab::AgentBackend::Claude;
+        let history = Task::perform(
             async move {
                 let id = session_id.clone();
                 tokio::task::spawn_blocking(move || {
@@ -28841,7 +28875,25 @@ fi
                 })
             },
             move |events| Event::AgentHistoryLoaded(tab_id, events),
-        )
+        );
+        if !claude {
+            return history;
+        }
+        // The tab now hosts this chat, so "Index older chats" skips it. If
+        // it ran on elsewhere (another instance, the CLI), what happened
+        // there is only in the transcript: catch the facts up once (TRU-201).
+        // Facts are written for chats on this Mac only, as the live writer.
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|t| t.id == tab_id)
+        else {
+            return history;
+        };
+        tab.chat_facts.request_catch_up();
+        Task::batch([history, self.flush_chat_facts(tab_id, true)])
     }
 
     fn recreate_terminals(&mut self) {

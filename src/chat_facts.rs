@@ -15,7 +15,11 @@
 //!   writer per file;
 //! - the explicit "Index older chats" action ([`backfill_claude`]), once
 //!   per transcript, streaming existing Claude transcripts (subagent
-//!   transcripts included). It skips chats a tab is hosting.
+//!   transcripts included). It skips chats a tab is hosting;
+//! - the hosting tab once more when it picks a chat up (TRU-201): a chat
+//!   that moved on elsewhere (another instance, the CLI) has its transcript
+//!   scanned in the tab's own write slot ([`LiveFacts::request_catch_up`],
+//!   [`flush_live`]), so the stretch no live writer saw is recorded too.
 //!
 //! Paths resolve to repo / checkout / branch with the TRU-146 rules in
 //! `worktree_follow` (candidate extraction, `list_worktrees`,
@@ -59,7 +63,8 @@ pub struct ChatFacts {
     #[serde(default)]
     pub children: Vec<ChatChild>,
     /// PRs the chat created (TRU-173): a `gh pr create` Bash result naming
-    /// a GitHub PR URL. Written by the hosting tab only.
+    /// a GitHub PR URL. Written by the hosting tab only: live, or from the
+    /// transcript when it picks the chat up (TRU-201).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prs: Vec<PrRef>,
     /// Markdown files the chat wrote or edited (TRU-191: Write, Edit,
@@ -328,6 +333,9 @@ impl ChatFacts {
         for child in scan.children {
             self.add_child(child);
         }
+        for pr in scan.prs {
+            self.add_pr(pr);
+        }
         // The scan saw the whole transcript in order: its documents are the
         // newest; any only a tab recorded keep their place before them.
         if !scan.documents.is_empty() {
@@ -592,7 +600,8 @@ pub struct RawFacts {
     pub touches: Vec<RawTouch>,
     pub issue_keys: Vec<String>,
     pub children: Vec<ChatChild>,
-    /// PRs from `gh pr create` results (live tabs only).
+    /// PRs from `gh pr create` results: live tabs, and transcript scans
+    /// for a tab catching up ("Index older chats" leaves them out).
     pub prs: Vec<PrRef>,
     /// Markdown files written or edited, in call order (TRU-191).
     pub documents: Vec<PathBuf>,
@@ -839,6 +848,9 @@ pub struct LiveFacts {
     pr_create_calls: HashSet<String>,
     last_flush: Option<Instant>,
     in_flight: bool,
+    /// The tab picked up a chat whose transcript may have moved on while
+    /// it ran elsewhere (TRU-201); the next write scans it first.
+    catch_up: bool,
 }
 
 impl LiveFacts {
@@ -899,33 +911,134 @@ impl LiveFacts {
         self.in_flight = false;
     }
 
-    /// Whether observations wait for a write.
+    /// The tab picked a chat up (TRU-201): its next write first scans the
+    /// transcript if it is newer than the facts file. The scan runs in the
+    /// same write slot as the live observations, so the two never race.
+    pub fn request_catch_up(&mut self) {
+        self.catch_up = true;
+    }
+
+    /// A requested catch-up, with whatever observations wait, when no write
+    /// is in flight; not debounced. The caller passes the transcript to
+    /// [`flush_live`] and calls [`LiveFacts::flush_done`] when it lands.
+    pub fn take_catch_up(&mut self, now: Instant) -> Option<RawFacts> {
+        if self.in_flight || !self.catch_up {
+            return None;
+        }
+        self.catch_up = false;
+        self.in_flight = true;
+        self.last_flush = Some(now);
+        Some(std::mem::take(&mut self.pending))
+    }
+
+    /// Whether observations, or a catch-up, wait for a write.
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        self.catch_up || !self.pending.is_empty()
     }
 }
 
 /// Folds a live tab's observations and its delegation children into the
 /// chat's facts file. Blocking (git, file I/O); run on a blocking thread.
 /// A file that exists but does not parse is left alone and reported.
+///
+/// `catch_up` is the chat's transcript when the tab has just picked the
+/// chat up (TRU-201). If there is no facts file yet, or the transcript is
+/// newer than it (the rule "Index older chats" uses), the transcript is
+/// scanned and merged as a backfill would ([`ChatFacts::absorb_scan`]),
+/// then the observations are added, all in this one read, merge and
+/// write. Returns the PRs the scan added, which the tab did not see live.
 pub fn flush_live(
     dir: &Path,
     backend: ChatBackend,
     session_id: &str,
     pending: RawFacts,
     children: Vec<ChatChild>,
-) -> Result<(), String> {
+    catch_up: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<Vec<PrRef>, String> {
     let path = facts_path(dir, backend, session_id)?;
-    let mut facts = load_facts(&path)?.unwrap_or_default();
-    let before = facts.clone();
-    pending.resolve_into(&mut facts, &mut GitResolver::default());
+    let existing = load_facts(&path)?;
+    let before = existing.clone().unwrap_or_default();
+    let mut resolver = GitResolver::default();
+    let (mut facts, caught_up) = match catch_up {
+        Some(transcript) => {
+            catch_up_from_transcript(existing, &path, transcript, home, &mut resolver)
+        }
+        None => (existing.unwrap_or_default(), Vec::new()),
+    };
+    pending.resolve_into(&mut facts, &mut resolver);
     for child in children {
         facts.add_child(child);
     }
     if facts == before {
-        return Ok(());
+        return Ok(caught_up);
     }
-    write_facts(&path, &facts)
+    write_facts(&path, &facts).map(|()| caught_up)
+}
+
+/// Whether a transcript modified at `transcript_mtime` moved on after the
+/// facts file at `path` was written. False when there is no file.
+fn transcript_is_newer(path: &Path, transcript_mtime: SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|written| transcript_mtime > written)
+}
+
+/// The catch-up for [`flush_live`]: `existing` (the facts file at `path`,
+/// if any) with the transcript absorbed when the file is missing or older
+/// than the transcript, else unchanged. Returns the facts and the PRs the
+/// scan added. An unreadable transcript is logged and changes nothing.
+fn catch_up_from_transcript(
+    existing: Option<ChatFacts>,
+    path: &Path,
+    transcript: &Path,
+    home: Option<&Path>,
+    resolver: &mut GitResolver,
+) -> (ChatFacts, Vec<PrRef>) {
+    let mtime = match std::fs::metadata(transcript).and_then(|meta| meta.modified()) {
+        Ok(mtime) => mtime,
+        Err(error) => {
+            eprintln!(
+                "[chat-facts] catch-up cannot read {}: {error}",
+                transcript.display()
+            );
+            return (existing.unwrap_or_default(), Vec::new());
+        }
+    };
+    if existing.is_some() && !transcript_is_newer(path, mtime) {
+        return (existing.unwrap_or_default(), Vec::new());
+    }
+    let scan = match facts_from_claude_transcript(transcript, home, resolver) {
+        Ok(scan) => scan,
+        Err(error) => {
+            eprintln!(
+                "[chat-facts] catch-up cannot read {}: {error}",
+                transcript.display()
+            );
+            return (existing.unwrap_or_default(), Vec::new());
+        }
+    };
+    let mut facts = existing.unwrap_or_default();
+    let added: Vec<PrRef> = scan
+        .prs
+        .iter()
+        .filter(|pr| {
+            let id = pr.key().id();
+            !facts.prs.iter().any(|known| known.key().id() == id)
+        })
+        .cloned()
+        .collect();
+    facts.absorb_scan(scan);
+    // A whole-transcript scan, as "Index older chats" records one.
+    facts.backfilled = true;
+    facts.documents_backfilled = true;
+    eprintln!(
+        "[chat-facts] {} caught up from {} ({} new PRs)",
+        path.display(),
+        transcript.display(),
+        added.len()
+    );
+    (facts, added)
 }
 
 // ---------------------------------------------------------------------------
@@ -935,9 +1048,23 @@ pub fn flush_live(
 /// subagent transcript, whose user lines are the coordinator's brief, not
 /// the human's words.
 pub fn observe_claude_line(raw: &mut RawFacts, line: &str, home: Option<&Path>, main: bool) {
+    observe_claude_line_with(raw, &mut HashSet::new(), line, home, main);
+}
+
+/// [`observe_claude_line`] across a whole transcript: `pr_create_calls`
+/// holds the `gh pr create` Bash calls whose result line has not come yet;
+/// that result's PR URLs are recorded as the live tab would (TRU-201).
+fn observe_claude_line_with(
+    raw: &mut RawFacts,
+    pr_create_calls: &mut HashSet<String>,
+    line: &str,
+    home: Option<&Path>,
+    main: bool,
+) {
     // Most lines are neither tool calls nor user text; skip them unparsed.
     let user_line = main && line.contains("\"user\"");
-    if !user_line && !line.contains("\"tool_use\"") {
+    let pr_result = !pr_create_calls.is_empty() && line.contains("\"tool_result\"");
+    if !user_line && !pr_result && !line.contains("\"tool_use\"") {
         return;
     }
     let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -947,6 +1074,22 @@ pub fn observe_claude_line(raw: &mut RawFacts, line: &str, home: Option<&Path>, 
     let Some(content) = value.get("message").and_then(|m| m.get("content")) else {
         return;
     };
+    if pr_result && kind == Some("user") {
+        for block in content.as_array().into_iter().flatten() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let created = block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| pr_create_calls.remove(id));
+            if created {
+                let output = block.get("content").map(tool_result_text);
+                raw.prs
+                    .extend(merge_plan::pr_urls_in(output.as_deref().unwrap_or("")));
+            }
+        }
+    }
     match kind {
         Some("user") if main => {
             let flag = |key: &str| value.get(key).and_then(Value::as_bool) == Some(true);
@@ -989,9 +1132,31 @@ pub fn observe_claude_line(raw: &mut RawFacts, line: &str, home: Option<&Path>, 
                     continue;
                 };
                 raw.observe_tool_call(id, name, input, home, &at);
+                let creates_pr = name == "Bash"
+                    && input
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(merge_plan::is_gh_pr_create);
+                if creates_pr {
+                    pr_create_calls.insert(id.to_string());
+                }
             }
         }
         _ => {}
+    }
+}
+
+/// A tool result's text: a string, or the text blocks of a list.
+fn tool_result_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -1003,11 +1168,12 @@ fn scan_lines(
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(std::fs::File::open(path)?);
     let mut line = String::new();
+    let mut pr_create_calls = HashSet::new();
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
-            Ok(_) => observe_claude_line(raw, &line, home, main),
+            Ok(_) => observe_claude_line_with(raw, &mut pr_create_calls, &line, home, main),
             // A line that is not UTF-8 is skipped, not fatal.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
             Err(error) => return Err(error),
@@ -1151,9 +1317,7 @@ pub fn backfill_claude(
         // A backfilled chat is scanned again when its transcript moved on
         // after the facts file was written (a CLI session has no live
         // writer, so this is how it catches up).
-        let stale = std::fs::metadata(&path)
-            .and_then(|meta| meta.modified())
-            .is_ok_and(|written| target.mtime > written);
+        let stale = transcript_is_newer(&path, target.mtime);
         if existing
             .as_ref()
             .is_some_and(|facts| facts.backfilled && facts.documents_backfilled && !stale)
@@ -1165,7 +1329,7 @@ pub fn backfill_claude(
             report.remaining += 1;
             continue;
         }
-        let scan = match facts_from_claude_transcript(&target.path, home, &mut resolver) {
+        let mut scan = match facts_from_claude_transcript(&target.path, home, &mut resolver) {
             Ok(scan) => scan,
             Err(error) => {
                 eprintln!(
@@ -1176,6 +1340,9 @@ pub fn backfill_claude(
                 continue;
             }
         };
+        // PRs stay a hosting tab's record (TRU-173): indexing old chats
+        // does not fill the PRs lists with their history.
+        scan.prs.clear();
         let mut facts = existing.unwrap_or_default();
         facts.absorb_scan(scan);
         for link in links.iter().filter(|link| link.parent == target.id) {
@@ -2247,12 +2414,159 @@ branch refs/heads/tracey/tru-12-thing
         // The live writer adds to the same file without losing the scan.
         let mut pending = RawFacts::default();
         pending.observe_user_text("now TRU-5");
-        flush_live(&facts_dir, ChatBackend::Claude, "s1", pending, vec![]).unwrap();
+        flush_live(
+            &facts_dir,
+            ChatBackend::Claude,
+            "s1",
+            pending,
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
         let facts = load_facts(&facts_dir.join("claude-s1.json"))
             .unwrap()
             .unwrap();
         assert_eq!(facts.issue_keys, vec!["PRJ-6", "PRJ-7", "TRU-5"]);
         assert!(facts.backfilled);
+    }
+
+    fn set_mtime(path: &Path, at: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(at))
+            .expect("set mtime");
+    }
+
+    #[test]
+    fn a_catch_up_waits_for_the_write_in_flight_and_takes_what_waits() {
+        let mut live = LiveFacts::default();
+        live.observe_user_text("see ACME-1");
+        let t0 = Instant::now();
+        let first = live.take_due(t0, true).expect("due");
+        assert_eq!(first.issue_keys, vec!["ACME-1"]);
+        live.request_catch_up();
+        assert!(live.has_pending());
+        // One write per tab at a time: the catch-up waits for this one.
+        assert_eq!(live.take_catch_up(t0), None);
+        live.observe_user_text("then ACME-2");
+        live.flush_done();
+        let caught = live.take_catch_up(t0).expect("catch-up after the write");
+        assert_eq!(caught.issue_keys, vec!["ACME-2"]);
+        // While it runs, nothing else writes; once done, nothing is left.
+        live.observe_user_text("and ACME-3");
+        assert_eq!(live.take_due(t0, true), None);
+        live.flush_done();
+        assert_eq!(live.take_catch_up(t0), None);
+        assert!(live.take_due(t0, true).is_some());
+    }
+
+    #[test]
+    fn a_tab_picking_up_a_stale_chat_scans_it_once_and_keeps_live_facts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let facts_dir = temp.path().join("chat-meta");
+        let transcript = temp.path().join("s9.jsonl");
+        let plan = temp.path().join("notes/plan.md");
+        let lines = [
+            json!({"type": "user", "message": {"content": "ship ACME-12"}}),
+            json!({"type": "assistant", "timestamp": "2026-11-01T10:00:00Z",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "b1", "name": "Bash",
+                        "input": {"command": "gh pr create --fill"}},
+                    {"type": "tool_use", "id": "b2", "name": "Bash",
+                        "input": {"command": "echo https://github.com/acme/launch/pull/1"}},
+                    {"type": "tool_use", "id": "a1", "name": "Agent",
+                        "input": {"description": "Draft the brief", "prompt": "go"}},
+                    {"type": "tool_use", "id": "w1", "name": "Write",
+                        "input": {"file_path": plan.to_str().unwrap()}}]}}),
+            json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "b2",
+                    "content": "https://github.com/acme/launch/pull/1"},
+                {"type": "tool_result", "tool_use_id": "b1",
+                    "content": [{"type": "text",
+                        "text": "https://github.com/acme/launch/pull/42\n"}]}]}}),
+        ];
+        let body: Vec<String> = lines.iter().map(Value::to_string).collect();
+        std::fs::write(&transcript, body.join("\n")).unwrap();
+
+        // What a tab hosting the chat earlier wrote, before the chat ran on
+        // elsewhere; the transcript is newer.
+        let path = facts_dir.join("claude-s9.json");
+        let mut known = ChatFacts::default();
+        known.add_issue_key("LIVE-1");
+        known.add_pr(merge_plan::pr_urls_in("https://github.com/acme/web/pull/7").remove(0));
+        write_facts(&path, &known).unwrap();
+        let now = SystemTime::now();
+        set_mtime(&path, now - Duration::from_secs(7200));
+        set_mtime(&transcript, now - Duration::from_secs(3600));
+
+        let mut pending = RawFacts::default();
+        pending.observe_user_text("then LIVE-2");
+        let added = flush_live(
+            &facts_dir,
+            ChatBackend::Claude,
+            "s9",
+            pending,
+            vec![],
+            Some(&transcript),
+            None,
+        )
+        .unwrap();
+        let ids = |prs: &[PrRef]| prs.iter().map(|pr| pr.key().id()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&added),
+            ids(&merge_plan::pr_urls_in(
+                "https://github.com/acme/launch/pull/42"
+            ))
+        );
+        let facts = load_facts(&path).unwrap().unwrap();
+        assert_eq!(facts.issue_keys, vec!["LIVE-1", "ACME-12", "LIVE-2"]);
+        assert_eq!(facts.prs.len(), 2, "{:?}", facts.prs);
+        assert_eq!(facts.documents, vec![plan.clone()]);
+        assert_eq!(facts.children.len(), 1);
+        assert_eq!(facts.children[0].title.as_deref(), Some("Draft the brief"));
+        assert!(facts.backfilled && facts.documents_backfilled);
+
+        // The file is now newer than the transcript: picked up again, it is
+        // not scanned again, and live facts still land.
+        let mut pending = RawFacts::default();
+        pending.observe_user_text("LIVE-3");
+        let added = flush_live(
+            &facts_dir,
+            ChatBackend::Claude,
+            "s9",
+            pending,
+            vec![],
+            Some(&transcript),
+            None,
+        )
+        .unwrap();
+        assert!(added.is_empty());
+        let after = load_facts(&path).unwrap().unwrap();
+        assert_eq!(
+            after.issue_keys,
+            vec!["LIVE-1", "ACME-12", "LIVE-2", "LIVE-3"]
+        );
+
+        // A fresh chat (facts written after its transcript) is not scanned.
+        let fresh = facts_dir.join("claude-s10.json");
+        let mut live_only = ChatFacts::default();
+        live_only.add_issue_key("LIVE-9");
+        write_facts(&fresh, &live_only).unwrap();
+        set_mtime(&transcript, now - Duration::from_secs(9000));
+        let added = flush_live(
+            &facts_dir,
+            ChatBackend::Claude,
+            "s10",
+            RawFacts::default(),
+            vec![],
+            Some(&transcript),
+            None,
+        )
+        .unwrap();
+        assert!(added.is_empty());
+        assert_eq!(load_facts(&fresh).unwrap().unwrap(), live_only);
     }
 
     /// Real-data check (TRU-166 acceptance), read-only over a transcript you
