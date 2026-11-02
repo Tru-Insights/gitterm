@@ -42671,28 +42671,31 @@ fi
 
     /// Background placeholder for an agent tab. The wry webview is positioned
     /// by `calculate_webview_bounds` and overlays this area; the placeholder is
-    /// only visible briefly during webview construction or as a fallback if
-    /// the webview fails to attach.
+    /// only visible briefly during webview construction, as a fallback if
+    /// the webview fails to attach, or while a menu or sheet hides the page
+    /// (the page would cover it). In that last case the chat is fine, so the
+    /// placeholder says nothing rather than "Loading".
     fn view_agent_tab<'a>(
         &'a self,
         _tab: &'a TabState,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let bg = theme.bg_base();
-        container(
-            text("Loading agent…")
-                .size(13)
-                .color(theme.text_secondary()),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(bg.into()),
-            ..Default::default()
-        })
-        .into()
+        let label = if self.webview_overlay_open() {
+            ""
+        } else {
+            "Loading agent…"
+        };
+        container(text(label).size(13).color(theme.text_secondary()))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(bg.into()),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn view_terminal<'a>(&'a self, tab: &'a TabState) -> Element<'a, Event, Theme, iced::Renderer> {
