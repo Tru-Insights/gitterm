@@ -2128,6 +2128,42 @@ fn running_parked_index(workspaces: &[Workspace], key: &ParkedKey) -> Option<usi
     })
 }
 
+/// The tab "Add to workspace" moves into workspace `target` for chat
+/// `chat_id` (TRU-200), as `(workspace, tab)`: the first tab hosting it in
+/// another workspace on this Mac. `None` when no tab hosts it there, or
+/// `target` already does. `workspaces` gives each workspace's "on this
+/// Mac" flag and its tabs' chat session ids, in bar order.
+fn chat_tab_to_move<'a, T>(
+    workspaces: impl IntoIterator<Item = (bool, T)>,
+    target: usize,
+    chat_id: &str,
+) -> Option<(usize, usize)>
+where
+    T: IntoIterator<Item = Option<&'a str>>,
+{
+    let mut found = None;
+    for (ws_idx, (local, tabs)) in workspaces.into_iter().enumerate() {
+        let Some(tab_idx) = tabs.into_iter().position(|id| id == Some(chat_id)) else {
+            continue;
+        };
+        if ws_idx == target {
+            return None;
+        }
+        if local && found.is_none() {
+            found = Some((ws_idx, tab_idx));
+        }
+    }
+    found
+}
+
+/// A workspace's active tab after tab `removed` leaves it, `remaining`
+/// tabs left (at least one): a later tab shifts down one; the removed
+/// tab's place goes to the tab after it, else the last.
+fn active_tab_after_removal(active: usize, removed: usize, remaining: usize) -> usize {
+    let active = if active > removed { active - 1 } else { active };
+    active.min(remaining.saturating_sub(1))
+}
+
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
@@ -6670,9 +6706,10 @@ pub enum Event {
     /// chat opened there.
     WorkspaceGoToChatOwner(String),
     ChatAddToWorkspaceToggle,
-    /// Adds root chat `.0` to the open workspace with uid `.1`, taking it
-    /// from any other owner.
-    ChatAddToWorkspace(String, u64),
+    /// Adds root chat `.0` to the open workspace with uid `.2`, taking it
+    /// from any other owner. `.1` is the chat the preview shows (the root
+    /// or a chat folded under it): a tab hosting either moves there too.
+    ChatAddToWorkspace(String, String, u64),
     /// Starts an inline rename of the workspace at this index.
     WorkspaceRenameStart(usize, RenameSite),
     WorkspaceRenameInput(String),
@@ -14132,7 +14169,10 @@ impl App {
 
     /// Adds root chat `root` to the workspace with `uid`, removing it from
     /// every other workspace, open or closed: a chat belongs to exactly one.
-    fn add_chat_to_workspace(&mut self, root: &str, uid: u64) -> Task<Event> {
+    /// A tab hosting `root` or `chat` (the chat the preview shows) in
+    /// another local workspace moves there with its session attached, and
+    /// that workspace becomes active with the tab focused.
+    fn add_chat_to_workspace(&mut self, root: &str, chat: &str, uid: u64) -> Task<Event> {
         self.chat_add_to_workspace_open = false;
         let Some(target) = self.workspace_index_by_uid(uid) else {
             eprintln!("[workspace] cannot add chat {root}: workspace uid={uid} is not open");
@@ -14158,7 +14198,48 @@ impl App {
             return Task::none();
         }
         self.mark_workspaces_dirty();
-        self.workspace_chats_changed()
+        // The root first, so the shown chat's tab ends up focused.
+        let mut ids = vec![root];
+        if chat != root {
+            ids.push(chat);
+        }
+        let mut moved = false;
+        for id in ids {
+            let hosts: Vec<(bool, Vec<Option<&str>>)> = self
+                .workspaces
+                .iter()
+                .map(|ws| {
+                    (
+                        matches!(ws.location, WorkspaceLocation::Local { .. }),
+                        ws.tabs
+                            .iter()
+                            .map(|tab| tab.chat_session_id.as_deref())
+                            .collect(),
+                    )
+                })
+                .collect();
+            let Some((from, tab_idx)) = chat_tab_to_move(hosts, target, id) else {
+                continue;
+            };
+            eprintln!(
+                "[workspace] moving the tab hosting chat {id} from workspace {} to uid={uid}",
+                self.workspaces[from].uid
+            );
+            self.move_tab_to_workspace(from, tab_idx, target);
+            moved = true;
+        }
+        let changed = self.workspace_chats_changed();
+        if !moved {
+            return changed;
+        }
+        self.mark_log_server_dirty();
+        let show = if target != self.active_workspace_idx {
+            self.update(Event::WorkspaceSelect(target))
+        } else {
+            self.sync_visible_terminals();
+            self.present_active_tab_surfaces()
+        };
+        Task::batch([changed, show, self.scroll_to_active_tab()])
     }
 
     /// Owned chats moved: rebuild every overview built so far and reread
@@ -14203,10 +14284,7 @@ impl App {
         }
         let tab = self.workspaces[from].tabs.remove(tab_idx);
         let source = &mut self.workspaces[from];
-        if source.active_tab > tab_idx {
-            source.active_tab -= 1;
-        }
-        source.active_tab = source.active_tab.min(source.tabs.len() - 1);
+        source.active_tab = active_tab_after_removal(source.active_tab, tab_idx, source.tabs.len());
         let target = &mut self.workspaces[to];
         target.tabs.push(tab);
         target.active_tab = target.tabs.len() - 1;
@@ -14237,6 +14315,10 @@ impl App {
             draft: ws.name.clone(),
             site,
         });
+        // A chat page shown just before (Make workspace reveals one) holds
+        // AppKit focus, where typing and Escape would never reach the
+        // field: give it back to GitTerm's own view.
+        webview::focus_app_view();
         iced::widget::operation::focus(workspace_rename_input_id()).chain(
             iced::widget::operation::select_all(workspace_rename_input_id()),
         )
@@ -23566,6 +23648,15 @@ fi
                     return Task::none();
                 }
 
+                // Inline workspace rename: Escape cancels it before
+                // anything else Escape closes, since the field being edited
+                // is the innermost thing. The old name stays; nothing saves.
+                if self.workspace_rename.is_some()
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    return self.update(Event::WorkspaceRenameCancel);
+                }
+
                 // New workspace sheet: Escape closes
                 if self.new_work_sheet.is_some()
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
@@ -23602,13 +23693,6 @@ fi
                     if self.prs.ready_open {
                         return self.update(Event::Pr(PrEvent::ReadyListToggle));
                     }
-                }
-
-                // Inline workspace rename: Escape cancels
-                if self.workspace_rename.is_some()
-                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
-                {
-                    return self.update(Event::WorkspaceRenameCancel);
                 }
 
                 // Workspace settings: Escape closes
@@ -26288,8 +26372,8 @@ fi
             Event::ChatAddToWorkspaceToggle => {
                 self.chat_add_to_workspace_open = !self.chat_add_to_workspace_open;
             }
-            Event::ChatAddToWorkspace(root, uid) => {
-                return self.add_chat_to_workspace(&root, uid);
+            Event::ChatAddToWorkspace(root, chat, uid) => {
+                return self.add_chat_to_workspace(&root, &chat, uid);
             }
             Event::WorkspaceRenameStart(idx, site) => {
                 let Some(uid) = self.workspaces.get(idx).map(|ws| ws.uid) else {
@@ -29736,7 +29820,7 @@ fi
         if machine.is_none() {
             actions = actions.push(
                 button(text("Use macOS dialog…").size(font_small))
-                    .style(button::text)
+                    .style(self.ghost_button_style())
                     .padding([6, 12])
                     .on_press(Event::FolderPickerNativeDialog),
             );
@@ -30577,8 +30661,8 @@ fi
         card = card.push(
             row![
                 button(text("Open a folder as a repo workspace\u{2026}").size(font_small))
-                    .style(button::text)
-                    .padding([6, 0])
+                    .style(self.ghost_button_style())
+                    .padding([6, 12])
                     .on_press(Event::NewWorkOpenFolder),
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("Cancel").size(font_small))
@@ -30876,7 +30960,7 @@ fi
                 .padding([4, 10])
                 .on_press(Event::ParkedResume(key.clone())),
             button(text("Done").size(font_small))
-                .style(button::text)
+                .style(self.ghost_button_style())
                 .padding([4, 10])
                 .on_press(Event::ParkedDone(key)),
         ]
@@ -35014,7 +35098,8 @@ fi
             );
         }
 
-        // Focus: whose repos, branches and issues show below.
+        // Focus: which chats the Repos section's edits and branches and
+        // the Issues section are read for.
         if !summary.owned && !summary.coordinators.is_empty() {
             let focus_button = button(
                 row![
@@ -35080,7 +35165,11 @@ fi
                             ),
                             overview::Focus::AllRecent,
                         ))
-                        .push(text("or pick a chat below").size(10).color(text_muted)),
+                        .push(
+                            text("Repos and Issues show this work; or click a chat in Chats")
+                                .size(10)
+                                .color(text_muted),
+                        ),
                 );
             }
         }
@@ -39532,7 +39621,7 @@ fi
                 picker = picker.push(small_button(
                     ws.name.clone(),
                     color,
-                    Event::ChatAddToWorkspace(root.clone(), ws.uid),
+                    Event::ChatAddToWorkspace(root.clone(), entry.id.clone(), ws.uid),
                 ));
             }
             block = block.push(
@@ -46537,6 +46626,51 @@ mod tests {
         // A running parked one is never picked; else the last before.
         assert_eq!(next_on_bar(1, &[false, true, true]), Some(0));
         assert_eq!(next_on_bar(0, &[true, true]), None);
+    }
+
+    #[test]
+    fn add_to_workspace_moves_the_tab_hosting_the_chat_from_another_local_workspace() {
+        let hosts = |list: &[(bool, &[Option<&'static str>])]| {
+            list.iter()
+                .map(|(local, tabs)| (*local, tabs.to_vec()))
+                .collect::<Vec<_>>()
+        };
+        // Open in workspace 0, added to 2: tab 1 of workspace 0 moves.
+        let open_in_first = hosts(&[
+            (true, &[None, Some("chat")]),
+            (true, &[Some("other")]),
+            (true, &[None]),
+        ]);
+        assert_eq!(chat_tab_to_move(open_in_first, 2, "chat"), Some((0, 1)));
+        // Not open anywhere: nothing moves.
+        let not_open = hosts(&[(true, &[None]), (true, &[Some("other")])]);
+        assert_eq!(chat_tab_to_move(not_open, 1, "chat"), None);
+        // Already open in the target: nothing moves.
+        let in_target = hosts(&[(true, &[Some("chat")]), (true, &[Some("chat")])]);
+        assert_eq!(chat_tab_to_move(in_target, 1, "chat"), None);
+        // A tab in a workspace off this Mac stays; a local one moves.
+        let remote_first = hosts(&[
+            (false, &[Some("chat")]),
+            (true, &[None, None, Some("chat")]),
+            (true, &[]),
+        ]);
+        assert_eq!(chat_tab_to_move(remote_first, 2, "chat"), Some((1, 2)));
+        let only_remote = hosts(&[(false, &[Some("chat")]), (true, &[])]);
+        assert_eq!(chat_tab_to_move(only_remote, 1, "chat"), None);
+    }
+
+    #[test]
+    fn the_source_workspace_keeps_a_valid_active_tab_after_a_tab_leaves() {
+        // A tab before the active one leaves: the active one shifts down.
+        assert_eq!(active_tab_after_removal(3, 1, 3), 2);
+        // A tab after the active one leaves: unchanged.
+        assert_eq!(active_tab_after_removal(1, 2, 3), 1);
+        // The active tab leaves: the one after it takes its place...
+        assert_eq!(active_tab_after_removal(1, 1, 3), 1);
+        // ...else the last.
+        assert_eq!(active_tab_after_removal(2, 2, 2), 1);
+        // Its only tab left, after a plain one was pushed: that one.
+        assert_eq!(active_tab_after_removal(0, 0, 1), 0);
     }
 
     #[test]

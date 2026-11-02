@@ -1719,7 +1719,7 @@ impl App {
                         .font(mono)
                         .width(Length::Fill),
                     button(text(if parked { "Resume" } else { "Open" }).size(font_small - 1.0))
-                        .style(button::text)
+                        .style(self.ghost_button_style())
                         .padding([2, 8])
                         .on_press(Event::Pr(PrEvent::ReadyGo(home.clone()))),
                 ]
