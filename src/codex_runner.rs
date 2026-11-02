@@ -880,12 +880,15 @@ pub fn find_rollout(
     thread_id: &str,
     now: DateTime<Utc>,
 ) -> std::io::Result<Option<PathBuf>> {
+    // Step back calendar days, not 24-hour spans: a 25-hour day (the
+    // daylight saving change) would otherwise skip a local date.
+    let local_today = now.with_timezone(&Local).date_naive();
+    let utc_today = now.date_naive();
     let mut days: Vec<NaiveDate> = Vec::new();
     for offset in 0..ROLLOUT_SEARCH_DAYS {
-        let instant = now - Duration::days(offset);
         for day in [
-            instant.with_timezone(&Local).date_naive(),
-            instant.date_naive(),
+            local_today - Duration::days(offset),
+            utc_today - Duration::days(offset),
         ] {
             if !days.contains(&day) {
                 days.push(day);

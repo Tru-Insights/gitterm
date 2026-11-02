@@ -7041,6 +7041,8 @@ struct App {
     needs_you_notifier: NeedsYouNotifier,
     /// `notifications` from settings.json, written back on save.
     notifications_config: config::NotificationsConfig,
+    /// `pr_watch` from settings.json (TRU-197), written back on save.
+    pr_watch_config: config::PrWatchConfig,
     // Track modifier state for filtering terminal writes
     current_modifiers: Modifiers,
     // Help modal
@@ -8562,6 +8564,7 @@ impl App {
             policy: self.model_policy.clone(),
             usage: self.usage_config.clone(),
             notifications: self.notifications_config.clone(),
+            pr_watch: self.pr_watch_config.clone(),
         };
         if let Err(error) = config.save() {
             eprintln!("[settings] cannot save the settings: {error}");
@@ -17360,6 +17363,7 @@ impl App {
             attention_pulse_bright: false,
             needs_you_notifier: NeedsYouNotifier::new(Instant::now()),
             notifications_config: config.notifications.clone(),
+            pr_watch_config: config.pr_watch.clone(),
             current_modifiers: Modifiers::empty(),
             show_help: false,
             workspace_settings_open: false,
@@ -20838,6 +20842,8 @@ fi
                 tasks.push(self.poll_work_documents());
                 // The PR watch (TRU-173): one background poll when PRs are due.
                 tasks.push(self.poll_pr_watch());
+                // Its actionable news, to idle coordinators (TRU-197).
+                tasks.push(self.auto_tell_coordinators());
                 // Closed tabs release their browser targets (TRU-176).
                 tasks.push(self.sync_browser_owners());
                 let workspace_dirty = false;
