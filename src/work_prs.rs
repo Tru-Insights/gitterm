@@ -29,7 +29,7 @@
 use super::*;
 
 use gitterm::merge_plan::{
-    self, MergeMethod, MergePlan, OrderedRow, PrBrief, PrKey, PrRef, RowStatus,
+    self, MergeMethod, MergePlan, OrderedRow, PrBrief, PrKey, PrRef, PrState, RowStatus,
 };
 use gitterm::pr_watch::{self, NewsItem, NewsKind, PrAction, WatchedPr};
 use gitterm::task_mcp::MergePlanSetRequest;
@@ -148,6 +148,36 @@ pub enum PrEvent {
     NewsTell(String, String, String),
     ReadyListToggle,
     ReadyGo(PrHome),
+    /// Fold or expand a root's merged and closed PRs: root chat.
+    DoneToggle(String),
+}
+
+/// Splits `keys` into the open ones (state unknown counts as open) and the
+/// done ones with their final state, keeping order.
+fn split_done<K>(
+    keys: Vec<K>,
+    state_of: impl Fn(&K) -> Option<PrState>,
+) -> (Vec<K>, Vec<(K, PrState)>) {
+    let mut open = Vec::new();
+    let mut done = Vec::new();
+    for key in keys {
+        match state_of(&key) {
+            Some(state) if state.is_final() => done.push((key, state)),
+            _ => open.push(key),
+        }
+    }
+    (open, done)
+}
+
+/// The fold line for done PRs: "\u{2713} 3 merged" or with "n closed".
+fn done_summary(done: &[PrState]) -> String {
+    let merged = done.iter().filter(|s| **s == PrState::Merged).count();
+    let closed = done.iter().filter(|s| **s == PrState::Closed).count();
+    match (merged, closed) {
+        (m, 0) => format!("\u{2713} {m} merged"),
+        (0, c) => format!("\u{2713} {c} closed"),
+        (m, c) => format!("\u{2713} {m} merged \u{00B7} {c} closed"),
+    }
 }
 
 /// Everything the app keeps for PRs.
@@ -171,6 +201,8 @@ pub struct PrsState {
     pub live_prs: HashMap<String, Vec<PrRef>>,
     pub action: Option<PrActionConfirm>,
     pub ready_open: bool,
+    /// Roots whose merged and closed PRs are expanded (not persisted).
+    pub done_open: HashSet<String>,
     /// The index was asked for once for the watch.
     pub index_requested: bool,
 }
@@ -878,6 +910,11 @@ impl App {
                 }
             }
             PrEvent::NewsTell(root, pr, news) => return self.tell_coordinator(&root, &pr, &news),
+            PrEvent::DoneToggle(root) => {
+                if !self.prs.done_open.remove(&root) {
+                    self.prs.done_open.insert(root);
+                }
+            }
             PrEvent::ReadyListToggle => {
                 self.prs.ready_open = !self.prs.ready_open;
                 return self.apply_webview_surfaces();
@@ -1484,21 +1521,64 @@ impl App {
         let briefs = self.pr_briefs();
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
-        type Group<'g> = (&'g RootPrs, Vec<OrderedRow>, Vec<PrKey>);
+        struct Group<'g> {
+            root: &'g RootPrs,
+            rows: Vec<OrderedRow>,
+            unplanned: Vec<PrKey>,
+            done: Vec<(PrKey, PrState)>,
+            done_rows: Vec<OrderedRow>,
+            /// The plan lists PRs, finished ones included.
+            planned: bool,
+        }
+        let now = chrono::Utc::now();
+        let shown = |key: &PrKey| {
+            self.watched(key)
+                .is_none_or(|w| pr_watch::done_pr_shown(w.done_at(), now))
+        };
+        let state_of = |key: &PrKey| self.watched(key).and_then(|w| w.snapshot.state());
         let groups: Vec<Group<'_>> = roots
             .iter()
             .filter_map(|root| {
                 let plan = self.prs.plans.get(&root.root);
-                let rows = plan
+                let all_rows = plan
                     .map(|plan| merge_plan::order_plan(plan, &briefs))
                     .unwrap_or_default();
-                let unplanned: Vec<PrKey> = root
+                let all_unplanned: Vec<PrKey> = root
                     .facts
                     .iter()
                     .map(PrRef::key)
                     .filter(|key| plan.is_none_or(|plan| plan.entry(key).is_none()))
                     .collect();
-                (!rows.is_empty() || !unplanned.is_empty()).then_some((root, rows, unplanned))
+                if all_rows.is_empty() && all_unplanned.is_empty() {
+                    return None;
+                }
+                let (rows, done_rows): (Vec<_>, Vec<_>) = all_rows
+                    .into_iter()
+                    .partition(|row| !state_of(&row.entry.key()).is_some_and(PrState::is_final));
+                let planned = !rows.is_empty() || !done_rows.is_empty();
+                let (unplanned, mut done) = split_done(all_unplanned, state_of);
+                for row in &done_rows {
+                    if let Some(state) = state_of(&row.entry.key()) {
+                        done.push((row.entry.key(), state));
+                    }
+                }
+                // Done PRs older than a day leave the section entirely.
+                done.retain(|(key, _)| shown(key));
+                let done_rows: Vec<OrderedRow> = done_rows
+                    .into_iter()
+                    .filter(|row| shown(&row.entry.key()))
+                    .collect();
+                if rows.is_empty() && unplanned.is_empty() && done.is_empty() {
+                    return None;
+                }
+                Some(Group {
+                    root,
+                    rows,
+                    unplanned,
+                    done,
+                    done_rows,
+                    planned,
+                })
             })
             .collect();
         if groups.is_empty() {
@@ -1506,7 +1586,7 @@ impl App {
         }
         let total: usize = groups
             .iter()
-            .map(|(_, rows, more)| rows.len() + more.len())
+            .map(|g| g.rows.len() + g.unplanned.len())
             .sum();
         let mut section = Column::new().spacing(4).push(
             text(format!("PRS \u{00B7} MERGE ORDER \u{00B7} {total}"))
@@ -1515,7 +1595,15 @@ impl App {
                 .font(mono),
         );
         let several = groups.len() > 1;
-        for (root, rows, unplanned) in groups {
+        for group in groups {
+            let Group {
+                root,
+                rows,
+                unplanned,
+                done,
+                done_rows,
+                planned,
+            } = group;
             if several {
                 section = section.push(
                     text(overview::shorten(&root.title, 50))
@@ -1523,7 +1611,7 @@ impl App {
                         .color(theme.text_secondary()),
                 );
             }
-            if rows.is_empty() {
+            if !planned {
                 section = section.push(
                     text("no merge plan yet; the coordinator sets one with merge_plan_set")
                         .size(10)
@@ -1543,6 +1631,32 @@ impl App {
             }
             for key in &unplanned {
                 section = section.push(self.view_pr_row(&root.root, key, None));
+            }
+            if !done.is_empty() {
+                let states: Vec<PrState> = done.iter().map(|(_, state)| *state).collect();
+                section = section.push(
+                    button(
+                        text(done_summary(&states))
+                            .size(10)
+                            .color(theme.text_muted())
+                            .font(mono),
+                    )
+                    .style(self.ghost_button_style())
+                    .padding([2, 4])
+                    .on_press(Event::Pr(PrEvent::DoneToggle(root.root.clone()))),
+                );
+                if self.prs.done_open.contains(&root.root) {
+                    for row in &done_rows {
+                        section =
+                            section.push(self.view_pr_row(&root.root, &row.entry.key(), Some(row)));
+                    }
+                    for (key, _) in done
+                        .iter()
+                        .filter(|(key, _)| !done_rows.iter().any(|r| r.entry.key() == *key))
+                    {
+                        section = section.push(self.view_pr_row(&root.root, key, None));
+                    }
+                }
             }
         }
         Some(section.into())
@@ -1835,6 +1949,31 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_done_keeps_open_and_unknown_apart_from_final() {
+        let states = |k: &&str| match *k {
+            "a" => Some(PrState::Open),
+            "b" => Some(PrState::Merged),
+            "c" => Some(PrState::Closed),
+            "d" => Some(PrState::Draft),
+            _ => None,
+        };
+        let (open, done) = split_done(vec!["a", "b", "c", "d", "e"], states);
+        assert_eq!(open, vec!["a", "d", "e"]);
+        assert_eq!(done, vec![("b", PrState::Merged), ("c", PrState::Closed)]);
+    }
+
+    #[test]
+    fn done_summary_names_merged_and_closed() {
+        use PrState::{Closed, Merged};
+        assert_eq!(done_summary(&[Merged, Merged]), "\u{2713} 2 merged");
+        assert_eq!(
+            done_summary(&[Merged, Closed]),
+            "\u{2713} 1 merged \u{00B7} 1 closed"
+        );
+        assert_eq!(done_summary(&[Closed]), "\u{2713} 1 closed");
+    }
+
     use super::*;
 
     fn confirming(key: &PrKey) -> PrsState {

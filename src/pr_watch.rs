@@ -54,6 +54,9 @@ const NEWS_KEPT: usize = 20;
 /// and by then it is likely stale or already seen on the chip; "Tell
 /// coordinator" still sends it.
 pub const AUTO_TELL_MAX_AGE: Duration = Duration::from_secs(2 * 3600);
+/// How long a merged or closed PR stays in the PRs section (folded) after
+/// it finished.
+pub const DONE_PR_SHOWN_FOR: Duration = Duration::from_secs(24 * 3600);
 /// Items read per list endpoint (one page).
 const PAGE: &str = "per_page=100";
 
@@ -317,6 +320,18 @@ pub fn tells_by_itself(item: &NewsItem) -> bool {
     }
 }
 
+/// Whether a PR that finished at `done_at` is still shown at `now`: within
+/// [`DONE_PR_SHOWN_FOR`]. An unknown or unreadable time stays shown rather
+/// than silently dropping the PR.
+pub fn done_pr_shown(done_at: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(at) = done_at.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()) else {
+        return true;
+    };
+    now.signed_duration_since(at.with_timezone(&chrono::Utc))
+        .to_std()
+        .map_or(true, |age| age < DONE_PR_SHOWN_FOR)
+}
+
 /// Whether `item` of `watched` is sent to the coordinator by itself at
 /// `now`: actionable, not told or dismissed, newer than
 /// [`AUTO_TELL_MAX_AGE`], and still true of the PR's latest read (open; a
@@ -536,6 +551,21 @@ impl WatchedPr {
         self.snapshot.state().is_some_and(PrState::is_final)
     }
 
+    /// When the PR finished: the `at` of its Merged / Closed news if it has
+    /// one, else the last read (a done PR is no longer polled, so that is
+    /// when the watch saw it done). `None` while it is not done.
+    pub fn done_at(&self) -> Option<&str> {
+        if !self.done() {
+            return None;
+        }
+        self.news
+            .iter()
+            .rev()
+            .find(|item| matches!(item.kind, NewsKind::Merged | NewsKind::Closed))
+            .map(|item| item.at.as_str())
+            .or(self.checked_at.as_deref())
+    }
+
     /// Whether a poll is due after `interval` at `now`.
     pub fn due(&self, interval: Duration, now: chrono::DateTime<chrono::Utc>) -> bool {
         if self.done() {
@@ -561,9 +591,14 @@ impl WatchedPr {
         })
     }
 
-    /// News not dismissed, newest first.
+    /// News not dismissed, newest first. A merged or closed PR has none:
+    /// its news is settled, though the stored items stay as they are.
     pub fn open_news(&self) -> impl Iterator<Item = &NewsItem> {
-        self.news.iter().rev().filter(|item| !item.dismissed)
+        let done = self.done();
+        self.news
+            .iter()
+            .rev()
+            .filter(move |item| !done && !item.dismissed)
     }
 
     /// Takes a fetched snapshot at `at` for user `me` and returns the news
@@ -1551,6 +1586,48 @@ mod tests {
             told: false,
             approvals_only: false,
         }
+    }
+
+    #[test]
+    fn news_is_settled_once_the_pr_is_done() {
+        let mut pr = WatchedPr::new(PrKey::new("acme/api", 12));
+        pr.news.push(news(NewsKind::ChecksFailed, "a", "t1"));
+        pr.news.push(news(NewsKind::NewActivity, "b", "t2"));
+        pr.news[0].dismissed = true;
+        pr.snapshot = snapshot(PrState::Open, "a1", Vec::new());
+        assert_eq!(pr.open_news().count(), 1);
+        for state in [PrState::Merged, PrState::Closed] {
+            pr.snapshot = snapshot(state, "a1", Vec::new());
+            assert_eq!(pr.open_news().count(), 0);
+        }
+        // Stored news is left as it was.
+        assert_eq!(pr.news.len(), 2);
+        assert!(!pr.news[1].dismissed);
+    }
+
+    #[test]
+    fn done_prs_are_shown_for_a_day() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(done_pr_shown(Some("2026-11-01T13:00:00Z"), now));
+        assert!(!done_pr_shown(Some("2026-11-01T12:00:00Z"), now));
+        assert!(!done_pr_shown(Some("2026-10-20T12:00:00Z"), now));
+        // Unknown or unreadable: kept, not dropped.
+        assert!(done_pr_shown(None, now));
+        assert!(done_pr_shown(Some("garbage"), now));
+    }
+
+    #[test]
+    fn done_at_prefers_the_merged_news_then_the_last_read() {
+        let mut pr = WatchedPr::new(PrKey::new("acme/api", 12));
+        pr.checked_at = Some("t9".to_string());
+        pr.snapshot = snapshot(PrState::Open, "a1", Vec::new());
+        assert_eq!(pr.done_at(), None);
+        pr.snapshot = snapshot(PrState::Merged, "a1", Vec::new());
+        assert_eq!(pr.done_at(), Some("t9"));
+        pr.news.push(news(NewsKind::Merged, "merged", "t5"));
+        assert_eq!(pr.done_at(), Some("t5"));
     }
 
     #[test]
