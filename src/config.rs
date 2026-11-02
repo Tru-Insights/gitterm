@@ -973,6 +973,18 @@ mod tests {
     }
 
     #[test]
+    fn pr_watch_auto_tell_defaults_on_and_can_be_switched_off() {
+        let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(config.pr_watch.auto_tell);
+        let config: Config = serde_json::from_str(r#"{"theme":"dark","pr_watch":{}}"#).unwrap();
+        assert!(config.pr_watch.auto_tell);
+        let config: Config =
+            serde_json::from_str(r#"{"theme":"dark","pr_watch":{"auto_tell":false}}"#).unwrap();
+        assert!(!config.pr_watch.auto_tell);
+        assert!(Config::default().pr_watch.auto_tell);
+    }
+
+    #[test]
     fn new_chats_use_the_defaults_until_something_is_picked() {
         // An older config without `chat` gets the defaults.
         let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
@@ -1265,6 +1277,31 @@ pub struct Config {
     /// macOS notifications (TRU-148).
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    /// The PR watch (TRU-197).
+    #[serde(default)]
+    pub pr_watch: PrWatchConfig,
+}
+
+/// The PR watch (TRU-197). Edit the `pr_watch` object in `settings.json`:
+///
+/// ```json
+/// "pr_watch": { "auto_tell": true }
+/// ```
+///
+/// `auto_tell`: send actionable PR news (merge conflicts, failed checks,
+/// review comments, changes requested) to the coordinator's open chat by
+/// itself when its turn is idle. Off, news only shows on the overview and
+/// the chip, and "Tell coordinator" sends it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrWatchConfig {
+    #[serde(default = "default_true")]
+    pub auto_tell: bool,
+}
+
+impl Default for PrWatchConfig {
+    fn default() -> Self {
+        Self { auto_tell: true }
+    }
 }
 
 /// Which macOS notifications GitTerm posts (TRU-148). Edit the
@@ -1564,6 +1601,7 @@ impl Default for Config {
             policy: gitterm::workers::ModelPolicy::default(),
             usage: gitterm::usage::UsageConfig::default(),
             notifications: NotificationsConfig::default(),
+            pr_watch: PrWatchConfig::default(),
         }
     }
 }

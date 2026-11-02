@@ -11,8 +11,20 @@
 //! root's plan entries and the PRs its chats' facts recorded. Open
 //! workspaces' PRs are due every `pr_watch::OPEN_INTERVAL`, parked ones'
 //! every `pr_watch::PARKED_INTERVAL`; a merged or closed PR is never read
-//! again. News is notify only: nothing wakes a coordinator; "Tell
-//! coordinator" sends one prompt when the user presses it.
+//! again.
+//!
+//! Actionable news tells the coordinator by itself (TRU-197): merge
+//! conflicts (once settled, `pr_watch::conflict_settled`), failed checks,
+//! review comments and changes requested (`pr_watch::tells_by_itself`).
+//! [`App::auto_tell_coordinators`] sends it from `Tick` to the root's chat
+//! tab only while that tab's turn is idle (not `Streaming`), all of a
+//! root's pending items as one prompt, one line each, and marks them told.
+//! A coordinator not open in a chat tab gets nothing; its news waits, and
+//! goes once the chat opens idle if it is younger than
+//! `pr_watch::AUTO_TELL_MAX_AGE` and still holds. Informational news
+//! (checks passed, merged, closed, approvals) only shows on the list and
+//! the chip. "Tell coordinator" still sends any one item when pressed, and
+//! `pr_watch.auto_tell: false` in settings.json turns the rest off.
 
 use super::*;
 
@@ -30,8 +42,38 @@ const PR_HOMES_FRESH: Duration = Duration::from_secs(30);
 const PR_POLL_MAX_ITEMS: usize = 25;
 /// A PR no workspace lists is forgotten this long after its last read.
 const PR_FORGET_AFTER: Duration = Duration::from_secs(30 * 24 * 3600);
-/// Prefix of the prompt "Tell coordinator" sends.
+/// Prefix of every line of a prompt that tells the coordinator news.
 const TELL_PREFIX: &str = "GitTerm PR watch";
+
+/// One news line for the coordinator: the PR, its title, the news, its URL.
+fn news_line(watched: &WatchedPr, item: &NewsItem) -> String {
+    let (title, url) = watched
+        .snapshot
+        .core
+        .as_ref()
+        .map(|core| (core.title.clone(), core.url.clone()))
+        .unwrap_or_default();
+    let url = if url.is_empty() {
+        watched.key.url()
+    } else {
+        url
+    };
+    let title = if title.is_empty() {
+        String::new()
+    } else {
+        format!(" \"{}\"", overview::shorten(&title, 80))
+    };
+    format!(
+        "{TELL_PREFIX}: {}{title}: {}. {url}",
+        watched.key.label(),
+        item.text
+    )
+}
+
+/// The prompt that tells a coordinator its news: one line per item.
+fn tell_prompt(lines: &[String]) -> String {
+    lines.join("\n")
+}
 
 /// Where a PR's work lives.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -974,27 +1016,7 @@ impl App {
         let Some(item) = watched.news.iter().find(|item| item.key == news) else {
             return Task::none();
         };
-        let (title, url) = watched
-            .snapshot
-            .core
-            .as_ref()
-            .map(|core| (core.title.clone(), core.url.clone()))
-            .unwrap_or_default();
-        let url = if url.is_empty() {
-            watched.key.url()
-        } else {
-            url
-        };
-        let title = if title.is_empty() {
-            String::new()
-        } else {
-            format!(" \"{}\"", overview::shorten(&title, 80))
-        };
-        let prompt = format!(
-            "{TELL_PREFIX}: {}{title}: {}. {url}",
-            watched.key.label(),
-            item.text
-        );
+        let prompt = tell_prompt(&[news_line(watched, item)]);
         if let Some(item) = self.news_item_mut(pr, news) {
             item.told = true;
         }
@@ -1004,6 +1026,80 @@ impl App {
             save,
             Task::done(Event::AgentSubmitPrompt(tab_id, prompt.into())),
         ])
+    }
+
+    /// Whether chat tab `tab_id` is mid-turn: the state the chat strip's
+    /// running marker and held delegation sends go by.
+    fn chat_turn_running(&self, tab_id: usize) -> bool {
+        self.workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.agent_session())
+            .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming))
+    }
+
+    /// From `Tick` (TRU-197): each root chat with news due by itself
+    /// ([`pr_watch::auto_tell_due`]) whose coordinator is open in a chat
+    /// tab and idle gets one prompt, one line per item, oldest first, and
+    /// the items are marked told. A busy coordinator gets it on the first
+    /// tick after its turn ends; a closed one keeps its news (the line says
+    /// why) until it opens.
+    pub(super) fn auto_tell_coordinators(&mut self) -> Task<Event> {
+        if !self.pr_watch_config.auto_tell {
+            return Task::none();
+        }
+        let now = chrono::Utc::now();
+        // Root -> (at, PR id, news key, line).
+        let mut due: HashMap<String, Vec<(String, String, String, String)>> = HashMap::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for (_, roots) in &self.prs.homes {
+            for (root, key) in self.keys_of_roots(roots) {
+                let Some(watched) = self.watched(&key) else {
+                    continue;
+                };
+                for item in &watched.news {
+                    if !pr_watch::auto_tell_due(watched, item, now)
+                        || !seen.insert((key.id(), item.key.clone()))
+                    {
+                        continue;
+                    }
+                    due.entry(root.clone()).or_default().push((
+                        item.at.clone(),
+                        key.id(),
+                        item.key.clone(),
+                        news_line(watched, item),
+                    ));
+                }
+            }
+        }
+        let mut tasks: Vec<Task<Event>> = Vec::new();
+        for (root, mut items) in due {
+            let Ok(tab_id) = self.coordinator_tab(&root) else {
+                continue;
+            };
+            if self.chat_turn_running(tab_id) {
+                continue;
+            }
+            items.sort_by(|a, b| a.0.cmp(&b.0));
+            let lines: Vec<String> = items.iter().map(|(_, _, _, line)| line.clone()).collect();
+            for (_, pr, news, _) in &items {
+                if let Some(item) = self.news_item_mut(pr, news) {
+                    item.told = true;
+                }
+            }
+            let prompt = tell_prompt(&lines);
+            eprintln!(
+                "[pr-watch] told coordinator {root} by itself ({} item(s)): {prompt}",
+                lines.len()
+            );
+            tasks.push(Task::done(Event::AgentSubmitPrompt(tab_id, prompt.into())));
+        }
+        if tasks.is_empty() {
+            return Task::none();
+        }
+        tasks.push(self.save_pr_watch());
+        Task::batch(tasks)
     }
 
     // -----------------------------------------------------------------------
@@ -1774,6 +1870,59 @@ mod tests {
         assert!(!confirm.running);
         assert_eq!(confirm.error.as_deref(), Some("not mergeable"));
         assert!(prs.due_now.contains(&key.id()));
+    }
+
+    #[test]
+    fn news_for_a_coordinator_is_one_line_per_item() {
+        let mut watched = WatchedPr::new(PrKey::new("acme/api", 12));
+        watched.snapshot.core = Some(pr_watch::PullCore {
+            title: "PRJ-101: add the export".to_string(),
+            url: "https://github.com/acme/api/pull/12".to_string(),
+            ..pr_watch::PullCore::default()
+        });
+        let item = |key: &str, kind, text: &str| NewsItem {
+            key: key.to_string(),
+            kind,
+            text: text.to_string(),
+            at: "2026-11-01T12:00:00Z".to_string(),
+            dismissed: false,
+            told: false,
+            approvals_only: false,
+        };
+        let failed = item(
+            "checks_failed:a1",
+            NewsKind::ChecksFailed,
+            "checks failed: test",
+        );
+        let conflict = item(
+            "conflicting:a1",
+            NewsKind::Conflicting,
+            "has merge conflicts",
+        );
+        // One item: the line "Tell coordinator" has always sent.
+        assert_eq!(
+            tell_prompt(&[news_line(&watched, &failed)]),
+            "GitTerm PR watch: acme/api#12 \"PRJ-101: add the export\": checks failed: test. \
+             https://github.com/acme/api/pull/12"
+        );
+        // Several: one prompt, a line each. A PR without a read yet falls
+        // back to its URL and no title.
+        let unread = WatchedPr::new(PrKey::new("acme/web", 3));
+        assert_eq!(
+            tell_prompt(&[
+                news_line(&watched, &failed),
+                news_line(&watched, &conflict),
+                news_line(&unread, &conflict),
+            ]),
+            format!(
+                "GitTerm PR watch: acme/api#12 \"PRJ-101: add the export\": checks failed: test. \
+                 https://github.com/acme/api/pull/12\n\
+                 GitTerm PR watch: acme/api#12 \"PRJ-101: add the export\": has merge conflicts. \
+                 https://github.com/acme/api/pull/12\n\
+                 GitTerm PR watch: acme/web#3: has merge conflicts. {}",
+                PrKey::new("acme/web", 3).url()
+            )
+        );
     }
 
     #[test]

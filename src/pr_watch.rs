@@ -1,5 +1,6 @@
 //! The PR watch (TRU-173): live state of the PRs a piece of work produced,
-//! and news about them, notify only.
+//! and news about them. Actionable news ([`tells_by_itself`]) also goes to
+//! the coordinator by itself (TRU-197); [`auto_tell_due`] decides which.
 //!
 //! One background poller in the app (never in `update()`, applied by
 //! event) asks [`poll`] for the PRs that are due: every PR in a plan or in
@@ -15,7 +16,8 @@
 //!
 //! News ([`NewsKind`]) is the difference between two snapshots, each item
 //! keyed so it is reported once ([`WatchedPr::absorb`]); the first snapshot
-//! of a PR is the baseline and reports nothing.
+//! of a PR is the baseline and reports nothing. A merge conflict is news
+//! only once it is settled ([`conflict_settled`]).
 //!
 //! Commands run as the GitHub account the config maps the repo owner to
 //! (`github_accounts`), with `GH_TOKEN` from `gh auth token --user <user>`
@@ -47,6 +49,11 @@ pub const POLL_DEADLINE: Duration = Duration::from_secs(90);
 pub const STATE_FILE_NAME: &str = "pr-watch.json";
 /// News kept per PR, newest last.
 const NEWS_KEPT: usize = 20;
+/// Actionable news older than this is not sent to the coordinator by
+/// itself (TRU-197): it waited for a chat that was closed or busy that long,
+/// and by then it is likely stale or already seen on the chip; "Tell
+/// coordinator" still sends it.
+pub const AUTO_TELL_MAX_AGE: Duration = Duration::from_secs(2 * 3600);
 /// Items read per list endpoint (one page).
 const PAGE: &str = "per_page=100";
 
@@ -290,9 +297,78 @@ pub struct NewsItem {
     pub at: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dismissed: bool,
-    /// Sent to the coordinator with "Tell coordinator".
+    /// Sent to the coordinator, by "Tell coordinator" or by itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub told: bool,
+    /// [`NewsKind::NewActivity`] that is approvals only: informational.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approvals_only: bool,
+}
+
+/// Whether news of this kind goes to the coordinator by itself (TRU-197):
+/// what it must act on (conflicts, failed checks, review comments, changes
+/// requested). Passed checks, merged, closed and approvals only update the
+/// list and the chip.
+pub fn tells_by_itself(item: &NewsItem) -> bool {
+    match item.kind {
+        NewsKind::Conflicting | NewsKind::ChecksFailed => true,
+        NewsKind::NewActivity => !item.approvals_only,
+        NewsKind::RequiredChecksPassed | NewsKind::Merged | NewsKind::Closed => false,
+    }
+}
+
+/// Whether `item` of `watched` is sent to the coordinator by itself at
+/// `now`: actionable, not told or dismissed, newer than
+/// [`AUTO_TELL_MAX_AGE`], and still true of the PR's latest read (open; a
+/// failure or conflict still on its head commit), so a resolved condition
+/// is never sent late.
+pub fn auto_tell_due(
+    watched: &WatchedPr,
+    item: &NewsItem,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if item.told || item.dismissed || !tells_by_itself(item) || watched.done() {
+        return false;
+    }
+    let Some(at) = chrono::DateTime::parse_from_rfc3339(&item.at).ok() else {
+        return false;
+    };
+    let fresh = now
+        .signed_duration_since(at.with_timezone(&chrono::Utc))
+        .to_std()
+        .map_or(true, |age| age < AUTO_TELL_MAX_AGE);
+    if !fresh {
+        return false;
+    }
+    let snapshot = &watched.snapshot;
+    let head = snapshot
+        .core
+        .as_ref()
+        .map(|core| core.head_sha.as_str())
+        .unwrap_or_default();
+    match item.kind {
+        NewsKind::ChecksFailed => {
+            item.key == format!("checks_failed:{head}") && snapshot.checks() == ChecksState::Fail
+        }
+        NewsKind::Conflicting => {
+            item.key == format!("conflicting:{head}") && snapshot.conflicting() == Some(true)
+        }
+        _ => true,
+    }
+}
+
+/// Whether a merge conflict in `next` is settled: GitHub reported it on the
+/// read before as well, for the same head commit and base branch. GitHub
+/// reports "dirty" or not mergeable for a while as it recomputes after a
+/// merge lower in a stack, so one read is not enough to call it a conflict.
+pub fn conflict_settled(previous: &PrSnapshot, next: &PrSnapshot) -> bool {
+    let (Some(was), Some(now)) = (previous.core.as_ref(), next.core.as_ref()) else {
+        return false;
+    };
+    previous.conflicting() == Some(true)
+        && next.conflicting() == Some(true)
+        && was.head_sha == now.head_sha
+        && was.base_ref == now.base_ref
 }
 
 /// The news between `previous` and `next` as `(key, kind, text)`, given the
@@ -341,7 +417,10 @@ pub fn news_between(
             ));
         }
     }
-    if still_open && next.conflicting() == Some(true) {
+    // A baseline read (no previous core) reports nothing, but records the
+    // conflict it shows so it is not news on the next read.
+    let settled = previous.core.is_none() || conflict_settled(previous, next);
+    if still_open && next.conflicting() == Some(true) && settled {
         out.push((
             format!("conflicting:{sha}"),
             NewsKind::Conflicting,
@@ -493,13 +572,18 @@ impl WatchedPr {
     pub fn absorb(&mut self, fetched: Fetched, me: &str, at: &str) -> Vec<NewsItem> {
         let baseline = self.snapshot.core.is_none();
         let found = news_between(&self.snapshot, &fetched.snapshot, me);
-        let fresh_activity = {
+        let (fresh_activity, approvals_only) = {
             let known: BTreeSet<&str> = self.snapshot.activity().map(|a| a.id.as_str()).collect();
-            fetched
+            let fresh: Vec<&Activity> = fetched
                 .snapshot
                 .activity()
                 .filter(|a| !known.contains(a.id.as_str()) && !a.author.eq_ignore_ascii_case(me))
-                .count() as u32
+                .collect();
+            let approvals_only = !fresh.is_empty()
+                && fresh
+                    .iter()
+                    .all(|a| a.id.starts_with("review:") && a.review_state == "APPROVED");
+            (fresh.len() as u32, approvals_only)
         };
         self.snapshot = fetched.snapshot;
         self.etags = fetched.etags;
@@ -517,6 +601,7 @@ impl WatchedPr {
                 at: at.to_string(),
                 dismissed: false,
                 told: false,
+                approvals_only: kind == NewsKind::NewActivity && approvals_only,
             };
             self.news.push(item.clone());
             added.push(item);
@@ -1377,19 +1462,20 @@ mod tests {
             .absorb(fetched(commented.clone()), "dev", "t11")
             .is_empty());
 
-        // Conflicts, then merged; merged stops the watch.
+        // Conflicts, news on the second read that shows them, then
+        // merged; merged stops the watch.
         let mut conflicting = commented.clone();
         if let Some(core) = conflicting.core.as_mut() {
             core.mergeable = Some(false);
             core.mergeable_state = "dirty".to_string();
         }
+        assert!(pr
+            .absorb(fetched(conflicting.clone()), "dev", "t12")
+            .is_empty());
         assert_eq!(
-            kinds(&pr.absorb(fetched(conflicting.clone()), "dev", "t12")),
+            kinds(&pr.absorb(fetched(conflicting.clone()), "dev", "t13")),
             vec![NewsKind::Conflicting]
         );
-        assert!(pr
-            .absorb(fetched(conflicting.clone()), "dev", "t13")
-            .is_empty());
         let mut merged = conflicting;
         if let Some(core) = merged.core.as_mut() {
             core.state = Some(PrState::Merged);
@@ -1402,6 +1488,158 @@ mod tests {
         assert!(!pr.due(Duration::ZERO, chrono::Utc::now()));
         assert!(pr.absorb(fetched(merged), "dev", "t15").is_empty());
         assert_eq!(pr.news.len(), 6);
+    }
+
+    fn dirty(mut snapshot: PrSnapshot) -> PrSnapshot {
+        if let Some(core) = snapshot.core.as_mut() {
+            core.mergeable = Some(false);
+            core.mergeable_state = "dirty".to_string();
+        }
+        snapshot
+    }
+
+    #[test]
+    fn a_conflict_is_settled_only_on_two_reads_of_the_same_head_and_base() {
+        let clean = snapshot(PrState::Open, "a1", Vec::new());
+        let conflicting = dirty(clean.clone());
+        // One read after a clean one: GitHub may still be recomputing.
+        assert!(!conflict_settled(&clean, &conflicting));
+        assert!(conflict_settled(&conflicting, &conflicting));
+        // Still computing in between: not two conflicting reads.
+        let mut computing = clean.clone();
+        if let Some(core) = computing.core.as_mut() {
+            core.mergeable = None;
+            core.mergeable_state = "unknown".to_string();
+        }
+        assert!(!conflict_settled(&computing, &conflicting));
+        // Clean again: not a conflict at all.
+        assert!(!conflict_settled(&conflicting, &clean));
+        // A new head commit or a retargeted base starts over.
+        let pushed = dirty(snapshot(PrState::Open, "b2", Vec::new()));
+        assert!(!conflict_settled(&conflicting, &pushed));
+        let mut retargeted = conflicting.clone();
+        if let Some(core) = retargeted.core.as_mut() {
+            core.base_ref = "release".to_string();
+        }
+        assert!(!conflict_settled(&conflicting, &retargeted));
+        // No previous read: nothing to compare.
+        assert!(!conflict_settled(&PrSnapshot::default(), &conflicting));
+
+        // Through the watch: a transient conflict that clears is never news.
+        let mut pr = WatchedPr::new(PrKey::new("acme/api", 12));
+        assert!(pr.absorb(fetched(clean.clone()), "dev", "t1").is_empty());
+        assert!(pr
+            .absorb(fetched(conflicting.clone()), "dev", "t2")
+            .is_empty());
+        assert!(pr.absorb(fetched(clean.clone()), "dev", "t3").is_empty());
+        assert!(pr.news.is_empty());
+        // A conflict the baseline already showed is not news later either.
+        let mut pr = WatchedPr::new(PrKey::new("acme/api", 13));
+        assert!(pr
+            .absorb(fetched(conflicting.clone()), "dev", "t1")
+            .is_empty());
+        assert!(pr.absorb(fetched(conflicting), "dev", "t2").is_empty());
+    }
+
+    fn news(kind: NewsKind, key: &str, at: &str) -> NewsItem {
+        NewsItem {
+            key: key.to_string(),
+            kind,
+            text: "text".to_string(),
+            at: at.to_string(),
+            dismissed: false,
+            told: false,
+            approvals_only: false,
+        }
+    }
+
+    #[test]
+    fn only_actionable_kinds_tell_the_coordinator_by_themselves() {
+        let tells = |kind| tells_by_itself(&news(kind, "k", "t"));
+        assert!(tells(NewsKind::Conflicting));
+        assert!(tells(NewsKind::ChecksFailed));
+        assert!(tells(NewsKind::NewActivity));
+        assert!(!tells(NewsKind::RequiredChecksPassed));
+        assert!(!tells(NewsKind::Merged));
+        assert!(!tells(NewsKind::Closed));
+        let mut approved = news(NewsKind::NewActivity, "activity:review:1", "t");
+        approved.approvals_only = true;
+        assert!(!tells_by_itself(&approved));
+    }
+
+    #[test]
+    fn activity_that_is_approvals_only_is_marked_so() {
+        let mut pr = WatchedPr::new(PrKey::new("acme/api", 12));
+        let mut s = snapshot(PrState::Open, "a1", Vec::new());
+        pr.absorb(fetched(s.clone()), "dev", "t1");
+        let review = |id: &str, state: &str| Activity {
+            id: id.to_string(),
+            author: "reviewer".to_string(),
+            review_state: state.to_string(),
+        };
+        s.reviews.push(review("review:1", "APPROVED"));
+        let added = pr.absorb(fetched(s.clone()), "dev", "t2");
+        assert_eq!(kinds(&added), vec![NewsKind::NewActivity]);
+        assert!(added[0].approvals_only);
+        s.reviews.push(review("review:2", "CHANGES_REQUESTED"));
+        let added = pr.absorb(fetched(s.clone()), "dev", "t3");
+        assert!(!added[0].approvals_only);
+        s.comments.push(comment("comment:3", "reviewer"));
+        let added = pr.absorb(fetched(s), "dev", "t4");
+        assert!(!added[0].approvals_only);
+    }
+
+    #[test]
+    fn auto_tell_sends_recent_actionable_news_that_still_holds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let recent = "2026-11-01T11:00:00Z";
+        let old = "2026-11-01T09:59:00Z";
+        let mut pr = WatchedPr::new(PrKey::new("acme/api", 12));
+        pr.snapshot = dirty(snapshot(
+            PrState::Open,
+            "a1",
+            vec![check("test", CheckOutcome::Fail)],
+        ));
+        let failed = news(NewsKind::ChecksFailed, "checks_failed:a1", recent);
+        let conflict = news(NewsKind::Conflicting, "conflicting:a1", recent);
+        let comments = news(NewsKind::NewActivity, "activity:comment:1", recent);
+        assert!(auto_tell_due(&pr, &failed, now));
+        assert!(auto_tell_due(&pr, &conflict, now));
+        assert!(auto_tell_due(&pr, &comments, now));
+        // Informational, told, dismissed, too old, or unreadable: not sent.
+        let passed = news(NewsKind::RequiredChecksPassed, "required_passed:a1", recent);
+        assert!(!auto_tell_due(&pr, &passed, now));
+        let mut told = failed.clone();
+        told.told = true;
+        assert!(!auto_tell_due(&pr, &told, now));
+        let mut dismissed = failed.clone();
+        dismissed.dismissed = true;
+        assert!(!auto_tell_due(&pr, &dismissed, now));
+        assert!(!auto_tell_due(
+            &pr,
+            &news(NewsKind::ChecksFailed, "checks_failed:a1", old),
+            now
+        ));
+        assert!(!auto_tell_due(
+            &pr,
+            &news(NewsKind::ChecksFailed, "checks_failed:a1", "t1"),
+            now
+        ));
+        // Superseded by a newer head commit, or resolved: not sent late.
+        assert!(!auto_tell_due(
+            &pr,
+            &news(NewsKind::ChecksFailed, "checks_failed:z9", recent),
+            now
+        ));
+        pr.snapshot = snapshot(PrState::Open, "a1", vec![check("test", CheckOutcome::Pass)]);
+        assert!(!auto_tell_due(&pr, &failed, now));
+        assert!(!auto_tell_due(&pr, &conflict, now));
+        assert!(auto_tell_due(&pr, &comments, now));
+        // A merged PR's news is never sent by itself.
+        pr.snapshot = snapshot(PrState::Merged, "a1", Vec::new());
+        assert!(!auto_tell_due(&pr, &comments, now));
     }
 
     #[test]
