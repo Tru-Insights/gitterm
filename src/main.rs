@@ -2302,6 +2302,8 @@ struct WorkDocumentsState {
 
 /// Visible documents are gathered again after this long.
 const WORK_DOCUMENTS_POLL: Duration = Duration::from_secs(60);
+/// Documents the Work page lists before "n more" (newest first).
+const WORK_DOCUMENTS_SHOWN: usize = 5;
 
 /// One workspace's overview (TRU-167): the summary from the chat index and
 /// tasks, and the owned branches' git state from the background poller.
@@ -6648,6 +6650,8 @@ pub enum Event {
     ),
     /// Show or hide a document's copies, by its key.
     WorkDocumentCopiesToggle(String),
+    /// Documents shows all, or only the newest few.
+    WorkDocumentsAllToggle,
     /// A background refresh finished: workspace dir, generation, result.
     WorkspaceOverviewRefreshed(OverviewKey, u64, Box<overview::RefreshOutcome>),
     /// Open a coordinator's conversation in the main area; the sidebar
@@ -7097,6 +7101,9 @@ struct App {
     work_documents: HashMap<u64, WorkDocumentsState>,
     /// The document whose copies are listed (its key), if any.
     work_document_copies_open: Option<String>,
+    /// Documents lists every document, not just the newest
+    /// [`WORK_DOCUMENTS_SHOWN`].
+    work_documents_all: bool,
     /// Hand-picked overview focus per workspace, kept across restarts.
     overview_focus_picks: overview::FocusPicks,
     /// An inline workspace rename in progress (TRU-169).
@@ -17422,6 +17429,7 @@ impl App {
             workspace_overviews: HashMap::new(),
             work_documents: HashMap::new(),
             work_document_copies_open: None,
+            work_documents_all: false,
             overview_focus_picks: overview::FocusPicks::load(&overview::FocusPicks::path_in(
                 &config::global_config_dir(),
             )),
@@ -26156,6 +26164,9 @@ fi
                         state.error = Some(error);
                     }
                 }
+            }
+            Event::WorkDocumentsAllToggle => {
+                self.work_documents_all = !self.work_documents_all;
             }
             Event::WorkDocumentCopiesToggle(key) => {
                 self.work_document_copies_open = (self.work_document_copies_open.as_deref()
@@ -39996,7 +40007,12 @@ fi
             return None;
         }
         let mut col = Column::new().spacing(2);
-        for doc in &result.documents {
+        let shown = if self.work_documents_all {
+            result.documents.len()
+        } else {
+            WORK_DOCUMENTS_SHOWN
+        };
+        for doc in result.documents.iter().take(shown) {
             let newest = doc.newest();
             let head = row![
                 text(overview::shorten(&doc.title, 60))
@@ -40068,6 +40084,20 @@ fi
                 }
             }
             col = col.push(entry);
+        }
+        let hidden = result.documents.len().saturating_sub(WORK_DOCUMENTS_SHOWN);
+        if hidden > 0 {
+            let label = if self.work_documents_all {
+                "\u{25BE} show fewer".to_string()
+            } else {
+                format!("\u{25B8} {hidden} more")
+            };
+            col = col.push(
+                button(text(label).size(10).color(text_muted).font(mono))
+                    .style(self.ghost_button_style())
+                    .padding([2, 6])
+                    .on_press(Event::WorkDocumentsAllToggle),
+            );
         }
         if result.truncated {
             col = col.push(
