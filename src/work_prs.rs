@@ -60,7 +60,8 @@ pub struct PrActionConfirm {
     /// The mapped gh account; `None` for gh's active account.
     pub account: Option<String>,
     pub running: bool,
-    pub result: Option<Result<String, String>>,
+    /// Why the last run failed; a run that succeeds closes the sheet.
+    pub error: Option<String>,
 }
 
 impl PrActionConfirm {
@@ -133,6 +134,29 @@ pub struct PrsState {
 }
 
 impl PrsState {
+    /// An Approve / Merge run for `key` finished. Its PR is read at the
+    /// next tick either way. The open confirmation for it closes on
+    /// success and keeps the error on failure; returns whether it closed.
+    pub fn action_done(&mut self, key: &PrKey, result: Result<String, String>) -> bool {
+        self.due_now.insert(key.id());
+        if !self.action.as_ref().is_some_and(|c| c.key == *key) {
+            return false;
+        }
+        match result {
+            Ok(_) => {
+                self.action = None;
+                true
+            }
+            Err(error) => {
+                if let Some(confirm) = self.action.as_mut() {
+                    confirm.running = false;
+                    confirm.error = Some(error);
+                }
+                false
+            }
+        }
+    }
+
     /// Plans and the watch file from the config dir (small reads).
     pub fn load(config_dir: &Path) -> Self {
         Self {
@@ -753,7 +777,7 @@ impl App {
                     method: method.unwrap_or_default(),
                     method_from_plan: method.is_some(),
                     running: false,
-                    result: None,
+                    error: None,
                 });
                 self.prs.ready_open = false;
                 return self.apply_webview_surfaces();
@@ -762,7 +786,7 @@ impl App {
                 if let Some(confirm) = self.prs.action.as_mut() {
                     if !confirm.running {
                         confirm.method = method;
-                        confirm.result = None;
+                        confirm.error = None;
                     }
                 }
             }
@@ -774,7 +798,7 @@ impl App {
                     return Task::none();
                 }
                 confirm.running = true;
-                confirm.result = None;
+                confirm.error = None;
                 let action = confirm.action();
                 let key = confirm.key.clone();
                 let account = confirm.account.clone();
@@ -792,10 +816,10 @@ impl App {
                     Ok(output) => eprintln!("[pr-watch] {}: done: {output}", key.label()),
                     Err(error) => eprintln!("[pr-watch] {}: {error}", key.label()),
                 }
-                self.prs.due_now.insert(key.id());
-                if let Some(confirm) = self.prs.action.as_mut().filter(|c| c.key == key) {
-                    confirm.running = false;
-                    confirm.result = Some(result);
+                if self.prs.action_done(&key, result) {
+                    // The overview row shows the new state once the
+                    // `due_now` read lands.
+                    return self.apply_webview_surfaces();
                 }
             }
             PrEvent::ActionClose => {
@@ -1545,7 +1569,7 @@ impl App {
                 row![
                     iced::widget::Space::new().width(Length::Fill),
                     button(text("Close").size(font_small))
-                        .style(button::text)
+                        .style(button::secondary)
                         .padding([6, 12])
                         .on_press(Event::Pr(PrEvent::ReadyListToggle)),
                 ]
@@ -1678,37 +1702,22 @@ impl App {
                 ..Default::default()
             }),
         );
-        let done = matches!(confirm.result, Some(Ok(_)));
-        match &confirm.result {
-            Some(Ok(output)) => {
-                card = card.push(
-                    text(if output.is_empty() {
-                        "Done.".to_string()
-                    } else {
-                        overview::shorten(output, 300)
-                    })
+        if let Some(error) = &confirm.error {
+            card = card.push(
+                text(overview::shorten(error, 400))
                     .size(font_small - 1.0)
-                    .color(theme.success()),
-                );
-            }
-            Some(Err(error)) => {
-                card = card.push(
-                    text(overview::shorten(error, 400))
-                        .size(font_small - 1.0)
-                        .color(theme.danger()),
-                );
-            }
-            None if confirm.running => {
-                card = card.push(
-                    text("Running\u{2026}")
-                        .size(font_small - 1.0)
-                        .color(theme.text_muted()),
-                );
-            }
-            None => {}
+                    .color(theme.danger()),
+            );
+        } else if confirm.running {
+            card = card.push(
+                text("Running\u{2026}")
+                    .size(font_small - 1.0)
+                    .color(theme.text_muted()),
+            );
         }
-        let mut close = button(text(if done { "Close" } else { "Cancel" }).size(font_small))
-            .style(button::text)
+        let failed = confirm.error.is_some();
+        let mut close = button(text(if failed { "Close" } else { "Cancel" }).size(font_small))
+            .style(button::secondary)
             .padding([6, 12]);
         if !confirm.running {
             close = close.on_press(Event::Pr(PrEvent::ActionClose));
@@ -1716,7 +1725,7 @@ impl App {
         let mut run = button(text(action.verb()).size(font_small))
             .style(button::primary)
             .padding([6, 12]);
-        if !confirm.running && !done && account_ok {
+        if !confirm.running && account_ok {
             run = run.on_press(Event::Pr(PrEvent::ActionRun));
         }
         card = card.push(
@@ -1725,5 +1734,57 @@ impl App {
                 .align_y(iced::Alignment::Center),
         );
         self.view_sheet_card(card)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn confirming(key: &PrKey) -> PrsState {
+        PrsState {
+            action: Some(PrActionConfirm {
+                key: key.clone(),
+                approve: false,
+                method: MergeMethod::default(),
+                method_from_plan: false,
+                account: None,
+                running: true,
+                error: None,
+            }),
+            ..PrsState::default()
+        }
+    }
+
+    #[test]
+    fn a_successful_action_closes_its_confirmation() {
+        let key = PrKey::new("example-org/example-repo", 7);
+        let mut prs = confirming(&key);
+        assert!(prs.action_done(&key, Ok(String::new())));
+        assert!(prs.action.is_none());
+        assert!(prs.due_now.contains(&key.id()));
+    }
+
+    #[test]
+    fn a_failed_action_keeps_its_confirmation_with_the_error() {
+        let key = PrKey::new("example-org/example-repo", 7);
+        let mut prs = confirming(&key);
+        assert!(!prs.action_done(&key, Err("not mergeable".to_string())));
+        let confirm = prs.action.as_ref().expect("confirmation stays open");
+        assert!(!confirm.running);
+        assert_eq!(confirm.error.as_deref(), Some("not mergeable"));
+        assert!(prs.due_now.contains(&key.id()));
+    }
+
+    #[test]
+    fn another_prs_result_leaves_the_open_confirmation_alone() {
+        let open = PrKey::new("example-org/example-repo", 7);
+        let other = PrKey::new("example-org/example-repo", 8);
+        let mut prs = confirming(&open);
+        assert!(!prs.action_done(&other, Ok(String::new())));
+        let confirm = prs.action.as_ref().expect("confirmation stays open");
+        assert!(confirm.running);
+        assert!(confirm.error.is_none());
+        assert!(prs.due_now.contains(&other.id()));
     }
 }
