@@ -229,7 +229,7 @@ Windows CI exists.
   lines). Don't split into submodules unless the change is large and contained.
 - **Supporting modules**: `src/log_server.rs` (warp localhost server),
   `src/plans_viewer.rs` (plans viewer routes), `src/markdown.rs`,
-  `src/webview.rs` (wry WebView surfaces), `src/services.rs`, `src/agent.rs`,
+  `src/webview.rs` (wry WebView surfaces), `src/services.rs`,
   `src/tab/` (TabKind enum + AgentSession), `src/events.rs`, `src/config.rs`,
   `src/theme.rs`.
 - **Embedded WebView**: wry child `WebView` surfaces keyed by
@@ -334,7 +334,7 @@ that's a deliberate user preference. Create issues with
 
 ### Design Roadmap
 
-See `.plans/` for active design docs (the in-app **Plans** sidebar tab lists
+See `.plans/` for active design docs (the in-app **Work** page's Documents section lists
 them). Notable: `plans-viewer-integration.md` (the viewer itself),
 `agent-tab-integration.md` (Claude Code / pi tab kind), and
 `design/WORKSPACE_DESIGN.md` for the multi-phase workspace plan.

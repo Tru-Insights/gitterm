@@ -143,8 +143,10 @@ impl ChatRef {
 /// diverge when remote machines land (slice 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatScope {
-    #[default]
     Workspace,
+    /// The default since TRU-192: the Find mode looks across this Mac;
+    /// Work lists the workspace's own chats.
+    #[default]
     Machine,
     Everywhere,
 }

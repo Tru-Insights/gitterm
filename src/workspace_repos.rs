@@ -189,6 +189,21 @@ pub fn repo_name(dir: &Path) -> String {
         .unwrap_or_else(|| dir.display().to_string())
 }
 
+/// The Files panel's top-level folders (TRU-192): for a piece of work,
+/// each listed repo, then the work's `docs` folder when `docs` exists.
+/// `None` for a folder workspace, which browses its own dir as before.
+pub fn files_roots(work: bool, repos: &[PathBuf], docs: Option<PathBuf>) -> Option<Vec<PathBuf>> {
+    work.then(|| {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for dir in repos.iter().cloned().chain(docs) {
+            if !roots.contains(&dir) {
+                roots.push(dir);
+            }
+        }
+        roots
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +451,26 @@ mod tests {
             Some(&PathBuf::from("/w/api/vendor/lib"))
         );
         assert_eq!(containing_repo(Path::new("/elsewhere"), &repos), None);
+    }
+
+    #[test]
+    fn files_roots_are_the_works_repos_then_its_docs() {
+        let repos = [PathBuf::from("/w/api"), PathBuf::from("/w/web")];
+        assert_eq!(
+            files_roots(true, &repos, Some(PathBuf::from("/home/work/x/docs"))),
+            Some(vec![
+                PathBuf::from("/w/api"),
+                PathBuf::from("/w/web"),
+                PathBuf::from("/home/work/x/docs"),
+            ])
+        );
+        // No docs folder; a repo listed twice shows once.
+        let twice = [PathBuf::from("/w/api"), PathBuf::from("/w/api")];
+        assert_eq!(
+            files_roots(true, &twice, None),
+            Some(vec![PathBuf::from("/w/api")])
+        );
+        // A folder workspace keeps browsing its own dir.
+        assert_eq!(files_roots(false, &repos, None), None);
     }
 }

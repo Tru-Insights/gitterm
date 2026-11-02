@@ -28,7 +28,6 @@ use std::time::Instant;
 
 use iced::widget::image;
 
-use crate::agent as agent_log;
 use crate::FileVersionSignature;
 use crate::SyntaxHighlightLine;
 
@@ -101,16 +100,4 @@ impl TerminalTab {
 pub(crate) enum TabKind {
     Terminal(TerminalTab),
     Agent(AgentSession),
-}
-
-/// Cross-cutting agent-activity sidebar state. Lives on every tab regardless of kind because
-/// any tab can have its sidebar set to `SidebarMode::Agent` and view captures from this repo.
-/// Note: this is the *captured-log viewer* (reads on-disk JSONL captures) — it predates
-/// the live agent tab kind in `TabKind::Agent` and is separate state.
-#[derive(Default)]
-pub(crate) struct AgentActivityState {
-    pub(crate) activity: Option<agent_log::AgentActivity>,
-    pub(crate) loading: bool,
-    pub(crate) selected_capture_idx: Option<usize>,
-    pub(crate) conversation: Option<agent_log::Conversation>,
 }
