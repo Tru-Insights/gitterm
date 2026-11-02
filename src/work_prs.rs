@@ -1457,7 +1457,7 @@ impl App {
             color,
             Some(Event::Pr(PrEvent::ReadyListToggle)),
         );
-        Some(self.bar_tooltip(btn, full, iced::widget::tooltip::Position::Left))
+        Some(self.bar_hint_area(btn, full))
     }
 
     /// "Ready to merge" across this Mac's workspaces, open and parked: each

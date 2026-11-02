@@ -64,6 +64,21 @@ pub struct ScanRequest {
     pub written: Vec<PathBuf>,
     /// The workspace's listed local repos (main checkouts).
     pub repos: Vec<PathBuf>,
+    /// GitTerm task worktrees: never read, like agent scratch worktrees
+    /// under `.claude/worktrees/` (TRU-180's exclusion).
+    pub task_worktrees: Vec<PathBuf>,
+}
+
+/// Whether a checkout is scratch: a Claude Code agent worktree or a
+/// GitTerm task worktree. Their files are copies of the repo's, not
+/// documents of the work.
+fn is_scratch_worktree(path: &Path, task_worktrees: &[PathBuf]) -> bool {
+    let agent_scratch = path
+        .components()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair[0].as_os_str() == ".claude" && pair[1].as_os_str() == "worktrees");
+    agent_scratch || task_worktrees.iter().any(|tree| path.starts_with(tree))
 }
 
 /// Where one copy of a document lives.
@@ -262,7 +277,11 @@ pub fn scan(request: &ScanRequest) -> ScanResult {
     let docs_dir = canonical(&request.docs_dir);
     walk(&docs_dir, 0, &|_| true, &mut budget, &mut seen, &mut found);
     for repo in &request.repos {
-        for checkout in resolver.list_repo(repo) {
+        for (index, checkout) in resolver.list_repo(repo).into_iter().enumerate() {
+            // The first is the main checkout, always read.
+            if index > 0 && is_scratch_worktree(&checkout, &request.task_worktrees) {
+                continue;
+            }
             walk(
                 &checkout.join(".plans"),
                 0,
@@ -286,7 +305,7 @@ pub fn scan(request: &ScanRequest) -> ScanResult {
             budget.truncated = true;
             break;
         }
-        if !is_markdown_path(path) {
+        if !is_markdown_path(path) || is_scratch_worktree(path, &request.task_worktrees) {
             continue;
         }
         // A file since deleted or moved is skipped.
@@ -433,6 +452,20 @@ fn group(found: Vec<Found>, docs_dir: &Path, resolver: &mut Resolver) -> Vec<Doc
                     .cmp(&a.0.modified)
                     .then_with(|| a.0.path.cmp(&b.0.path))
             });
+            // Copies identical to the main checkout's are noise: keep the
+            // main copy and the ones that differ from it.
+            let main = copies
+                .iter()
+                .position(|(_, source)| matches!(source, CopySource::Repo { worktree: None, .. }));
+            if let Some(main) = main {
+                let main_file = copies[main].0.clone();
+                let mut index = 0;
+                copies.retain(|(file, _)| {
+                    let keep = index == main || !same_content(&main_file, file);
+                    index += 1;
+                    keep
+                });
+            }
             let differ = copies_differ(&copies.iter().map(|(file, _)| file).collect::<Vec<_>>());
             let title = title_of(&copies[0].0.path);
             Some(Document {
@@ -465,6 +498,18 @@ fn slash_path(path: &Path) -> String {
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Whether two copies hold the same bytes. A copy that cannot be read is
+/// not the same.
+fn same_content(a: &Found, b: &Found) -> bool {
+    if a.size != b.size {
+        return false;
+    }
+    match (std::fs::read(&a.path), std::fs::read(&b.path)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Whether the copies' contents are not all the same: sizes first, then a
@@ -674,6 +719,7 @@ mod tests {
                 api.join("src/main.rs"),
             ],
             repos: vec![home.clone(), api.clone()],
+            task_worktrees: Vec::new(),
         });
         assert!(!result.truncated);
         let rels: Vec<&str> = result.documents.iter().map(|d| d.rel.as_str()).collect();
@@ -696,7 +742,8 @@ mod tests {
 
         let decisions = &result.documents[1];
         assert_eq!(decisions.title, "Decisions");
-        assert_eq!(decisions.copies.len(), 3);
+        // The "other" worktree's copy equals the main checkout's: hidden.
+        assert_eq!(decisions.copies.len(), 2);
         assert!(decisions.differ);
         assert_eq!(
             decisions.newest().path,
@@ -712,14 +759,15 @@ mod tests {
         assert_eq!(decisions.newest().source.label(), "api \u{00B7} feature");
         assert_eq!(
             decisions.copies[1].path,
-            other.join("docs/topic/DECISIONS.md")
+            api.join("docs/topic/DECISIONS.md")
         );
-        assert_eq!(decisions.copies[2].source.label(), "api");
+        assert_eq!(decisions.copies[1].source.label(), "api");
 
+        // The identical copy in another worktree is hidden: no copies line.
         let rollout = &result.documents[3];
-        assert_eq!(rollout.copies.len(), 2);
+        assert_eq!(rollout.copies.len(), 1);
         assert!(!rollout.differ);
-        assert_eq!(rollout.newest().path, other.join(".plans/rollout.md"));
+        assert_eq!(rollout.newest().path, api.join(".plans/rollout.md"));
 
         let scratch = &result.documents[4];
         assert_eq!(
@@ -738,6 +786,7 @@ mod tests {
                 api.join("docs/topic/DECISIONS.md"),
             ],
             repos: Vec::new(),
+            task_worktrees: Vec::new(),
         });
         let decisions: Vec<&Document> = only_written
             .documents
@@ -753,5 +802,89 @@ mod tests {
                 worktree: Some("api-feature".into())
             }
         );
+    }
+
+    #[test]
+    fn scratch_worktrees_are_recognised() {
+        let tasks = vec![PathBuf::from("/tasks/api-1")];
+        assert!(is_scratch_worktree(
+            Path::new("/r/api/.claude/worktrees/agent-1"),
+            &tasks
+        ));
+        assert!(is_scratch_worktree(Path::new("/tasks/api-1"), &tasks));
+        assert!(!is_scratch_worktree(Path::new("/r/api"), &tasks));
+        assert!(!is_scratch_worktree(Path::new("/r/api-wt"), &tasks));
+    }
+
+    #[test]
+    fn agent_scratch_and_task_worktrees_and_identical_copies_do_not_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let api = root.join("api");
+        init_repo(&api);
+        let add = |path: &Path, branch: &str| {
+            git(
+                &api,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                ],
+            );
+        };
+        let scratch = api.join(".claude/worktrees/agent-1");
+        let task = root.join("tasks/api-ops-1");
+        let same = root.join("api-same");
+        let changed = root.join("api-changed");
+        add(&scratch, "scratch");
+        add(&task, "task");
+        add(&same, "same");
+        add(&changed, "changed");
+        for (dir, text, age) in [
+            (&api, "# Plan\n", 100),
+            (&scratch, "# Plan\nscratch edit\n", 1),
+            (&task, "# Plan\ntask edit\n", 2),
+            (&same, "# Plan\n", 50),
+            (&changed, "# Plan\nreal edit\n", 20),
+        ] {
+            write(&dir.join(".plans/plan.md"), text, age);
+        }
+        write(&api.join(".plans/solo.md"), "# Solo\n", 90);
+        write(&same.join(".plans/solo.md"), "# Solo\n", 40);
+
+        let result = scan(&ScanRequest {
+            docs_dir: root.join("none/docs"),
+            written: vec![scratch.join(".plans/plan.md")],
+            repos: vec![api.clone()],
+            task_worktrees: vec![task.clone()],
+        });
+        let plan = result
+            .documents
+            .iter()
+            .find(|d| d.rel == ".plans/plan.md")
+            .unwrap();
+        // Main plus the one real difference; scratch, task and the
+        // identical copy are gone.
+        let paths: Vec<&Path> = plan.copies.iter().map(|c| c.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                changed.join(".plans/plan.md").as_path(),
+                api.join(".plans/plan.md").as_path()
+            ]
+        );
+        assert!(plan.differ);
+
+        // Every copy identical: one copy, no differ flag.
+        let solo = result
+            .documents
+            .iter()
+            .find(|d| d.rel == ".plans/solo.md")
+            .unwrap();
+        assert_eq!(solo.copies.len(), 1);
+        assert!(!solo.differ);
     }
 }
