@@ -1942,6 +1942,30 @@ struct NewWorkSheet {
     decisions_repo: Option<PathBuf>,
 }
 
+/// ~/Work committing and pushing itself (TRU-201), on when `auto_commit`.
+/// Off in an instance with an isolated config dir: a dev or test launch
+/// must not commit and push the real notes.
+fn new_work_notes(auto_commit: bool) -> gitterm::work_notes::WorkNotes {
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("[work-notes] no home directory; ~/{WORK_FOLDER} is not committed");
+        return gitterm::work_notes::WorkNotes::new(PathBuf::from(WORK_FOLDER), false);
+    };
+    let root = home.join(WORK_FOLDER);
+    let isolated = config::config_dir_override().is_some();
+    if auto_commit && isolated {
+        eprintln!(
+            "[work-notes] isolated config dir: {} is not committed",
+            root.display()
+        );
+    } else if !auto_commit {
+        eprintln!(
+            "[work-notes] work_notes.auto_commit is off: {} is not committed",
+            root.display()
+        );
+    }
+    gitterm::work_notes::WorkNotes::new(root, auto_commit && !isolated)
+}
+
 /// The New workspace sheet's home preview: `~/Work/<slug>`, live from
 /// the name.
 fn new_work_home_preview(name: &str) -> String {
@@ -6675,6 +6699,8 @@ pub enum Event {
     /// "Index older chats" in the Chats panel (TRU-166).
     ChatFactsBackfill,
     ChatFactsBackfilled(Result<chat_facts::BackfillReport, String>),
+    /// A ~/Work git job ended (TRU-201).
+    WorkNotesDone(gitterm::work_notes::JobResult),
     /// Workspace overview (TRU-167): rebuild from the index and reread git.
     WorkspaceOverviewRefresh,
     /// Gather the active workspace's documents again (TRU-191).
@@ -7081,6 +7107,10 @@ struct App {
     notifications_config: config::NotificationsConfig,
     /// `pr_watch` from settings.json (TRU-197), written back on save.
     pr_watch_config: config::PrWatchConfig,
+    /// `work_notes` from settings.json (TRU-201), written back on save.
+    work_notes_config: config::WorkNotesConfig,
+    /// ~/Work committing and pushing itself (TRU-201).
+    work_notes: gitterm::work_notes::WorkNotes,
     // Track modifier state for filtering terminal writes
     current_modifiers: Modifiers,
     // Help modal
@@ -8603,6 +8633,7 @@ impl App {
             usage: self.usage_config.clone(),
             notifications: self.notifications_config.clone(),
             pr_watch: self.pr_watch_config.clone(),
+            work_notes: self.work_notes_config.clone(),
         };
         if let Err(error) = config.save() {
             eprintln!("[settings] cannot save the settings: {error}");
@@ -12544,11 +12575,24 @@ impl App {
             note: note.trim().to_string(),
             parked_at: chrono::Utc::now().to_rfc3339(),
         };
-        if mode.stops_processes() {
+        // Its notes are committed now, not ten minutes on (TRU-201);
+        // Close parks first, so it lands here too.
+        let ws = &self.workspaces[idx];
+        let notes = if ws.is_work()
+            && matches!(ws.location, WorkspaceLocation::Local { .. })
+            && self.work_notes.covers(&ws.dir)
+        {
+            self.work_notes.request_commit();
+            self.poll_work_notes()
+        } else {
+            Task::none()
+        };
+        let parked = if mode.stops_processes() {
             self.park_stopping(idx, info)
         } else {
             self.park_keep_running(idx, info)
-        }
+        };
+        Task::batch([parked, notes])
     }
 
     /// Stops workspace `idx` into a parked entry with `info`: its tabs
@@ -13750,6 +13794,27 @@ impl App {
                 .unwrap_or_else(|error| Err(format!("facts write task failed: {error}")))
             },
             move |result| Event::ChatFactsFlushed(tab_id, result),
+        )
+    }
+
+    /// ~/Work's next git job (TRU-201), if one is due and none is running:
+    /// on a blocking thread, ending in `WorkNotesDone`.
+    fn poll_work_notes(&mut self) -> Task<Event> {
+        let Some(job) = self.work_notes.next_job(Instant::now()) else {
+            return Task::none();
+        };
+        let root = self.work_notes.root().to_path_buf();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || gitterm::work_notes::run(&root, job))
+                    .await
+                    .unwrap_or_else(|error| {
+                        gitterm::work_notes::JobResult::Failed(format!(
+                            "{job:?} task failed: {error}"
+                        ))
+                    })
+            },
+            Event::WorkNotesDone,
         )
     }
 
@@ -17468,6 +17533,8 @@ impl App {
             needs_you_notifier: NeedsYouNotifier::new(Instant::now()),
             notifications_config: config.notifications.clone(),
             pr_watch_config: config.pr_watch.clone(),
+            work_notes_config: config.work_notes.clone(),
+            work_notes: new_work_notes(config.work_notes.auto_commit),
             current_modifiers: Modifiers::empty(),
             show_help: false,
             workspace_settings_open: false,
@@ -20948,6 +21015,8 @@ fi
                 tasks.push(self.poll_pr_watch());
                 // Its actionable news, to idle coordinators (TRU-197).
                 tasks.push(self.auto_tell_coordinators());
+                // ~/Work commits and pushes itself (TRU-201).
+                tasks.push(self.poll_work_notes());
                 // Closed tabs release their browser targets (TRU-176).
                 tasks.push(self.sync_browser_owners());
                 let workspace_dirty = false;
@@ -26223,6 +26292,11 @@ fi
                 }
             }
             Event::ChatFactsBackfill => return self.start_chat_facts_backfill(),
+            Event::WorkNotesDone(result) => {
+                self.work_notes.finish(result, Instant::now());
+                // A commit asked for meanwhile (a park) runs now.
+                return self.poll_work_notes();
+            }
             Event::ChatFactsBackfilled(result) => {
                 self.chat_backfill_running = false;
                 match result {
@@ -35055,6 +35129,14 @@ fi
                         .color(text_secondary),
                 ),
             );
+        }
+        // ~/Work did not commit or push (TRU-201).
+        let notes_note = self.work_notes.note().filter(|_| {
+            self.active_workspace()
+                .is_some_and(|ws| ws.is_work() && self.work_notes.covers(&ws.dir))
+        });
+        if let Some(note) = notes_note {
+            content = content.push(text(note).size(font_small - 1.0).color(text_muted));
         }
         // PRs of the work in merge order (TRU-173).
         if let Some(prs) = self.view_overview_prs() {
