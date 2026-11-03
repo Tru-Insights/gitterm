@@ -1942,6 +1942,30 @@ struct NewWorkSheet {
     decisions_repo: Option<PathBuf>,
 }
 
+/// ~/Work committing and pushing itself (TRU-201), on when `auto_commit`.
+/// Off in an instance with an isolated config dir: a dev or test launch
+/// must not commit and push the real notes.
+fn new_work_notes(auto_commit: bool) -> gitterm::work_notes::WorkNotes {
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("[work-notes] no home directory; ~/{WORK_FOLDER} is not committed");
+        return gitterm::work_notes::WorkNotes::new(PathBuf::from(WORK_FOLDER), false);
+    };
+    let root = home.join(WORK_FOLDER);
+    let isolated = config::config_dir_override().is_some();
+    if auto_commit && isolated {
+        eprintln!(
+            "[work-notes] isolated config dir: {} is not committed",
+            root.display()
+        );
+    } else if !auto_commit {
+        eprintln!(
+            "[work-notes] work_notes.auto_commit is off: {} is not committed",
+            root.display()
+        );
+    }
+    gitterm::work_notes::WorkNotes::new(root, auto_commit && !isolated)
+}
+
 /// The New workspace sheet's home preview: `~/Work/<slug>`, live from
 /// the name.
 fn new_work_home_preview(name: &str) -> String {
@@ -6671,11 +6695,14 @@ pub enum Event {
     // Chats panel (TRU-78)
     RefreshChatIndex,
     ChatIndexLoaded(Vec<chats::ChatIndexEntry>),
-    /// A chat tab's facts write landed (TRU-166).
-    ChatFactsFlushed(usize, Result<(), String>),
+    /// A chat tab's facts write landed (TRU-166), with the PRs a catch-up
+    /// scan found in its transcript (TRU-201).
+    ChatFactsFlushed(usize, Result<Vec<gitterm::merge_plan::PrRef>, String>),
     /// "Index older chats" in the Chats panel (TRU-166).
     ChatFactsBackfill,
     ChatFactsBackfilled(Result<chat_facts::BackfillReport, String>),
+    /// A ~/Work git job ended (TRU-201).
+    WorkNotesDone(gitterm::work_notes::JobResult),
     /// Workspace overview (TRU-167): rebuild from the index and reread git.
     WorkspaceOverviewRefresh,
     /// Gather the active workspace's documents again (TRU-191).
@@ -7084,6 +7111,10 @@ struct App {
     notifications_config: config::NotificationsConfig,
     /// `pr_watch` from settings.json (TRU-197), written back on save.
     pr_watch_config: config::PrWatchConfig,
+    /// `work_notes` from settings.json (TRU-201), written back on save.
+    work_notes_config: config::WorkNotesConfig,
+    /// ~/Work committing and pushing itself (TRU-201).
+    work_notes: gitterm::work_notes::WorkNotes,
     // Track modifier state for filtering terminal writes
     current_modifiers: Modifiers,
     // Help modal
@@ -8609,6 +8640,7 @@ impl App {
             usage: self.usage_config.clone(),
             notifications: self.notifications_config.clone(),
             pr_watch: self.pr_watch_config.clone(),
+            work_notes: self.work_notes_config.clone(),
         };
         if let Err(error) = config.save() {
             eprintln!("[settings] cannot save the settings: {error}");
@@ -12550,11 +12582,24 @@ impl App {
             note: note.trim().to_string(),
             parked_at: chrono::Utc::now().to_rfc3339(),
         };
-        if mode.stops_processes() {
+        // Its notes are committed now, not ten minutes on (TRU-201);
+        // Close parks first, so it lands here too.
+        let ws = &self.workspaces[idx];
+        let notes = if ws.is_work()
+            && matches!(ws.location, WorkspaceLocation::Local { .. })
+            && self.work_notes.covers(&ws.dir)
+        {
+            self.work_notes.request_commit();
+            self.poll_work_notes()
+        } else {
+            Task::none()
+        };
+        let parked = if mode.stops_processes() {
             self.park_stopping(idx, info)
         } else {
             self.park_keep_running(idx, info)
-        }
+        };
+        Task::batch([parked, notes])
     }
 
     /// Stops workspace `idx` into a parked entry with `info`: its tabs
@@ -13696,7 +13741,9 @@ impl App {
 
     /// Write a chat tab's facts when they are due (TRU-166): debounced while
     /// a turn runs, at once when `force` (the turn ended). The write runs
-    /// on a blocking thread; one per tab at a time.
+    /// on a blocking thread; one per tab at a time. A requested catch-up
+    /// (TRU-201) goes first, in that same slot, so its transcript scan and
+    /// the live observations are merged in one read and write.
     fn flush_chat_facts(&mut self, tab_id: usize, force: bool) -> Task<Event> {
         let Some(tab) = self
             .workspaces
@@ -13711,8 +13758,13 @@ impl App {
         let Some(session_id) = tab.chat_session_id.clone() else {
             return Task::none();
         };
-        let Some(pending) = tab.chat_facts.take_due(Instant::now(), force) else {
-            return Task::none();
+        let now = Instant::now();
+        let (pending, catch_up) = match tab.chat_facts.take_catch_up(now) {
+            Some(pending) => (pending, true),
+            None => match tab.chat_facts.take_due(now, force) {
+                Some(pending) => (pending, false),
+                None => return Task::none(),
+            },
         };
         // PRs show in the overview before the index rereads the file.
         if !pending.prs.is_empty() {
@@ -13723,18 +13775,53 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
+                    let transcript = if catch_up {
+                        let found = chats::claude_session_path(&session_id);
+                        if found.is_none() {
+                            eprintln!(
+                                "[chat-facts] Claude session {session_id} has no transcript to catch up from"
+                            );
+                        }
+                        found
+                    } else {
+                        None
+                    };
+                    let home = dirs::home_dir();
                     chat_facts::flush_live(
                         &dir,
                         chats::ChatBackend::Claude,
                         &session_id,
                         pending,
                         children,
+                        transcript.as_deref(),
+                        home.as_deref(),
                     )
                 })
                 .await
                 .unwrap_or_else(|error| Err(format!("facts write task failed: {error}")))
             },
             move |result| Event::ChatFactsFlushed(tab_id, result),
+        )
+    }
+
+    /// ~/Work's next git job (TRU-201), if one is due and none is running:
+    /// on a blocking thread, ending in `WorkNotesDone`.
+    fn poll_work_notes(&mut self) -> Task<Event> {
+        let Some(job) = self.work_notes.next_job(Instant::now()) else {
+            return Task::none();
+        };
+        let root = self.work_notes.root().to_path_buf();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || gitterm::work_notes::run(&root, job))
+                    .await
+                    .unwrap_or_else(|error| {
+                        gitterm::work_notes::JobResult::Failed(format!(
+                            "{job:?} task failed: {error}"
+                        ))
+                    })
+            },
+            Event::WorkNotesDone,
         )
     }
 
@@ -17453,6 +17540,8 @@ impl App {
             needs_you_notifier: NeedsYouNotifier::new(Instant::now()),
             notifications_config: config.notifications.clone(),
             pr_watch_config: config.pr_watch.clone(),
+            work_notes_config: config.work_notes.clone(),
+            work_notes: new_work_notes(config.work_notes.auto_commit),
             current_modifiers: Modifiers::empty(),
             show_help: false,
             workspace_settings_open: false,
@@ -20934,6 +21023,8 @@ fi
                 tasks.push(self.poll_pr_watch());
                 // Its actionable news, to idle coordinators (TRU-197).
                 tasks.push(self.auto_tell_coordinators());
+                // ~/Work commits and pushes itself (TRU-201).
+                tasks.push(self.poll_work_notes());
                 // Closed tabs release their browser targets (TRU-176).
                 tasks.push(self.sync_browser_owners());
                 let workspace_dirty = false;
@@ -26176,9 +26267,13 @@ fi
                 }
             }
             Event::ChatFactsFlushed(tab_id, result) => {
-                if let Err(error) = result {
-                    eprintln!("[chat-facts] tab {tab_id}: facts not written: {error}");
-                }
+                let caught_up_prs = match result {
+                    Ok(prs) => prs,
+                    Err(error) => {
+                        eprintln!("[chat-facts] tab {tab_id}: facts not written: {error}");
+                        Vec::new()
+                    }
+                };
                 let tab = self
                     .workspaces
                     .iter_mut()
@@ -26188,6 +26283,13 @@ fi
                     return Task::none();
                 };
                 tab.chat_facts.flush_done();
+                // PRs opened while the chat ran elsewhere (TRU-201) show
+                // before the index rereads the file, as live ones do.
+                if let (false, Some(session_id)) =
+                    (caught_up_prs.is_empty(), tab.chat_session_id.as_deref())
+                {
+                    self.prs.note_live_prs(session_id, &caught_up_prs);
+                }
                 // What arrived during the write: at once when the turn has
                 // ended meanwhile, else on the debounce.
                 let idle = tab.agent_session().is_some_and(|session| {
@@ -26198,6 +26300,11 @@ fi
                 }
             }
             Event::ChatFactsBackfill => return self.start_chat_facts_backfill(),
+            Event::WorkNotesDone(result) => {
+                self.work_notes.finish(result, Instant::now());
+                // A commit asked for meanwhile (a park) runs now.
+                return self.poll_work_notes();
+            }
             Event::ChatFactsBackfilled(result) => {
                 self.chat_backfill_running = false;
                 match result {
@@ -28829,7 +28936,8 @@ fi
                 },
             );
         }
-        Task::perform(
+        let claude = session.backend() == tab::AgentBackend::Claude;
+        let history = Task::perform(
             async move {
                 let id = session_id.clone();
                 tokio::task::spawn_blocking(move || {
@@ -28852,7 +28960,25 @@ fi
                 })
             },
             move |events| Event::AgentHistoryLoaded(tab_id, events),
-        )
+        );
+        if !claude {
+            return history;
+        }
+        // The tab now hosts this chat, so "Index older chats" skips it. If
+        // it ran on elsewhere (another instance, the CLI), what happened
+        // there is only in the transcript: catch the facts up once (TRU-201).
+        // Facts are written for chats on this Mac only, as the live writer.
+        let Some(tab) = self
+            .workspaces
+            .iter_mut()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find(|t| t.id == tab_id)
+        else {
+            return history;
+        };
+        tab.chat_facts.request_catch_up();
+        Task::batch([history, self.flush_chat_facts(tab_id, true)])
     }
 
     fn recreate_terminals(&mut self) {
@@ -35014,6 +35140,14 @@ fi
                         .color(text_secondary),
                 ),
             );
+        }
+        // ~/Work did not commit or push (TRU-201).
+        let notes_note = self.work_notes.note().filter(|_| {
+            self.active_workspace()
+                .is_some_and(|ws| ws.is_work() && self.work_notes.covers(&ws.dir))
+        });
+        if let Some(note) = notes_note {
+            content = content.push(text(note).size(font_small - 1.0).color(text_muted));
         }
         // PRs of the work in merge order (TRU-173).
         if let Some(prs) = self.view_overview_prs() {

@@ -985,6 +985,16 @@ mod tests {
     }
 
     #[test]
+    fn work_notes_auto_commit_defaults_on_and_can_be_switched_off() {
+        let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(config.work_notes.auto_commit);
+        let config: Config =
+            serde_json::from_str(r#"{"theme":"dark","work_notes":{"auto_commit":false}}"#).unwrap();
+        assert!(!config.work_notes.auto_commit);
+        assert!(Config::default().work_notes.auto_commit);
+    }
+
+    #[test]
     fn new_chats_use_the_defaults_until_something_is_picked() {
         // An older config without `chat` gets the defaults.
         let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
@@ -1280,6 +1290,9 @@ pub struct Config {
     /// The PR watch (TRU-197).
     #[serde(default)]
     pub pr_watch: PrWatchConfig,
+    /// ~/Work committing and pushing itself (TRU-201).
+    #[serde(default)]
+    pub work_notes: WorkNotesConfig,
 }
 
 /// The PR watch (TRU-197). Edit the `pr_watch` object in `settings.json`:
@@ -1301,6 +1314,29 @@ pub struct PrWatchConfig {
 impl Default for PrWatchConfig {
     fn default() -> Self {
         Self { auto_tell: true }
+    }
+}
+
+/// The work-notes folder (TRU-201). Edit the `work_notes` object in
+/// `settings.json`:
+///
+/// ```json
+/// "work_notes": { "auto_commit": true }
+/// ```
+///
+/// `auto_commit`: when `~/Work` is a git repo with an `origin` remote,
+/// commit what changed there about ten minutes after the last change, and
+/// at once when a work workspace is parked or closed, then push it. Off,
+/// GitTerm runs no git there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkNotesConfig {
+    #[serde(default = "default_true")]
+    pub auto_commit: bool,
+}
+
+impl Default for WorkNotesConfig {
+    fn default() -> Self {
+        Self { auto_commit: true }
     }
 }
 
@@ -1602,6 +1638,7 @@ impl Default for Config {
             usage: gitterm::usage::UsageConfig::default(),
             notifications: NotificationsConfig::default(),
             pr_watch: PrWatchConfig::default(),
+            work_notes: WorkNotesConfig::default(),
         }
     }
 }
