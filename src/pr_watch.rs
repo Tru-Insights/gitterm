@@ -132,6 +132,10 @@ pub struct PrSnapshot {
     pub reviews: Vec<Activity>,
     #[serde(default)]
     pub comments: Vec<Activity>,
+    /// Checks were seen on some head of this PR, so a head with none yet
+    /// is waiting for them to start (right after a push), not checkless.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub had_checks: bool,
 }
 
 /// The combined checks of the head commit.
@@ -224,6 +228,21 @@ impl PrSnapshot {
 
     fn all_checks(&self) -> impl Iterator<Item = &CheckItem> {
         self.check_runs.iter().chain(self.statuses.iter())
+    }
+
+    /// [`Self::checks`] for gating Merge: no checks yet on a PR that has
+    /// had them, or whose base requires some, is pending.
+    pub fn gate_checks(&self) -> ChecksState {
+        match self.checks() {
+            ChecksState::None
+                if self.had_checks
+                    || !self.required.is_empty()
+                    || !self.required_rules.is_empty() =>
+            {
+                ChecksState::Pending
+            }
+            state => state,
+        }
     }
 
     pub fn checks(&self) -> ChecksState {
@@ -611,13 +630,18 @@ impl WatchedPr {
 
     /// The checks gate of the latest read; a PR not read yet is pending.
     pub fn checks_gate(&self) -> ChecksGate {
-        ChecksGate::from_checks(self.snapshot.core.as_ref().map(|_| self.snapshot.checks()))
+        ChecksGate::from_checks(
+            self.snapshot
+                .core
+                .as_ref()
+                .map(|_| self.snapshot.gate_checks()),
+        )
     }
 
     /// `interval`, shortened to [`PENDING_INTERVAL`] while the last read
     /// had pending checks.
     pub fn interval_for(&self, interval: Duration) -> Duration {
-        if self.snapshot.core.is_some() && self.snapshot.checks() == ChecksState::Pending {
+        if self.snapshot.core.is_some() && self.snapshot.gate_checks() == ChecksState::Pending {
             interval.min(PENDING_INTERVAL)
         } else {
             interval
@@ -1264,6 +1288,9 @@ pub async fn fetch_pr(
         if let Read::Changed(value) = reader.read(&status).await? {
             snapshot.statuses = parse_statuses(&value);
         }
+        if !snapshot.check_runs.is_empty() || !snapshot.statuses.is_empty() {
+            snapshot.had_checks = true;
+        }
     }
 
     // Required checks of the base branch. A source the token cannot read
@@ -1903,6 +1930,15 @@ mod tests {
         assert_eq!(pr.checks_gate(), ChecksGate::Ready);
         pr.snapshot = snapshot(PrState::Open, "a1", vec![check("t", CheckOutcome::Fail)]);
         assert_eq!(pr.checks_gate(), ChecksGate::Failed);
+        // Right after a push the new head has no checks yet: a PR that had
+        // checks, or whose base requires some, waits rather than merging.
+        pr.snapshot = snapshot(PrState::Open, "b2", vec![]);
+        pr.snapshot.had_checks = true;
+        assert_eq!(pr.checks_gate(), ChecksGate::Running);
+        assert_eq!(pr.interval_for(OPEN_INTERVAL), PENDING_INTERVAL);
+        pr.snapshot = snapshot(PrState::Open, "b2", vec![]);
+        pr.snapshot.required = vec!["test".to_string()];
+        assert_eq!(pr.checks_gate(), ChecksGate::Running);
     }
 
     #[test]
