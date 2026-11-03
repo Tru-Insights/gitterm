@@ -1821,7 +1821,7 @@ impl App {
                 row![
                     iced::widget::Space::new().width(Length::Fill),
                     button(text("Close").size(font_small))
-                        .style(button::secondary)
+                        .style(self.secondary_button_style())
                         .padding([6, 12])
                         .on_press(Event::Pr(PrEvent::ReadyListToggle)),
                 ]
@@ -1969,13 +1969,13 @@ impl App {
         }
         let failed = confirm.error.is_some();
         let mut close = button(text(if failed { "Close" } else { "Cancel" }).size(font_small))
-            .style(button::secondary)
+            .style(self.secondary_button_style())
             .padding([6, 12]);
         if !confirm.running {
             close = close.on_press(Event::Pr(PrEvent::ActionClose));
         }
         let mut run = button(text(action.verb()).size(font_small))
-            .style(button::primary)
+            .style(self.primary_button_style())
             .padding([6, 12]);
         if !confirm.running && account_ok {
             run = run.on_press(Event::Pr(PrEvent::ActionRun));
