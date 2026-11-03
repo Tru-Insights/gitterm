@@ -1928,16 +1928,12 @@ struct WorkspaceRename {
 const WORK_FOLDER: &str = "Work";
 
 /// "New workspace" (TRU-194, `+`): a sheet for a piece of work. Its
-/// name, its home (`~/Work/<slug>` unless another folder is chosen),
-/// optional starting repos (browsed with the folder picker, or one click
+/// name (its home is always a new `~/Work/<slug>`), optional starting repos (browsed with the folder picker, or one click
 /// from `recent`) and a decisions repo among them (TRU-205).
 #[derive(Debug, Clone, Default)]
 struct NewWorkSheet {
     name: String,
     error: Option<String>,
-    /// A folder chosen with Change…, used as is; `None` makes a new
-    /// `~/Work/<slug>` on Create.
-    home: Option<PathBuf>,
     /// This Mac's recently used repos, read when the sheet opens (see
     /// [`new_work_recent_repos`]).
     recent: Vec<PathBuf>,
@@ -1946,29 +1942,15 @@ struct NewWorkSheet {
     decisions_repo: Option<PathBuf>,
 }
 
-/// What the folder picker chooses for the New workspace sheet (TRU-205).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NewWorkPick {
-    /// Change…: the work's home folder.
-    Home,
-    /// Add repo…: a starting repo.
-    Repo,
-}
-
 /// How many recent repos the New workspace sheet offers as one-click adds.
 const NEW_WORK_RECENT_REPOS: usize = 5;
 
 impl NewWorkSheet {
-    /// "Use this folder" for a picker the sheet opened: `dir` becomes the
-    /// home, or joins the starting repos (once).
-    fn use_picked_folder(&mut self, pick: NewWorkPick, dir: PathBuf) {
-        match pick {
-            NewWorkPick::Home => self.home = Some(dir),
-            NewWorkPick::Repo => {
-                if !self.repos.contains(&dir) {
-                    self.repos.push(dir);
-                }
-            }
+    /// "Use this folder" for a picker the sheet opened: `dir` joins the
+    /// starting repos (once).
+    fn use_picked_folder(&mut self, dir: PathBuf) {
+        if !self.repos.contains(&dir) {
+            self.repos.push(dir);
         }
         self.error = None;
     }
@@ -2121,15 +2103,6 @@ fn new_work_notes(auto_commit: bool) -> gitterm::work_notes::WorkNotes {
         );
     }
     gitterm::work_notes::WorkNotes::new(root, auto_commit && !isolated)
-}
-
-/// The New workspace sheet's home preview: `~/Work/<slug>`, live from
-/// the name.
-fn new_work_home_preview(name: &str) -> String {
-    if name.trim().is_empty() {
-        return format!("~/{WORK_FOLDER}/\u{2026}");
-    }
-    format!("~/{WORK_FOLDER}/{}", overview::work_folder_slug(name))
 }
 
 /// What a new piece of work starts with (TRU-194): repos added by hand,
@@ -6922,7 +6895,7 @@ pub enum Event {
     NewWorkRepoToggled(PathBuf, bool),
     NewWorkDecisionsPicked(DecisionsRepoChoice),
     /// Change… or Add repo… (TRU-205): the folder picker, over the sheet.
-    NewWorkBrowse(NewWorkPick),
+    NewWorkBrowse,
     /// An existing work row's Switch or Resume: the sheet closes.
     NewWorkOpenExisting(ExistingWorkAction),
     NewWorkSubmit,
@@ -8206,9 +8179,9 @@ pub enum FolderPickerPurpose {
     /// "+ add repo" in a workspace's overview (TRU-180): list the folder
     /// in the open workspace with this uid. This Mac only.
     AddRepo(u64),
-    /// The New workspace sheet's Change… and Add repo… (TRU-205): the
-    /// folder goes back to the sheet, still open beneath. This Mac only.
-    NewWork(NewWorkPick),
+    /// The New workspace sheet's Add repo… (TRU-205): the folder goes
+    /// back to the sheet, still open beneath. This Mac only.
+    NewWork,
 }
 
 /// The in-app folder picker (TRU-149), one for every machine. Listings
@@ -8232,17 +8205,39 @@ struct FolderPicker {
     /// handshake that reports it moves the picker there, unless the user
     /// navigated meanwhile.
     awaiting_home: bool,
+    /// Where to open when no folder was chosen yet on the machine (the
+    /// New workspace sheet's repos' common parent); `None` opens at home.
+    start_hint: Option<String>,
 }
 
 /// Where the folder picker opens on a machine: the folder last chosen
-/// there this session, else the machine's home, else "/".
-fn folder_picker_start_dir(last_chosen: Option<&str>, home: Option<&str>) -> String {
-    [last_chosen, home]
+/// there this session, else `hint`, else the machine's home, else "/".
+fn folder_picker_start_dir(
+    last_chosen: Option<&str>,
+    hint: Option<&str>,
+    home: Option<&str>,
+) -> String {
+    [last_chosen, hint, home]
         .into_iter()
         .flatten()
         .find(|dir| !dir.is_empty())
         .unwrap_or("/")
         .to_string()
+}
+
+/// The deepest folder that holds every one of `repos`, if it is below
+/// `home` (a repo directly in home, or outside it, gives `None`).
+fn repos_common_parent_below_home(repos: &[PathBuf], home: &Path) -> Option<PathBuf> {
+    let mut parents = repos.iter().filter_map(|repo| repo.parent());
+    let mut common: PathBuf = parents.next()?.to_path_buf();
+    for parent in parents {
+        while !parent.starts_with(&common) {
+            if !common.pop() {
+                return None;
+            }
+        }
+    }
+    (common.starts_with(home) && common != home).then_some(common)
 }
 
 /// The Chats row's facts line (TRU-166): up to three issue keys, three
@@ -8323,18 +8318,6 @@ fn folder_picker_typed_path(input: &str, home: Option<&str>) -> Result<String, S
         return Err(format!("{resolved} is not an absolute path"));
     }
     Ok(resolved)
-}
-
-/// Cut a long path to at most `max` characters, keeping the end (the part
-/// that tells folders apart) and marking the cut with a leading ellipsis.
-fn ellipsize_path_start(path: &str, max: usize) -> String {
-    let count = path.chars().count();
-    if count <= max {
-        return path.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    let tail: String = path.chars().skip(count - keep).collect();
-    format!("\u{2026}{tail}")
 }
 
 /// A picker path for display, with the machine's home shown as "~".
@@ -14425,8 +14408,7 @@ impl App {
             return self.go_to_chat_owner(id);
         }
         let name = overview::workspace_name_from_title(&entry.title);
-        let made =
-            self.create_work_workspace(&name, None, vec![id.to_string()], WorkStart::default());
+        let made = self.create_work_workspace(&name, vec![id.to_string()], WorkStart::default());
         let (idx, uid) = match made {
             Ok(made) => made,
             Err(error) => {
@@ -14471,23 +14453,19 @@ impl App {
     }
 
     /// A workspace that is a piece of work, not a folder: named `name`,
-    /// homed in `chosen` (an existing folder, used as is) else a new
-    /// `~/Work/<slug>` folder (created here), owning `chats`, claiming the
+    /// homed in a new `~/Work/<slug>` folder (created here), owning `chats`, claiming the
     /// chats started in it, listing `start`'s repos, on the bar and
     /// active. Returns its index and uid.
     fn create_work_workspace(
         &mut self,
         name: &str,
-        chosen: Option<&Path>,
         chats: Vec<String>,
         start: WorkStart,
     ) -> Result<(usize, u64), String> {
         let home = dirs::home_dir().ok_or("no home directory to put ~/Work in")?;
         let base = home.join(WORK_FOLDER);
-        let dir = overview::work_home(&base, name, chosen).map_err(|error| match chosen {
-            Some(dir) => format!("cannot use {} as the home folder: {error}", dir.display()),
-            None => format!("cannot create a folder in {}: {error}", base.display()),
-        })?;
+        let dir = overview::create_work_folder(&base, name)
+            .map_err(|error| format!("cannot create a folder in {}: {error}", base.display()))?;
         let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
         let mut workspace = Workspace::new(
             name.to_string(),
@@ -14503,7 +14481,7 @@ impl App {
     }
 
     /// The New workspace sheet's Create: the `~/Work/<slug>` folder is
-    /// created now (or the chosen folder used as is), the workspace joins
+    /// created now, the workspace joins
     /// the bar and becomes active with its starting repos and decisions
     /// repo, and a new Claude chat opens there; that chat joins the
     /// workspace's chats once it has a session id.
@@ -14527,9 +14505,7 @@ impl App {
                 return Task::none();
             }
         };
-        let chosen = sheet.home.clone();
-        let (_, uid) = match self.create_work_workspace(&name, chosen.as_deref(), Vec::new(), start)
-        {
+        let (_, uid) = match self.create_work_workspace(&name, Vec::new(), start) {
             Ok(made) => made,
             Err(error) => {
                 eprintln!("[workspace] new workspace {name:?}: {error}");
@@ -15741,6 +15717,14 @@ impl App {
             path_error: None,
             typed_seq: 0,
             awaiting_home: false,
+            start_hint: match (purpose, dirs::home_dir()) {
+                (FolderPickerPurpose::NewWork, Some(home)) => self
+                    .new_work_sheet
+                    .as_ref()
+                    .and_then(|sheet| repos_common_parent_below_home(&sheet.recent, &home))
+                    .map(|dir| dir.to_string_lossy().into_owned()),
+                _ => None,
+            },
         });
         let select = self.folder_picker_select_machine(remote_id);
         let surfaces = self.apply_webview_surfaces();
@@ -15762,7 +15746,11 @@ impl App {
         }
         let last = self.folder_picker_last_dirs.get(&remote_id).cloned();
         let home = self.folder_picker_home(remote_id.as_deref());
-        let start = folder_picker_start_dir(last.as_deref(), home.as_deref());
+        let hint = self
+            .folder_picker
+            .as_ref()
+            .and_then(|picker| picker.start_hint.clone());
+        let start = folder_picker_start_dir(last.as_deref(), hint.as_deref(), home.as_deref());
         let connect = match remote_id.as_deref() {
             Some(id) => self.ensure_remote_agent_connection(id, false),
             None => Task::none(),
@@ -15900,16 +15888,13 @@ impl App {
                 );
                 Task::none()
             }
-            (FolderPickerPurpose::NewWork(pick), None) => {
+            (FolderPickerPurpose::NewWork, None) => {
                 // Back to the sheet, still open beneath the picker. A
                 // linked worktree is a repo as its main checkout (TRU-191).
-                let dir = match pick {
-                    NewWorkPick::Home => PathBuf::from(dir),
-                    NewWorkPick::Repo => gitterm::workspace_repos::main_checkout(Path::new(&dir)),
-                };
+                let dir = gitterm::workspace_repos::main_checkout(Path::new(&dir));
                 match self.new_work_sheet.as_mut() {
                     Some(sheet) => {
-                        sheet.use_picked_folder(pick, dir);
+                        sheet.use_picked_folder(dir);
                         // The sheet stays up: its surfaces stay hidden.
                         return Task::batch([
                             self.apply_webview_surfaces(),
@@ -15918,16 +15903,16 @@ impl App {
                     }
                     None => {
                         eprintln!(
-                            "[workspace] {} picked for {pick:?}, but the New workspace sheet is closed",
+                            "[workspace] {} picked for a new work repo, but the New workspace sheet is closed",
                             dir.display()
                         );
                         Task::none()
                     }
                 }
             }
-            (FolderPickerPurpose::NewWork(pick), Some(remote_id)) => {
+            (FolderPickerPurpose::NewWork, Some(remote_id)) => {
                 eprintln!(
-                    "[workspace] {pick:?} on {remote_id}: new work picks folders on this Mac only"
+                    "[workspace] new work repo on {remote_id}: new work picks folders on this Mac only"
                 );
                 Task::none()
             }
@@ -26959,17 +26944,17 @@ fi
             Event::NewWorkRepoToggled(dir, picked) => {
                 if let Some(sheet) = self.new_work_sheet.as_mut() {
                     if picked {
-                        sheet.use_picked_folder(NewWorkPick::Repo, dir);
+                        sheet.use_picked_folder(dir);
                     } else {
                         sheet.remove_repo(&dir);
                     }
                 }
             }
-            Event::NewWorkBrowse(pick) => {
+            Event::NewWorkBrowse => {
                 if self.new_work_sheet.is_none() {
                     return Task::none();
                 }
-                return self.open_folder_picker(FolderPickerPurpose::NewWork(pick), None);
+                return self.open_folder_picker(FolderPickerPurpose::NewWork, None);
             }
             Event::NewWorkOpenExisting(action) => {
                 self.new_work_sheet = None;
@@ -28315,8 +28300,7 @@ fi
                     FolderPickerPurpose::NewWorkspace => "Select Workspace Folder",
                     FolderPickerPurpose::OpenFolder => "Select Folder",
                     FolderPickerPurpose::AddRepo(_) => "Add Repo to Workspace",
-                    FolderPickerPurpose::NewWork(NewWorkPick::Home) => "Select the Work's Folder",
-                    FolderPickerPurpose::NewWork(NewWorkPick::Repo) => "Add a Repo to the Work",
+                    FolderPickerPurpose::NewWork => "Add a Repo to the Work",
                 };
                 let dialog = Task::perform(
                     async move {
@@ -30245,8 +30229,7 @@ fi
             FolderPickerPurpose::NewWorkspace => "New workspace",
             FolderPickerPurpose::OpenFolder => "Open folder",
             FolderPickerPurpose::AddRepo(_) => "Add a repo to this workspace",
-            FolderPickerPurpose::NewWork(NewWorkPick::Home) => "The work's folder",
-            FolderPickerPurpose::NewWork(NewWorkPick::Repo) => "Add a repo to the new work",
+            FolderPickerPurpose::NewWork => "Add a repo to the new work",
         };
         let mut body = Column::new().spacing(8).width(Length::Fixed(520.0));
         body = body.push(text(title).size(font).color(text_primary));
@@ -30292,7 +30275,7 @@ fi
         ));
         // New work picks on this Mac only (its sheet has no other
         // machine), so no selector to pick another.
-        if !matches!(picker.purpose, FolderPickerPurpose::NewWork(_)) {
+        if !matches!(picker.purpose, FolderPickerPurpose::NewWork) {
             body = body.push(machines.wrap().vertical_spacing(6));
         }
 
@@ -31191,24 +31174,6 @@ fi
             ));
         }
 
-        // The folder: plain info, Change… the exception.
-        let folder = match &sheet.home {
-            Some(dir) => shown(dir),
-            None => new_work_home_preview(&sheet.name),
-        };
-        let folder = ellipsize_path_start(&folder, 56);
-        card = card.push(
-            row![
-                muted(&format!("Folder: {folder}")),
-                button(text("Change\u{2026}").size(font_small - 1.0))
-                    .style(self.ghost_button_style())
-                    .padding([0, 4])
-                    .on_press(Event::NewWorkBrowse(NewWorkPick::Home)),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-        );
-
         // Repos: browsed with the folder picker; Recent is a shortcut.
         let mut repos = Column::new().spacing(6).push(secondary("Repos (optional)"));
         if !sheet.repos.is_empty() {
@@ -31222,7 +31187,7 @@ fi
             button(text("Add repo\u{2026}").size(font_small))
                 .style(self.secondary_button_style())
                 .padding([4, 10])
-                .on_press(Event::NewWorkBrowse(NewWorkPick::Repo)),
+                .on_press(Event::NewWorkBrowse),
         );
         let shortcuts = sheet.recent_shortcuts();
         if !shortcuts.is_empty() {
@@ -47053,13 +47018,51 @@ mod tests {
     #[test]
     fn folder_picker_starts_at_last_choice_then_home_then_root() {
         assert_eq!(
-            folder_picker_start_dir(Some("/w/repo"), Some("/Users/t")),
+            folder_picker_start_dir(Some("/w/repo"), Some("/Users/t/Code"), Some("/Users/t")),
             "/w/repo"
         );
-        assert_eq!(folder_picker_start_dir(None, Some("/Users/t")), "/Users/t");
+        assert_eq!(
+            folder_picker_start_dir(None, Some("/Users/t/Code"), Some("/Users/t")),
+            "/Users/t/Code"
+        );
+        assert_eq!(
+            folder_picker_start_dir(None, None, Some("/Users/t")),
+            "/Users/t"
+        );
         // An older agent reports an empty home.
-        assert_eq!(folder_picker_start_dir(None, Some("")), "/");
-        assert_eq!(folder_picker_start_dir(None, None), "/");
+        assert_eq!(folder_picker_start_dir(None, None, Some("")), "/");
+        assert_eq!(folder_picker_start_dir(None, None, None), "/");
+    }
+
+    #[test]
+    fn repos_common_parent_is_the_deepest_shared_folder_below_home() {
+        let home = Path::new("/Users/t");
+        let dirs = |items: &[&str]| items.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            repos_common_parent_below_home(&dirs(&["/Users/t/Code/a", "/Users/t/Code/b"]), home),
+            Some(PathBuf::from("/Users/t/Code"))
+        );
+        assert_eq!(
+            repos_common_parent_below_home(&dirs(&["/Users/t/Code/a"]), home),
+            Some(PathBuf::from("/Users/t/Code"))
+        );
+        assert_eq!(
+            repos_common_parent_below_home(
+                &dirs(&["/Users/t/Code/x/a", "/Users/t/Code/y/b"]),
+                home
+            ),
+            Some(PathBuf::from("/Users/t/Code"))
+        );
+        // Home itself, or outside it, is no hint.
+        assert_eq!(
+            repos_common_parent_below_home(&dirs(&["/Users/t/a", "/Users/t/Code/b"]), home),
+            None
+        );
+        assert_eq!(
+            repos_common_parent_below_home(&dirs(&["/w/a", "/w/b"]), home),
+            None
+        );
+        assert_eq!(repos_common_parent_below_home(&[], home), None);
     }
 
     #[test]
@@ -47138,7 +47141,7 @@ mod tests {
             sheet.recent_shortcuts(),
             recent[..5].iter().collect::<Vec<_>>()
         );
-        sheet.use_picked_folder(NewWorkPick::Repo, PathBuf::from("/w/r2"));
+        sheet.use_picked_folder(PathBuf::from("/w/r2"));
         assert_eq!(
             sheet.recent_shortcuts(),
             [&recent[0], &recent[2], &recent[3], &recent[4], &recent[5]]
@@ -47152,12 +47155,11 @@ mod tests {
             error: Some("stale".to_string()),
             ..NewWorkSheet::default()
         };
-        sheet.use_picked_folder(NewWorkPick::Home, PathBuf::from("/w/notes"));
-        assert_eq!(sheet.home, Some(PathBuf::from("/w/notes")));
+        sheet.use_picked_folder(PathBuf::from("/w/api"));
         assert_eq!(sheet.error, None);
         // A repo joins once, in pick order; the name stays as typed.
         for dir in ["/w/api", "/w/web", "/w/api"] {
-            sheet.use_picked_folder(NewWorkPick::Repo, PathBuf::from(dir));
+            sheet.use_picked_folder(PathBuf::from(dir));
         }
         assert_eq!(sheet.repos, ["/w/api", "/w/web"].map(PathBuf::from));
         assert_eq!(sheet.name, "Cloud migration");
@@ -47166,7 +47168,6 @@ mod tests {
         sheet.remove_repo(Path::new("/w/api"));
         assert_eq!(sheet.repos, [PathBuf::from("/w/web")]);
         assert_eq!(sheet.decisions_repo, None);
-        assert_eq!(sheet.home, Some(PathBuf::from("/w/notes")));
     }
 
     fn existing(name: &str, status: ExistingWorkStatus) -> ExistingWork {
@@ -47242,13 +47243,6 @@ mod tests {
         assert!(existing_work_named(&work, "Old migration"));
         assert!(!existing_work_named(&work, "Cloud"));
         assert!(!existing_work_named(&work, "   "));
-    }
-
-    #[test]
-    fn ellipsize_path_start_keeps_the_end_of_long_paths() {
-        assert_eq!(ellipsize_path_start("~/a/b", 10), "~/a/b");
-        assert_eq!(ellipsize_path_start("~/abcdefghij", 6), "\u{2026}fghij");
-        assert_eq!(ellipsize_path_start("exactly", 7), "exactly");
     }
 
     #[test]
@@ -48085,22 +48079,6 @@ mod tests {
     }
 
     /// The New workspace sheet's home preview follows the name (TRU-194).
-    #[test]
-    fn new_work_home_preview_is_the_slug_under_work() {
-        assert_eq!(new_work_home_preview(""), "~/Work/\u{2026}");
-        assert_eq!(new_work_home_preview("   "), "~/Work/\u{2026}");
-        assert_eq!(
-            new_work_home_preview("Cloud migration"),
-            "~/Work/cloud-migration"
-        );
-        assert_eq!(
-            new_work_home_preview("PRJ-101: ship!"),
-            "~/Work/prj-101-ship"
-        );
-    }
-
-    /// Create lists the starting repos as added by hand, so they persist,
-    /// and sets the decisions repo; one not among them is rejected.
     #[test]
     fn new_work_starts_with_its_repos_and_decisions_repo() {
         let api = PathBuf::from("/w/api");

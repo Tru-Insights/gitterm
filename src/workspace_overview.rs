@@ -425,20 +425,6 @@ pub fn create_work_folder(base: &Path, name: &str) -> std::io::Result<PathBuf> {
     unreachable!("u32 suffixes exhausted under {}", base.display())
 }
 
-/// The home folder of a new workspace called `name` (TRU-205): `chosen`
-/// as is when one was picked (it must be an existing folder; nothing is
-/// created), else a new one under `base` by [`create_work_folder`].
-pub fn work_home(base: &Path, name: &str, chosen: Option<&Path>) -> std::io::Result<PathBuf> {
-    match chosen {
-        Some(dir) if dir.is_dir() => Ok(dir.to_path_buf()),
-        Some(dir) => Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{} is not a folder", dir.display()),
-        )),
-        None => create_work_folder(base, name),
-    }
-}
-
 /// Which coordinators the repos, branches and issues are read for: the
 /// interim answer until a workspace owns its chats (design step 4).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3351,34 +3337,6 @@ mod tests {
         let fourth = create_work_folder(&base, "Cloud migration").unwrap();
         assert_eq!(fourth, base.join("cloud-migration-4"));
         assert!(fourth.is_dir());
-    }
-
-    #[test]
-    fn work_home_is_the_chosen_folder_as_is_else_a_new_one_under_base() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("Work");
-        // The default: a new folder, suffixed when the slug is taken.
-        let made = work_home(&base, "Cloud migration", None).unwrap();
-        assert_eq!(made, base.join("cloud-migration"));
-        let again = work_home(&base, "Cloud migration", None).unwrap();
-        assert_eq!(again, base.join("cloud-migration-2"));
-
-        // A chosen folder that exists is used as is; nothing is created.
-        let chosen = temp.path().join("notes");
-        std::fs::create_dir(&chosen).unwrap();
-        let before: Vec<_> = std::fs::read_dir(temp.path()).unwrap().collect();
-        assert_eq!(
-            work_home(&base, "Cloud migration", Some(&chosen)).unwrap(),
-            chosen
-        );
-        let after: Vec<_> = std::fs::read_dir(temp.path()).unwrap().collect();
-        assert_eq!(before.len(), after.len());
-        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 2);
-
-        // A chosen folder that is gone is an error, not a new folder.
-        let gone = temp.path().join("gone");
-        assert!(work_home(&base, "Cloud migration", Some(&gone)).is_err());
-        assert!(!gone.exists());
     }
 
     /// Prints the overview of a workspace owning one real chat. Read-only.
