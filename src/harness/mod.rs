@@ -105,6 +105,11 @@ pub enum HarnessEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         commands: Vec<Value>,
     },
+    /// The harness cleared the conversation (Claude's `/clear`); the next
+    /// `TurnStarted` carries the new session's id.
+    ConversationReset {
+        trigger: Option<String>,
+    },
     /// The harness began working on a user message. Carries the session id
     /// the harness reports for this turn (Claude assigns it on the first
     /// message and repeats it every turn).

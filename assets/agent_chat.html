@@ -2986,6 +2986,11 @@
         else note(d.session_id ? 'Resumed Claude session ' + d.session_id.slice(0, 8) + ' · permission mode ' + (d.permission_mode || '?')
                           : 'Claude session ready · permission mode ' + (d.permission_mode || '?'));
         break;
+      case 'conversation_reset':
+        // `/clear` starts a new session; what is above stays in the old one.
+        endSegment(); endThinking();
+        note('Conversation cleared · Claude starts fresh; the messages above stay in the previous session');
+        break;
       case 'turn_started':
         // Claude starts a turn on its own when a background subagent
         // finishes; show it as running like any other turn.
