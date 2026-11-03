@@ -430,6 +430,20 @@ impl App {
             .collect()
     }
 
+    /// The PR's author is the gh account Approve would run as (the mapped
+    /// one, else the active one). Unknown either way: not own.
+    fn is_own_pr(&self, key: &PrKey, watched: Option<&WatchedPr>) -> bool {
+        let author = watched
+            .and_then(|w| w.snapshot.core.as_ref())
+            .map(|core| core.author.as_str());
+        let account = pr_watch::account_for(key.owner(), &self.github_accounts);
+        let login = match &account {
+            Some(user) => Some(user.as_str()),
+            None => self.prs.logins.get(&None).map(String::as_str),
+        };
+        pr_watch::is_own_pr(author, login)
+    }
+
     fn watched(&self, key: &PrKey) -> Option<&WatchedPr> {
         self.prs.watch.prs.get(&key.id())
     }
@@ -484,7 +498,7 @@ impl App {
                 continue;
             }
             let due = self.prs.due_now.contains(&id)
-                || watched.is_none_or(|watched| watched.due(interval, now));
+                || watched.is_none_or(|watched| watched.due(watched.interval_for(interval), now));
             if !due {
                 continue;
             }
@@ -865,10 +879,27 @@ impl App {
                 }
             }
             PrEvent::ActionRun => {
-                let Some(confirm) = self.prs.action.as_mut() else {
+                let Some(confirm) = self.prs.action.as_ref() else {
                     return Task::none();
                 };
                 if confirm.running {
+                    return Task::none();
+                }
+                // Merge re-checks the latest read: the checks may have
+                // turned pending or failing since the sheet opened.
+                let reason = if confirm.approve {
+                    None
+                } else {
+                    self.watched(&confirm.key)
+                        .map(WatchedPr::checks_gate)
+                        .unwrap_or(pr_watch::ChecksGate::Running)
+                        .reason()
+                };
+                let Some(confirm) = self.prs.action.as_mut() else {
+                    return Task::none();
+                };
+                if let Some(reason) = reason {
+                    confirm.error = Some(format!("Not merged: {reason}"));
                     return Task::none();
                 }
                 confirm.running = true;
@@ -1461,7 +1492,7 @@ impl App {
         let open = watched
             .and_then(WatchedPr::brief)
             .is_some_and(|brief| brief.state == merge_plan::PrState::Open);
-        let action = |label: &'static str, event: Option<Event>| {
+        let action = |label: String, event: Option<Event>| {
             let mut b = button(text(label).size(10).color(theme.text_primary()))
                 .style(self.ghost_button_style())
                 .padding([2, 8]);
@@ -1470,20 +1501,31 @@ impl App {
             }
             b
         };
-        body = body.push(
-            row![
-                action("Review", Some(Event::Pr(PrEvent::Review(key.clone())))),
-                action(
-                    "Approve",
-                    open.then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), true)))
-                ),
-                action(
-                    "Merge",
-                    open.then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), false)))
-                ),
-            ]
-            .spacing(4),
-        );
+        // Approve and Merge wait for the checks of the latest read.
+        let reason = watched
+            .map(WatchedPr::checks_gate)
+            .unwrap_or(pr_watch::ChecksGate::Running)
+            .reason();
+        let gated = |name: &str| match reason {
+            Some(reason) if open => format!("{name} ({reason})"),
+            _ => name.to_string(),
+        };
+        let mut actions = Row::new().spacing(4).push(action(
+            "Review".to_string(),
+            Some(Event::Pr(PrEvent::Review(key.clone()))),
+        ));
+        if !self.is_own_pr(key, watched) {
+            actions = actions.push(action(
+                gated("Approve"),
+                (open && reason.is_none())
+                    .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), true))),
+            ));
+        }
+        actions = actions.push(action(
+            gated("Merge"),
+            (open && reason.is_none()).then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), false))),
+        ));
+        body = body.push(actions);
         if let Some(watched) = watched {
             for item in watched.open_news() {
                 body = body.push(self.view_pr_news_item(root, watched, item, false));

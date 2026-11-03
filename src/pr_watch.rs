@@ -40,6 +40,9 @@ use crate::merge_plan::{MergeMethod, PrBrief, PrKey, PrState};
 pub const OPEN_INTERVAL: Duration = Duration::from_secs(120);
 /// Poll interval for PRs of parked workspaces.
 pub const PARKED_INTERVAL: Duration = Duration::from_secs(600);
+/// A PR whose last read had pending checks is read again after this, so
+/// Merge wakes up soon after the checks pass.
+pub const PENDING_INTERVAL: Duration = Duration::from_secs(30);
 /// One `gh` call gives up after this long; the process is killed.
 pub const GH_TIMEOUT: Duration = Duration::from_secs(20);
 /// A whole poll stops starting new PRs after this long; the rest wait for
@@ -150,6 +153,46 @@ impl ChecksState {
             ChecksState::Pending => "checks pending",
             ChecksState::None => "no checks",
         }
+    }
+}
+
+/// Whether Merge and Approve may run, going by the latest read's checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksGate {
+    Ready,
+    Running,
+    Failed,
+}
+
+impl ChecksGate {
+    /// `checks` is the latest read's state; `None` = not read yet, which
+    /// counts as pending. No checks at all counts as passed.
+    pub fn from_checks(checks: Option<ChecksState>) -> Self {
+        match checks {
+            None | Some(ChecksState::Pending) => ChecksGate::Running,
+            Some(ChecksState::Fail) => ChecksGate::Failed,
+            Some(ChecksState::Pass | ChecksState::None) => ChecksGate::Ready,
+        }
+    }
+
+    /// Why Merge / Approve is off; `None` when they may run.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            ChecksGate::Ready => None,
+            ChecksGate::Running => Some("checks running"),
+            ChecksGate::Failed => Some("checks failed"),
+        }
+    }
+}
+
+/// Whether the PR is the user's own: its author is the login the action
+/// would run as. Unknown on either side is not own (Approve stays shown).
+pub fn is_own_pr(author: Option<&str>, login: Option<&str>) -> bool {
+    match (author, login) {
+        (Some(author), Some(login)) => {
+            !author.is_empty() && !login.is_empty() && author.eq_ignore_ascii_case(login)
+        }
+        _ => false,
     }
 }
 
@@ -564,6 +607,21 @@ impl WatchedPr {
             .find(|item| matches!(item.kind, NewsKind::Merged | NewsKind::Closed))
             .map(|item| item.at.as_str())
             .or(self.checked_at.as_deref())
+    }
+
+    /// The checks gate of the latest read; a PR not read yet is pending.
+    pub fn checks_gate(&self) -> ChecksGate {
+        ChecksGate::from_checks(self.snapshot.core.as_ref().map(|_| self.snapshot.checks()))
+    }
+
+    /// `interval`, shortened to [`PENDING_INTERVAL`] while the last read
+    /// had pending checks.
+    pub fn interval_for(&self, interval: Duration) -> Duration {
+        if self.snapshot.core.is_some() && self.snapshot.checks() == ChecksState::Pending {
+            interval.min(PENDING_INTERVAL)
+        } else {
+            interval
+        }
     }
 
     /// Whether a poll is due after `interval` at `now`.
@@ -1814,6 +1872,71 @@ mod tests {
         pr.failed("gh api: HTTP 502".to_string(), "2026-10-31T10:00:00Z");
         assert!(!pr.due(OPEN_INTERVAL, now));
         assert_eq!(pr.error.as_deref(), Some("gh api: HTTP 502"));
+    }
+
+    #[test]
+    fn checks_gate_enables_only_when_passed() {
+        assert_eq!(ChecksGate::from_checks(None), ChecksGate::Running);
+        assert_eq!(
+            ChecksGate::from_checks(Some(ChecksState::Pending)),
+            ChecksGate::Running
+        );
+        assert_eq!(
+            ChecksGate::from_checks(Some(ChecksState::Fail)),
+            ChecksGate::Failed
+        );
+        assert_eq!(
+            ChecksGate::from_checks(Some(ChecksState::Pass)),
+            ChecksGate::Ready
+        );
+        assert_eq!(
+            ChecksGate::from_checks(Some(ChecksState::None)),
+            ChecksGate::Ready
+        );
+        assert_eq!(ChecksGate::Running.reason(), Some("checks running"));
+        assert_eq!(ChecksGate::Failed.reason(), Some("checks failed"));
+        assert_eq!(ChecksGate::Ready.reason(), None);
+
+        let mut pr = WatchedPr::new(PrKey::new("acme/api", 12));
+        assert_eq!(pr.checks_gate(), ChecksGate::Running);
+        pr.snapshot = snapshot(PrState::Open, "a1", vec![]);
+        assert_eq!(pr.checks_gate(), ChecksGate::Ready);
+        pr.snapshot = snapshot(PrState::Open, "a1", vec![check("t", CheckOutcome::Fail)]);
+        assert_eq!(pr.checks_gate(), ChecksGate::Failed);
+    }
+
+    #[test]
+    fn pending_checks_are_read_again_after_thirty_seconds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-31T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut pr = WatchedPr::new(PrKey::new("acme/api", 12));
+        pr.snapshot = snapshot(PrState::Open, "a1", vec![check("t", CheckOutcome::Pending)]);
+        pr.checked_at = Some("2026-10-31T09:59:20Z".to_string());
+        assert_eq!(pr.interval_for(OPEN_INTERVAL), PENDING_INTERVAL);
+        assert!(pr.due(pr.interval_for(OPEN_INTERVAL), now));
+        pr.checked_at = Some("2026-10-31T09:59:50Z".to_string());
+        assert!(!pr.due(pr.interval_for(OPEN_INTERVAL), now));
+        // Passed checks keep the normal interval.
+        pr.snapshot = snapshot(PrState::Open, "a1", vec![check("t", CheckOutcome::Pass)]);
+        pr.checked_at = Some("2026-10-31T09:59:20Z".to_string());
+        assert_eq!(pr.interval_for(OPEN_INTERVAL), OPEN_INTERVAL);
+        assert!(!pr.due(pr.interval_for(OPEN_INTERVAL), now));
+        // Never longer than the base interval.
+        assert_eq!(
+            pr.interval_for(Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn own_pr_needs_both_author_and_login() {
+        assert!(is_own_pr(Some("dev"), Some("dev")));
+        assert!(is_own_pr(Some("Dev"), Some("dev")));
+        assert!(!is_own_pr(Some("dev"), Some("reviewer")));
+        assert!(!is_own_pr(None, Some("dev")));
+        assert!(!is_own_pr(Some("dev"), None));
+        assert!(!is_own_pr(Some(""), Some("")));
     }
 
     #[test]
