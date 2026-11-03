@@ -464,10 +464,15 @@
   .chip-menu .section:first-child { border-top: none; margin-top: 0; }
   .chip-menu button:disabled { opacity: 0.45; }
   /* The composer's `/` menu (TRU-206) */
-  #slash-menu { right: 0; max-height: 260px; }
+  #slash-menu { right: 0; max-height: 360px; }
+  #slash-menu button { align-items: flex-start; gap: 12px; }
   #slash-menu button.selected { background: var(--bg-block); }
-  #slash-menu .name { flex: none; }
-  #slash-menu .sub { flex: 1; max-width: none; margin-left: 0; }
+  #slash-menu .name { flex: none; width: 32%; min-width: 140px; overflow-wrap: anywhere; }
+  /* Like the CLI's menu: an aligned name column, descriptions up to two lines */
+  #slash-menu .sub {
+    flex: 1; max-width: none; margin-left: 0; padding-left: 0; font-size: 12px;
+    white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
 
   /* Review… button and popover (left of the mode chip) */
   .review-wrap { position: relative; display: none; }
