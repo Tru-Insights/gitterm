@@ -1999,8 +1999,8 @@ impl NewWorkSheet {
 enum ExistingWorkStatus {
     Open,
     Parked,
-    /// Done or closed (Close parks then marks done): kept in the file,
-    /// with no path back to the bar, so it has no action.
+    /// Done or closed (Close parks then marks done): kept in the file;
+    /// Reopen clears the done state and resumes it.
     Done,
 }
 
@@ -2022,6 +2022,9 @@ pub enum ExistingWorkAction {
     Switch(u64),
     /// Resume the parked entry (`ParkedResume`).
     Resume(ParkedKey),
+    /// Reopen done work: clear its done state, then resume it
+    /// (`reopen_done`, `ParkedResume`).
+    Reopen(ParkedKey),
 }
 
 /// A piece of work that already exists, as the sheet lists it.
@@ -2029,7 +2032,6 @@ pub enum ExistingWorkAction {
 struct ExistingWork {
     name: String,
     status: ExistingWorkStatus,
-    /// `None` for done work.
     action: Option<ExistingWorkAction>,
 }
 
@@ -2434,6 +2436,22 @@ fn finish_parked(configs: &mut [WorkspaceConfig], key: &ParkedKey, stamp: String
     {
         Some(cfg) => {
             cfg.done_at = Some(stamp);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Reopen (TRU-205): clears the done state of the closed entry matching
+/// `key`, which puts it back on the Parked list. False when no done entry
+/// matches.
+fn reopen_done(configs: &mut [WorkspaceConfig], key: &ParkedKey) -> bool {
+    match configs
+        .iter_mut()
+        .find(|cfg| !cfg.active && cfg.done_at.is_some() && key.matches(cfg))
+    {
+        Some(cfg) => {
+            cfg.done_at = None;
             true
         }
         None => false,
@@ -14598,7 +14616,7 @@ impl App {
         work.extend(done.into_iter().map(|cfg| ExistingWork {
             name: cfg.name.clone(),
             status: ExistingWorkStatus::Done,
-            action: None,
+            action: Some(ExistingWorkAction::Reopen(ParkedKey::of(cfg))),
         }));
         work
     }
@@ -26964,6 +26982,18 @@ fi
                         }
                     },
                     ExistingWorkAction::Resume(key) => self.update(Event::ParkedResume(key)),
+                    ExistingWorkAction::Reopen(key) => {
+                        if reopen_done(&mut self.closed_workspace_configs, &key) {
+                            eprintln!("[workspace] {:?} reopened from done", key.name);
+                            self.mark_workspaces_dirty();
+                        } else {
+                            eprintln!(
+                                "[workspace] cannot reopen {:?} ({}): not done",
+                                key.name, key.dir
+                            );
+                        }
+                        self.update(Event::ParkedResume(key))
+                    }
                 };
                 return Task::batch([opened, self.apply_webview_surfaces()]);
             }
@@ -31278,7 +31308,7 @@ fi
     }
 
     /// An existing work row of the Workspace sheet: name, status and its
-    /// action (none for done work).
+    /// action.
     fn view_existing_work_row(
         &self,
         item: &ExistingWork,
@@ -31303,6 +31333,7 @@ fi
             let label = match action {
                 ExistingWorkAction::Switch(_) => "Switch",
                 ExistingWorkAction::Resume(_) => "Resume",
+                ExistingWorkAction::Reopen(_) => "Reopen",
             };
             line = line.push(
                 button(text(label).size(font_small))
@@ -47477,6 +47508,33 @@ mod tests {
         // A work workspace: its roots and children.
         let chats = park_note_chats(&entries, &["b".to_string()], &none, &["a".to_string()]);
         assert_eq!(park_note_prefill(&chats), "their line");
+    }
+
+    #[test]
+    fn reopen_turns_a_done_entry_back_into_a_parked_one() {
+        let mut done = closed_config("Docs", Some("2026-01-01T00:00:00Z"));
+        done.done_at = Some("2026-01-02T00:00:00Z".to_string());
+        let key = ParkedKey::of(&done);
+        let mut configs = vec![done];
+        assert!(!configs[0].is_parked());
+        assert!(parked_order(&configs).is_empty());
+        assert!(reopen_done(&mut configs, &key));
+        assert!(configs[0].is_parked());
+        assert_eq!(configs[0].done_at, None);
+        assert!(configs[0].parked.is_some());
+        // `existing_work` takes parked entries from `parked_order`, so the
+        // matcher now reports it as parked, resumable by the same key.
+        assert_eq!(parked_order(&configs), [0]);
+        let work = vec![ExistingWork {
+            name: configs[0].name.clone(),
+            status: ExistingWorkStatus::Parked,
+            action: Some(ExistingWorkAction::Resume(ParkedKey::of(&configs[0]))),
+        }];
+        let found = existing_work_matches(&work, "docs");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].status, ExistingWorkStatus::Parked);
+        // Not done any more: nothing to reopen.
+        assert!(!reopen_done(&mut configs, &key));
     }
 
     #[test]
