@@ -29322,16 +29322,18 @@ fi
     }
 
     fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
-        let base = self.view_base();
-        match self.view_bar_hint() {
-            Some(hint) => Stack::new()
-                .push(base)
-                .push(hint)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-            None => base,
-        }
+        // Always the same Stack, so showing the bar hint doesn't rebuild
+        // the widget tree: a rebuild reset the hovered bar item's state,
+        // which re-entered the hover and hid the hint again at once.
+        let hint = self
+            .view_bar_hint()
+            .unwrap_or_else(|| iced::widget::Space::new().into());
+        Stack::new()
+            .push(self.view_base())
+            .push(hint)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn view_base(&self) -> Element<'_, Event, Theme, iced::Renderer> {
