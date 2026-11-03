@@ -44,6 +44,7 @@ mod hover_bounds;
 mod tab;
 mod theme;
 mod v5_pickup;
+mod work_issues;
 mod work_prs;
 mod workspace_bar;
 
@@ -91,6 +92,7 @@ use gitterm::worktree_follow::{
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab};
 use webview::WebviewSurface;
+use work_issues::IssueEvent;
 use work_prs::PrEvent;
 
 // Start with just config for now to avoid conflicts
@@ -6755,6 +6757,8 @@ pub enum Event {
     NewWorkCancel,
     /// PRs of the work: watch, merge plans, Approve / Merge (TRU-173).
     Pr(PrEvent),
+    /// The Work page's Issues: titles from `linear`, fold, open (TRU-203).
+    Issue(IssueEvent),
     /// Open the review pane on an owned checkout (TRU-178).
     ReviewOpen(PathBuf, overview::DiffSource),
     /// A review load finished, for this generation.
@@ -7187,6 +7191,8 @@ struct App {
     /// PRs of the work (TRU-173): merge plans, the PR watch, the Approve /
     /// Merge confirmation and the Ready to merge list.
     prs: work_prs::PrsState,
+    /// The Work page's Issues section (TRU-203): cached titles and the fold.
+    issues: work_issues::IssuesState,
     /// `github-accounts.json` (shared config dir): gh account per GitHub owner.
     github_accounts: std::collections::BTreeMap<String, String>,
     /// The review pane (TRU-178) while the Viewer shows it.
@@ -17610,6 +17616,7 @@ impl App {
             park_sheet: None,
             parked_list_open: false,
             prs: work_prs::PrsState::load(&config::global_config_dir()),
+            issues: work_issues::IssuesState::load(&config::global_config_dir()),
             github_accounts: config::load_github_accounts(),
             review_pane: None,
             review_generation: 0,
@@ -21023,6 +21030,8 @@ fi
                 tasks.push(self.poll_pr_watch());
                 // Its actionable news, to idle coordinators (TRU-197).
                 tasks.push(self.auto_tell_coordinators());
+                // Titles of the shown Issues, from `linear` (TRU-203).
+                tasks.push(self.poll_issue_titles());
                 // ~/Work commits and pushes itself (TRU-201).
                 tasks.push(self.poll_work_notes());
                 // Closed tabs release their browser targets (TRU-176).
@@ -26569,6 +26578,7 @@ fi
                 }
             }
             Event::Pr(event) => return self.update_prs(event),
+            Event::Issue(event) => return self.update_issues(event),
             Event::ToggleChatOpenSection => {
                 self.chat_open_section_collapsed = !self.chat_open_section_collapsed;
             }
@@ -35423,12 +35433,7 @@ fi
                     "ISSUES \u{00B7} {}",
                     summary.issue_keys.len()
                 )))
-                .push(
-                    text(summary.issue_keys.join(" \u{00B7} "))
-                        .size(font_small)
-                        .color(text_secondary)
-                        .font(mono),
-                );
+                .push(self.view_work_issues(&summary.issue_keys));
         }
         for error in &state.errors {
             content = content.push(
