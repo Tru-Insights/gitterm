@@ -8154,6 +8154,18 @@ fn folder_picker_typed_path(input: &str, home: Option<&str>) -> Result<String, S
     Ok(resolved)
 }
 
+/// Cut a long path to at most `max` characters, keeping the end (the part
+/// that tells folders apart) and marking the cut with a leading ellipsis.
+fn ellipsize_path_start(path: &str, max: usize) -> String {
+    let count = path.chars().count();
+    if count <= max {
+        return path.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let tail: String = path.chars().skip(count - keep).collect();
+    format!("\u{2026}{tail}")
+}
+
 /// A picker path for display, with the machine's home shown as "~".
 fn folder_picker_tilde(path: &str, home: Option<&str>) -> String {
     let Some(home) = home
@@ -8396,6 +8408,168 @@ impl App {
                 button::Status::Hovered => (Some(hover_bg.into()), text_color),
                 button::Status::Pressed => (Some(hover_bg.into()), text_color),
                 _ => (None, text_muted),
+            };
+            button::Style {
+                background: bg,
+                text_color: tc,
+                border: iced::Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Text input in GitTerm's palette: base fill, accent border when focused.
+    fn input_style(&self) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
+        let base = self.theme.bg_base();
+        let border = self.theme.border();
+        let accent = self.theme.accent();
+        let text_primary = self.theme.text_primary();
+        let text_muted = self.theme.text_muted();
+        move |_, status| text_input::Style {
+            background: base.into(),
+            border: iced::Border {
+                color: if matches!(status, text_input::Status::Focused { .. }) {
+                    accent
+                } else {
+                    border
+                },
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            icon: iced::Color::TRANSPARENT,
+            placeholder: text_muted,
+            value: text_primary,
+            selection: iced::Color { a: 0.35, ..accent },
+        }
+    }
+
+    /// Checkbox in GitTerm's palette: accent fill when checked, readable label.
+    fn checkbox_style(&self) -> impl Fn(&Theme, checkbox::Status) -> checkbox::Style {
+        let accent = self.theme.accent();
+        let bg_base = self.theme.bg_base();
+        let border_color = self.theme.border();
+        let text_primary = self.theme.text_primary();
+        move |_, status| {
+            let checked = matches!(
+                status,
+                checkbox::Status::Active { is_checked: true }
+                    | checkbox::Status::Hovered { is_checked: true }
+                    | checkbox::Status::Disabled { is_checked: true }
+            );
+            checkbox::Style {
+                background: if checked { accent } else { bg_base }.into(),
+                icon_color: bg_base,
+                border: iced::Border {
+                    color: if checked { accent } else { border_color },
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                text_color: Some(text_primary),
+            }
+        }
+    }
+
+    /// Pick list field in GitTerm's palette.
+    fn pick_list_style(&self) -> impl Fn(&Theme, pick_list::Status) -> pick_list::Style {
+        let accent = self.theme.accent();
+        let bg_base = self.theme.bg_base();
+        let border_color = self.theme.border();
+        let text_primary = self.theme.text_primary();
+        let text_muted = self.theme.text_muted();
+        move |_, status| pick_list::Style {
+            text_color: text_primary,
+            placeholder_color: text_muted,
+            handle_color: if matches!(status, pick_list::Status::Hovered) {
+                accent
+            } else {
+                text_muted
+            },
+            background: bg_base.into(),
+            border: iced::Border {
+                color: if matches!(status, pick_list::Status::Opened { .. }) {
+                    accent
+                } else {
+                    border_color
+                },
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+        }
+    }
+
+    /// Dropdown menu of a pick list, matching [`Self::pick_list_style`].
+    fn pick_list_menu_style(&self) -> impl Fn(&Theme) -> iced::overlay::menu::Style {
+        let surface = self.theme.bg_surface();
+        let overlay = self.theme.bg_overlay();
+        let border_color = self.theme.border();
+        let text_primary = self.theme.text_primary();
+        move |_| iced::overlay::menu::Style {
+            background: surface.into(),
+            border: iced::Border {
+                color: border_color,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            text_color: text_primary,
+            selected_text_color: text_primary,
+            selected_background: overlay.into(),
+            shadow: Default::default(),
+        }
+    }
+
+    /// Main action button: accent fill, dimmed but legible when disabled.
+    fn primary_button_style(&self) -> impl Fn(&Theme, button::Status) -> button::Style {
+        let accent = self.theme.accent();
+        let text_color = self.theme.bg_base();
+        move |_, status| {
+            let (bg, tc) = match status {
+                button::Status::Hovered => (
+                    iced::Color {
+                        r: accent.r + (1.0 - accent.r) * 0.15,
+                        g: accent.g + (1.0 - accent.g) * 0.15,
+                        b: accent.b + (1.0 - accent.b) * 0.15,
+                        a: accent.a,
+                    },
+                    text_color,
+                ),
+                button::Status::Disabled => (
+                    iced::Color { a: 0.45, ..accent },
+                    iced::Color {
+                        a: 0.8,
+                        ..text_color
+                    },
+                ),
+                _ => (accent, text_color),
+            };
+            button::Style {
+                background: Some(bg.into()),
+                text_color: tc,
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Secondary action button: transparent, `overlay0` border, tint on hover.
+    fn secondary_button_style(&self) -> impl Fn(&Theme, button::Status) -> button::Style {
+        let border_color = self.theme.overlay0();
+        let hover_bg = self.theme.bg_overlay();
+        let text_color = self.theme.text_primary();
+        let muted = self.theme.text_muted();
+        move |_, status| {
+            let (bg, tc) = match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    (Some(hover_bg.into()), text_color)
+                }
+                button::Status::Disabled => (None, muted),
+                _ => (None, text_color),
             };
             button::Style {
                 background: bg,
@@ -29965,13 +30139,13 @@ fi
             .push(iced::widget::Space::new().width(Length::Fill))
             .push(
                 button(text("Cancel").size(font_small))
-                    .style(button::secondary)
+                    .style(self.secondary_button_style())
                     .padding([6, 12])
                     .on_press(Event::FolderPickerCancel),
             )
             .push(
                 button(text("Use this folder").size(font_small))
-                    .style(button::primary)
+                    .style(self.primary_button_style())
                     .padding([6, 12])
                     .on_press_maybe(can_confirm.then_some(Event::FolderPickerConfirm)),
             );
@@ -30708,15 +30882,20 @@ fi
             let picked = sheet.repos.contains(dir);
             let toggled = dir.clone();
             repos = repos.push(
-                checkbox(picked)
-                    .label(format!(
-                        "{} \u{00B7} {}",
-                        gitterm::workspace_repos::repo_name(dir),
-                        shown(dir)
-                    ))
-                    .on_toggle(move |on| Event::NewWorkRepoToggled(toggled.clone(), on))
-                    .size(14)
-                    .text_size(font_small),
+                row![
+                    checkbox(picked)
+                        .label(gitterm::workspace_repos::repo_name(dir))
+                        .on_toggle(move |on| Event::NewWorkRepoToggled(toggled.clone(), on))
+                        .size(14)
+                        .text_size(font_small)
+                        .style(self.checkbox_style()),
+                    text(ellipsize_path_start(&shown(dir), 38))
+                        .size(font_small)
+                        .color(theme.text_muted())
+                        .wrapping(iced::widget::text::Wrapping::None),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
             );
         }
         let picked_note = match sheet.repos.len() {
@@ -30745,6 +30924,8 @@ fi
                 .width(Length::Fill)
                 .padding([4, 8])
                 .text_size(font_small)
+                .style(self.pick_list_style())
+                .menu_style(self.pick_list_menu_style())
                 .into()
         };
 
@@ -30765,6 +30946,7 @@ fi
                     .on_submit(Event::NewWorkSubmit)
                     .size(font_small)
                     .padding([6, 8])
+                    .style(self.input_style())
                     .into(),
             ))
             .push(field(
@@ -30779,14 +30961,15 @@ fi
                 text_input("Filter repos", &sheet.query)
                     .on_input(Event::NewWorkQueryChanged)
                     .size(font_small)
-                    .padding([4, 8]),
+                    .padding([4, 8])
+                    .style(self.input_style()),
             )
             .push(container(scrollable(repos)).max_height(132.0))
             .push(field("Decisions repo", decisions))
             .push(field(
                 "Home folder",
                 muted(format!(
-                    "{} (a -2, -3 suffix if taken)",
+                    "{} (a number is added if the folder exists)",
                     new_work_home_preview(&sheet.name)
                 )),
             ));
@@ -30802,11 +30985,11 @@ fi
                     .on_press(Event::NewWorkOpenFolder),
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("Cancel").size(font_small))
-                    .style(button::secondary)
+                    .style(self.secondary_button_style())
                     .padding([6, 12])
                     .on_press(Event::NewWorkCancel),
                 button(text("Create").size(font_small))
-                    .style(button::primary)
+                    .style(self.primary_button_style())
                     .padding([6, 12])
                     .on_press_maybe(can_create.then_some(Event::NewWorkSubmit)),
             ]
@@ -30890,15 +31073,15 @@ fi
                 row![
                     iced::widget::Space::new().width(Length::Fill),
                     button(text("Cancel").size(font_small))
-                        .style(button::secondary)
+                        .style(self.secondary_button_style())
                         .padding([6, 12])
                         .on_press(Event::ParkCancel),
                     button(text("Park").size(font_small))
-                        .style(button::secondary)
+                        .style(self.secondary_button_style())
                         .padding([6, 12])
                         .on_press(Event::ParkSubmit),
                     button(text("Close").size(font_small))
-                        .style(button::primary)
+                        .style(self.primary_button_style())
                         .padding([6, 12])
                         .on_press(Event::CloseConfirm),
                 ]
@@ -30930,14 +31113,16 @@ fi
                     .on_input(Event::ParkNoteChanged)
                     .on_submit(Event::ParkSubmit)
                     .size(font_small)
-                    .padding([6, 8]),
+                    .padding([6, 8])
+                    .style(self.input_style()),
             )
             .push(
                 checkbox(sheet.keep_running)
                     .label("Keep running")
                     .on_toggle(Event::ParkKeepRunningToggled)
                     .size(14)
-                    .text_size(font_small),
+                    .text_size(font_small)
+                    .style(self.checkbox_style()),
             );
         if !sheet.keep_running && Self::workspace_chat_working(ws) {
             card = card.push(
@@ -30950,11 +31135,11 @@ fi
             row![
                 iced::widget::Space::new().width(Length::Fill),
                 button(text("Cancel").size(font_small))
-                    .style(button::secondary)
+                    .style(self.secondary_button_style())
                     .padding([6, 12])
                     .on_press(Event::ParkCancel),
                 button(text("Park").size(font_small))
-                    .style(button::primary)
+                    .style(self.primary_button_style())
                     .padding([6, 12])
                     .on_press(Event::ParkSubmit),
             ]
@@ -31024,7 +31209,7 @@ fi
                 row![
                     iced::widget::Space::new().width(Length::Fill),
                     button(text("Close").size(font_small))
-                        .style(button::secondary)
+                        .style(self.secondary_button_style())
                         .padding([6, 12])
                         .on_press(Event::ParkedListToggle),
                 ]
@@ -31092,7 +31277,7 @@ fi
         let row_content = row![
             lines,
             button(text("Resume").size(font_small))
-                .style(button::primary)
+                .style(self.primary_button_style())
                 .padding([4, 10])
                 .on_press(Event::ParkedResume(key.clone())),
             button(text("Done").size(font_small))
@@ -32233,6 +32418,7 @@ fi
                 .padding([1, 4])
                 .width(Length::Fixed(160.0))
                 .font(iced::Font::with_name("Menlo"))
+                .style(self.input_style())
                 .into(),
             None => iced::widget::mouse_area(
                 text(if is_active {
@@ -34010,7 +34196,7 @@ fi
                         .size(16)
                         .color(theme.text_primary()),
                     button(text("Open Folder").size(14))
-                        .style(button::primary)
+                        .style(self.primary_button_style())
                         .padding([8, 16])
                         .on_press(Event::OpenFolder)
                 ]
@@ -34967,7 +35153,8 @@ fi
                             .size(font_small - 1.0)
                             .padding([2, 4])
                             .width(Length::Fixed(160.0))
-                            .font(mono),
+                            .font(mono)
+                            .style(self.input_style()),
                     ),
                     (None, Some(command)) => head
                         .push(
@@ -35105,6 +35292,7 @@ fi
                 .size(font_small)
                 .padding([3, 6])
                 .width(Length::Fill)
+                .style(self.input_style())
                 .into(),
             None => row![
                 iced::widget::mouse_area(
@@ -36238,7 +36426,7 @@ fi
                         .size(12)
                         .color(text_muted),
                     button(text("Back to General").size(12))
-                        .style(button::secondary)
+                        .style(self.secondary_button_style())
                         .padding([6, 12])
                         .on_press(Event::TaskContextBack),
                 ]
@@ -36277,7 +36465,7 @@ fi
             "+ Continue ▾".to_string()
         };
         let action = button(text(action_label).size(12).font(mono))
-            .style(button::primary)
+            .style(self.primary_button_style())
             .padding([7, 14])
             .on_press_maybe(can_add_session.then(|| Event::TaskChildAdd(task.task_id.clone())));
         let archive = button(text("Archive").size(12).font(mono))
@@ -36560,7 +36748,7 @@ fi
         {
             verbs = verbs.push(
                 button(text("▸ Resume").size(12).font(mono))
-                    .style(button::secondary)
+                    .style(self.secondary_button_style())
                     .padding([7, 12])
                     .on_press(Event::TaskResume(task.task_id.clone())),
             );
@@ -36568,7 +36756,7 @@ fi
         if let Some(session_id) = first_open_session.clone().flatten() {
             verbs = verbs.push(
                 button(text("Go to session").size(12).font(mono))
-                    .style(button::secondary)
+                    .style(self.secondary_button_style())
                     .padding([7, 12])
                     .on_press(Event::TaskFocusSession(session_id)),
             );
@@ -36579,7 +36767,7 @@ fi
         {
             verbs = verbs.push(
                 button(text("Review changes").size(12).font(mono))
-                    .style(button::secondary)
+                    .style(self.secondary_button_style())
                     .padding([7, 12])
                     .on_press(Event::TaskReviewChanges(task.task_id.clone())),
             );
@@ -36596,14 +36784,14 @@ fi
                             .size(12)
                             .font(mono),
                     )
-                    .style(button::secondary)
+                    .style(self.secondary_button_style())
                     .padding([7, 12])
                     .on_press_maybe((!busy).then(|| Event::TaskPushBranch(task.task_id.clone()))),
                 );
                 if task.delivery.pr_url.is_none() && !busy {
                     verbs = verbs.push(
                         button(text("Open draft PR").size(12).font(mono))
-                            .style(button::secondary)
+                            .style(self.secondary_button_style())
                             .padding([7, 12])
                             .on_press(Event::TaskOpenDraftPr(task.task_id.clone())),
                     );
@@ -37604,10 +37792,13 @@ fi
             ]
             .spacing(4);
 
-            let row_btn_style = if is_selected_file {
-                button::primary
-            } else {
-                button::text
+            let selected_style = self.primary_button_style();
+            let row_btn_style = move |t: &Theme, status: button::Status| {
+                if is_selected_file {
+                    selected_style(t, status)
+                } else {
+                    button::text(t, status)
+                }
             };
 
             let mut file_btn = button(entry_row)
@@ -42511,10 +42702,13 @@ fi
         ]
         .spacing(8);
 
-        let btn_style = if is_selected {
-            button::primary
-        } else {
-            button::text
+        let selected_style = self.primary_button_style();
+        let btn_style = move |t: &Theme, status: button::Status| {
+            if is_selected {
+                selected_style(t, status)
+            } else {
+                button::text(t, status)
+            }
         };
 
         let select_btn = button(file_row)
@@ -43345,10 +43539,15 @@ fi
             .padding([4, 8]);
 
         let prev_btn = button(text("<").size(font))
-            .style(if has_matches {
-                button::secondary
-            } else {
-                button::text
+            .style({
+                let secondary = self.secondary_button_style();
+                move |t: &Theme, status: button::Status| {
+                    if has_matches {
+                        secondary(t, status)
+                    } else {
+                        button::text(t, status)
+                    }
+                }
             })
             .padding([4, 8])
             .on_press_maybe(if has_matches {
@@ -43358,10 +43557,15 @@ fi
             });
 
         let next_btn = button(text(">").size(font))
-            .style(if has_matches {
-                button::secondary
-            } else {
-                button::text
+            .style({
+                let secondary = self.secondary_button_style();
+                move |t: &Theme, status: button::Status| {
+                    if has_matches {
+                        secondary(t, status)
+                    } else {
+                        button::text(t, status)
+                    }
+                }
             })
             .padding([4, 8])
             .on_press_maybe(if has_matches {
@@ -46463,6 +46667,13 @@ mod tests {
         assert!(folder_picker_typed_path("   ", home).is_err());
         // "~user" is not expanded (and so not absolute).
         assert!(folder_picker_typed_path("~other/x", home).is_err());
+    }
+
+    #[test]
+    fn ellipsize_path_start_keeps_the_end_of_long_paths() {
+        assert_eq!(ellipsize_path_start("~/a/b", 10), "~/a/b");
+        assert_eq!(ellipsize_path_start("~/abcdefghij", 6), "\u{2026}fghij");
+        assert_eq!(ellipsize_path_start("exactly", 7), "exactly");
     }
 
     #[test]
