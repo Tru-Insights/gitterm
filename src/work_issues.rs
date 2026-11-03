@@ -271,6 +271,9 @@ impl App {
                 (None, None) => "Not read from Linear yet".to_string(),
             };
             card = card.push(text(detail).size(10).color(text_muted));
+            if let Some(description) = found.and_then(|entry| entry.description.as_deref()) {
+                card = card.push(text(description.to_string()).size(11).color(text_primary));
+            }
             let tip = self.rail_tooltip(container(card).max_width(360.0));
             col = col.push(iced::widget::tooltip(
                 line,

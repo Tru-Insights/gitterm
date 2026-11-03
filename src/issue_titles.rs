@@ -147,10 +147,55 @@ pub struct IssueInfo {
     pub url: String,
     pub state: String,
     pub assignee: Option<String>,
+    /// The start of the description as plain text ([`description_excerpt`]).
+    pub description: Option<String>,
 }
 
-/// Reads `identifier`, `title`, `url` and `state.name` (all required) and
-/// `assignee` (`displayName`, else `name`; null when unassigned).
+/// Characters of the description kept for the hover.
+pub const DESCRIPTION_CHARS: usize = 400;
+
+/// The first [`DESCRIPTION_CHARS`] of a Markdown description as one plain
+/// paragraph: heading, list, quote and emphasis markers dropped, links
+/// reduced to their text, whitespace collapsed. `None` when empty.
+pub fn description_excerpt(markdown: &str) -> Option<String> {
+    let mut words: Vec<String> = Vec::new();
+    for line in markdown.lines() {
+        let line = line
+            .trim()
+            .trim_start_matches(['#', '>', '-', '*', '+'])
+            .trim();
+        if line.starts_with("```") || line.starts_with("![") {
+            continue;
+        }
+        for word in line.split_whitespace() {
+            words.push(word.to_string());
+        }
+    }
+    let joined = words.join(" ");
+    let mut plain = String::with_capacity(joined.len());
+    let mut chars = joined.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' | '_' | '`' => {}
+            // [text](url) keeps the text.
+            ']' if chars.peek() == Some(&'(') => {
+                for c in chars.by_ref() {
+                    if c == ')' {
+                        break;
+                    }
+                }
+            }
+            '[' => {}
+            c => plain.push(c),
+        }
+    }
+    let plain = plain.trim();
+    (!plain.is_empty()).then(|| shorten(plain, DESCRIPTION_CHARS))
+}
+
+/// Reads `identifier`, `title`, `url` and `state.name` (all required),
+/// `assignee` (`displayName`, else `name`; null when unassigned) and the
+/// optional `description`.
 pub fn parse_issue(json: &str) -> Result<IssueInfo, String> {
     let value: Value =
         serde_json::from_str(json).map_err(|error| format!("issue JSON: {error}"))?;
@@ -196,12 +241,17 @@ pub fn parse_issue(json: &str) -> Result<IssueInfo, String> {
                 .ok_or("issue JSON assignee has no displayName or name")?,
         ),
     };
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .and_then(description_excerpt);
     Ok(IssueInfo {
         identifier,
         title,
         url,
         state,
         assignee,
+        description,
     })
 }
 
@@ -228,6 +278,9 @@ pub struct CachedIssue {
     pub state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// The description's start, for the hover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// RFC 3339.
     pub fetched_at: String,
     /// No workspace knew the key at `fetched_at`.
@@ -242,6 +295,7 @@ impl CachedIssue {
             url: Some(info.url),
             state: Some(info.state),
             assignee: info.assignee,
+            description: info.description,
             fetched_at: at.to_string(),
             not_found: false,
         }
@@ -588,6 +642,22 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
         "assignee": {"name": "pat", "displayName": "Pat Example"},
         "priority": 2
     }"#;
+
+    #[test]
+    fn descriptions_become_a_short_plain_paragraph() {
+        assert_eq!(
+            description_excerpt("## Goal\n\n- Make **the widget** [faster](https://x/y)\n```\ncode\n```\n> quoted `bit`").as_deref(),
+            Some("Goal Make the widget faster code quoted bit")
+        );
+        assert_eq!(description_excerpt("  \n\n"), None);
+        let long = "word ".repeat(200);
+        let excerpt = description_excerpt(&long).unwrap();
+        assert!(excerpt.chars().count() <= DESCRIPTION_CHARS + 1);
+        assert_eq!(
+            parse_issue(ISSUE).unwrap().description.as_deref(),
+            Some("long text")
+        );
+    }
 
     #[test]
     fn issue_json_gives_title_url_state_and_assignee() {
