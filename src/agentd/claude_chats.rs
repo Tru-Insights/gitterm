@@ -902,6 +902,7 @@ mod tests {
                 permission_mode: Some("default".into()),
                 models: Vec::new(),
                 modes: Vec::new(),
+                commands: Vec::new(),
             },
         );
         h.emit(0, turn_started("s1"));
@@ -940,6 +941,7 @@ mod tests {
                 permission_mode: Some("default".into()),
                 models: Vec::new(),
                 modes: Vec::new(),
+                commands: Vec::new(),
             },
         ); // 1
         h.emit(0, turn_started("s1")); // 2

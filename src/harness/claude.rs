@@ -425,6 +425,7 @@ impl ClaudeFrameParser {
                     permission_mode: body["current_permission_mode"].as_str().map(str::to_string),
                     models: body["models"].as_array().cloned().unwrap_or_default(),
                     modes: Vec::new(),
+                    commands: body["commands"].as_array().cloned().unwrap_or_default(),
                 }));
             }
             (HostRequest::Initialize { .. }, Err(e)) => out.push(ParsedFrame::Event(
@@ -2391,6 +2392,7 @@ mod tests {
             session_id,
             permission_mode,
             models,
+            commands,
             ..
         }] = evs.as_slice()
         else {
@@ -2399,6 +2401,7 @@ mod tests {
         assert_eq!(session_id.as_deref(), Some("abc"));
         assert_eq!(permission_mode.as_deref(), Some("default"));
         assert!(!models.is_empty());
+        assert_eq!(commands[0]["name"], "deep-research");
         assert!(matches!(
             frames.last(),
             Some(ParsedFrame::HostRequestDone {
@@ -3349,6 +3352,7 @@ mod tests {
             permission_mode: None,
             models: Vec::new(),
             modes: Vec::new(),
+            commands: Vec::new(),
         };
         let request = HarnessEvent::RuntimeRequest {
             request_id: "r1".into(),

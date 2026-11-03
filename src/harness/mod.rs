@@ -99,6 +99,11 @@ pub enum HarnessEvent {
         /// Claude, whose permission modes the page knows.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         modes: Vec<Value>,
+        /// The slash commands and skills the session accepts, passed
+        /// through as `{name, description, argumentHint}`, for the
+        /// composer's `/` menu. Empty for ACP agents.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        commands: Vec<Value>,
     },
     /// The harness began working on a user message. Carries the session id
     /// the harness reports for this turn (Claude assigns it on the first
@@ -563,12 +568,14 @@ mod tests {
                 permission_mode: Some("default".into()),
                 models: vec![json!({"value": "haiku"})],
                 modes: Vec::new(),
+                commands: vec![json!({"name": "checkpoint", "description": "Save"})],
             },
             HarnessEvent::Ready {
                 session_id: Some("g".into()),
                 permission_mode: Some("plan".into()),
                 models: Vec::new(),
                 modes: vec![json!({"value": "plan", "displayName": "Plan"})],
+                commands: Vec::new(),
             },
             HarnessEvent::HistoryReplayed {
                 entries: vec![
