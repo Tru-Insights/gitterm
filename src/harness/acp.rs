@@ -1632,6 +1632,7 @@ impl Session {
             permission_mode: self.settings.current(Setting::Mode),
             models: self.settings.page_models(),
             modes: self.settings.page_modes(),
+            commands: Vec::new(),
         });
         // The tab and page start from the tab's config; where the agent
         // ended up elsewhere (a rejected setting, or no model configured),

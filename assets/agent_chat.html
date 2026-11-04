@@ -343,7 +343,7 @@
   /* Composer */
   /* Composer (T3 Code layout): the message box full width on top, a
      toolbar of compact chips below it with Send/Stop on the right. */
-  #composer { display: flex; flex-direction: column; gap: 6px; }
+  #composer { position: relative; display: flex; flex-direction: column; gap: 6px; }
   #prompt {
     width: 100%;
     min-height: 56px;
@@ -463,6 +463,16 @@
   .chip-menu .section { padding: 6px 8px 2px; color: var(--fg-muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; border-top: 1px solid var(--border); margin-top: 4px; }
   .chip-menu .section:first-child { border-top: none; margin-top: 0; }
   .chip-menu button:disabled { opacity: 0.45; }
+  /* The composer's `/` menu (TRU-206) */
+  #slash-menu { right: 0; max-height: 360px; }
+  #slash-menu button { align-items: flex-start; gap: 12px; }
+  #slash-menu button.selected { background: var(--bg-block); }
+  #slash-menu .name { flex: none; width: 32%; min-width: 140px; overflow-wrap: anywhere; }
+  /* Like the CLI's menu: an aligned name column, descriptions up to two lines */
+  #slash-menu .sub {
+    flex: 1; max-width: none; margin-left: 0; padding-left: 0; font-size: 12px;
+    white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
 
   /* Review… button and popover (left of the mode chip) */
   .review-wrap { position: relative; display: none; }
@@ -597,6 +607,7 @@
   <div id="roster"></div>
   <div id="composer">
     <div id="attachments"></div>
+    <div class="chip-menu" id="slash-menu"></div>
     <textarea id="prompt" placeholder="Message Claude... (Enter to send, Shift+Enter for newline)" rows="2"></textarea>
     <div id="toolbar">
       <div class="tb-chips">
@@ -1603,6 +1614,7 @@
   submitBtn.addEventListener('click', submitPrompt);
   stopBtn.addEventListener('click', () => postIpc({ type: 'stop' }));
   promptEl.addEventListener('keydown', (e) => {
+    if (slashKey(e)) return;
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       submitPrompt();
@@ -1614,7 +1626,86 @@
   promptEl.addEventListener('input', () => {
     promptEl.style.height = 'auto';
     promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + 'px';
+    slash.index = 0;
+    renderSlash();
   });
+
+  // ---- `/` menu (TRU-206) -------------------------------------------------
+  // `commands` is the session's list from its `ready` ({name, description,
+  // argumentHint}); null until the session starts. The menu shows while the
+  // prompt is `/` plus a name being typed, matches by prefix first.
+  const slashMenuEl = document.getElementById('slash-menu');
+  const slash = { commands: null, matches: [], index: 0 };
+  function slashQuery() {
+    const m = /^\/(\S*)$/.exec(promptEl.value);
+    return m && promptEl.selectionStart === promptEl.value.length ? m[1].toLowerCase() : null;
+  }
+  function renderSlash() {
+    const q = harness ? slashQuery() : null;
+    slashMenuEl.innerHTML = '';
+    slash.matches = [];
+    if (q == null) { slashMenuEl.classList.remove('visible'); return; }
+    if (!slash.commands) {
+      if (isAcp()) { slashMenuEl.classList.remove('visible'); return; }
+      slashMenuEl.appendChild(el('div', 'hint', 'Commands · listed after the session starts'));
+      slashMenuEl.classList.add('visible');
+      return;
+    }
+    const named = slash.commands.filter((c) => c && typeof c.name === 'string');
+    // The exact name first, so `/pr` Enter runs `pr`, not `pr-ready`.
+    const starts = named.filter((c) => c.name.toLowerCase().startsWith(q))
+      .sort((a, b) => (b.name.toLowerCase() === q) - (a.name.toLowerCase() === q));
+    const within = named.filter((c) => !c.name.toLowerCase().startsWith(q) && c.name.toLowerCase().includes(q));
+    slash.matches = starts.concat(within);
+    if (!slash.matches.length) { slashMenuEl.classList.remove('visible'); return; }
+    slash.index = Math.min(slash.index, slash.matches.length - 1);
+    slashMenuEl.appendChild(el('div', 'hint', 'Commands · ↑↓ choose · Enter runs · Tab fills in'));
+    slash.matches.forEach((c, i) => {
+      const b = el('button', i === slash.index ? 'selected' : null);
+      b.title = c.description || '';
+      b.appendChild(el('span', 'name', '/' + c.name + (c.argumentHint ? ' ' + c.argumentHint : '')));
+      b.appendChild(el('span', 'sub', c.description || ''));
+      // Keep the prompt focused through the click.
+      b.addEventListener('mousedown', (e) => e.preventDefault());
+      b.addEventListener('click', () => { slash.index = i; fillSlash(); });
+      slashMenuEl.appendChild(b);
+    });
+    slashMenuEl.classList.add('visible');
+    const sel = slashMenuEl.querySelector('button.selected');
+    if (sel) sel.scrollIntoView({ block: 'nearest' });
+  }
+  function fillSlash() {
+    const c = slash.matches[slash.index];
+    if (!c) return;
+    promptEl.value = '/' + c.name + ' ';
+    promptEl.focus();
+    renderSlash();
+  }
+  // Keys while the menu lists commands. True when the key was handled.
+  // Enter runs the command unless it takes arguments, which it fills in.
+  function slashKey(e) {
+    if (e.isComposing || !slash.matches.length || !slashMenuEl.classList.contains('visible')) return false;
+    const n = slash.matches.length;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      slash.index = (slash.index + (e.key === 'ArrowDown' ? 1 : n - 1)) % n;
+      renderSlash();
+    } else if (e.key === 'Tab' && !e.shiftKey) {
+      fillSlash();
+    } else if (e.key === 'Enter' && !e.shiftKey) {
+      const c = slash.matches[slash.index];
+      fillSlash();
+      if (!c.argumentHint) submitPrompt();
+    } else if (e.key === 'Escape') {
+      slashMenuEl.classList.remove('visible');
+      slash.matches = [];
+    } else {
+      return false;
+    }
+    e.preventDefault();
+    return true;
+  }
+  promptEl.addEventListener('click', renderSlash);
+  promptEl.addEventListener('blur', () => slashMenuEl.classList.remove('visible'));
 
   // ---- permission mode ---------------------------------------------------
   // `current` is only ever a mode the harness confirmed (ready, or the reply
@@ -1884,6 +1975,8 @@
   function resetComposerChips(composer) {
     chips.enabled = composer != null;
     chips.models = null;
+    slash.commands = null;
+    renderSlash();
     chips.model = { current: composer ? composer.model || 'default' : null, pending: null };
     chips.effort = { current: composer ? (composer.effort == null ? null : composer.effort) : null, pending: null, applied: null };
     chips.checkout = composer ? composer.checkout || null : null;
@@ -2888,9 +2981,15 @@
         if (Array.isArray(d.modes) && d.modes.length) { mode.agent = d.modes; renderMode(); }
         confirmMode(d.permission_mode);
         if (Array.isArray(d.models) && d.models.length) { chips.models = d.models; renderModel(); renderEffort(); }
+        if (Array.isArray(d.commands) && d.commands.length) { slash.commands = d.commands; renderSlash(); }
         if (isAcp()) note(harnessName() + ' session ' + (d.session_id ? d.session_id.slice(0, 12) + ' ' : '') + 'ready · mode ' + modeLabel(d.permission_mode || '?'));
         else note(d.session_id ? 'Resumed Claude session ' + d.session_id.slice(0, 8) + ' · permission mode ' + (d.permission_mode || '?')
                           : 'Claude session ready · permission mode ' + (d.permission_mode || '?'));
+        break;
+      case 'conversation_reset':
+        // `/clear` starts a new session; what is above stays in the old one.
+        endSegment(); endThinking();
+        note('Conversation cleared · Claude starts fresh; the messages above stay in the previous session');
         break;
       case 'turn_started':
         // Claude starts a turn on its own when a background subagent
@@ -3180,6 +3279,7 @@
   // event (text, or image files for the composer's paste handler).
   function pageHasOpenLayer() {
     return modeMenuEl.classList.contains('visible')
+      || slashMenuEl.classList.contains('visible')
       || CHIP_MENUS.some((m) => m.classList.contains('visible'))
       || reviewPopEl.classList.contains('visible')
       || panelEl.classList.contains('visible');

@@ -79,6 +79,7 @@ async fn next(events: &mut UnboundedReceiver<HarnessEvent>) -> HarnessEvent {
             permission_mode,
             models,
             modes,
+            ..
         } => println!(
             "[event] ready session={session_id:?} mode={permission_mode:?} models={} modes={}",
             models.len(),

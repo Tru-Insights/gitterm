@@ -303,6 +303,9 @@ impl ClaudeFrameParser {
                 Some(mode) => self.permission_mode_changed(mode),
                 None => Vec::new(),
             },
+            "conversation_reset" => vec![ParsedFrame::Event(HarnessEvent::ConversationReset {
+                trigger: str_at("/trigger").map(str::to_string),
+            })],
             // assistant (duplicates the stream deltas),
             // session_state_changed, rate_limit_event, keep_alive, ...
             _ => Vec::new(),
@@ -425,6 +428,7 @@ impl ClaudeFrameParser {
                     permission_mode: body["current_permission_mode"].as_str().map(str::to_string),
                     models: body["models"].as_array().cloned().unwrap_or_default(),
                     modes: Vec::new(),
+                    commands: body["commands"].as_array().cloned().unwrap_or_default(),
                 }));
             }
             (HostRequest::Initialize { .. }, Err(e)) => out.push(ParsedFrame::Event(
@@ -2320,6 +2324,8 @@ mod tests {
     const TURN_TEXT: &str = include_str!("../../tests/fixtures/claude/turn_text.jsonl");
     const TURN_SLASH_COMMAND: &str =
         include_str!("../../tests/fixtures/claude/turn_slash_command.jsonl");
+    // Captured from `/clear` in stream-json mode (TRU-206), tools trimmed.
+    const TURN_CLEAR: &str = include_str!("../../tests/fixtures/claude/turn_clear.jsonl");
     const TURN_BASH_ALLOW: &str = include_str!("../../tests/fixtures/claude/turn_bash_allow.jsonl");
     const TURN_BASH_DENY: &str = include_str!("../../tests/fixtures/claude/turn_bash_deny.jsonl");
     const TURN_QUESTION: &str = include_str!("../../tests/fixtures/claude/turn_question.jsonl");
@@ -2391,6 +2397,7 @@ mod tests {
             session_id,
             permission_mode,
             models,
+            commands,
             ..
         }] = evs.as_slice()
         else {
@@ -2399,6 +2406,7 @@ mod tests {
         assert_eq!(session_id.as_deref(), Some("abc"));
         assert_eq!(permission_mode.as_deref(), Some("default"));
         assert!(!models.is_empty());
+        assert_eq!(commands[0]["name"], "deep-research");
         assert!(matches!(
             frames.last(),
             Some(ParsedFrame::HostRequestDone {
@@ -2424,6 +2432,23 @@ mod tests {
                 status: TurnStatus::Completed,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn clear_resets_then_starts_the_new_session() {
+        let mut p = ClaudeFrameParser::new();
+        let evs = events(&parse_fixture(&mut p, TURN_CLEAR));
+        assert_eq!(
+            evs[0],
+            HarnessEvent::ConversationReset {
+                trigger: Some("clear".into())
+            }
+        );
+        assert!(matches!(
+            &evs[1],
+            HarnessEvent::TurnStarted { session_id: Some(id), .. }
+                if id == "212e1a1e-350e-4933-97c9-dbb15c62178a"
         ));
     }
 
@@ -3349,6 +3374,7 @@ mod tests {
             permission_mode: None,
             models: Vec::new(),
             modes: Vec::new(),
+            commands: Vec::new(),
         };
         let request = HarnessEvent::RuntimeRequest {
             request_id: "r1".into(),
