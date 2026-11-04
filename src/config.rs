@@ -1304,7 +1304,7 @@ pub struct Config {
 /// `auto_tell`: send actionable PR news (merge conflicts, failed checks,
 /// review comments, changes requested) to the coordinator's open chat by
 /// itself when its turn is idle. Off, news only shows on the overview and
-/// the chip, and "Tell coordinator" sends it.
+/// the chip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrWatchConfig {
     #[serde(default = "default_true")]

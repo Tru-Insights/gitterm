@@ -23,8 +23,9 @@
 //! goes once the chat opens idle if it is younger than
 //! `pr_watch::AUTO_TELL_MAX_AGE` and still holds. Informational news
 //! (checks passed, merged, closed, approvals) only shows on the list and
-//! the chip. "Tell coordinator" still sends any one item when pressed, and
-//! `pr_watch.auto_tell: false` in settings.json turns the rest off.
+//! the chip. An item that was sent says "sent to chat ✓" (TRU-208); there
+//! is no button to send one by hand. `pr_watch.auto_tell: false` in
+//! settings.json turns the sending off.
 
 use super::*;
 
@@ -153,8 +154,6 @@ pub enum PrEvent {
     ActionClose,
     /// Dismiss news: PR id, news key.
     NewsDismiss(String, String),
-    /// Tell the coordinator: root chat, PR id, news key.
-    NewsTell(String, String, String),
     ReadyListToggle,
     ReadyGo(PrHome),
     /// Fold or expand a root's merged and closed PRs: root chat.
@@ -967,7 +966,6 @@ impl App {
                     return self.save_pr_watch();
                 }
             }
-            PrEvent::NewsTell(root, pr, news) => return self.tell_coordinator(&root, &pr, &news),
             PrEvent::DoneToggle(root) => {
                 if !self.prs.done_open.remove(&root) {
                     self.prs.done_open.insert(root);
@@ -1080,47 +1078,16 @@ impl App {
         Task::batch([save, resolve])
     }
 
-    /// The chat tab hosting root chat `root`, or why there is none.
-    fn coordinator_tab(&self, root: &str) -> Result<usize, &'static str> {
-        let tab = self
-            .workspaces
+    /// The chat tab hosting root chat `root`; `None` when it is not open,
+    /// or runs in a terminal tab.
+    fn coordinator_tab(&self, root: &str) -> Option<usize> {
+        self.workspaces
             .iter()
             .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
             .flat_map(|ws| ws.tabs.iter())
             .find(|tab| tab.chat_session_id.as_deref() == Some(root))
-            .ok_or("open the coordinator's chat to tell it")?;
-        if tab.agent_session().is_none() {
-            return Err("the coordinator runs in a terminal tab");
-        }
-        Ok(tab.id)
-    }
-
-    /// "Tell coordinator": one short prompt naming the PR and the news,
-    /// through the prompt-submit path of the coordinator's open chat tab.
-    fn tell_coordinator(&mut self, root: &str, pr: &str, news: &str) -> Task<Event> {
-        let tab_id = match self.coordinator_tab(root) {
-            Ok(tab_id) => tab_id,
-            Err(reason) => {
-                eprintln!("[pr-watch] cannot tell coordinator {root}: {reason}");
-                return Task::none();
-            }
-        };
-        let Some(watched) = self.prs.watch.prs.get(pr) else {
-            return Task::none();
-        };
-        let Some(item) = watched.news.iter().find(|item| item.key == news) else {
-            return Task::none();
-        };
-        let prompt = tell_prompt(&[news_line(watched, item)]);
-        if let Some(item) = self.news_item_mut(pr, news) {
-            item.told = true;
-        }
-        eprintln!("[pr-watch] told coordinator {root}: {prompt}");
-        let save = self.save_pr_watch();
-        Task::batch([
-            save,
-            Task::done(Event::AgentSubmitPrompt(tab_id, prompt.into())),
-        ])
+            .filter(|tab| tab.agent_session().is_some())
+            .map(|tab| tab.id)
     }
 
     /// Whether chat tab `tab_id` is mid-turn: the state the chat strip's
@@ -1138,8 +1105,8 @@ impl App {
     /// ([`pr_watch::auto_tell_due`]) whose coordinator is open in a chat
     /// tab and idle gets one prompt, one line per item, oldest first, and
     /// the items are marked told. A busy coordinator gets it on the first
-    /// tick after its turn ends; a closed one keeps its news (the line says
-    /// why) until it opens.
+    /// tick after its turn ends; a closed one keeps its news until it
+    /// opens.
     pub(super) fn auto_tell_coordinators(&mut self) -> Task<Event> {
         if !self.pr_watch_config.auto_tell {
             return Task::none();
@@ -1170,7 +1137,7 @@ impl App {
         }
         let mut tasks: Vec<Task<Event>> = Vec::new();
         for (root, mut items) in due {
-            let Ok(tab_id) = self.coordinator_tab(&root) else {
+            let Some(tab_id) = self.coordinator_tab(&root) else {
                 continue;
             };
             if self.chat_turn_running(tab_id) {
@@ -1349,10 +1316,10 @@ impl App {
         line
     }
 
-    /// One news item with Tell coordinator (or why not) and dismiss.
+    /// One news item with dismiss, and "sent to chat ✓" once it was sent
+    /// to the coordinator (TRU-197 sends actionable news by itself).
     fn view_pr_news_item<'a>(
         &'a self,
-        root: &str,
         watched: &WatchedPr,
         item: &NewsItem,
         with_pr: bool,
@@ -1377,27 +1344,14 @@ impl App {
                     .width(Length::Fill),
             )
             .push(text(age).size(10).color(theme.text_muted()));
-        let tell_label = if item.told {
-            "told"
-        } else {
-            "Tell coordinator"
-        };
-        let mut tell = button(text(tell_label).size(10).color(theme.accent()))
-            .style(self.flat_button_style())
-            .padding([2, 6]);
-        let reason = match self.coordinator_tab(root) {
-            Ok(_) if !item.told => {
-                tell = tell.on_press(Event::Pr(PrEvent::NewsTell(
-                    root.to_string(),
-                    watched.key.id(),
-                    item.key.clone(),
-                )));
-                None
-            }
-            Ok(_) => None,
-            Err(reason) => Some(reason),
-        };
-        line = line.push(tell).push(
+        if item.told {
+            line = line.push(
+                text("sent to chat \u{2713}")
+                    .size(10)
+                    .color(theme.text_muted()),
+            );
+        }
+        line = line.push(
             button(text("\u{00D7}").size(10).color(theme.text_muted()))
                 .style(self.flat_button_style())
                 .padding([2, 6])
@@ -1406,11 +1360,7 @@ impl App {
                     item.key.clone(),
                 ))),
         );
-        let mut item_col = Column::new().spacing(1).push(line);
-        if let Some(reason) = reason {
-            item_col = item_col.push(text(reason).size(10).color(theme.text_muted()));
-        }
-        item_col.into()
+        line.into()
     }
 
     /// One PR row of the overview section, on one line (TRU-208): number,
@@ -1635,7 +1585,7 @@ impl App {
         }
         if let Some(watched) = watched {
             for item in watched.open_news() {
-                detail = detail.push(self.view_pr_news_item(root, watched, item, false));
+                detail = detail.push(self.view_pr_news_item(watched, item, false));
             }
         }
         // The row has no other action: a click anywhere on it opens it.
@@ -1885,8 +1835,8 @@ impl App {
                     )
                     .push(self.pr_live_line(watched));
             }
-            for (root, watched, item) in &news {
-                group = group.push(self.view_pr_news_item(root, watched, item, true));
+            for (_, watched, item) in &news {
+                group = group.push(self.view_pr_news_item(watched, item, true));
             }
             let bg = theme.bg_base();
             rows = rows.push(
@@ -2204,7 +2154,7 @@ mod tests {
             NewsKind::Conflicting,
             "has merge conflicts",
         );
-        // One item: the line "Tell coordinator" has always sent.
+        // One item: the line a single news item has always sent.
         assert_eq!(
             tell_prompt(&[news_line(&watched, &failed)]),
             "GitTerm PR watch: acme/api#12 \"PRJ-101: add the export\": checks failed: test. \
