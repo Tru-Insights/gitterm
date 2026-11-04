@@ -2806,6 +2806,101 @@
       what, meta, target: card.root, live, time: created, seq: card.seq,
     };
   }
+  // ---- codex exec runs (TRU-212) ----
+  // `codex exec` runs this chat started outside GitTerm's tools (a Bash
+  // `codex exec …`). Rust polls the chat's process tree and sends
+  // {"kind":"codex_exec", run} every 5 s while a run lives and once when
+  // it ends. Live only: nothing is in the conversation, so a rebuilt page
+  // gets running runs back on the next poll. GitTerm only watches them.
+  const execRuns = new Map(); // run key -> card
+  function execStateText(card) {
+    const r = card.data;
+    if (r.state === 'running') return 'running ' + fmtClock(Date.now() - r.started_at_ms);
+    return 'finished · ' + fmtDur(Math.max(0, (r.ended_at_ms || Date.now()) - r.started_at_ms));
+  }
+  function execSubName(sub) { return sub.nickname || sub.agent_path || 'subagent'; }
+  function newExecCard(key) {
+    endSegment(); endThinking();
+    const root = el('details', 'dlg exec running');
+    root.dataset.execRun = key;
+    const summary = root.appendChild(el('summary'));
+    const card = {
+      key, root, data: null, shown: null,
+      kindEl: summary.appendChild(el('span', 'dlg-kind', 'Codex (exec)')),
+      whatEl: summary.appendChild(el('span', 'dlg-what')),
+      stateEl: summary.appendChild(el('span', 'dlg-state')),
+      body: root.appendChild(el('div', 'dlg-body')),
+      seq: ++rosterSeq,
+    };
+    execRuns.set(key, card);
+    append(root);
+    return card;
+  }
+  function renderExecCard(card) {
+    const r = card.data;
+    card.root.className = 'dlg exec ' + (r.state === 'running' ? 'running' : 'done');
+    setText(card.kindEl, 'Codex (exec)' + (r.model ? ' · ' + r.model : ''));
+    setText(card.whatEl, r.checkout ? 'in ' + r.checkout : 'working folder unknown');
+    setText(card.stateEl, execStateText(card));
+    // The body changes only when the run's record does (not every poll).
+    const shown = JSON.stringify(r);
+    if (card.shown === shown) return;
+    card.shown = shown;
+    const body = card.body;
+    body.innerHTML = '';
+    body.appendChild(el('div', 'dlg-line', "Started outside GitTerm's tools (codex exec in a shell). GitTerm only shows it: it cannot stop or adopt this run."));
+    body.appendChild(el('div', 'dlg-path', 'cwd ' + (r.cwd || 'unknown')));
+    for (const dir of r.add_dirs || []) body.appendChild(el('div', 'dlg-path', 'add-dir ' + dir));
+    body.appendChild(el('div', 'dlg-path', 'PID ' + r.pid + (r.sandbox ? ' · sandbox ' + r.sandbox : '') + (r.cli_version ? ' · codex ' + r.cli_version : '')));
+    body.appendChild(el('div', 'dlg-path', r.rollout_path ? 'rollout ' + r.rollout_path : 'rollout not found yet'));
+    if (r.activity) {
+      const a = body.appendChild(el('div', 'dlg-activity', 'Latest: ' + r.activity.text));
+      a.title = r.activity.text;
+    }
+    if ((r.subagents || []).length) {
+      body.appendChild(el('div', 'dlg-section', 'Subagents'));
+      for (const sub of r.subagents) {
+        const line = body.appendChild(el('div', 'dlg-activity',
+          '↳ ' + execSubName(sub) + (sub.nickname && sub.agent_path ? ' (' + sub.agent_path + ')' : '') +
+          ' · ' + sub.state + (sub.activity ? ' — ' + sub.activity.text : '')));
+        line.title = sub.rollout_path;
+      }
+    }
+  }
+  function codexExecEvent(ev) {
+    const r = ev.run;
+    if (!r || !r.key) { console.warn('codex_exec event without a run', ev); return; }
+    const card = execRuns.get(r.key) || newExecCard(r.key);
+    card.data = r;
+    renderExecCard(card);
+    renderRoster();
+  }
+  function execRows(card) {
+    const r = card.data;
+    const running = r.state === 'running';
+    const key = 'cx:' + card.key;
+    const rows = [{
+      key,
+      cls: running ? 'running' : 'done',
+      name: 'Codex (exec)' + (r.model ? ' · ' + r.model : ''),
+      what: (running ? 'running' : 'finished') + (r.checkout ? ' · in ' + r.checkout : '') + (r.activity ? ' — ' + r.activity.text : ''),
+      meta: fmtDur(Math.max(0, (running ? Date.now() : (r.ended_at_ms || Date.now())) - r.started_at_ms)),
+      target: card.root, live: running, time: r.started_at_ms, seq: card.seq,
+    }];
+    for (const sub of r.subagents || []) {
+      const subRunning = sub.state === 'running';
+      rows.push({
+        key: key + ':' + sub.thread_id,
+        under: key,
+        cls: subRunning ? 'running' : 'done',
+        name: '↳ ' + execSubName(sub),
+        what: (sub.nickname && sub.agent_path ? sub.agent_path + ' · ' : '') + sub.state + (sub.activity ? ' — ' + sub.activity.text : ''),
+        meta: '',
+        target: card.root, live: subRunning, time: r.started_at_ms, seq: card.seq,
+      });
+    }
+    return rows;
+  }
   // Finished subagents read back after a restart: the latest few stay so
   // the roster reads as it did before; older ones are history.
   const ROSTER_REPLAYED_SUBAGENTS = 10;
@@ -2822,15 +2917,25 @@
       if (!d || d.dismissed_at || d.delivered_at) continue;
       rows.push(delegationRow(card));
     }
+    for (const card of execRuns.values()) if (card.data) rows.push(...execRows(card));
     // Running rows first, then newest first: by start time, or by when
     // the row appeared when a start is unknown.
     const newest = (a, b) => {
       if (a.time != null && b.time != null && a.time !== b.time) return b.time - a.time;
       return b.seq - a.seq;
     };
-    return rows
+    const sorted = rows
       .filter((row) => !rosterHidden.has(row.key))
       .sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0) || newest(a, b));
+    // A run's subagent rows follow their run's row, in their own order,
+    // and go when it is hidden.
+    const top = sorted.filter((row) => !row.under);
+    const out = [];
+    for (const row of top) {
+      out.push(row);
+      for (const child of rows) if (child.under === row.key && !rosterHidden.has(child.key)) out.push(child);
+    }
+    return out;
   }
   // Row elements by key, updated in place. The roster re-renders every
   // second while anything runs and on every subagent event; rebuilding the
@@ -2898,6 +3003,7 @@
     if ((live || anyRunningCard) && !rosterTimer) {
       rosterTimer = setInterval(() => {
         for (const card of cards.values()) if (card.data && state(card.data) === 'running') card.stateEl.textContent = stateText(card);
+        for (const card of execRuns.values()) if (card.data && card.data.state === 'running') setText(card.stateEl, execStateText(card));
         renderRoster();
       }, 1000);
     } else if (!live && !anyRunningCard && rosterTimer) {
@@ -2906,6 +3012,7 @@
   }
   function resetDelegations() {
     cards.clear();
+    execRuns.clear();
     subagents.length = 0;
     rosterHidden.clear();
     if (rosterTimer) { clearInterval(rosterTimer); rosterTimer = null; }
@@ -2924,6 +3031,13 @@
     if (key.startsWith('dlg:')) {
       const card = cards.get(key.slice(4));
       return card && card.data ? delegationRow(card) : null;
+    }
+    if (key.startsWith('cx:')) {
+      for (const card of execRuns.values()) {
+        if (!card.data) continue;
+        const row = execRows(card).find((r) => r.key === key);
+        if (row) return row;
+      }
     }
     return null;
   }
@@ -3420,6 +3534,7 @@
       if (event.kind === 'delegation_anchor') { delegationAnchor(event.delegation_id); return; }
       if (event.kind === 'subagent_started_at') { subagentStartedAt(event.id, event.at_ms); return; }
       if (event.kind === 'delegation') { delegationEvent(event); return; }
+      if (event.kind === 'codex_exec') { codexExecEvent(event); return; }
       if (event.type === 'user_prompt') { showUserPrompt(event); return; }
       legacyEvent(event);
     } catch (e) {

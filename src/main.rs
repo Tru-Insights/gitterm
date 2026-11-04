@@ -6893,6 +6893,9 @@ pub enum Event {
     /// A CLI transcript the Chats overview follows was checked (TRU-154):
     /// `Ok(None)` when it had not changed.
     OverviewTranscriptLoaded(PathBuf, Result<Option<Box<TranscriptGist>>, String>),
+    /// A `codex exec` poll (TRU-212): page payloads by tab, and whether
+    /// any run is still followed.
+    CodexExecPolled(Vec<(usize, serde_json::Value)>, bool),
     /// The Agent surface finished building this tab's page. The tab's
     /// buffer is replayed now, from live state, so events that arrived while
     /// the page was under construction (transcript read-back, a fast first
@@ -7535,6 +7538,14 @@ struct App {
     /// changes, for the overview's snapshot key.
     overview_transcripts: HashMap<PathBuf, OverviewTranscript>,
     overview_transcripts_revision: u64,
+    /// `codex exec` runs the local Claude chats started outside GitTerm's
+    /// tools (TRU-212), followed on the tick off the UI thread. The lock
+    /// is taken only by the poll, one at a time (`codex_exec_polling`).
+    codex_exec_watch: Arc<std::sync::Mutex<gitterm::codex_exec::Watcher>>,
+    codex_exec_polling: bool,
+    /// The last poll still followed a run: poll once more even when no
+    /// chat is left, so the run is seen to end.
+    codex_exec_has_runs: bool,
     /// The Chats overview's snapshot and the key it was built for. Built
     /// in `view` on first need and rebuilt only when the key changes, so a
     /// frame costs a cheap key, not a walk of every conversation.
@@ -18627,6 +18638,9 @@ impl App {
             overview_running_polled: HashMap::new(),
             overview_transcripts: HashMap::new(),
             overview_transcripts_revision: 0,
+            codex_exec_watch: Arc::default(),
+            codex_exec_polling: false,
+            codex_exec_has_runs: false,
             chat_overview_cache: ChatOverviewCache::default(),
             chat_overview_idle_expanded: false,
             roster_reveal_held: HashMap::new(),
@@ -20372,6 +20386,57 @@ fi
         Task::batch(tasks)
     }
 
+    /// Look for `codex exec` runs under each local Claude chat's `claude`
+    /// process (TRU-212), on a blocking thread: only while a chat's process
+    /// runs (or a run is still followed), one poll at a time.
+    fn poll_codex_exec(&mut self) -> Task<Event> {
+        if self.codex_exec_polling {
+            return Task::none();
+        }
+        let roots: Vec<gitterm::codex_exec::Root> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .filter_map(|tab| {
+                let pid = tab.agent_session()?.harness.as_ref()?.claude_pid()?;
+                Some(gitterm::codex_exec::Root {
+                    tab_id: tab.id,
+                    pid,
+                })
+            })
+            .collect();
+        if roots.is_empty() && !self.codex_exec_has_runs {
+            return Task::none();
+        }
+        self.codex_exec_polling = true;
+        let watch = self.codex_exec_watch.clone();
+        Task::perform(
+            async move {
+                let polled = tokio::task::spawn_blocking(move || {
+                    let mut watcher = watch
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let payloads = watcher
+                        .poll(&gitterm::codex_exec::Libproc, &roots, now_ms)
+                        .into_iter()
+                        .map(|(tab_id, run)| (tab_id, gitterm::chat_page::codex_exec_payload(&run)))
+                        .collect::<Vec<_>>();
+                    (payloads, watcher.has_runs())
+                })
+                .await;
+                match polled {
+                    Ok(polled) => polled,
+                    Err(error) => {
+                        eprintln!("[codex-exec] the poll task failed: {error}");
+                        (Vec::new(), true)
+                    }
+                }
+            },
+            |(payloads, has_runs)| Event::CodexExecPolled(payloads, has_runs),
+        )
+    }
+
     /// Check the transcripts of this Mac's CLI terminal tabs (Claude CLI,
     /// Codex CLI) the Chats index knows, for the overview's rows: at most
     /// every `OVERVIEW_TRANSCRIPT_POLL` per file, one check at a time, and
@@ -22028,6 +22093,8 @@ fi
                 tasks.push(self.poll_work_notes());
                 // Closed tabs release their browser targets (TRU-176).
                 tasks.push(self.sync_browser_owners());
+                // `codex exec` runs under the chats (TRU-212).
+                tasks.push(self.poll_codex_exec());
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
@@ -27679,6 +27746,20 @@ fi
                     Err(err) => {
                         eprintln!("[chats] remote index fetch for {remote_id} failed: {err}");
                         state.error = Some(err);
+                    }
+                }
+            }
+            Event::CodexExecPolled(payloads, has_runs) => {
+                self.codex_exec_polling = false;
+                self.codex_exec_has_runs = has_runs;
+                // Live only: a page not open now gets running runs back on
+                // the next poll, and finished ones not at all.
+                for (tab_id, payload) in payloads {
+                    if webview::is_active(WebviewSurface::Agent(tab_id)) {
+                        webview::evaluate_script(
+                            WebviewSurface::Agent(tab_id),
+                            &format!("window.__appendEvent({payload})"),
+                        );
                     }
                 }
             }

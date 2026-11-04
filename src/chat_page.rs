@@ -4,8 +4,8 @@
 //!
 //! The page takes events through `window.__appendEvent` / `__replay`:
 //! harness events wrapped as `{"kind": "harness", "event": ...}`, the
-//! human's prompts as `{"type": "user_prompt", "text": ...}`, and markers
-//! such as `subagent_started_at`.
+//! human's prompts as `{"type": "user_prompt", "text": ...}`, markers
+//! such as `subagent_started_at`, and live-only rows such as `codex_exec`.
 
 use serde_json::Value;
 
@@ -82,6 +82,13 @@ pub fn subagent_started(event: &HarnessEvent) -> Option<&str> {
 /// (Unix ms). The chat page uses it when the start was not seen live.
 pub fn subagent_started_at(parent: &str, at_ms: i64) -> Value {
     serde_json::json!({ "kind": "subagent_started_at", "id": parent, "at_ms": at_ms })
+}
+
+/// A `codex exec` run a chat started outside GitTerm's tools (TRU-212),
+/// for its roster row and card. Live only: never in the conversation
+/// buffer; a rebuilt page gets running runs back on the next poll.
+pub fn codex_exec_payload(run: &crate::codex_exec::RunView) -> Value {
+    serde_json::json!({ "kind": "codex_exec", "run": run })
 }
 
 /// A transcript read-back as page payloads, each subagent start followed

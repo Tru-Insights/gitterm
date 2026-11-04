@@ -1038,6 +1038,9 @@ pub fn resolve_claude_program() -> Result<PathBuf, String> {
 pub struct ClaudeSession {
     commands: mpsc::UnboundedSender<HarnessCommand>,
     shutdown_on_drop: bool,
+    /// The local `claude` process id while it runs; 0 before the spawn,
+    /// after it exits, and always for a remote chat.
+    pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl ClaudeSession {
@@ -1046,6 +1049,8 @@ impl ClaudeSession {
     pub fn spawn(config: ClaudeSessionConfig) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let session_pid = pid.clone();
         let spawn_result = std::thread::Builder::new()
             .name("claude-session".into())
             .spawn(move || {
@@ -1062,7 +1067,7 @@ impl ClaudeSession {
                         return;
                     }
                 };
-                rt.block_on(run_session(config, cmd_rx, ev_tx));
+                rt.block_on(run_session(config, cmd_rx, ev_tx, session_pid));
             });
         if let Err(e) = spawn_result {
             eprintln!("[claude-harness] could not spawn session thread: {e}");
@@ -1071,6 +1076,7 @@ impl ClaudeSession {
             Self {
                 commands: cmd_tx,
                 shutdown_on_drop: true,
+                pid,
             },
             ev_rx,
         )
@@ -1080,6 +1086,16 @@ impl ClaudeSession {
         self.commands
             .send(command)
             .map_err(|_| "the Claude session has exited".to_string())
+    }
+
+    /// The local `claude` process id while it runs (TRU-212: the root of
+    /// the `codex exec` runs the chat starts). `None` before it has
+    /// spawned, once it has exited, and for a remote chat.
+    pub fn local_pid(&self) -> Option<u32> {
+        match self.pid.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            pid => Some(pid),
+        }
     }
 }
 
@@ -1234,6 +1250,7 @@ impl ClaudeSession {
             Self {
                 commands: cmd_tx,
                 shutdown_on_drop: false,
+                pid: Default::default(),
             },
             ev_rx,
         )
@@ -1864,6 +1881,7 @@ async fn run_session(
     config: ClaudeSessionConfig,
     mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
     events: mpsc::UnboundedSender<HarnessEvent>,
+    process_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     let fail = |msg: String| {
         harness_log(&msg);
@@ -1923,6 +1941,7 @@ async fn run_session(
     else {
         return fail("claude child is missing a stdio pipe".to_string());
     };
+    process_id.store(pid, std::sync::atomic::Ordering::Relaxed);
     let wire = config
         .wire_log_dir
         .as_deref()
@@ -2238,6 +2257,7 @@ async fn run_session(
         }
     };
     harness_log(&format!("claude {pid} exited with {code:?}"));
+    process_id.store(0, std::sync::atomic::Ordering::Relaxed);
     if !shutting_down && code != Some(0) {
         let tail = stderr_tail
             .lock()
