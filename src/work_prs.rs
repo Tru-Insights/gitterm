@@ -188,6 +188,25 @@ fn done_summary(done: &[PrState]) -> String {
     }
 }
 
+/// A PR list's columns before the title (TRU-208): the plan position, then
+/// "#n" in a fixed width, each followed by this gap. Detail and news lines
+/// are indented by the same amount so they start under the title.
+const PR_POSITION_WIDTH: f32 = 16.0;
+const PR_COLUMN_GAP: f32 = 6.0;
+/// Menlo's advance per character, as a fraction of the font size.
+const MONO_ADVANCE: f32 = 0.62;
+
+/// Characters of the widest "#n" among `numbers`, and at least 5, so every
+/// row's title starts at the same x.
+fn pr_number_chars(numbers: impl IntoIterator<Item = u64>) -> usize {
+    numbers
+        .into_iter()
+        .map(|number| number.to_string().len() + 1)
+        .max()
+        .unwrap_or(0)
+        .max(5)
+}
+
 /// Which of a PR row's actions show (TRU-208).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrActionsShown {
@@ -1316,6 +1335,25 @@ impl App {
         line
     }
 
+    /// Width of a "#n" column `chars` characters wide (TRU-208).
+    fn pr_number_width(&self, chars: usize) -> f32 {
+        (chars as f32 * self.ui_font_small() * MONO_ADVANCE).ceil()
+    }
+
+    /// "#n" in a column `chars` wide; empty, keeping the width, for `None`.
+    fn pr_number_cell<'a>(
+        &self,
+        number: Option<u64>,
+        chars: usize,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        text(number.map_or_else(String::new, |number| format!("#{number}")))
+            .size(self.ui_font_small())
+            .color(self.theme.text_muted())
+            .font(iced::Font::with_name("Menlo"))
+            .width(Length::Fixed(self.pr_number_width(chars)))
+            .into()
+    }
+
     /// One news item with dismiss, and "sent to chat ✓" once it was sent
     /// to the coordinator (TRU-197 sends actionable news by itself).
     fn view_pr_news_item<'a>(
@@ -1326,24 +1364,24 @@ impl App {
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let font_small = self.ui_font_small();
-        let label = if with_pr {
-            format!("{} {}", watched.key.label(), item.text)
-        } else {
-            item.text.clone()
-        };
         let age = overview::parse_stamp(&item.at)
             .map(overview::age_label)
             .unwrap_or_default();
-        let mut line = Row::new()
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .push(
-                text(format!("\u{25CF} {}", overview::shorten(&label, 70)))
-                    .size(font_small - 1.0)
-                    .color(news_color(theme, item.kind))
-                    .width(Length::Fill),
-            )
-            .push(text(age).size(10).color(theme.text_muted()));
+        let mut line = Row::new().spacing(6).align_y(iced::Alignment::Center).push(
+            text(format!("\u{25CF} {}", overview::shorten(&item.text, 70)))
+                .size(font_small - 1.0)
+                .color(news_color(theme, item.kind))
+                .width(Length::Fill),
+        );
+        // Its "#n" sits in the number column beside it; the repo says which.
+        if with_pr {
+            line = line.push(
+                text(watched.key.repo.clone())
+                    .size(10)
+                    .color(theme.text_muted()),
+            );
+        }
+        line = line.push(text(age).size(10).color(theme.text_muted()));
         if item.told {
             line = line.push(
                 text("sent to chat \u{2713}")
@@ -1375,6 +1413,7 @@ impl App {
         root: &str,
         key: &PrKey,
         row: Option<&OrderedRow>,
+        number_chars: usize,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
@@ -1394,15 +1433,16 @@ impl App {
             .filter(|title| !title.is_empty());
 
         // Fixed slots: position, number, title, facts, actions, disclosure.
+        // Position and number have fixed widths, so every row's title (and
+        // its wrapped lines) starts at the same x.
         let position = text(row.map_or_else(String::new, |row| format!("{}", row.position)))
             .size(font_small)
             .color(text_muted)
             .font(mono)
-            .width(Length::Fixed(if row.is_some() { 16.0 } else { 0.0 }));
-        let number = text(format!("#{}", key.number))
-            .size(font_small)
-            .color(text_muted)
-            .font(mono);
+            .width(Length::Fixed(PR_POSITION_WIDTH));
+        let number = self.pr_number_cell(Some(key.number), number_chars);
+        let title_indent =
+            PR_POSITION_WIDTH + PR_COLUMN_GAP + self.pr_number_width(number_chars) + PR_COLUMN_GAP;
         let title = text(overview::shorten(title.unwrap_or(&key.label()), 60))
             .size(font_small)
             .color(theme.text_primary())
@@ -1516,7 +1556,7 @@ impl App {
         }
         let disclosure = self.overview_disclosure(expanded, row_key.clone());
         let line = row![position, number, title, facts, actions, disclosure]
-            .spacing(6)
+            .spacing(PR_COLUMN_GAP)
             .align_y(iced::Alignment::Center);
 
         // Opened: the full live line, what it waits for, hold, note.
@@ -1590,6 +1630,11 @@ impl App {
         }
         // The row has no other action: a click anywhere on it opens it.
         let hover_bg = theme.bg_overlay();
+        // Detail, hold and news lines start under the title.
+        let detail = row![
+            iced::widget::Space::new().width(Length::Fixed(title_indent)),
+            detail.width(Length::Fill)
+        ];
         button(Column::new().spacing(2).push(line).push(detail))
             .padding([3, 6])
             .width(Length::Fill)
@@ -1697,6 +1742,15 @@ impl App {
             .padding([0, 4])
             .on_press(Event::Pr(PrEvent::DoneToggle(root.to_string())))
         };
+        // One "#n" width for the whole list, so titles line up across groups.
+        let number_chars = pr_number_chars(groups.iter().flat_map(|group| {
+            group
+                .rows
+                .iter()
+                .map(|row| row.entry.key().number)
+                .chain(group.unplanned.iter().map(|key| key.number))
+                .chain(group.done.iter().map(|(key, _)| key.number))
+        }));
         let several = groups.len() > 1;
         let header_fold = groups
             .first()
@@ -1727,7 +1781,12 @@ impl App {
                 section = section.push(title);
             }
             for row in &rows {
-                section = section.push(self.view_pr_row(&root.root, &row.entry.key(), Some(row)));
+                section = section.push(self.view_pr_row(
+                    &root.root,
+                    &row.entry.key(),
+                    Some(row),
+                    number_chars,
+                ));
             }
             if !unplanned.is_empty() && !rows.is_empty() {
                 section = section.push(
@@ -1738,18 +1797,22 @@ impl App {
                 );
             }
             for key in &unplanned {
-                section = section.push(self.view_pr_row(&root.root, key, None));
+                section = section.push(self.view_pr_row(&root.root, key, None, number_chars));
             }
             if !done.is_empty() && self.prs.done_open.contains(&root.root) {
                 for row in &done_rows {
-                    section =
-                        section.push(self.view_pr_row(&root.root, &row.entry.key(), Some(row)));
+                    section = section.push(self.view_pr_row(
+                        &root.root,
+                        &row.entry.key(),
+                        Some(row),
+                        number_chars,
+                    ));
                 }
                 for (key, _) in done
                     .iter()
                     .filter(|(key, _)| !done_rows.iter().any(|r| r.entry.key() == *key))
                 {
-                    section = section.push(self.view_pr_row(&root.root, key, None));
+                    section = section.push(self.view_pr_row(&root.root, key, None, number_chars));
                 }
             }
         }
@@ -1820,6 +1883,14 @@ impl App {
                 .spacing(6)
                 .align_y(iced::Alignment::Center),
             );
+            // "#n" in a fixed column; the title, live line and news start
+            // after it (TRU-208).
+            let number_chars = pr_number_chars(
+                next.iter()
+                    .map(|(_, row)| row.entry.key().number)
+                    .chain(news.iter().map(|(_, watched, _)| watched.key.number)),
+            );
+            let indent = self.pr_number_width(number_chars) + PR_COLUMN_GAP;
             for (_, row) in &next {
                 let key = row.entry.key();
                 let watched = self.watched(&key);
@@ -1829,14 +1900,31 @@ impl App {
                     .unwrap_or_default();
                 group = group
                     .push(
-                        text(format!("next: {} {title}", key.label()))
-                            .size(font_small - 1.0)
-                            .color(theme.accent()),
+                        row![
+                            self.pr_number_cell(Some(key.number), number_chars),
+                            text(format!("next: {title}"))
+                                .size(font_small - 1.0)
+                                .color(theme.accent())
+                                .width(Length::Fill),
+                            text(key.repo.clone()).size(10).color(theme.text_muted()),
+                        ]
+                        .spacing(PR_COLUMN_GAP)
+                        .align_y(iced::Alignment::Center),
                     )
-                    .push(self.pr_live_line(watched));
+                    .push(row![
+                        iced::widget::Space::new().width(Length::Fixed(indent)),
+                        self.pr_live_line(watched)
+                    ]);
             }
             for (_, watched, item) in &news {
-                group = group.push(self.view_pr_news_item(watched, item, true));
+                group = group.push(
+                    row![
+                        self.pr_number_cell(Some(watched.key.number), number_chars),
+                        self.view_pr_news_item(watched, item, true)
+                    ]
+                    .spacing(PR_COLUMN_GAP)
+                    .align_y(iced::Alignment::Center),
+                );
             }
             let bg = theme.bg_base();
             rows = rows.push(
@@ -2066,6 +2154,14 @@ mod tests {
             "1 merged \u{00B7} 1 closed"
         );
         assert_eq!(done_summary(&[Closed]), "1 closed");
+    }
+
+    #[test]
+    fn the_pr_number_column_fits_the_widest_number_and_at_least_five() {
+        assert_eq!(pr_number_chars([93, 591]), 5);
+        assert_eq!(pr_number_chars([]), 5);
+        assert_eq!(pr_number_chars([7, 12345]), 6);
+        assert_eq!(pr_number_chars([134, 1234567]), 8);
     }
 
     #[test]
