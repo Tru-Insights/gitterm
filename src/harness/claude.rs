@@ -21,8 +21,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use super::{
-    HarnessCommand, HarnessEvent, ItemKind, MessageState, RuntimeDecision, RuntimeRequestKind,
-    TurnStatus, UserPrompt,
+    HarnessCommand, HarnessEvent, ItemKind, MessageState, RateLimitReading, RuntimeDecision,
+    RuntimeRequestKind, TurnStatus, UserPrompt,
 };
 use crate::agentd::client::{
     ClaudeChatFrame, ClaudeChatOpen, ClaudeChatOpened, RemoteAgentBackend, RemoteAgentClientConfig,
@@ -147,6 +147,9 @@ pub struct ClaudeFrameParser {
     /// Last permission mode confirmed by the CLI, for deduplicating the
     /// status frame that follows an acknowledged set_permission_mode.
     permission_mode: Option<String>,
+    /// The latest `rate_limit_event` since the last turn ended; the next
+    /// `result` carries it out on its `TurnCompleted` (TRU-211).
+    rate_limit: Option<RateLimitReading>,
 }
 
 impl ClaudeFrameParser {
@@ -168,6 +171,17 @@ impl ClaudeFrameParser {
             return vec![ParsedFrame::Unparsed(line.to_string())];
         };
         let str_at = |p: &str| v.pointer(p).and_then(Value::as_str);
+        // Plan limits (TRU-211), whoever's API call they followed; the
+        // latest frame wins.
+        if str_at("/type") == Some("rate_limit_event") {
+            if let Some(info) = v.get("rate_limit_info").filter(|info| info.is_object()) {
+                self.rate_limit = Some(RateLimitReading {
+                    observed_at: unix_now(),
+                    info: info.clone(),
+                });
+            }
+            return Vec::new();
+        }
         // Subagent traffic (Agent tool) carries the parent's tool_use id.
         // It is wrapped in `SubagentEvent`s so the chat nests it under the
         // parent's tool card instead of mixing it into this turn.
@@ -268,7 +282,13 @@ impl ClaudeFrameParser {
                 parse_synthetic_assistant(&v)
             }
             "user" => parse_tool_results(&v),
-            "result" => vec![ParsedFrame::Event(parse_result(&v))],
+            "result" => {
+                let mut event = parse_result(&v);
+                if let HarnessEvent::TurnCompleted { rate_limit, .. } = &mut event {
+                    *rate_limit = self.rate_limit.take();
+                }
+                vec![ParsedFrame::Event(event)]
+            }
             // Queue state of a user message sent with a `uuid` (CLI
             // capability `msg_lifecycle_v1`). Other states are ignored.
             "command_lifecycle" => {
@@ -307,7 +327,7 @@ impl ClaudeFrameParser {
                 trigger: str_at("/trigger").map(str::to_string),
             })],
             // assistant (duplicates the stream deltas),
-            // session_state_changed, rate_limit_event, keep_alive, ...
+            // session_state_changed, keep_alive, ...
             _ => Vec::new(),
         }
     }
@@ -582,6 +602,7 @@ fn task_completion(v: &Value) -> HarnessEvent {
         status,
         usage: v.get("usage").cloned().unwrap_or(Value::Null),
         cost_usd: None,
+        rate_limit: None,
     }
 }
 
@@ -637,6 +658,11 @@ fn parse_synthetic_assistant(v: &Value) -> Vec<ParsedFrame> {
         .unwrap_or_default()
 }
 
+/// Seconds since the Unix epoch, now.
+fn unix_now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
 fn parse_result(v: &Value) -> HarnessEvent {
     let subtype = v["subtype"].as_str().unwrap_or("");
     let is_error = v["is_error"].as_bool().unwrap_or(false);
@@ -666,6 +692,7 @@ fn parse_result(v: &Value) -> HarnessEvent {
         status,
         usage: v.get("usage").cloned().unwrap_or(Value::Null),
         cost_usd: v["total_cost_usd"].as_f64(),
+        rate_limit: None,
     }
 }
 
@@ -1995,7 +2022,12 @@ async fn run_session(
                                     in_turn = true;
                                     HarnessEvent::TurnStarted { session_id, model }
                                 }
-                                HarnessEvent::TurnCompleted { status, usage, cost_usd } => {
+                                HarnessEvent::TurnCompleted {
+                                    status,
+                                    usage,
+                                    cost_usd,
+                                    rate_limit,
+                                } => {
                                     in_turn = false;
                                     let status = match status {
                                         TurnStatus::Failed(_) if interrupt_requested => {
@@ -2009,7 +2041,12 @@ async fn run_session(
                                     for (request_id, _) in pending.drain() {
                                         io.emit(HarnessEvent::RuntimeRequestResolved { request_id });
                                     }
-                                    HarnessEvent::TurnCompleted { status, usage, cost_usd }
+                                    HarnessEvent::TurnCompleted {
+                                        status,
+                                        usage,
+                                        cost_usd,
+                                        rate_limit,
+                                    }
                                 }
                                 HarnessEvent::Error(msg) => {
                                     harness_log(&format!("error: {msg}"));
@@ -2476,6 +2513,63 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_event_rides_on_the_turns_completion() {
+        let before = chrono::Utc::now().timestamp();
+        let mut p = ClaudeFrameParser::new();
+        let evs = events(&parse_fixture(&mut p, TURN_TEXT));
+        let HarnessEvent::TurnCompleted {
+            rate_limit: Some(reading),
+            ..
+        } = &evs[2]
+        else {
+            panic!("expected TurnCompleted with a rate limit, got {:?}", evs[2]);
+        };
+        assert!(reading.observed_at >= before);
+        assert_eq!(reading.info["status"], "allowed");
+        assert_eq!(
+            reading.info["unifiedWindows"]["five_hour"]["utilization"],
+            json!(0.03)
+        );
+        // Taken once: the next turn without a frame carries none.
+        let evs = events(&parse_fixture(&mut p, TURN_SLASH_COMMAND));
+        assert!(matches!(
+            evs.last(),
+            Some(HarnessEvent::TurnCompleted {
+                rate_limit: None,
+                ..
+            })
+        ));
+        // The latest frame wins; a subagent's frame counts too; a frame
+        // without an info object is ignored.
+        let frame = |utilization: f64, parent: Option<&str>| {
+            json!({
+                "type": "rate_limit_event",
+                "parent_tool_use_id": parent,
+                "rate_limit_info": {"unifiedWindows": {"seven_day": {"utilization": utilization}}}
+            })
+            .to_string()
+        };
+        assert!(p.parse_line(&frame(0.1, None)).is_empty());
+        assert!(p.parse_line(&frame(0.2, Some("toolu_agent"))).is_empty());
+        assert!(p
+            .parse_line(r#"{"type":"rate_limit_event","rate_limit_info":null}"#)
+            .is_empty());
+        let result = r#"{"type":"result","subtype":"success","is_error":false,"usage":{}}"#;
+        let evs = events(&p.parse_line(result));
+        let HarnessEvent::TurnCompleted {
+            rate_limit: Some(reading),
+            ..
+        } = &evs[0]
+        else {
+            panic!("expected a rate limit, got {evs:?}");
+        };
+        assert_eq!(
+            reading.info["unifiedWindows"]["seven_day"]["utilization"],
+            json!(0.2)
+        );
+    }
+
+    #[test]
     fn bash_turn_has_thinking_tool_item_permission_and_result() {
         let mut p = ClaudeFrameParser::new();
         let frames = parse_fixture(&mut p, TURN_BASH_ALLOW);
@@ -2774,6 +2868,7 @@ mod tests {
                     status: TurnStatus::Failed("API error".into()),
                     usage: Value::Null,
                     cost_usd: None,
+                    rate_limit: None,
                 }),
             })
         );

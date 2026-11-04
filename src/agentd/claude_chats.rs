@@ -1128,6 +1128,7 @@ mod tests {
                 status: crate::harness::TurnStatus::Completed,
                 usage: serde_json::Value::Null,
                 cost_usd: None,
+                rate_limit: None,
             },
         );
         let chat = h

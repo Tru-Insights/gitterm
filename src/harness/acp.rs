@@ -1200,6 +1200,7 @@ impl HistoryBuilder {
                     status: TurnStatus::Completed,
                     usage: Value::Null,
                     cost_usd: None,
+                    rate_limit: None,
                 }));
             self.turn_open = false;
         }
@@ -1730,6 +1731,7 @@ impl Session {
             status,
             usage,
             cost_usd: self.mapper.cost_usd,
+            rate_limit: None,
         });
         if let Some(id) = self.turn_message.take() {
             self.emit(HarnessEvent::MessageLifecycle {
@@ -2775,6 +2777,7 @@ mod tests {
             status: TurnStatus::Completed,
             usage: Value::Null,
             cost_usd: None,
+            rate_limit: None,
         });
         assert_eq!(
             entries,

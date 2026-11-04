@@ -203,6 +203,7 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
             status: TurnStatus::Interrupted,
             usage: Value::Null,
             cost_usd: None,
+            rate_limit: None,
         };
         out.push(TimedEntry {
             at: None,
@@ -277,6 +278,7 @@ fn foreground_end(result: &Value, is_error: bool) -> HarnessEvent {
             result["totalDurationMs"].as_u64(),
         ),
         cost_usd: None,
+        rate_limit: None,
     }
 }
 
@@ -313,6 +315,7 @@ fn task_notification(content: &Value) -> Option<(String, HarnessEvent)> {
             status,
             usage,
             cost_usd: None,
+            rate_limit: None,
         },
     ))
 }
@@ -331,6 +334,7 @@ fn turn_completed() -> HarnessEvent {
         status: TurnStatus::Completed,
         usage: Value::Null,
         cost_usd: None,
+        rate_limit: None,
     }
 }
 

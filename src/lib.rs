@@ -15,6 +15,7 @@ pub mod harness;
 pub mod issue_titles;
 pub mod jev;
 pub mod merge_plan;
+pub mod plan_limits;
 pub mod pr_watch;
 pub mod resource_watch;
 pub mod review;
