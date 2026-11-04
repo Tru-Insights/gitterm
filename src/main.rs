@@ -2539,6 +2539,26 @@ struct WorkspaceOverviewState {
     show_older: bool,
     /// The "Focus ▾" picker is open.
     focus_menu_open: bool,
+    /// Documents is unfolded (TRU-208; starts folded, not persisted).
+    documents_open: bool,
+    /// "Also worked here" is unfolded (TRU-208; starts folded).
+    also_open: bool,
+}
+
+/// The Work sidebar row the pointer is over (TRU-208): its details and
+/// actions show while hovered. One at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverviewHover {
+    /// A PR row, by PR id.
+    Pr(String),
+    /// A repo's line, by its folder.
+    Repo(PathBuf),
+    /// A branch row, by its checkout.
+    Branch(PathBuf),
+    /// A chat row, by chat id.
+    Chat(String),
+    /// A document row, by its key.
+    Document(String),
 }
 
 #[derive(Debug, Clone)]
@@ -6874,6 +6894,16 @@ pub enum Event {
     WorkspaceOverviewFocus(overview::Focus),
     WorkspaceOverviewToggleFocusMenu,
     WorkspaceOverviewToggleOlder,
+    /// Unfold or fold the overview's Documents (TRU-208).
+    WorkspaceOverviewToggleDocuments,
+    /// Unfold or fold the overview's "Also worked here" (TRU-208).
+    WorkspaceOverviewToggleAlso,
+    /// The pointer entered a Work sidebar row (TRU-208).
+    OverviewHoverEnter(OverviewHover),
+    /// The pointer left this Work sidebar row.
+    OverviewHoverExit(OverviewHover),
+    /// The pointer left the Work sidebar.
+    OverviewHoverClear,
     /// "Make workspace" on a coordinator: a workspace that owns this local
     /// root chat (TRU-169).
     WorkspaceFromChat(String),
@@ -7323,6 +7353,8 @@ struct App {
     /// Documents lists every document, not just the newest
     /// [`WORK_DOCUMENTS_SHOWN`].
     work_documents_all: bool,
+    /// The Work sidebar row under the pointer (TRU-208).
+    overview_hover: Option<OverviewHover>,
     /// Hand-picked overview focus per workspace, kept across restarts.
     overview_focus_picks: overview::FocusPicks,
     /// An inline workspace rename in progress (TRU-169).
@@ -8580,6 +8612,100 @@ impl App {
                 ..Default::default()
             }
         }
+    }
+
+    /// Borderless text button (TRU-208): transparent, tinted on hover. The
+    /// Work sidebar's rows and controls, which space and type separate.
+    fn flat_button_style(&self) -> impl Fn(&Theme, button::Status) -> button::Style {
+        let hover_bg = self.theme.bg_overlay();
+        let text_color = self.theme.text_primary();
+        let text_muted = self.theme.text_secondary();
+        move |_theme, status| {
+            let (bg, tc) = match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    (Some(hover_bg.into()), text_color)
+                }
+                _ => (None, text_muted),
+            };
+            button::Style {
+                background: bg,
+                text_color: tc,
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Whether the Work sidebar's pointer is over `target`.
+    fn overview_hovered(&self, target: &OverviewHover) -> bool {
+        self.overview_hover.as_ref() == Some(target)
+    }
+
+    /// Wraps a Work sidebar row so hovering it shows its details (TRU-208).
+    /// The row itself stays in the tree either way.
+    fn overview_hover_area<'a>(
+        &self,
+        content: impl Into<Element<'a, Event, Theme, iced::Renderer>>,
+        target: OverviewHover,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        iced::widget::mouse_area(content)
+            .on_enter(Event::OverviewHoverEnter(target.clone()))
+            .on_exit(Event::OverviewHoverExit(target))
+            .into()
+    }
+
+    /// A Work sidebar section header (TRU-208): the name, its count dim
+    /// beside it, then `trailing` at the right.
+    fn overview_section_header<'a>(
+        &self,
+        label: &str,
+        count: String,
+        trailing: Option<Element<'a, Event, Theme, iced::Renderer>>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let font_small = self.ui_font_small();
+        let bold = iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..Default::default()
+        };
+        let mut head = row![
+            text(label.to_string())
+                .size(font_small)
+                .color(self.theme.text_secondary())
+                .font(bold),
+            text(count)
+                .size(font_small - 1.0)
+                .color(self.theme.text_muted()),
+            iced::widget::Space::new().width(Length::Fill),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        if let Some(trailing) = trailing {
+            head = head.push(trailing);
+        }
+        head.into()
+    }
+
+    /// A folded section's header (TRU-208): the whole line toggles, with
+    /// "▸" / "▾" at the right.
+    fn overview_fold_header<'a>(
+        &self,
+        label: &str,
+        count: usize,
+        open: bool,
+        toggle: Event,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let marker = text(overview::fold_marker(open))
+            .size(self.ui_font_small() - 1.0)
+            .color(self.theme.text_muted());
+        button(self.overview_section_header(label, count.to_string(), Some(marker.into())))
+            .style(self.flat_button_style())
+            .padding([2, 0])
+            .width(Length::Fill)
+            .on_press(toggle)
+            .into()
     }
 
     /// Text input in GitTerm's palette: base fill, accent border when focused.
@@ -18023,6 +18149,7 @@ impl App {
             work_documents: HashMap::new(),
             work_document_copies_open: None,
             work_documents_all: false,
+            overview_hover: None,
             overview_focus_picks: overview::FocusPicks::load(&overview::FocusPicks::path_in(
                 &config::global_config_dir(),
             )),
@@ -26896,6 +27023,32 @@ fi
                     state.show_older = !state.show_older;
                 }
             }
+            Event::WorkspaceOverviewToggleDocuments => {
+                if let Some(state) = self
+                    .overview_key()
+                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
+                {
+                    state.documents_open = !state.documents_open;
+                }
+            }
+            Event::WorkspaceOverviewToggleAlso => {
+                if let Some(state) = self
+                    .overview_key()
+                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
+                {
+                    state.also_open = !state.also_open;
+                }
+            }
+            Event::OverviewHoverEnter(target) => {
+                self.overview_hover = Some(target);
+            }
+            Event::OverviewHoverClear => {
+                self.overview_hover = None;
+            }
+            Event::OverviewHoverExit(target) => {
+                self.overview_hover =
+                    overview::hover_after_exit(self.overview_hover.take(), &target);
+            }
             Event::WorkspaceOverviewOpenChat(id) => {
                 return self.open_overview_chat(&id);
             }
@@ -35408,10 +35561,11 @@ fi
 
     /// The overview's one Repos section (TRU-167, TRU-180, TRU-192): every
     /// repo the workspace lists or the work touched, each with its edit
-    /// count and the owned branches under it. The header carries the repo's
-    /// run command, a remove control (not the home) and opens the Git view
-    /// on a click; `+ add repo` picks a folder. A note offers undo when
-    /// repos joined from the chats' touches. A pure render over `state`.
+    /// count and the owned branches under it. The repo's line carries its
+    /// run command and opens the Git view on a click; editing the command,
+    /// its age and a remove control (not the home) show on hover (TRU-208).
+    /// `+ add` picks a folder. A note offers undo when repos joined from
+    /// the chats' touches. A pure render over `state`.
     fn view_overview_repos<'a>(
         &'a self,
         state: Option<&'a WorkspaceOverviewState>,
@@ -35431,36 +35585,18 @@ fi
             state.map_or(&[][..], |state| &state.summary.repos),
             state.map_or(&[][..], |state| &state.branches),
         );
-        let owned_count: usize = groups
-            .iter()
-            .map(|group| group.rows.iter().filter(|row| !row.owned.gone).count())
-            .sum();
-
-        let mut header = Row::new()
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .push(
-                text(format!(
-                    "REPOS \u{00B7} {} \u{00B7} BRANCHES \u{00B7} {owned_count}",
-                    groups.len()
-                ))
-                .size(10)
-                .color(text_muted)
-                .font(mono),
-            )
-            .push(iced::widget::Space::new().width(Length::Fill));
-        if matches!(ws.location, WorkspaceLocation::Local { .. }) {
-            header = header.push(
-                button(
-                    text("+ add repo")
-                        .size(font_small - 1.0)
-                        .color(theme.accent()),
-                )
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::WorkspaceRepoAdd(uid)),
-            );
-        }
+        let bold = iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..Default::default()
+        };
+        let add = matches!(ws.location, WorkspaceLocation::Local { .. }).then(|| {
+            button(text("+ add").size(font_small - 1.0).color(theme.accent()))
+                .style(self.flat_button_style())
+                .padding([0, 4])
+                .on_press(Event::WorkspaceRepoAdd(uid))
+                .into()
+        });
+        let header = self.overview_section_header("Repos", groups.len().to_string(), add);
         let mut section = Column::new().spacing(3).push(header);
 
         if !ws.joined_note.is_empty() {
@@ -35478,11 +35614,11 @@ fi
                         .color(theme.text_secondary())
                         .width(Length::Fill),
                     button(text("Undo").size(font_small - 1.0).color(theme.accent()))
-                        .style(self.ghost_button_style())
+                        .style(self.flat_button_style())
                         .padding([2, 6])
                         .on_press(Event::WorkspaceRepoJoinedUndo(uid)),
                     button(text("\u{00D7}").size(font_small - 1.0).color(text_muted))
-                        .style(self.ghost_button_style())
+                        .style(self.flat_button_style())
                         .padding([2, 4])
                         .on_press(Event::WorkspaceRepoJoinedDismiss(uid)),
                 ]
@@ -35493,7 +35629,7 @@ fi
 
         let home = dirs::home_dir();
         let selected = self.open_review_checkout();
-        let mut repos = Column::new().spacing(6);
+        let mut repos = Column::new().spacing(4);
         for group in groups {
             let repo_state = listed.iter().find(|repo| repo.dir == group.dir);
             // Worktrees git still lists whose folder is gone: one dim
@@ -35501,102 +35637,113 @@ fi
             let (gone, rows): (Vec<_>, Vec<_>) =
                 group.rows.into_iter().partition(|row| row.owned.gone);
             let oldest = rows.iter().map(|row| row.checked_at).min();
-            let mut name = overview::folder_name(&group.dir);
-            if repo_state.is_some_and(|repo| repo.id == ws.home) {
-                name.push_str(" \u{00B7} home");
-            }
-            // The name opens the Git view on the repo (TRU-192).
-            let local = repo_state.is_none_or(|repo| repo.key.is_local());
-            let mut head = row![
-                button(text(name).size(font_small).color(text_primary).font(mono))
-                    .style(self.ghost_button_style())
-                    .padding([0, 2])
-                    .on_press_maybe(local.then(|| {
-                        Event::OpenRepoPanel(SidebarMode::Git, Some(group.dir.clone()))
-                    }))
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
-            if let Some(edits) = group.edits {
-                head = head.push(
-                    text(format!("{edits} edits"))
-                        .size(10)
-                        .color(text_muted)
-                        .font(mono),
-                );
-            }
-            head = head.push(iced::widget::Space::new().width(Length::Fill));
-            // Its run command (TRU-180): `▶` opens it as a terminal tab
-            // below; ✎ edits it. Only this Mac's folders run.
-            if let Some(repo) = repo_state.filter(|repo| repo.key.is_local()) {
-                let editing = self
-                    .editing_run_command
-                    .as_ref()
-                    .filter(|(id, _)| *id == repo.id);
-                head = match (editing, &repo.run_command) {
-                    (Some((_, draft)), _) => head.push(
-                        text_input("npm run dev", draft)
-                            .on_input(Event::RunCommandChanged)
-                            .on_submit(Event::RunCommandSubmit)
-                            .size(font_small - 1.0)
-                            .padding([2, 4])
-                            .width(Length::Fixed(160.0))
-                            .font(mono)
-                            .style(self.input_style()),
-                    ),
-                    (None, Some(command)) => head
-                        .push(
-                            button(
-                                text(format!("\u{25B6} {command}"))
-                                    .size(10)
-                                    .color(theme.success())
-                                    .font(mono),
-                            )
-                            .style(self.ghost_button_style())
-                            .padding([0, 4])
-                            .on_press(Event::RunRepoCommand(repo.id)),
-                        )
-                        .push(
-                            button(text("\u{270E}").size(10).color(text_muted))
-                                .style(self.ghost_button_style())
-                                .padding([0, 4])
-                                .on_press(Event::RunCommandEditStart(repo.id)),
-                        ),
-                    (None, None) => head.push(
-                        button(text("+ run command").size(10).color(text_muted).font(mono))
-                            .style(self.ghost_button_style())
-                            .padding([0, 4])
-                            .on_press(Event::RunCommandEditStart(repo.id)),
-                    ),
-                };
-            }
-            if let Some(oldest) = oldest {
-                head = head.push(
-                    text(overview::age_label(oldest))
-                        .size(10)
-                        .color(text_muted)
-                        .font(mono),
-                );
-            }
-            if let Some(repo) = repo_state.filter(|repo| repo.id != ws.home) {
-                head = head.push(
-                    button(text("\u{00D7}").size(font_small).color(text_muted))
-                        .style(self.ghost_button_style())
-                        .padding([0, 4])
-                        .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
-                );
-            }
-            let mut column = Column::new().spacing(2).push(head);
-            if rows.is_empty() && gone.is_empty() {
-                let note = if group.edits.is_none() {
+            let name = overview::folder_name(&group.dir);
+            let is_home = repo_state.is_some_and(|repo| repo.id == ws.home);
+            // A repo with nothing going on is one line (TRU-208): its note
+            // moves to the line's right side and the name dims.
+            let empty_note = (rows.is_empty() && gone.is_empty()).then(|| {
+                if group.edits.is_none() {
                     "no edits yet"
                 } else if state.is_some_and(|state| state.last_full_refresh.is_none()) {
                     "reading\u{2026}"
                 } else {
                     "no live checkout of this work"
-                };
-                column = column.push(text(note).size(10).color(text_muted));
+                }
+            });
+            let quiet = empty_note.is_some() && group.edits.is_none();
+            let facts = overview::repo_facts(is_home, group.edits, empty_note);
+            let target = OverviewHover::Repo(group.dir.clone());
+            let hovered = self.overview_hovered(&target);
+            // The name opens the Git view on the repo (TRU-192).
+            let local = repo_state.is_none_or(|repo| repo.key.is_local());
+            let name_button = button(text(name).size(font_small).font(bold).color(if quiet {
+                text_muted
+            } else {
+                text_primary
+            }))
+            .style(self.flat_button_style())
+            .padding([0, 2])
+            .on_press_maybe(
+                local.then(|| Event::OpenRepoPanel(SidebarMode::Git, Some(group.dir.clone()))),
+            );
+            // Its run command (TRU-180): `▶` opens it as a terminal tab
+            // below and stays shown; ✎ edits it, on hover. Only this Mac's
+            // folders run. Fixed slots: name, run, gap, hover, facts.
+            let local_repo = repo_state.filter(|repo| repo.key.is_local());
+            let editing = local_repo.and_then(|repo| {
+                self.editing_run_command
+                    .as_ref()
+                    .filter(|(id, _)| *id == repo.id)
+                    .map(|(_, draft)| draft)
+            });
+            let run_slot: Element<'a, Event, Theme, iced::Renderer> = match (local_repo, editing) {
+                (Some(_), Some(draft)) => text_input("npm run dev", draft)
+                    .on_input(Event::RunCommandChanged)
+                    .on_submit(Event::RunCommandSubmit)
+                    .size(font_small - 1.0)
+                    .padding([2, 4])
+                    .width(Length::Fixed(160.0))
+                    .font(mono)
+                    .style(self.input_style())
+                    .into(),
+                (Some(repo), None) => match &repo.run_command {
+                    Some(command) => button(
+                        text(format!("\u{25B6} {command}"))
+                            .size(10)
+                            .color(theme.success())
+                            .font(mono),
+                    )
+                    .style(self.flat_button_style())
+                    .padding([0, 4])
+                    .on_press(Event::RunRepoCommand(repo.id))
+                    .into(),
+                    None => iced::widget::Space::new().into(),
+                },
+                (None, _) => iced::widget::Space::new().into(),
+            };
+            let mut hover_slot = Row::new().spacing(2).align_y(iced::Alignment::Center);
+            if hovered {
+                if let Some(repo) = local_repo.filter(|_| editing.is_none()) {
+                    hover_slot = hover_slot.push(match &repo.run_command {
+                        Some(_) => button(text("\u{270E}").size(10).color(text_muted))
+                            .style(self.flat_button_style())
+                            .padding([0, 4])
+                            .on_press(Event::RunCommandEditStart(repo.id)),
+                        None => button(text("+ run command").size(10).color(text_muted).font(mono))
+                            .style(self.flat_button_style())
+                            .padding([0, 4])
+                            .on_press(Event::RunCommandEditStart(repo.id)),
+                    });
+                }
+                if let Some(oldest) = oldest {
+                    hover_slot = hover_slot.push(
+                        text(overview::age_label(oldest))
+                            .size(10)
+                            .color(text_muted)
+                            .font(mono),
+                    );
+                }
+                if let Some(repo) = repo_state.filter(|repo| repo.id != ws.home) {
+                    hover_slot = hover_slot.push(
+                        button(text("\u{00D7}").size(font_small).color(text_muted))
+                            .style(self.flat_button_style())
+                            .padding([0, 4])
+                            .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
+                    );
+                }
             }
+            let head = row![
+                name_button,
+                run_slot,
+                iced::widget::Space::new().width(Length::Fill),
+                hover_slot,
+                text(facts).size(10).color(text_muted).font(mono),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            let mut column = Column::new()
+                .spacing(1)
+                .push(self.overview_hover_area(head, target));
             for row in rows {
                 column = column.push(self.view_overview_branch_row(
                     row,
@@ -35640,11 +35787,14 @@ fi
         let text_muted = theme.text_muted();
         let hover = theme.bg_overlay();
         let surface0 = theme.surface0();
-        let section = |label: String| text(label).size(10).color(text_muted).font(mono);
+        let bold = iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..Default::default()
+        };
         let name = self
             .active_workspace()
-            .map(|ws| ws.name.to_uppercase())
-            .unwrap_or_else(|| "WORKSPACE".to_string());
+            .map(|ws| ws.name.clone())
+            .unwrap_or_else(|| "Workspace".to_string());
         let state = self
             .overview_key()
             .and_then(|dir| self.workspace_overviews.get(&dir));
@@ -35653,14 +35803,14 @@ fi
             text(if reading {
                 "reading\u{2026}"
             } else {
-                "\u{21BB} Refresh"
+                "\u{21BB}"
             })
             .size(11)
-            .color(theme.blue())
+            .color(text_muted)
             .font(mono),
         )
-        .style(self.ghost_button_style())
-        .padding([4, 5]);
+        .style(self.flat_button_style())
+        .padding([2, 5]);
         if state.is_some() && !reading {
             refresh = refresh.on_press(Event::WorkspaceOverviewRefresh);
         }
@@ -35684,23 +35834,23 @@ fi
                 .into(),
             None => row![
                 iced::widget::mouse_area(
-                    text(format!("WORKSPACE \u{00B7} {name}"))
-                        .size(10)
-                        .color(text_muted)
-                        .font(mono),
+                    text(name)
+                        .size(self.ui_font())
+                        .color(text_primary)
+                        .font(bold),
                 )
                 .on_double_click(Event::WorkspaceRenameStart(
                     active_idx,
                     RenameSite::Overview
                 )),
+                iced::widget::Space::new().width(Length::Fill),
                 button(text("\u{270E}").size(10).color(text_muted))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([2, 4])
                     .on_press(Event::WorkspaceRenameStart(
                         active_idx,
                         RenameSite::Overview
                     )),
-                iced::widget::Space::new().width(Length::Fill),
             ]
             .spacing(2)
             .align_y(iced::Alignment::Center)
@@ -35710,11 +35860,13 @@ fi
         let header = row![title, refresh]
             .spacing(4)
             .align_y(iced::Alignment::Center);
-        let mut content = Column::new().spacing(8).padding([10, 8]).push(header);
+        let mut content = Column::new().spacing(10).padding([10, 8]).push(header);
+        // Leaving the panel clears the hovered row (TRU-208), so a row
+        // whose own exit never came (it went away under the pointer) does
+        // not stay open.
         let finish = |content: Column<'a, Event, Theme, iced::Renderer>| {
-            scrollable(content)
-                .height(Length::Fill)
-                .width(Length::Fill)
+            iced::widget::mouse_area(scrollable(content).height(Length::Fill).width(Length::Fill))
+                .on_exit(Event::OverviewHoverClear)
                 .into()
         };
 
@@ -35745,22 +35897,21 @@ fi
             content = content.push(repos);
         }
         // What the agent has here (TRU-192): opens the Agent view.
-        if let Some(config) = self.active_tab().map(|tab| &tab.claude_config) {
+        // Hidden when it has none of them (TRU-208).
+        let config_line = self.active_tab().and_then(|tab| {
+            let config = &tab.claude_config;
+            overview::agent_config_line(
+                config.skills.len(),
+                config.mcp_servers.len(),
+                config.hooks.len(),
+            )
+        });
+        if let Some(line) = config_line {
             content = content.push(
-                button(
-                    text(format!(
-                        "skills {} \u{00B7} MCPs {} \u{00B7} hooks {}",
-                        config.skills.len(),
-                        config.mcp_servers.len(),
-                        config.hooks.len()
-                    ))
-                    .size(10)
-                    .color(theme.accent())
-                    .font(mono),
-                )
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::SetSidebarMode(SidebarMode::Claude)),
+                button(text(line).size(10).color(theme.accent()).font(mono))
+                    .style(self.flat_button_style())
+                    .padding([2, 0])
+                    .on_press(Event::SetSidebarMode(SidebarMode::Claude)),
             );
         }
         let Some(state) = state else {
@@ -35789,7 +35940,7 @@ fi
                 "Index older chats"
             };
             let mut backfill = button(text(label).size(font_small - 1.0).color(theme.accent()))
-                .style(self.ghost_button_style())
+                .style(self.flat_button_style())
                 .padding([3, 8]);
             if !self.chat_backfill_running && !self.chat_index.is_empty() {
                 backfill = backfill.on_press(Event::ChatFactsBackfill);
@@ -35866,7 +36017,7 @@ fi
                     } else {
                         text_primary
                     }))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([3, 8])
                     .width(Length::Fill)
                     .on_press(Event::WorkspaceOverviewFocus(focus))
@@ -35896,11 +36047,11 @@ fi
 
         // An owning workspace lists every root it owns, newest first.
         if summary.owned && !summary.coordinators.is_empty() {
-            content = content.push(section(format!(
-                "CHATS \u{00B7} {}",
-                summary.coordinators.len()
-            )));
-            let mut chats = Column::new().spacing(2);
+            let mut chats = Column::new().spacing(2).push(self.overview_section_header(
+                "Chats",
+                summary.coordinators.len().to_string(),
+                None,
+            ));
             for coordinator in &summary.coordinators {
                 chats = chats.push(self.view_overview_coordinator_row(coordinator, false));
             }
@@ -35914,12 +36065,15 @@ fi
                 summary.coordinators.iter().filter(|c| c.recent).collect();
             let older: Vec<&overview::Coordinator> =
                 summary.coordinators.iter().filter(|c| !c.recent).collect();
-            content = content.push(section(if recent.is_empty() {
-                "CHATS \u{00B7} none in the last 7 days".to_string()
-            } else {
-                format!("CHATS \u{00B7} {} in the last 7 days", recent.len())
-            }));
-            let mut chats = Column::new().spacing(2);
+            let mut chats = Column::new().spacing(2).push(self.overview_section_header(
+                "Chats",
+                if recent.is_empty() {
+                    "none in the last 7 days".to_string()
+                } else {
+                    format!("{} in the last 7 days", recent.len())
+                },
+                None,
+            ));
             for coordinator in recent.iter().take(COORDINATOR_ROWS) {
                 chats = chats.push(self.view_overview_coordinator_row(
                     coordinator,
@@ -35932,7 +36086,7 @@ fi
                         .size(10)
                         .color(theme.accent()),
                 )
-                .style(self.ghost_button_style())
+                .style(self.flat_button_style())
                 .padding([2, 6])
                 .on_press(Event::SetSidebarMode(SidebarMode::Chats))
             };
@@ -35943,57 +36097,68 @@ fi
                 chats = chats.push(
                     button(
                         text(format!(
-                            "{} {} older",
-                            if state.show_older {
-                                "\u{25BE}"
-                            } else {
-                                "\u{25B8}"
-                            },
-                            older.len()
+                            "{} older {}",
+                            older.len(),
+                            overview::fold_marker(state.show_older)
                         ))
                         .size(10)
-                        .color(text_muted)
-                        .font(mono),
+                        .color(text_muted),
                     )
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([2, 6])
                     .on_press(Event::WorkspaceOverviewToggleOlder),
                 );
-                if state.show_older {
-                    for coordinator in older.iter().take(OLDER_ROWS) {
-                        chats = chats.push(self.view_overview_coordinator_row(
-                            coordinator,
-                            summary.focused.contains(&coordinator.id),
-                        ));
-                    }
-                    if older.len() > OLDER_ROWS {
-                        chats = chats.push(more_in_chats(older.len() - OLDER_ROWS));
-                    }
+                for coordinator in overview::fold_rows(&older, state.show_older)
+                    .iter()
+                    .take(OLDER_ROWS)
+                {
+                    chats = chats.push(self.view_overview_coordinator_row(
+                        coordinator,
+                        summary.focused.contains(&coordinator.id),
+                    ));
+                }
+                if state.show_older && older.len() > OLDER_ROWS {
+                    chats = chats.push(more_in_chats(older.len() - OLDER_ROWS));
                 }
             }
             content = content.push(chats);
         }
 
-        // Documents of the work (TRU-191), newest first.
-        if let Some(documents) = self.view_work_documents() {
-            let count = self
-                .active_workspace()
-                .and_then(|ws| self.work_documents.get(&ws.uid))
-                .and_then(|state| state.result.as_ref())
-                .map_or(0, |result| result.documents.len());
-            content = content
-                .push(section(format!("DOCUMENTS \u{00B7} {count}")))
-                .push(documents);
+        // Documents of the work (TRU-191), newest first; folded to a count
+        // until opened (TRU-208).
+        let documents_count = self
+            .active_workspace()
+            .and_then(|ws| self.work_documents.get(&ws.uid))
+            .and_then(|state| state.result.as_ref())
+            .map_or(0, |result| result.documents.len());
+        if documents_count > 0 {
+            let mut documents = Column::new().spacing(2).push(self.overview_fold_header(
+                "Documents",
+                documents_count,
+                state.documents_open,
+                Event::WorkspaceOverviewToggleDocuments,
+            ));
+            if state.documents_open {
+                if let Some(list) = self.view_work_documents() {
+                    documents = documents.push(list);
+                }
+            }
+            content = content.push(documents);
         }
 
-        // Coordinators that live in another workspace but edited here.
+        // Coordinators that live in another workspace but edited here;
+        // folded to a count until opened (TRU-208).
         if !summary.also_worked.is_empty() {
-            content = content.push(section(format!(
-                "ALSO WORKED HERE \u{00B7} {}",
-                summary.also_worked.len()
-            )));
-            let mut also = Column::new().spacing(2);
-            for item in summary.also_worked.iter().take(COORDINATOR_ROWS) {
+            let mut also = Column::new().spacing(2).push(self.overview_fold_header(
+                "Also worked here",
+                summary.also_worked.len(),
+                state.also_open,
+                Event::WorkspaceOverviewToggleAlso,
+            ));
+            for item in overview::fold_rows(&summary.also_worked, state.also_open)
+                .iter()
+                .take(COORDINATOR_ROWS)
+            {
                 also = also.push(self.view_overview_coordinator_row_with(
                     &item.coordinator,
                     summary.focused.contains(&item.coordinator.id),
@@ -36004,12 +36169,16 @@ fi
         }
 
         if !summary.issue_keys.is_empty() {
-            content = content
-                .push(section(format!(
-                    "ISSUES \u{00B7} {}",
-                    summary.issue_keys.len()
-                )))
-                .push(self.view_work_issues(&summary.issue_keys));
+            content = content.push(
+                Column::new()
+                    .spacing(2)
+                    .push(self.overview_section_header(
+                        "Issues",
+                        summary.issue_keys.len().to_string(),
+                        None,
+                    ))
+                    .push(self.view_work_issues(&summary.issue_keys)),
+            );
         }
         for error in &state.errors {
             content = content.push(
@@ -36021,9 +36190,9 @@ fi
         finish(content)
     }
 
-    /// One coordinator: title and age, latest line, fan-out and indexed
-    /// children. Clicking focuses it; the ↗ beside it opens the conversation in the
-    /// main area, and "open" marks one a tab already hosts.
+    /// One coordinator on one line (TRU-208): title, "open", fan-out and
+    /// age. Hovering shows the latest line, the indexed children and ↗,
+    /// which opens the conversation in the main area. Clicking focuses it.
     fn view_overview_coordinator_row<'a>(
         &'a self,
         coordinator: &'a overview::Coordinator,
@@ -36055,72 +36224,90 @@ fi
         let text_muted = theme.text_muted();
         let surface0 = theme.surface0();
         let hover = theme.bg_overlay();
-        let mut body = Column::new().spacing(2).push(
-            row![
-                text("\u{2726}").size(font_small).color(theme.mauve()),
-                text(overview::shorten(&coordinator.title, 70))
-                    .size(font_small)
-                    .color(theme.text_primary())
-                    .width(Length::Fill),
-                text(if is_open { "open" } else { "" })
-                    .size(10)
-                    .color(theme.green()),
-                text(chats::format_age(coordinator.active))
-                    .size(10)
-                    .color(text_muted)
-                    .font(mono),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-        );
-        if let Some(latest) = &coordinator.latest {
-            body = body.push(
-                text(format!("\u{21B3} {}", overview::shorten(latest, 90)))
-                    .size(font_small - 1.0)
-                    .color(theme.text_secondary()),
-            );
-        }
-        if let Some(edits) = edits_here {
-            body = body.push(
-                text(format!(
-                    "{edits} edit{} here",
-                    if edits == 1 { "" } else { "s" }
-                ))
+        let target = OverviewHover::Chat(coordinator.id.clone());
+        let hovered = self.overview_hovered(&target);
+        // Fixed slots: mark, title, open, edits here, fan-out, age, ↗.
+        let open = button(text("\u{2197}").size(font_small).color(theme.accent()))
+            .style(self.flat_button_style())
+            .padding([0, 4])
+            .on_press(Event::WorkspaceOverviewOpenChat(coordinator.id.clone()));
+        let open_slot: Element<'a, Event, Theme, iced::Renderer> = if hovered {
+            open.into()
+        } else {
+            iced::widget::Space::new().into()
+        };
+        let line = row![
+            text("\u{2726}").size(font_small).color(theme.mauve()),
+            text(overview::shorten(&coordinator.title, 70))
+                .size(font_small)
+                .color(theme.text_primary())
+                .width(Length::Fill),
+            text(if is_open { "open" } else { "" })
                 .size(10)
-                .color(theme.accent())
+                .color(theme.green()),
+            text(edits_here.map_or_else(String::new, |edits| format!(
+                "{edits} edit{} here",
+                if edits == 1 { "" } else { "s" }
+            )))
+            .size(10)
+            .color(theme.accent())
+            .font(mono),
+            text(
+                coordinator
+                    .fan_out
+                    .as_deref()
+                    .map_or_else(String::new, |fan_out| overview::shorten(fan_out, 28))
+            )
+            .size(10)
+            .color(text_muted)
+            .font(mono),
+            text(chats::format_age(coordinator.active))
+                .size(10)
+                .color(text_muted)
                 .font(mono),
-            );
-        }
-        if let Some(fan_out) = &coordinator.fan_out {
-            body = body.push(text(fan_out.clone()).size(10).color(text_muted).font(mono));
-        }
-        for child in coordinator.children.iter().take(CHILD_ROWS) {
-            let kind = match child.kind {
-                Some(chat_facts::ChildKind::Worker) => "worker",
-                Some(chat_facts::ChildKind::Review) => "review",
-                Some(chat_facts::ChildKind::Consult) => "consult",
-                Some(chat_facts::ChildKind::Subagent) => "subagent",
-                None => "chat",
-            };
-            body = body.push(
-                text(format!(
-                    "   {kind} \u{00B7} {} \u{00B7} {}",
-                    overview::shorten(&child.title, 50),
-                    chats::format_age(child.mtime)
-                ))
-                .size(10)
-                .color(text_muted),
-            );
-        }
-        if coordinator.children.len() > CHILD_ROWS {
-            body = body.push(
-                text(format!(
-                    "   \u{2026} {} more",
-                    coordinator.children.len() - CHILD_ROWS
-                ))
-                .size(10)
-                .color(text_muted),
-            );
+            open_slot,
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        // Hover detail: the latest line and the indexed children.
+        let mut detail = Column::new().spacing(2);
+        if hovered {
+            if let Some(latest) = &coordinator.latest {
+                detail = detail.push(
+                    text(format!("\u{21B3} {}", overview::shorten(latest, 90)))
+                        .size(font_small - 1.0)
+                        .color(theme.text_secondary()),
+                );
+            }
+            for child in coordinator.children.iter().take(CHILD_ROWS) {
+                let kind = match child.kind {
+                    Some(chat_facts::ChildKind::Worker) => "worker",
+                    Some(chat_facts::ChildKind::Review) => "review",
+                    Some(chat_facts::ChildKind::Consult) => "consult",
+                    Some(chat_facts::ChildKind::Subagent) => "subagent",
+                    None => "chat",
+                };
+                detail = detail.push(
+                    text(format!(
+                        "   {kind} \u{00B7} {} \u{00B7} {}",
+                        overview::shorten(&child.title, 50),
+                        chats::format_age(child.mtime)
+                    ))
+                    .size(10)
+                    .color(text_muted),
+                );
+            }
+            if coordinator.children.len() > CHILD_ROWS {
+                detail = detail.push(
+                    text(format!(
+                        "   \u{2026} {} more",
+                        coordinator.children.len() - CHILD_ROWS
+                    ))
+                    .size(10)
+                    .color(text_muted),
+                );
+            }
         }
         // A workspace that owns its chats has no focus: a row opens its
         // chat. Folder-scoped, a row focuses (TRU-167).
@@ -36132,7 +36319,8 @@ fi
         };
         // "Make workspace", or "Go to <name>" when another workspace owns
         // it (TRU-169): on the focused row of a folder-scoped overview, and
-        // on rows this owning workspace does not own.
+        // on rows this owning workspace does not own. On hover, or while
+        // the row is focused (TRU-208).
         let owner = self.root_chat_owner(&coordinator.id);
         let owned_here = owning.is_some_and(|ws| ws.chats.contains(&coordinator.id));
         let show_action = if owning.is_some() {
@@ -36140,7 +36328,7 @@ fi
         } else {
             focused
         };
-        if show_action {
+        if show_action && (hovered || focused) {
             let (label, event) = match &owner {
                 Some((name, _)) => (
                     format!("\u{2192} Go to {}", overview::shorten(name, 30)),
@@ -36151,16 +36339,17 @@ fi
                     Event::WorkspaceFromChat(coordinator.id.clone()),
                 ),
             };
-            body = body.push(
+            detail = detail.push(
                 button(text(label).size(10).color(theme.accent()).font(mono))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([1, 0])
                     .on_press(event),
             );
         }
-        let focus = button(body)
+        let body = column![line, detail].spacing(2);
+        let row = button(body)
             .width(Length::Fill)
-            .padding([5, 6])
+            .padding([4, 6])
             .style(move |_, status| button::Style {
                 background: Some(
                     if focused {
@@ -36179,19 +36368,14 @@ fi
                 ..Default::default()
             })
             .on_press(press);
-        let open = button(text("\u{2197}").size(font_small).color(theme.accent()))
-            .style(self.ghost_button_style())
-            .padding([4, 5])
-            .on_press(Event::WorkspaceOverviewOpenChat(coordinator.id.clone()));
-        row![focus, open]
-            .spacing(2)
-            .align_y(iced::Alignment::Start)
-            .into()
+        self.overview_hover_area(row, target)
     }
 
-    /// One owned checkout: branch and dirty count, then checkout, ahead and
-    /// behind its base, push state, PR when known, owner and last activity.
-    /// Opens the review pane (TRU-178): Uncommitted when dirty, else vs base.
+    /// One owned checkout on one line (TRU-208): the branch and the one
+    /// fact that needs you (dirty count, else unpushed ↑n; nothing when
+    /// clean). Hovering adds the checkout, ahead and behind its base, push
+    /// state, PR when known, owner and last activity, and "Diff". A click
+    /// opens the review pane (TRU-178): Uncommitted when dirty, else vs base.
     fn view_overview_branch_row<'a>(
         &'a self,
         row: &'a overview::BranchStatus,
@@ -36204,53 +36388,77 @@ fi
         let text_muted = theme.text_muted();
         let surface0 = theme.surface0();
         let hover = theme.bg_overlay();
+        let target = OverviewHover::Branch(row.owned.checkout.clone());
+        let hovered = self.overview_hovered(&target);
         let branch = row.owned.branch.as_deref().unwrap_or("(detached)");
-        let (dirty, dirty_color) = match &row.status {
-            Some(status) if status.files > 0 => (status.dirty_label(), theme.warning()),
-            Some(status) => (status.dirty_label(), text_muted),
-            None => ("\u{2014}".to_string(), text_muted),
+        let fact = overview::branch_fact(row.status.as_ref());
+        let fact_color = match fact {
+            Some(overview::BranchFact::Dirty(_)) => theme.warning(),
+            _ => text_muted,
         };
-        let mut parts = vec![overview::short_checkout(&row.owned, home)];
-        match (overview::vs_base_label(row), &row.base) {
-            (Some(label), _) => parts.push(label),
-            (None, None) => parts.push("no base".to_string()),
-            (None, Some(_)) => {}
+        let source = match (&row.status, &row.base) {
+            (Some(status), Some(_)) if status.files == 0 => overview::DiffSource::VsBase,
+            _ => overview::DiffSource::Uncommitted,
+        };
+        let open = Event::ReviewOpen(row.owned.checkout.clone(), source);
+        // Fixed slots: name, fact, Diff (on hover).
+        let diff_slot: Element<'a, Event, Theme, iced::Renderer> = if hovered {
+            button(text("Diff").size(10).color(theme.accent()))
+                .style(self.flat_button_style())
+                .padding([0, 4])
+                .on_press(open.clone())
+                .into()
+        } else {
+            iced::widget::Space::new().into()
+        };
+        let line = row![
+            text(overview::shorten(branch, 40))
+                .size(font_small)
+                .color(theme.text_primary())
+                .font(mono)
+                .width(Length::Fill),
+            text(
+                fact.as_ref()
+                    .map_or_else(String::new, overview::BranchFact::label)
+            )
+            .size(10)
+            .color(fact_color)
+            .font(mono),
+            diff_slot,
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        let mut detail = Column::new().spacing(1);
+        if hovered {
+            let mut parts = vec![overview::short_checkout(&row.owned, home)];
+            match (overview::vs_base_label(row), &row.base) {
+                (Some(label), _) => parts.push(label),
+                (None, None) => parts.push("no base".to_string()),
+                (None, Some(_)) => {}
+            }
+            if let Some(status) = &row.status {
+                parts.push(overview::push_label(status.push_state()));
+            }
+            parts.extend(row.pr_label());
+            parts.push(row.owner_label());
+            if let Some(at) = row.last_activity() {
+                parts.push(chats::format_age(at));
+            }
+            detail = detail.push(text(parts.join(" \u{00B7} ")).size(10).color(text_muted));
         }
-        if let Some(status) = &row.status {
-            parts.push(overview::push_label(status.push_state()));
-        }
-        parts.extend(row.pr_label());
-        parts.push(row.owner_label());
-        if let Some(at) = row.last_activity() {
-            parts.push(chats::format_age(at));
-        }
-        let mut body = Column::new().spacing(1).push(
-            row![
-                text(overview::shorten(branch, 40))
-                    .size(font_small)
-                    .color(theme.text_primary())
-                    .font(mono)
-                    .width(Length::Fill),
-                text(dirty).size(10).color(dirty_color).font(mono),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-        );
-        body = body.push(text(parts.join(" \u{00B7} ")).size(10).color(text_muted));
+        // A read failure needs you: always shown.
         if let Some(error) = &row.error {
-            body = body.push(
+            detail = detail.push(
                 text(overview::shorten(error, 160))
                     .size(10)
                     .color(theme.danger()),
             );
         }
-        let source = match (&row.status, &row.base) {
-            (Some(status), Some(_)) if status.files == 0 => overview::DiffSource::VsBase,
-            _ => overview::DiffSource::Uncommitted,
-        };
-        button(body)
+        let body = column![line, detail].spacing(1);
+        let row = button(body)
             .width(Length::Fill)
-            .padding([4, 8])
+            .padding([3, 8])
             .style(move |_, status| button::Style {
                 background: Some(
                     if selected {
@@ -36268,8 +36476,8 @@ fi
                 },
                 ..Default::default()
             })
-            .on_press(Event::ReviewOpen(row.owned.checkout.clone(), source))
-            .into()
+            .on_press(open);
+        self.overview_hover_area(row, target)
     }
 
     fn view_task_rail(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -40797,10 +41005,11 @@ fi
         .into()
     }
 
-    /// The active workspace's documents (TRU-191), newest first. Each row: title and age, then the newest copy's
-    /// source and the path within its checkout, and "N copies" (with
-    /// "copies differ") when there are more; clicking opens the newest copy
-    /// in the markdown viewer and the copies line lists each copy to open.
+    /// The active workspace's documents (TRU-191), newest first. Each row is
+    /// one line, title and age (TRU-208); hovering adds the newest copy's
+    /// source and the path within its checkout, and "N copies" when there
+    /// are more (always shown when they differ). Clicking opens the newest
+    /// copy in the markdown viewer; "N copies" lists each copy to open.
     /// `None` while nothing has been read or nothing was found.
     fn view_work_documents(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
         let theme = &self.theme;
@@ -40821,11 +41030,37 @@ fi
         };
         for doc in result.documents.iter().take(shown) {
             let newest = doc.newest();
+            let target = OverviewHover::Document(doc.key.clone());
+            let hovered = self.overview_hovered(&target);
+            let open = self.work_document_copies_open.as_deref() == Some(doc.key.as_str());
+            // One line per document (TRU-208), its copies merged into it:
+            // "n copies" shows on hover, while open, or when they differ.
+            let copies_slot: Element<'_, Event, Theme, iced::Renderer> =
+                if doc.copies.len() > 1 && (hovered || open || doc.differ) {
+                    let label = format!(
+                        "{} copies{} {}",
+                        doc.copies.len(),
+                        if doc.differ { " differ" } else { "" },
+                        overview::fold_marker(open)
+                    );
+                    button(text(label).size(10).color(if doc.differ {
+                        theme.yellow()
+                    } else {
+                        text_muted
+                    }))
+                    .style(self.flat_button_style())
+                    .padding([0, 4])
+                    .on_press(Event::WorkDocumentCopiesToggle(doc.key.clone()))
+                    .into()
+                } else {
+                    iced::widget::Space::new().into()
+                };
             let head = row![
                 text(overview::shorten(&doc.title, 60))
                     .size(font_small)
                     .color(text_primary)
                     .width(Length::Fill),
+                copies_slot,
                 text(overview::age_label(newest.modified))
                     .size(10)
                     .color(text_muted)
@@ -40833,61 +41068,44 @@ fi
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
-            let detail = text(overview::shorten(
-                &format!("{} \u{00B7} {}", newest.source.label(), doc.rel),
-                80,
-            ))
-            .size(10)
-            .color(text_muted);
-            let mut entry = Column::new().spacing(1).push(
-                button(column![head, detail].spacing(1))
-                    .style(self.ghost_button_style())
-                    .padding([4, 6])
-                    .width(Length::Fill)
-                    .on_press(Event::ViewFile(SourcePath::Local(newest.path.clone()))),
-            );
-            if doc.copies.len() > 1 {
-                let open = self.work_document_copies_open.as_deref() == Some(doc.key.as_str());
-                let label = format!(
-                    "{} {} copies{}",
-                    if open { "\u{25BE}" } else { "\u{25B8}" },
-                    doc.copies.len(),
-                    if doc.differ {
-                        " \u{00B7} copies differ"
-                    } else {
-                        ""
-                    }
+            let mut detail = Column::new();
+            if hovered {
+                detail = detail.push(
+                    text(overview::shorten(
+                        &format!("{} \u{00B7} {}", newest.source.label(), doc.rel),
+                        80,
+                    ))
+                    .size(10)
+                    .color(text_muted),
                 );
-                entry = entry.push(
-                    button(text(label).size(10).color(if doc.differ {
-                        theme.yellow()
-                    } else {
-                        text_muted
-                    }))
-                    .style(self.ghost_button_style())
-                    .padding([1, 12])
-                    .on_press(Event::WorkDocumentCopiesToggle(doc.key.clone())),
-                );
-                if open {
-                    for (index, copy) in doc.copies.iter().enumerate() {
-                        let line = format!(
-                            "{}{} \u{00B7} {}",
-                            if index == 0 { "newest \u{00B7} " } else { "" },
-                            copy.source.label(),
-                            overview::age_label(copy.modified)
-                        );
-                        entry = entry.push(
-                            button(
-                                text(overview::shorten(&line, 70))
-                                    .size(10)
-                                    .color(theme.accent()),
-                            )
-                            .style(self.ghost_button_style())
-                            .padding([1, 18])
-                            .width(Length::Fill)
-                            .on_press(Event::ViewFile(SourcePath::Local(copy.path.clone()))),
-                        );
-                    }
+            }
+            let line = button(column![head, detail].spacing(1))
+                .style(self.flat_button_style())
+                .padding([3, 6])
+                .width(Length::Fill)
+                .on_press(Event::ViewFile(SourcePath::Local(newest.path.clone())));
+            let mut entry = Column::new()
+                .spacing(1)
+                .push(self.overview_hover_area(line, target));
+            if open {
+                for (index, copy) in doc.copies.iter().enumerate() {
+                    let line = format!(
+                        "{}{} \u{00B7} {}",
+                        if index == 0 { "newest \u{00B7} " } else { "" },
+                        copy.source.label(),
+                        overview::age_label(copy.modified)
+                    );
+                    entry = entry.push(
+                        button(
+                            text(overview::shorten(&line, 70))
+                                .size(10)
+                                .color(theme.accent()),
+                        )
+                        .style(self.flat_button_style())
+                        .padding([1, 18])
+                        .width(Length::Fill)
+                        .on_press(Event::ViewFile(SourcePath::Local(copy.path.clone()))),
+                    );
                 }
             }
             col = col.push(entry);
@@ -40901,7 +41119,7 @@ fi
             };
             col = col.push(
                 button(text(label).size(10).color(text_muted).font(mono))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([2, 6])
                     .on_press(Event::WorkDocumentsAllToggle),
             );

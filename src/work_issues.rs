@@ -245,7 +245,7 @@ impl App {
             .align_y(iced::Alignment::Center);
             let line: Element<'a, Event, Theme, iced::Renderer> = match url {
                 Some(url) => button(line)
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([3, 6])
                     .width(Length::Fill)
                     .on_press(Event::Issue(IssueEvent::Open(url)))
@@ -281,7 +281,7 @@ impl App {
         if let Some(label) = fold_label {
             col = col.push(
                 button(text(label).size(10).color(text_muted).font(mono))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([2, 6])
                     .on_press(Event::Issue(IssueEvent::AllToggle)),
             );

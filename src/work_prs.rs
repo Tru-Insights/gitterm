@@ -178,14 +178,32 @@ fn split_done<K>(
     (open, done)
 }
 
-/// The fold line for done PRs: "\u{2713} 3 merged" or with "n closed".
+/// The fold line for done PRs: "3 merged" or with "n closed".
 fn done_summary(done: &[PrState]) -> String {
     let merged = done.iter().filter(|s| **s == PrState::Merged).count();
     let closed = done.iter().filter(|s| **s == PrState::Closed).count();
     match (merged, closed) {
-        (m, 0) => format!("\u{2713} {m} merged"),
-        (0, c) => format!("\u{2713} {c} closed"),
-        (m, c) => format!("\u{2713} {m} merged \u{00B7} {c} closed"),
+        (m, 0) => format!("{m} merged"),
+        (0, c) => format!("{c} closed"),
+        (m, c) => format!("{m} merged \u{00B7} {c} closed"),
+    }
+}
+
+/// Which of a PR row's actions show (TRU-208).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrActionsShown {
+    /// Merge (filled on the next-to-merge PR).
+    merge: bool,
+    /// Review, Approve and Ready for review.
+    others: bool,
+}
+
+/// Actions wait for hover, except the next-to-merge PR keeps its Merge:
+/// the one action that is due now.
+fn pr_actions_shown(is_next: bool, hovered: bool) -> PrActionsShown {
+    PrActionsShown {
+        merge: is_next || hovered,
+        others: hovered,
     }
 }
 
@@ -1365,7 +1383,7 @@ impl App {
             "Tell coordinator"
         };
         let mut tell = button(text(tell_label).size(10).color(theme.accent()))
-            .style(self.ghost_button_style())
+            .style(self.flat_button_style())
             .padding([2, 6]);
         let reason = match self.coordinator_tab(root) {
             Ok(_) if !item.told => {
@@ -1381,7 +1399,7 @@ impl App {
         };
         line = line.push(tell).push(
             button(text("\u{00D7}").size(10).color(theme.text_muted()))
-                .style(self.ghost_button_style())
+                .style(self.flat_button_style())
                 .padding([2, 6])
                 .on_press(Event::Pr(PrEvent::NewsDismiss(
                     watched.key.id(),
@@ -1395,7 +1413,13 @@ impl App {
         item_col.into()
     }
 
-    /// One PR row of the overview section.
+    /// One PR row of the overview section, on one line (TRU-208): number,
+    /// title, the facts that need you (checks, blocked or held, changes
+    /// requested, new comments, conflicts, draft) and the actions. Review,
+    /// Approve, Merge and Ready for review show on hover, except that the
+    /// next-to-merge PR keeps a filled Merge. Hovering adds the full live
+    /// line, what it waits for, its hold and note. News and read errors
+    /// always show.
     fn view_pr_row<'a>(
         &'a self,
         root: &str,
@@ -1405,127 +1429,87 @@ impl App {
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
         let font_small = self.ui_font_small();
+        let text_muted = theme.text_muted();
         let watched = self.watched(key);
+        let target = OverviewHover::Pr(key.id());
+        let hovered = self.overview_hovered(&target);
         let is_next = row.is_some_and(|row| row.status == RowStatus::Next);
+        let shown = pr_actions_shown(is_next, hovered);
         let draft = watched
             .and_then(WatchedPr::brief)
             .is_some_and(|brief| brief.state == merge_plan::PrState::Draft);
-        let mut head = Row::new().spacing(6).align_y(iced::Alignment::Center);
-        if let Some(row) = row {
-            head = head.push(
-                text(format!("{}", row.position))
-                    .size(font_small)
-                    .color(theme.text_muted())
-                    .font(mono)
-                    .width(Length::Fixed(16.0)),
-            );
+        let core = watched.and_then(|w| w.snapshot.core.as_ref());
+        let title = core
+            .map(|core| core.title.as_str())
+            .filter(|title| !title.is_empty());
+
+        // Fixed slots: position, number, title, facts, actions.
+        let position = text(row.map_or_else(String::new, |row| format!("{}", row.position)))
+            .size(font_small)
+            .color(text_muted)
+            .font(mono)
+            .width(Length::Fixed(if row.is_some() { 16.0 } else { 0.0 }));
+        let number = text(format!("#{}", key.number))
+            .size(font_small)
+            .color(text_muted)
+            .font(mono);
+        let title = text(overview::shorten(title.unwrap_or(&key.label()), 60))
+            .size(font_small)
+            .color(theme.text_primary())
+            .width(Length::Fill);
+        let part = |label: String, color: iced::Color| text(label).size(10).color(color).font(mono);
+        let mut facts = Row::new().spacing(6).align_y(iced::Alignment::Center);
+        let live = core.is_some_and(|core| !core.state.is_some_and(PrState::is_final));
+        if let (Some(watched), true) = (watched, live) {
+            let snapshot = &watched.snapshot;
+            match snapshot.checks() {
+                pr_watch::ChecksState::Pass => {
+                    facts = facts.push(part("\u{2713}".to_string(), theme.success()));
+                }
+                pr_watch::ChecksState::Fail => {
+                    facts = facts.push(part("\u{2717}".to_string(), theme.danger()));
+                }
+                pr_watch::ChecksState::Pending => {
+                    facts = facts.push(part("\u{25CF}".to_string(), theme.warning()));
+                }
+                pr_watch::ChecksState::None => {}
+            }
+            if snapshot.review_decision() == pr_watch::ReviewDecision::ChangesRequested {
+                facts = facts.push(part("changes requested".to_string(), theme.danger()));
+            }
+            if watched.unseen_comments > 0 {
+                facts = facts.push(part(
+                    format!("{} new", watched.unseen_comments),
+                    theme.accent(),
+                ));
+            }
+            if snapshot.conflicting() == Some(true) {
+                facts = facts.push(part("conflicts".to_string(), theme.danger()));
+            }
         }
-        head = head.push(
-            text(key.label())
-                .size(font_small)
-                .color(if is_next {
-                    theme.accent()
-                } else {
-                    theme.text_primary()
-                })
-                .font(mono)
-                .width(Length::Fill),
-        );
         if let Some(row) = row {
-            let (label, color) = match &row.status {
-                RowStatus::Next => ("next to merge".to_string(), theme.accent()),
-                RowStatus::Ready => ("ready".to_string(), theme.success()),
-                RowStatus::Blocked(_) => ("blocked".to_string(), theme.warning()),
-                RowStatus::Held(_) => ("held".to_string(), theme.warning()),
-                other => (other.label().to_string(), theme.text_muted()),
-            };
-            if row.status != RowStatus::Draft {
-                head = head.push(text(label).size(10).color(color).font(mono));
+            match &row.status {
+                RowStatus::Blocked(_) => {
+                    facts = facts.push(part("blocked".to_string(), theme.warning()));
+                }
+                RowStatus::Held(_) => {
+                    facts = facts.push(part("held".to_string(), theme.warning()));
+                }
+                _ => {}
             }
         }
         // A draft can't be merged; say so where it can't be missed.
         if draft {
-            let warning = theme.warning();
-            head = head.push(
-                container(text("draft").size(font_small).color(warning).font(mono))
-                    .padding([1, 6])
-                    .style(move |_| container::Style {
-                        border: iced::Border {
-                            color: warning,
-                            width: 1.0,
-                            radius: 4.0.into(),
-                        },
-                        ..Default::default()
-                    }),
-            );
+            facts = facts.push(part("draft".to_string(), theme.warning()));
         }
-        let mut body = Column::new().spacing(2).push(head);
-        if let Some(core) = watched.and_then(|w| w.snapshot.core.as_ref()) {
-            if !core.title.is_empty() {
-                body = body.push(
-                    text(overview::shorten(&core.title, 70))
-                        .size(font_small - 1.0)
-                        .color(theme.text_secondary()),
-                );
-            }
-        }
-        body = body.push(self.pr_live_line(watched));
-        if let Some(row) = row {
-            match &row.status {
-                RowStatus::Blocked(waits) => {
-                    body = body.push(
-                        text(format!(
-                            "waits for {}{}",
-                            waits.join(", "),
-                            if row.stacked { " (stacked)" } else { "" }
-                        ))
-                        .size(10)
-                        .color(theme.warning()),
-                    );
-                }
-                RowStatus::Held(hold) => {
-                    body = body.push(
-                        row![
-                            text(format!("hold: {hold}"))
-                                .size(10)
-                                .color(theme.warning())
-                                .width(Length::Fill),
-                            button(text("clear hold").size(10).color(theme.accent()))
-                                .style(self.ghost_button_style())
-                                .padding([2, 6])
-                                .on_press(Event::Pr(PrEvent::ClearHold(
-                                    root.to_string(),
-                                    key.clone()
-                                ))),
-                        ]
-                        .spacing(6)
-                        .align_y(iced::Alignment::Center),
-                    );
-                }
-                _ => {}
-            }
-            if let Some(note) = &row.entry.note {
-                body = body.push(
-                    text(overview::shorten(note, 120))
-                        .size(10)
-                        .color(theme.text_muted()),
-                );
-            }
-        }
-        if let Some(error) = watched.and_then(|w| w.error.as_deref()) {
-            body = body.push(
-                text(overview::shorten(&format!("not read: {error}"), 160))
-                    .size(10)
-                    .color(theme.danger()),
-            );
-        }
+
         let open = watched
             .and_then(WatchedPr::brief)
             .is_some_and(|brief| brief.state == merge_plan::PrState::Open);
         let action = |label: String, event: Option<Event>| {
             let mut b = button(text(label).size(10).color(theme.text_primary()))
-                .style(self.ghost_button_style())
-                .padding([2, 8]);
+                .style(self.flat_button_style())
+                .padding([1, 6]);
             if let Some(event) = event {
                 b = b.on_press(event);
             }
@@ -1542,58 +1526,130 @@ impl App {
             Some(reason) if open => format!("{name} ({reason})"),
             _ => name.to_string(),
         };
-        let mut actions = Row::new().spacing(4).push(action(
-            "Review".to_string(),
-            Some(Event::Pr(PrEvent::Review(key.clone()))),
-        ));
-        if !self.is_own_pr(key, watched) {
+        let mut actions = Row::new().spacing(2).align_y(iced::Alignment::Center);
+        if shown.others {
             actions = actions.push(action(
-                gated("Approve"),
-                (open && reason.is_none())
-                    .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Approve))),
+                "Review".to_string(),
+                Some(Event::Pr(PrEvent::Review(key.clone()))),
             ));
+            if !self.is_own_pr(key, watched) {
+                actions = actions.push(action(
+                    gated("Approve"),
+                    (open && reason.is_none())
+                        .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Approve))),
+                ));
+            }
         }
-        actions = actions.push(action(
-            gated("Merge"),
-            (open && reason.is_none())
-                .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Merge))),
-        ));
-        if draft {
+        if shown.merge {
+            let merge = (open && reason.is_none())
+                .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Merge)));
+            actions = actions.push(if is_next {
+                // The only filled button: the action that is due now.
+                button(text(gated("Merge")).size(10).color(theme.bg_base()))
+                    .style(self.primary_button_style())
+                    .padding([1, 8])
+                    .on_press_maybe(merge)
+            } else {
+                action(gated("Merge"), merge)
+            });
+        }
+        if shown.others && draft {
             actions = actions.push(
                 button(text("Ready for review").size(10).color(theme.accent()))
-                    .style(self.ghost_button_style())
-                    .padding([2, 8])
+                    .style(self.flat_button_style())
+                    .padding([1, 6])
                     .on_press(Event::Pr(PrEvent::ActionOpen(
                         key.clone(),
                         ActionKind::Ready,
                     ))),
             );
         }
-        body = body.push(actions);
-        if let Some(watched) = watched {
-            for item in watched.open_news() {
-                body = body.push(self.view_pr_news_item(root, watched, item, false));
+        let line = row![position, number, title, facts, actions]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+
+        // Hover detail: the full live line, what it waits for, hold, note.
+        let mut detail = Column::new().spacing(2);
+        if hovered {
+            // Its place in the plan ("next", "ready", ...), the live line
+            // and the full `owner/name#n`.
+            let mut live = Row::new().spacing(6).align_y(iced::Alignment::Center);
+            if let Some(row) = row {
+                live = live.push(part(row.status.label().to_string(), text_muted));
+            }
+            detail = detail.push(
+                live.push(self.pr_live_line(watched))
+                    .push(part(key.label(), text_muted)),
+            );
+            if let Some(row) = row {
+                match &row.status {
+                    RowStatus::Blocked(waits) => {
+                        detail = detail.push(
+                            text(format!(
+                                "waits for {}{}",
+                                waits.join(", "),
+                                if row.stacked { " (stacked)" } else { "" }
+                            ))
+                            .size(10)
+                            .color(theme.warning()),
+                        );
+                    }
+                    RowStatus::Held(hold) => {
+                        detail = detail.push(
+                            row![
+                                text(format!("hold: {hold}"))
+                                    .size(10)
+                                    .color(theme.warning())
+                                    .width(Length::Fill),
+                                button(text("clear hold").size(10).color(theme.accent()))
+                                    .style(self.flat_button_style())
+                                    .padding([1, 6])
+                                    .on_press(Event::Pr(PrEvent::ClearHold(
+                                        root.to_string(),
+                                        key.clone()
+                                    ))),
+                            ]
+                            .spacing(6)
+                            .align_y(iced::Alignment::Center),
+                        );
+                    }
+                    _ => {}
+                }
+                if let Some(note) = &row.entry.note {
+                    detail = detail.push(
+                        text(overview::shorten(note, 120))
+                            .size(10)
+                            .color(text_muted),
+                    );
+                }
             }
         }
-        let accent = theme.accent();
-        let surface = theme.surface0();
-        container(body)
-            .padding([5, 6])
+        // Read errors and news need you: always shown.
+        if let Some(error) = watched.and_then(|w| w.error.as_deref()) {
+            detail = detail.push(
+                text(overview::shorten(&format!("not read: {error}"), 160))
+                    .size(10)
+                    .color(theme.danger()),
+            );
+        }
+        if let Some(watched) = watched {
+            for item in watched.open_news() {
+                detail = detail.push(self.view_pr_news_item(root, watched, item, false));
+            }
+        }
+        let hover_bg = theme.bg_overlay();
+        let body = container(Column::new().spacing(2).push(line).push(detail))
+            .padding([3, 6])
             .width(Length::Fill)
             .style(move |_| container::Style {
-                background: is_next.then(|| surface.into()),
+                background: hovered.then(|| hover_bg.into()),
                 border: iced::Border {
-                    color: if is_next {
-                        accent
-                    } else {
-                        iced::Color::TRANSPARENT
-                    },
-                    width: if is_next { 1.0 } else { 0.0 },
                     radius: 6.0.into(),
+                    ..Default::default()
                 },
                 ..Default::default()
-            })
-            .into()
+            });
+        self.overview_hover_area(body, target)
     }
 
     /// "PRs · merge order" for the active workspace's overview: each root's
@@ -1613,8 +1669,6 @@ impl App {
             unplanned: Vec<PrKey>,
             done: Vec<(PrKey, PrState)>,
             done_rows: Vec<OrderedRow>,
-            /// The plan lists PRs, finished ones included.
-            planned: bool,
         }
         let now = chrono::Utc::now();
         let shown = |key: &PrKey| {
@@ -1641,7 +1695,6 @@ impl App {
                 let (rows, done_rows): (Vec<_>, Vec<_>) = all_rows
                     .into_iter()
                     .partition(|row| !state_of(&row.entry.key()).is_some_and(PrState::is_final));
-                let planned = !rows.is_empty() || !done_rows.is_empty();
                 let (unplanned, mut done) = split_done(all_unplanned, state_of);
                 for row in &done_rows {
                     if let Some(state) = state_of(&row.entry.key()) {
@@ -1663,7 +1716,6 @@ impl App {
                     unplanned,
                     done,
                     done_rows,
-                    planned,
                 })
             })
             .collect();
@@ -1674,13 +1726,34 @@ impl App {
             .iter()
             .map(|g| g.rows.len() + g.unplanned.len())
             .sum();
-        let mut section = Column::new().spacing(4).push(
-            text(format!("PRS \u{00B7} MERGE ORDER \u{00B7} {total}"))
+        // Merged and closed PRs fold to a count at the right of the group's
+        // line, the section's header when there is one group (TRU-208).
+        let done_fold = |root: &str, done: &[(PrKey, PrState)]| {
+            let open = self.prs.done_open.contains(root);
+            let states: Vec<PrState> = done.iter().map(|(_, state)| *state).collect();
+            button(
+                text(format!(
+                    "{} {}",
+                    done_summary(&states),
+                    overview::fold_marker(open)
+                ))
                 .size(10)
-                .color(theme.text_muted())
-                .font(mono),
-        );
+                .color(theme.text_muted()),
+            )
+            .style(self.flat_button_style())
+            .padding([0, 4])
+            .on_press(Event::Pr(PrEvent::DoneToggle(root.to_string())))
+        };
         let several = groups.len() > 1;
+        let header_fold = groups
+            .first()
+            .filter(|group| !several && !group.done.is_empty())
+            .map(|group| done_fold(&group.root.root, &group.done).into());
+        let mut section = Column::new().spacing(2).push(self.overview_section_header(
+            "Pull requests",
+            format!("{total} open"),
+            header_fold,
+        ));
         for group in groups {
             let Group {
                 root,
@@ -1688,21 +1761,17 @@ impl App {
                 unplanned,
                 done,
                 done_rows,
-                planned,
             } = group;
             if several {
-                section = section.push(
-                    text(overview::shorten(&root.title, 50))
-                        .size(10)
-                        .color(theme.text_secondary()),
-                );
-            }
-            if !planned {
-                section = section.push(
-                    text("no merge plan yet; the coordinator sets one with merge_plan_set")
-                        .size(10)
-                        .color(theme.text_muted()),
-                );
+                let mut title = row![text(overview::shorten(&root.title, 50))
+                    .size(10)
+                    .color(theme.text_secondary())
+                    .width(Length::Fill)]
+                .align_y(iced::Alignment::Center);
+                if !done.is_empty() {
+                    title = title.push(done_fold(&root.root, &done));
+                }
+                section = section.push(title);
             }
             for row in &rows {
                 section = section.push(self.view_pr_row(&root.root, &row.entry.key(), Some(row)));
@@ -1718,30 +1787,16 @@ impl App {
             for key in &unplanned {
                 section = section.push(self.view_pr_row(&root.root, key, None));
             }
-            if !done.is_empty() {
-                let states: Vec<PrState> = done.iter().map(|(_, state)| *state).collect();
-                section = section.push(
-                    button(
-                        text(done_summary(&states))
-                            .size(10)
-                            .color(theme.text_muted())
-                            .font(mono),
-                    )
-                    .style(self.ghost_button_style())
-                    .padding([2, 4])
-                    .on_press(Event::Pr(PrEvent::DoneToggle(root.root.clone()))),
-                );
-                if self.prs.done_open.contains(&root.root) {
-                    for row in &done_rows {
-                        section =
-                            section.push(self.view_pr_row(&root.root, &row.entry.key(), Some(row)));
-                    }
-                    for (key, _) in done
-                        .iter()
-                        .filter(|(key, _)| !done_rows.iter().any(|r| r.entry.key() == *key))
-                    {
-                        section = section.push(self.view_pr_row(&root.root, key, None));
-                    }
+            if !done.is_empty() && self.prs.done_open.contains(&root.root) {
+                for row in &done_rows {
+                    section =
+                        section.push(self.view_pr_row(&root.root, &row.entry.key(), Some(row)));
+                }
+                for (key, _) in done
+                    .iter()
+                    .filter(|(key, _)| !done_rows.iter().any(|r| r.entry.key() == *key))
+                {
+                    section = section.push(self.view_pr_row(&root.root, key, None));
                 }
             }
         }
@@ -2052,12 +2107,34 @@ mod tests {
     #[test]
     fn done_summary_names_merged_and_closed() {
         use PrState::{Closed, Merged};
-        assert_eq!(done_summary(&[Merged, Merged]), "\u{2713} 2 merged");
+        assert_eq!(done_summary(&[Merged, Merged]), "2 merged");
         assert_eq!(
             done_summary(&[Merged, Closed]),
-            "\u{2713} 1 merged \u{00B7} 1 closed"
+            "1 merged \u{00B7} 1 closed"
         );
-        assert_eq!(done_summary(&[Closed]), "\u{2713} 1 closed");
+        assert_eq!(done_summary(&[Closed]), "1 closed");
+    }
+
+    #[test]
+    fn only_the_next_to_merge_pr_keeps_its_merge_visible() {
+        let quiet = PrActionsShown {
+            merge: false,
+            others: false,
+        };
+        assert_eq!(pr_actions_shown(false, false), quiet);
+        assert_eq!(
+            pr_actions_shown(true, false),
+            PrActionsShown {
+                merge: true,
+                others: false
+            }
+        );
+        let all = PrActionsShown {
+            merge: true,
+            others: true,
+        };
+        assert_eq!(pr_actions_shown(false, true), all);
+        assert_eq!(pr_actions_shown(true, true), all);
     }
 
     use super::*;
