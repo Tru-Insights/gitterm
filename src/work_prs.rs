@@ -275,7 +275,6 @@ enum PrTitleRowControl {
 // disappears. Iced keeps button interaction state by child position.
 const PR_TITLE_ROW_CONTROLS: [PrTitleRowControl; 2] =
     [PrTitleRowControl::Merge, PrTitleRowControl::Disclosure];
-const PR_MERGE_TITLE_SLOT_WIDTH: f32 = 72.0;
 
 fn pr_row_parts(is_next: bool, expanded: bool) -> PrRowParts {
     PrRowParts {
@@ -1657,9 +1656,9 @@ impl App {
             line = match control {
                 PrTitleRowControl::Merge => line.push(match merge_on_title.take() {
                     Some(merge) => merge,
-                    None => iced::widget::Space::new()
-                        .width(Length::Fixed(PR_MERGE_TITLE_SLOT_WIDTH))
-                        .into(),
+                    // Zero-width: Iced matches children by index, so the slot
+                    // only has to exist; a wide gap would cost every row's title.
+                    None => iced::widget::Space::new().width(Length::Fixed(0.0)).into(),
                 }),
                 PrTitleRowControl::Disclosure => {
                     line.push(self.overview_disclosure(expanded, row_key.clone()))
@@ -2409,9 +2408,8 @@ mod tests {
         assert_eq!(PR_TITLE_ROW_CONTROLS[0], PrTitleRowControl::Merge);
         assert_eq!(PR_TITLE_ROW_CONTROLS[1], PrTitleRowControl::Disclosure);
 
-        // The optional Merge content occupies a fixed-width empty slot when
-        // absent; the disclosure remains the second trailing child.
-        assert!(PR_MERGE_TITLE_SLOT_WIDTH >= 72.0);
+        // The optional Merge content keeps an empty slot when absent; the
+        // disclosure remains the second trailing child.
         assert!(pr_row_parts(true, false).merge_on_title);
         assert!(!pr_row_parts(false, false).merge_on_title);
     }
