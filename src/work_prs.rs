@@ -188,40 +188,67 @@ fn done_summary(done: &[PrState]) -> String {
     }
 }
 
-/// A PR list's columns before the title (TRU-208): the plan position, then
-/// "#n" in a fixed width, each followed by this gap. Detail and news lines
-/// are indented by the same amount so they start under the title.
+/// A PR list's columns before the title (TRU-208): the plan position
+/// (only when some PR of the list has one), then "#n" as wide as the
+/// list's widest, each followed by [`PR_COLUMN_GAP`]. The opened row's
+/// lines are indented by the same amount so they start under the title.
 const PR_POSITION_WIDTH: f32 = 16.0;
 const PR_COLUMN_GAP: f32 = 6.0;
 /// Menlo's advance per character, as a fraction of the font size.
-const MONO_ADVANCE: f32 = 0.62;
+const MONO_ADVANCE: f32 = 0.61;
+/// A generous average advance of the proportional UI font, as a fraction
+/// of its size, for cutting text to the width it gets.
+const TEXT_ADVANCE: f32 = 0.55;
+/// The "Ready to merge" sheet's width.
+const READY_LIST_WIDTH: f32 = 560.0;
 
-/// Characters of the widest "#n" among `numbers`, and at least 5, so every
-/// row's title starts at the same x.
-fn pr_number_chars(numbers: impl IntoIterator<Item = u64>) -> usize {
-    numbers
-        .into_iter()
-        .map(|number| number.to_string().len() + 1)
-        .max()
-        .unwrap_or(0)
-        .max(5)
-}
-
-/// Which of a PR row's actions show (TRU-208).
+/// The columns one PR list shares (TRU-208).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PrActionsShown {
-    /// Merge (filled on the next-to-merge PR).
-    merge: bool,
-    /// Review, Approve and Ready for review.
-    others: bool,
+struct PrColumns {
+    /// Some PR of the list has a plan position.
+    position: bool,
+    /// Characters of the widest "#n".
+    number_chars: usize,
 }
 
-/// Actions wait for the row to be opened, except the next-to-merge PR
-/// keeps its Merge: the one action that is due now.
-fn pr_actions_shown(is_next: bool, expanded: bool) -> PrActionsShown {
-    PrActionsShown {
-        merge: is_next || expanded,
-        others: expanded,
+/// The columns for a list of PRs: (number, in a plan) each.
+fn pr_columns(prs: impl IntoIterator<Item = (u64, bool)>) -> PrColumns {
+    let mut columns = PrColumns {
+        position: false,
+        number_chars: 0,
+    };
+    for (number, planned) in prs {
+        columns.position |= planned;
+        columns.number_chars = columns.number_chars.max(number.to_string().len() + 1);
+    }
+    columns
+}
+
+/// The most characters of text at `font` that fit `lines` lines of
+/// `width` px; at least 12 so a narrow sidebar still says something.
+fn chars_that_fit(width: f32, font: f32, lines: usize) -> usize {
+    let per_line = (width / (font * TEXT_ADVANCE)).floor().max(0.0) as usize;
+    (per_line * lines).max(12)
+}
+
+/// What a PR row shows (TRU-208). Closed, it is one title line with its
+/// facts; opened, it adds the meta line, the plan line, news, the actions
+/// line and read errors: nothing the title line already says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrRowParts {
+    /// Merge on the title line: the next-to-merge PR's filled button.
+    merge_on_title: bool,
+    /// The opened lines, news included.
+    opened: bool,
+    /// Merge on the actions line (any other PR, opened).
+    merge_in_actions: bool,
+}
+
+fn pr_row_parts(is_next: bool, expanded: bool) -> PrRowParts {
+    PrRowParts {
+        merge_on_title: is_next,
+        opened: expanded,
+        merge_in_actions: expanded && !is_next,
     }
 }
 
@@ -1401,19 +1428,93 @@ impl App {
         line.into()
     }
 
-    /// One PR row of the overview section, on one line (TRU-208): number,
-    /// title, the facts that need you (checks, blocked or held, changes
-    /// requested, new comments, conflicts, draft) and the actions. Review,
-    /// Approve, Merge and Ready for review show once the row is opened (a
-    /// click on it or its ▸), except that the next-to-merge PR keeps a
-    /// filled Merge. Opened, it adds the full live line, what it waits
-    /// for, its hold and note. News and read errors always show.
+    /// The facts a PR's title line shows (TRU-208): checks (✓ ✗ ●),
+    /// changes requested, "n new", conflicts, blocked, held, draft and
+    /// "not read". Opening the row never repeats them.
+    fn pr_facts(
+        &self,
+        watched: Option<&WatchedPr>,
+        row: Option<&OrderedRow>,
+        draft: bool,
+    ) -> Vec<(String, iced::Color)> {
+        let theme = &self.theme;
+        let mut facts: Vec<(String, iced::Color)> = Vec::new();
+        let live = watched
+            .and_then(|w| w.snapshot.core.as_ref())
+            .is_some_and(|core| !core.state.is_some_and(PrState::is_final));
+        if let (Some(watched), true) = (watched, live) {
+            let snapshot = &watched.snapshot;
+            match snapshot.checks() {
+                pr_watch::ChecksState::Pass => facts.push(("\u{2713}".into(), theme.success())),
+                pr_watch::ChecksState::Fail => facts.push(("\u{2717}".into(), theme.danger())),
+                pr_watch::ChecksState::Pending => {
+                    facts.push(("\u{25CF}".into(), theme.warning()));
+                }
+                pr_watch::ChecksState::None => {}
+            }
+            if snapshot.review_decision() == pr_watch::ReviewDecision::ChangesRequested {
+                facts.push(("changes requested".into(), theme.danger()));
+            }
+            if watched.unseen_comments > 0 {
+                facts.push((format!("{} new", watched.unseen_comments), theme.accent()));
+            }
+            if snapshot.conflicting() == Some(true) {
+                facts.push(("conflicts".into(), theme.danger()));
+            }
+        }
+        match row.map(|row| &row.status) {
+            Some(RowStatus::Blocked(_)) => facts.push(("blocked".into(), theme.warning())),
+            Some(RowStatus::Held(_)) => facts.push(("held".into(), theme.warning())),
+            _ => {}
+        }
+        // A draft can't be merged; say so where it can't be missed.
+        if draft {
+            facts.push(("draft".into(), theme.warning()));
+        }
+        if watched.is_some_and(|w| w.error.is_some()) {
+            facts.push(("not read".into(), theme.danger()));
+        }
+        facts
+    }
+
+    /// The facts as a row, with the width they take.
+    fn pr_facts_row<'a>(
+        &self,
+        facts: Vec<(String, iced::Color)>,
+    ) -> (Row<'a, Event, Theme, iced::Renderer>, f32) {
+        let mono = iced::Font::with_name("Menlo");
+        let mut width = 0.0;
+        let mut line = Row::new()
+            .spacing(PR_COLUMN_GAP)
+            .align_y(iced::Alignment::Center);
+        for (label, color) in facts {
+            width += label.chars().count() as f32 * 10.0 * MONO_ADVANCE + PR_COLUMN_GAP;
+            line = line.push(text(label).size(10).color(color).font(mono));
+        }
+        (line, width)
+    }
+
+    /// Where a PR list's titles start, from the row's content edge.
+    fn pr_title_indent(&self, columns: PrColumns) -> f32 {
+        let position = if columns.position {
+            PR_POSITION_WIDTH + PR_COLUMN_GAP
+        } else {
+            0.0
+        };
+        position + self.pr_number_width(columns.number_chars) + PR_COLUMN_GAP
+    }
+
+    /// One PR row (TRU-208). Closed: "#n", the title (two lines at most),
+    /// its facts and ▸, plus the filled Merge on the next-to-merge PR. A
+    /// click anywhere (or ▸) opens it, adding under the title only what the
+    /// title line does not say: repo, head → base, author and when it was
+    /// read; the plan's wait or hold; news; the actions; read errors.
     fn view_pr_row<'a>(
         &'a self,
         root: &str,
         key: &PrKey,
         row: Option<&OrderedRow>,
-        number_chars: usize,
+        columns: PrColumns,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
         let theme = &self.theme;
         let mono = iced::Font::with_name("Menlo");
@@ -1423,88 +1524,14 @@ impl App {
         let row_key = overview::RowKey::Pr(key.id());
         let expanded = self.overview_row_open(&row_key);
         let is_next = row.is_some_and(|row| row.status == RowStatus::Next);
-        let shown = pr_actions_shown(is_next, expanded);
+        let parts = pr_row_parts(is_next, expanded);
         let draft = watched
             .and_then(WatchedPr::brief)
             .is_some_and(|brief| brief.state == merge_plan::PrState::Draft);
         let core = watched.and_then(|w| w.snapshot.core.as_ref());
-        let title = core
-            .map(|core| core.title.as_str())
-            .filter(|title| !title.is_empty());
-
-        // Fixed slots: position, number, title, facts, actions, disclosure.
-        // Position and number have fixed widths, so every row's title (and
-        // its wrapped lines) starts at the same x.
-        let position = text(row.map_or_else(String::new, |row| format!("{}", row.position)))
-            .size(font_small)
-            .color(text_muted)
-            .font(mono)
-            .width(Length::Fixed(PR_POSITION_WIDTH));
-        let number = self.pr_number_cell(Some(key.number), number_chars);
-        let title_indent =
-            PR_POSITION_WIDTH + PR_COLUMN_GAP + self.pr_number_width(number_chars) + PR_COLUMN_GAP;
-        let title = text(overview::shorten(title.unwrap_or(&key.label()), 60))
-            .size(font_small)
-            .color(theme.text_primary())
-            .width(Length::Fill);
-        let part = |label: String, color: iced::Color| text(label).size(10).color(color).font(mono);
-        let mut facts = Row::new().spacing(6).align_y(iced::Alignment::Center);
-        let live = core.is_some_and(|core| !core.state.is_some_and(PrState::is_final));
-        if let (Some(watched), true) = (watched, live) {
-            let snapshot = &watched.snapshot;
-            match snapshot.checks() {
-                pr_watch::ChecksState::Pass => {
-                    facts = facts.push(part("\u{2713}".to_string(), theme.success()));
-                }
-                pr_watch::ChecksState::Fail => {
-                    facts = facts.push(part("\u{2717}".to_string(), theme.danger()));
-                }
-                pr_watch::ChecksState::Pending => {
-                    facts = facts.push(part("\u{25CF}".to_string(), theme.warning()));
-                }
-                pr_watch::ChecksState::None => {}
-            }
-            if snapshot.review_decision() == pr_watch::ReviewDecision::ChangesRequested {
-                facts = facts.push(part("changes requested".to_string(), theme.danger()));
-            }
-            if watched.unseen_comments > 0 {
-                facts = facts.push(part(
-                    format!("{} new", watched.unseen_comments),
-                    theme.accent(),
-                ));
-            }
-            if snapshot.conflicting() == Some(true) {
-                facts = facts.push(part("conflicts".to_string(), theme.danger()));
-            }
-        }
-        if let Some(row) = row {
-            match &row.status {
-                RowStatus::Blocked(_) => {
-                    facts = facts.push(part("blocked".to_string(), theme.warning()));
-                }
-                RowStatus::Held(_) => {
-                    facts = facts.push(part("held".to_string(), theme.warning()));
-                }
-                _ => {}
-            }
-        }
-        // A draft can't be merged; say so where it can't be missed.
-        if draft {
-            facts = facts.push(part("draft".to_string(), theme.warning()));
-        }
-
         let open = watched
             .and_then(WatchedPr::brief)
             .is_some_and(|brief| brief.state == merge_plan::PrState::Open);
-        let action = |label: String, event: Option<Event>| {
-            let mut b = button(text(label).size(10).color(theme.text_primary()))
-                .style(self.flat_button_style())
-                .padding([1, 6]);
-            if let Some(event) = event {
-                b = b.on_press(event);
-            }
-            b
-        };
         // Approve and Merge wait for the checks of the latest read.
         let reason = watched
             .map(WatchedPr::checks_gate)
@@ -1516,61 +1543,89 @@ impl App {
             Some(reason) if open => format!("{name} ({reason})"),
             _ => name.to_string(),
         };
-        let mut actions = Row::new().spacing(2).align_y(iced::Alignment::Center);
-        if shown.others {
-            actions = actions.push(action(
-                "Review".to_string(),
-                Some(Event::Pr(PrEvent::Review(key.clone()))),
-            ));
-            if !self.is_own_pr(key, watched) {
-                actions = actions.push(action(
-                    gated("Approve"),
-                    (open && reason.is_none())
-                        .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Approve))),
-                ));
-            }
-        }
-        if shown.merge {
-            let merge = (open && reason.is_none())
-                .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Merge)));
-            actions = actions.push(if is_next {
-                // The only filled button: the action that is due now.
-                button(text(gated("Merge")).size(10).color(theme.bg_base()))
-                    .style(self.primary_button_style())
-                    .padding([1, 8])
-                    .on_press_maybe(merge)
-            } else {
-                action(gated("Merge"), merge)
-            });
-        }
-        if shown.others && draft {
-            actions = actions.push(
-                button(text("Ready for review").size(10).color(theme.accent()))
-                    .style(self.flat_button_style())
-                    .padding([1, 6])
-                    .on_press(Event::Pr(PrEvent::ActionOpen(
-                        key.clone(),
-                        ActionKind::Ready,
-                    ))),
-            );
-        }
-        let disclosure = self.overview_disclosure(expanded, row_key.clone());
-        let line = row![position, number, title, facts, actions, disclosure]
+        let merge_event = (open && reason.is_none())
+            .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Merge)));
+        let action = |label: String, event: Option<Event>| {
+            button(text(label).size(10).color(theme.text_primary()))
+                .style(self.flat_button_style())
+                .padding([1, 6])
+                .on_press_maybe(event)
+        };
+
+        // The title line. The sidebar less the overview's padding (16),
+        // the row's (12) and room for the scrollbar (10) is what it gets.
+        let indent = self.pr_title_indent(columns);
+        let text_width = self.sidebar_panel_width() - 16.0 - 12.0 - 10.0 - indent;
+        let (facts, facts_width) = self.pr_facts_row(self.pr_facts(watched, row, draft));
+        let mut taken = facts_width + 18.0 + PR_COLUMN_GAP;
+        let mut line = Row::new()
             .spacing(PR_COLUMN_GAP)
             .align_y(iced::Alignment::Center);
+        if columns.position {
+            line = line.push(
+                text(row.map_or_else(String::new, |row| format!("{}", row.position)))
+                    .size(font_small)
+                    .color(text_muted)
+                    .font(mono)
+                    .width(Length::Fixed(PR_POSITION_WIDTH)),
+            );
+        }
+        line = line.push(self.pr_number_cell(Some(key.number), columns.number_chars));
+        let merge_on_title = parts.merge_on_title.then(|| {
+            let label = gated("Merge");
+            taken += label.chars().count() as f32 * 10.0 * TEXT_ADVANCE + 16.0 + PR_COLUMN_GAP;
+            // The only filled button: the action that is due now.
+            button(text(label).size(10).color(theme.bg_base()))
+                .style(self.primary_button_style())
+                .padding([1, 8])
+                .on_press_maybe(merge_event.clone())
+        });
+        let title = core
+            .map(|core| core.title.clone())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| key.label());
+        line = line
+            .push(
+                text(overview::shorten(
+                    &title,
+                    chars_that_fit(text_width - taken, font_small, 2),
+                ))
+                .size(font_small)
+                .color(theme.text_primary())
+                .width(Length::Fill),
+            )
+            .push(facts);
+        if let Some(merge) = merge_on_title {
+            line = line.push(merge);
+        }
+        line = line.push(self.overview_disclosure(expanded, row_key.clone()));
 
-        // Opened: the full live line, what it waits for, hold, note.
+        // Opened: only what the title line does not say.
         let mut detail = Column::new().spacing(2);
-        if expanded {
-            // Its place in the plan ("next", "ready", ...), the live line
-            // and the full `owner/name#n`.
-            let mut live = Row::new().spacing(6).align_y(iced::Alignment::Center);
-            if let Some(row) = row {
-                live = live.push(part(row.status.label().to_string(), text_muted));
+        if parts.opened {
+            let repo = key.repo.rsplit('/').next().unwrap_or(&key.repo).to_string();
+            let mut meta = vec![repo];
+            if let Some(core) = core {
+                if !core.head_ref.is_empty() && !core.base_ref.is_empty() {
+                    meta.push(format!("{} \u{2192} {}", core.head_ref, core.base_ref));
+                }
+                if !core.author.is_empty() {
+                    meta.push(core.author.clone());
+                }
+            }
+            if let Some(at) = watched
+                .and_then(|w| w.checked_at.as_deref())
+                .and_then(overview::parse_stamp)
+            {
+                meta.push(format!("read {}", overview::age_label(at)));
             }
             detail = detail.push(
-                live.push(self.pr_live_line(watched))
-                    .push(part(key.label(), text_muted)),
+                text(overview::shorten(
+                    &meta.join(" \u{00B7} "),
+                    chars_that_fit(text_width, 10.0, 1),
+                ))
+                .size(10)
+                .color(text_muted),
             );
             if let Some(row) = row {
                 match &row.status {
@@ -1614,27 +1669,53 @@ impl App {
                     );
                 }
             }
-        }
-        // Read errors and news need you: always shown.
-        if let Some(error) = watched.and_then(|w| w.error.as_deref()) {
-            detail = detail.push(
-                text(overview::shorten(&format!("not read: {error}"), 160))
-                    .size(10)
-                    .color(theme.danger()),
-            );
-        }
-        if let Some(watched) = watched {
-            for item in watched.open_news() {
-                detail = detail.push(self.view_pr_news_item(watched, item, false));
+            if let Some(watched) = watched {
+                for item in watched.open_news() {
+                    detail = detail.push(self.view_pr_news_item(watched, item, false));
+                }
+            }
+            let mut actions = Row::new().spacing(2).align_y(iced::Alignment::Center);
+            actions = actions.push(action(
+                "Review".to_string(),
+                Some(Event::Pr(PrEvent::Review(key.clone()))),
+            ));
+            if !self.is_own_pr(key, watched) {
+                actions = actions.push(action(
+                    gated("Approve"),
+                    (open && reason.is_none())
+                        .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Approve))),
+                ));
+            }
+            if parts.merge_in_actions {
+                actions = actions.push(action(gated("Merge"), merge_event));
+            }
+            if draft {
+                actions = actions.push(
+                    button(text("Ready for review").size(10).color(theme.accent()))
+                        .style(self.flat_button_style())
+                        .padding([1, 6])
+                        .on_press(Event::Pr(PrEvent::ActionOpen(
+                            key.clone(),
+                            ActionKind::Ready,
+                        ))),
+                );
+            }
+            detail = detail.push(actions);
+            if let Some(error) = watched.and_then(|w| w.error.as_deref()) {
+                detail = detail.push(
+                    text(overview::shorten(&format!("not read: {error}"), 160))
+                        .size(10)
+                        .color(theme.danger()),
+                );
             }
         }
-        // The row has no other action: a click anywhere on it opens it.
-        let hover_bg = theme.bg_overlay();
-        // Detail, hold and news lines start under the title.
+        // The opened lines start under the title.
         let detail = row![
-            iced::widget::Space::new().width(Length::Fixed(title_indent)),
+            iced::widget::Space::new().width(Length::Fixed(indent)),
             detail.width(Length::Fill)
         ];
+        // The row has no other action: a click anywhere on it opens it.
+        let hover_bg = theme.bg_overlay();
         button(Column::new().spacing(2).push(line).push(detail))
             .padding([3, 6])
             .width(Length::Fill)
@@ -1742,14 +1823,25 @@ impl App {
             .padding([0, 4])
             .on_press(Event::Pr(PrEvent::DoneToggle(root.to_string())))
         };
-        // One "#n" width for the whole list, so titles line up across groups.
-        let number_chars = pr_number_chars(groups.iter().flat_map(|group| {
+        // One set of columns for the rows the list shows, so titles line
+        // up across groups; folded done PRs do not count.
+        let columns = pr_columns(groups.iter().flat_map(|group| {
+            let done_open = self.prs.done_open.contains(&group.root.root);
+            let done_rows = group.done_rows.iter().filter(move |_| done_open);
+            let done_unplanned = group
+                .done
+                .iter()
+                .filter(move |(key, _)| {
+                    done_open && !group.done_rows.iter().any(|r| r.entry.key() == *key)
+                })
+                .map(|(key, _)| (key.number, false));
             group
                 .rows
                 .iter()
-                .map(|row| row.entry.key().number)
-                .chain(group.unplanned.iter().map(|key| key.number))
-                .chain(group.done.iter().map(|(key, _)| key.number))
+                .chain(done_rows)
+                .map(|row| (row.entry.key().number, true))
+                .chain(group.unplanned.iter().map(|key| (key.number, false)))
+                .chain(done_unplanned)
         }));
         let several = groups.len() > 1;
         let header_fold = groups
@@ -1785,7 +1877,7 @@ impl App {
                     &root.root,
                     &row.entry.key(),
                     Some(row),
-                    number_chars,
+                    columns,
                 ));
             }
             if !unplanned.is_empty() && !rows.is_empty() {
@@ -1797,7 +1889,7 @@ impl App {
                 );
             }
             for key in &unplanned {
-                section = section.push(self.view_pr_row(&root.root, key, None, number_chars));
+                section = section.push(self.view_pr_row(&root.root, key, None, columns));
             }
             if !done.is_empty() && self.prs.done_open.contains(&root.root) {
                 for row in &done_rows {
@@ -1805,14 +1897,14 @@ impl App {
                         &root.root,
                         &row.entry.key(),
                         Some(row),
-                        number_chars,
+                        columns,
                     ));
                 }
                 for (key, _) in done
                     .iter()
                     .filter(|(key, _)| !done_rows.iter().any(|r| r.entry.key() == *key))
                 {
-                    section = section.push(self.view_pr_row(&root.root, key, None, number_chars));
+                    section = section.push(self.view_pr_row(&root.root, key, None, columns));
                 }
             }
         }
@@ -1883,38 +1975,50 @@ impl App {
                 .spacing(6)
                 .align_y(iced::Alignment::Center),
             );
-            // "#n" in a fixed column; the title, live line and news start
-            // after it (TRU-208).
-            let number_chars = pr_number_chars(
+            // "#n" in a column as wide as the card's widest; the title and
+            // news start after it. The title line carries the facts, as in
+            // the overview (TRU-208).
+            let columns = pr_columns(
                 next.iter()
-                    .map(|(_, row)| row.entry.key().number)
-                    .chain(news.iter().map(|(_, watched, _)| watched.key.number)),
+                    .map(|(_, row)| (row.entry.key().number, false))
+                    .chain(
+                        news.iter()
+                            .map(|(_, watched, _)| (watched.key.number, false)),
+                    ),
             );
-            let indent = self.pr_number_width(number_chars) + PR_COLUMN_GAP;
+            let number_chars = columns.number_chars;
+            let text_width = READY_LIST_WIDTH - 16.0 - self.pr_title_indent(columns);
             for (_, row) in &next {
                 let key = row.entry.key();
                 let watched = self.watched(&key);
+                let draft = watched
+                    .and_then(WatchedPr::brief)
+                    .is_some_and(|brief| brief.state == merge_plan::PrState::Draft);
+                let (facts, facts_width) =
+                    self.pr_facts_row(self.pr_facts(watched, Some(row), draft));
+                let taken = facts_width
+                    + key.repo.chars().count() as f32 * 10.0 * TEXT_ADVANCE
+                    + PR_COLUMN_GAP;
                 let title = watched
                     .and_then(|w| w.snapshot.core.as_ref())
-                    .map(|core| overview::shorten(&core.title, 60))
+                    .map(|core| core.title.clone())
                     .unwrap_or_default();
-                group = group
-                    .push(
-                        row![
-                            self.pr_number_cell(Some(key.number), number_chars),
-                            text(format!("next: {title}"))
-                                .size(font_small - 1.0)
-                                .color(theme.accent())
-                                .width(Length::Fill),
-                            text(key.repo.clone()).size(10).color(theme.text_muted()),
-                        ]
-                        .spacing(PR_COLUMN_GAP)
-                        .align_y(iced::Alignment::Center),
-                    )
-                    .push(row![
-                        iced::widget::Space::new().width(Length::Fixed(indent)),
-                        self.pr_live_line(watched)
-                    ]);
+                group = group.push(
+                    row![
+                        self.pr_number_cell(Some(key.number), number_chars),
+                        text(overview::shorten(
+                            &format!("next: {title}"),
+                            chars_that_fit(text_width - taken, font_small - 1.0, 2),
+                        ))
+                        .size(font_small - 1.0)
+                        .color(theme.accent())
+                        .width(Length::Fill),
+                        facts,
+                        text(key.repo.clone()).size(10).color(theme.text_muted()),
+                    ]
+                    .spacing(PR_COLUMN_GAP)
+                    .align_y(iced::Alignment::Center),
+                );
             }
             for (_, watched, item) in &news {
                 group = group.push(
@@ -1949,7 +2053,7 @@ impl App {
         }
         let card = Column::new()
             .spacing(10)
-            .width(Length::Fixed(560.0))
+            .width(Length::Fixed(READY_LIST_WIDTH))
             .push(text("Ready to merge").size(font).color(theme.text_primary()))
             .push(
                 text("The next PR of each merge plan, and what changed on the work's PRs. GitTerm only watches; you approve and merge from the workspace overview.")
@@ -2157,33 +2261,47 @@ mod tests {
     }
 
     #[test]
-    fn the_pr_number_column_fits_the_widest_number_and_at_least_five() {
-        assert_eq!(pr_number_chars([93, 591]), 5);
-        assert_eq!(pr_number_chars([]), 5);
-        assert_eq!(pr_number_chars([7, 12345]), 6);
-        assert_eq!(pr_number_chars([134, 1234567]), 8);
+    fn the_pr_columns_fit_the_list() {
+        // No plan: no position column; "#n" as wide as the widest.
+        assert_eq!(
+            pr_columns([(93, false), (591, false)]),
+            PrColumns {
+                position: false,
+                number_chars: 4
+            }
+        );
+        // One planned PR gives the whole list the position column.
+        assert_eq!(
+            pr_columns([(7, false), (12345, true)]),
+            PrColumns {
+                position: true,
+                number_chars: 6
+            }
+        );
+        assert_eq!(pr_columns([]).number_chars, 0);
     }
 
     #[test]
-    fn only_the_next_to_merge_pr_keeps_its_merge_visible() {
-        let quiet = PrActionsShown {
-            merge: false,
-            others: false,
-        };
-        assert_eq!(pr_actions_shown(false, false), quiet);
-        assert_eq!(
-            pr_actions_shown(true, false),
-            PrActionsShown {
-                merge: true,
-                others: false
-            }
-        );
-        let all = PrActionsShown {
-            merge: true,
-            others: true,
-        };
-        assert_eq!(pr_actions_shown(false, true), all);
-        assert_eq!(pr_actions_shown(true, true), all);
+    fn text_is_cut_to_the_lines_it_gets() {
+        // 11 px font: 6.05 px a character, 33 a line in 200 px.
+        assert_eq!(chars_that_fit(200.0, 11.0, 2), 66);
+        assert_eq!(chars_that_fit(200.0, 11.0, 1), 33);
+        assert_eq!(chars_that_fit(10.0, 11.0, 2), 12);
+    }
+
+    #[test]
+    fn a_closed_pr_row_shows_no_news_and_only_the_due_merge() {
+        let closed = pr_row_parts(false, false);
+        assert!(!closed.opened && !closed.merge_on_title && !closed.merge_in_actions);
+        let next_closed = pr_row_parts(true, false);
+        assert!(next_closed.merge_on_title && !next_closed.opened);
+        let opened = pr_row_parts(false, true);
+        assert!(opened.opened && opened.merge_in_actions && !opened.merge_on_title);
+        // The next PR keeps Merge on its title line; the actions line
+        // does not repeat it.
+        let next_opened = pr_row_parts(true, true);
+        assert!(next_opened.opened && next_opened.merge_on_title);
+        assert!(!next_opened.merge_in_actions);
     }
 
     use super::*;
