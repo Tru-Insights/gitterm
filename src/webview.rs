@@ -250,6 +250,13 @@ pub fn try_create_with_window(
             .with_transparent(false)
             .with_visible(slot.visible);
 
+        if surface == WebviewSurface::Viewer {
+            builder = builder.with_new_window_req_handler(|url| {
+                open_url_in_browser(&url);
+                false
+            });
+        }
+
         builder = match &content {
             PendingContent::Html(html) => builder.with_html(html),
             PendingContent::Url(url) => builder.with_url(url),
@@ -269,6 +276,24 @@ pub fn try_create_with_window(
         Ok(true)
     })
     .unwrap_or(Ok(false))
+}
+
+/// Open a URL using the platform's default browser. Viewer links that request
+/// a new window use this instead of creating another embedded surface.
+pub fn open_url_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(url)
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+
+    if let Err(error) = result {
+        eprintln!("[webview] cannot open {url} in the browser: {error}");
+    }
 }
 
 /// Update the bounds (position and size) of `surface`'s webview.

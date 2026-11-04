@@ -71,6 +71,13 @@ fn news_line(watched: &WatchedPr, item: &NewsItem) -> String {
     )
 }
 
+fn pr_url_for(key: &PrKey, watched_url: Option<&str>) -> String {
+    watched_url
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| key.url())
+}
+
 /// The prompt that tells a coordinator its news: one line per item.
 fn tell_prompt(lines: &[String]) -> String {
     lines.join("\n")
@@ -146,6 +153,8 @@ pub enum PrEvent {
     Review(PrKey),
     /// Open the PR on GitHub, whatever checkouts exist.
     OpenInBrowser(PrKey),
+    /// Open the PR in the shared Viewer surface.
+    OpenInViewer(PrKey),
     /// The checkout of the PR's head branch, if the overview knows one.
     ReviewResolved(PrKey, Option<PathBuf>),
     /// Open the confirmation for a row action on a PR.
@@ -953,6 +962,10 @@ impl App {
                 self.open_pr_in_browser(&key);
                 return Task::none();
             }
+            PrEvent::OpenInViewer(key) => {
+                let url = self.pr_url(&key);
+                return self.open_viewer_page(url);
+            }
             PrEvent::ReviewResolved(key, checkout) => {
                 return match checkout {
                     Some(checkout) => self.open_review(checkout, overview::DiffSource::VsBase),
@@ -1089,15 +1102,15 @@ impl App {
     }
 
     fn open_pr_in_browser(&self, key: &PrKey) {
+        webview::open_url_in_browser(&self.pr_url(key));
+    }
+
+    fn pr_url(&self, key: &PrKey) -> String {
         let url = self
             .watched(key)
             .and_then(|watched| watched.snapshot.core.as_ref())
-            .map(|core| core.url.clone())
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| key.url());
-        if let Err(error) = std::process::Command::new("open").arg(&url).spawn() {
-            eprintln!("[pr-watch] cannot open {url} in the browser: {error}");
-        }
+            .map(|core| core.url.as_str());
+        pr_url_for(key, url)
     }
 
     /// Review: the review pane (TRU-178) vs base when the overview owns a checkout of
@@ -1406,8 +1419,8 @@ impl App {
         (chars as f32 * self.ui_font_small() * MONO_ADVANCE).ceil()
     }
 
-    /// "#n" in a column `chars` wide, as a button that opens the PR on
-    /// GitHub (TRU-208).
+    /// "#n" in a column `chars` wide, as a button that opens the PR in the
+    /// Viewer.
     fn pr_number_cell<'a>(
         &self,
         key: &PrKey,
@@ -1422,7 +1435,7 @@ impl App {
         .style(self.flat_button_style())
         .padding(0)
         .width(Length::Fixed(self.pr_number_width(chars)))
-        .on_press(Event::Pr(PrEvent::OpenInBrowser(key.clone())))
+        .on_press(Event::Pr(PrEvent::OpenInViewer(key.clone())))
         .into()
     }
 
@@ -1763,7 +1776,7 @@ impl App {
             }
             if parts.open_on_github {
                 actions = actions.push(action(
-                    "Open on GitHub".to_string(),
+                    "Open in browser".to_string(),
                     Some(Event::Pr(PrEvent::OpenInBrowser(key.clone()))),
                 ));
             }
@@ -2421,6 +2434,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn pr_url_uses_watched_url_or_canonical_fallback() {
+        let key = PrKey::new("owner/repo", 12);
+        assert_eq!(
+            pr_url_for(&key, Some("https://github.com/owner/repo/pull/12")),
+            "https://github.com/owner/repo/pull/12"
+        );
+        assert_eq!(
+            pr_url_for(&key, Some("")),
+            "https://github.com/owner/repo/pull/12"
+        );
+        assert_eq!(
+            pr_url_for(&key, None),
+            "https://github.com/owner/repo/pull/12"
+        );
+    }
 
     fn confirming(key: &PrKey) -> PrsState {
         PrsState {

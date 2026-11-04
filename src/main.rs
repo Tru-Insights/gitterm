@@ -6737,6 +6737,10 @@ pub enum Event {
     OpenPlansViewer,
     OpenPlan(plans_viewer::DocumentSource, String),
     ClosePlansViewer,
+    /// Load a public or authenticated web page in the existing Viewer.
+    OpenViewerPage(String),
+    OpenViewerPageInBrowser,
+    CloseViewerPage,
     // Window events
     WindowResized(f32, f32),
     WindowCloseRequested,
@@ -7666,6 +7670,8 @@ struct App {
     dictation_held: HashMap<usize, String>,
     /// What the Viewer webview surface is presenting (`None` = hidden).
     viewer_webview: ViewerWebview,
+    /// URL currently shown when `viewer_webview` is `Page`.
+    viewer_page_url: Option<String>,
     /// Agent tabs that own a chat page (`WebviewSurface::Agent(tab_id)`),
     /// most recently shown first, at most `MAX_AGENT_PAGES`. A page keeps
     /// receiving its tab's events while hidden, so showing it again needs no
@@ -7685,6 +7691,8 @@ enum ViewerWebview {
     File,
     /// Plans viewer — URL-loaded surface served by warp on localhost.
     PlansViewer,
+    /// A GitHub PR, Linear issue, or other page opened from the Work sidebar.
+    Page,
     /// The review pane (TRU-178), state in `App::review_pane`.
     Review,
 }
@@ -18721,6 +18729,7 @@ impl App {
             stt_transcribing: false,
             dictation_held: HashMap::new(),
             viewer_webview: ViewerWebview::None,
+            viewer_page_url: None,
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
             workspace_overviews: HashMap::new(),
@@ -25002,6 +25011,12 @@ fi
                     return self.update(Event::ClosePlansViewer);
                 }
 
+                if self.viewer_webview == ViewerWebview::Page
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    return self.update(Event::CloseViewerPage);
+                }
+
                 // Review pane: Escape closes it (the page handles Escape
                 // itself while it has keyboard focus).
                 if self.viewer_webview == ViewerWebview::Review
@@ -27176,6 +27191,17 @@ fi
             }
             Event::ClosePlansViewer => {
                 if self.viewer_webview == ViewerWebview::PlansViewer {
+                    return self.present_active_tab_surfaces();
+                }
+            }
+            Event::OpenViewerPage(url) => return self.open_viewer_page(url),
+            Event::OpenViewerPageInBrowser => {
+                if let Some(url) = self.viewer_page_url.as_deref() {
+                    webview::open_url_in_browser(url);
+                }
+            }
+            Event::CloseViewerPage => {
+                if self.viewer_webview == ViewerWebview::Page {
                     return self.present_active_tab_surfaces();
                 }
             }
@@ -29472,6 +29498,9 @@ fi
     /// (TRU-178) lives only while the Viewer shows it.
     fn set_viewer_webview(&mut self, viewer: ViewerWebview) {
         self.viewer_webview = viewer;
+        if viewer != ViewerWebview::Page {
+            self.viewer_page_url = None;
+        }
         if viewer != ViewerWebview::Review {
             self.review_pane = None;
         }
@@ -29866,6 +29895,35 @@ fi
         );
         webview::hide_agent_pages();
         self.set_viewer_webview(ViewerWebview::PlansViewer);
+        if webview::is_active(WebviewSurface::Viewer) {
+            webview::update_bounds(
+                WebviewSurface::Viewer,
+                bounds.0,
+                bounds.1,
+                bounds.2,
+                bounds.3,
+            );
+            webview::navigate_to_url(WebviewSurface::Viewer, &url);
+            webview::set_visible(WebviewSurface::Viewer, true);
+            return Task::none();
+        }
+
+        webview::set_pending_url_with_ipc(
+            WebviewSurface::Viewer,
+            url,
+            bounds,
+            Some(viewer_ipc_handler()),
+        );
+        Self::create_staged_viewer_surface()
+    }
+
+    /// Show a remote page in the same Viewer surface used by the plans page.
+    /// The surface keeps its existing Viewer IPC handler when already built.
+    fn open_viewer_page(&mut self, url: String) -> Task<Event> {
+        let bounds = self.calculate_webview_bounds();
+        webview::hide_agent_pages();
+        self.viewer_page_url = Some(url.clone());
+        self.set_viewer_webview(ViewerWebview::Page);
         if webview::is_active(WebviewSurface::Viewer) {
             webview::update_bounds(
                 WebviewSurface::Viewer,
@@ -30313,6 +30371,9 @@ fi
         main_col = main_col.push(tab_bar);
         if self.viewer_webview == ViewerWebview::PlansViewer {
             main_col = main_col.push(self.view_plans_viewer_header());
+        }
+        if self.viewer_webview == ViewerWebview::Page {
+            main_col = main_col.push(self.view_page_header());
         }
         if self.viewer_webview == ViewerWebview::Review {
             main_col = main_col.push(self.view_review_header());
@@ -31256,6 +31317,40 @@ fi
         .spacing(8);
         container(header)
             .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(header_bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// Header strip for a page opened from the Work sidebar.
+    fn view_page_header(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let header_bg = theme.bg_overlay();
+        let title = self.viewer_page_url.as_deref().unwrap_or_default();
+        let header = row![
+            text(overview::shorten(title, 100))
+                .size(font_small)
+                .color(theme.text_muted())
+                .width(Length::Fill),
+            button(text("Open in browser").size(font_small))
+                .style(self.flat_button_style())
+                .padding([4, 8])
+                .on_press(Event::OpenViewerPageInBrowser),
+            button(text("×").size(font))
+                .style(self.flat_button_style())
+                .padding([2, 8])
+                .on_press(Event::CloseViewerPage),
+        ]
+        .padding(6)
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        container(header)
+            .width(Length::Fill)
+            .height(Length::Fixed(40.0))
             .style(move |_| container::Style {
                 background: Some(header_bg.into()),
                 ..Default::default()
@@ -47755,6 +47850,7 @@ mod tests {
         for viewer in [
             ViewerWebview::File,
             ViewerWebview::PlansViewer,
+            ViewerWebview::Page,
             ViewerWebview::Review,
         ] {
             for active in [
@@ -47789,6 +47885,18 @@ mod tests {
         assert_eq!(
             visible_webview_surface(ViewerWebview::None, ActiveTabSurface::Other, false),
             VisibleSurface::None
+        );
+    }
+
+    #[test]
+    fn closing_viewer_page_restores_agent_chat_surface() {
+        assert_eq!(
+            visible_webview_surface(ViewerWebview::Page, ActiveTabSurface::AgentChat(3), false),
+            VisibleSurface::Viewer
+        );
+        assert_eq!(
+            visible_webview_surface(ViewerWebview::None, ActiveTabSurface::AgentChat(3), false),
+            VisibleSurface::AgentChat(3)
         );
     }
 

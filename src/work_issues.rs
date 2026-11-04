@@ -1,5 +1,6 @@
 //! The Work page's Issues section (TRU-203): one line per issue key, with
-//! its title, state and a hover card, the line opening the issue's URL.
+//! its title, state and a hover card, the line opening the issue's URL in the
+//! shared Viewer.
 //! The pure parts and the `linear` CLI calls live in
 //! `gitterm::issue_titles`.
 //!
@@ -26,7 +27,7 @@ pub enum IssueEvent {
     Saved(Result<(), String>),
     /// "▸ n more" / "▾ show fewer".
     AllToggle,
-    /// Open an issue's URL (from the cache) in the browser.
+    /// Open an issue's URL (from the cache) in the Viewer.
     Open(String),
 }
 
@@ -195,9 +196,7 @@ impl App {
             }
             IssueEvent::AllToggle => self.issues.all = !self.issues.all,
             IssueEvent::Open(url) => {
-                if let Err(error) = std::process::Command::new("open").arg(&url).spawn() {
-                    eprintln!("[issue-titles] cannot open {url}: {error}");
-                }
+                return self.open_viewer_page(url);
             }
         }
         Task::none()
