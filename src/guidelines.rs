@@ -19,14 +19,14 @@
 //! agent without it and is logged. A launch is never blocked.
 //!
 //! An agent started in a piece of work also gets a short documents note
-//! (TRU-191, [`with_documents`]) naming the work's docs folder and its
+//! (TRU-191, [`launch_instructions`]) naming the work's docs folder and its
 //! decisions repo. It goes in through the same options; for the harnesses
 //! that read a file, the guidelines and the note are written together to a
 //! per-launch file.
 //!
-//! Whenever a launch carries any of that, a short note on starting Codex
-//! through GitTerm's task tools follows it (TRU-212,
-//! [`with_codex_tools_note`]).
+//! Every agent given GitTerm's task tools also gets a short note on
+//! starting Codex through them (TRU-212, [`CODEX_TOOLS_NOTE`]), with or
+//! without the guidelines and the documents note.
 
 use std::path::{Path, PathBuf};
 
@@ -251,36 +251,6 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
     note
 }
 
-/// The instructions a launch carries: the guidelines (when they apply)
-/// followed by the documents note (when the workspace has places). With a
-/// note, the combined text is written to a file in `launch_dir` (named by
-/// its content, so equal launches share one) for the harnesses that read a
-/// file. A file that cannot be written is logged and the launch carries
-/// the guidelines alone; a launch is never blocked.
-pub fn with_documents(
-    guidelines: Option<Guidelines>,
-    places: Option<&DocumentPlaces>,
-    launch_dir: &Path,
-) -> Option<Guidelines> {
-    let Some(places) = places else {
-        return guidelines;
-    };
-    let note = documents_note(places);
-    let text = match &guidelines {
-        Some(guidelines) => format!("{}\n\n{note}", guidelines.text.trim_end()),
-        None => note,
-    };
-    match write_launch_file(launch_dir, &text) {
-        Ok(path) => Some(Guidelines { path, text }),
-        Err(error) => {
-            log(&format!(
-                "{error}; starting the agent without the documents note"
-            ));
-            guidelines
-        }
-    }
-}
-
 /// How agents in GitTerm start Codex (TRU-212): through GitTerm's task
 /// tools, which GitTerm shows, never `codex exec` in a background shell,
 /// which it cannot see.
@@ -292,25 +262,47 @@ make a new worktree from that repository); pass `time_limit_minutes` and `effort
 needs them. Do not run `codex exec` in a background shell: GitTerm cannot see those runs, so the \
 user cannot follow or stop them.\n";
 
-/// The instructions a launch already carries, with [`CODEX_TOOLS_NOTE`]
-/// after them, written to a launch file in `launch_dir` like
-/// [`with_documents`]. No instructions stay none: an agent whose
-/// guidelines are off and that has no documents note gets nothing from
-/// GitTerm. A file that cannot be written is logged and the launch carries
-/// what it had; a launch is never blocked.
-pub fn with_codex_tools_note(
-    instructions: Option<Guidelines>,
+/// The instructions a launch carries: the guidelines (when they apply),
+/// the documents note (when the workspace has places, TRU-191) and, for an
+/// agent given GitTerm's task tools (`task_tools`), [`CODEX_TOOLS_NOTE`]
+/// (TRU-212), whatever else is or is not there. With a note, the combined
+/// text is written once to a file in `launch_dir` (named by its content,
+/// so equal launches share one) for the harnesses that read a file. A file
+/// that cannot be written is logged and the launch carries the guidelines
+/// alone; a launch is never blocked.
+pub fn launch_instructions(
+    guidelines: Option<Guidelines>,
+    places: Option<&DocumentPlaces>,
+    task_tools: bool,
     launch_dir: &Path,
 ) -> Option<Guidelines> {
-    let instructions = instructions?;
-    let text = format!("{}\n\n{CODEX_TOOLS_NOTE}", instructions.text.trim_end());
+    let mut notes = Vec::new();
+    if let Some(places) = places {
+        notes.push(documents_note(places));
+    }
+    if task_tools {
+        notes.push(CODEX_TOOLS_NOTE.to_string());
+    }
+    if notes.is_empty() {
+        return guidelines;
+    }
+    let mut text = guidelines
+        .as_ref()
+        .map(|guidelines| guidelines.text.trim_end().to_string())
+        .unwrap_or_default();
+    for note in notes {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&note);
+    }
     match write_launch_file(launch_dir, &text) {
         Ok(path) => Some(Guidelines { path, text }),
         Err(error) => {
             log(&format!(
-                "{error}; starting the agent without the Codex tools note"
+                "{error}; starting the agent without GitTerm's notes (documents, Codex tools)"
             ));
-            Some(instructions)
+            guidelines
         }
     }
 }
@@ -615,7 +607,8 @@ mod tests {
         let repo = Path::new("/code/team-decisions");
         let places = document_places(true, true, home, Some(repo)).unwrap();
         let launch = tempfile::tempdir().unwrap();
-        let combined = with_documents(Some(sample()), Some(&places), launch.path()).unwrap();
+        let combined =
+            launch_instructions(Some(sample()), Some(&places), false, launch.path()).unwrap();
         assert!(combined.text.starts_with("Say \"why\"."));
         assert!(combined.text.contains("`/work/example-work/docs`"));
         assert!(combined.text.contains("`/code/team-decisions`"));
@@ -629,24 +622,21 @@ mod tests {
         );
         assert!(codex_config_value(&combined).contains("example-work/docs"));
         // Equal launches share the file.
-        let again = with_documents(Some(sample()), Some(&places), launch.path()).unwrap();
+        let again =
+            launch_instructions(Some(sample()), Some(&places), false, launch.path()).unwrap();
         assert_eq!(again.path, combined.path);
 
         // Without a decisions repo it says so; with the guidelines off the
         // note still goes in, alone.
         let no_repo = document_places(true, true, home, None).unwrap();
-        let alone = with_documents(None, Some(&no_repo), launch.path()).unwrap();
+        let alone = launch_instructions(None, Some(&no_repo), false, launch.path()).unwrap();
         assert!(alone.text.starts_with("# Documents for this work"));
         assert!(alone.text.contains("`/work/example-work/docs`"));
         assert!(alone.text.contains("No decisions repo is set"));
     }
 
     #[test]
-    fn launches_with_instructions_get_the_codex_tools_note() {
-        let launch = tempfile::tempdir().unwrap();
-        let noted = with_codex_tools_note(Some(sample()), launch.path()).unwrap();
-        assert!(noted.text.starts_with("Say \"why\"."));
-        assert!(noted.text.ends_with(CODEX_TOOLS_NOTE));
+    fn agents_with_task_tools_get_the_codex_tools_note_whatever_else_they_get() {
         for word in [
             "delegate_task",
             "consult_request",
@@ -659,10 +649,50 @@ mod tests {
         ] {
             assert!(CODEX_TOOLS_NOTE.contains(word), "{word}");
         }
-        assert!(noted.path.starts_with(launch.path()));
-        assert_eq!(std::fs::read_to_string(&noted.path).unwrap(), noted.text);
-        assert!(codex_config_value(&noted).contains("delegate_task"));
-        assert_eq!(with_codex_tools_note(None, launch.path()), None);
+        let launch = tempfile::tempdir().unwrap();
+        let places = document_places(true, true, Path::new("/work/w"), None).unwrap();
+
+        // Guidelines only, nothing else appended (the coordinator chat of
+        // 2026-11-04 had only these): the note follows them.
+        let guidelines_only =
+            launch_instructions(Some(sample()), None, true, launch.path()).unwrap();
+        assert!(guidelines_only.text.starts_with("Say \"why\"."));
+        assert!(guidelines_only.text.ends_with(CODEX_TOOLS_NOTE));
+        assert!(!guidelines_only.text.contains("# Documents for this work"));
+        assert!(guidelines_only.path.starts_with(launch.path()));
+        assert_eq!(
+            std::fs::read_to_string(&guidelines_only.path).unwrap(),
+            guidelines_only.text
+        );
+        assert!(codex_config_value(&guidelines_only).contains("delegate_task"));
+
+        // Nothing else at all (guidelines off, no documents): the note alone.
+        let alone = launch_instructions(None, None, true, launch.path()).unwrap();
+        assert_eq!(alone.text, CODEX_TOOLS_NOTE);
+        assert_eq!(
+            std::fs::read_to_string(&alone.path).unwrap(),
+            CODEX_TOOLS_NOTE
+        );
+
+        // Everything: guidelines, documents, then the note.
+        let all = launch_instructions(Some(sample()), Some(&places), true, launch.path()).unwrap();
+        let docs = all.text.find("# Documents for this work").unwrap();
+        let codex = all.text.find("# Starting Codex in GitTerm").unwrap();
+        assert!(all.text.starts_with("Say \"why\".") && docs < codex);
+        assert!(all.text.ends_with(CODEX_TOOLS_NOTE));
+
+        // One file per launch: no half-composed file is left beside it.
+        let names: Vec<String> = std::fs::read_dir(launch.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+
+        // Without the task tools there is no note.
+        let without =
+            launch_instructions(Some(sample()), Some(&places), false, launch.path()).unwrap();
+        assert!(!without.text.contains("Starting Codex"));
+        assert_eq!(launch_instructions(None, None, false, launch.path()), None);
     }
 
     #[test]
@@ -672,10 +702,10 @@ mod tests {
         assert_eq!(document_places(true, false, home, None), None);
         let launch = tempfile::tempdir().unwrap();
         assert_eq!(
-            with_documents(Some(sample()), None, launch.path()),
+            launch_instructions(Some(sample()), None, false, launch.path()),
             Some(sample())
         );
-        assert_eq!(with_documents(None, None, launch.path()), None);
+        assert_eq!(launch_instructions(None, None, false, launch.path()), None);
         assert_eq!(std::fs::read_dir(launch.path()).unwrap().count(), 0);
     }
 

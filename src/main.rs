@@ -642,14 +642,15 @@ fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guideli
 }
 
 /// What an agent starting now in `cwd` gets appended: the guidelines and,
-/// in a piece of work, the documents note naming `places` (TRU-191), then
-/// how to start Codex in GitTerm (TRU-212). The
-/// work's docs folder is created here, as the agent starts; a failure is
-/// logged and the note still names it.
+/// in a piece of work, the documents note naming `places` (TRU-191), then,
+/// for an agent given GitTerm's task tools (`task_tools`), how to start
+/// Codex in GitTerm (TRU-212). The work's docs folder is created here, as
+/// the agent starts; a failure is logged and the note still names it.
 fn launch_instructions(
     cwd: &Path,
     workspace_off: bool,
     places: Option<&gitterm::guidelines::DocumentPlaces>,
+    task_tools: bool,
 ) -> Option<gitterm::guidelines::Guidelines> {
     if let Some(places) = places {
         if let Err(error) = std::fs::create_dir_all(&places.docs_dir) {
@@ -659,14 +660,11 @@ fn launch_instructions(
             );
         }
     }
-    let launch_dir = config::instance_config_dir();
-    gitterm::guidelines::with_codex_tools_note(
-        gitterm::guidelines::with_documents(
-            launch_guidelines(cwd, workspace_off),
-            places,
-            &launch_dir,
-        ),
-        &launch_dir,
+    gitterm::guidelines::launch_instructions(
+        launch_guidelines(cwd, workspace_off),
+        places,
+        task_tools,
+        &config::instance_config_dir(),
     )
 }
 
@@ -686,13 +684,16 @@ fn config_document_places(cfg: &WorkspaceConfig) -> Option<gitterm::guidelines::
 }
 
 /// A terminal startup command with the guidelines (and the documents note
-/// of `places`) added when it starts `claude`, `pi` or `codex`. Other
-/// commands are not inspected, so they never read the guidelines file.
+/// of `places`, and the Codex tools note when the terminal gets GitTerm's
+/// task tools, `task_tools`) added when it starts `claude`, `pi` or
+/// `codex`. Other commands are not inspected, so they never read the
+/// guidelines file.
 fn terminal_command_with_guidelines(
     command: &str,
     cwd: &Path,
     workspace_off: bool,
     places: Option<&gitterm::guidelines::DocumentPlaces>,
+    task_tools: bool,
 ) -> String {
     // shortcut: the added option is POSIX-quoted, so Windows terminals
     // (cmd, PowerShell) launch without the guidelines until the quoting is
@@ -703,7 +704,7 @@ fn terminal_command_with_guidelines(
     if !gitterm::guidelines::starts_a_harness(command) {
         return command.to_string();
     }
-    match launch_instructions(cwd, workspace_off, places) {
+    match launch_instructions(cwd, workspace_off, places, task_tools) {
         Some(guidelines) => gitterm::guidelines::configure_terminal_command(command, &guidelines),
         None => command.to_string(),
     }
@@ -16691,11 +16692,14 @@ impl App {
             };
             match gitterm::delegations::codex_run(delegation, &config_root) {
                 Ok(mut run) => {
+                    // A Codex review or consult runs without the task
+                    // tools, so it is not told to use them.
                     run.guidelines = launch_instructions(
                         &run.cwd,
                         self.workspace_guidelines_off(&delegation.parent.workspace),
                         self.workspace_document_places(&delegation.parent.workspace)
                             .as_ref(),
+                        false,
                     );
                     runs.push((delegation_id, run))
                 }
@@ -19403,11 +19407,15 @@ fi
 
         // Added at launch only: the stored startup command stays as given.
         let launch_command = startup_command.as_deref().map(|command| {
+            // The terminal gets the task server when it runs (its
+            // environment carries the endpoint; claude and codex are given
+            // the config, pi finds it through its extension).
             let command = terminal_command_with_guidelines(
                 command,
                 &repo_path,
                 guidelines_off,
                 document_places.as_ref(),
+                self.task_mcp.is_some(),
             );
             gitterm::harness::claude::configure_terminal_chrome(&command, claude_in_chrome)
         });
@@ -22685,7 +22693,12 @@ fi
                                     }
                                 }
                                 // Remote chats start without the
-                                // guidelines (TRU-174 is local only).
+                                // guidelines (TRU-174 is local only). A
+                                // chat given the task server is told how
+                                // to start Codex through it (TRU-212).
+                                let task_tools = claude_mcp_servers.iter().any(|server| {
+                                    server.config["mcpServers"].get("gitterm_tasks").is_some()
+                                });
                                 let guidelines_file = remote_chat
                                     .is_none()
                                     .then(|| {
@@ -22693,6 +22706,7 @@ fi
                                             &repo_path,
                                             guidelines_off,
                                             document_places.as_ref(),
+                                            task_tools,
                                         )
                                     })
                                     .flatten()
@@ -22778,10 +22792,12 @@ fi
                             echo = tab::AgentEvent::user_prompt(&prompt.text);
                         }
                         if session.task_handle.is_none() {
+                            // A per-turn pi process gets no MCP servers.
                             let guidelines_file = launch_instructions(
                                 &repo_path,
                                 guidelines_off,
                                 document_places.as_ref(),
+                                false,
                             )
                             .map(|guidelines| guidelines.path);
                             let handle = tab::spawn_agent_task(
