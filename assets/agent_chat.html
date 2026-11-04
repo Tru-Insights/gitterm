@@ -2405,14 +2405,14 @@
       open.title = (card.worker && card.worker.tab_open) ? 'Switch to the worker\'s terminal tab' : 'The worker tab is not open';
       open.addEventListener('click', () => postIpc({ type: 'delegation_open_worker', delegationId: d.delegation_id }));
     }
-    const sendable = st === 'completed' || (worker && st === 'blocked');
-    if (sendable && !dismissed) {
+    const sendable = st === 'completed' || st === 'failed' || (worker && st === 'blocked');
+    if (sendable && (d.delivered || d.delivered_at)) {
+      actions.appendChild(el('span', 'dlg-note', 'sent to chat ✓'));
+      card.sendBtn = null;
+    } else if (sendable && !dismissed) {
       const send = actions.appendChild(el('button', 'primary', 'Send to Claude'));
       card.sendBtn = send;
-      if (d.delivered_at) {
-        send.textContent = 'Sent to Claude';
-        send.disabled = true;
-      } else if (card.held) {
+      if (card.held) {
         send.textContent = 'Queued, sends when Claude finishes';
         send.disabled = true;
       } else {
@@ -2457,7 +2457,7 @@
         const box = li.appendChild(el('input'));
         box.type = 'checkbox';
         box.checked = card.selected.has(finding.id);
-        box.disabled = !!d.delivered_at;
+        box.disabled = !!(d.delivered || d.delivered_at);
         box.addEventListener('change', () => {
           if (box.checked) card.selected.add(finding.id); else card.selected.delete(finding.id);
           refreshCardSend(card);
@@ -2494,7 +2494,7 @@
   function refreshCardSend(card) {
     const btn = card.sendBtn;
     const d = card.data;
-    if (!btn || !d || d.delivered_at || card.held) return;
+    if (!btn || !d || d.delivered || d.delivered_at || card.held) return;
     const f = findingsOf(d);
     const none = f && f.findings.length > 0 && card.selected && card.selected.size === 0;
     btn.disabled = !!none;
@@ -2601,7 +2601,7 @@
     }
     for (const card of cards.values()) {
       const d = card.data;
-      if (!d || d.dismissed_at || d.delivered_at) continue;
+      if (!d || d.dismissed_at || d.delivered || d.delivered_at) continue;
       rows.push(delegationRow(card));
     }
     // Running rows first, then newest first: by start time, or by when

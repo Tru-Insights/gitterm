@@ -7381,6 +7381,7 @@ struct App {
     notifications_config: config::NotificationsConfig,
     /// `pr_watch` from settings.json (TRU-197), written back on save.
     pr_watch_config: config::PrWatchConfig,
+    delegations_config: config::DelegationsConfig,
     /// `work_notes` from settings.json (TRU-201), written back on save.
     work_notes_config: config::WorkNotesConfig,
     /// ~/Work committing and pushing itself (TRU-201).
@@ -9099,6 +9100,7 @@ impl App {
             usage: self.usage_config.clone(),
             notifications: self.notifications_config.clone(),
             pr_watch: self.pr_watch_config.clone(),
+            delegations: self.delegations_config.clone(),
             work_notes: self.work_notes_config.clone(),
         };
         if let Err(error) = config.save() {
@@ -17770,46 +17772,123 @@ impl App {
         )
     }
 
-    /// Submits a delegation's message as a user message and stamps it
-    /// delivered, so a replay or restart never sends it again.
-    fn deliver_delegation(
+    /// Persist the whole batch once, then submit synchronously so the chat's
+    /// streaming state is set before another tick or result can dispatch.
+    fn deliver_delegations(
         &mut self,
         tab_id: usize,
-        delegation_id: &str,
-        message: String,
+        batch: gitterm::delegations::SendBatch,
     ) -> Task<Event> {
+        if !self
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .any(|tab| tab.id == tab_id && tab.agent_session().is_some())
+        {
+            eprintln!(
+                "[delegation] {:?}: not sent: requesting chat tab {tab_id} is gone",
+                batch.delegation_ids
+            );
+            return Task::none();
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let marked = match self.task_store.as_mut() {
             Some(store) => store
-                .mark_delegation_delivered(delegation_id, &now)
+                .mark_delegations_delivered(&batch.delegation_ids, &now)
                 .map_err(|error| error.to_string()),
             None => Err("GitTerm's task store is unavailable".to_string()),
         };
         if let Err(error) = marked {
-            eprintln!("[delegation] {delegation_id}: not sent: {error}");
+            eprintln!("[delegation] {:?}: not sent: {error}", batch.delegation_ids);
             agent_webview_note(tab_id, &format!("Not sent: {error}"));
             return Task::none();
         }
-        self.push_delegation_card(delegation_id);
-        Task::done(Event::AgentSubmitPrompt(tab_id, message.into()))
+        for id in &batch.delegation_ids {
+            self.push_delegation_card(id);
+        }
+        self.update(Event::AgentSubmitPrompt(tab_id, batch.message.into()))
     }
 
-    /// After the parent's turn ends: send the oldest held message.
+    /// Collect every finished outcome at the same moment. Idle chats flush
+    /// now; busy chats keep the existing held queue until their turn ends.
+    fn auto_deliver_delegations(&mut self) -> Task<Event> {
+        let parents: HashSet<String> = self
+            .task_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .delegations()
+                    .iter()
+                    .filter(|d| {
+                        self.delegations_config.auto_tell
+                            && d.status.is_sendable()
+                            && !d.is_delivered()
+                    })
+                    .map(|d| d.parent.session_uid.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut tabs: HashSet<usize> = self.delegation_held.keys().copied().collect();
+        for parent in parents {
+            match self.delegation_parent_tab_id(&parent) {
+                Some(tab_id) => {
+                    tabs.insert(tab_id);
+                }
+                None => eprintln!(
+                    "[delegation] results for {parent} not sent: requesting chat tab is gone"
+                ),
+            }
+        }
+        Task::batch(
+            tabs.into_iter()
+                .map(|tab_id| self.flush_held_delegation(tab_id))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Both Tick and turn-end use this path, including results that finished
+    /// since the last tick. There is at most one submitted prompt per chat.
     fn flush_held_delegation(&mut self, tab_id: usize) -> Task<Event> {
-        let streaming = self
+        let Some(parent) = self
             .workspaces
             .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|tab| tab.id == tab_id)
-            .and_then(|tab| tab.agent_session())
-            .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming));
-        let Some(held) = self.delegation_held.get_mut(&tab_id) else {
+            .flat_map(|ws| &ws.tabs)
+            .find(|tab| tab.id == tab_id && tab.agent_session().is_some())
+            .map(|tab| tab.session_uid.clone())
+        else {
+            self.delegation_held.remove(&tab_id);
+            eprintln!("[delegation] not sent: requesting chat tab {tab_id} is gone");
             return Task::none();
         };
-        let Some(next) = gitterm::delegations::next_held_send(held, streaming) else {
-            return Task::none();
-        };
-        self.deliver_delegation(tab_id, &next.delegation_id, next.message)
+        let streaming = self.chat_turn_running(tab_id);
+        let held = self.delegation_held.entry(tab_id).or_default();
+        let mut ids: HashSet<String> = held.iter().map(|send| send.delegation_id.clone()).collect();
+        if let Some(store) = &self.task_store {
+            // A worker may replace a blocked report before it was delivered.
+            held.retain(|send| {
+                store
+                    .delegation(&send.delegation_id)
+                    .is_some_and(|d| d.status.is_sendable() && !d.is_delivered())
+            });
+            let mut delegations = store.delegations_for_parent(&parent);
+            delegations.reverse();
+            if let Err(error) = gitterm::delegations::queue_auto_sends(
+                &delegations,
+                self.delegations_config.auto_tell,
+                held,
+            ) {
+                eprintln!("[delegation] chat {tab_id}: cannot queue result: {error}");
+            }
+        }
+        ids.extend(held.iter().map(|send| send.delegation_id.clone()));
+        let next = gitterm::delegations::next_held_send(held, streaming);
+        for id in ids {
+            self.push_delegation_card(&id);
+        }
+        match next {
+            Some(batch) => self.deliver_delegations(tab_id, batch),
+            None => Task::none(),
+        }
     }
 
     /// The delegation behind a card on `tab_id`'s page, checked to belong
@@ -18516,6 +18595,7 @@ impl App {
             needs_you_notifier: NeedsYouNotifier::new(Instant::now()),
             notifications_config: config.notifications.clone(),
             pr_watch_config: config.pr_watch.clone(),
+            delegations_config: config.delegations.clone(),
             work_notes_config: config.work_notes.clone(),
             work_notes: new_work_notes(config.work_notes.auto_commit),
             current_modifiers: Modifiers::empty(),
@@ -22002,6 +22082,7 @@ fi
                 tasks.push(self.poll_work_documents());
                 // The PR watch (TRU-173): one background poll when PRs are due.
                 tasks.push(self.poll_pr_watch());
+                tasks.push(self.auto_deliver_delegations());
                 // Its actionable news, to idle coordinators (TRU-197).
                 tasks.push(self.auto_tell_coordinators());
                 // Titles of the shown Issues, from `linear` (TRU-203).
@@ -23339,7 +23420,7 @@ fi
                     .is_some_and(|s| matches!(s.state, tab::AgentSessionState::Streaming));
                 let prepared = self.tab_delegation(tab_id, &delegation_id).and_then(|d| {
                     gitterm::delegations::compose_send_message(d, &finding_ids)
-                        .map(|message| (message, d.delivered_at.is_some()))
+                        .map(|message| (message, d.is_delivered()))
                 });
                 let (message, delivered) = match prepared {
                     Ok(prepared) => prepared,
@@ -23353,12 +23434,18 @@ fi
                 match gitterm::delegations::decide_send(streaming, delivered, held, &delegation_id)
                 {
                     gitterm::delegations::SendDecision::SendNow => {
-                        return self.deliver_delegation(tab_id, &delegation_id, message);
+                        held.push(gitterm::delegations::HeldSend {
+                            delegation_id,
+                            message,
+                            automatic: false,
+                        });
+                        return self.flush_held_delegation(tab_id);
                     }
                     gitterm::delegations::SendDecision::Hold => {
                         held.push(gitterm::delegations::HeldSend {
                             delegation_id: delegation_id.clone(),
                             message,
+                            automatic: false,
                         });
                         self.push_delegation_card(&delegation_id);
                     }

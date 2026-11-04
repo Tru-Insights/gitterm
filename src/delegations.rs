@@ -1025,6 +1025,7 @@ pub fn delegation_summary(delegation: &Delegation) -> Value {
     if delegation.time_limit_reached_at.is_some() {
         row["outcome"] = Value::String("stopped at the time limit".to_string());
     }
+    row["delivered"] = json!(delegation.is_delivered());
     if let Some(delivered_at) = &delegation.delivered_at {
         row["delivered_at"] = Value::String(delivered_at.clone());
     }
@@ -1123,16 +1124,23 @@ pub fn compose_send_message(
     selected: &[String],
 ) -> Result<String, String> {
     let id = &delegation.delegation_id;
-    let sendable = match delegation.kind {
-        DelegationKind::Implement => delegation.status.has_result(),
-        DelegationKind::Review | DelegationKind::Consult => {
-            delegation.status == DelegationStatus::Completed
-        }
-    };
-    if !sendable {
+    if !delegation.status.is_sendable() {
         return Err(format!(
-            "delegation {id} is {}; only a completed result can be sent",
+            "delegation {id} is {}; only a final outcome can be sent",
             delegation.status.label()
+        ));
+    }
+    if let DelegationStatus::Failed { message } = &delegation.status {
+        let outcome = if delegation.time_limit_reached_at.is_some() {
+            "stopped at the time limit"
+        } else {
+            "failed"
+        };
+        let header = format!("{} delegation {id} {outcome}:\n", delegation.kind.label());
+        let footer = format!("\nFull record: delegation_get {id}");
+        return Ok(format!(
+            "{header}{}{footer}",
+            cut_to_bytes(message, MAX_SEND_BYTES - header.len() - footer.len())
         ));
     }
     let Some(result) = &delegation.result else {
@@ -1344,11 +1352,12 @@ fn worker_send_header(delegation: &Delegation) -> String {
 pub struct HeldSend {
     pub delegation_id: String,
     pub message: String,
+    pub automatic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendDecision {
-    /// Submit now and stamp `delivered_at`.
+    /// Submit now and persist delivery.
     SendNow,
     /// Claude is mid-turn: hold it and send when the turn ends.
     Hold,
@@ -1376,13 +1385,110 @@ pub fn decide_send(
     }
 }
 
-/// When the parent's turn ends: the oldest held message to send now. One per
-/// turn, because sending starts the next turn; the rest wait for its end.
-pub fn next_held_send(held: &mut Vec<HeldSend>, streaming: bool) -> Option<HeldSend> {
+/// Add final, undelivered outcomes to the same queue as manual sends.
+/// Existing held selections are preserved. Progress never enters this queue.
+pub fn queue_auto_sends(
+    delegations: &[&Delegation],
+    enabled: bool,
+    held: &mut Vec<HeldSend>,
+) -> Result<(), String> {
+    held.retain(|send| enabled || !send.automatic);
+    if !enabled {
+        return Ok(());
+    }
+    for delegation in delegations {
+        if !delegation.status.is_sendable()
+            || delegation.is_delivered()
+            || held
+                .iter()
+                .any(|send| send.delegation_id == delegation.delegation_id && !send.automatic)
+        {
+            continue;
+        }
+        let selected = delegation
+            .result
+            .as_ref()
+            .and_then(|result| result.findings.as_ref())
+            .map(|findings| {
+                findings
+                    .findings
+                    .iter()
+                    .map(|finding| finding.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let message = compose_send_message(delegation, &selected)?;
+        if let Some(send) = held
+            .iter_mut()
+            .find(|send| send.delegation_id == delegation.delegation_id)
+        {
+            send.message = message;
+        } else {
+            held.push(HeldSend {
+                delegation_id: delegation.delegation_id.clone(),
+                message,
+                automatic: true,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendBatch {
+    pub delegation_ids: Vec<String>,
+    pub message: String,
+}
+
+/// One bounded prompt for all waiting results. Reserve a full-record pointer
+/// for each, sharing the remaining space equally. If even the pointers do not
+/// fit, the overflow stays queued for the next turn.
+pub fn next_held_send(held: &mut Vec<HeldSend>, streaming: bool) -> Option<SendBatch> {
     if streaming || held.is_empty() {
         return None;
     }
-    Some(held.remove(0))
+    if held.len() == 1 {
+        let send = held.remove(0);
+        return Some(SendBatch {
+            delegation_ids: vec![send.delegation_id],
+            message: send.message,
+        });
+    }
+    let header = "Delegation results:\n";
+    let mut count = 0;
+    let mut reserved = header.len();
+    for send in held.iter() {
+        let minimum = format!("\n…\nFull record: delegation_get {}\n", send.delegation_id).len();
+        if reserved + minimum > MAX_SEND_BYTES {
+            break;
+        }
+        reserved += minimum;
+        count += 1;
+    }
+    // A hand-edited store may contain an id too large even for a pointer.
+    if count == 0 {
+        return None;
+    }
+    let budget = (MAX_SEND_BYTES - reserved) / count;
+    let mut message = header.to_string();
+    let mut delegation_ids = Vec::new();
+    for send in held.drain(..count) {
+        let footer = format!("Full record: delegation_get {}", send.delegation_id);
+        let body = send.message.strip_suffix(&footer).unwrap_or(&send.message);
+        message.push('\n');
+        message.push_str(cut_to_bytes(body, budget));
+        if body.len() > budget {
+            message.push_str("…\n");
+        }
+        message.push_str(&footer);
+        message.push('\n');
+        delegation_ids.push(send.delegation_id);
+    }
+    debug_assert!(message.len() <= MAX_SEND_BYTES);
+    Some(SendBatch {
+        delegation_ids,
+        message,
+    })
 }
 
 /// The chat card payload (`__appendEvent({"kind":"delegation", ...})`):
@@ -1967,17 +2073,19 @@ mod tests {
     }
 
     #[test]
-    fn sends_hold_while_streaming_and_flush_one_per_turn_end() {
+    fn sends_hold_while_streaming_and_flush_together_at_turn_end() {
         let mut held = Vec::new();
         assert_eq!(decide_send(false, false, &held, "a"), SendDecision::SendNow);
         assert_eq!(decide_send(true, false, &held, "a"), SendDecision::Hold);
         held.push(HeldSend {
             delegation_id: "a".into(),
             message: "A".into(),
+            automatic: false,
         });
         held.push(HeldSend {
             delegation_id: "b".into(),
             message: "B".into(),
+            automatic: false,
         });
         assert_eq!(
             decide_send(true, false, &held, "a"),
@@ -1989,9 +2097,166 @@ mod tests {
         );
         // A turn that is still going (a queued message restarted it) flushes nothing.
         assert_eq!(next_held_send(&mut held, true), None);
-        assert_eq!(next_held_send(&mut held, false).unwrap().delegation_id, "a");
-        assert_eq!(next_held_send(&mut held, false).unwrap().delegation_id, "b");
+        let batch = next_held_send(&mut held, false).unwrap();
+        assert_eq!(batch.delegation_ids, ["a", "b"]);
+        assert!(batch.message.contains("A") && batch.message.contains("B"));
         assert_eq!(next_held_send(&mut held, false), None);
+    }
+
+    #[test]
+    fn automatic_delivery_is_once_while_idle_and_survives_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(crate::tasks::TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        let finished = completed_review(3);
+        let mut requested = finished.clone();
+        requested.status = DelegationStatus::Requested;
+        requested.result = None;
+        store.insert_delegation(requested).unwrap();
+        store
+            .complete_delegation("d-7", finished.result.unwrap(), "t2")
+            .unwrap();
+        let mut held = Vec::new();
+        queue_auto_sends(
+            &store.delegations_for_parent(&caller().session_uid),
+            true,
+            &mut held,
+        )
+        .unwrap();
+        let batch = next_held_send(&mut held, false).unwrap();
+        assert_eq!(batch.delegation_ids, ["d-7"]);
+        assert!(batch.message.contains("3 selected of 3 findings"));
+        store
+            .mark_delegations_delivered(&batch.delegation_ids, "t3")
+            .unwrap();
+        let store = TaskStore::load(&path).unwrap();
+        assert!(store.delegation("d-7").unwrap().delivered);
+        queue_auto_sends(
+            &store.delegations_for_parent(&caller().session_uid),
+            true,
+            &mut held,
+        )
+        .unwrap();
+        assert!(next_held_send(&mut held, false).is_none());
+
+        // Old records omit the additive flag and timestamp and remain unsent.
+        let mut old = serde_json::to_value(completed_review(0)).unwrap();
+        old.as_object_mut().unwrap().remove("delivered");
+        old.as_object_mut().unwrap().remove("delivered_at");
+        let old: Delegation = serde_json::from_value(old).unwrap();
+        assert!(!old.is_delivered());
+        queue_auto_sends(&[&old], true, &mut held).unwrap();
+        assert!(next_held_send(&mut held, false).is_some());
+    }
+
+    #[test]
+    fn automatic_results_wait_batch_and_setting_off_restores_manual_delivery() {
+        let review = completed_review(2);
+        let mut failure = delegation(
+            "failed",
+            DelegationStatus::Failed {
+                message: "runner exited".into(),
+            },
+        );
+        let progress = delegation("running", DelegationStatus::Running);
+        let mut held = Vec::new();
+        queue_auto_sends(&[&review, &progress], true, &mut held).unwrap();
+        assert!(next_held_send(&mut held, true).is_none());
+        queue_auto_sends(&[&review, &failure], true, &mut held).unwrap();
+        assert_eq!(held.len(), 2); // Repeated ticks do not duplicate results.
+        assert!(next_held_send(&mut held, true).is_none());
+        let batch = next_held_send(&mut held, false).unwrap();
+        assert_eq!(batch.delegation_ids, ["d-7", "failed"]);
+        assert!(batch.message.contains("runner exited"));
+        assert!(batch.message.contains("2 selected of 2 findings"));
+        assert!(next_held_send(&mut held, false).is_none());
+
+        failure.time_limit_reached_at = Some("t2".into());
+        assert!(compose_send_message(&failure, &[])
+            .unwrap()
+            .contains("stopped at the time limit"));
+        queue_auto_sends(&[&review], true, &mut held).unwrap();
+        queue_auto_sends(&[&review], false, &mut held).unwrap();
+        assert!(held.is_empty());
+        assert!(!review.is_delivered());
+        // Manual selections still work with automatic delivery off.
+        held.push(HeldSend {
+            delegation_id: "d-7".into(),
+            message: compose_send_message(&review, &["F1".into()]).unwrap(),
+            automatic: false,
+        });
+        queue_auto_sends(&[&review], false, &mut held).unwrap();
+        assert!(next_held_send(&mut held, false)
+            .unwrap()
+            .message
+            .contains("1 selected of 2 findings"));
+    }
+
+    #[test]
+    fn batches_keep_the_byte_bound_and_every_full_record_pointer() {
+        let mut held = Vec::new();
+        for id in ["first", "second", "third"] {
+            held.push(HeldSend {
+                delegation_id: id.into(),
+                message: format!("{}\nFull record: delegation_get {id}", "é".repeat(4_000)),
+                automatic: true,
+            });
+        }
+        let batch = next_held_send(&mut held, false).unwrap();
+        assert!(batch.message.len() <= MAX_SEND_BYTES);
+        assert_eq!(batch.delegation_ids.len(), 3);
+        for id in &batch.delegation_ids {
+            assert!(batch
+                .message
+                .contains(&format!("Full record: delegation_get {id}")));
+        }
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn a_held_automatic_report_uses_the_latest_result() {
+        let mut result = completed_review(1);
+        let mut held = Vec::new();
+        queue_auto_sends(&[&result], true, &mut held).unwrap();
+        result
+            .result
+            .as_mut()
+            .unwrap()
+            .findings
+            .as_mut()
+            .unwrap()
+            .findings[0]
+            .title = "Updated finding".into();
+        queue_auto_sends(&[&result], true, &mut held).unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(next_held_send(&mut held, false)
+            .unwrap()
+            .message
+            .contains("Updated finding"));
+    }
+
+    #[test]
+    fn more_pointers_than_fit_wait_without_losing_or_duplicating_results() {
+        let mut held: Vec<HeldSend> = (0..200)
+            .map(|i| HeldSend {
+                delegation_id: format!("00000000-0000-0000-0000-{i:012}"),
+                message: "Result".into(),
+                automatic: true,
+            })
+            .collect();
+        let first = next_held_send(&mut held, false).unwrap();
+        assert!(!held.is_empty());
+        assert!(first.message.len() <= MAX_SEND_BYTES);
+        assert!(next_held_send(&mut held, true).is_none());
+        let second = next_held_send(&mut held, false).unwrap();
+        assert!(second.message.len() <= MAX_SEND_BYTES);
+        assert!(held.is_empty());
+        let ids: HashSet<_> = first
+            .delegation_ids
+            .iter()
+            .chain(&second.delegation_ids)
+            .collect();
+        assert_eq!(ids.len(), 200);
     }
 
     #[test]

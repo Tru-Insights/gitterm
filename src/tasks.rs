@@ -717,6 +717,11 @@ impl DelegationStatus {
         matches!(self, Self::Completed | Self::Blocked)
     }
 
+    /// Final outcomes eligible for delivery, including failures and time limits.
+    pub fn is_sendable(&self) -> bool {
+        self.has_result() || matches!(self, Self::Failed { .. })
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Requested => "requested",
@@ -840,6 +845,10 @@ pub struct Delegation {
     /// sends it twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
+    /// Additive delivery flag (TRU-218). Failures leave `delivered_at`
+    /// absent because older builds only accept that timestamp on results.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivered: bool,
     /// When the human dismissed the result card; it then stays collapsed
     /// and leaves the roster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -922,6 +931,10 @@ pub struct NewDelegation {
 }
 
 impl Delegation {
+    pub fn is_delivered(&self) -> bool {
+        self.delivered || self.delivered_at.is_some()
+    }
+
     /// A new `requested` delegation with a fresh UUID id, the same id
     /// convention as `TaskRecord.task_id`.
     pub fn new_requested(input: NewDelegation, timestamp: impl Into<String>) -> Self {
@@ -939,6 +952,7 @@ impl Delegation {
             created_at: timestamp.clone(),
             updated_at: timestamp,
             delivered_at: None,
+            delivered: false,
             dismissed_at: None,
             options: input.options,
             time_limit_reached_at: None,
@@ -1814,7 +1828,7 @@ impl TaskStore {
         }
         if !delegation.status.is_active()
             || delegation.result.is_some()
-            || delegation.delivered_at.is_some()
+            || delegation.is_delivered()
             || delegation.dismissed_at.is_some()
         {
             return Err(TaskStoreError::new(
@@ -1923,10 +1937,7 @@ impl TaskStore {
             ));
         }
         if delegation.status == DelegationStatus::Blocked {
-            // The blocked report was a different result: the finished one
-            // is news again, whether or not the blocked one was sent or
-            // dismissed.
-            delegation.delivered_at = None;
+            // Keep the once-only delivery markers while updating the card.
             delegation.dismissed_at = None;
         }
         delegation.status = DelegationStatus::Completed;
@@ -1937,8 +1948,8 @@ impl TaskStore {
 
     /// A worker reported itself blocked (S6): the delegation becomes
     /// `Blocked` with the worker's handoff as its result. Reporting blocked
-    /// again replaces the result; either way the new report is unsent and
-    /// undismissed. Only implementation delegations block.
+    /// again replaces the card's result without sending it twice.
+    /// Only implementation delegations block.
     pub fn block_delegation(
         &mut self,
         delegation_id: &str,
@@ -1969,7 +1980,6 @@ impl TaskStore {
         }
         delegation.status = DelegationStatus::Blocked;
         delegation.result = Some(result);
-        delegation.delivered_at = None;
         delegation.dismissed_at = None;
         delegation.updated_at = timestamp.to_string();
         self.commit_delegation(index, delegation)
@@ -2060,36 +2070,64 @@ impl TaskStore {
             .collect()
     }
 
-    /// Stamps that a completed result (or a worker's blocked report) was
-    /// sent to the parent. Stamping twice is an error so a caller cannot
-    /// deliver the same result again.
+    /// Marks a batch in one atomic store write, before submitting its prompt.
+    pub fn mark_delegations_delivered(
+        &mut self,
+        delegation_ids: &[String],
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "mark delegations delivered in";
+        let mut candidate = self.document.clone();
+        for id in delegation_ids {
+            let delegation = candidate
+                .delegations
+                .iter_mut()
+                .find(|delegation| delegation.delegation_id == *id)
+                .ok_or_else(|| {
+                    TaskStoreError::new(
+                        OPERATION,
+                        &self.path,
+                        format!("delegation {id} does not exist"),
+                    )
+                })?;
+            if delegation.is_delivered() {
+                return Err(TaskStoreError::new(
+                    OPERATION,
+                    &self.path,
+                    format!(
+                        "delegation {id} was already delivered at {}",
+                        delegation
+                            .delivered_at
+                            .as_deref()
+                            .unwrap_or("an earlier delivery")
+                    ),
+                ));
+            }
+            if !delegation.status.is_sendable() {
+                return Err(TaskStoreError::new(
+                    OPERATION,
+                    &self.path,
+                    format!(
+                        "delegation {id} is {}, not a final outcome",
+                        delegation.status.label()
+                    ),
+                ));
+            }
+            delegation.delivered = true;
+            if delegation.status.has_result() {
+                delegation.delivered_at = Some(timestamp.to_string());
+            }
+            delegation.updated_at = timestamp.to_string();
+        }
+        self.commit_candidate(candidate)
+    }
+
     pub fn mark_delegation_delivered(
         &mut self,
         delegation_id: &str,
         timestamp: &str,
     ) -> Result<(), TaskStoreError> {
-        const OPERATION: &str = "mark delegation delivered in";
-        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
-        if !delegation.status.has_result() {
-            return Err(TaskStoreError::new(
-                OPERATION,
-                &self.path,
-                format!(
-                    "delegation {delegation_id} is {}, not completed or blocked",
-                    delegation.status.label()
-                ),
-            ));
-        }
-        if let Some(delivered_at) = &delegation.delivered_at {
-            return Err(TaskStoreError::new(
-                OPERATION,
-                &self.path,
-                format!("delegation {delegation_id} was already delivered at {delivered_at}"),
-            ));
-        }
-        delegation.delivered_at = Some(timestamp.to_string());
-        delegation.updated_at = timestamp.to_string();
-        self.commit_delegation(index, delegation)
+        self.mark_delegations_delivered(&[delegation_id.to_string()], timestamp)
     }
 
     pub fn cancel_delegation(
@@ -2419,6 +2457,12 @@ fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
     if delegation.dismissed_at.is_some() && delegation.status.is_active() {
         return Err(format!(
             "delegation {id} is dismissed but still {}",
+            delegation.status.label()
+        ));
+    }
+    if delegation.delivered && !delegation.status.is_sendable() {
+        return Err(format!(
+            "delegation {id} is marked delivered but is {}",
             delegation.status.label()
         ));
     }
@@ -2806,6 +2850,58 @@ mod tests {
                 target_description: "changes against 'v6'".to_string(),
             }),
         }
+    }
+
+    #[test]
+    fn failed_delivery_round_trips_without_an_incompatible_result_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        for id in ["failed", "limited"] {
+            store
+                .insert_delegation(sample_delegation(id, "parent", "t1"))
+                .unwrap();
+        }
+        store
+            .set_delegation_status(
+                "failed",
+                DelegationStatus::Failed {
+                    message: "runner exited".into(),
+                },
+                "t2",
+            )
+            .unwrap();
+        store
+            .stop_delegation_at_time_limit("limited", "stopped at the time limit".into(), "t2")
+            .unwrap();
+        store
+            .mark_delegations_delivered(&["failed".into(), "limited".into()], "t3")
+            .unwrap();
+        let mut store = TaskStore::load(&path).unwrap();
+        for id in ["failed", "limited"] {
+            let d = store.delegation(id).unwrap();
+            assert!(d.delivered);
+            assert!(d.delivered_at.is_none()); // Older builds accept this record.
+            assert!(store.mark_delegation_delivered(id, "t4").is_err());
+        }
+    }
+
+    #[test]
+    fn a_delivery_batch_is_not_partially_stamped_if_one_record_is_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        for id in ["finished", "running"] {
+            store
+                .insert_delegation(sample_delegation(id, "parent", "t1"))
+                .unwrap();
+        }
+        store
+            .complete_delegation("finished", sample_review_result(), "t2")
+            .unwrap();
+        assert!(store
+            .mark_delegations_delivered(&["finished".into(), "running".into()], "t3")
+            .is_err());
+        assert!(!store.delegation("finished").unwrap().is_delivered());
     }
 
     #[test]
@@ -3439,8 +3535,9 @@ mod tests {
                 .summary,
             "Done, tests pass"
         );
-        // The finished report is news again.
-        assert_eq!(worker.delivered_at, None);
+        // The card updates, but this delegation is delivered only once.
+        assert_eq!(worker.delivered_at.as_deref(), Some("t5"));
+        assert!(worker.is_delivered());
         assert_eq!(worker.dismissed_at, None);
         assert!(reloaded.open_worker_delegations("task-1").is_empty());
 
