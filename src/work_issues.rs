@@ -28,7 +28,7 @@ pub enum IssueEvent {
     /// "▸ n more" / "▾ show fewer".
     AllToggle,
     /// Open an issue's URL (from the cache) in the Viewer.
-    Open(String),
+    Open(String, Option<String>),
 }
 
 #[derive(Debug, Default)]
@@ -195,8 +195,8 @@ impl App {
                 }
             }
             IssueEvent::AllToggle => self.issues.all = !self.issues.all,
-            IssueEvent::Open(url) => {
-                return self.open_viewer_page(url);
+            IssueEvent::Open(url, workspace) => {
+                return self.open_linear_issue_page(url, workspace.as_deref());
             }
         }
         Task::none()
@@ -232,6 +232,14 @@ impl App {
                 (None, None) => "not read yet".to_string(),
             };
             let url = found.and_then(|entry| entry.url.clone());
+            let workspace = found.and_then(|entry| {
+                entry.workspace.clone().or_else(|| {
+                    entry
+                        .url
+                        .as_deref()
+                        .and_then(issue_titles::workspace_from_issue_url)
+                })
+            });
             let line = row![
                 text(key.clone())
                     .size(font_small)
@@ -252,7 +260,7 @@ impl App {
                     .style(self.flat_button_style())
                     .padding([3, 6])
                     .width(Length::Fill)
-                    .on_press(Event::Issue(IssueEvent::Open(url)))
+                    .on_press(Event::Issue(IssueEvent::Open(url, workspace)))
                     .into(),
                 None => container(line).padding([3, 6]).width(Length::Fill).into(),
             };

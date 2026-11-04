@@ -7672,6 +7672,8 @@ struct App {
     viewer_webview: ViewerWebview,
     /// URL currently shown when `viewer_webview` is `Page`.
     viewer_page_url: Option<String>,
+    /// Store identity bound to the current remote page surface.
+    viewer_page_store: Option<webview::PageDataStore>,
     /// Agent tabs that own a chat page (`WebviewSurface::Agent(tab_id)`),
     /// most recently shown first, at most `MAX_AGENT_PAGES`. A page keeps
     /// receiving its tab's events while hidden, so showing it again needs no
@@ -7742,8 +7744,25 @@ fn bar_hint_target(visible: VisibleSurface, console_expanded: bool) -> BarHintTa
     match visible {
         VisibleSurface::None => BarHintTarget::Iced,
         VisibleSurface::Viewer => BarHintTarget::Webview(WebviewSurface::Viewer),
+        VisibleSurface::Page => BarHintTarget::Webview(WebviewSurface::Page),
         VisibleSurface::AgentChat(tab_id) => BarHintTarget::Webview(WebviewSurface::Agent(tab_id)),
     }
+}
+
+fn github_page_store(
+    owner: &str,
+    accounts: &std::collections::BTreeMap<String, String>,
+) -> webview::PageDataStore {
+    gitterm::pr_watch::account_for(owner, accounts)
+        .map(webview::PageDataStore::GitHub)
+        .unwrap_or(webview::PageDataStore::Default)
+}
+
+fn linear_page_store(workspace: Option<&str>) -> webview::PageDataStore {
+    workspace
+        .filter(|slug| !slug.is_empty())
+        .map(|slug| webview::PageDataStore::Linear(slug.to_string()))
+        .unwrap_or(webview::PageDataStore::Default)
 }
 
 /// A rough bubble width for 15px Menlo text (0.6em a character), enough to
@@ -7777,6 +7796,7 @@ fn bar_hint_show_script(text: &str, x: f32) -> String {
 enum VisibleSurface {
     None,
     Viewer,
+    Page,
     /// The Agent surface, showing this agent tab's chat.
     AgentChat(usize),
 }
@@ -7793,7 +7813,11 @@ fn visible_webview_surface(
         return VisibleSurface::None;
     }
     if viewer != ViewerWebview::None {
-        return VisibleSurface::Viewer;
+        return if viewer == ViewerWebview::Page {
+            VisibleSurface::Page
+        } else {
+            VisibleSurface::Viewer
+        };
     }
     match active {
         ActiveTabSurface::AgentChat(tab_id) => VisibleSurface::AgentChat(tab_id),
@@ -9984,8 +10008,7 @@ impl App {
     /// from the cache.
     fn usage_view_changed(&mut self) -> Task<Event> {
         if self.usage_view.open {
-            webview::set_visible(WebviewSurface::Viewer, false);
-            webview::hide_agent_pages();
+            let _ = self.apply_webview_surfaces();
             let limits = self.read_codex_limits();
             return Task::batch([self.request_usage_scan(), limits]);
         }
@@ -18730,6 +18753,7 @@ impl App {
             dictation_held: HashMap::new(),
             viewer_webview: ViewerWebview::None,
             viewer_page_url: None,
+            viewer_page_store: None,
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
             workspace_overviews: HashMap::new(),
@@ -29482,6 +29506,7 @@ fi
             webview::update_bounds(WebviewSurface::Agent(tab_id), x, y, width, height);
         }
         webview::update_bounds(WebviewSurface::Viewer, x, y, width, height);
+        webview::update_bounds(WebviewSurface::Page, x, y, width, height);
     }
 
     /// Hide the Viewer surface and let the Agent surface follow the active tab
@@ -29497,6 +29522,11 @@ fi
     /// Record what the Viewer surface presents. The review pane's state
     /// (TRU-178) lives only while the Viewer shows it.
     fn set_viewer_webview(&mut self, viewer: ViewerWebview) {
+        if viewer == ViewerWebview::Page {
+            webview::set_visible(WebviewSurface::Viewer, false);
+        } else {
+            webview::set_visible(WebviewSurface::Page, false);
+        }
         self.viewer_webview = viewer;
         if viewer != ViewerWebview::Page {
             self.viewer_page_url = None;
@@ -29725,16 +29755,26 @@ fi
         match self.visible_webview_surface() {
             VisibleSurface::Viewer => {
                 webview::hide_agent_pages();
+                webview::set_visible(WebviewSurface::Page, false);
                 self.sync_webview_bounds();
                 webview::set_visible(WebviewSurface::Viewer, true);
                 Task::none()
             }
+            VisibleSurface::Page => {
+                webview::hide_agent_pages();
+                webview::set_visible(WebviewSurface::Viewer, false);
+                self.sync_webview_bounds();
+                webview::set_visible(WebviewSurface::Page, true);
+                Task::none()
+            }
             VisibleSurface::AgentChat(tab_id) => {
                 webview::set_visible(WebviewSurface::Viewer, false);
+                webview::set_visible(WebviewSurface::Page, false);
                 self.show_agent_webview(tab_id)
             }
             VisibleSurface::None => {
                 webview::set_visible(WebviewSurface::Viewer, false);
+                webview::set_visible(WebviewSurface::Page, false);
                 webview::hide_agent_pages();
                 Task::none()
             }
@@ -29917,33 +29957,65 @@ fi
         Self::create_staged_viewer_surface()
     }
 
-    /// Show a remote page in the same Viewer surface used by the plans page.
-    /// The surface keeps its existing Viewer IPC handler when already built.
+    /// Show a remote page in the dedicated page surface with the default store.
     fn open_viewer_page(&mut self, url: String) -> Task<Event> {
+        self.open_page_in_store(url, webview::PageDataStore::Default)
+    }
+
+    fn open_linear_issue_page(&mut self, url: String, workspace: Option<&str>) -> Task<Event> {
+        let store = linear_page_store(workspace);
+        self.open_page_in_store(url, store)
+    }
+
+    fn open_page_in_store(
+        &mut self,
+        url: String,
+        requested_store: webview::PageDataStore,
+    ) -> Task<Event> {
+        let store = requested_store.for_current_os();
         let bounds = self.calculate_webview_bounds();
         webview::hide_agent_pages();
         self.viewer_page_url = Some(url.clone());
         self.set_viewer_webview(ViewerWebview::Page);
-        if webview::is_active(WebviewSurface::Viewer) {
-            webview::update_bounds(
-                WebviewSurface::Viewer,
-                bounds.0,
-                bounds.1,
-                bounds.2,
-                bounds.3,
-            );
-            webview::navigate_to_url(WebviewSurface::Viewer, &url);
-            webview::set_visible(WebviewSurface::Viewer, true);
+        let action = webview::page_store_action(self.viewer_page_store.as_ref(), &store);
+        if action == webview::PageStoreAction::Navigate && webview::is_active(WebviewSurface::Page)
+        {
+            webview::update_bounds(WebviewSurface::Page, bounds.0, bounds.1, bounds.2, bounds.3);
+            webview::navigate_to_url(WebviewSurface::Page, &url);
+            webview::set_visible(WebviewSurface::Page, !self.webview_overlay_open());
             return Task::none();
         }
 
-        webview::set_pending_url_with_ipc(
-            WebviewSurface::Viewer,
-            url,
-            bounds,
-            Some(viewer_ipc_handler()),
-        );
-        Self::create_staged_viewer_surface()
+        if action == webview::PageStoreAction::Rebuild {
+            webview::destroy(WebviewSurface::Page);
+        }
+        self.viewer_page_store = Some(store.clone());
+        let page_label = store.label();
+        let page_url = url.clone();
+        webview::set_pending_page(url, bounds, &store);
+        webview::set_visible(WebviewSurface::Page, !self.webview_overlay_open());
+        Self::create_staged_page_surface(page_url, page_label)
+    }
+
+    fn create_staged_page_surface(url: String, store_label: String) -> Task<Event> {
+        iced::window::oldest().then(move |opt_id| {
+            if let Some(id) = opt_id {
+                let url = url.clone();
+                let store_label = store_label.clone();
+                iced::window::run(id, move |window| {
+                    if let Err(error) =
+                        webview::try_create_with_window(WebviewSurface::Page, window)
+                    {
+                        eprintln!(
+                            "[webview] page creation failed for {url} ({store_label}): {error}"
+                        );
+                    }
+                })
+                .discard()
+            } else {
+                Task::none()
+            }
+        })
     }
 
     /// Show the agent chat for `tab_id`. Each agent tab has its own page
@@ -31331,11 +31403,17 @@ fi
         let font_small = self.ui_font_small();
         let header_bg = theme.bg_overlay();
         let title = self.viewer_page_url.as_deref().unwrap_or_default();
+        let store_label = self
+            .viewer_page_store
+            .as_ref()
+            .map(webview::PageDataStore::label)
+            .unwrap_or_else(|| "default login".to_string());
         let header = row![
             text(overview::shorten(title, 100))
                 .size(font_small)
                 .color(theme.text_muted())
                 .width(Length::Fill),
+            text(store_label).size(font_small).color(theme.text_muted()),
             button(text("Open in browser").size(font_small))
                 .style(self.flat_button_style())
                 .padding([4, 8])
@@ -45177,6 +45255,32 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn pr_page_store_uses_owner_mapping_and_defaults_when_unmapped() {
+        let accounts = std::collections::BTreeMap::from([(
+            "sample-owner".to_string(),
+            "sample-login".to_string(),
+        )]);
+        assert_eq!(
+            github_page_store("SAMPLE-OWNER", &accounts),
+            webview::PageDataStore::GitHub("sample-login".to_string())
+        );
+        assert_eq!(
+            github_page_store("another-owner", &accounts),
+            webview::PageDataStore::Default
+        );
+    }
+
+    #[test]
+    fn linear_page_store_uses_issue_workspace_or_default() {
+        assert_eq!(
+            linear_page_store(Some("sample-workspace")),
+            webview::PageDataStore::Linear("sample-workspace".to_string())
+        );
+        assert_eq!(linear_page_store(None), webview::PageDataStore::Default);
+        assert_eq!(linear_page_store(Some("")), webview::PageDataStore::Default);
+    }
+
+    #[test]
     fn connect_form_closes_only_when_its_saved_host_connects() {
         let unsaved = RemoteConnectForm::default();
         assert!(!remote_connect_form_done(&unsaved, "build-host", true));
@@ -47846,7 +47950,7 @@ mod tests {
     }
 
     #[test]
-    fn viewer_surface_wins_over_agent_chat() {
+    fn viewer_or_page_surface_wins_over_agent_chat() {
         for viewer in [
             ViewerWebview::File,
             ViewerWebview::PlansViewer,
@@ -47860,7 +47964,11 @@ mod tests {
             ] {
                 assert_eq!(
                     visible_webview_surface(viewer, active, false),
-                    VisibleSurface::Viewer,
+                    if viewer == ViewerWebview::Page {
+                        VisibleSurface::Page
+                    } else {
+                        VisibleSurface::Viewer
+                    },
                     "viewer={viewer:?} active={active:?}"
                 );
             }
@@ -47892,7 +48000,7 @@ mod tests {
     fn closing_viewer_page_restores_agent_chat_surface() {
         assert_eq!(
             visible_webview_surface(ViewerWebview::Page, ActiveTabSurface::AgentChat(3), false),
-            VisibleSurface::Viewer
+            VisibleSurface::Page
         );
         assert_eq!(
             visible_webview_surface(ViewerWebview::None, ActiveTabSurface::AgentChat(3), false),
@@ -47906,6 +48014,7 @@ mod tests {
             ViewerWebview::None,
             ViewerWebview::File,
             ViewerWebview::PlansViewer,
+            ViewerWebview::Page,
             ViewerWebview::Review,
         ] {
             assert_eq!(

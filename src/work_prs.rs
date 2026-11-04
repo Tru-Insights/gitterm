@@ -964,7 +964,8 @@ impl App {
             }
             PrEvent::OpenInViewer(key) => {
                 let url = self.pr_url(&key);
-                return self.open_viewer_page(url);
+                let store = github_page_store(key.owner(), &self.github_accounts);
+                return self.open_page_in_store(url, store);
             }
             PrEvent::ReviewResolved(key, checkout) => {
                 return match checkout {

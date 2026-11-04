@@ -11,6 +11,8 @@
 // - `WebviewSurface::Viewer` hosts markdown / HTML / excalidraw HTML, the
 //   plans-viewer URL and the review pane (TRU-178). It is built with an IPC
 //   handler that only the review page's token-stamped messages get through.
+// - `WebviewSurface::Page` hosts remote GitHub and Linear pages, with an
+//   optional persistent WebKit store keyed by the signed-in account/workspace.
 //
 // The app keeps at most one surface visible at a time (see
 // `visible_webview_surface` in main.rs).
@@ -37,6 +39,109 @@ pub enum WebviewSurface {
     /// File viewer HTML (markdown / HTML / excalidraw), the plans viewer URL
     /// and the review pane.
     Viewer,
+    /// A remote GitHub or Linear page, kept separate from the default Viewer store.
+    Page,
+}
+
+/// Persistent cookie-store identity for a remote page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageDataStore {
+    Default,
+    GitHub(String),
+    Linear(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageStoreAction {
+    Navigate,
+    Rebuild,
+}
+
+pub fn page_store_action(
+    current: Option<&PageDataStore>,
+    requested: &PageDataStore,
+) -> PageStoreAction {
+    if current == Some(requested) {
+        PageStoreAction::Navigate
+    } else {
+        PageStoreAction::Rebuild
+    }
+}
+
+impl PageDataStore {
+    /// Normalize GitHub login casing because logins are case-insensitive.
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::GitHub(login) => Self::GitHub(login.to_ascii_lowercase()),
+            store => store,
+        }
+    }
+
+    /// Use shared cookies when custom stores are unavailable on this OS.
+    pub fn for_current_os(self) -> Self {
+        if matches!(&self, Self::Default) {
+            return self.normalized();
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Self::Default;
+        #[cfg(target_os = "macos")]
+        if custom_data_stores_available() {
+            return self.normalized();
+        }
+        #[cfg(target_os = "macos")]
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        #[cfg(target_os = "macos")]
+        LOGGED.call_once(|| {
+            eprintln!("[webview] named page data stores are unavailable; using the default store");
+        });
+        #[cfg(target_os = "macos")]
+        Self::Default
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Default => "default login".to_string(),
+            Self::GitHub(login) => format!("as {login}"),
+            Self::Linear(workspace) => format!("as {workspace}"),
+        }
+    }
+
+    /// A stable, namespaced identifier accepted by wry's Darwin extension.
+    pub fn identifier(&self) -> Option<[u8; 16]> {
+        let (namespace, key) = match self {
+            Self::Default => return None,
+            Self::GitHub(login) => ("github", login.to_ascii_lowercase()),
+            Self::Linear(workspace) => ("linear", workspace.clone()),
+        };
+        let mut input = b"gitterm-v6-webkit-store-v1\0".to_vec();
+        input.extend_from_slice(namespace.as_bytes());
+        input.push(0);
+        input.extend_from_slice(key.as_bytes());
+        let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+        let mut identifier = [0; 16];
+        identifier.copy_from_slice(&digest.as_ref()[..16]);
+        Some(identifier)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn custom_data_stores_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("/usr/bin/sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|version| version.trim().split('.').next()?.parse::<u32>().ok())
+            .is_some_and(|major| major >= 14)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn custom_data_stores_available() -> bool {
+    false
 }
 
 /// What kind of content is staged for the next webview create / reuse. The
@@ -56,7 +161,8 @@ use wry::{Rect, WebView, WebViewBuilder};
 /// after the app hid the surface doesn't pop it up.
 struct SurfaceSlot {
     webview: Option<WebView>,
-    pending: Option<(PendingContent, WebViewBounds)>,
+    pending: Option<(PendingContent, WebViewBounds, Option<[u8; 16]>)>,
+    data_store_identifier: Option<[u8; 16]>,
     pending_ipc_handler: Option<IpcHandler>,
     visible: bool,
 }
@@ -65,6 +171,7 @@ impl SurfaceSlot {
     const EMPTY: SurfaceSlot = SurfaceSlot {
         webview: None,
         pending: None,
+        data_store_identifier: None,
         pending_ipc_handler: None,
         visible: false,
     };
@@ -75,6 +182,7 @@ impl SurfaceSlot {
 thread_local! {
     static AGENT_PAGES: RefCell<HashMap<usize, SurfaceSlot>> = RefCell::new(HashMap::new());
     static VIEWER_SURFACE: RefCell<SurfaceSlot> = const { RefCell::new(SurfaceSlot::EMPTY) };
+    static PAGE_SURFACE: RefCell<SurfaceSlot> = const { RefCell::new(SurfaceSlot::EMPTY) };
 }
 
 /// Run `f` on `surface`'s slot, creating an empty agent page slot on demand.
@@ -89,6 +197,7 @@ fn with_slot<R>(surface: WebviewSurface, f: impl FnOnce(&mut SurfaceSlot) -> R) 
                 .or_insert(SurfaceSlot::EMPTY))
         }),
         WebviewSurface::Viewer => VIEWER_SURFACE.with(|slot| f(&mut slot.borrow_mut())),
+        WebviewSurface::Page => PAGE_SURFACE.with(|slot| f(&mut slot.borrow_mut())),
     }
 }
 
@@ -102,6 +211,7 @@ fn with_existing_slot<R>(
             AGENT_PAGES.with(|pages| pages.borrow_mut().get_mut(&tab_id).map(f))
         }
         WebviewSurface::Viewer => VIEWER_SURFACE.with(|slot| Some(f(&mut slot.borrow_mut()))),
+        WebviewSurface::Page => PAGE_SURFACE.with(|slot| Some(f(&mut slot.borrow_mut()))),
     }
 }
 
@@ -151,7 +261,7 @@ pub fn set_pending_content_with_ipc(
     ipc_handler: Option<IpcHandler>,
 ) {
     with_slot(surface, |slot| {
-        slot.pending = Some((PendingContent::Html(html), bounds));
+        slot.pending = Some((PendingContent::Html(html), bounds, None));
         slot.pending_ipc_handler = ipc_handler;
         slot.visible = true;
     });
@@ -177,8 +287,17 @@ pub fn set_pending_url_with_ipc(
     ipc_handler: Option<IpcHandler>,
 ) {
     with_slot(surface, |slot| {
-        slot.pending = Some((PendingContent::Url(url), bounds));
+        slot.pending = Some((PendingContent::Url(url), bounds, None));
         slot.pending_ipc_handler = ipc_handler;
+        slot.visible = true;
+    });
+}
+
+/// Stage a remote page with a persistent, account-scoped WebKit data store.
+pub fn set_pending_page(url: String, bounds: (f32, f32, f32, f32), store: &PageDataStore) {
+    with_slot(WebviewSurface::Page, |slot| {
+        slot.pending = Some((PendingContent::Url(url), bounds, store.identifier()));
+        slot.pending_ipc_handler = None;
         slot.visible = true;
     });
 }
@@ -210,10 +329,19 @@ pub fn try_create_with_window(
     window: &dyn HasWindowHandle,
 ) -> Result<bool, String> {
     with_existing_slot(surface, |slot| {
-        let Some((content, bounds)) = slot.pending.take() else {
+        let Some((content, bounds, data_store_identifier)) = slot.pending.take() else {
             return Ok(false);
         };
         let ipc_handler = slot.pending_ipc_handler.take();
+
+        // A Page webview cannot change its cookie store after construction.
+        // Drop it before reusing the slot when its staged store differs.
+        if surface == WebviewSurface::Page
+            && slot.webview.is_some()
+            && slot.data_store_identifier != data_store_identifier
+        {
+            slot.webview = None;
+        }
 
         // If WebView already exists, update content and apply visibility.
         if let Some(webview) = slot.webview.as_ref() {
@@ -250,11 +378,19 @@ pub fn try_create_with_window(
             .with_transparent(false)
             .with_visible(slot.visible);
 
-        if surface == WebviewSurface::Viewer {
+        if matches!(surface, WebviewSurface::Viewer | WebviewSurface::Page) {
             builder = builder.with_new_window_req_handler(|url| {
                 open_url_in_browser(&url);
                 false
             });
+        }
+
+        #[cfg(target_os = "macos")]
+        if surface == WebviewSurface::Page {
+            if let Some(identifier) = data_store_identifier {
+                use wry::WebViewBuilderExtDarwin;
+                builder = builder.with_data_store_identifier(identifier);
+            }
         }
 
         builder = match &content {
@@ -273,6 +409,7 @@ pub fn try_create_with_window(
             .map_err(|e| format!("Failed to create {surface:?} WebView: {}", e))?;
 
         slot.webview = Some(webview);
+        slot.data_store_identifier = data_store_identifier;
         Ok(true)
     })
     .unwrap_or(Ok(false))
@@ -466,7 +603,8 @@ pub fn focus_app_view() {
         |slot: &mut SurfaceSlot| slot.webview.as_ref().map(|webview| webview.focus_parent());
     let result = AGENT_PAGES
         .with(|pages| pages.borrow_mut().values_mut().find_map(focus_parent))
-        .or_else(|| VIEWER_SURFACE.with(|slot| focus_parent(&mut slot.borrow_mut())));
+        .or_else(|| VIEWER_SURFACE.with(|slot| focus_parent(&mut slot.borrow_mut())))
+        .or_else(|| PAGE_SURFACE.with(|slot| focus_parent(&mut slot.borrow_mut())));
     if let Some(Err(e)) = result {
         eprintln!("[webview] giving keyboard focus back to the app view failed: {e}");
     }
@@ -497,12 +635,77 @@ pub fn destroy(surface: WebviewSurface) {
                 .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), SurfaceSlot::EMPTY));
             drop(old);
         }
+        WebviewSurface::Page => {
+            let old = PAGE_SURFACE
+                .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), SurfaceSlot::EMPTY));
+            drop(old);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::insert_composer_text_script;
+    use super::{insert_composer_text_script, page_store_action, PageDataStore, PageStoreAction};
+
+    #[test]
+    fn a_pending_page_keeps_the_latest_hidden_visibility_request() {
+        let store = PageDataStore::GitHub("sample-login".to_string());
+        super::set_pending_page(
+            "https://github.com/sample-owner/sample-repo/pull/1".to_string(),
+            (0.0, 0.0, 100.0, 100.0),
+            &store,
+        );
+        super::set_visible(super::WebviewSurface::Page, false);
+        super::PAGE_SURFACE.with(|slot| {
+            let slot = slot.borrow();
+            assert!(slot.pending.is_some());
+            assert!(!slot.visible);
+        });
+        super::destroy(super::WebviewSurface::Page);
+    }
+
+    #[test]
+    fn page_store_identifiers_are_stable_and_distinct() {
+        let alpha = PageDataStore::GitHub("sample-login-a".to_string());
+        let beta = PageDataStore::GitHub("sample-login-b".to_string());
+        assert_eq!(
+            alpha.identifier(),
+            Some([
+                0xa9, 0x0d, 0x78, 0xb9, 0x36, 0xe7, 0x7e, 0x9f, 0x1e, 0xe4, 0x3b, 0x89, 0xd3, 0xf8,
+                0xa9, 0x35,
+            ])
+        );
+        assert_eq!(alpha.identifier(), alpha.clone().identifier());
+        assert_ne!(alpha.identifier(), beta.identifier());
+        assert_ne!(
+            alpha.identifier(),
+            PageDataStore::Linear("sample-login-a".to_string()).identifier()
+        );
+    }
+
+    #[test]
+    fn page_store_action_navigates_for_same_store_and_rebuilds_for_another() {
+        let first = PageDataStore::GitHub("sample-login-a".to_string());
+        let other = PageDataStore::GitHub("sample-login-b".to_string());
+        assert_eq!(
+            page_store_action(Some(&first), &first),
+            PageStoreAction::Navigate
+        );
+        assert_eq!(
+            page_store_action(Some(&first), &other),
+            PageStoreAction::Rebuild
+        );
+        assert_eq!(page_store_action(None, &first), PageStoreAction::Rebuild);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn platforms_without_named_webkit_stores_use_the_default_store() {
+        assert_eq!(
+            PageDataStore::GitHub("sample-login".to_string()).for_current_os(),
+            PageDataStore::Default
+        );
+    }
 
     /// The argument the page receives, decoded as the JS engine would read
     /// the JSON literal.
