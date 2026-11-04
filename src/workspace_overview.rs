@@ -2248,11 +2248,31 @@ pub fn fold_marker(open: bool) -> &'static str {
     }
 }
 
-/// The hovered row after the pointer left `left`. Moving from one row to
-/// the next can deliver the new row's enter before the old row's exit, so
-/// an exit only clears the row it names.
-pub fn hover_after_exit<T: PartialEq>(current: Option<T>, left: &T) -> Option<T> {
-    current.filter(|hovered| hovered != left)
+/// A Work sidebar row whose detail and actions can be opened with its
+/// ▸ / ▾ disclosure (TRU-208). Hover never opens anything.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RowKey {
+    /// A PR row, by PR id.
+    Pr(String),
+    /// A repo's line, by its folder.
+    Repo(PathBuf),
+    /// A branch row, by its checkout.
+    Branch(PathBuf),
+    /// A chat row, by chat id.
+    Chat(String),
+    /// A document row, by its key.
+    Document(String),
+}
+
+/// Opens `key` in one workspace's set of open rows, or closes it when it
+/// was open; returns whether it is open now. Other rows stay as they are.
+pub fn toggle_row(open: &mut HashSet<RowKey>, key: RowKey) -> bool {
+    if open.remove(&key) {
+        false
+    } else {
+        open.insert(key);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -3647,10 +3667,41 @@ mod tests {
     }
 
     #[test]
-    fn an_exit_clears_only_the_row_it_left() {
-        // The next row's enter arrived first: the old exit leaves it.
-        assert_eq!(hover_after_exit(Some("b"), &"a"), Some("b"));
-        assert_eq!(hover_after_exit(Some("a"), &"a"), None);
-        assert_eq!(hover_after_exit(None, &"a"), None);
+    fn a_row_opens_and_closes_on_its_toggle() {
+        let mut open = HashSet::new();
+        let branch = RowKey::Branch(PathBuf::from("/r/a-wt"));
+        assert!(toggle_row(&mut open, branch.clone()));
+        assert!(open.contains(&branch));
+        assert!(!toggle_row(&mut open, branch.clone()));
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn several_rows_stay_open_together() {
+        let mut open = HashSet::new();
+        toggle_row(&mut open, RowKey::Pr("o/r#1".into()));
+        toggle_row(&mut open, RowKey::Chat("c1".into()));
+        toggle_row(&mut open, RowKey::Repo(PathBuf::from("/r/a")));
+        assert_eq!(open.len(), 3);
+        // Closing one leaves the others open.
+        toggle_row(&mut open, RowKey::Chat("c1".into()));
+        assert!(open.contains(&RowKey::Pr("o/r#1".into())));
+        assert!(open.contains(&RowKey::Repo(PathBuf::from("/r/a"))));
+        assert!(!open.contains(&RowKey::Chat("c1".into())));
+    }
+
+    #[test]
+    fn open_rows_are_kept_per_workspace() {
+        let mut by_workspace: HashMap<&str, HashSet<RowKey>> = HashMap::new();
+        let doc = RowKey::Document("plan.md".into());
+        toggle_row(by_workspace.entry("one").or_default(), doc.clone());
+        assert!(by_workspace["one"].contains(&doc));
+        assert!(by_workspace
+            .get("two")
+            .is_none_or(|open| !open.contains(&doc)));
+        toggle_row(by_workspace.entry("two").or_default(), doc.clone());
+        toggle_row(by_workspace.entry("one").or_default(), doc.clone());
+        assert!(!by_workspace["one"].contains(&doc));
+        assert!(by_workspace["two"].contains(&doc));
     }
 }

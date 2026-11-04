@@ -198,12 +198,12 @@ struct PrActionsShown {
     others: bool,
 }
 
-/// Actions wait for hover, except the next-to-merge PR keeps its Merge:
-/// the one action that is due now.
-fn pr_actions_shown(is_next: bool, hovered: bool) -> PrActionsShown {
+/// Actions wait for the row to be opened, except the next-to-merge PR
+/// keeps its Merge: the one action that is due now.
+fn pr_actions_shown(is_next: bool, expanded: bool) -> PrActionsShown {
     PrActionsShown {
-        merge: is_next || hovered,
-        others: hovered,
+        merge: is_next || expanded,
+        others: expanded,
     }
 }
 
@@ -1416,10 +1416,10 @@ impl App {
     /// One PR row of the overview section, on one line (TRU-208): number,
     /// title, the facts that need you (checks, blocked or held, changes
     /// requested, new comments, conflicts, draft) and the actions. Review,
-    /// Approve, Merge and Ready for review show on hover, except that the
-    /// next-to-merge PR keeps a filled Merge. Hovering adds the full live
-    /// line, what it waits for, its hold and note. News and read errors
-    /// always show.
+    /// Approve, Merge and Ready for review show once the row is opened (a
+    /// click on it or its ▸), except that the next-to-merge PR keeps a
+    /// filled Merge. Opened, it adds the full live line, what it waits
+    /// for, its hold and note. News and read errors always show.
     fn view_pr_row<'a>(
         &'a self,
         root: &str,
@@ -1431,10 +1431,10 @@ impl App {
         let font_small = self.ui_font_small();
         let text_muted = theme.text_muted();
         let watched = self.watched(key);
-        let target = OverviewHover::Pr(key.id());
-        let hovered = self.overview_hovered(&target);
+        let row_key = overview::RowKey::Pr(key.id());
+        let expanded = self.overview_row_open(&row_key);
         let is_next = row.is_some_and(|row| row.status == RowStatus::Next);
-        let shown = pr_actions_shown(is_next, hovered);
+        let shown = pr_actions_shown(is_next, expanded);
         let draft = watched
             .and_then(WatchedPr::brief)
             .is_some_and(|brief| brief.state == merge_plan::PrState::Draft);
@@ -1443,7 +1443,7 @@ impl App {
             .map(|core| core.title.as_str())
             .filter(|title| !title.is_empty());
 
-        // Fixed slots: position, number, title, facts, actions.
+        // Fixed slots: position, number, title, facts, actions, disclosure.
         let position = text(row.map_or_else(String::new, |row| format!("{}", row.position)))
             .size(font_small)
             .color(text_muted)
@@ -1564,13 +1564,14 @@ impl App {
                     ))),
             );
         }
-        let line = row![position, number, title, facts, actions]
+        let disclosure = self.overview_disclosure(expanded, row_key.clone());
+        let line = row![position, number, title, facts, actions, disclosure]
             .spacing(6)
             .align_y(iced::Alignment::Center);
 
-        // Hover detail: the full live line, what it waits for, hold, note.
+        // Opened: the full live line, what it waits for, hold, note.
         let mut detail = Column::new().spacing(2);
-        if hovered {
+        if expanded {
             // Its place in the plan ("next", "ready", ...), the live line
             // and the full `owner/name#n`.
             let mut live = Row::new().spacing(6).align_y(iced::Alignment::Center);
@@ -1637,19 +1638,21 @@ impl App {
                 detail = detail.push(self.view_pr_news_item(root, watched, item, false));
             }
         }
+        // The row has no other action: a click anywhere on it opens it.
         let hover_bg = theme.bg_overlay();
-        let body = container(Column::new().spacing(2).push(line).push(detail))
+        button(Column::new().spacing(2).push(line).push(detail))
             .padding([3, 6])
             .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: hovered.then(|| hover_bg.into()),
+            .style(move |_, status| button::Style {
+                background: matches!(status, button::Status::Hovered).then(|| hover_bg.into()),
                 border: iced::Border {
                     radius: 6.0.into(),
                     ..Default::default()
                 },
                 ..Default::default()
-            });
-        self.overview_hover_area(body, target)
+            })
+            .on_press(Event::OverviewRowToggle(row_key))
+            .into()
     }
 
     /// "PRs · merge order" for the active workspace's overview: each root's

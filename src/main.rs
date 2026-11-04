@@ -2543,22 +2543,9 @@ struct WorkspaceOverviewState {
     documents_open: bool,
     /// "Also worked here" is unfolded (TRU-208; starts folded).
     also_open: bool,
-}
-
-/// The Work sidebar row the pointer is over (TRU-208): its details and
-/// actions show while hovered. One at a time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OverviewHover {
-    /// A PR row, by PR id.
-    Pr(String),
-    /// A repo's line, by its folder.
-    Repo(PathBuf),
-    /// A branch row, by its checkout.
-    Branch(PathBuf),
-    /// A chat row, by chat id.
-    Chat(String),
-    /// A document row, by its key.
-    Document(String),
+    /// Rows opened with their ▸ disclosure (TRU-208), several at once;
+    /// not persisted.
+    open_rows: HashSet<overview::RowKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -6898,12 +6885,8 @@ pub enum Event {
     WorkspaceOverviewToggleDocuments,
     /// Unfold or fold the overview's "Also worked here" (TRU-208).
     WorkspaceOverviewToggleAlso,
-    /// The pointer entered a Work sidebar row (TRU-208).
-    OverviewHoverEnter(OverviewHover),
-    /// The pointer left this Work sidebar row.
-    OverviewHoverExit(OverviewHover),
-    /// The pointer left the Work sidebar.
-    OverviewHoverClear,
+    /// Open or close a Work sidebar row's detail and actions (TRU-208).
+    OverviewRowToggle(overview::RowKey),
     /// "Make workspace" on a coordinator: a workspace that owns this local
     /// root chat (TRU-169).
     WorkspaceFromChat(String),
@@ -7353,8 +7336,6 @@ struct App {
     /// Documents lists every document, not just the newest
     /// [`WORK_DOCUMENTS_SHOWN`].
     work_documents_all: bool,
-    /// The Work sidebar row under the pointer (TRU-208).
-    overview_hover: Option<OverviewHover>,
     /// Hand-picked overview focus per workspace, kept across restarts.
     overview_focus_picks: overview::FocusPicks,
     /// An inline workspace rename in progress (TRU-169).
@@ -8639,22 +8620,30 @@ impl App {
         }
     }
 
-    /// Whether the Work sidebar's pointer is over `target`.
-    fn overview_hovered(&self, target: &OverviewHover) -> bool {
-        self.overview_hover.as_ref() == Some(target)
+    /// Whether a Work sidebar row is open (TRU-208), in the active
+    /// workspace's overview.
+    fn overview_row_open(&self, key: &overview::RowKey) -> bool {
+        self.overview_key()
+            .and_then(|dir| self.workspace_overviews.get(&dir))
+            .is_some_and(|state| state.open_rows.contains(key))
     }
 
-    /// Wraps a Work sidebar row so hovering it shows its details (TRU-208).
-    /// The row itself stays in the tree either way.
-    fn overview_hover_area<'a>(
+    /// A row's ▸ / ▾ disclosure (TRU-208): opens and closes its detail and
+    /// actions. Always in the row, so opening never moves its siblings.
+    fn overview_disclosure<'a>(
         &self,
-        content: impl Into<Element<'a, Event, Theme, iced::Renderer>>,
-        target: OverviewHover,
+        open: bool,
+        key: overview::RowKey,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
-        iced::widget::mouse_area(content)
-            .on_enter(Event::OverviewHoverEnter(target.clone()))
-            .on_exit(Event::OverviewHoverExit(target))
-            .into()
+        button(
+            text(overview::fold_marker(open))
+                .size(10)
+                .color(self.theme.text_muted()),
+        )
+        .style(self.flat_button_style())
+        .padding([0, 4])
+        .on_press(Event::OverviewRowToggle(key))
+        .into()
     }
 
     /// A Work sidebar section header (TRU-208): the name, its count dim
@@ -18149,7 +18138,6 @@ impl App {
             work_documents: HashMap::new(),
             work_document_copies_open: None,
             work_documents_all: false,
-            overview_hover: None,
             overview_focus_picks: overview::FocusPicks::load(&overview::FocusPicks::path_in(
                 &config::global_config_dir(),
             )),
@@ -27039,15 +27027,13 @@ fi
                     state.also_open = !state.also_open;
                 }
             }
-            Event::OverviewHoverEnter(target) => {
-                self.overview_hover = Some(target);
-            }
-            Event::OverviewHoverClear => {
-                self.overview_hover = None;
-            }
-            Event::OverviewHoverExit(target) => {
-                self.overview_hover =
-                    overview::hover_after_exit(self.overview_hover.take(), &target);
+            Event::OverviewRowToggle(key) => {
+                if let Some(state) = self
+                    .overview_key()
+                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
+                {
+                    overview::toggle_row(&mut state.open_rows, key);
+                }
             }
             Event::WorkspaceOverviewOpenChat(id) => {
                 return self.open_overview_chat(&id);
@@ -35563,7 +35549,8 @@ fi
     /// repo the workspace lists or the work touched, each with its edit
     /// count and the owned branches under it. The repo's line carries its
     /// run command and opens the Git view on a click; editing the command,
-    /// its age and a remove control (not the home) show on hover (TRU-208).
+    /// its age and a remove control (not the home) show once ▸ opens the
+    /// line (TRU-208).
     /// `+ add` picks a folder. A note offers undo when repos joined from
     /// the chats' touches. A pure render over `state`.
     fn view_overview_repos<'a>(
@@ -35652,8 +35639,8 @@ fi
             });
             let quiet = empty_note.is_some() && group.edits.is_none();
             let facts = overview::repo_facts(is_home, group.edits, empty_note);
-            let target = OverviewHover::Repo(group.dir.clone());
-            let hovered = self.overview_hovered(&target);
+            let key = overview::RowKey::Repo(group.dir.clone());
+            let expanded = self.overview_row_open(&key);
             // The name opens the Git view on the repo (TRU-192).
             let local = repo_state.is_none_or(|repo| repo.key.is_local());
             let name_button = button(text(name).size(font_small).font(bold).color(if quiet {
@@ -35667,8 +35654,9 @@ fi
                 local.then(|| Event::OpenRepoPanel(SidebarMode::Git, Some(group.dir.clone()))),
             );
             // Its run command (TRU-180): `▶` opens it as a terminal tab
-            // below and stays shown; ✎ edits it, on hover. Only this Mac's
-            // folders run. Fixed slots: name, run, gap, hover, facts.
+            // below and stays shown; ✎ edits it, once the line is opened
+            // with ▸. Only this Mac's folders run. Fixed slots: name, run,
+            // gap, actions, facts, disclosure; the input never moves.
             let local_repo = repo_state.filter(|repo| repo.key.is_local());
             let editing = local_repo.and_then(|repo| {
                 self.editing_run_command
@@ -35701,10 +35689,12 @@ fi
                 },
                 (None, _) => iced::widget::Space::new().into(),
             };
-            let mut hover_slot = Row::new().spacing(2).align_y(iced::Alignment::Center);
-            if hovered {
+            let removable = repo_state.filter(|repo| repo.id != ws.home);
+            let has_hidden = local_repo.is_some() || oldest.is_some() || removable.is_some();
+            let mut actions_slot = Row::new().spacing(2).align_y(iced::Alignment::Center);
+            if expanded {
                 if let Some(repo) = local_repo.filter(|_| editing.is_none()) {
-                    hover_slot = hover_slot.push(match &repo.run_command {
+                    actions_slot = actions_slot.push(match &repo.run_command {
                         Some(_) => button(text("\u{270E}").size(10).color(text_muted))
                             .style(self.flat_button_style())
                             .padding([0, 4])
@@ -35716,15 +35706,15 @@ fi
                     });
                 }
                 if let Some(oldest) = oldest {
-                    hover_slot = hover_slot.push(
+                    actions_slot = actions_slot.push(
                         text(overview::age_label(oldest))
                             .size(10)
                             .color(text_muted)
                             .font(mono),
                     );
                 }
-                if let Some(repo) = repo_state.filter(|repo| repo.id != ws.home) {
-                    hover_slot = hover_slot.push(
+                if let Some(repo) = removable {
+                    actions_slot = actions_slot.push(
                         button(text("\u{00D7}").size(font_small).color(text_muted))
                             .style(self.flat_button_style())
                             .padding([0, 4])
@@ -35736,14 +35726,17 @@ fi
                 name_button,
                 run_slot,
                 iced::widget::Space::new().width(Length::Fill),
-                hover_slot,
+                actions_slot,
                 text(facts).size(10).color(text_muted).font(mono),
+                if has_hidden {
+                    self.overview_disclosure(expanded, key)
+                } else {
+                    iced::widget::Space::new().into()
+                },
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
-            let mut column = Column::new()
-                .spacing(1)
-                .push(self.overview_hover_area(head, target));
+            let mut column = Column::new().spacing(1).push(head);
             for row in rows {
                 column = column.push(self.view_overview_branch_row(
                     row,
@@ -35861,12 +35854,10 @@ fi
             .spacing(4)
             .align_y(iced::Alignment::Center);
         let mut content = Column::new().spacing(10).padding([10, 8]).push(header);
-        // Leaving the panel clears the hovered row (TRU-208), so a row
-        // whose own exit never came (it went away under the pointer) does
-        // not stay open.
         let finish = |content: Column<'a, Event, Theme, iced::Renderer>| {
-            iced::widget::mouse_area(scrollable(content).height(Length::Fill).width(Length::Fill))
-                .on_exit(Event::OverviewHoverClear)
+            scrollable(content)
+                .height(Length::Fill)
+                .width(Length::Fill)
                 .into()
         };
 
@@ -36191,8 +36182,9 @@ fi
     }
 
     /// One coordinator on one line (TRU-208): title, "open", fan-out and
-    /// age. Hovering shows the latest line, the indexed children and ↗,
-    /// which opens the conversation in the main area. Clicking focuses it.
+    /// age. Its ▸ opens the latest line, the indexed children and ↗,
+    /// which opens the conversation in the main area. Clicking the row
+    /// focuses it (or opens it, in a workspace that owns its chats).
     fn view_overview_coordinator_row<'a>(
         &'a self,
         coordinator: &'a overview::Coordinator,
@@ -36224,14 +36216,14 @@ fi
         let text_muted = theme.text_muted();
         let surface0 = theme.surface0();
         let hover = theme.bg_overlay();
-        let target = OverviewHover::Chat(coordinator.id.clone());
-        let hovered = self.overview_hovered(&target);
-        // Fixed slots: mark, title, open, edits here, fan-out, age, ↗.
+        let key = overview::RowKey::Chat(coordinator.id.clone());
+        let expanded = self.overview_row_open(&key);
+        // Fixed slots: mark, title, open, edits here, fan-out, age, ↗, ▸.
         let open = button(text("\u{2197}").size(font_small).color(theme.accent()))
             .style(self.flat_button_style())
             .padding([0, 4])
             .on_press(Event::WorkspaceOverviewOpenChat(coordinator.id.clone()));
-        let open_slot: Element<'a, Event, Theme, iced::Renderer> = if hovered {
+        let open_slot: Element<'a, Event, Theme, iced::Renderer> = if expanded {
             open.into()
         } else {
             iced::widget::Space::new().into()
@@ -36266,13 +36258,14 @@ fi
                 .color(text_muted)
                 .font(mono),
             open_slot,
+            self.overview_disclosure(expanded, key),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center);
 
-        // Hover detail: the latest line and the indexed children.
+        // Opened: the latest line and the indexed children.
         let mut detail = Column::new().spacing(2);
-        if hovered {
+        if expanded {
             if let Some(latest) = &coordinator.latest {
                 detail = detail.push(
                     text(format!("\u{21B3} {}", overview::shorten(latest, 90)))
@@ -36319,8 +36312,8 @@ fi
         };
         // "Make workspace", or "Go to <name>" when another workspace owns
         // it (TRU-169): on the focused row of a folder-scoped overview, and
-        // on rows this owning workspace does not own. On hover, or while
-        // the row is focused (TRU-208).
+        // on rows this owning workspace does not own. Once opened, or
+        // while the row is focused (TRU-208).
         let owner = self.root_chat_owner(&coordinator.id);
         let owned_here = owning.is_some_and(|ws| ws.chats.contains(&coordinator.id));
         let show_action = if owning.is_some() {
@@ -36328,7 +36321,7 @@ fi
         } else {
             focused
         };
-        if show_action && (hovered || focused) {
+        if show_action && (expanded || focused) {
             let (label, event) = match &owner {
                 Some((name, _)) => (
                     format!("\u{2192} Go to {}", overview::shorten(name, 30)),
@@ -36368,13 +36361,13 @@ fi
                 ..Default::default()
             })
             .on_press(press);
-        self.overview_hover_area(row, target)
+        row.into()
     }
 
     /// One owned checkout on one line (TRU-208): the branch and the one
     /// fact that needs you (dirty count, else unpushed ↑n; nothing when
-    /// clean). Hovering adds the checkout, ahead and behind its base, push
-    /// state, PR when known, owner and last activity, and "Diff". A click
+    /// clean). Its ▸ opens the checkout, ahead and behind its base, push
+    /// state, PR when known, owner and last activity. A click on the row
     /// opens the review pane (TRU-178): Uncommitted when dirty, else vs base.
     fn view_overview_branch_row<'a>(
         &'a self,
@@ -36388,8 +36381,8 @@ fi
         let text_muted = theme.text_muted();
         let surface0 = theme.surface0();
         let hover = theme.bg_overlay();
-        let target = OverviewHover::Branch(row.owned.checkout.clone());
-        let hovered = self.overview_hovered(&target);
+        let key = overview::RowKey::Branch(row.owned.checkout.clone());
+        let expanded = self.overview_row_open(&key);
         let branch = row.owned.branch.as_deref().unwrap_or("(detached)");
         let fact = overview::branch_fact(row.status.as_ref());
         let fact_color = match fact {
@@ -36401,16 +36394,7 @@ fi
             _ => overview::DiffSource::Uncommitted,
         };
         let open = Event::ReviewOpen(row.owned.checkout.clone(), source);
-        // Fixed slots: name, fact, Diff (on hover).
-        let diff_slot: Element<'a, Event, Theme, iced::Renderer> = if hovered {
-            button(text("Diff").size(10).color(theme.accent()))
-                .style(self.flat_button_style())
-                .padding([0, 4])
-                .on_press(open.clone())
-                .into()
-        } else {
-            iced::widget::Space::new().into()
-        };
+        // Fixed slots: name, fact, disclosure.
         let line = row![
             text(overview::shorten(branch, 40))
                 .size(font_small)
@@ -36424,13 +36408,13 @@ fi
             .size(10)
             .color(fact_color)
             .font(mono),
-            diff_slot,
+            self.overview_disclosure(expanded, key),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center);
 
         let mut detail = Column::new().spacing(1);
-        if hovered {
+        if expanded {
             let mut parts = vec![overview::short_checkout(&row.owned, home)];
             match (overview::vs_base_label(row), &row.base) {
                 (Some(label), _) => parts.push(label),
@@ -36477,7 +36461,7 @@ fi
                 ..Default::default()
             })
             .on_press(open);
-        self.overview_hover_area(row, target)
+        row.into()
     }
 
     fn view_task_rail(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -41006,7 +40990,7 @@ fi
     }
 
     /// The active workspace's documents (TRU-191), newest first. Each row is
-    /// one line, title and age (TRU-208); hovering adds the newest copy's
+    /// one line, title and age (TRU-208); its ▸ opens the newest copy's
     /// source and the path within its checkout, and "N copies" when there
     /// are more (always shown when they differ). Clicking opens the newest
     /// copy in the markdown viewer; "N copies" lists each copy to open.
@@ -41030,13 +41014,14 @@ fi
         };
         for doc in result.documents.iter().take(shown) {
             let newest = doc.newest();
-            let target = OverviewHover::Document(doc.key.clone());
-            let hovered = self.overview_hovered(&target);
+            let row_key = overview::RowKey::Document(doc.key.clone());
+            let expanded = self.overview_row_open(&row_key);
             let open = self.work_document_copies_open.as_deref() == Some(doc.key.as_str());
             // One line per document (TRU-208), its copies merged into it:
-            // "n copies" shows on hover, while open, or when they differ.
+            // "n copies" shows once opened, while listed, or when they
+            // differ.
             let copies_slot: Element<'_, Event, Theme, iced::Renderer> =
-                if doc.copies.len() > 1 && (hovered || open || doc.differ) {
+                if doc.copies.len() > 1 && (expanded || open || doc.differ) {
                     let label = format!(
                         "{} copies{} {}",
                         doc.copies.len(),
@@ -41065,11 +41050,12 @@ fi
                     .size(10)
                     .color(text_muted)
                     .font(mono),
+                self.overview_disclosure(expanded, row_key),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
             let mut detail = Column::new();
-            if hovered {
+            if expanded {
                 detail = detail.push(
                     text(overview::shorten(
                         &format!("{} \u{00B7} {}", newest.source.label(), doc.rel),
@@ -41084,9 +41070,7 @@ fi
                 .padding([3, 6])
                 .width(Length::Fill)
                 .on_press(Event::ViewFile(SourcePath::Local(newest.path.clone())));
-            let mut entry = Column::new()
-                .spacing(1)
-                .push(self.overview_hover_area(line, target));
+            let mut entry = Column::new().spacing(1).push(line);
             if open {
                 for (index, copy) in doc.copies.iter().enumerate() {
                     let line = format!(
