@@ -48,6 +48,16 @@ impl PlanLimitsState {
             ..Self::default()
         }
     }
+
+    fn finish_save(&mut self, result: Result<(), String>, path: &Path) -> bool {
+        self.save_in_flight = false;
+        if let Err(error) = result {
+            eprintln!("[plan-limits] not saved to {}: {error}", path.display());
+            self.dirty = true;
+            return false;
+        }
+        true
+    }
 }
 
 fn now_unix() -> i64 {
@@ -138,9 +148,9 @@ impl App {
                 }
             }
             PlanLimitsEvent::Saved(result) => {
-                self.plan_limits.save_in_flight = false;
-                if let Err(error) = result {
-                    eprintln!("[plan-limits] not saved: {error}");
+                let path = PlanLimitsFile::path_in(&config::global_config_dir());
+                if !self.plan_limits.finish_save(result, &path) {
+                    return Task::none();
                 }
                 return self.save_plan_limits();
             }
@@ -380,5 +390,23 @@ impl App {
             col = col.push(text(facts.join("  ·  ")).size(font_small).color(secondary));
         }
         col.push(text(source).size(font_tiny).color(muted)).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_save_restores_dirty_state_for_a_later_tick() {
+        let mut state = PlanLimitsState {
+            dirty: false,
+            save_in_flight: true,
+            ..PlanLimitsState::default()
+        };
+
+        assert!(!state.finish_save(Err("disk full".into()), Path::new("plan-limits.json")));
+        assert!(state.dirty);
+        assert!(!state.save_in_flight);
     }
 }

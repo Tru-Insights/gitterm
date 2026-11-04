@@ -47,6 +47,8 @@ pub const LIMITS_FILE: &str = "plan-limits.json";
 const CODEX_MAX_FILES: usize = 8;
 /// First tail read of a rollout; grown fourfold until a line is found.
 const TAIL_START_BYTES: u64 = 256 * 1024;
+/// Maximum bytes inspected at the end of one rollout.
+const TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// The account-wide Codex limit; other ids are per-model buckets.
 const CODEX_LIMIT_ID: &str = "codex";
 
@@ -305,9 +307,8 @@ pub fn window_label(minutes: u64) -> String {
 /// bucket rather than the account's limit.
 pub fn codex_limits(rate_limits: &Value, observed_at: i64) -> Option<PlanLimits> {
     let object = rate_limits.as_object()?;
-    match object.get("limit_id").and_then(Value::as_str) {
-        None | Some(CODEX_LIMIT_ID) => {}
-        Some(_) => return None,
+    if object.get("limit_id").and_then(Value::as_str) != Some(CODEX_LIMIT_ID) {
+        return None;
     }
     let mut windows = Vec::new();
     for (key, fallback) in [("primary", "primary"), ("secondary", "secondary")] {
@@ -333,7 +334,17 @@ pub fn codex_limits(rate_limits: &Value, observed_at: i64) -> Option<PlanLimits>
             kind: AlertKind::LimitReached {
                 which: Some(reached.to_string()),
             },
-            until: windows.iter().filter_map(|w| w.resets_at).max(),
+            until: match reached {
+                "primary" => object
+                    .get("primary")
+                    .and_then(|window| window.get("resets_at"))
+                    .and_then(Value::as_i64),
+                "secondary" => object
+                    .get("secondary")
+                    .and_then(|window| window.get("resets_at"))
+                    .and_then(Value::as_i64),
+                _ => None,
+            },
         });
     }
     Some(PlanLimits {
@@ -424,17 +435,16 @@ pub fn last_codex_limits_in(path: &Path) -> std::io::Result<Option<PlanLimits>> 
         {
             return Ok(Some(limits));
         }
-        if start == 0 {
+        if start == 0 || window >= TAIL_MAX_BYTES {
             return Ok(None);
         }
-        window = window.saturating_mul(4).min(len);
+        window = window.saturating_mul(4).min(TAIL_MAX_BYTES).min(len);
     }
 }
 
-/// The current Codex limits: the newest rollout (by mtime) that has a
-/// `rate_limits` line, looking at no more than the newest
-/// [`CODEX_MAX_FILES`]. Blocking; run it off the UI thread. A rollout that
-/// cannot be read is logged and skipped.
+/// The current Codex limits: the newest observation in no more than the
+/// newest [`CODEX_MAX_FILES`] rollouts (by mtime). Blocking; run it off the
+/// UI thread. A rollout that cannot be read is logged and skipped.
 pub fn latest_codex_limits(sessions_root: &Path) -> Option<PlanLimits> {
     let mut rollouts: Vec<(SystemTime, PathBuf)> =
         crate::chats::jsonl_files_under(sessions_root, 3)
@@ -450,14 +460,22 @@ pub fn latest_codex_limits(sessions_root: &Path) -> Option<PlanLimits> {
             })
             .collect();
     rollouts.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    let mut newest: Option<PlanLimits> = None;
     for (_, path) in rollouts.into_iter().take(CODEX_MAX_FILES) {
         match last_codex_limits_in(&path) {
-            Ok(Some(limits)) => return Some(limits),
+            Ok(Some(limits)) => {
+                if newest
+                    .as_ref()
+                    .is_none_or(|current| limits.observed_at > current.observed_at)
+                {
+                    newest = Some(limits);
+                }
+            }
             Ok(None) => {}
             Err(error) => eprintln!("[plan-limits] cannot read {}: {error}", path.display()),
         }
     }
-    None
+    newest
 }
 
 fn unix_secs(at: SystemTime) -> i64 {
@@ -842,6 +860,21 @@ mod tests {
     }
 
     #[test]
+    fn codex_reached_limit_uses_the_named_window_reset() {
+        let mut raw = codex_rate_limits();
+        raw["primary"]["resets_at"] = json!(NOW + 500);
+        raw["secondary"] = json!({
+            "used_percent": 10.0,
+            "window_minutes": 300,
+            "resets_at": NOW + 100
+        });
+        raw["rate_limit_reached_type"] = json!("secondary");
+
+        let limits = codex_limits(&raw, NOW).unwrap();
+        assert_eq!(limits.alerts[0].until, Some(NOW + 100));
+    }
+
+    #[test]
     fn codex_credits_and_per_model_buckets() {
         let mut raw = codex_rate_limits();
         raw["credits"] = json!({"has_credits": false, "unlimited": false, "balance": "0"});
@@ -861,6 +894,12 @@ mod tests {
         );
         raw["limit_id"] = json!("codex_othermodel");
         assert_eq!(codex_limits(&raw, NOW), None);
+        raw.as_object_mut().unwrap().remove("limit_id");
+        assert_eq!(codex_limits(&raw, NOW), None);
+        for invalid in [json!(null), json!(42)] {
+            raw["limit_id"] = invalid;
+            assert_eq!(codex_limits(&raw, NOW), None);
+        }
         assert_eq!(codex_limits(&Value::Null, NOW), None);
     }
 
@@ -956,6 +995,32 @@ mod tests {
     }
 
     #[test]
+    fn newest_observation_wins_across_bounded_rollouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_rollout(
+            tmp.path(),
+            "rollout-newer-mtime.jsonl",
+            &[token_count_line("2026-11-04T09:00:00Z", "codex", 10.0)],
+            1,
+        );
+        write_rollout(
+            tmp.path(),
+            "rollout-older-mtime.jsonl",
+            &[token_count_line("2026-11-04T10:00:00Z", "codex", 80.0)],
+            600,
+        );
+
+        let limits = latest_codex_limits(tmp.path()).unwrap();
+        assert_eq!(limits.windows[0].used_percent, Some(80.0));
+        assert_eq!(
+            limits.observed_at,
+            DateTime::parse_from_rfc3339("2026-11-04T10:00:00Z")
+                .unwrap()
+                .timestamp()
+        );
+    }
+
+    #[test]
     fn tail_read_grows_past_a_long_trailing_line() {
         let tmp = tempfile::tempdir().unwrap();
         let filler = format!(
@@ -976,9 +1041,28 @@ mod tests {
     }
 
     #[test]
+    fn tail_read_skips_a_reading_before_the_byte_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let filler = format!(
+            r#"{{"type":"response_item","payload":{{"text":"{}"}}}}"#,
+            "x".repeat(TAIL_MAX_BYTES as usize)
+        );
+        let path = write_rollout(
+            tmp.path(),
+            "rollout-too-large.jsonl",
+            &[
+                token_count_line("2026-11-04T09:00:00Z", "codex", 7.0),
+                filler,
+            ],
+            0,
+        );
+
+        assert_eq!(last_codex_limits_in(&path).unwrap(), None);
+    }
+
+    #[test]
     fn a_line_without_a_timestamp_uses_the_file_mtime() {
-        let line =
-            br#"{"type":"event_msg","payload":{"rate_limits":{"primary":{"used_percent":3.0}}}}"#;
+        let line = br#"{"type":"event_msg","payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":3.0}}}}"#;
         assert_eq!(codex_line_limits(line, 1234).unwrap().observed_at, 1234);
         assert_eq!(codex_line_limits(b"{\"rate_limits\":null}", 1), None);
     }
