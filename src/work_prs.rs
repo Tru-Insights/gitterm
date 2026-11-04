@@ -211,6 +211,22 @@ struct PrColumns {
     position: bool,
     /// Characters of the widest "#n".
     number_chars: usize,
+    /// The list spans several repos, so a closed row names its repo.
+    show_repo: bool,
+}
+
+/// Whether a list of PRs names the repo on each row: only when the list
+/// has PRs of more than one repo (TRU-208).
+fn show_repo_names<'a>(repos: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut repos = repos.into_iter();
+    repos
+        .next()
+        .is_some_and(|first| repos.any(|repo| repo != first))
+}
+
+/// The repo's short name: the part after the last slash.
+fn repo_short_name(repo: &str) -> &str {
+    repo.rsplit('/').next().unwrap_or(repo)
 }
 
 /// The columns for a list of PRs: (number, in a plan) each.
@@ -218,6 +234,7 @@ fn pr_columns(prs: impl IntoIterator<Item = (u64, bool)>) -> PrColumns {
     let mut columns = PrColumns {
         position: false,
         number_chars: 0,
+        show_repo: false,
     };
     for (number, planned) in prs {
         columns.position |= planned;
@@ -1573,6 +1590,10 @@ impl App {
         let text_width = self.sidebar_panel_width() - 16.0 - 12.0 - 10.0 - indent;
         let (facts, facts_width) = self.pr_facts_row(self.pr_facts(watched, row, draft));
         let mut taken = facts_width + 18.0 + PR_COLUMN_GAP;
+        // A closed row of a multi-repo list leads with its repo.
+        let repo_prefix = (columns.show_repo && !expanded)
+            .then(|| format!("{} \u{00B7} ", repo_short_name(&key.repo)));
+        let prefix_chars = repo_prefix.as_ref().map_or(0, |p| p.chars().count());
         let mut line = Row::new()
             .spacing(PR_COLUMN_GAP)
             .align_y(iced::Alignment::Center);
@@ -1599,17 +1620,25 @@ impl App {
             .map(|core| core.title.clone())
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| key.label());
-        line = line
-            .push(
-                text(overview::shorten(
-                    &title,
-                    chars_that_fit(text_width - taken, font_small, 2),
-                ))
+        let title_budget =
+            chars_that_fit(text_width - taken, font_small, 2).saturating_sub(prefix_chars);
+        let title_text = overview::shorten(&title, title_budget.max(12));
+        let title_widget: Element<'a, Event, Theme, iced::Renderer> = match repo_prefix {
+            Some(prefix) => iced::widget::rich_text::<(), Event, _, _>([
+                iced::widget::span(prefix).color(text_muted),
+                iced::widget::span(title_text),
+            ])
+            .size(font_small)
+            .color(theme.text_primary())
+            .width(Length::Fill)
+            .into(),
+            None => text(title_text)
                 .size(font_small)
                 .color(theme.text_primary())
-                .width(Length::Fill),
-            )
-            .push(facts);
+                .width(Length::Fill)
+                .into(),
+        };
+        line = line.push(title_widget).push(facts);
         if let Some(merge) = merge_on_title {
             line = line.push(merge);
         }
@@ -1618,7 +1647,7 @@ impl App {
         // Opened: only what the title line does not say.
         let mut detail = Column::new().spacing(2);
         if parts.opened {
-            let repo = key.repo.rsplit('/').next().unwrap_or(&key.repo).to_string();
+            let repo = repo_short_name(&key.repo).to_string();
             let mut meta = vec![repo];
             if let Some(core) = core {
                 if !core.head_ref.is_empty() && !core.base_ref.is_empty() {
@@ -1846,24 +1875,37 @@ impl App {
         };
         // One set of columns for the rows the list shows, so titles line
         // up across groups; folded done PRs do not count.
-        let columns = pr_columns(groups.iter().flat_map(|group| {
-            let done_open = self.prs.done_open.contains(&group.root.root);
-            let done_rows = group.done_rows.iter().filter(move |_| done_open);
-            let done_unplanned = group
-                .done
-                .iter()
-                .filter(move |(key, _)| {
-                    done_open && !group.done_rows.iter().any(|r| r.entry.key() == *key)
-                })
-                .map(|(key, _)| (key.number, false));
-            group
-                .rows
-                .iter()
-                .chain(done_rows)
-                .map(|row| (row.entry.key().number, true))
-                .chain(group.unplanned.iter().map(|key| (key.number, false)))
-                .chain(done_unplanned)
-        }));
+        let shown: Vec<(u64, bool, String)> = groups
+            .iter()
+            .flat_map(|group| {
+                let done_open = self.prs.done_open.contains(&group.root.root);
+                let done_rows = group.done_rows.iter().filter(move |_| done_open);
+                let done_unplanned = group
+                    .done
+                    .iter()
+                    .filter(move |(key, _)| {
+                        done_open && !group.done_rows.iter().any(|r| r.entry.key() == *key)
+                    })
+                    .map(|(key, _)| (key.number, false, key.repo.clone()));
+                group
+                    .rows
+                    .iter()
+                    .chain(done_rows)
+                    .map(|row| {
+                        let key = row.entry.key();
+                        (key.number, true, key.repo)
+                    })
+                    .chain(
+                        group
+                            .unplanned
+                            .iter()
+                            .map(|key| (key.number, false, key.repo.clone())),
+                    )
+                    .chain(done_unplanned)
+            })
+            .collect();
+        let mut columns = pr_columns(shown.iter().map(|(number, planned, _)| (*number, *planned)));
+        columns.show_repo = show_repo_names(shown.iter().map(|(_, _, repo)| repo.as_str()));
         let several = groups.len() > 1;
         let header_fold = groups
             .first()
@@ -2288,7 +2330,8 @@ mod tests {
             pr_columns([(93, false), (591, false)]),
             PrColumns {
                 position: false,
-                number_chars: 4
+                number_chars: 4,
+                show_repo: false
             }
         );
         // One planned PR gives the whole list the position column.
@@ -2296,10 +2339,20 @@ mod tests {
             pr_columns([(7, false), (12345, true)]),
             PrColumns {
                 position: true,
-                number_chars: 6
+                number_chars: 6,
+                show_repo: false
             }
         );
         assert_eq!(pr_columns([]).number_chars, 0);
+    }
+
+    #[test]
+    fn the_repo_is_named_only_when_a_list_spans_repos() {
+        assert!(!show_repo_names([]));
+        assert!(!show_repo_names(["acme/api"]));
+        assert!(!show_repo_names(["acme/api", "acme/api"]));
+        assert!(show_repo_names(["acme/api", "acme/api", "acme/web"]));
+        assert_eq!(repo_short_name("acme/bebop-server"), "bebop-server");
     }
 
     #[test]
