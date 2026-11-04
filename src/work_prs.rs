@@ -265,6 +265,18 @@ struct PrRowParts {
     open_on_github: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrTitleRowControl {
+    Merge,
+    Disclosure,
+}
+
+// The disclosure's child index must not shift when the due Merge action
+// disappears. Iced keeps button interaction state by child position.
+const PR_TITLE_ROW_CONTROLS: [PrTitleRowControl; 2] =
+    [PrTitleRowControl::Merge, PrTitleRowControl::Disclosure];
+const PR_MERGE_TITLE_SLOT_WIDTH: f32 = 72.0;
+
 fn pr_row_parts(is_next: bool, expanded: bool) -> PrRowParts {
     PrRowParts {
         merge_on_title: is_next,
@@ -1607,15 +1619,17 @@ impl App {
             );
         }
         line = line.push(self.pr_number_cell(key, columns.number_chars));
-        let merge_on_title = parts.merge_on_title.then(|| {
-            let label = gated("Merge");
-            taken += label.chars().count() as f32 * 10.0 * TEXT_ADVANCE + 16.0 + PR_COLUMN_GAP;
-            // The only filled button: the action that is due now.
-            button(text(label).size(10).color(theme.bg_base()))
-                .style(self.primary_button_style())
-                .padding([1, 8])
-                .on_press_maybe(merge_event.clone())
-        });
+        let mut merge_on_title: Option<Element<'a, Event, Theme, iced::Renderer>> =
+            parts.merge_on_title.then(|| {
+                let label = gated("Merge");
+                taken += label.chars().count() as f32 * 10.0 * TEXT_ADVANCE + 16.0 + PR_COLUMN_GAP;
+                // The only filled button: the action that is due now.
+                button(text(label).size(10).color(theme.bg_base()))
+                    .style(self.primary_button_style())
+                    .padding([1, 8])
+                    .on_press_maybe(merge_event.clone())
+                    .into()
+            });
         let title = core
             .map(|core| core.title.clone())
             .filter(|title| !title.is_empty())
@@ -1639,10 +1653,19 @@ impl App {
                 .into(),
         };
         line = line.push(title_widget).push(facts);
-        if let Some(merge) = merge_on_title {
-            line = line.push(merge);
+        for control in PR_TITLE_ROW_CONTROLS {
+            line = match control {
+                PrTitleRowControl::Merge => line.push(match merge_on_title.take() {
+                    Some(merge) => merge,
+                    None => iced::widget::Space::new()
+                        .width(Length::Fixed(PR_MERGE_TITLE_SLOT_WIDTH))
+                        .into(),
+                }),
+                PrTitleRowControl::Disclosure => {
+                    line.push(self.overview_disclosure(expanded, row_key.clone()))
+                }
+            };
         }
-        line = line.push(self.overview_disclosure(expanded, row_key.clone()));
 
         // Opened: only what the title line does not say.
         let mut detail = Column::new().spacing(2);
@@ -2378,6 +2401,19 @@ mod tests {
         let next_opened = pr_row_parts(true, true);
         assert!(next_opened.opened && next_opened.merge_on_title);
         assert!(!next_opened.merge_in_actions);
+    }
+
+    #[test]
+    fn title_row_keeps_the_merge_and_disclosure_child_slots() {
+        assert_eq!(PR_TITLE_ROW_CONTROLS.len(), 2);
+        assert_eq!(PR_TITLE_ROW_CONTROLS[0], PrTitleRowControl::Merge);
+        assert_eq!(PR_TITLE_ROW_CONTROLS[1], PrTitleRowControl::Disclosure);
+
+        // The optional Merge content occupies a fixed-width empty slot when
+        // absent; the disclosure remains the second trailing child.
+        assert!(PR_MERGE_TITLE_SLOT_WIDTH >= 72.0);
+        assert!(pr_row_parts(true, false).merge_on_title);
+        assert!(!pr_row_parts(false, false).merge_on_title);
     }
 
     use super::*;

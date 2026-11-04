@@ -2535,18 +2535,26 @@ struct WorkspaceOverviewState {
     /// Whose repos, branches and issues show (default: the most recently
     /// active coordinator).
     focus: overview::Focus,
+}
+
+/// Per-workspace presentation state for the shared workspace overview data.
+/// Folder-scoped workspaces can share an `OverviewKey`, but their folds and
+/// row disclosures must remain independent (TRU-208).
+#[derive(Debug, Default)]
+struct WorkspaceOverviewPresentation {
     /// The "▸ n older" coordinators are unfolded.
     show_older: bool,
     /// The "Focus ▾" picker is open.
     focus_menu_open: bool,
-    /// Documents is unfolded (TRU-208; starts folded, not persisted).
+    /// Documents is unfolded (starts folded, not persisted).
     documents_open: bool,
-    /// "Also worked here" is unfolded (TRU-208; starts folded).
+    /// "Also worked here" is unfolded (starts folded).
     also_open: bool,
-    /// Rows opened with their ▸ disclosure (TRU-208), several at once;
-    /// not persisted.
+    /// Rows opened with their ▸ disclosure (several at once); not persisted.
     open_rows: HashSet<overview::RowKey>,
 }
+
+const OVERVIEW_DISCLOSURE_WIDTH: f32 = 24.0;
 
 #[derive(Debug, Clone)]
 pub struct GitWorktreeEntry {
@@ -7329,6 +7337,9 @@ struct App {
     /// one that owns its chats (TRU-169); built when the panel first opens
     /// in that workspace.
     workspace_overviews: HashMap<OverviewKey, WorkspaceOverviewState>,
+    /// Fold and row disclosure state belongs to a workspace, even when its
+    /// overview summary is shared with another folder-scoped workspace.
+    workspace_overview_presentations: HashMap<u64, WorkspaceOverviewPresentation>,
     /// Each open workspace's documents by uid (TRU-191).
     work_documents: HashMap<u64, WorkDocumentsState>,
     /// The document whose copies are listed (its key), if any.
@@ -8623,9 +8634,9 @@ impl App {
     /// Whether a Work sidebar row is open (TRU-208), in the active
     /// workspace's overview.
     fn overview_row_open(&self, key: &overview::RowKey) -> bool {
-        self.overview_key()
-            .and_then(|dir| self.workspace_overviews.get(&dir))
-            .is_some_and(|state| state.open_rows.contains(key))
+        self.active_workspace()
+            .and_then(|workspace| self.workspace_overview_presentations.get(&workspace.uid))
+            .is_some_and(|presentation| presentation.open_rows.contains(key))
     }
 
     /// A row's ▸ / ▾ disclosure (TRU-208): opens and closes its detail and
@@ -8642,6 +8653,7 @@ impl App {
         )
         .style(self.flat_button_style())
         .padding([0, 4])
+        .width(Length::Fixed(OVERVIEW_DISCLOSURE_WIDTH))
         .on_press(Event::OverviewRowToggle(key))
         .into()
     }
@@ -18135,6 +18147,7 @@ impl App {
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
             workspace_overviews: HashMap::new(),
+            workspace_overview_presentations: HashMap::new(),
             work_documents: HashMap::new(),
             work_document_copies_open: None,
             work_documents_all: false,
@@ -26953,8 +26966,13 @@ fi
                     return Task::none();
                 };
                 let dir = OverviewKey::Folder(folder.clone());
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    self.workspace_overview_presentations
+                        .entry(uid)
+                        .or_default()
+                        .focus_menu_open = false;
+                }
                 let state = self.workspace_overviews.entry(dir.clone()).or_default();
-                state.focus_menu_open = false;
                 if state.focus == focus {
                     return Task::none();
                 }
@@ -26996,43 +27014,48 @@ fi
                 }
             }
             Event::WorkspaceOverviewToggleFocusMenu => {
-                if let Some(state) = self
-                    .overview_key()
-                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
-                {
-                    state.focus_menu_open = !state.focus_menu_open;
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    presentation.focus_menu_open = !presentation.focus_menu_open;
                 }
             }
             Event::WorkspaceOverviewToggleOlder => {
-                if let Some(state) = self
-                    .overview_key()
-                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
-                {
-                    state.show_older = !state.show_older;
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    presentation.show_older = !presentation.show_older;
                 }
             }
             Event::WorkspaceOverviewToggleDocuments => {
-                if let Some(state) = self
-                    .overview_key()
-                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
-                {
-                    state.documents_open = !state.documents_open;
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    presentation.documents_open = !presentation.documents_open;
                 }
             }
             Event::WorkspaceOverviewToggleAlso => {
-                if let Some(state) = self
-                    .overview_key()
-                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
-                {
-                    state.also_open = !state.also_open;
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    presentation.also_open = !presentation.also_open;
                 }
             }
             Event::OverviewRowToggle(key) => {
-                if let Some(state) = self
-                    .overview_key()
-                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
-                {
-                    overview::toggle_row(&mut state.open_rows, key);
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    overview::toggle_row(&mut presentation.open_rows, key);
                 }
             }
             Event::WorkspaceOverviewOpenChat(id) => {
@@ -35791,6 +35814,13 @@ fi
         let state = self
             .overview_key()
             .and_then(|dir| self.workspace_overviews.get(&dir));
+        let presentation = self
+            .active_workspace()
+            .and_then(|workspace| self.workspace_overview_presentations.get(&workspace.uid));
+        let focus_menu_open = presentation.is_some_and(|state| state.focus_menu_open);
+        let show_older = presentation.is_some_and(|state| state.show_older);
+        let documents_open = presentation.is_some_and(|state| state.documents_open);
+        let also_open = presentation.is_some_and(|state| state.also_open);
         let reading = state.is_some_and(|state| state.in_flight);
         let mut refresh = button(
             text(if reading {
@@ -35970,7 +36000,7 @@ fi
                         .size(font_small)
                         .color(text_primary)
                         .width(Length::Fill),
-                    text(if state.focus_menu_open {
+                    text(if focus_menu_open {
                         "\u{25B4}"
                     } else {
                         "\u{25BE}"
@@ -36000,7 +36030,7 @@ fi
             })
             .on_press(Event::WorkspaceOverviewToggleFocusMenu);
             content = content.push(focus_button);
-            if state.focus_menu_open {
+            if focus_menu_open {
                 let option = |label: String, focus: overview::Focus| {
                     let active = summary.focus == focus;
                     button(text(label).size(font_small - 1.0).color(if active {
@@ -36090,7 +36120,7 @@ fi
                         text(format!(
                             "{} older {}",
                             older.len(),
-                            overview::fold_marker(state.show_older)
+                            overview::fold_marker(show_older)
                         ))
                         .size(10)
                         .color(text_muted),
@@ -36099,7 +36129,7 @@ fi
                     .padding([2, 6])
                     .on_press(Event::WorkspaceOverviewToggleOlder),
                 );
-                for coordinator in overview::fold_rows(&older, state.show_older)
+                for coordinator in overview::fold_rows(&older, show_older)
                     .iter()
                     .take(OLDER_ROWS)
                 {
@@ -36108,7 +36138,7 @@ fi
                         summary.focused.contains(&coordinator.id),
                     ));
                 }
-                if state.show_older && older.len() > OLDER_ROWS {
+                if show_older && older.len() > OLDER_ROWS {
                     chats = chats.push(more_in_chats(older.len() - OLDER_ROWS));
                 }
             }
@@ -36126,10 +36156,10 @@ fi
             let mut documents = Column::new().spacing(2).push(self.overview_fold_header(
                 "Documents",
                 documents_count,
-                state.documents_open,
+                documents_open,
                 Event::WorkspaceOverviewToggleDocuments,
             ));
-            if state.documents_open {
+            if documents_open {
                 if let Some(list) = self.view_work_documents() {
                     documents = documents.push(list);
                 }
@@ -36143,10 +36173,10 @@ fi
             let mut also = Column::new().spacing(2).push(self.overview_fold_header(
                 "Also worked here",
                 summary.also_worked.len(),
-                state.also_open,
+                also_open,
                 Event::WorkspaceOverviewToggleAlso,
             ));
-            for item in overview::fold_rows(&summary.also_worked, state.also_open)
+            for item in overview::fold_rows(&summary.also_worked, also_open)
                 .iter()
                 .take(COORDINATOR_ROWS)
             {
@@ -44452,6 +44482,35 @@ mod tests {
         assert_eq!(clamp_hint_center(995.0, 100.0, 1000.0), 946.0);
         // A page narrower than the bubble centres it.
         assert_eq!(clamp_hint_center(10.0, 100.0, 80.0), 40.0);
+    }
+
+    #[test]
+    fn overview_disclosure_reserves_a_fixed_width_slot() {
+        assert_eq!(OVERVIEW_DISCLOSURE_WIDTH, 24.0);
+    }
+
+    #[test]
+    fn overview_row_and_section_folds_are_per_workspace() {
+        let shared_summary_key = OverviewKey::Folder(PathBuf::from("/same/folder"));
+        assert_eq!(
+            shared_summary_key,
+            OverviewKey::Folder(PathBuf::from("/same/folder"))
+        );
+
+        let row = overview::RowKey::Repo(PathBuf::from("/same/folder/repo"));
+        let mut presentations = HashMap::<u64, WorkspaceOverviewPresentation>::new();
+        let first = presentations.entry(101).or_default();
+        overview::toggle_row(&mut first.open_rows, row.clone());
+        first.documents_open = true;
+
+        assert!(presentations[&101].open_rows.contains(&row));
+        assert!(presentations[&101].documents_open);
+        assert!(!presentations
+            .entry(202)
+            .or_default()
+            .open_rows
+            .contains(&row));
+        assert!(!presentations[&202].documents_open);
     }
 
     #[test]
