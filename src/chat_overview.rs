@@ -1957,6 +1957,8 @@ mod tests {
             updated_at: "2026-10-20T10:05:00Z".into(),
             delivered_at: None,
             dismissed_at: None,
+            options: Default::default(),
+            time_limit_reached_at: None,
         }
     }
 

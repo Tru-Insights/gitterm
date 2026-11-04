@@ -17,15 +17,16 @@ use crate::codex_runner::{describe_target, CodexRun, CodexRunKind};
 use crate::harness::transcript::{TimedEntry, TranscriptEntry};
 use crate::harness::{HarnessEvent, ItemKind};
 use crate::review::{is_commit_sha, is_model_name, is_safe_ref};
+use crate::task_mcp::DelegateTaskRequest;
 use crate::task_mcp::{
     ConsultDelegationRequest, HandoffStatus, ReviewDelegationRequest, ReviewTargetKind,
 };
 use crate::tasks::{
     Delegation, DelegationChild, DelegationKind, DelegationParent, DelegationResult,
-    DelegationStatus, NewDelegation, ReviewSeverity, ReviewTarget, ReviewTargetMode, ReviewVerdict,
-    TaskHandoff, TaskLifecycle, TaskRecord, TaskStore,
+    DelegationRunOptions, DelegationStatus, NewDelegation, ReviewSeverity, ReviewTarget,
+    ReviewTargetMode, ReviewVerdict, TaskHandoff, TaskLifecycle, TaskRecord, TaskStore,
 };
-use crate::workers::WorkerChoice;
+use crate::workers::{ReasoningEffort, WorkerChoice};
 
 /// Directory under the GitTerm config root holding each run's JSONL log
 /// (`<id>.jsonl`) and Codex's final message (`<id>.last.md`).
@@ -46,6 +47,9 @@ const STATUS_FILTERS: [&str; 7] = [
     "cancelled",
 ];
 const PROGRESS_LINE_CHARS: usize = 200;
+/// The longest `time_limit_minutes` GitTerm takes: a day.
+pub const MAX_TIME_LIMIT_MINUTES: u32 = 24 * 60;
+const MAX_ADD_DIRS: usize = 16;
 
 /// The tab a delegation request came from, as the app resolved it from the
 /// caller identity.
@@ -54,10 +58,17 @@ pub struct CallerTab {
     pub session_uid: String,
     pub chat_session_id: Option<String>,
     pub workspace: String,
-    /// The tab's checkout; Codex runs here.
+    /// The tab's checkout; Codex runs here unless the request names
+    /// another checkout.
     pub cwd: PathBuf,
     /// The tab's workspace lives on another machine.
     pub remote: bool,
+    /// The workspace's home folder (TRU-212): a target may be it, or a
+    /// worktree of it when it is a repo.
+    pub home: PathBuf,
+    /// The local repos the workspace lists (home included or not): a
+    /// target must be one of them, one of their worktrees, or `home`.
+    pub repos: Vec<PathBuf>,
 }
 
 impl CallerTab {
@@ -166,6 +177,12 @@ pub fn review_delegation(
         return Err(format!("focus is longer than {MAX_FOCUS_CHARS} characters"));
     }
     let model = codex_model(request.model.as_deref(), configured_model)?;
+    let options = requested_options(
+        request.checkout.as_deref(),
+        &[],
+        request.effort,
+        request.time_limit_minutes,
+    )?;
     let target = ReviewTarget { mode, focus };
     Ok(NewDelegation {
         kind: DelegationKind::Review,
@@ -177,6 +194,7 @@ pub fn review_delegation(
         brief: format!("Codex review of {}", describe_target(&target)),
         target: Some(target),
         previous,
+        options,
     })
 }
 
@@ -208,6 +226,12 @@ pub fn consult_delegation(
         brief: brief.to_string(),
         target: None,
         previous,
+        options: requested_options(
+            request.checkout.as_deref(),
+            &[],
+            request.effort,
+            request.time_limit_minutes,
+        )?,
     })
 }
 
@@ -230,11 +254,15 @@ pub fn review_request_from_popover(
         focus: request.focus.clone(),
         reviewer: Some("codex".to_string()),
         model: Some(request.model.clone()),
+        checkout: None,
+        effort: None,
+        time_limit_minutes: None,
     }
 }
 
-/// The request a Re-run of `delegation` makes: same kind, target, brief and
-/// model, following it as `previous`.
+/// The request a Re-run of `delegation` makes: same kind, target, brief,
+/// model and run options, following it as `previous`. The stored checkout
+/// is checked against the workspace again before the run starts.
 pub fn rerun_delegation(delegation: &Delegation) -> Result<NewDelegation, String> {
     let child = match &delegation.child {
         DelegationChild::CodexReview { model, .. } => DelegationChild::CodexReview {
@@ -259,18 +287,23 @@ pub fn rerun_delegation(delegation: &Delegation) -> Result<NewDelegation, String
         brief: delegation.brief.clone(),
         target: delegation.target.clone(),
         previous: Some(delegation.delegation_id.clone()),
+        options: delegation.options.clone(),
     })
 }
 
 /// The implementation delegation `delegate_task` asks for: a worker in task
 /// `task_id`, which the app has just created in the calling tab's
-/// repository. The worker's session is attached when its launch starts.
+/// repository (or the requested repo), or set up around the requested
+/// checkout. `options` are the request's, already checked
+/// ([`resolve_targets`]). The worker's session is attached when its launch
+/// starts.
 pub fn worker_delegation(
     caller: &CallerTab,
     task_id: &str,
     title: &str,
     objective: &str,
     choice: &WorkerChoice,
+    options: &DelegationRunOptions,
 ) -> Result<NewDelegation, String> {
     caller.refuse_remote("delegate_task")?;
     let title = title.trim();
@@ -297,6 +330,7 @@ pub fn worker_delegation(
         brief: format!("{title}\n\n{objective}"),
         target: None,
         previous: None,
+        options: options.clone(),
     })
 }
 
@@ -522,18 +556,16 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, String> {
 /// Refuses a checkout Codex cannot review: not a directory, not a git work
 /// tree, or without a commit. Blocking; call off the UI thread.
 pub fn check_checkout(cwd: &Path) -> Result<(), String> {
+    check_checkout_as(cwd, "the calling tab's checkout")
+}
+
+/// [`check_checkout`], naming the checkout as `what` in its errors.
+fn check_checkout_as(cwd: &Path, what: &str) -> Result<(), String> {
     if !cwd.is_dir() {
-        return Err(format!(
-            "the calling tab's checkout {} is not a directory",
-            cwd.display()
-        ));
+        return Err(format!("{what} {} is not a directory", cwd.display()));
     }
-    git_stdout(cwd, &["rev-parse", "--show-toplevel"]).map_err(|error| {
-        format!(
-            "the calling tab's directory {} is not a git checkout: {error}",
-            cwd.display()
-        )
-    })?;
+    git_stdout(cwd, &["rev-parse", "--show-toplevel"])
+        .map_err(|error| format!("{what} {} is not a git checkout: {error}", cwd.display()))?;
     git_stdout(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"]).map_err(|_| {
         format!(
             "the git checkout {} has no commits yet; Codex reviews need one",
@@ -541,6 +573,329 @@ pub fn check_checkout(cwd: &Path) -> Result<(), String> {
         )
     })?;
     Ok(())
+}
+
+/// A request's run options before the paths are checked: `checkout` and
+/// `add_dirs` as the agent gave them (checked by [`resolve_targets`] off
+/// the UI thread), effort as is, the time limit bounded.
+pub fn requested_options(
+    checkout: Option<&Path>,
+    add_dirs: &[PathBuf],
+    effort: Option<ReasoningEffort>,
+    time_limit_minutes: Option<u32>,
+) -> Result<DelegationRunOptions, String> {
+    if let Some(minutes) = time_limit_minutes {
+        if minutes == 0 || minutes > MAX_TIME_LIMIT_MINUTES {
+            return Err(format!(
+                "time_limit_minutes {minutes} is out of range: give 1 to \
+                 {MAX_TIME_LIMIT_MINUTES} minutes, or omit it for no limit"
+            ));
+        }
+    }
+    if add_dirs.len() > MAX_ADD_DIRS {
+        return Err(format!(
+            "add_dirs names {} folders; GitTerm takes at most {MAX_ADD_DIRS}",
+            add_dirs.len()
+        ));
+    }
+    Ok(DelegationRunOptions {
+        checkout: checkout.map(Path::to_path_buf),
+        add_dirs: add_dirs.to_vec(),
+        effort,
+        time_limit_minutes,
+    })
+}
+
+/// Where a `delegate_task` worker runs (TRU-212).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerPlace {
+    /// A new task worktree from the calling tab's repository (the default).
+    TabRepository,
+    /// A new task worktree from this repository, as the agent gave it.
+    Repository(PathBuf),
+    /// This existing checkout, as the agent gave it; no new worktree.
+    Checkout(PathBuf),
+}
+
+/// `delegate_task`'s target and run options before the paths are checked.
+/// `checkout` and `repo` exclude each other; `checkout` is also stored in
+/// the options, so the card can say where the worker runs.
+pub fn worker_targets(
+    request: &DelegateTaskRequest,
+) -> Result<(WorkerPlace, DelegationRunOptions), String> {
+    let place =
+        match (&request.checkout, &request.repo) {
+            (Some(_), Some(_)) => return Err(
+                "delegate_task takes checkout (work in an existing checkout) or repo (make a new \
+                 task worktree from that repository), not both"
+                    .to_string(),
+            ),
+            (Some(checkout), None) => {
+                if request
+                    .base_reference
+                    .as_deref()
+                    .is_some_and(|base| !base.trim().is_empty())
+                {
+                    return Err(
+                        "base_reference applies to a new task worktree; a worker in an existing \
+                     checkout starts from what is checked out there"
+                            .to_string(),
+                    );
+                }
+                WorkerPlace::Checkout(checkout.clone())
+            }
+            (None, Some(repo)) => WorkerPlace::Repository(repo.clone()),
+            (None, None) => WorkerPlace::TabRepository,
+        };
+    let checkout = match &place {
+        WorkerPlace::Checkout(path) => Some(path.as_path()),
+        _ => None,
+    };
+    let options = requested_options(
+        checkout,
+        &request.add_dirs,
+        request.effort,
+        request.time_limit_minutes,
+    )?;
+    Ok((place, options))
+}
+
+/// The canonical form of `path`, or an error naming `field` and the path.
+fn canonical(field: &str, path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path)
+        .map_err(|error| format!("cannot resolve {field} {}: {error}", path.display()))
+}
+
+/// The git top level of the folder an agent named as `field`: it must be
+/// an absolute path to an existing directory inside a git work tree.
+/// Canonical. Blocking.
+fn git_top_level(field: &str, path: &Path) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{field} is empty; give an absolute path"));
+    }
+    if !path.is_absolute() {
+        return Err(format!(
+            "{field} {} is not an absolute path",
+            path.display()
+        ));
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(format!("{field} {} is not a directory", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("{field} {} does not exist", path.display()))
+        }
+        Err(error) => return Err(format!("cannot read {field} {}: {error}", path.display())),
+    }
+    let top = git_stdout(path, &["rev-parse", "--show-toplevel"]).map_err(|error| {
+        format!(
+            "{field} {} is not in a git work tree: {}",
+            path.display(),
+            or_unknown(&error)
+        )
+    })?;
+    if top.is_empty() {
+        return Err(format!(
+            "{field} {} is not in a git work tree: git printed no top level",
+            path.display()
+        ));
+    }
+    canonical(field, Path::new(&top))
+}
+
+fn or_unknown(text: &str) -> &str {
+    if text.trim().is_empty() {
+        "git gave no reason"
+    } else {
+        text
+    }
+}
+
+/// The workspace's home and repos, canonical. A listed folder that is gone
+/// is left out: nothing can run there.
+fn known_roots(caller: &CallerTab) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for dir in std::iter::once(&caller.home).chain(&caller.repos) {
+        if let Ok(dir) = std::fs::canonicalize(dir) {
+            if !roots.contains(&dir) {
+                roots.push(dir);
+            }
+        }
+    }
+    roots
+}
+
+/// Whether the git top level `top` is the workspace's home, one of its
+/// repos, or a registered worktree of one of them
+/// (`git worktree list`, as the sidebar lists them). Blocking.
+fn workspace_knows(top: &Path, roots: &[PathBuf]) -> Result<bool, Vec<String>> {
+    if roots.iter().any(|root| root == top) {
+        return Ok(true);
+    }
+    let mut errors = Vec::new();
+    for root in roots {
+        // Only a root that is a checkout itself has worktrees of its own: a
+        // home folder inside some larger repository (a notes repo holding
+        // the work folders) does not bring that repository in.
+        if crate::workspace_repos::checkout_root(root).as_deref() != Some(root.as_path()) {
+            continue;
+        }
+        match crate::worktree_follow::list_worktrees(root) {
+            Ok(worktrees) => {
+                if worktrees.iter().any(|worktree| worktree.path == top) {
+                    return Ok(true);
+                }
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Ok(false)
+    } else {
+        Err(errors)
+    }
+}
+
+fn unknown_target(field: &str, given: &Path, top: &Path, caller: &CallerTab) -> String {
+    let repos = if caller.repos.is_empty() {
+        "none".to_string()
+    } else {
+        caller
+            .repos
+            .iter()
+            .map(|repo| repo.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let top_note = if given == top {
+        String::new()
+    } else {
+        format!(" (git top level {})", top.display())
+    };
+    format!(
+        "{field} {}{top_note} is outside workspace {:?}: it is not its home ({}), one of its \
+         repos ({repos}), or a worktree of them. Add the repository to the workspace first, or \
+         name one of its checkouts",
+        given.display(),
+        caller.workspace,
+        caller.home.display()
+    )
+}
+
+/// Checks a checkout an agent named as `field` (TRU-212): absolute,
+/// existing, in a git work tree, and known to the requesting chat's
+/// workspace. Returns the work tree's top level, canonical. Blocking.
+pub fn resolve_checkout(field: &str, path: &Path, caller: &CallerTab) -> Result<PathBuf, String> {
+    let top = git_top_level(field, path)?;
+    match workspace_knows(&top, &known_roots(caller)) {
+        Ok(true) => Ok(top),
+        Ok(false) => Err(unknown_target(field, path, &top, caller)),
+        Err(errors) => Err(format!(
+            "{}; git could not list some of the workspace's worktrees: {}",
+            unknown_target(field, path, &top, caller),
+            errors.join("; ")
+        )),
+    }
+}
+
+/// Checks a folder an agent named in `add_dirs`: like a checkout, except
+/// that the workspace home and folders inside it count even when the home
+/// is not a git repository (a piece of work's folder usually is not). The
+/// folder itself is returned, canonical, not its top level. Blocking.
+pub fn resolve_add_dir(path: &Path, caller: &CallerTab) -> Result<PathBuf, String> {
+    const FIELD: &str = "add_dirs entry";
+    if !path.is_absolute() {
+        return Err(format!(
+            "{FIELD} {} is not an absolute path",
+            path.display()
+        ));
+    }
+    let dir = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => canonical(FIELD, path)?,
+        Ok(_) => return Err(format!("{FIELD} {} is not a directory", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("{FIELD} {} does not exist", path.display()))
+        }
+        Err(error) => return Err(format!("cannot read {FIELD} {}: {error}", path.display())),
+    };
+    if let Ok(home) = std::fs::canonicalize(&caller.home) {
+        if dir.starts_with(&home) {
+            return Ok(dir);
+        }
+    }
+    resolve_checkout(FIELD, &dir, caller)?;
+    Ok(dir)
+}
+
+/// Checks a request's paths against the requesting chat's workspace and
+/// replaces them with what was checked: the checkout's top level and each
+/// extra folder canonical. Refuses, never falls back to the tab's
+/// checkout. Blocking; call off the UI thread.
+pub fn resolve_targets(
+    options: &mut DelegationRunOptions,
+    caller: &CallerTab,
+) -> Result<(), String> {
+    if caller.remote && (options.checkout.is_some() || !options.add_dirs.is_empty()) {
+        return Err(format!(
+            "checkout and add_dirs name folders on this Mac, and workspace {:?} is remote; \
+             remote delegations are not supported yet",
+            caller.workspace
+        ));
+    }
+    if let Some(checkout) = &options.checkout {
+        options.checkout = Some(resolve_checkout("checkout", checkout, caller)?);
+    }
+    let mut dirs = Vec::with_capacity(options.add_dirs.len());
+    for dir in &options.add_dirs {
+        let dir = resolve_add_dir(dir, caller)?;
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    options.add_dirs = dirs;
+    Ok(())
+}
+
+/// Checks a Codex run's paths ([`resolve_targets`]), then that the checkout
+/// it runs in can be reviewed ([`check_checkout`]). Blocking.
+pub fn check_run(new: &mut NewDelegation, caller: &CallerTab) -> Result<(), String> {
+    resolve_targets(&mut new.options, caller)?;
+    match &new.options.checkout {
+        Some(checkout) => check_checkout_as(checkout, "checkout"),
+        None => check_checkout(&new.parent.cwd),
+    }
+}
+
+/// A checkout's short name for the card and roster: its folder name.
+pub fn checkout_name(path: &Path) -> String {
+    crate::workspace_repos::repo_name(path)
+}
+
+/// Why a Codex delegation run ended without a result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunFailure {
+    Failed(String),
+    /// GitTerm stopped it at its `time_limit_minutes` (TRU-212).
+    TimeLimit,
+}
+
+/// What the card shows as the reason a job stopped at its limit.
+pub fn time_limit_message(minutes: u32, place: Option<&Path>, worker: bool) -> String {
+    let limit = crate::codex_runner::describe_limit(std::time::Duration::from_secs(
+        u64::from(minutes) * 60,
+    ));
+    let what = if worker {
+        "GitTerm closed the worker's tab"
+    } else {
+        "GitTerm ended the Codex run"
+    };
+    match place {
+        Some(place) => format!(
+            "Stopped at the time limit ({limit}): {what}; it did not crash. Work so far is in {}.",
+            place.display()
+        ),
+        None => format!("Stopped at the time limit ({limit}): {what}; it did not crash."),
+    }
 }
 
 /// The checkout's HEAD commit, for the "branch has moved" banner. Blocking.
@@ -579,11 +934,16 @@ pub fn codex_run(delegation: &Delegation, config_root: &Path) -> Result<CodexRun
     };
     Ok(CodexRun {
         kind,
-        cwd: delegation.parent.cwd.clone(),
+        cwd: delegation.run_checkout().to_path_buf(),
         model: model.map(str::to_string),
         // The caller adds them: whether they apply depends on the
         // workspace (TRU-174).
         guidelines: None,
+        effort: delegation.options.effort,
+        time_limit: delegation
+            .options
+            .time_limit_minutes
+            .map(|minutes| std::time::Duration::from_secs(u64::from(minutes) * 60)),
         log_path: log_path(config_root, id),
     })
 }
@@ -652,6 +1012,12 @@ pub fn delegation_summary(delegation: &Delegation) -> Value {
     }
     if let DelegationChild::TaskSession { task_id, .. } = &delegation.child {
         row["task_id"] = Value::String(task_id.clone());
+    }
+    if let Some(checkout) = &delegation.options.checkout {
+        row["checkout"] = Value::String(checkout.display().to_string());
+    }
+    if delegation.time_limit_reached_at.is_some() {
+        row["outcome"] = Value::String("stopped at the time limit".to_string());
     }
     if let Some(delivered_at) = &delegation.delivered_at {
         row["delivered_at"] = Value::String(delivered_at.clone());
@@ -767,17 +1133,25 @@ pub fn compose_send_message(
         return Err(format!("delegation {id} has no result"));
     };
     let footer = format!("Full record: delegation_get {id}");
+    // A run in another checkout says where, so Claude reads its paths there
+    // (TRU-212).
+    let place = delegation
+        .options
+        .checkout
+        .as_ref()
+        .map(|checkout| format!(" in {}", checkout.display()))
+        .unwrap_or_default();
     let reviewed = result
         .reviewed
         .as_ref()
         .map(|reviewed| {
             format!(
-                " at {}{}",
+                "{place} at {}{}",
                 short_head(&reviewed.head),
                 if reviewed.dirty { ", dirty" } else { "" }
             )
         })
-        .unwrap_or_default();
+        .unwrap_or(place);
     let mut message = String::new();
     match delegation.kind {
         DelegationKind::Review => {
@@ -1023,7 +1397,88 @@ pub fn card_payload(
     if let Some(worker) = worker {
         payload["worker"] = worker;
     }
+    show_place(&mut payload, delegation);
     Ok(payload)
+}
+
+/// Where the job runs, in the card's own text (TRU-212): the page shows the
+/// model in the card head and the roster row, so " · in <checkout>" goes
+/// after it. A worker always names its worktree; a Codex run names its
+/// checkout when it is not the calling tab's. A Codex review in another
+/// checkout drops the reviewed HEAD from the card copy, since the page
+/// compares it with the tab's own HEAD ("the branch has moved"), and
+/// names it in the description instead. Only the card copy changes;
+/// `delegation_get` keeps the record as stored.
+fn show_place(payload: &mut Value, delegation: &Delegation) {
+    let place = match &delegation.child {
+        DelegationChild::TaskSession { .. } => payload["worker"]["worktree_path"]
+            .as_str()
+            .map(PathBuf::from)
+            .or_else(|| delegation.options.checkout.clone()),
+        _ => delegation
+            .options
+            .checkout
+            .clone()
+            .filter(|checkout| *checkout != delegation.parent.cwd),
+    };
+    let Some(place) = place else {
+        return;
+    };
+    let name = checkout_name(&place);
+    let with_place =
+        |model: &Value| format!("{} · in {name}", model.as_str().unwrap_or("default model"));
+    match &delegation.child {
+        DelegationChild::TaskSession { .. } => {
+            if let Some(worker) = payload.get_mut("worker").and_then(Value::as_object_mut) {
+                let model = with_place(worker.get("model").unwrap_or(&Value::Null));
+                worker.insert("model".to_string(), Value::String(model));
+            }
+        }
+        _ => {
+            if let Some(child) = payload
+                .pointer_mut("/delegation/child")
+                .and_then(Value::as_object_mut)
+            {
+                let model = with_place(child.get("model").unwrap_or(&Value::Null));
+                child.insert("model".to_string(), Value::String(model));
+            }
+            if let Some(reviewed) = payload
+                .pointer_mut("/delegation/result/reviewed")
+                .and_then(Value::as_object_mut)
+            {
+                let head = reviewed
+                    .remove("head")
+                    .and_then(|head| head.as_str().map(|head| short_head(head).to_string()))
+                    .unwrap_or_else(|| "?".to_string());
+                let described = reviewed
+                    .get("target_description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let described = if described == "consult" || described.is_empty() {
+                    format!("in {name} at {head}")
+                } else {
+                    format!("{described} · in {name} at {head}")
+                };
+                reviewed.insert("target_description".to_string(), Value::String(described));
+            }
+            // The page opens a finding's file against the tab's checkout,
+            // so a repo-relative path becomes the target checkout's.
+            if let Some(findings) = payload
+                .pointer_mut("/delegation/result/findings/findings")
+                .and_then(Value::as_array_mut)
+            {
+                for finding in findings {
+                    let Some(file) = finding.get("file").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if Path::new(file).is_relative() {
+                        let absolute = place.join(file).display().to_string();
+                        finding["file"] = Value::String(absolute);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The timeline marker recorded in the parent tab's conversation where the
@@ -1169,6 +1624,8 @@ mod tests {
             workspace: "GitTerm".into(),
             cwd: PathBuf::from("/repo"),
             remote: false,
+            home: PathBuf::from("/repo"),
+            repos: Vec::new(),
         }
     }
 
@@ -1180,6 +1637,9 @@ mod tests {
             focus: None,
             reviewer: None,
             model: None,
+            checkout: None,
+            effort: None,
+            time_limit_minutes: None,
         }
     }
 
@@ -1289,6 +1749,7 @@ mod tests {
             &ConsultDelegationRequest {
                 brief: "  Should we split main.rs?  ".into(),
                 model: None,
+                ..Default::default()
             },
             &caller(),
             None,
@@ -1301,7 +1762,8 @@ mod tests {
         assert!(consult_delegation(
             &ConsultDelegationRequest {
                 brief: "  ".into(),
-                model: None
+                model: None,
+                ..Default::default()
             },
             &caller(),
             None,
@@ -1311,7 +1773,8 @@ mod tests {
         assert!(consult_delegation(
             &ConsultDelegationRequest {
                 brief: "x".repeat(MAX_BRIEF_CHARS + 1),
-                model: None
+                model: None,
+                ..Default::default()
             },
             &caller(),
             None,
@@ -1580,8 +2043,15 @@ mod tests {
     #[test]
     fn worker_delegations_carry_the_choice_and_refuse_remote_or_empty_requests() {
         let choice = worker_choice();
-        let new =
-            worker_delegation(&caller(), "task-1", " Fix export ", "Do it.", &choice).unwrap();
+        let new = worker_delegation(
+            &caller(),
+            "task-1",
+            " Fix export ",
+            "Do it.",
+            &choice,
+            &DelegationRunOptions::default(),
+        )
+        .unwrap();
         assert_eq!(new.kind, DelegationKind::Implement);
         assert_eq!(new.brief, "Fix export\n\nDo it.");
         assert_eq!(new.parent.session_uid, "tab-uid");
@@ -1598,10 +2068,25 @@ mod tests {
         );
         let mut remote = caller();
         remote.remote = true;
-        assert!(worker_delegation(&remote, "t", "a", "b", &choice)
-            .unwrap_err()
-            .contains("remote"));
-        assert!(worker_delegation(&caller(), "t", "a", " ", &choice).is_err());
+        assert!(worker_delegation(
+            &remote,
+            "t",
+            "a",
+            "b",
+            &choice,
+            &DelegationRunOptions::default()
+        )
+        .unwrap_err()
+        .contains("remote"));
+        assert!(worker_delegation(
+            &caller(),
+            "t",
+            "a",
+            " ",
+            &choice,
+            &DelegationRunOptions::default()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1639,7 +2124,15 @@ mod tests {
         assert_eq!(none, None);
 
         let delegation = Delegation::new_requested(
-            worker_delegation(&caller(), "task-1", "Fix", "Do it.", &worker_choice()).unwrap(),
+            worker_delegation(
+                &caller(),
+                "task-1",
+                "Fix",
+                "Do it.",
+                &worker_choice(),
+                &DelegationRunOptions::default(),
+            )
+            .unwrap(),
             "t2",
         );
         let id = delegation.delegation_id.clone();
@@ -1829,6 +2322,7 @@ mod tests {
                 "Fix export",
                 "Do it.",
                 &worker_choice(),
+                &DelegationRunOptions::default(),
             )
             .unwrap(),
             "t1",
@@ -1984,6 +2478,370 @@ mod tests {
         assert_eq!(
             history_anchor_positions(&entries, &delegations),
             vec![(1, "d-1".to_string())]
+        );
+    }
+
+    /// A scratch layout for the target checks (TRU-212), all synthetic:
+    /// `work/` is the workspace home (not a repo), `api/` a listed repo
+    /// with a linked worktree `api-wt/`, `other/` a repo the workspace does
+    /// not list, and `plain/` a folder outside git.
+    struct Targets {
+        root: tempfile::TempDir,
+    }
+
+    impl Targets {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            for dir in ["work/out", "api", "other", "plain"] {
+                std::fs::create_dir_all(root.path().join(dir)).unwrap();
+            }
+            for repo in ["api", "other"] {
+                let repo = root.path().join(repo);
+                git(&repo, &["init", "-q", "-b", "main"]);
+                std::fs::write(repo.join("README.md"), "scratch\n").unwrap();
+                git(&repo, &["add", "."]);
+                git(&repo, &["commit", "-q", "-m", "init"]);
+            }
+            let worktree = root.path().join("api-wt");
+            git(
+                &root.path().join("api"),
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "feature",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            std::fs::create_dir_all(worktree.join("src")).unwrap();
+            Self { root }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.root.path().join(relative)
+        }
+
+        fn canonical(&self, relative: &str) -> PathBuf {
+            std::fs::canonicalize(self.path(relative)).unwrap()
+        }
+
+        fn caller(&self) -> CallerTab {
+            CallerTab {
+                cwd: self.path("work"),
+                home: self.path("work"),
+                repos: vec![self.path("api")],
+                ..caller()
+            }
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = git_command()
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    #[test]
+    fn targets_must_be_checkouts_the_workspace_knows() {
+        let targets = Targets::new();
+        let caller = targets.caller();
+
+        // A worktree of a listed repo, from a folder inside it: its top level.
+        assert_eq!(
+            resolve_checkout("checkout", &targets.path("api-wt/src"), &caller).unwrap(),
+            targets.canonical("api-wt")
+        );
+        // The listed repo itself.
+        assert_eq!(
+            resolve_checkout("checkout", &targets.path("api"), &caller).unwrap(),
+            targets.canonical("api")
+        );
+
+        let refused = |path: &Path| resolve_checkout("checkout", path, &caller).unwrap_err();
+        let outside = refused(&targets.path("other"));
+        assert!(outside.contains("is outside workspace"), "{outside}");
+        assert!(outside.contains("other"), "{outside}");
+        let not_git = refused(&targets.path("plain"));
+        assert!(not_git.contains("is not in a git work tree"), "{not_git}");
+        let relative = refused(Path::new("api"));
+        assert!(relative.contains("is not an absolute path"), "{relative}");
+        let missing = refused(&targets.path("gone"));
+        assert!(missing.contains("does not exist"), "{missing}");
+        assert!(refused(Path::new("")).contains("is empty"));
+        // The home is not a repo here, so it is no checkout either.
+        assert!(refused(&targets.path("work")).contains("is not in a git work tree"));
+
+        // Extra folders: the home and folders inside it count even outside
+        // git; anything else follows the checkout rules.
+        assert_eq!(
+            resolve_add_dir(&targets.path("work/out"), &caller).unwrap(),
+            targets.canonical("work/out")
+        );
+        assert_eq!(
+            resolve_add_dir(&targets.path("api-wt/src"), &caller).unwrap(),
+            targets.canonical("api-wt/src")
+        );
+        assert!(resolve_add_dir(&targets.path("other"), &caller)
+            .unwrap_err()
+            .contains("is outside workspace"));
+        assert!(resolve_add_dir(&targets.path("plain"), &caller).is_err());
+
+        // A home inside a larger repository does not bring that repository
+        // in: neither the folder (whose top level is the outer repo) nor the
+        // outer repo is a target, though the folder still takes add_dirs.
+        let outer = targets.path("outer");
+        std::fs::create_dir_all(outer.join("work/out")).unwrap();
+        git(&outer, &["init", "-q", "-b", "main"]);
+        std::fs::write(outer.join("notes.md"), "notes\n").unwrap();
+        git(&outer, &["add", "."]);
+        git(&outer, &["commit", "-q", "-m", "init"]);
+        let nested = CallerTab {
+            home: outer.join("work"),
+            ..targets.caller()
+        };
+        for path in [outer.join("work"), outer.clone()] {
+            let error = resolve_checkout("checkout", &path, &nested).unwrap_err();
+            assert!(error.contains("is outside workspace"), "{error}");
+        }
+        assert!(resolve_add_dir(&outer.join("work/out"), &nested).is_ok());
+
+        // resolve_targets replaces what the agent gave with what it checked.
+        let mut options = requested_options(
+            Some(&targets.path("api-wt/src")),
+            &[targets.path("work/out"), targets.path("work/out")],
+            Some(ReasoningEffort::High),
+            Some(45),
+        )
+        .unwrap();
+        resolve_targets(&mut options, &caller).unwrap();
+        assert_eq!(options.checkout, Some(targets.canonical("api-wt")));
+        assert_eq!(options.add_dirs, vec![targets.canonical("work/out")]);
+
+        // A refused target is never replaced by the tab's checkout.
+        let mut bad = requested_options(Some(&targets.path("other")), &[], None, None).unwrap();
+        assert!(resolve_targets(&mut bad, &caller).is_err());
+        let remote = CallerTab {
+            remote: true,
+            ..targets.caller()
+        };
+        let mut options =
+            requested_options(Some(&targets.path("api-wt")), &[], None, None).unwrap();
+        assert!(resolve_targets(&mut options, &remote)
+            .unwrap_err()
+            .contains("remote"));
+    }
+
+    #[test]
+    fn requests_carry_targets_effort_and_time_limits() {
+        let mut review = review_request(ReviewTargetKind::Uncommitted);
+        review.checkout = Some(PathBuf::from("/repos/api-wt"));
+        review.effort = Some(ReasoningEffort::Xhigh);
+        review.time_limit_minutes = Some(45);
+        let new = review_delegation(&review, &caller(), None, None).unwrap();
+        assert_eq!(
+            new.options,
+            DelegationRunOptions {
+                checkout: Some(PathBuf::from("/repos/api-wt")),
+                add_dirs: Vec::new(),
+                effort: Some(ReasoningEffort::Xhigh),
+                time_limit_minutes: Some(45),
+            }
+        );
+        for minutes in [0, MAX_TIME_LIMIT_MINUTES + 1] {
+            review.time_limit_minutes = Some(minutes);
+            let error = review_delegation(&review, &caller(), None, None).unwrap_err();
+            assert!(error.contains("time_limit_minutes"), "{error}");
+        }
+
+        let consult = consult_delegation(
+            &ConsultDelegationRequest {
+                brief: "Which crate owns the parser?".into(),
+                checkout: Some(PathBuf::from("/repos/api")),
+                effort: Some(ReasoningEffort::Low),
+                ..Default::default()
+            },
+            &caller(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(consult.options.checkout, Some(PathBuf::from("/repos/api")));
+
+        let request = |checkout: Option<&str>, repo: Option<&str>| DelegateTaskRequest {
+            title: "Fix".into(),
+            objective: "Do it.".into(),
+            checkout: checkout.map(PathBuf::from),
+            repo: repo.map(PathBuf::from),
+            add_dirs: vec![PathBuf::from("/work/out")],
+            time_limit_minutes: Some(40),
+            ..Default::default()
+        };
+        let (place, options) = worker_targets(&request(Some("/repos/api-wt"), None)).unwrap();
+        assert_eq!(place, WorkerPlace::Checkout(PathBuf::from("/repos/api-wt")));
+        assert_eq!(options.checkout, Some(PathBuf::from("/repos/api-wt")));
+        assert_eq!(options.add_dirs, vec![PathBuf::from("/work/out")]);
+        assert_eq!(options.time_limit_minutes, Some(40));
+        let (place, options) = worker_targets(&request(None, Some("/repos/api"))).unwrap();
+        assert_eq!(place, WorkerPlace::Repository(PathBuf::from("/repos/api")));
+        assert_eq!(options.checkout, None);
+        assert_eq!(
+            worker_targets(&request(None, None)).unwrap().0,
+            WorkerPlace::TabRepository
+        );
+        assert!(worker_targets(&request(Some("/a"), Some("/b")))
+            .unwrap_err()
+            .contains("not both"));
+        let mut based = request(Some("/repos/api-wt"), None);
+        based.base_reference = Some("main".into());
+        assert!(worker_targets(&based)
+            .unwrap_err()
+            .contains("base_reference"));
+    }
+
+    #[test]
+    fn the_codex_command_line_runs_in_the_target_with_effort_and_a_limit() {
+        let mut review = review_request(ReviewTargetKind::Uncommitted);
+        review.effort = Some(ReasoningEffort::High);
+        review.time_limit_minutes = Some(45);
+        let mut new = review_delegation(&review, &caller(), None, None).unwrap();
+        // What resolve_targets stored after the check.
+        new.options.checkout = Some(PathBuf::from("/repos/api-wt"));
+        let mut delegation = Delegation::new_requested(new, "t0");
+        delegation.delegation_id = "d1".into();
+        let run = codex_run(&delegation, Path::new("/cfg")).unwrap();
+        assert_eq!(run.cwd, PathBuf::from("/repos/api-wt"));
+        assert_eq!(run.effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            run.time_limit,
+            Some(std::time::Duration::from_secs(45 * 60))
+        );
+        let (args, stdin) = crate::codex_runner::codex_args(&run, Path::new("/cfg/d1.last.md"));
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "exec",
+                "review",
+                "--uncommitted",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "--json",
+                "-o",
+                "/cfg/d1.last.md"
+            ]
+        );
+        assert_eq!(stdin, None);
+
+        // Without a target the run stays in the tab's checkout.
+        let plain = Delegation::new_requested(
+            review_delegation(
+                &review_request(ReviewTargetKind::Uncommitted),
+                &caller(),
+                None,
+                None,
+            )
+            .unwrap(),
+            "t0",
+        );
+        let run = codex_run(&plain, Path::new("/cfg")).unwrap();
+        assert_eq!(run.cwd, PathBuf::from("/repo"));
+        assert_eq!((run.effort, run.time_limit), (None, None));
+    }
+
+    #[test]
+    fn a_time_limit_stop_is_reported_as_such() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(crate::tasks::TASKS_FILE_NAME)).unwrap();
+        let mut consult = consult_delegation(
+            &ConsultDelegationRequest {
+                brief: "Which crate owns the parser?".into(),
+                time_limit_minutes: Some(30),
+                ..Default::default()
+            },
+            &caller(),
+            None,
+            None,
+        )
+        .unwrap();
+        consult.options.checkout = Some(PathBuf::from("/repos/api-wt"));
+        let delegation = Delegation::new_requested(consult, "t0");
+        let id = delegation.delegation_id.clone();
+        store.insert_delegation(delegation).unwrap();
+        let message = time_limit_message(30, Some(Path::new("/repos/api-wt")), false);
+        assert_eq!(
+            message,
+            "Stopped at the time limit (30 minutes): GitTerm ended the Codex run; it did not \
+             crash. Work so far is in /repos/api-wt."
+        );
+        store
+            .stop_delegation_at_time_limit(&id, message.clone(), "t1")
+            .unwrap();
+        let stopped = store.delegation(&id).unwrap().clone();
+        assert_eq!(stopped.status, DelegationStatus::Failed { message });
+        assert_eq!(stopped.time_limit_reached_at.as_deref(), Some("t1"));
+        let row = delegation_summary(&stopped);
+        assert_eq!(row["outcome"], "stopped at the time limit");
+        assert_eq!(row["checkout"], "/repos/api-wt");
+        // Once stopped it cannot be stopped again.
+        assert!(store
+            .stop_delegation_at_time_limit(&id, "again".into(), "t2")
+            .is_err());
+        // It survives a reload, and an old record without the fields loads.
+        let reloaded = TaskStore::load(temp.path().join(crate::tasks::TASKS_FILE_NAME)).unwrap();
+        assert_eq!(
+            reloaded.delegation(&id).unwrap().options.time_limit_minutes,
+            Some(30)
+        );
+        assert!(time_limit_message(1, None, true)
+            .starts_with("Stopped at the time limit (1 minute): GitTerm closed the worker's tab"));
+
+        // The card names where it ran, after the model, and drops the
+        // reviewed HEAD the page would compare with the tab's own.
+        let mut card = stopped.clone();
+        card.result = Some(DelegationResult {
+            handoff: None,
+            findings: None,
+            reviewed: Some(ReviewedState {
+                head: "0123456789abcdef".into(),
+                dirty: false,
+                target_description: "consult".into(),
+            }),
+        });
+        let payload = card_payload(&card, None, false, None, Path::new("/cfg")).unwrap();
+        assert_eq!(
+            payload["delegation"]["child"]["model"],
+            "default model · in api-wt"
+        );
+        let reviewed = &payload["delegation"]["result"]["reviewed"];
+        assert!(reviewed.get("head").is_none());
+        assert_eq!(reviewed["target_description"], "in api-wt at 0123456");
+        // A run in the tab's own checkout is shown as before.
+        let mut own = card.clone();
+        own.options.checkout = None;
+        let payload = card_payload(&own, None, false, None, Path::new("/cfg")).unwrap();
+        assert!(payload["delegation"]["child"].get("model").is_none());
+        assert_eq!(
+            payload["delegation"]["result"]["reviewed"]["head"],
+            "0123456789abcdef"
         );
     }
 }

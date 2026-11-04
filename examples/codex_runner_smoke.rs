@@ -100,6 +100,8 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
             cwd: repo.clone(),
             model: None,
             guidelines: None,
+            effort: None,
+            time_limit: None,
             log_path: root.join("logs").join("review.jsonl"),
         },
     )
@@ -150,6 +152,8 @@ async fn smoke(workdir: &Path) -> Result<(), String> {
             cwd: repo.clone(),
             model: None,
             guidelines: None,
+            effort: None,
+            time_limit: None,
             log_path: root.join("logs").join("consult.jsonl"),
         },
     )

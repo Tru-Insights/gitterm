@@ -489,6 +489,8 @@ async fn delegate_task(
         workspace: "worker-smoke".to_string(),
         cwd: bridge.repo.clone(),
         remote: false,
+        home: bridge.repo.clone(),
+        repos: Vec::new(),
     };
     // The default presets' Claude Code and Codex entries.
     let presets = [
@@ -577,7 +579,14 @@ async fn delegate_task(
         .map_err(|error| error.to_string())?;
     let task = store.get(&task_id).cloned().ok_or("task vanished")?;
     let delegation = Delegation::new_requested(
-        delegations::worker_delegation(&tab, &task_id, &task.title, &task.objective, &choice)?,
+        delegations::worker_delegation(
+            &tab,
+            &task_id,
+            &task.title,
+            &task.objective,
+            &choice,
+            &Default::default(),
+        )?,
         now.clone(),
     );
     let delegation_id = delegation.delegation_id.clone();

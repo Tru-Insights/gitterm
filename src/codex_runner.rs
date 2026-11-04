@@ -12,6 +12,11 @@
 //! Every stdout line and every stderr line (wrapped as a JSON object) is
 //! appended to the run's log. The child is killed when the `run` future is
 //! dropped. Concurrency limits belong to the caller.
+//!
+//! A run may carry a reasoning effort (`-c model_reasoning_effort="…"`) and
+//! a time limit (TRU-212). At the limit the runner kills Codex's process
+//! group and ends with [`CodexRunError::TimeLimit`], which callers report as
+//! "stopped at the time limit", not as a crash.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -73,6 +78,11 @@ pub struct CodexRun {
     /// GitTerm's change guidelines (TRU-174), passed as
     /// `-c developer_instructions=…`; `None` adds nothing.
     pub guidelines: Option<crate::guidelines::Guidelines>,
+    /// `-c model_reasoning_effort="…"`; `None` keeps Codex's configured
+    /// effort (TRU-212).
+    pub effort: Option<crate::workers::ReasoningEffort>,
+    /// Stop Codex when the run takes longer (TRU-212).
+    pub time_limit: Option<std::time::Duration>,
     /// JSONL log: stdout lines verbatim, stderr lines as
     /// `{"type":"gitterm.stderr","line":...}`. Codex writes the final message
     /// next to it with the extension `last.md`.
@@ -145,6 +155,26 @@ pub enum CodexRunError {
         reason: String,
         stderr_tail: String,
     },
+    /// The run reached its time limit and GitTerm stopped Codex.
+    TimeLimit {
+        limit: std::time::Duration,
+    },
+}
+
+impl CodexRunError {
+    pub fn is_time_limit(&self) -> bool {
+        matches!(self, Self::TimeLimit { .. })
+    }
+}
+
+/// "45 minutes", "1 minute", or seconds for a limit under a whole minute.
+pub fn describe_limit(limit: std::time::Duration) -> String {
+    let seconds = limit.as_secs();
+    match (seconds / 60, seconds % 60) {
+        (1, 0) => "1 minute".to_string(),
+        (minutes, 0) if minutes > 0 => format!("{minutes} minutes"),
+        _ => format!("{:.1} seconds", limit.as_secs_f64()),
+    }
 }
 
 impl fmt::Display for CodexRunError {
@@ -170,6 +200,11 @@ impl fmt::Display for CodexRunError {
                 reason,
                 stderr_tail,
             } => write!(formatter, "{reason}; stderr: {}", or_none(stderr_tail)),
+            Self::TimeLimit { limit } => write!(
+                formatter,
+                "stopped at the time limit ({}); GitTerm ended the Codex run, it did not crash",
+                describe_limit(*limit)
+            ),
         }
     }
 }
@@ -367,6 +402,12 @@ async fn run_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Its own process group, so the time limit stops what Codex started
+    // too (the npm `codex` is a Node shim around the native binary).
+    #[cfg(unix)]
+    if run.time_limit.is_some() {
+        command.process_group(0);
+    }
     for var in GIT_LOCATION_VARS {
         command.env_remove(var);
     }
@@ -409,8 +450,28 @@ async fn run_inner(
         .await?;
         Ok::<_, CodexRunError>(tail)
     };
-    let (stdin_result, stream, stderr_tail) = tokio::join!(write_stdin, read_stdout, read_stderr);
-    let status = child.wait().await.map_err(|source| CodexRunError::Io {
+    let child_id = child.id();
+    let work = async {
+        let streams = tokio::join!(write_stdin, read_stdout, read_stderr);
+        (streams, child.wait().await)
+    };
+    let finished = match run.time_limit {
+        None => Some(work.await),
+        Some(limit) => tokio::time::timeout(limit, work).await.ok(),
+    };
+    let Some(((stdin_result, stream, stderr_tail), status)) = finished else {
+        let limit = run.time_limit.unwrap_or_default();
+        stop_at_time_limit(&mut child, child_id).await;
+        log.append(
+            &serde_json::json!({
+                "type": "gitterm.time_limit",
+                "limit_seconds": limit.as_secs(),
+            })
+            .to_string(),
+        )?;
+        return Err(CodexRunError::TimeLimit { limit });
+    };
+    let status = status.map_err(|source| CodexRunError::Io {
         context: "wait for codex to exit".to_string(),
         source,
     })?;
@@ -517,6 +578,30 @@ async fn run_inner(
     }
 }
 
+/// Kills Codex at its time limit: its whole process group on unix (it was
+/// started as the group leader), then the child itself, and reaps it.
+/// Failures are logged; the run ends as stopped either way.
+async fn stop_at_time_limit(child: &mut tokio::process::Child, child_id: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = child_id.and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: killpg only sends a signal; the group is the one this
+        // runner created for the child.
+        if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                eprintln!("[codex-runner] could not kill process group {pid}: {error}");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child_id;
+    if let Err(error) = child.kill().await {
+        if error.kind() != std::io::ErrorKind::InvalidInput {
+            eprintln!("[codex-runner] could not kill codex at its time limit: {error}");
+        }
+    }
+}
+
 fn missing_pipe(name: &str) -> CodexRunError {
     CodexRunError::Io {
         context: format!("capture codex {name}"),
@@ -532,7 +617,10 @@ fn describe_status(status: &std::process::ExitStatus) -> String {
 }
 
 /// The command line after the program, and the text to pipe to stdin.
-fn codex_args(run: &CodexRun, last_message_path: &Path) -> (Vec<OsString>, Option<String>) {
+pub(crate) fn codex_args(
+    run: &CodexRun,
+    last_message_path: &Path,
+) -> (Vec<OsString>, Option<String>) {
     let mut args: Vec<OsString> = vec!["exec".into()];
     let mut stdin_text = None;
     match &run.kind {
@@ -558,6 +646,10 @@ fn codex_args(run: &CodexRun, last_message_path: &Path) -> (Vec<OsString>, Optio
                 .into_iter()
                 .map(OsString::from),
         );
+    }
+    if let Some(effort) = run.effort {
+        args.push("-c".into());
+        args.push(effort.codex_config_value().into());
     }
     args.push("--json".into());
     args.push("-o".into());
@@ -1400,6 +1492,8 @@ mod tests {
             cwd: PathBuf::from("/repo"),
             model: None,
             guidelines: None,
+            effort: None,
+            time_limit: None,
             log_path: PathBuf::from("/logs/d1.jsonl"),
         };
         let strings = |args: Vec<OsString>| -> Vec<String> {
@@ -1466,6 +1560,8 @@ mod tests {
             cwd: PathBuf::from("/repo"),
             model: Some("gpt-6-astra".into()),
             guidelines: None,
+            effort: None,
+            time_limit: None,
             log_path: PathBuf::from("/logs/d1.jsonl"),
         };
         let (args, stdin) = codex_args(&consult, last);
@@ -1543,6 +1639,18 @@ mod tests {
                 }
             }
 
+            /// A `codex` that starts a long `sleep` (recording its pid) and
+            /// waits for it, past any test's time limit.
+            fn hanging() -> Self {
+                let fake = Self::new("", 0);
+                let script = format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{dir}/args'\necho '{{\"type\":\"thread.started\",\"thread_id\":\"thread-slow\"}}'\nsleep 30 &\necho $! > '{dir}/sleep.pid'\nwait\n",
+                    dir = fake.dir.path().display(),
+                );
+                std::fs::write(fake.dir.path().join("codex"), script).expect("write fake codex");
+                fake
+            }
+
             fn environment(&self) -> CodexEnvironment {
                 CodexEnvironment {
                     search_path: std::env::join_paths([
@@ -1561,6 +1669,8 @@ mod tests {
                     cwd: self.repo.path().to_path_buf(),
                     model: None,
                     guidelines: None,
+                    effort: None,
+                    time_limit: None,
                     log_path: self.dir.path().join("logs").join("d1.jsonl"),
                 }
             }
@@ -1690,6 +1800,69 @@ mod tests {
             assert!(log_lines.iter().any(
                 |line| line.contains("gitterm.stderr") && line.contains("codex_models_manager")
             ));
+        }
+
+        #[tokio::test]
+        async fn a_run_past_its_time_limit_is_stopped_not_crashed() {
+            let fake = FakeCodex::hanging();
+            let mut run = fake.run(CodexRunKind::Consult {
+                brief: "Take your time.".to_string(),
+            });
+            run.effort = Some(crate::workers::ReasoningEffort::Medium);
+            run.time_limit = Some(std::time::Duration::from_secs(2));
+            let log_path = run.log_path.clone();
+
+            let started = std::time::Instant::now();
+            let (result, events) = run_collect(&fake, run).await;
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the limit stops the run: {:?}",
+                started.elapsed()
+            );
+            let error = result.expect_err("the run is stopped");
+            assert!(error.is_time_limit(), "{error:?}");
+            assert_eq!(
+                error.to_string(),
+                "stopped at the time limit (2.0 seconds); GitTerm ended the Codex run, it did \
+                 not crash"
+            );
+            assert_eq!(
+                events.first(),
+                Some(&CodexRunEvent::Started {
+                    thread_id: "thread-slow".to_string()
+                })
+            );
+            assert!(matches!(
+                events.last(),
+                Some(CodexRunEvent::Failed { message }) if message.contains("time limit")
+            ));
+            let args = fake.recorded("args");
+            assert!(args
+                .lines()
+                .any(|arg| arg == "model_reasoning_effort=\"medium\""));
+            let log = std::fs::read_to_string(log_path).expect("log");
+            assert!(log.lines().any(|line| line.contains("gitterm.time_limit")));
+
+            // The whole process group went, not only the shim: the `sleep`
+            // Codex started is gone too.
+            let pid: i32 = fake
+                .recorded("sleep.pid")
+                .trim()
+                .parse()
+                .expect("sleep pid");
+            let gone = (0..50).any(|_| {
+                // SAFETY: signal 0 only checks that the process exists.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if alive {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                !alive
+            });
+            assert!(gone, "sleep {pid} outlived the time limit");
+            assert_eq!(
+                describe_limit(std::time::Duration::from_secs(45 * 60)),
+                "45 minutes"
+            );
         }
 
         #[tokio::test]

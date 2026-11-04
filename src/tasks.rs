@@ -844,6 +844,39 @@ pub struct Delegation {
     /// and leaves the roster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_at: Option<String>,
+    /// Where and how the job runs when the request said so (TRU-212).
+    #[serde(default, skip_serializing_if = "DelegationRunOptions::is_default")]
+    pub options: DelegationRunOptions,
+    /// When GitTerm stopped the job at its time limit (TRU-212). The status
+    /// is then `failed` with a message saying so: older GitTerm builds share
+    /// `tasks.json` and know no other state for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limit_reached_at: Option<String>,
+}
+
+/// A delegation's run options from `review_request`, `consult_request` or
+/// `delegate_task` (TRU-212). Paths are stored after GitTerm checked them
+/// against the requesting chat's workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DelegationRunOptions {
+    /// The checkout the job runs in, in place of the calling tab's (a Codex
+    /// run) or of a new task worktree (a worker): its git top level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<PathBuf>,
+    /// Extra writable folders (`--add-dir`), for workers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_dirs: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::workers::ReasoningEffort>,
+    /// GitTerm stops the job after this many minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limit_minutes: Option<u32>,
+}
+
+impl DelegationRunOptions {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -854,6 +887,7 @@ pub struct NewDelegation {
     pub brief: String,
     pub target: Option<ReviewTarget>,
     pub previous: Option<String>,
+    pub options: DelegationRunOptions,
 }
 
 impl Delegation {
@@ -875,7 +909,15 @@ impl Delegation {
             updated_at: timestamp,
             delivered_at: None,
             dismissed_at: None,
+            options: input.options,
+            time_limit_reached_at: None,
         }
+    }
+
+    /// The checkout the job runs in: the requested one, else the calling
+    /// tab's (TRU-212).
+    pub fn run_checkout(&self) -> &Path {
+        self.options.checkout.as_deref().unwrap_or(&self.parent.cwd)
     }
 
     /// The Codex run's thread id and model, for a delegation GitTerm runs
@@ -1756,6 +1798,33 @@ impl TaskStore {
         self.commit_delegation(index, delegation)
     }
 
+    /// GitTerm stopped the job at its time limit (TRU-212): the delegation
+    /// fails with `message` and remembers when the limit was reached.
+    pub fn stop_delegation_at_time_limit(
+        &mut self,
+        delegation_id: &str,
+        message: String,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "stop a delegation at its time limit in";
+        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
+        let status = DelegationStatus::Failed { message };
+        if !delegation.status.can_transition_to(&status) {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!(
+                    "delegation {delegation_id} is {} and cannot be stopped",
+                    delegation.status.label()
+                ),
+            ));
+        }
+        delegation.status = status;
+        delegation.time_limit_reached_at = Some(timestamp.to_string());
+        delegation.updated_at = timestamp.to_string();
+        self.commit_delegation(index, delegation)
+    }
+
     /// Records the child's result. A delegation that already completed,
     /// failed or was cancelled is an error, never a silent overwrite.
     pub fn complete_delegation(
@@ -2606,6 +2675,7 @@ mod tests {
                     focus: Some("error handling".to_string()),
                 }),
                 previous: None,
+                options: Default::default(),
             },
             timestamp,
         );
@@ -2749,6 +2819,7 @@ mod tests {
                 brief: first.brief.clone(),
                 target: first.target.clone(),
                 previous: None,
+                options: Default::default(),
             },
             "2026-10-08T10:00:00Z",
         )
