@@ -991,6 +991,7 @@
   function keepsOutOfFold(node) {
     if (node.matches('.error-block, .dlg, .note.warn')) return true;
     if (!node.matches('details.tool')) return false;
+    if (node.classList.contains('error')) return true;
     const id = node.dataset.toolId;
     const item = items.get(id);
     if (item && item.sub && item.sub.state === 'running') return true;
@@ -1006,8 +1007,11 @@
     const nodes = s.nodes.slice(0, last + 1).filter((n) => !keepsOutOfFold(n));
     if (!nodes.some((n) => n.matches(WORK))) return false;
     const fold = el('details', 'turn-fold');
-    fold.appendChild(el('summary')).appendChild(el('span', 'tf-label',
+    const summary = fold.appendChild(el('summary'));
+    summary.appendChild(el('span', 'tf-label',
       s.start != null && s.end != null ? 'Worked for ' + fmtDur(Math.max(0, s.end - s.start)) : 'Worked'));
+    const failed = s.nodes.filter((n) => n.matches('details.tool.error')).length;
+    if (failed) summary.appendChild(el('span', 'tr-failed', failed + ' failed'));
     const body = fold.appendChild(el('div', 'tf-body'));
     nodes[0].parentNode.insertBefore(fold, nodes[0]);
     let run = [];
@@ -1568,6 +1572,7 @@
         }
         sub.tracked = true;
         sub.state = 'running';
+        openFoldsAround(sub.item.card);
         if (d && d.model) sub.model = d.model;
         break;
       case 'turn_completed': {
@@ -3105,7 +3110,11 @@
     const item = items.get(d.tool_use_id);
     if (item) item.badge.textContent = d.kind.type === 'question' ? 'waiting for your answer' : 'waiting for approval';
     const subRoot = subTools.has(d.tool_use_id) && items.get(subTools.get(d.tool_use_id));
-    if (subRoot && subRoot.sub) { subRoot.sub.waiting = true; renderSubagent(subRoot.sub); }
+    if (subRoot && subRoot.sub) {
+      subRoot.sub.waiting = true;
+      renderSubagent(subRoot.sub);
+      openFoldsAround(subRoot.card);
+    }
     setActivity(d.kind.type === 'question' ? 'Waiting for your answer' : 'Waiting for approval: ' + (d.kind.tool_name || ''), 'waiting');
     renderPanel();
   }
