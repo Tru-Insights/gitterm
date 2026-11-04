@@ -144,6 +144,8 @@ pub enum PrEvent {
     /// The user cleared a hold: root chat, PR.
     ClearHold(String, PrKey),
     Review(PrKey),
+    /// Open the PR on GitHub, whatever checkouts exist.
+    OpenInBrowser(PrKey),
     /// The checkout of the PR's head branch, if the overview knows one.
     ReviewResolved(PrKey, Option<PathBuf>),
     /// Open the confirmation for a row action on a PR.
@@ -242,6 +244,8 @@ struct PrRowParts {
     opened: bool,
     /// Merge on the actions line (any other PR, opened).
     merge_in_actions: bool,
+    /// "Open on GitHub" on the actions line (opened).
+    open_on_github: bool,
 }
 
 fn pr_row_parts(is_next: bool, expanded: bool) -> PrRowParts {
@@ -249,6 +253,7 @@ fn pr_row_parts(is_next: bool, expanded: bool) -> PrRowParts {
         merge_on_title: is_next,
         opened: expanded,
         merge_in_actions: expanded && !is_next,
+        open_on_github: expanded,
     }
 }
 
@@ -914,6 +919,10 @@ impl App {
                 return self.write_merge_plan(plan, Some(previous), None, Vec::new());
             }
             PrEvent::Review(key) => return self.review_pr(key),
+            PrEvent::OpenInBrowser(key) => {
+                self.open_pr_in_browser(&key);
+                return Task::none();
+            }
             PrEvent::ReviewResolved(key, checkout) => {
                 return match checkout {
                     Some(checkout) => self.open_review(checkout, overview::DiffSource::VsBase),
@@ -1367,18 +1376,24 @@ impl App {
         (chars as f32 * self.ui_font_small() * MONO_ADVANCE).ceil()
     }
 
-    /// "#n" in a column `chars` wide; empty, keeping the width, for `None`.
+    /// "#n" in a column `chars` wide, as a button that opens the PR on
+    /// GitHub (TRU-208).
     fn pr_number_cell<'a>(
         &self,
-        number: Option<u64>,
+        key: &PrKey,
         chars: usize,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
-        text(number.map_or_else(String::new, |number| format!("#{number}")))
-            .size(self.ui_font_small())
-            .color(self.theme.text_muted())
-            .font(iced::Font::with_name("Menlo"))
-            .width(Length::Fixed(self.pr_number_width(chars)))
-            .into()
+        button(
+            text(format!("#{}", key.number))
+                .size(self.ui_font_small())
+                .color(self.theme.text_muted())
+                .font(iced::Font::with_name("Menlo")),
+        )
+        .style(self.flat_button_style())
+        .padding(0)
+        .width(Length::Fixed(self.pr_number_width(chars)))
+        .on_press(Event::Pr(PrEvent::OpenInBrowser(key.clone())))
+        .into()
     }
 
     /// One news item with dismiss, and "sent to chat ✓" once it was sent
@@ -1570,7 +1585,7 @@ impl App {
                     .width(Length::Fixed(PR_POSITION_WIDTH)),
             );
         }
-        line = line.push(self.pr_number_cell(Some(key.number), columns.number_chars));
+        line = line.push(self.pr_number_cell(key, columns.number_chars));
         let merge_on_title = parts.merge_on_title.then(|| {
             let label = gated("Merge");
             taken += label.chars().count() as f32 * 10.0 * TEXT_ADVANCE + 16.0 + PR_COLUMN_GAP;
@@ -1699,6 +1714,12 @@ impl App {
                             ActionKind::Ready,
                         ))),
                 );
+            }
+            if parts.open_on_github {
+                actions = actions.push(action(
+                    "Open on GitHub".to_string(),
+                    Some(Event::Pr(PrEvent::OpenInBrowser(key.clone()))),
+                ));
             }
             detail = detail.push(actions);
             if let Some(error) = watched.and_then(|w| w.error.as_deref()) {
@@ -2005,7 +2026,7 @@ impl App {
                     .unwrap_or_default();
                 group = group.push(
                     row![
-                        self.pr_number_cell(Some(key.number), number_chars),
+                        self.pr_number_cell(&key, number_chars),
                         text(overview::shorten(
                             &format!("next: {title}"),
                             chars_that_fit(text_width - taken, font_small - 1.0, 2),
@@ -2023,7 +2044,7 @@ impl App {
             for (_, watched, item) in &news {
                 group = group.push(
                     row![
-                        self.pr_number_cell(Some(watched.key.number), number_chars),
+                        self.pr_number_cell(&watched.key, number_chars),
                         self.view_pr_news_item(watched, item, true)
                     ]
                     .spacing(PR_COLUMN_GAP)
@@ -2293,10 +2314,12 @@ mod tests {
     fn a_closed_pr_row_shows_no_news_and_only_the_due_merge() {
         let closed = pr_row_parts(false, false);
         assert!(!closed.opened && !closed.merge_on_title && !closed.merge_in_actions);
+        assert!(!closed.open_on_github);
         let next_closed = pr_row_parts(true, false);
         assert!(next_closed.merge_on_title && !next_closed.opened);
         let opened = pr_row_parts(false, true);
         assert!(opened.opened && opened.merge_in_actions && !opened.merge_on_title);
+        assert!(opened.open_on_github && pr_row_parts(true, true).open_on_github);
         // The next PR keeps Merge on its title line; the actions line
         // does not repeat it.
         let next_opened = pr_row_parts(true, true);
