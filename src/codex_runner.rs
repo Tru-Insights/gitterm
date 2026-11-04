@@ -578,8 +578,8 @@ async fn run_inner(
     }
 }
 
-/// Kills Codex at its time limit: its whole process group on unix (it was
-/// started as the group leader), then the child itself, and reaps it.
+/// Kills Codex at its time limit: its process group on Unix (it was started
+/// as the group leader), its process tree on Windows, then reaps the child.
 /// Failures are logged; the run ends as stopped either way.
 async fn stop_at_time_limit(child: &mut tokio::process::Child, child_id: Option<u32>) {
     #[cfg(unix)]
@@ -593,7 +593,25 @@ async fn stop_at_time_limit(child: &mut tokio::process::Child, child_id: Option<
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    if let Some(pid) = child_id {
+        match tokio::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => eprintln!(
+                "[codex-runner] could not kill process tree {pid}: {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => {
+                eprintln!("[codex-runner] could not run taskkill for process tree {pid}: {error}")
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = child_id;
     if let Err(error) = child.kill().await {
         if error.kind() != std::io::ErrorKind::InvalidInput {

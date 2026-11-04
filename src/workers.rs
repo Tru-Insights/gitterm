@@ -379,6 +379,27 @@ pub fn with_launch_options(
     effort: Option<ReasoningEffort>,
     add_dirs: &[std::path::PathBuf],
 ) -> Result<String, String> {
+    with_launch_options_for_shell(command, effort, add_dirs, cfg!(unix))
+}
+
+fn with_launch_options_for_shell(
+    command: &str,
+    effort: Option<ReasoningEffort>,
+    add_dirs: &[std::path::PathBuf],
+    posix_shell: bool,
+) -> Result<String, String> {
+    if !posix_shell {
+        let option = if !add_dirs.is_empty() {
+            Some("add_dirs")
+        } else {
+            effort.map(|_| "effort")
+        };
+        if let Some(option) = option {
+            return Err(format!(
+                "{option} requires a POSIX shell; GitTerm cannot safely pass it to this worker shell"
+            ));
+        }
+    }
     if effort.is_none() && add_dirs.is_empty() {
         return Ok(command.to_string());
     }
@@ -428,19 +449,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn non_posix_shells_refuse_interpolated_launch_options() {
+        let dirs = [std::path::PathBuf::from(r"C:\work\a&whoami&b")];
+        for command in ["codex", "claude"] {
+            assert!(with_launch_options_for_shell(command, None, &dirs, false)
+                .unwrap_err()
+                .contains("add_dirs"));
+            assert!(with_launch_options_for_shell(
+                command,
+                Some(ReasoningEffort::High),
+                &[],
+                false
+            )
+            .unwrap_err()
+            .contains("effort"));
+            assert_eq!(
+                with_launch_options_for_shell(command, None, &[], false).unwrap(),
+                command
+            );
+        }
+    }
+
+    #[test]
     fn launch_options_reach_codex_and_claude_and_refuse_other_clis() {
         let dirs = [
             std::path::PathBuf::from("/work/notes"),
             std::path::PathBuf::from("/repos/api wt"),
         ];
         assert_eq!(
-            with_launch_options("codex -m gpt-6-luna", Some(ReasoningEffort::Xhigh), &dirs)
-                .unwrap(),
+            with_launch_options_for_shell(
+                "codex -m gpt-6-luna",
+                Some(ReasoningEffort::Xhigh),
+                &dirs,
+                true
+            )
+            .unwrap(),
             "codex -c 'model_reasoning_effort=\"xhigh\"' --add-dir /work/notes --add-dir \
              '/repos/api wt' -m gpt-6-luna"
         );
         assert_eq!(
-            with_launch_options("claude", Some(ReasoningEffort::High), &dirs[..1]).unwrap(),
+            with_launch_options_for_shell("claude", Some(ReasoningEffort::High), &dirs[..1], true)
+                .unwrap(),
             "claude --effort high --add-dir /work/notes"
         );
         assert_eq!(

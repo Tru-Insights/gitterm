@@ -4614,13 +4614,51 @@ fn stopping_boundary_from_control(boundary: Option<TaskStoppingBoundary>) -> Sto
     }
 }
 
-/// Fires `WorkerTimeLimitReached` when a worker's time limit is up
-/// (TRU-212). In memory: a restart drops it.
-fn worker_time_limit_task(delegation_id: String, session_id: String, minutes: u32) -> Task<Event> {
-    Task::perform(
-        tokio::time::sleep(std::time::Duration::from_secs(u64::from(minutes) * 60)),
-        move |()| Event::WorkerTimeLimitReached(delegation_id, session_id),
-    )
+/// Restored tabs subscribe to the same durable deadline as newly launched ones.
+fn worker_time_limit_stream(
+    timer: &gitterm::tasks::WorkerTimeLimit,
+) -> impl iced::futures::Stream<Item = Event> + Send + 'static {
+    let timer = timer.clone();
+    iced::futures::stream::once(async move {
+        tokio::time::sleep(timer.remaining(chrono::Utc::now().timestamp_millis())).await;
+        Event::WorkerTimeLimitReached(timer.delegation_id, timer.session_id)
+    })
+}
+
+fn worker_time_limit_subscriptions(
+    store: &TaskStore,
+    workspaces: &[Workspace],
+) -> Vec<Subscription<Event>> {
+    store
+        .delegations()
+        .iter()
+        .filter_map(|delegation| {
+            let gitterm::tasks::DelegationChild::TaskSession {
+                task_session_id: Some(session_id),
+                ..
+            } = &delegation.child
+            else {
+                return None;
+            };
+            find_task_session_tab(workspaces, session_id)?;
+            let timer = match store.worker_time_limit(&delegation.delegation_id) {
+                Ok(timer) => timer?,
+                Err(error) => {
+                    // Fail closed: an invalid legacy timestamp must not leave a
+                    // restored worker running without a limit.
+                    eprintln!(
+                        "[delegation] cannot restore worker time limit: {error}; stopping worker"
+                    );
+                    gitterm::tasks::WorkerTimeLimit {
+                        delegation_id: delegation.delegation_id.clone(),
+                        session_id: session_id.clone(),
+                        deadline_unix_ms: 0,
+                    }
+                }
+            };
+            Some(Subscription::run_with(timer, worker_time_limit_stream))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -12399,21 +12437,16 @@ impl App {
         store
             .upsert_session(task_id, task_session, &timestamp)
             .map_err(|error| error.to_string())?;
-        let mut time_limit = Task::none();
-        if let Some((delegation_id, _, options)) = &worker {
+        if let Some((delegation_id, _, _)) = &worker {
             // The worker is running; its report reaches the delegation.
             if let Err(error) =
                 store.attach_worker_session(delegation_id, &session_id, conversation, &timestamp)
             {
-                eprintln!(
-                    "[delegation] {delegation_id}: worker session {session_id} launched but \
-                     could not be attached: {error}"
-                );
-            }
-            // TRU-212: the limit counts from this launch.
-            if let Some(minutes) = options.time_limit_minutes {
-                time_limit =
-                    worker_time_limit_task(delegation_id.clone(), session_id.clone(), minutes);
+                // `tab` has not entered the workspace yet. Dropping it stops
+                // the terminal instead of leaving an untracked timed worker.
+                return Err(format!(
+                    "worker session {session_id} could not attach to delegation {delegation_id}: {error}; stopping worker"
+                ));
             }
         }
         self.workspaces[workspace_idx].tabs.push(tab);
@@ -12459,10 +12492,7 @@ impl App {
         } else {
             Task::none()
         };
-        Ok(TaskChildLaunch::Started(
-            Task::batch([focus_task, time_limit]),
-            session,
-        ))
+        Ok(TaskChildLaunch::Started(focus_task, session))
     }
 
     /// Focus a specific tab, switching workspaces first when needed
@@ -21110,6 +21140,10 @@ fi
                 _ => None,
             }),
         ];
+
+        if let Some(store) = &self.task_store {
+            subs.extend(worker_time_limit_subscriptions(store, &self.workspaces));
+        }
 
         if self.browser_mcp.is_some() {
             subs.push(
@@ -45068,6 +45102,117 @@ mod tests {
         assert_eq!(
             preset_conversation_backend(&preset("Review shell", "zsh")),
             None
+        );
+    }
+
+    #[test]
+    fn restored_worker_tabs_rearm_session_bound_deadline_subscriptions() {
+        use gitterm::tasks::{
+            Delegation, DelegationChild, DelegationKind, DelegationParent, NewDelegation,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tasks.json");
+        let mut store = TaskStore::load(&path).unwrap();
+        let task = slot_task(ExecutorTarget::Local, TaskLifecycle::Ready);
+        let task_id = task.task_id.clone();
+        store.insert(task).unwrap();
+        let mut worker = Delegation::new_requested(
+            NewDelegation {
+                kind: DelegationKind::Implement,
+                parent: DelegationParent {
+                    session_uid: "parent".into(),
+                    chat_session_id: None,
+                    workspace: "work".into(),
+                    cwd: PathBuf::from("/repo"),
+                },
+                child: DelegationChild::TaskSession {
+                    task_id: task_id.clone(),
+                    task_session_id: Some("session-1".into()),
+                    conversation: None,
+                    preset_name: None,
+                    model: None,
+                    role: None,
+                },
+                brief: "Fix the test".into(),
+                target: None,
+                previous: None,
+                options: gitterm::tasks::DelegationRunOptions {
+                    time_limit_minutes: Some(1),
+                    ..Default::default()
+                },
+            },
+            "2026-10-20T10:00:00Z",
+        );
+        let id = worker.delegation_id.clone();
+        worker.time_limit_deadline_unix_ms = Some(chrono::Utc::now().timestamp_millis() + 60_000);
+        store.insert_delegation(worker).unwrap();
+        let restored = TaskStore::load(&path).unwrap();
+        let mut workspace =
+            Workspace::new("work".into(), PathBuf::from("/repo"), WorkspaceColor::Blue);
+        let mut tab = TabState::new(1, PathBuf::from("/repo"));
+        tab.task_id = Some(task_id);
+        tab.task_session_id = Some("session-1".into());
+        workspace.tabs.push(tab);
+        assert_eq!(
+            worker_time_limit_subscriptions(&restored, std::slice::from_ref(&workspace)).len(),
+            1
+        );
+        assert!(worker_time_limit_subscriptions(&restored, &[]).is_empty());
+        workspace.tabs[0].task_session_id = Some("replacement".into());
+        assert!(
+            worker_time_limit_subscriptions(&restored, std::slice::from_ref(&workspace)).is_empty()
+        );
+
+        // Legacy records without a linked start fail closed to an immediate
+        // subscription rather than silently dropping their timer.
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["delegations"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("time_limit_deadline_unix_ms");
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let legacy = TaskStore::load(&path).unwrap();
+        assert!(legacy.worker_time_limit(&id).is_err());
+        workspace.tabs[0].task_session_id = Some("session-1".into());
+        assert_eq!(
+            worker_time_limit_subscriptions(&legacy, &[workspace]).len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_worker_timer_fires_at_its_deadline_or_at_once_if_expired() {
+        use iced::futures::StreamExt;
+        let mut timer = gitterm::tasks::WorkerTimeLimit {
+            delegation_id: "timed".into(),
+            session_id: "original-session".into(),
+            deadline_unix_ms: chrono::Utc::now().timestamp_millis() - 1_000,
+        };
+        let stream = worker_time_limit_stream(&timer);
+        iced::futures::pin_mut!(stream);
+        let event = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(event, Event::WorkerTimeLimitReached(id, session) if id == "timed" && session == "original-session")
+        );
+
+        timer.deadline_unix_ms = chrono::Utc::now().timestamp_millis() + 100;
+        let stream = worker_time_limit_stream(&timer);
+        iced::futures::pin_mut!(stream);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), stream.next())
+                .await
+                .is_err()
+        );
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(event, Event::WorkerTimeLimitReached(id, session) if id == "timed" && session == "original-session")
         );
     }
 

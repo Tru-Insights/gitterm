@@ -550,7 +550,9 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, String> {
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Git terminates this value with LF; all other characters belong to it.
+    Ok(stdout.strip_suffix('\n').unwrap_or(&stdout).to_string())
 }
 
 /// Refuses a checkout Codex cannot review: not a directory, not a git work
@@ -823,7 +825,11 @@ pub fn resolve_add_dir(path: &Path, caller: &CallerTab) -> Result<PathBuf, Strin
             return Ok(dir);
         }
     }
-    resolve_checkout(FIELD, &dir, caller)?;
+    let top = resolve_checkout(FIELD, &dir, caller)?;
+    // core.worktree can report an authorized top level for an outside repo.
+    if !dir.starts_with(&top) {
+        return Err(unknown_target(FIELD, &dir, &top, caller));
+    }
     Ok(dir)
 }
 
@@ -2555,6 +2561,41 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_trailing_space_sibling_is_not_an_authorized_checkout() {
+        let targets = Targets::new();
+        let sibling = targets.path("api ");
+        std::fs::create_dir(&sibling).unwrap();
+        git(&sibling, &["init", "-q", "-b", "main"]);
+        // Check the Git output itself as well as both authorization callers.
+        assert_eq!(
+            git_top_level("checkout", &sibling).unwrap(),
+            targets.canonical("api ")
+        );
+        assert!(resolve_checkout("checkout", &sibling, &targets.caller()).is_err());
+        assert!(resolve_add_dir(&sibling, &targets.caller()).is_err());
+    }
+
+    #[test]
+    fn a_git_worktree_setting_cannot_authorize_an_outside_writable_folder() {
+        let targets = Targets::new();
+        let outside = targets.path("api-outside");
+        std::fs::create_dir(&outside).unwrap();
+        git(&outside, &["init", "-q", "-b", "main"]);
+        let listed = targets.canonical("api");
+        git(
+            &outside,
+            &["config", "core.worktree", listed.to_str().unwrap()],
+        );
+        assert_eq!(git_top_level("add_dirs entry", &outside).unwrap(), listed);
+        let error = resolve_add_dir(&outside, &targets.caller()).unwrap_err();
+        assert!(error.contains("add_dirs"), "{error}");
+        assert!(error.contains("outside workspace"), "{error}");
+        // Registered worktrees and their subfolders remain authorized.
+        assert!(resolve_add_dir(&targets.path("api-wt/src"), &targets.caller()).is_ok());
     }
 
     #[test]

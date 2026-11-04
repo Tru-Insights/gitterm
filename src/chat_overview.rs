@@ -1959,6 +1959,7 @@ mod tests {
             dismissed_at: None,
             options: Default::default(),
             time_limit_reached_at: None,
+            time_limit_deadline_unix_ms: None,
         }
     }
 
