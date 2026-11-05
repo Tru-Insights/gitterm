@@ -6863,7 +6863,7 @@ pub enum Event {
     EdgePeekExit,
     SlideScrolled(scrollable::Viewport),
     HorizontalStripHover(HorizontalStrip, bool),
-    WheelScrolled(iced::mouse::ScrollDelta),
+    WheelScrolled(iced::event::Status, iced::mouse::ScrollDelta),
     // Bottom panel events (expand/collapse, height)
     ConsoleToggle,
     ConsoleDividerDragStart,
@@ -7455,7 +7455,7 @@ struct App {
     // Edge peek state
     edge_peek_left: bool,
     edge_peek_right: bool,
-    hovered_horizontal_strip: Option<HorizontalStrip>,
+    hovered_horizontal_strips: Vec<HorizontalStrip>,
     // Attention pulse animation (toggles every 500ms)
     attention_pulse_bright: bool,
     /// Background needs-you transitions → macOS notifications (TRU-148).
@@ -8191,6 +8191,23 @@ pub enum HorizontalStrip {
     SessionBar,
     WorkspaceSlide,
     ChatWorkspaceActions,
+}
+
+fn horizontal_wheel_offset(
+    status: iced::event::Status,
+    delta: iced::mouse::ScrollDelta,
+) -> Option<f32> {
+    match status {
+        iced::event::Status::Ignored => plain_vertical_wheel_offset(delta),
+        iced::event::Status::Captured => None,
+    }
+}
+
+fn hovered_horizontal_strip(hovered: &[HorizontalStrip]) -> Option<HorizontalStrip> {
+    hovered.iter().copied().max_by_key(|strip| match strip {
+        HorizontalStrip::ChatWorkspaceActions => 1,
+        _ => 0,
+    })
 }
 
 impl HorizontalStrip {
@@ -19053,7 +19070,7 @@ impl App {
             last_user_scroll: None,
             edge_peek_left: false,
             edge_peek_right: false,
-            hovered_horizontal_strip: None,
+            hovered_horizontal_strips: Vec::new(),
             attention_pulse_bright: false,
             needs_you_notifier: NeedsYouNotifier::new(Instant::now()),
             notifications_config: config.notifications.clone(),
@@ -21728,7 +21745,7 @@ fi
             // Poll menu events frequently
             iced::time::every(Duration::from_millis(MENU_POLL_INTERVAL_MS))
                 .map(|_| Event::CheckMenu),
-            iced::event::listen_with(|event, _status, _id| match event {
+            iced::event::listen_with(|event, status, _id| match event {
                 iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                     Some(Event::ModifiersChanged(modifiers))
                 }
@@ -21739,7 +21756,7 @@ fi
                     Some(Event::MouseMoved(position.x, position.y))
                 }
                 iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => {
-                    Some(Event::WheelScrolled(delta))
+                    Some(Event::WheelScrolled(status, delta))
                 }
                 iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                     iced::mouse::Button::Left,
@@ -29408,20 +29425,21 @@ fi
                 }
             }
             Event::HorizontalStripHover(strip, true) => {
-                self.hovered_horizontal_strip = Some(strip);
-                return Task::none();
-            }
-            Event::HorizontalStripHover(strip, false) => {
-                if self.hovered_horizontal_strip == Some(strip) {
-                    self.hovered_horizontal_strip = None;
+                if !self.hovered_horizontal_strips.contains(&strip) {
+                    self.hovered_horizontal_strips.push(strip);
                 }
                 return Task::none();
             }
-            Event::WheelScrolled(delta) => {
-                let Some(strip) = self.hovered_horizontal_strip else {
+            Event::HorizontalStripHover(strip, false) => {
+                self.hovered_horizontal_strips
+                    .retain(|hovered| *hovered != strip);
+                return Task::none();
+            }
+            Event::WheelScrolled(status, delta) => {
+                let Some(strip) = hovered_horizontal_strip(&self.hovered_horizontal_strips) else {
                     return Task::none();
                 };
-                let Some(x) = plain_vertical_wheel_offset(delta) else {
+                let Some(x) = horizontal_wheel_offset(status, delta) else {
                     return Task::none();
                 };
                 return iced::advanced::widget::operate(
@@ -46013,6 +46031,28 @@ mod tests {
         assert_eq!(
             plain_vertical_wheel_offset(iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -24.0 }),
             None
+        );
+    }
+
+    #[test]
+    fn captured_wheel_events_are_not_translated() {
+        assert_eq!(
+            horizontal_wheel_offset(
+                iced::event::Status::Captured,
+                iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn innermost_hovered_strip_wins_regardless_of_enter_order() {
+        assert_eq!(
+            hovered_horizontal_strip(&[
+                HorizontalStrip::ChatWorkspaceActions,
+                HorizontalStrip::WorkspaceSlide,
+            ]),
+            Some(HorizontalStrip::ChatWorkspaceActions)
         );
     }
 
