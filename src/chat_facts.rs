@@ -69,6 +69,10 @@ pub struct ChatFacts {
     /// transcript when it picks the chat up (TRU-201).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prs: Vec<PrRef>,
+    /// Repositories where the chat ran a recognized git/GitHub write
+    /// command (TRU-222). Paths are resolved to the main checkout.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repo_work: Vec<PathBuf>,
     /// Markdown files the chat wrote or edited (TRU-191: Write, Edit,
     /// MultiEdit on a `.md` / `.markdown` path), absolute, oldest first.
     /// At most [`DOCUMENTS_CAP`], the newest kept. Inside git or not.
@@ -195,6 +199,7 @@ impl ChatFacts {
             && self.checkouts.is_empty()
             && self.children.is_empty()
             && self.prs.is_empty()
+            && self.repo_work.is_empty()
             && self.documents.is_empty()
     }
 
@@ -337,6 +342,11 @@ impl ChatFacts {
         }
         for pr in scan.prs {
             self.add_pr(pr);
+        }
+        for dir in scan.repo_work {
+            if !self.repo_work.contains(&dir) {
+                self.repo_work.push(dir);
+            }
         }
         for key in scan.issue_keys {
             self.add_issue_key(&key);
@@ -610,6 +620,9 @@ pub struct RawFacts {
     /// PRs from `gh pr create` results: live tabs, and transcript scans
     /// for a tab catching up ("Index older chats" leaves them out).
     pub prs: Vec<PrRef>,
+    /// Candidate directories for repo write commands; resolved in
+    /// `resolve_into` just like tool touches.
+    pub repo_work: Vec<PathBuf>,
     /// Markdown files written or edited, in call order (TRU-191).
     pub documents: Vec<PathBuf>,
 }
@@ -620,6 +633,7 @@ impl RawFacts {
             && self.issue_keys.is_empty()
             && self.children.is_empty()
             && self.prs.is_empty()
+            && self.repo_work.is_empty()
             && self.documents.is_empty()
     }
 
@@ -631,6 +645,39 @@ impl RawFacts {
         home: Option<&Path>,
         at: &str,
     ) {
+        self.observe_tool_call_with_cwd(id, name, input, home, None, at);
+    }
+
+    fn observe_tool_call_with_cwd(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: &Value,
+        home: Option<&Path>,
+        cwd: Option<&Path>,
+        at: &str,
+    ) {
+        if name == "Bash"
+            && input
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(is_repo_work_command)
+        {
+            let command = input.get("command").and_then(Value::as_str);
+            let target = command
+                .and_then(|command| worktree_follow::bash_leading_dir(command, home))
+                .or_else(|| command.and_then(|command| repo_flag_target(command, home)))
+                .or_else(|| {
+                    input
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .and_then(|cwd| absolute_tool_path(cwd, home))
+                })
+                .or_else(|| cwd.map(Path::to_path_buf));
+            if let Some(target) = target {
+                self.repo_work.push(target);
+            }
+        }
         if let Some((kind, paths)) = tool_call_touches(name, input, home) {
             if DOCUMENT_TOOLS.contains(&name) {
                 self.documents
@@ -675,6 +722,7 @@ impl RawFacts {
     fn append(&mut self, other: RawFacts) {
         self.touches.extend(other.touches);
         self.prs.extend(other.prs);
+        self.repo_work.extend(other.repo_work);
         self.documents.extend(other.documents);
         for key in other.issue_keys {
             if !self.issue_keys.contains(&key) {
@@ -695,6 +743,13 @@ impl RawFacts {
         for touch in &self.touches {
             if let Some(resolved) = resolver.resolve(&touch.path) {
                 facts.record_touch(&resolved, touch.kind, &touch.at);
+            }
+        }
+        for path in &self.repo_work {
+            if let Some(resolved) = resolver.resolve(path) {
+                if !facts.repo_work.contains(&resolved.repo) {
+                    facts.repo_work.push(resolved.repo);
+                }
             }
         }
         for child in self.children {
@@ -868,9 +923,24 @@ pub struct LiveFacts {
 
 impl LiveFacts {
     pub fn observe(&mut self, event: &HarnessEvent, home: Option<&Path>) {
+        self.observe_with_cwd(event, home, None);
+    }
+
+    pub fn observe_with_cwd(
+        &mut self,
+        event: &HarnessEvent,
+        home: Option<&Path>,
+        cwd: Option<&Path>,
+    ) {
         if let Some(call) = self.tracker.observe_calls(event, is_facts_tool) {
-            self.pending
-                .observe_tool_call(&call.id, &call.name, &call.input, home, &now_stamp());
+            self.pending.observe_tool_call_with_cwd(
+                &call.id,
+                &call.name,
+                &call.input,
+                home,
+                cwd,
+                &now_stamp(),
+            );
             let creates_pr = call.name == "Bash"
                 && call
                     .input
@@ -1083,6 +1153,7 @@ pub fn observe_claude_line(raw: &mut RawFacts, line: &str, home: Option<&Path>, 
         line,
         home,
         main,
+        &mut None,
     );
 }
 
@@ -1134,6 +1205,72 @@ fn shell_assignment(word: &str) -> bool {
                 byte == b'_' || byte.is_ascii_alphabetic() || (i > 0 && byte.is_ascii_digit())
             })
     })
+}
+
+/// Whether a literal command changes git/GitHub state in a repository.
+/// This intentionally ignores dynamic shell expansion, like the adjacent
+/// issue-create matcher.
+fn is_repo_work_command(command: &str) -> bool {
+    let Some(commands) = ShellScanner(command.chars().peekable(), 0).commands(false) else {
+        return false;
+    };
+    commands.iter().any(|command| {
+        let words = &command.words;
+        let Some(executable) = words.first().and_then(|word| word.rsplit('/').next()) else {
+            return false;
+        };
+        let args = &words[1..];
+        if executable == "gh" {
+            return args.windows(2).any(|pair| pair == ["pr", "create"]);
+        }
+        if executable != "git" {
+            return false;
+        }
+        let mut args = args;
+        while args.first().is_some_and(|arg| arg.starts_with('-')) {
+            if args[0] == "-C" {
+                args = args.get(2..).unwrap_or_default();
+            } else {
+                args = &args[1..];
+            }
+        }
+        match args.first().map(String::as_str) {
+            Some("commit" | "push") => true,
+            Some("switch") => args.iter().any(|arg| arg == "-c" || arg == "--create"),
+            Some("checkout") => args.iter().any(|arg| arg == "-b" || arg == "-B"),
+            Some("branch") => {
+                !args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-d" | "-D" | "--delete"))
+                    && args.len() > 1
+                    && !args[1].starts_with('-')
+            }
+            _ => false,
+        }
+    })
+}
+
+fn repo_flag_target(command: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let commands = ShellScanner(command.chars().peekable(), 0).commands(false)?;
+    commands.into_iter().find_map(|command| {
+        command
+            .words
+            .windows(2)
+            .find(|pair| pair[0] == "--repo")
+            .and_then(|pair| absolute_tool_path(&pair[1], home))
+    })
+}
+
+fn absolute_tool_path(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let path = if raw == "~" {
+        home?.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home?.join(rest)
+    } else {
+        PathBuf::from(raw)
+    };
+    path.is_absolute()
+        .then(|| worktree_follow::resolve_for_match(&path))
 }
 
 #[derive(Default)]
@@ -1430,7 +1567,19 @@ fn observe_claude_line_with(
     line: &str,
     home: Option<&Path>,
     main: bool,
+    cwd: &mut Option<PathBuf>,
 ) {
+    if let Ok(value) = serde_json::from_str::<Value>(line) {
+        if value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("init")
+        {
+            *cwd = value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .and_then(|path| absolute_tool_path(path, home));
+            return;
+        }
+    }
     // Most lines are neither tool calls nor user text; skip them unparsed.
     let user_line = main && line.contains("\"user\"");
     let create_result = (!pr_create_calls.is_empty() || !bash_commands.is_empty())
@@ -1506,7 +1655,7 @@ fn observe_claude_line_with(
                 ) else {
                     continue;
                 };
-                raw.observe_tool_call(id, name, input, home, &at);
+                raw.observe_tool_call_with_cwd(id, name, input, home, cwd.as_deref(), &at);
                 let creates_pr = name == "Bash"
                     && input
                         .get("command")
@@ -1550,6 +1699,7 @@ fn scan_lines(
     let mut line = String::new();
     let mut pr_create_calls = HashSet::new();
     let mut bash_commands = HashMap::new();
+    let mut cwd = None;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -1561,6 +1711,7 @@ fn scan_lines(
                 &line,
                 home,
                 main,
+                &mut cwd,
             ),
             // A line that is not UTF-8 is skipped, not fatal.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
@@ -2100,6 +2251,68 @@ branch refs/heads/tracey/tru-12-thing
             tool_call_touches("Bash", &json!({"command": "ls /repos/app"}), home),
             None
         );
+    }
+
+    #[test]
+    fn write_command_facts_rebuild_from_transcript_like_live_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        let command = "git commit -m update";
+
+        let mut live = LiveFacts::default();
+        live.observe_with_cwd(
+            &HarnessEvent::ItemStarted {
+                id: "call".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Bash".into(),
+                    input: json!({"command": command}),
+                },
+            },
+            None,
+            Some(&repo),
+        );
+        let mut live_facts = ChatFacts::default();
+        live.take_due(Instant::now(), true)
+            .unwrap()
+            .resolve_into(&mut live_facts, &mut GitResolver::default());
+
+        let transcript = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            [
+                json!({"type":"system", "subtype":"init", "cwd":repo}),
+                json!({"type":"assistant", "message":{"content":[
+                    {"type":"tool_use", "id":"call", "name":"Bash", "input":{"command":command}}
+                ]}}),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        let mut rebuilt = ChatFacts::default();
+        scan_claude_transcript(&transcript, None)
+            .unwrap()
+            .resolve_into(&mut rebuilt, &mut GitResolver::default());
+        let canonical_repo = std::fs::canonicalize(&repo).unwrap();
+        assert_eq!(live_facts.repo_work, vec![canonical_repo]);
+        assert_eq!(rebuilt.repo_work, live_facts.repo_work);
+        assert!(is_repo_work_command("gh pr create --title x"));
+        assert!(is_repo_work_command("git -C /repo push"));
+        assert!(!is_repo_work_command("git status"));
+        assert!(!is_repo_work_command("git branch -D old"));
+    }
+
+    #[test]
+    fn older_chat_facts_without_repo_work_still_load() {
+        let facts: ChatFacts = serde_json::from_str(
+            r#"{"issue_keys":[],"repos_touched":[],"checkouts":[],"children":[]}"#,
+        )
+        .unwrap();
+        assert!(facts.repo_work.is_empty());
     }
 
     #[test]

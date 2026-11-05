@@ -13967,12 +13967,24 @@ impl App {
                 .filter_map(|task_id| self.task_store.as_ref()?.get(task_id))
                 .filter_map(|task| task_main_checkout(&task.repository.common_dir))
                 .collect();
+            let delegated = self.task_store.as_ref().map_or_else(Vec::new, |store| {
+                gitterm::workspace_repos::delegation_targets(
+                    &work,
+                    store.delegations(),
+                    store.tasks(),
+                )
+            });
             // A linked worktree (an agent-made one too) joins as its main
             // checkout (TRU-191); a checkout since deleted does not join.
             let candidates: Vec<PathBuf> = gitterm::workspace_repos::fold_worktrees(
-                gitterm::workspace_repos::auto_repo_candidates(&work, &workers, &task_worktrees)
-                    .into_iter()
-                    .filter(|dir| dir.is_dir()),
+                gitterm::workspace_repos::auto_repo_candidates(
+                    &work,
+                    &workers,
+                    &task_worktrees,
+                    &delegated,
+                )
+                .into_iter()
+                .filter(|dir| dir.is_dir()),
             );
             let listed: Vec<PathBuf> = ws
                 .repos
@@ -24578,7 +24590,11 @@ fi
                                 if t.agent_session().is_some_and(|session| {
                                     session.backend() == tab::AgentBackend::Claude
                                 }) {
-                                    t.chat_facts.observe(harness_event, home.as_deref());
+                                    t.chat_facts.observe_with_cwd(
+                                        harness_event,
+                                        home.as_deref(),
+                                        Some(&t.repo_path),
+                                    );
                                     facts_tab = true;
                                 }
                             }

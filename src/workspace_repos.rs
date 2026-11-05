@@ -92,15 +92,15 @@ pub fn fold_worktrees(dirs: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     folded
 }
 
-/// The main checkouts the chats `work` edited in, then those `workers`
-/// (task repositories of workers they started) ran in, in first-touch
-/// order: chats oldest first, each chat's touches in the order it made
-/// them. Reads (touches without edits) never count. A dir inside one of
+/// The main checkouts the chats `work` edited or ran a recognized write
+/// command in, then `workers` and delegated targets, in first-touch order.
+/// Reads (touches without edits) never count. A dir inside one of
 /// `task_worktrees` is not a repo and is left out.
 pub fn auto_repo_candidates(
     work: &[&ChatIndexEntry],
     workers: &[PathBuf],
     task_worktrees: &[PathBuf],
+    delegated: &[PathBuf],
 ) -> Vec<PathBuf> {
     let mut chats: Vec<&ChatIndexEntry> = work.to_vec();
     chats.sort_by_key(|entry| entry.mtime);
@@ -118,11 +118,60 @@ pub fn auto_repo_candidates(
         for checkout in facts.checkouts.iter().filter(|c| c.edits > 0) {
             push(&checkout.repo);
         }
+        for repo in &facts.repo_work {
+            push(repo);
+        }
     }
     for dir in workers {
         push(dir);
     }
+    for dir in delegated {
+        push(dir);
+    }
     found
+}
+
+/// Delegation targets belonging to chats in `work`: explicit checkout,
+/// worker repository, and extra writable directories.
+pub fn delegation_targets(
+    work: &[&ChatIndexEntry],
+    delegations: &[crate::tasks::Delegation],
+    tasks: &[crate::tasks::TaskRecord],
+) -> Vec<PathBuf> {
+    let chats: std::collections::HashSet<&str> =
+        work.iter().map(|entry| entry.id.as_str()).collect();
+    let mut targets = Vec::new();
+    for delegation in delegations {
+        if !delegation
+            .parent
+            .chat_session_id
+            .as_deref()
+            .is_some_and(|chat| chats.contains(chat))
+        {
+            continue;
+        }
+        if let Some(checkout) = &delegation.options.checkout {
+            targets.push(checkout.clone());
+        }
+        targets.extend(delegation.options.add_dirs.iter().cloned());
+        if let crate::tasks::DelegationChild::TaskSession { task_id, .. } = &delegation.child {
+            if let Some(task) = tasks.iter().find(|task| &task.task_id == task_id) {
+                if task
+                    .repository
+                    .common_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(".git")
+                {
+                    let Some(repo) = task.repository.common_dir.parent() else {
+                        continue;
+                    };
+                    targets.push(repo.to_path_buf());
+                }
+            }
+        }
+    }
+    targets
 }
 
 /// A workspace's repo list after applying what joined: `home` first,
@@ -276,11 +325,127 @@ mod tests {
             &[&newer, &older],
             &paths(&["/w/worker-repo", "/w/api"]),
             &[],
+            &[],
         );
         assert_eq!(
             candidates,
             paths(&["/w/api", "/w/infra", "/w/web", "/w/worker-repo"])
         );
+    }
+
+    #[test]
+    fn commit_and_pr_only_chat_repos_join_but_reads_do_not() {
+        let chat = entry(
+            "chat",
+            1,
+            ChatFacts {
+                repos_touched: vec![touch("/w/read-only", 0), touch("/w/commit", 0)],
+                repo_work: paths(&["/w/commit", "/w/pr"]),
+                ..ChatFacts::default()
+            },
+        );
+        assert_eq!(
+            auto_repo_candidates(&[&chat], &[], &[], &[]),
+            paths(&["/w/commit", "/w/pr"])
+        );
+    }
+
+    #[test]
+    fn removed_repo_does_not_rejoin_after_a_write() {
+        let candidates = paths(&["/w/repo"]);
+        let (repos, joined) =
+            derive_repo_list(Path::new("/w/home"), &[], &candidates, &[], &candidates);
+        assert_eq!(repos, paths(&["/w/home"]));
+        assert!(joined.is_empty());
+    }
+
+    #[test]
+    fn review_checkout_and_add_dirs_are_delegation_candidates_for_the_parent_chat() {
+        use crate::tasks::{
+            Delegation, DelegationChild, DelegationKind, DelegationParent, DelegationRunOptions,
+            DelegationStatus, ExecutorTarget, GitBase, NewTaskRecord, RepositoryIdentity,
+            StoppingBoundary, TaskRecord, WorkspaceIdentity, WorkspaceLocationIdentity,
+        };
+        let chat = entry("parent-chat", 1, ChatFacts::default());
+        let delegation = Delegation {
+            delegation_id: "d1".into(),
+            kind: DelegationKind::Review,
+            parent: DelegationParent {
+                session_uid: "tab".into(),
+                chat_session_id: Some("parent-chat".into()),
+                workspace: "ws".into(),
+                cwd: "/w/home".into(),
+            },
+            child: DelegationChild::CodexReview {
+                thread_id: None,
+                model: None,
+            },
+            brief: "review".into(),
+            target: None,
+            previous: None,
+            status: DelegationStatus::Requested,
+            result: None,
+            created_at: "2026-11-05T00:00:00Z".into(),
+            updated_at: "2026-11-05T00:00:00Z".into(),
+            delivered_at: None,
+            delivered: false,
+            dismissed_at: None,
+            options: DelegationRunOptions {
+                checkout: Some("/w/reviewed".into()),
+                add_dirs: paths(&["/w/extra"]),
+                ..DelegationRunOptions::default()
+            },
+            time_limit_reached_at: None,
+            time_limit_deadline_unix_ms: None,
+        };
+        assert_eq!(
+            delegation_targets(&[&chat], &[delegation.clone()], &[]),
+            paths(&["/w/reviewed", "/w/extra"])
+        );
+        let task = TaskRecord::new_draft(
+            NewTaskRecord {
+                task_id: "task-1".into(),
+                title: "worker".into(),
+                objective: "work".into(),
+                workspace: WorkspaceIdentity {
+                    name: "ws".into(),
+                    location: WorkspaceLocationIdentity::Local {
+                        directory: "/w/home".into(),
+                    },
+                },
+                repository: RepositoryIdentity {
+                    common_dir: "/w/task-repo/.git".into(),
+                    remote_url: None,
+                },
+                issue: None,
+                base: GitBase {
+                    reference: "main".into(),
+                    commit: "abc".into(),
+                },
+                branch: "feature".into(),
+                executor: ExecutorTarget::Local,
+                harness: None,
+                stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+            },
+            "2026-11-05T00:00:00Z",
+        );
+        let mut worker = delegation.clone();
+        worker.kind = DelegationKind::Implement;
+        worker.child = DelegationChild::TaskSession {
+            task_id: "task-1".into(),
+            task_session_id: None,
+            conversation: None,
+            preset_name: None,
+            model: None,
+            role: None,
+        };
+        worker.options = DelegationRunOptions::default();
+        assert_eq!(
+            delegation_targets(&[&chat], &[worker], &[task]),
+            paths(&["/w/task-repo"])
+        );
+        let unrelated = entry("other-chat", 1, ChatFacts::default());
+        assert!(delegation_targets(&[&unrelated], &[delegation], &[]).is_empty());
     }
 
     #[test]
@@ -294,7 +459,7 @@ mod tests {
                 ..ChatFacts::default()
             },
         );
-        let candidates = auto_repo_candidates(&[&chat], &[], &paths(&["/tasks/api-ops-1"]));
+        let candidates = auto_repo_candidates(&[&chat], &[], &paths(&["/tasks/api-ops-1"]), &[]);
         assert_eq!(candidates, paths(&["/w/api"]));
     }
 
@@ -433,7 +598,7 @@ mod tests {
                 ..ChatFacts::default()
             },
         );
-        let candidates = fold_worktrees(auto_repo_candidates(&[&chat], &[], &[]));
+        let candidates = fold_worktrees(auto_repo_candidates(&[&chat], &[], &[], &[]));
         let (list, joined) = derive_repo_list(&org.join("home"), &[], &candidates, &[], &[]);
         assert_eq!(list, vec![org.join("home"), api.clone()]);
         assert_eq!(joined, vec![api]);
