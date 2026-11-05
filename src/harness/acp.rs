@@ -196,11 +196,12 @@ fn prompt_text_for_channel(
         return prompt.to_string();
     };
     match channel {
-        Some(GuidelinesChannel::FirstPrompt) => format!(
+        Some(GuidelinesChannel::FirstPrompt) if !is_cli_command(prompt) => format!(
             "<gitterm-change-guidelines>\n{}\n</gitterm-change-guidelines>\n\n{}",
             guidelines.text.trim_end(),
             prompt
         ),
+        Some(GuidelinesChannel::FirstPrompt) => prompt.to_string(),
         Some(GuidelinesChannel::ConfigFile) => prompt.to_string(),
         None => {
             acp_log(&format!(
@@ -209,6 +210,16 @@ fn prompt_text_for_channel(
             prompt.to_string()
         }
     }
+}
+
+/// Gemini CLI dispatches slash and shell commands from the unadorned prompt.
+fn is_cli_command(prompt: &str) -> bool {
+    let prompt = prompt.trim_start();
+    prompt.starts_with('/') || prompt.starts_with('$')
+}
+
+fn should_defer_guidelines(agent: AcpAgent, prompt: &str) -> bool {
+    agent == AcpAgent::Gemini && is_cli_command(prompt)
 }
 
 /// Gemini CLI system settings for GitTerm's chats: whatever the machine's
@@ -1272,6 +1283,14 @@ impl HistoryBuilder {
         self.entries.is_empty()
     }
 
+    fn contains_guidelines_preamble(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(entry, TranscriptEntry::UserPrompt(text)
+                if text.contains("<gitterm-change-guidelines>")
+                    && text.contains("</gitterm-change-guidelines>"))
+        })
+    }
+
     pub fn finish(mut self) -> Vec<TranscriptEntry> {
         self.close_turn();
         self.entries
@@ -1749,7 +1768,7 @@ impl Session {
             prompt.id
         ));
         let mut prompt = prompt;
-        if !self.prompt_started {
+        if !self.prompt_started && !should_defer_guidelines(self.config.agent, &prompt.text) {
             prompt.text = first_prompt_text(
                 self.config.agent,
                 self.config.guidelines.as_ref(),
@@ -1815,6 +1834,7 @@ impl Session {
 
     async fn finish_history(&mut self) -> Result<(), String> {
         self.history_deadline = None;
+        self.prompt_started = self.history.contains_guidelines_preamble();
         let entries = std::mem::take(&mut self.history).finish();
         acp_log(&format!(
             "session {} replayed {} history entries",
@@ -2866,6 +2886,20 @@ mod tests {
     }
 
     #[test]
+    fn resumed_history_records_that_guidelines_were_already_sent() {
+        let mut history = HistoryBuilder::default();
+        history.user_chunk(
+            Some("u1".into()),
+            "<gitterm-change-guidelines>\nRules\n</gitterm-change-guidelines>\n\nPlease help",
+        );
+        assert!(history.contains_guidelines_preamble());
+
+        let mut history = HistoryBuilder::default();
+        history.user_chunk(Some("u1".into()), "Please help");
+        assert!(!history.contains_guidelines_preamble());
+    }
+
+    #[test]
     fn a_model_api_error_fails_the_turn_with_the_agents_message() {
         // Gemini CLI 0.41.2 answers a failed model call with
         // `RequestError(status, message)` (gemini-KXTGCWBT.js, Session.prompt).
@@ -2975,6 +3009,22 @@ mod tests {
         assert_eq!(opencode["instructions"], json!([on.path]));
         assert_eq!(first_prompt_text(AcpAgent::Gemini, Some(&on), "hello"),
             "<gitterm-change-guidelines>\nFollow the repository rules.\n</gitterm-change-guidelines>\n\nhello");
+        assert_eq!(
+            first_prompt_text(AcpAgent::Gemini, Some(&on), "/help"),
+            "/help"
+        );
+        assert_eq!(
+            first_prompt_text(AcpAgent::Gemini, Some(&on), "  /init"),
+            "  /init"
+        );
+        assert_eq!(
+            first_prompt_text(AcpAgent::Gemini, Some(&on), "$ ls"),
+            "$ ls"
+        );
+        assert!(should_defer_guidelines(AcpAgent::Gemini, "/help"));
+        assert!(should_defer_guidelines(AcpAgent::Gemini, "$ ls"));
+        assert!(!should_defer_guidelines(AcpAgent::Gemini, "help me"));
+        assert!(!should_defer_guidelines(AcpAgent::OpenCode, "/help"));
         assert_eq!(first_prompt_text(AcpAgent::Gemini, None, "hello"), "hello");
     }
 
