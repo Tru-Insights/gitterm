@@ -126,7 +126,10 @@ pub fn auto_repo_candidates(
         push(dir);
     }
     for dir in delegated {
-        push(dir);
+        let path = crate::worktree_follow::resolve_for_match(dir);
+        if let Some(root) = checkout_root(&path) {
+            push(&main_checkout(&root));
+        }
     }
     found
 }
@@ -602,6 +605,22 @@ mod tests {
         let (list, joined) = derive_repo_list(&org.join("home"), &[], &candidates, &[], &[]);
         assert_eq!(list, vec![org.join("home"), api.clone()]);
         assert_eq!(joined, vec![api]);
+    }
+
+    #[test]
+    fn repo_write_finding_6_delegated_folders_are_repository_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = init_repo(temp.path(), "api");
+        let linked = temp.path().join("linked");
+        add_worktree(&repo, &linked, "feature");
+        let subdir = linked.join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let plain = temp.path().join("docs");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            fold_worktrees(auto_repo_candidates(&[], &[], &[], &[subdir, plain])),
+            vec![repo]
+        );
     }
 
     #[test]

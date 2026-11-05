@@ -620,9 +620,8 @@ pub struct RawFacts {
     /// PRs from `gh pr create` results: live tabs, and transcript scans
     /// for a tab catching up ("Index older chats" leaves them out).
     pub prs: Vec<PrRef>,
-    /// Candidate directories for repo write commands; resolved in
-    /// `resolve_into` just like tool touches.
-    pub repo_work: Vec<PathBuf>,
+    /// Invocation-specific write targets, resolved off the UI thread.
+    repo_work: Vec<RepoWorkTarget>,
     /// Markdown files written or edited, in call order (TRU-191).
     pub documents: Vec<PathBuf>,
 }
@@ -657,25 +656,14 @@ impl RawFacts {
         cwd: Option<&Path>,
         at: &str,
     ) {
-        if name == "Bash"
-            && input
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(is_repo_work_command)
-        {
-            let command = input.get("command").and_then(Value::as_str);
-            let target = command
-                .and_then(|command| worktree_follow::bash_leading_dir(command, home))
-                .or_else(|| command.and_then(|command| repo_flag_target(command, home)))
-                .or_else(|| {
-                    input
-                        .get("cwd")
-                        .and_then(Value::as_str)
-                        .and_then(|cwd| absolute_tool_path(cwd, home))
-                })
-                .or_else(|| cwd.map(Path::to_path_buf));
-            if let Some(target) = target {
-                self.repo_work.push(target);
+        if name == "Bash" {
+            if let Some(command) = input.get("command").and_then(Value::as_str) {
+                let bash_cwd = match input.get("cwd").and_then(Value::as_str) {
+                    Some(path) => command_path(path, cwd, home),
+                    None => cwd.map(Path::to_path_buf),
+                };
+                self.repo_work
+                    .extend(repo_write_targets(command, bash_cwd.as_deref(), home));
             }
         }
         if let Some((kind, paths)) = tool_call_touches(name, input, home) {
@@ -745,10 +733,17 @@ impl RawFacts {
                 facts.record_touch(&resolved, touch.kind, &touch.at);
             }
         }
-        for path in &self.repo_work {
-            if let Some(resolved) = resolver.resolve(path) {
-                if !facts.repo_work.contains(&resolved.repo) {
-                    facts.repo_work.push(resolved.repo);
+        for target in &self.repo_work {
+            let repo = match target {
+                RepoWorkTarget::Directory(path) if path.is_dir() => {
+                    resolver.resolve(path).map(|r| r.repo)
+                }
+                RepoWorkTarget::Directory(_) => None,
+                RepoWorkTarget::Github(selector) => resolver.resolve_selector(selector),
+            };
+            if let Some(repo) = repo {
+                if !facts.repo_work.contains(&repo) {
+                    facts.repo_work.push(repo);
                 }
             }
         }
@@ -795,11 +790,75 @@ pub fn resolve_against(path: &Path, worktrees: &[WorktreeInfo]) -> Option<Resolv
 /// Blocking; never on the UI thread.
 #[derive(Debug, Default)]
 pub struct GitResolver {
+    listed_repos: Vec<PathBuf>,
     nearest_checkout: HashMap<PathBuf, Option<PathBuf>>,
     worktrees: HashMap<PathBuf, Option<Vec<WorktreeInfo>>>,
 }
 
 impl GitResolver {
+    pub fn with_repos(repos: &[PathBuf]) -> Self {
+        Self {
+            listed_repos: repos.to_vec(),
+            ..Self::default()
+        }
+    }
+
+    fn resolve_selector(&mut self, selector: &str) -> Option<PathBuf> {
+        let parts: Vec<_> = selector.split('/').collect();
+        let (host, owner, name) = match parts.as_slice() {
+            [owner, name] => ("github.com", *owner, *name),
+            [host, owner, name] => (*host, *owner, *name),
+            _ => return None,
+        };
+        if [host, owner, name].iter().any(|part| part.is_empty()) {
+            return None;
+        }
+        let mut matches = Vec::new();
+        for dir in self.listed_repos.clone() {
+            let Some(resolved) = self.resolve(&dir) else {
+                continue;
+            };
+            let output = crate::agentd::git::git_command()
+                .args(["config", "--get-regexp", r"^remote\..*\.url$"])
+                .current_dir(&dir)
+                .output();
+            let output = match output {
+                Ok(output) if output.status.success() => output,
+                Ok(output) if output.status.code() == Some(1) => continue, // No remotes.
+                Ok(output) => {
+                    eprintln!(
+                        "[chat-facts] cannot read remotes in {}: {}",
+                        dir.display(),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[chat-facts] cannot read remotes in {}: {error}",
+                        dir.display()
+                    );
+                    continue;
+                }
+            };
+            let matches_remote = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                let Some((_, url)) = line.split_once(' ') else {
+                    return false;
+                };
+                crate::gh_identity::parse_repository_slug(url).is_some_and(|slug| {
+                    slug.host.eq_ignore_ascii_case(host)
+                        && slug.owner.eq_ignore_ascii_case(owner)
+                        && slug.name.eq_ignore_ascii_case(name)
+                })
+            });
+            if matches_remote && !matches.contains(&resolved.repo) {
+                matches.push(resolved.repo);
+            }
+        }
+        // Multiple independent clones are ambiguous; worktrees of one clone fold above.
+        (matches.len() == 1).then(|| matches.remove(0))
+    }
+
     pub fn resolve(&mut self, raw: &Path) -> Option<Resolved> {
         let path = worktree_follow::resolve_for_match(raw);
         let checkout = self.nearest_checkout_of(&path)?;
@@ -1035,6 +1094,13 @@ impl LiveFacts {
     }
 }
 
+/// Local paths available to live flushing and transcript backfill.
+#[derive(Default)]
+pub struct FactPaths<'a> {
+    pub home: Option<&'a Path>,
+    pub repos: &'a [PathBuf],
+}
+
 /// Folds a live tab's observations and its delegation children into the
 /// chat's facts file. Blocking (git, file I/O); run on a blocking thread.
 /// A file that exists but does not parse is left alone and reported.
@@ -1052,15 +1118,15 @@ pub fn flush_live(
     pending: RawFacts,
     children: Vec<ChatChild>,
     catch_up: Option<&Path>,
-    home: Option<&Path>,
+    paths: FactPaths<'_>,
 ) -> Result<Vec<PrRef>, String> {
     let path = facts_path(dir, backend, session_id)?;
     let existing = load_facts(&path)?;
     let before = existing.clone().unwrap_or_default();
-    let mut resolver = GitResolver::default();
+    let mut resolver = GitResolver::with_repos(paths.repos);
     let (mut facts, caught_up) = match catch_up {
         Some(transcript) => {
-            catch_up_from_transcript(existing, &path, transcript, home, &mut resolver)
+            catch_up_from_transcript(existing, &path, transcript, paths.home, &mut resolver)
         }
         None => (existing.unwrap_or_default(), Vec::new()),
     };
@@ -1207,58 +1273,402 @@ fn shell_assignment(word: &str) -> bool {
     })
 }
 
-/// Whether a literal command changes git/GitHub state in a repository.
-/// This intentionally ignores dynamic shell expansion, like the adjacent
-/// issue-create matcher.
-fn is_repo_work_command(command: &str) -> bool {
-    let Some(commands) = ShellScanner(command.chars().peekable(), 0).commands(false) else {
-        return false;
-    };
-    commands.iter().any(|command| {
-        let words = &command.words;
-        let Some(executable) = words.first().and_then(|word| word.rsplit('/').next()) else {
-            return false;
-        };
-        let args = &words[1..];
-        if executable == "gh" {
-            return args.windows(2).any(|pair| pair == ["pr", "create"]);
-        }
-        if executable != "git" {
-            return false;
-        }
-        let mut args = args;
-        while args.first().is_some_and(|arg| arg.starts_with('-')) {
-            if args[0] == "-C" {
-                args = args.get(2..).unwrap_or_default();
-            } else {
-                args = &args[1..];
-            }
-        }
-        match args.first().map(String::as_str) {
-            Some("commit" | "push") => true,
-            Some("switch") => args.iter().any(|arg| arg == "-c" || arg == "--create"),
-            Some("checkout") => args.iter().any(|arg| arg == "-b" || arg == "-B"),
-            Some("branch") => {
-                !args
-                    .iter()
-                    .any(|arg| matches!(arg.as_str(), "-d" | "-D" | "--delete"))
-                    && args.len() > 1
-                    && !args[1].starts_with('-')
-            }
-            _ => false,
-        }
-    })
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepoWorkTarget {
+    Directory(PathBuf),
+    Github(String),
 }
 
-fn repo_flag_target(command: &str, home: Option<&Path>) -> Option<PathBuf> {
-    let commands = ShellScanner(command.chars().peekable(), 0).commands(false)?;
-    commands.into_iter().find_map(|command| {
-        command
-            .words
-            .windows(2)
-            .find(|pair| pair[0] == "--repo")
-            .and_then(|pair| absolute_tool_path(&pair[1], home))
-    })
+fn command_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    if raw.contains(['$', '\0', '*', '?', '[', '{']) || raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('~') {
+        return absolute_tool_path(raw, home);
+    }
+    let path = Path::new(raw);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd?.join(path)
+    };
+    Some(worktree_follow::resolve_for_match(&path))
+}
+
+/// Shared by live observations and transcript scans. Each literal invocation
+/// owns its target; unknown directory state never falls back to the original cwd.
+fn repo_write_targets(
+    command: &str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<RepoWorkTarget> {
+    let Some(commands) = ShellScanner(command.chars().peekable(), 0).commands(false) else {
+        return Vec::new();
+    };
+    // shortcut: shell control flow needs a full parser; skip it until supported.
+    if commands.iter().any(|cmd| {
+        matches!(cmd.separator.as_str(), "|" | "&")
+            || cmd.words.iter().any(|word| {
+                matches!(
+                    word.as_str(),
+                    "if" | "then"
+                        | "else"
+                        | "elif"
+                        | "fi"
+                        | "for"
+                        | "while"
+                        | "until"
+                        | "do"
+                        | "done"
+                        | "case"
+                        | "esac"
+                        | "{"
+                        | "}"
+                        | "function"
+                )
+            })
+    }) {
+        return Vec::new();
+    }
+    let mut cwd = cwd.map(Path::to_path_buf);
+    let mut conditional_dir = false;
+    let mut targets = Vec::new();
+    for command in commands {
+        // Nested groups and substitutions have independent shell directories.
+        // Do not flatten their cd operations into the caller's directory state.
+        if command.nested {
+            // A group's success can select a different outer &&/|| path.
+            if conditional_dir {
+                cwd = None;
+            }
+            continue;
+        }
+        if command.environment {
+            // Assignments may override GIT_DIR, GIT_WORK_TREE, GH_REPO, or PATH.
+            return targets;
+        }
+        let Some(executable) = command.words.first().map(String::as_str) else {
+            continue;
+        };
+        let args = &command.words[1..];
+        if executable == "cd" {
+            cwd = if command.separator == "&&" && args.len() == 1 {
+                command_path(&args[0], cwd.as_deref(), home)
+            } else {
+                None
+            };
+            conditional_dir = true;
+            continue;
+        }
+        if matches!(
+            executable,
+            "eval"
+                | "source"
+                | "."
+                | "pushd"
+                | "popd"
+                | "exec"
+                | "export"
+                | "unset"
+                | "declare"
+                | "typeset"
+                | "readonly"
+        ) {
+            return targets;
+        }
+        let target = match executable.rsplit('/').next() {
+            Some("git") => {
+                git_write_target(args, cwd.as_deref(), home).map(RepoWorkTarget::Directory)
+            }
+            Some("gh") => gh_write_target(args, cwd.as_deref()),
+            _ => None,
+        };
+        if let Some(target) = target {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        if conditional_dir && command.separator != "&&" {
+            cwd = None;
+        }
+    }
+    targets
+}
+
+fn git_write_target(args: &[String], cwd: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    // shortcut: skip expansions that could supply directory or read-only flags;
+    // add expansion boundaries to the scanner before accepting dynamic arguments.
+    if args.iter().any(|arg| arg.contains(['$', '\0'])) {
+        return None;
+    }
+    let mut args = args;
+    let mut dir = cwd.map(Path::to_path_buf);
+    let mut git_dir = None;
+    let mut work_tree = None;
+    while let Some(arg) = args.first().filter(|arg| arg.starts_with('-')) {
+        let (option, attached) =
+            if let Some(value) = arg.strip_prefix("-C").filter(|v| !v.is_empty()) {
+                ("-C", Some(value))
+            } else if let Some(value) = arg.strip_prefix("-c").filter(|v| !v.is_empty()) {
+                ("-c", Some(value))
+            } else if let Some((key, value)) = arg.split_once('=') {
+                (key, Some(value))
+            } else {
+                (arg.as_str(), None)
+            };
+        match option {
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" => {
+                let value = match attached {
+                    Some(value) => {
+                        args = &args[1..];
+                        value
+                    }
+                    None => {
+                        let value = args.get(1)?.as_str();
+                        args = &args[2..];
+                        value
+                    }
+                };
+                match option {
+                    "-C" if !value.is_empty() => dir = command_path(value, dir.as_deref(), home),
+                    "--git-dir" => git_dir = Some(value.to_string()),
+                    "--work-tree" => work_tree = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+            "--no-pager"
+            | "--paginate"
+            | "-p"
+            | "-P"
+            | "--no-optional-locks"
+            | "--no-replace-objects"
+            | "--no-lazy-fetch"
+            | "--no-advice"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs" => args = &args[1..],
+            _ => return None,
+        }
+    }
+    let (verb, args) = args.split_first()?;
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--dry-run"))
+    {
+        return None;
+    }
+    let writes = match verb.as_str() {
+        "commit" => !args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--short" | "--porcelain" | "--long" | "-z" | "--null"
+            )
+        }),
+        "push" => !args
+            .iter()
+            .any(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.contains('n')),
+        "switch" => creates_branch(args, &["-c", "-C", "--create", "--force-create"]),
+        "checkout" => creates_branch(args, &["-b", "-B"]),
+        "branch" => {
+            let mut names = 0;
+            for arg in args {
+                match arg.as_str() {
+                    "-f"
+                    | "--force"
+                    | "--no-force"
+                    | "-t"
+                    | "--track"
+                    | "--track=direct"
+                    | "--track=inherit"
+                    | "--no-track"
+                    | "--create-reflog"
+                    | "--no-create-reflog"
+                    | "--recurse-submodules"
+                    | "--no-recurse-submodules"
+                    | "-q"
+                    | "--quiet" => {}
+                    _ if !arg.starts_with('-') => names += 1,
+                    _ => return None,
+                }
+            }
+            (1..=2).contains(&names)
+        }
+        _ => false,
+    };
+    if !writes {
+        return None;
+    }
+    let work_tree = match work_tree {
+        Some(tree) => Some(command_path(&tree, dir.as_deref(), home)?),
+        None => None,
+    };
+    if let Some(git_dir) = git_dir {
+        let git_dir = command_path(&git_dir, dir.as_deref(), home)?;
+        // Only a normal checkout's .git has an unambiguous filesystem owner.
+        if git_dir.file_name()? != ".git" || !git_dir.is_dir() {
+            return None;
+        }
+        let root = git_dir.parent()?.to_path_buf();
+        if work_tree.as_ref().is_some_and(|tree| tree != &root) {
+            return None;
+        }
+        return Some(root);
+    }
+    if let Some(tree) = work_tree {
+        // --work-tree alone does not select another repository's git directory.
+        if crate::workspace_repos::checkout_root(&tree)
+            != dir
+                .as_deref()
+                .and_then(crate::workspace_repos::checkout_root)
+        {
+            return None;
+        }
+    }
+    dir
+}
+
+fn creates_branch(args: &[String], options: &[&str]) -> bool {
+    let mut args = args.iter();
+    let mut creates = false;
+    while let Some(arg) = args.next() {
+        let key = arg.split('=').next().unwrap_or(arg);
+        if options.contains(&key) {
+            let name = arg
+                .split_once('=')
+                .map(|(_, name)| name)
+                .or_else(|| args.next().map(String::as_str));
+            if creates || !name.is_some_and(|name| !name.is_empty() && !name.starts_with('-')) {
+                return false;
+            }
+            creates = true;
+        } else if options
+            .iter()
+            .any(|option| option.len() == 2 && arg.starts_with(option) && arg.len() > 2)
+        {
+            if creates {
+                return false;
+            }
+            creates = true;
+        } else if key == "--conflict" {
+            if !arg.contains('=') && args.next().is_none() {
+                return false;
+            }
+        } else if arg.starts_with('-')
+            && !matches!(
+                arg.as_str(),
+                "-q" | "--quiet"
+                    | "-f"
+                    | "--force"
+                    | "-m"
+                    | "--merge"
+                    | "-t"
+                    | "--track"
+                    | "--track=direct"
+                    | "--track=inherit"
+                    | "--no-track"
+                    | "--guess"
+                    | "--no-guess"
+                    | "--discard-changes"
+                    | "--ignore-other-worktrees"
+                    | "--recurse-submodules"
+                    | "--no-recurse-submodules"
+                    | "--progress"
+                    | "--no-progress"
+            )
+        {
+            return false;
+        }
+    }
+    creates
+}
+
+fn gh_write_target(args: &[String], cwd: Option<&Path>) -> Option<RepoWorkTarget> {
+    if args.iter().any(|arg| arg.contains(['$', '\0'])) {
+        return None;
+    }
+    let mut args = args.iter();
+    let mut selector = None;
+    let mut verbs = Vec::new();
+    while let Some(arg) = args.next() {
+        if matches!(arg.as_str(), "--help" | "-h" | "--dry-run" | "--web" | "-w") {
+            return None;
+        }
+        if arg == "--repo" || arg == "-R" {
+            if selector.is_some() {
+                return None;
+            }
+            selector = Some(args.next()?.clone());
+        } else if let Some(value) = arg
+            .strip_prefix("--repo=")
+            .or_else(|| arg.strip_prefix("-R").filter(|v| !v.is_empty()))
+        {
+            if selector.is_some() || value.is_empty() {
+                return None;
+            }
+            selector = Some(value.to_string());
+        } else if !arg.starts_with('-') && verbs.len() < 2 {
+            verbs.push(arg.as_str());
+        } else {
+            // Consume known create-option values, so text is never parsed as flags/verbs.
+            if verbs != ["pr", "create"] {
+                return None;
+            }
+            let key = arg.split('=').next()?;
+            if [
+                "--assignee",
+                "-a",
+                "--base",
+                "-B",
+                "--body",
+                "-b",
+                "--body-file",
+                "-F",
+                "--head",
+                "-H",
+                "--label",
+                "-l",
+                "--milestone",
+                "-m",
+                "--project",
+                "-p",
+                "--recover",
+                "--reviewer",
+                "-r",
+                "--template",
+                "-T",
+                "--title",
+                "-t",
+            ]
+            .contains(&key)
+            {
+                if !arg.contains('=') {
+                    args.next()?;
+                }
+            } else if ![
+                "--draft",
+                "-d",
+                "--editor",
+                "-e",
+                "--fill",
+                "-f",
+                "--fill-first",
+                "--fill-verbose",
+                "--no-maintainer-edit",
+            ]
+            .contains(&key)
+            {
+                return None;
+            }
+        }
+    }
+    if verbs != ["pr", "create"] {
+        return None;
+    }
+    match selector {
+        Some(selector) => Some(RepoWorkTarget::Github(selector)),
+        None => cwd.map(|dir| RepoWorkTarget::Directory(dir.to_path_buf())),
+    }
 }
 
 fn absolute_tool_path(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
@@ -1275,6 +1685,9 @@ fn absolute_tool_path(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
 
 #[derive(Default)]
 struct ShellCommand {
+    nested: bool,
+    environment: bool,
+    separator: String,
     words: Vec<String>,
     stdout_redirected: bool,
 }
@@ -1316,6 +1729,7 @@ impl ShellScanner<'_> {
                 }
                 '\n' => {
                     self.0.next();
+                    current.separator = ch.to_string();
                     finish_shell_command(&mut commands, &mut current, &mut children);
                     for (delimiter, strip_tabs, quoted) in heredocs.drain(..) {
                         self.heredoc(&delimiter, strip_tabs, quoted)?;
@@ -1326,6 +1740,11 @@ impl ShellScanner<'_> {
                     if ch == '&' && self.0.peek() == Some(&'>') {
                         self.redirect(&mut current, &mut heredocs, Some(1))?;
                     } else {
+                        current.separator = ch.to_string();
+                        if self.0.peek() == Some(&ch) {
+                            self.0.next();
+                            current.separator.push(ch);
+                        }
                         finish_shell_command(&mut commands, &mut current, &mut children);
                     }
                 }
@@ -1353,6 +1772,8 @@ impl ShellScanner<'_> {
                         self.redirect(&mut current, &mut heredocs, Some(word.text.parse().ok()?))?;
                     } else {
                         children.extend(word.commands);
+                        current.nested = nested;
+                        current.environment |= word.assignment && current.words.is_empty();
                         if (!word.text.is_empty() || word.quoted)
                             && !(word.assignment && current.words.is_empty())
                         {
@@ -1499,7 +1920,7 @@ fn finish_shell_command(
     for child in children.iter_mut() {
         child.stdout_redirected |= current.stdout_redirected;
     }
-    if !current.words.is_empty() {
+    if !current.words.is_empty() || current.environment {
         commands.push(std::mem::take(current));
     } else {
         *current = ShellCommand::default();
@@ -1569,27 +1990,24 @@ fn observe_claude_line_with(
     main: bool,
     cwd: &mut Option<PathBuf>,
 ) {
-    if let Ok(value) = serde_json::from_str::<Value>(line) {
-        if value.get("type").and_then(Value::as_str) == Some("system")
-            && value.get("subtype").and_then(Value::as_str) == Some("init")
-        {
-            *cwd = value
-                .get("cwd")
-                .and_then(Value::as_str)
-                .and_then(|path| absolute_tool_path(path, home));
-            return;
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    let record_type = value.get("type").and_then(Value::as_str);
+    if matches!(record_type, Some("user" | "assistant"))
+        || (record_type == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("init"))
+    {
+        if let Some(path) = value.get("cwd").and_then(Value::as_str) {
+            *cwd = absolute_tool_path(path, home);
         }
     }
-    // Most lines are neither tool calls nor user text; skip them unparsed.
-    let user_line = main && line.contains("\"user\"");
+    let user_line = main && record_type == Some("user");
     let create_result = (!pr_create_calls.is_empty() || !bash_commands.is_empty())
         && line.contains("\"tool_result\"");
     if !user_line && !create_result && !line.contains("\"tool_use\"") {
         return;
     }
-    let Ok(value) = serde_json::from_str::<Value>(line) else {
-        return;
-    };
     let kind = value.get("type").and_then(Value::as_str);
     let Some(content) = value.get("message").and_then(|m| m.get("content")) else {
         return;
@@ -1824,11 +2242,11 @@ pub fn backfill_claude(
     hosted: &HashSet<String>,
     links: &[ChildLink],
     max: usize,
-    home: Option<&Path>,
+    paths: FactPaths<'_>,
 ) -> BackfillReport {
     targets.sort_by_key(|target| std::cmp::Reverse(target.mtime));
     let mut report = BackfillReport::default();
-    let mut resolver = GitResolver::default();
+    let mut resolver = GitResolver::with_repos(paths.repos);
     for target in targets {
         if hosted.contains(&target.id) {
             report.hosted += 1;
@@ -1868,7 +2286,7 @@ pub fn backfill_claude(
             report.remaining += 1;
             continue;
         }
-        let mut scan = match facts_from_claude_transcript(&target.path, home, &mut resolver) {
+        let mut scan = match facts_from_claude_transcript(&target.path, paths.home, &mut resolver) {
             Ok(scan) => scan,
             Err(error) => {
                 eprintln!(
@@ -2300,10 +2718,311 @@ branch refs/heads/tracey/tru-12-thing
         let canonical_repo = std::fs::canonicalize(&repo).unwrap();
         assert_eq!(live_facts.repo_work, vec![canonical_repo]);
         assert_eq!(rebuilt.repo_work, live_facts.repo_work);
-        assert!(is_repo_work_command("gh pr create --title x"));
-        assert!(is_repo_work_command("git -C /repo push"));
-        assert!(!is_repo_work_command("git status"));
-        assert!(!is_repo_work_command("git branch -D old"));
+        assert!(
+            !repo_write_targets("gh pr create --title x", Some(Path::new("/repo")), None)
+                .is_empty()
+        );
+        assert!(!repo_write_targets("git -C /repo push", None, None).is_empty());
+        assert!(repo_write_targets("git status", Some(Path::new("/repo")), None).is_empty());
+        assert!(repo_write_targets("git branch -D old", Some(Path::new("/repo")), None).is_empty());
+    }
+
+    fn work_repo(root: &Path, name: &str) -> PathBuf {
+        let repo = root.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::canonicalize(repo).unwrap()
+    }
+
+    fn command_repos(command: &str, cwd: &Path) -> Vec<PathBuf> {
+        let mut raw = RawFacts::default();
+        raw.observe_tool_call_with_cwd(
+            "call",
+            "Bash",
+            &json!({"command":command}),
+            None,
+            Some(cwd),
+            "now",
+        );
+        let mut facts = ChatFacts::default();
+        raw.resolve_into(&mut facts, &mut GitResolver::default());
+        facts.repo_work
+    }
+
+    #[test]
+    fn repo_write_finding_1_each_invocation_has_its_own_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let read = work_repo(temp.path(), "read");
+        let a = work_repo(temp.path(), "a");
+        let b = work_repo(temp.path(), "b");
+        let command = format!(
+            "git -C '{}' status && git -C '{}' push && git -C '{}' commit -m update",
+            read.display(),
+            a.display(),
+            b.display()
+        );
+        assert_eq!(command_repos(&command, &read), vec![a, b]);
+    }
+
+    #[test]
+    fn repo_write_finding_2_saved_message_cwd_matches_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = work_repo(temp.path(), "repo");
+        for kind in ["user", "assistant"] {
+            let transcript = temp.path().join("saved.jsonl");
+            std::fs::write(&transcript, [
+                json!({"type":kind,"cwd":repo,"message":{"content":"context"}}),
+                json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"call","name":"Bash","input":{"command":"git push"}}]}}),
+            ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+            let mut rebuilt = ChatFacts::default();
+            scan_claude_transcript(&transcript, None)
+                .unwrap()
+                .resolve_into(&mut rebuilt, &mut GitResolver::default());
+            assert_eq!(
+                rebuilt.repo_work,
+                command_repos("git push", &repo),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_write_finding_3_read_only_variants_never_join() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = work_repo(temp.path(), "repo");
+        for command in [
+            "git branch feature --list",
+            "git branch --list",
+            "git commit --dry-run",
+            "git push --dry-run",
+            "git push -n",
+            "git push -nv",
+            "git commit --porcelain",
+            "git commit --short",
+            "git commit -z",
+            "git commit --help",
+            "gh pr create --help",
+            "gh pr view",
+            "gh pr view --json pr,create",
+        ] {
+            assert!(command_repos(command, &repo).is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn repo_write_finding_4_unmatched_gh_selector_never_uses_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = work_repo(temp.path(), "unrelated");
+        for command in [
+            "gh pr create --repo acme/api",
+            "gh --repo acme/api pr create",
+            "gh pr create -Racme/api",
+            "gh pr create --repo=acme/api",
+        ] {
+            assert!(command_repos(command, &repo).is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn gh_selectors_match_only_unique_listed_local_remotes_in_live_and_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = work_repo(temp.path(), "cwd");
+        let api = work_repo(temp.path(), "api");
+        git(
+            &api,
+            &["remote", "add", "upstream", "git@github.com:acme/api.git"],
+        );
+        let repos = [cwd.clone(), api.clone()];
+        let dir = temp.path().join("facts");
+        for (i, command) in [
+            "gh pr create --repo acme/api",
+            "gh -R acme/api pr create",
+            "gh pr create -Racme/api",
+            "gh pr create --repo=github.com/acme/api",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut live = LiveFacts::default();
+            live.observe_with_cwd(
+                &HarnessEvent::ItemStarted {
+                    id: "call".into(),
+                    kind: ItemKind::ToolCall {
+                        name: "Bash".into(),
+                        input: json!({"command":command}),
+                    },
+                },
+                None,
+                Some(&cwd),
+            );
+            let transcript = temp.path().join("saved.jsonl");
+            std::fs::write(&transcript,json!({"type":"assistant","cwd":cwd,"message":{"content":[{"type":"tool_use","id":"call","name":"Bash","input":{"command":command}}]}}).to_string()).unwrap();
+            for (id, pending, scan) in [
+                (
+                    format!("live-{i}"),
+                    live.take_due(Instant::now(), true).unwrap(),
+                    None,
+                ),
+                (
+                    format!("scan-{i}"),
+                    RawFacts::default(),
+                    Some(transcript.as_path()),
+                ),
+            ] {
+                flush_live(
+                    &dir,
+                    ChatBackend::Claude,
+                    &id,
+                    pending,
+                    vec![],
+                    scan,
+                    FactPaths {
+                        home: None,
+                        repos: &repos,
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    load_facts(&facts_path(&dir, ChatBackend::Claude, &id).unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .repo_work,
+                    vec![api.clone()],
+                    "{id}"
+                );
+            }
+        }
+        let duplicate = work_repo(temp.path(), "duplicate");
+        git(
+            &duplicate,
+            &["remote", "add", "origin", "https://github.com/acme/api.git"],
+        );
+        let mut resolver = GitResolver::with_repos(&[api.clone(), duplicate]);
+        assert_eq!(resolver.resolve_selector("acme/api"), None);
+        let mut resolver = GitResolver::with_repos(&[api.clone()]);
+        assert_eq!(resolver.resolve_selector("other.example/acme/api"), None);
+        assert_eq!(resolver.resolve_selector("acme/unknown"), None);
+        git(
+            &api,
+            &[
+                "remote",
+                "set-url",
+                "upstream",
+                "https://other.example/acme/api.git",
+            ],
+        );
+        assert_eq!(
+            resolver.resolve_selector("other.example/acme/api"),
+            Some(api)
+        );
+    }
+
+    #[test]
+    fn ambiguous_shell_directories_never_fall_back_to_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = work_repo(temp.path(), "repo");
+        for command in [
+            "git -C $TARGET push",
+            "git -C missing push",
+            "cd $TARGET && git push",
+            "cd missing; git push",
+            "cd ../elsewhere || git push",
+            "cd missing && (false) || git push",
+            "cd ../elsewhere | cat; git push",
+            "GIT_DIR=/elsewhere/.git git push",
+            "GIT_DIR=/elsewhere/.git; git push",
+            "if true; then cd ../elsewhere; fi; git push",
+            "{ cd ../elsewhere; }; git push",
+            "eval 'cd ../elsewhere'; git push",
+            "git --unknown value push",
+            "git checkout --pathspec-from-file -b feature",
+            "git switch --conflict -c feature",
+            "git switch -c feature --no-create",
+            "git push $FLAGS",
+            "git branch $FLAGS feature",
+            "gh pr create --title $TITLE",
+            "export GIT_DIR=/elsewhere/.git; git push",
+            "GIT_DIR=/elsewhere/.git; git -C . push",
+        ] {
+            assert!(command_repos(command, &repo).is_empty(), "{command}");
+        }
+        assert_eq!(
+            command_repos("(cd /elsewhere); git push", &repo),
+            vec![repo.clone()]
+        );
+        assert!(command_repos("cat <<'EOF'\ngit push\nEOF", &repo).is_empty());
+        assert!(
+            command_repos("git commit -m \"$(cat <<'EOF'\nmessage\nEOF\n)\"", &repo).is_empty()
+        );
+    }
+
+    #[test]
+    fn repo_write_finding_5_relative_overrides_use_bash_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = work_repo(temp.path(), "cwd");
+        let api = work_repo(temp.path(), "api");
+        for command in [
+            "git -C ../api push",
+            "cd ../api && git push",
+            "git -C .. -C api push",
+            "git --git-dir .git -C ../api push",
+        ] {
+            assert_eq!(command_repos(command, &cwd), vec![api.clone()], "{command}");
+        }
+        let mut raw = RawFacts::default();
+        raw.observe_tool_call_with_cwd(
+            "call",
+            "Bash",
+            &json!({"command":"git push","cwd":"../api"}),
+            None,
+            Some(&cwd),
+            "now",
+        );
+        let mut facts = ChatFacts::default();
+        raw.resolve_into(&mut facts, &mut GitResolver::default());
+        assert_eq!(facts.repo_work, vec![api]);
+    }
+
+    #[test]
+    fn repo_write_finding_7_git_global_option_values_are_consumed() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = work_repo(temp.path(), "repo");
+        for options in [
+            "-c user.name=bot",
+            "--config-env user.name=BOT_NAME",
+            "--namespace test",
+            "--git-dir .git",
+            "--work-tree .",
+            "-cuser.name=bot",
+        ] {
+            assert_eq!(
+                command_repos(&format!("git {options} commit -m update"), &repo),
+                vec![repo.clone()],
+                "{options}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_write_finding_8_branch_creation_with_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = work_repo(temp.path(), "repo");
+        for command in [
+            "git switch -C feature",
+            "git switch -c feature",
+            "git switch --create=feature",
+            "git checkout -b feature",
+            "git checkout -B feature",
+            "git branch -f feature",
+            "git branch --track feature origin/main",
+            "git branch feature --force",
+        ] {
+            assert_eq!(
+                command_repos(command, &repo),
+                vec![repo.clone()],
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -3296,7 +4015,7 @@ branch refs/heads/tracey/tru-12-thing
             &HashSet::new(),
             &links,
             10,
-            None,
+            FactPaths::default(),
         );
         assert_eq!(report.scanned, 1);
         let facts = load_facts(&facts_dir.join("claude-s1.json"))
@@ -3323,7 +4042,14 @@ branch refs/heads/tracey/tru-12-thing
         assert_eq!(facts.children[0].title.as_deref(), Some("Build the thing"));
 
         // Once per transcript; hosted chats and the batch bound are honoured.
-        let again = backfill_claude(targets.clone(), &facts_dir, &HashSet::new(), &[], 10, None);
+        let again = backfill_claude(
+            targets.clone(),
+            &facts_dir,
+            &HashSet::new(),
+            &[],
+            10,
+            FactPaths::default(),
+        );
         assert_eq!((again.scanned, again.already), (0, 1));
         // A transcript that moved on after the facts were written is
         // scanned again; an untouched one is not.
@@ -3332,10 +4058,17 @@ branch refs/heads/tracey/tru-12-thing
             path: transcript.clone(),
             mtime: SystemTime::now() + std::time::Duration::from_secs(3600),
         }];
-        let rescan = backfill_claude(moved_on, &facts_dir, &HashSet::new(), &[], 10, None);
+        let rescan = backfill_claude(
+            moved_on,
+            &facts_dir,
+            &HashSet::new(),
+            &[],
+            10,
+            FactPaths::default(),
+        );
         assert_eq!((rescan.scanned, rescan.already), (1, 0));
         let hosted: HashSet<String> = ["s1".to_string()].into();
-        let skipped = backfill_claude(targets, &facts_dir, &hosted, &[], 10, None);
+        let skipped = backfill_claude(targets, &facts_dir, &hosted, &[], 10, FactPaths::default());
         assert_eq!((skipped.scanned, skipped.hosted), (0, 1));
         let bounded = backfill_claude(
             vec![BackfillTarget {
@@ -3347,7 +4080,7 @@ branch refs/heads/tracey/tru-12-thing
             &HashSet::new(),
             &[],
             0,
-            None,
+            FactPaths::default(),
         );
         assert_eq!((bounded.scanned, bounded.remaining), (0, 1));
 
@@ -3361,7 +4094,7 @@ branch refs/heads/tracey/tru-12-thing
             pending,
             vec![],
             None,
-            None,
+            FactPaths::default(),
         )
         .unwrap();
         let facts = load_facts(&facts_dir.join("claude-s1.json"))
@@ -3450,7 +4183,7 @@ branch refs/heads/tracey/tru-12-thing
             pending,
             vec![],
             Some(&transcript),
-            None,
+            FactPaths::default(),
         )
         .unwrap();
         let ids = |prs: &[PrRef]| prs.iter().map(|pr| pr.key().id()).collect::<Vec<_>>();
@@ -3479,7 +4212,7 @@ branch refs/heads/tracey/tru-12-thing
             pending,
             vec![],
             Some(&transcript),
-            None,
+            FactPaths::default(),
         )
         .unwrap();
         assert!(added.is_empty());
@@ -3502,7 +4235,7 @@ branch refs/heads/tracey/tru-12-thing
             RawFacts::default(),
             vec![],
             Some(&transcript),
-            None,
+            FactPaths::default(),
         )
         .unwrap();
         assert!(added.is_empty());
@@ -3539,7 +4272,10 @@ branch refs/heads/tracey/tru-12-thing
             &HashSet::new(),
             &[],
             1,
-            Some(&home),
+            FactPaths {
+                home: Some(&home),
+                repos: &[],
+            },
         );
         eprintln!("{report:?} in {:?}", started.elapsed());
         let facts = load_facts(&facts_path(dir.path(), ChatBackend::Claude, &id).unwrap())

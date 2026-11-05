@@ -14705,6 +14705,12 @@ impl App {
         }
         let children = chat_facts::links_for_parent(&self.chat_child_links(), &session_id);
         let dir = chat_facts::facts_dir(&config::global_config_dir());
+        let repos: Vec<PathBuf> = self
+            .repos
+            .iter()
+            .filter(|repo| matches!(repo.location, WorkspaceLocation::Local { .. }))
+            .map(|repo| repo.dir.clone())
+            .collect();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -14727,7 +14733,7 @@ impl App {
                         pending,
                         children,
                         transcript.as_deref(),
-                        home.as_deref(),
+                        chat_facts::FactPaths { home: home.as_deref(), repos: &repos },
                     )
                 })
                 .await
@@ -14790,6 +14796,12 @@ impl App {
             .collect();
         let links = self.chat_child_links();
         let dir = chat_facts::facts_dir(&config::global_config_dir());
+        let repos: Vec<PathBuf> = self
+            .repos
+            .iter()
+            .filter(|repo| matches!(repo.location, WorkspaceLocation::Local { .. }))
+            .map(|repo| repo.dir.clone())
+            .collect();
         self.chat_backfill_running = true;
         self.chat_backfill_note = None;
         Task::perform(
@@ -14802,7 +14814,10 @@ impl App {
                         &hosted,
                         &links,
                         chat_facts::BACKFILL_BATCH,
-                        home.as_deref(),
+                        chat_facts::FactPaths {
+                            home: home.as_deref(),
+                            repos: &repos,
+                        },
                     )
                 })
                 .await
