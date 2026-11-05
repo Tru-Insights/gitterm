@@ -4761,13 +4761,12 @@ enum TaskLaunchOrigin {
 impl TaskLaunchOrigin {
     fn policy_blocked(
         self,
-        has_delegation: bool,
         evaluation: &gitterm::plan_limits::PolicyEvaluation,
         provider: gitterm::plan_limits::Provider,
         parallel: bool,
         user_model_choice: bool,
     ) -> bool {
-        (matches!(self, Self::Agent) || has_delegation)
+        matches!(self, Self::Agent)
             && !evaluation.allows_start(provider, parallel, user_model_choice)
     }
 }
@@ -7432,6 +7431,7 @@ struct App {
     chat_config: config::ChatDefaults,
     task_store_error: Option<String>,
     task_ui_error: Option<String>,
+    task_launch_cost_note: Option<&'static str>,
     task_worktree_root: PathBuf,
     max_concurrent_local_tasks: usize,
     /// Open-file usage, logged to `resource.log` on band changes.
@@ -12396,7 +12396,13 @@ impl App {
     }
 
     fn launch_task_child(&mut self, task_id: &str, preset_idx: Option<usize>) -> Task<Event> {
-        match self.try_launch_task_child(task_id, preset_idx, true, TaskLaunchOrigin::User, false) {
+        self.task_launch_cost_note = None;
+        let result =
+            self.try_launch_task_child(task_id, preset_idx, true, TaskLaunchOrigin::User, false);
+        if result.is_ok() && preset_idx.is_some() {
+            self.task_launch_cost_note = Some("Explicit user preset choice overrides plan limits; this may consume remaining allowance or credits.");
+        }
+        match result {
             Ok(TaskChildLaunch::Started(task, _session)) => task,
             Ok(TaskChildLaunch::Queued { .. }) => {
                 // The rail and overview state row show "Queued · #N" — no
@@ -12792,7 +12798,6 @@ impl App {
                 gitterm::workers::WorkerProvider::Other => return false,
             };
             origin.policy_blocked(
-                worker.is_some(),
                 &self.plan_limits.evaluation_for_launch(),
                 provider,
                 self.plan_limit_running_workers(provider) > 0
@@ -19091,6 +19096,7 @@ impl App {
             chat_config: config.chat.clone(),
             task_store_error,
             task_ui_error: None,
+            task_launch_cost_note: None,
             task_worktree_root: config.task_worktree_root.clone(),
             max_concurrent_local_tasks: config.max_concurrent_local_tasks,
             fd_watch: gitterm::resource_watch::FdWatch::default(),
@@ -38513,6 +38519,9 @@ fi
         {
             content = content.push(text(error).size(10).color(theme.danger()).font(mono));
         }
+        if let Some(note) = self.task_launch_cost_note {
+            content = content.push(text(note).size(10).color(text_muted).font(mono));
+        }
 
         let mut tasks = repo_tasks
             .into_iter()
@@ -46820,7 +46829,7 @@ mod tests {
     }
 
     #[test]
-    fn third_round_mcp_launch_without_delegation_requires_policy() {
+    fn task_launch_honors_manual_preset_choices_under_hold() {
         use gitterm::plan_limits::{self, LimitWindow, PlanLimits, PlanLimitsFile, Provider};
         let now = 1_800_000_000;
         for provider in [Provider::Claude, Provider::Codex] {
@@ -46840,12 +46849,28 @@ mod tests {
             let mut file = PlanLimitsFile::default();
             file.absorb(limits);
             let held = plan_limits::evaluate_policy(&file, now);
-            // MCP task_create + task_launch_session has no worker delegation.
-            assert!(TaskLaunchOrigin::Agent.policy_blocked(false, &held, provider, false, false));
-            assert!(TaskLaunchOrigin::Agent.policy_blocked(true, &held, provider, false, false));
-            assert!(!TaskLaunchOrigin::Agent.policy_blocked(false, &held, provider, false, true));
-            assert!(!TaskLaunchOrigin::Agent.policy_blocked(true, &held, provider, false, true));
-            assert!(!TaskLaunchOrigin::User.policy_blocked(false, &held, provider, false, false));
+            // Delegation presence must not change how launch origin is treated.
+            for parallel in [false, true] {
+                assert!(TaskLaunchOrigin::Agent.policy_blocked(&held, provider, parallel, false));
+                assert!(!TaskLaunchOrigin::Agent.policy_blocked(&held, provider, parallel, true));
+                assert!(!TaskLaunchOrigin::User.policy_blocked(&held, provider, parallel, false));
+            }
+            let mut queue = vec![QueuedTaskLaunch {
+                task_id: "delegated".into(),
+                preset_idx: Some(0),
+                origin: TaskLaunchOrigin::Agent,
+                user_model_choice: false,
+            }];
+            // The UI choice can still queue for local concurrency. Promotion
+            // must retain its origin even after an automatic re-request.
+            update_queued_task_request(&mut queue, "delegated", TaskLaunchOrigin::User, false);
+            update_queued_task_request(&mut queue, "delegated", TaskLaunchOrigin::Agent, false);
+            assert!(!queue[0].origin.policy_blocked(
+                &held,
+                provider,
+                false,
+                queue[0].user_model_choice
+            ));
         }
     }
 
