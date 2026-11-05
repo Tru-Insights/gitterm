@@ -41,6 +41,8 @@ use serde_json::Value;
 const PR_HOMES_FRESH: Duration = Duration::from_secs(30);
 /// PRs one poll reads at most; the rest are read by the next.
 const PR_POLL_MAX_ITEMS: usize = 25;
+/// An immediate user-triggered refresh is coalesced per PR within this window.
+const PR_IMMEDIATE_DEBOUNCE: Duration = Duration::from_secs(10);
 /// A PR no workspace lists is forgotten this long after its last read.
 const PR_FORGET_AFTER: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Prefix of every line of a prompt that tells the coordinator news.
@@ -297,6 +299,8 @@ pub struct PrsState {
     /// PRs to read at the next tick whatever their interval (a plan was
     /// just set, an action just ran).
     pub due_now: HashSet<String>,
+    /// Last immediate user-triggered refresh request per PR.
+    immediate_requested_at: HashMap<String, Instant>,
     /// Login per account (`None` = gh's active account), from polls.
     pub logins: HashMap<Option<String>, String>,
     pub homes: Vec<(PrHome, Vec<RootPrs>)>,
@@ -315,11 +319,41 @@ pub struct PrsState {
 }
 
 impl PrsState {
-    /// An Approve / Merge run for `key` finished. Its PR is read at the
+    /// Queue an immediate refresh at most once per PR in the debounce window.
+    pub fn request_immediate_refresh(&mut self, id: String, now: Instant) -> bool {
+        if self
+            .immediate_requested_at
+            .get(&id)
+            .is_some_and(|at| now.saturating_duration_since(*at) < PR_IMMEDIATE_DEBOUNCE)
+        {
+            return false;
+        }
+        self.immediate_requested_at.insert(id.clone(), now);
+        self.due_now.insert(id);
+        true
+    }
+
+    fn request_open_workspace_refreshes(&mut self, homes: &[(PrHome, Vec<String>)], now: Instant) {
+        for (home, ids) in homes {
+            if matches!(home, PrHome::Open(_)) {
+                for id in ids {
+                    self.request_immediate_refresh(id.clone(), now);
+                }
+            }
+        }
+    }
+
+    pub(super) fn request_row_refresh(&mut self, id: String, opened: bool, now: Instant) {
+        if opened {
+            self.request_immediate_refresh(id, now);
+        }
+    }
+
+    /// An Approve / Merge / Ready run for `key` finished. Its PR is read at the
     /// next tick either way. The open confirmation for it closes on
     /// success and keeps the error on failure; returns whether it closed.
     pub fn action_done(&mut self, key: &PrKey, result: Result<String, String>) -> bool {
-        self.due_now.insert(key.id());
+        self.request_immediate_refresh(key.id(), Instant::now());
         if !self.action.as_ref().is_some_and(|c| c.key == *key) {
             return false;
         }
@@ -553,6 +587,34 @@ impl App {
 
     fn watched(&self, key: &PrKey) -> Option<&WatchedPr> {
         self.prs.watch.prs.get(&key.id())
+    }
+
+    /// A window focus refreshes open-workspace PRs, while parked work remains
+    /// on its slower schedule.
+    pub(super) fn request_open_pr_refreshes(&mut self) {
+        if self
+            .prs
+            .homes_built
+            .is_none_or(|at| at.elapsed() >= PR_HOMES_FRESH)
+        {
+            self.rebuild_pr_homes();
+        }
+        let homes: Vec<(PrHome, Vec<String>)> = self
+            .prs
+            .homes
+            .iter()
+            .map(|(home, roots)| {
+                (
+                    home.clone(),
+                    self.keys_of_roots(roots)
+                        .into_iter()
+                        .map(|(_, key)| key.id())
+                        .collect(),
+                )
+            })
+            .collect();
+        self.prs
+            .request_open_workspace_refreshes(&homes, Instant::now());
     }
 
     // -----------------------------------------------------------------------
@@ -1032,11 +1094,14 @@ impl App {
                     Ok(output) => eprintln!("[pr-watch] {}: done: {output}", key.label()),
                     Err(error) => eprintln!("[pr-watch] {}: {error}", key.label()),
                 }
-                if self.prs.action_done(&key, result) {
+                let closed = self.prs.action_done(&key, result);
+                let refresh = self.poll_pr_watch();
+                if closed {
                     // The overview row shows the new state once the
                     // `due_now` read lands.
-                    return self.apply_webview_surfaces();
+                    return Task::batch([self.apply_webview_surfaces(), refresh]);
                 }
+                return refresh;
             }
             PrEvent::ActionClose => {
                 if self.prs.action.as_ref().is_some_and(|c| c.running) {
@@ -2315,6 +2380,51 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_marks_open_workspace_prs_due_but_not_parked_prs() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        prs.request_open_workspace_refreshes(
+            &[
+                (PrHome::Open(1), vec!["open-pr".to_string()]),
+                (
+                    PrHome::Parked(ParkedKey {
+                        name: "parked".to_string(),
+                        dir: "/parked".to_string(),
+                    }),
+                    vec!["parked-pr".to_string()],
+                ),
+            ],
+            now,
+        );
+        assert!(prs.due_now.contains("open-pr"));
+        assert!(!prs.due_now.contains("parked-pr"));
+    }
+
+    #[test]
+    fn opening_a_pr_row_marks_only_that_pr_due() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        prs.request_row_refresh("closed-row".to_string(), false, now);
+        assert!(!prs.due_now.contains("closed-row"));
+        prs.request_row_refresh("opened-row".to_string(), true, now);
+        assert_eq!(prs.due_now, ["opened-row".to_string()].into());
+    }
+
+    #[test]
+    fn immediate_refresh_is_debounced_per_pr_for_ten_seconds() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        assert!(prs.request_immediate_refresh("same-pr".to_string(), now));
+        prs.due_now.clear();
+        assert!(!prs.request_immediate_refresh("same-pr".to_string(), now + Duration::from_secs(9)));
+        assert!(prs.due_now.is_empty());
+        assert!(prs.request_immediate_refresh("same-pr".to_string(), now + Duration::from_secs(10)));
+        assert!(prs.due_now.contains("same-pr"));
+    }
+
     #[test]
     fn split_done_keeps_open_and_unknown_apart_from_final() {
         let states = |k: &&str| match *k {
@@ -2419,8 +2529,6 @@ mod tests {
         assert!(pr_row_parts(true, false).merge_on_title);
         assert!(!pr_row_parts(false, false).merge_on_title);
     }
-
-    use super::*;
 
     fn confirming(key: &PrKey) -> PrsState {
         PrsState {
