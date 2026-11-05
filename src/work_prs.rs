@@ -181,6 +181,17 @@ fn split_done<K>(
     (open, done)
 }
 
+/// Queued immediate work keeps its request order ahead of periodic candidates.
+fn ordered_poll_ids(wanted: &[String], due_order: &VecDeque<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    due_order
+        .iter()
+        .chain(wanted)
+        .filter(|id| seen.insert((*id).clone()))
+        .cloned()
+        .collect()
+}
+
 /// The fold line for done PRs: "3 merged" or with "n closed".
 fn done_summary(done: &[PrState]) -> String {
     let merged = done.iter().filter(|s| **s == PrState::Merged).count();
@@ -299,6 +310,10 @@ pub struct PrsState {
     /// PRs to read at the next tick whatever their interval (a plan was
     /// just set, an action just ran).
     pub due_now: HashSet<String>,
+    /// The order immediate refreshes were queued, used ahead of periodic work.
+    due_order: VecDeque<String>,
+    /// Requests inside the debounce window, due when the window expires.
+    deferred_due: HashMap<String, Instant>,
     /// Last immediate user-triggered refresh request per PR.
     immediate_requested_at: HashMap<String, Instant>,
     /// Login per account (`None` = gh's active account), from polls.
@@ -319,18 +334,51 @@ pub struct PrsState {
 }
 
 impl PrsState {
-    /// Queue an immediate refresh at most once per PR in the debounce window.
+    /// Queue a refresh, deferring a coalesced request until its debounce ends.
     pub fn request_immediate_refresh(&mut self, id: String, now: Instant) -> bool {
-        if self
-            .immediate_requested_at
-            .get(&id)
-            .is_some_and(|at| now.saturating_duration_since(*at) < PR_IMMEDIATE_DEBOUNCE)
-        {
+        let Some(last) = self.immediate_requested_at.get(&id).copied() else {
+            self.immediate_requested_at.insert(id.clone(), now);
+            self.enqueue_due(id);
+            return true;
+        };
+        let due_at = last + PR_IMMEDIATE_DEBOUNCE;
+        if now < due_at {
+            self.deferred_due
+                .entry(id)
+                .and_modify(|due| *due = (*due).min(due_at))
+                .or_insert(due_at);
             return false;
         }
         self.immediate_requested_at.insert(id.clone(), now);
-        self.due_now.insert(id);
+        self.enqueue_due(id);
         true
+    }
+
+    fn enqueue_due(&mut self, id: String) {
+        if self.due_now.insert(id.clone()) {
+            self.due_order.push_back(id);
+        }
+    }
+
+    fn promote_deferred(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .deferred_due
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            self.deferred_due.remove(&id);
+            self.immediate_requested_at.insert(id.clone(), now);
+            self.enqueue_due(id);
+        }
+    }
+
+    fn take_due(&mut self, id: &str) {
+        self.due_now.remove(id);
+        if let Some(position) = self.due_order.iter().position(|queued| queued == id) {
+            self.due_order.remove(position);
+        }
     }
 
     fn request_open_workspace_refreshes(&mut self, homes: &[(PrHome, Vec<String>)], now: Instant) {
@@ -624,6 +672,7 @@ impl App {
     /// the due PRs unless one runs.
     pub(super) fn poll_pr_watch(&mut self) -> Task<Event> {
         let mut tasks: Vec<Task<Event>> = Vec::new();
+        self.prs.promote_deferred(Instant::now());
         // Facts PRs come from the index; load it once if nothing has.
         if !self.prs.index_requested
             && self.chat_index_loaded_at.is_none()
@@ -657,17 +706,31 @@ impl App {
             }
         }
         let mut items: Vec<pr_watch::PollItem> = Vec::new();
-        for (key, interval) in wanted {
+        let wanted_by_id: HashMap<String, (PrKey, Duration)> = wanted
+            .iter()
+            .cloned()
+            .map(|(key, interval)| (key.id(), (key, interval)))
+            .collect();
+        let wanted_ids = wanted.iter().map(|(key, _)| key.id()).collect::<Vec<_>>();
+        let ordered_ids = ordered_poll_ids(&wanted_ids, &self.prs.due_order);
+        let mut selected = HashSet::new();
+        for id in ordered_ids {
             if items.len() >= PR_POLL_MAX_ITEMS {
                 break;
             }
+            if !selected.insert(id.clone()) {
+                continue;
+            }
+            let Some((key, interval)) = wanted_by_id.get(&id) else {
+                continue;
+            };
             let id = key.id();
             let watched = self.prs.watch.prs.get(&id);
             if watched.is_some_and(WatchedPr::done) {
                 continue;
             }
             let due = self.prs.due_now.contains(&id)
-                || watched.is_none_or(|watched| watched.due(watched.interval_for(interval), now));
+                || watched.is_none_or(|watched| watched.due(watched.interval_for(*interval), now));
             if !due {
                 continue;
             }
@@ -675,14 +738,14 @@ impl App {
                 account: pr_watch::account_for(key.owner(), &self.github_accounts),
                 snapshot: watched.map(|w| w.snapshot.clone()).unwrap_or_default(),
                 etags: watched.map(|w| w.etags.clone()).unwrap_or_default(),
-                key,
+                key: key.clone(),
             });
         }
         if items.is_empty() {
             return Task::batch(tasks);
         }
         for item in &items {
-            self.prs.due_now.remove(&item.key.id());
+            self.prs.take_due(&item.key.id());
         }
         self.prs.in_flight = true;
         tasks.push(Task::perform(
@@ -826,7 +889,7 @@ impl App {
         });
         let kept_holds = plan.replace_entries(entries, &chat_facts::now_stamp());
         for entry in &plan.entries {
-            self.prs.due_now.insert(entry.key().id());
+            self.prs.enqueue_due(entry.key().id());
         }
         eprintln!(
             "[merge-plan] {root}: plan set with {} PR(s)",
@@ -2421,8 +2484,64 @@ mod tests {
         prs.due_now.clear();
         assert!(!prs.request_immediate_refresh("same-pr".to_string(), now + Duration::from_secs(9)));
         assert!(prs.due_now.is_empty());
-        assert!(prs.request_immediate_refresh("same-pr".to_string(), now + Duration::from_secs(10)));
+        assert_eq!(
+            prs.deferred_due.get("same-pr"),
+            Some(&(now + Duration::from_secs(10)))
+        );
+        prs.promote_deferred(now + Duration::from_secs(9));
+        assert!(prs.due_now.is_empty());
+        prs.promote_deferred(now + Duration::from_secs(10));
         assert!(prs.due_now.contains("same-pr"));
+    }
+
+    #[test]
+    fn action_refresh_after_a_recent_row_read_is_deferred_not_lost() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        prs.request_row_refresh("owner/repo#1".to_string(), true, now);
+        prs.take_due("owner/repo#1"); // the row refresh completed
+
+        assert!(!prs
+            .request_immediate_refresh("owner/repo#1".to_string(), now + Duration::from_secs(2),)); // Ready / Approve / Merge completed during the debounce window
+        prs.promote_deferred(now + Duration::from_secs(9));
+        assert!(!prs.due_now.contains("owner/repo#1"));
+        prs.promote_deferred(now + Duration::from_secs(10));
+        assert!(prs.due_now.contains("owner/repo#1"));
+    }
+
+    #[test]
+    fn focus_requests_during_a_full_poll_do_not_starve_the_next_pr_batch() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        let ids = (1..=26)
+            .map(|n| format!("owner/repo#{n}"))
+            .collect::<Vec<_>>();
+        for id in &ids {
+            prs.request_immediate_refresh(id.clone(), now);
+        }
+
+        let first_batch = ordered_poll_ids(&ids, &prs.due_order)
+            .into_iter()
+            .take(PR_POLL_MAX_ITEMS)
+            .collect::<Vec<_>>();
+        for id in &first_batch {
+            prs.take_due(id);
+        }
+        assert_eq!(
+            prs.due_order.front().map(String::as_str),
+            Some("owner/repo#26")
+        );
+
+        // Focus repeats while the first 25 PRs are still in flight. Their
+        // requests append after the older, still queued 26th PR.
+        for id in &ids {
+            prs.request_immediate_refresh(id.clone(), now + Duration::from_secs(11));
+        }
+        let next_batch = ordered_poll_ids(&ids, &prs.due_order)
+            .into_iter()
+            .take(PR_POLL_MAX_ITEMS)
+            .collect::<Vec<_>>();
+        assert!(next_batch.iter().any(|id| id == "owner/repo#26"));
     }
 
     #[test]
