@@ -362,7 +362,8 @@ pub struct NewsItem {
     pub at: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dismissed: bool,
-    /// Sent to the coordinator, by "Tell coordinator" or by itself.
+    /// Sent to the coordinator by itself (TRU-197); an older watch file may
+    /// also carry items sent by hand.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub told: bool,
     /// [`NewsKind::NewActivity`] that is approvals only: informational.
