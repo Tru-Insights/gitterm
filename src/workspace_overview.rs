@@ -1586,6 +1586,29 @@ pub(crate) async fn run_git_records(
     args: &[&str],
     timeout: Duration,
     separator: u8,
+    on_record: impl FnMut(&[u8]) -> Result<bool, String>,
+) -> Result<(), String> {
+    run_git_records_bounded(
+        dir,
+        args,
+        timeout,
+        separator,
+        usize::MAX,
+        usize::MAX,
+        on_record,
+    )
+    .await
+}
+
+/// Like `run_git_records`, but limits each record and the aggregate stdout bytes
+/// (including separators) before buffering them. Exceeding either cap is an error.
+pub(crate) async fn run_git_records_bounded(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+    separator: u8,
+    record_byte_cap: usize,
+    total_byte_cap: usize,
     mut on_record: impl FnMut(&[u8]) -> Result<bool, String>,
 ) -> Result<(), String> {
     let what = || format!("git {} in {}", args.join(" "), dir.display());
@@ -1601,11 +1624,23 @@ pub(crate) async fn run_git_records(
         // before anything waits on it, or git blocks on a full stdout pipe.
         let mut reader = BufReader::new(stdout);
         let mut record = Vec::new();
+        let mut total = 0usize;
         loop {
             record.clear();
-            match reader.read_until(separator, &mut record).await {
+            let limit = record_byte_cap
+                .min(total_byte_cap.saturating_sub(total))
+                .saturating_add(1);
+            match (&mut reader)
+                .take(limit as u64)
+                .read_until(separator, &mut record)
+                .await
+            {
                 Ok(0) => break,
-                Ok(_) => {
+                Ok(count) => {
+                    if count > record_byte_cap || count > total_byte_cap.saturating_sub(total) {
+                        return Err(format!("reading {}: output exceeds record ({record_byte_cap}) or total ({total_byte_cap}) byte limit", what()));
+                    }
+                    total += count;
                     let body = record.strip_suffix(&[separator]).unwrap_or(&record);
                     let keep_going = on_record(body);
                     if !matches!(keep_going, Ok(true)) {
@@ -1636,6 +1671,30 @@ pub(crate) async fn run_git_records(
     tokio::time::timeout(timeout, run)
         .await
         .map_err(|_| format!("{} timed out after {}s", what(), timeout.as_secs()))?
+}
+
+/// Resolve an untrusted revision as a commit before using it in other git calls.
+pub(crate) async fn resolve_commit(dir: &Path, rev: &str) -> Result<String, String> {
+    let oid = git_text(
+        dir,
+        &[
+            "--no-optional-locks",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{rev}^{{commit}}"),
+        ],
+        GIT_TIMEOUT,
+    )
+    .await?;
+    let oid = oid.trim();
+    if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "resolving commit {rev:?} in {}: git returned an invalid object id",
+            dir.display()
+        ));
+    }
+    Ok(oid.to_string())
 }
 
 pub(crate) async fn git_text(

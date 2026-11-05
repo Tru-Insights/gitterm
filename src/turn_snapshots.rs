@@ -240,7 +240,8 @@ pub async fn save(dir: &Path, chat: &str, turn: u64, phase: &str, oid: &str) -> 
         return Err("invalid snapshot phase".into());
     }
     let reference = format!("{}{turn}/{phase}", checkout_prefix(dir, chat).await?);
-    git(dir, None, &["update-ref", &reference, oid]).await?;
+    let oid = crate::workspace_overview::resolve_commit(dir, oid).await?;
+    git(dir, None, &["update-ref", &reference, &oid]).await?;
     Ok(())
 }
 
@@ -602,6 +603,24 @@ mod tests {
         g(dir.path(), &["commit", "-qm", "fixture"]);
         dir
     }
+    #[tokio::test]
+    async fn snapshot_publication_resolves_option_looking_revisions_as_commits() {
+        let temp = repo();
+        let dir = temp.path();
+        g(dir, &["update-ref", "refs/heads/--stdin", "HEAD"]);
+        save(dir, "option-test", 1, "start", "--stdin")
+            .await
+            .unwrap();
+        let listed = turns(dir, "option-test").await.unwrap();
+        assert_eq!(listed[0].start, Some(g(dir, &["rev-parse", "HEAD"])));
+        assert!(save(dir, "option-test", 2, "start", "--not-a-revision")
+            .await
+            .is_err());
+        let tree = g(dir, &["rev-parse", "HEAD^{tree}"]);
+        assert!(save(dir, "option-test", 2, "start", &tree).await.is_err());
+        assert_eq!(turns(dir, "option-test").await.unwrap().len(), 1);
+    }
+
     #[test]
     fn fixture_commands_ignore_inherited_git_repository() {
         let sentinel = repo();

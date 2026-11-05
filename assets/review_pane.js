@@ -38,16 +38,13 @@
   });
   let firstCommit = body.dataset.firstCommit || null;
   document.querySelectorAll('button[data-commit]').forEach((button) => {
-    button.addEventListener('click', (event) => {
+    button.addEventListener('click', () => {
       const sha = button.dataset.commit;
-      if (event.shiftKey && firstCommit) {
-        post({ type: 'review.commit_range', first: firstCommit, last: sha });
-        firstCommit = null;
-      } else if (!firstCommit) {
+      if (!firstCommit) {
         firstCommit = sha;
-        post({ type: 'review.commit_range', first: sha, last: sha });
+        post({ type: 'review.commit_range', first: sha, last: sha, pending: true });
       } else {
-        post({ type: 'review.commit_range', first: firstCommit, last: sha });
+        post({ type: 'review.commit_range', first: firstCommit, last: sha, pending: false });
         firstCommit = null;
       }
     });

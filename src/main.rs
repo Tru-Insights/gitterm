@@ -15675,7 +15675,12 @@ impl App {
                     pane.focus.clone(),
                 )
             }
-            ReviewIpc::SelectCommits { first, last, .. } => {
+            ReviewIpc::SelectCommits {
+                first,
+                last,
+                pending,
+                ..
+            } => {
                 let first_index = pane.commits.iter().position(|commit| commit.sha == first);
                 let last_index = pane.commits.iter().position(|commit| commit.sha == last);
                 let (Some(first_index), Some(last_index)) = (first_index, last_index) else {
@@ -15687,6 +15692,7 @@ impl App {
                 let range = review_pane::CommitRange {
                     first: pane.commits[older].sha.clone(),
                     last: pane.commits[newer].sha.clone(),
+                    pending,
                 };
                 self.start_review(
                     pane.target.clone(),

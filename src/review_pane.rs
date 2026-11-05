@@ -35,7 +35,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::workspace_overview::{git_text, run_git_records, BaseChoice, DiffSource, GIT_TIMEOUT};
+use crate::workspace_overview::{
+    git_text, resolve_commit, run_git_records, run_git_records_bounded, BaseChoice, DiffSource,
+    GIT_TIMEOUT,
+};
 
 /// Lines of one file shown before it is cut (`truncated`).
 pub const FILE_LINE_CAP: usize = 2_000;
@@ -55,6 +58,10 @@ pub const FILE_LIST_CAP: usize = 2_000;
 pub const UNTRACKED_SCAN_CAP: usize = 10_000;
 /// Branch commits shown in the Commits source. One extra row detects truncation.
 pub const COMMIT_LIST_CAP: usize = 200;
+/// Input caps include separators; excessive metadata fails visibly.
+const COMMIT_RECORD_BYTE_CAP: usize = 64 * 1024;
+const COMMIT_TOTAL_BYTE_CAP: usize = 2 * 1024 * 1024;
+const COMMIT_TEXT_BYTE_CAP: usize = 512;
 /// Bytes sniffed for a NUL to call a file binary (git's heuristic).
 const BINARY_SNIFF_BYTES: usize = 8_000;
 /// Paths per `git hash-object` call.
@@ -251,6 +258,7 @@ pub struct ReviewTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewCommit {
     pub sha: String,
+    pub short_sha: String,
     pub subject: String,
     pub author: String,
     pub authored_at: i64,
@@ -261,6 +269,8 @@ pub struct ReviewCommit {
 pub struct CommitRange {
     pub first: String,
     pub last: String,
+    /// A first click is waiting for a second endpoint; a completed range is not.
+    pub pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1063,13 +1073,15 @@ async fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 /// Lists only commits reachable from HEAD and not from the selected base.
 /// The extra row tells the caller whether the UI cap cut the list.
 pub async fn branch_commits(dir: &Path, base: &str) -> Result<(Vec<ReviewCommit>, bool), String> {
+    let base = resolve_commit(dir, base).await?;
     let range = format!("{base}..HEAD");
     let mut commits = Vec::new();
-    run_git_records(
+    run_git_records_bounded(
         dir,
         &[
             "--no-optional-locks",
             "log",
+            "--topo-order",
             &format!("--max-count={}", COMMIT_LIST_CAP + 1),
             "--format=%H%x00%h%x00%s%x00%an%x00%at",
             &range,
@@ -1077,6 +1089,8 @@ pub async fn branch_commits(dir: &Path, base: &str) -> Result<(Vec<ReviewCommit>
         ],
         GIT_TIMEOUT,
         b'\n',
+        COMMIT_RECORD_BYTE_CAP,
+        COMMIT_TOTAL_BYTE_CAP,
         |record| {
             let fields: Vec<&[u8]> = record.split(|byte| *byte == 0).collect();
             if fields.len() != 5 {
@@ -1101,9 +1115,10 @@ pub async fn branch_commits(dir: &Path, base: &str) -> Result<(Vec<ReviewCommit>
                 )
             })?;
             commits.push(ReviewCommit {
-                sha: short_sha,
-                subject: text(fields[2]),
-                author: text(fields[3]),
+                sha,
+                short_sha,
+                subject: commit_metadata(fields[2]),
+                author: commit_metadata(fields[3]),
                 authored_at,
             });
             Ok(true)
@@ -1115,12 +1130,27 @@ pub async fn branch_commits(dir: &Path, base: &str) -> Result<(Vec<ReviewCommit>
     Ok((commits, truncated))
 }
 
+fn commit_metadata(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if text.len() > COMMIT_TEXT_BYTE_CAP {
+        let mut end = COMMIT_TEXT_BYTE_CAP - '…'.len_utf8();
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
+}
+
 /// The two endpoints used for a commit diff: parent of the oldest selected
 /// commit (or the empty tree for a root commit), through the newest selected.
 pub async fn commit_diff_endpoints(
     dir: &Path,
     range: &CommitRange,
 ) -> Result<(String, String), String> {
+    let first = resolve_commit(dir, &range.first).await?;
+    let newest = resolve_commit(dir, &range.last).await?;
     let ancestry = git_text(
         dir,
         &[
@@ -1129,7 +1159,7 @@ pub async fn commit_diff_endpoints(
             "--parents",
             "-n",
             "1",
-            &range.first,
+            &first,
         ],
         GIT_TIMEOUT,
     )
@@ -1143,14 +1173,7 @@ pub async fn commit_diff_endpoints(
         Some(parent) => (*parent).to_string(),
         None => empty_tree_id(dir).await?,
     };
-    let newest = git_text(
-        dir,
-        &["--no-optional-locks", "rev-parse", "--verify", &range.last],
-        GIT_TIMEOUT,
-    )
-    .await
-    .map_err(|error| format!("cannot resolve selected commit {}: {error}", range.last))?;
-    Ok((from, newest.trim().to_string()))
+    Ok((from, newest))
 }
 
 async fn empty_tree_id(dir: &Path) -> Result<String, String> {
@@ -1350,13 +1373,17 @@ pub async fn load_review_source(
                     .iter()
                     .find(|turn| turn.number == *number)
                     .ok_or("selected turn is no longer available")?;
+                let start = turn
+                    .start
+                    .as_deref()
+                    .ok_or("turn has no start snapshot (checkout discovered late or skipped)")?;
+                let end = turn
+                    .end
+                    .as_deref()
+                    .ok_or("turn has no end snapshot (running or skipped)")?;
                 vec![
-                    turn.start.clone().ok_or(
-                        "turn has no start snapshot (checkout discovered late or skipped)",
-                    )?,
-                    turn.end
-                        .clone()
-                        .ok_or("turn has no end snapshot (running or skipped)")?,
+                    resolve_commit(&checkout, start).await?,
+                    resolve_commit(&checkout, end).await?,
                 ]
             }
             None => {
@@ -1365,7 +1392,10 @@ pub async fn load_review_source(
             }
         },
         (ReviewSource::Uncommitted, _) => vec!["HEAD".to_string()],
-        (ReviewSource::VsBase, _) => vec![format!("{}...HEAD", base.as_ref().unwrap().reference)],
+        (ReviewSource::VsBase, _) => vec![format!(
+            "{}...HEAD",
+            resolve_commit(&checkout, &base.as_ref().unwrap().reference).await?
+        )],
         (ReviewSource::Commits(None), _) => vec!["HEAD".to_string(), "HEAD".to_string()],
         (ReviewSource::Commits(Some(_)), Some(range)) => {
             let (from, to) = commit_diff_endpoints(&checkout, range).await?;
@@ -1616,7 +1646,12 @@ pub async fn load_review_source(
         Some(base) => {
             let text = git_text(
                 &checkout,
-                &["--no-optional-locks", "merge-base", &base.reference, "HEAD"],
+                &[
+                    "--no-optional-locks",
+                    "merge-base",
+                    &resolve_commit(&checkout, &base.reference).await?,
+                    "HEAD",
+                ],
                 GIT_TIMEOUT,
             )
             .await?;
@@ -1687,7 +1722,10 @@ async fn other_source_paths(
             let Some(base) = base else {
                 return Ok(Vec::new());
             };
-            let range = format!("{}...HEAD", base.reference);
+            let range = format!(
+                "{}...HEAD",
+                resolve_commit(checkout, &base.reference).await?
+            );
             let names = git_bytes(
                 checkout,
                 &[
@@ -1863,6 +1901,7 @@ pub enum ReviewIpc {
         token: String,
         first: String,
         last: String,
+        pending: bool,
     },
     /// A file's Viewed checkbox.
     SetViewed {
@@ -1915,6 +1954,7 @@ enum WireIpc {
         token: String,
         first: String,
         last: String,
+        pending: bool,
     },
     #[serde(rename = "review.viewed")]
     Viewed {
@@ -1971,14 +2011,24 @@ pub fn parse_ipc(body: &str) -> Result<ReviewIpc, String> {
         WireIpc::Turns { token } => ReviewIpc::ShowTurns { token },
         WireIpc::Turn { token, number } => ReviewIpc::SelectTurn { token, number },
         WireIpc::Commits { token } => ReviewIpc::ShowCommits { token },
-        WireIpc::CommitRange { token, first, last } => {
+        WireIpc::CommitRange {
+            token,
+            first,
+            last,
+            pending,
+        } => {
             let valid = |sha: &str| {
-                !sha.is_empty() && sha.len() <= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+                !sha.is_empty() && sha.len() <= 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())
             };
-            if !valid(&first) || !valid(&last) {
+            if !valid(&first) || !valid(&last) || (pending && first != last) {
                 return Err("review page sent an invalid commit id".to_string());
             }
-            ReviewIpc::SelectCommits { token, first, last }
+            ReviewIpc::SelectCommits {
+                token,
+                first,
+                last,
+                pending,
+            }
         }
         WireIpc::Close { token } => ReviewIpc::Close { token },
         WireIpc::OpenFile { token, path } => ReviewIpc::OpenFile {
@@ -2206,7 +2256,7 @@ pub fn render_page(page: &ReviewPage) -> String {
             ReviewSource::Turns { .. } => "turns",
         },
         match &page.source {
-            ReviewSource::Commits(Some(range)) =>
+            ReviewSource::Commits(Some(range)) if range.pending =>
                 format!("data-first-commit=\"{}\"", escape_html(&range.first)),
             _ => String::new(),
         }
@@ -2416,7 +2466,7 @@ fn render_commits(html: &mut String, page: &ReviewPage) {
                 if commit.sha == range.first || commit.sha == range.last { " selected" } else { "" }
             } else { "" },
             escape_html(&commit.sha), escape_html(&commit.subject), escape_html(&commit.author),
-            escape_html(&commit.sha), escape_html(&commit.subject), escape_html(&commit.author),
+            escape_html(&commit.short_sha), escape_html(&commit.subject), escape_html(&commit.author),
             escape_html(&commit_age(commit.authored_at))
         ));
     }
@@ -3133,12 +3183,13 @@ mod tests {
         );
         assert_eq!(
             parse_ipc(
-                r#"{"type":"review.commit_range","token":"t1","first":"abcdef1","last":"abcdef2"}"#
+                r#"{"type":"review.commit_range","token":"t1","first":"abcdef1","last":"abcdef2","pending":false}"#
             ),
             Ok(ReviewIpc::SelectCommits {
                 token: "t1".into(),
                 first: "abcdef1".into(),
-                last: "abcdef2".into()
+                last: "abcdef2".into(),
+                pending: false
             })
         );
         assert_eq!(
@@ -3394,6 +3445,7 @@ mod tests {
         });
         let commits = [ReviewCommit {
             sha: "abcdef1".into(),
+            short_sha: "abcdef1".into(),
             subject: "Example commit".into(),
             author: "Tracey".into(),
             authored_at: chrono::Utc::now().timestamp() - 3_600,
@@ -3404,6 +3456,7 @@ mod tests {
             source: ReviewSource::Commits(Some(CommitRange {
                 first: "abcdef1".into(),
                 last: "abcdef1".into(),
+                pending: true,
             })),
             commits: &commits,
             turns: &[],
@@ -3433,6 +3486,8 @@ mod tests {
 
     fn git(dir: &Path, args: &[&str]) {
         let status = crate::agentd::git::git_command()
+            // A commit hook's author override would defeat the fixture's user.name.
+            .env_remove("GIT_AUTHOR_NAME")
             .args([
                 "-c",
                 "user.name=t",
@@ -3471,6 +3526,240 @@ mod tests {
                 source: crate::workspace_overview::BaseSource::Local,
                 considered: 1,
             }),
+        }
+    }
+
+    fn review_fixture() -> tempfile::TempDir {
+        let temp = tempfile::Builder::new()
+            .prefix("tru188-")
+            .tempdir()
+            .unwrap();
+        git(temp.path(), &["init", "-q", "-b", "main"]);
+        git(temp.path(), &["commit", "--allow-empty", "-qm", "base"]);
+        git(temp.path(), &["checkout", "-qb", "feature"]);
+        temp
+    }
+
+    #[tokio::test]
+    async fn regression_review_base_cannot_inject_git_output_options() {
+        let temp = review_fixture();
+        let dir = temp.path();
+        let base = "--output=review".to_string();
+        git(dir, &["update-ref", &format!("refs/heads/{base}"), "HEAD"]);
+        git(dir, &["commit", "--allow-empty", "-qm", "change"]);
+        let result = branch_commits(dir, &base).await;
+        assert!(
+            !dir.join("review..HEAD").exists(),
+            "read-only log wrote a file"
+        );
+        assert_eq!(result.unwrap().0.len(), 1);
+        load_review_source(target(dir, Some(&base)), ReviewSource::VsBase)
+            .await
+            .unwrap();
+        assert!(!dir.join("review...HEAD").exists());
+        let invalid = "--output=invalid".to_string();
+        assert!(branch_commits(dir, &invalid).await.is_err());
+        assert!(!dir.join("invalid..HEAD").exists());
+        let secondary = other_source_paths(
+            dir,
+            DiffSource::Uncommitted,
+            target(dir, Some(&base)).base.as_ref(),
+        )
+        .await;
+        assert!(secondary.is_ok());
+        assert!(!dir.join("review...HEAD").exists());
+        git(dir, &["update-ref", "refs/heads/--all", "HEAD"]);
+        let selected = git_out(dir, &["rev-parse", "HEAD"]);
+        let parent = git_out(dir, &["rev-parse", "HEAD^"]);
+        let endpoints = commit_diff_endpoints(
+            dir,
+            &CommitRange {
+                first: "--all".into(),
+                last: "--all".into(),
+                pending: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(endpoints, (parent, selected));
+        for (first, last) in [(invalid.as_str(), "HEAD"), ("HEAD", invalid.as_str())] {
+            assert!(commit_diff_endpoints(
+                dir,
+                &CommitRange {
+                    first: first.into(),
+                    last: last.into(),
+                    pending: false,
+                }
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn regression_review_selection_uses_full_ids_despite_short_sha_refs() {
+        let temp = review_fixture();
+        let dir = temp.path();
+        let base = git_out(dir, &["rev-parse", "HEAD"]);
+        git(dir, &["commit", "--allow-empty", "-qm", "selected"]);
+        let selected = git_out(dir, &["rev-parse", "HEAD"]);
+        let short = git_out(dir, &["rev-parse", "--short", "HEAD"]);
+        git(dir, &["tag", &short, &base]);
+        let (commits, _) = branch_commits(dir, "main").await.unwrap();
+        let endpoints = commit_diff_endpoints(
+            dir,
+            &CommitRange {
+                first: commits[0].sha.clone(),
+                last: commits[0].sha.clone(),
+                pending: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(endpoints, (base, selected.clone()));
+        assert_eq!(commits[0].sha, selected);
+    }
+
+    #[tokio::test]
+    async fn regression_review_range_respects_topology_with_clock_skew() {
+        let temp = review_fixture();
+        let dir = temp.path();
+        let tree = git_out(dir, &["rev-parse", "HEAD^{tree}"]);
+        let base = git_out(dir, &["rev-parse", "HEAD"]);
+        let dated = |parents: &[&str], date: &str, subject: &str| {
+            let mut command = crate::agentd::git::git_command();
+            command
+                .current_dir(dir)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "commit-tree",
+                    &tree,
+                ]);
+            for parent in parents {
+                command.args(["-p", parent]);
+            }
+            let out = command.args(["-m", subject]).output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let a = dated(&[&base], "2000000000 +0000", "A");
+        let b = dated(&[&a], "1000000000 +0000", "B");
+        let merge = dated(&[&a, &b], "2100000000 +0000", "merge");
+        git(dir, &["update-ref", "HEAD", &merge]);
+        let (commits, _) = branch_commits(dir, "main").await.unwrap();
+        assert_eq!(
+            commits
+                .iter()
+                .map(|c| c.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["merge", "B", "A"]
+        );
+        let endpoints = commit_diff_endpoints(
+            dir,
+            &CommitRange {
+                first: commits[2].sha.clone(),
+                last: commits[1].sha.clone(),
+                pending: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(endpoints, (base, b));
+    }
+
+    #[tokio::test]
+    async fn regression_review_metadata_is_bounded() {
+        let temp = review_fixture();
+        let dir = temp.path();
+        let message = dir.join("message");
+        std::fs::write(&message, "界".repeat(1024)).unwrap();
+        git(
+            dir,
+            &[
+                "-c",
+                &format!("user.name={}", "a".repeat(1024)),
+                "commit",
+                "--allow-empty",
+                "-qF",
+                message.to_str().unwrap(),
+            ],
+        );
+        let (commits, _) = branch_commits(dir, "main").await.unwrap();
+        assert!(commits[0].subject.len() <= 512 && commits[0].subject.ends_with('…'));
+        assert!(commits[0].author.len() <= 512 && commits[0].author.ends_with('…'));
+        std::fs::write(&message, "x".repeat(128 * 1024)).unwrap();
+        git(
+            dir,
+            &["commit", "--allow-empty", "-qF", message.to_str().unwrap()],
+        );
+        assert!(
+            branch_commits(dir, "main").await.is_err(),
+            "oversized record must fail visibly"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_review_metadata_aggregate_is_bounded() {
+        let temp = review_fixture();
+        let dir = temp.path();
+        let message = dir.join("message");
+        std::fs::write(&message, "x".repeat(COMMIT_RECORD_BYTE_CAP - 1024)).unwrap();
+        for _ in 0..34 {
+            git(
+                dir,
+                &["commit", "--allow-empty", "-qF", message.to_str().unwrap()],
+            );
+        }
+        let error = branch_commits(dir, "main").await.unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
+    }
+
+    #[test]
+    fn regression_review_completed_range_does_not_restore_pending_anchor() {
+        assert!(parse_ipc(r#"{"type":"review.commit_range","token":"t","first":"abcdef1","last":"abcdef2","pending":true}"#).is_err());
+        assert!(matches!(
+            parse_ipc(
+                r#"{"type":"review.commit_range","token":"t","first":"abcdef1","last":"abcdef1","pending":true}"#
+            ),
+            Ok(ReviewIpc::SelectCommits { pending: true, .. })
+        ));
+        let (target, _) = hostile_diff();
+        for (last, pending) in [("abcdef2", false), ("abcdef1", false), ("abcdef1", true)] {
+            let html = render_page(&ReviewPage {
+                target: &target,
+                source: ReviewSource::Commits(Some(CommitRange {
+                    first: "abcdef1".into(),
+                    last: last.into(),
+                    pending,
+                })),
+                commits: &[],
+                turns: &[],
+                turns_available: false,
+                commits_truncated: false,
+                commits_error: None,
+                state: PageState::Loading,
+                dark: true,
+                hide_noise: false,
+                token: "t",
+                nonce: "n",
+                focus: None,
+            });
+            let body = html
+                .split("<body")
+                .nth(1)
+                .unwrap()
+                .split('>')
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("data-first-commit") == pending,
+                "completed range restored its anchor: {body}"
+            );
         }
     }
 
@@ -3567,6 +3856,7 @@ mod tests {
             &CommitRange {
                 first: root.clone(),
                 last: root.clone(),
+                pending: false,
             },
         )
         .await
@@ -3597,6 +3887,7 @@ mod tests {
             &CommitRange {
                 first: second.clone(),
                 last: second.clone(),
+                pending: false,
             },
         )
         .await
@@ -3607,6 +3898,7 @@ mod tests {
             &CommitRange {
                 first: root.clone(),
                 last: second.clone(),
+                pending: false,
             },
         )
         .await
@@ -3625,6 +3917,7 @@ mod tests {
             &CommitRange {
                 first: injected,
                 last: second,
+                pending: false
             }
         )
         .await
