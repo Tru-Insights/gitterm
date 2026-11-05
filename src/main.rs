@@ -8203,11 +8203,20 @@ fn horizontal_wheel_offset(
     }
 }
 
-fn hovered_horizontal_strip(hovered: &[HorizontalStrip]) -> Option<HorizontalStrip> {
-    hovered.iter().copied().max_by_key(|strip| match strip {
-        HorizontalStrip::ChatWorkspaceActions => 1,
-        _ => 0,
-    })
+fn hovered_horizontal_strip(
+    hovered: &[HorizontalStrip],
+    chat_workspace_actions_mounted: bool,
+) -> Option<HorizontalStrip> {
+    hovered
+        .iter()
+        .copied()
+        .filter(|strip| {
+            chat_workspace_actions_mounted || *strip != HorizontalStrip::ChatWorkspaceActions
+        })
+        .max_by_key(|strip| match strip {
+            HorizontalStrip::ChatWorkspaceActions => 1,
+            _ => 0,
+        })
 }
 
 impl HorizontalStrip {
@@ -29436,7 +29445,10 @@ fi
                 return Task::none();
             }
             Event::WheelScrolled(status, delta) => {
-                let Some(strip) = hovered_horizontal_strip(&self.hovered_horizontal_strips) else {
+                let Some(strip) = hovered_horizontal_strip(
+                    &self.hovered_horizontal_strips,
+                    self.chat_add_to_workspace_open,
+                ) else {
                     return Task::none();
                 };
                 let Some(x) = horizontal_wheel_offset(status, delta) else {
@@ -46048,11 +46060,28 @@ mod tests {
     #[test]
     fn innermost_hovered_strip_wins_regardless_of_enter_order() {
         assert_eq!(
-            hovered_horizontal_strip(&[
-                HorizontalStrip::ChatWorkspaceActions,
-                HorizontalStrip::WorkspaceSlide,
-            ]),
+            hovered_horizontal_strip(
+                &[
+                    HorizontalStrip::ChatWorkspaceActions,
+                    HorizontalStrip::WorkspaceSlide,
+                ],
+                true
+            ),
             Some(HorizontalStrip::ChatWorkspaceActions)
+        );
+    }
+
+    #[test]
+    fn removed_chat_workspace_picker_does_not_keep_hover_priority() {
+        assert_eq!(
+            hovered_horizontal_strip(
+                &[
+                    HorizontalStrip::ChatWorkspaceActions,
+                    HorizontalStrip::WorkspaceSlide,
+                ],
+                false,
+            ),
+            Some(HorizontalStrip::WorkspaceSlide)
         );
     }
 
