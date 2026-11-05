@@ -227,6 +227,23 @@
   .sa-tool.done { color: var(--result); } .sa-tool.error { color: var(--err); }
   .sa-text { white-space: pre-wrap; word-break: break-word; font-size: 12px; max-height: 240px; overflow: auto; margin-top: 4px; }
 
+  /* A finished turn's work folded into one row, and each run of tool
+     cards in it into one line (TRU-209). */
+  details.turn-fold { margin: 4px 0 8px; }
+  details.turn-fold > summary, details.tool-run > summary {
+    cursor: pointer; user-select: none; list-style: none;
+    display: flex; gap: 6px; align-items: baseline;
+    color: var(--fg-muted); font-size: 13px; padding: 2px 0;
+  }
+  details.tool-run > summary { font-size: 12.5px; }
+  details.turn-fold > summary::-webkit-details-marker, details.tool-run > summary::-webkit-details-marker { display: none; }
+  details.turn-fold > summary:hover, details.tool-run > summary:hover { color: var(--fg); }
+  details.turn-fold > summary::after, details.tool-run > summary::after { content: '\203A'; display: inline-block; transition: transform 0.12s; }
+  details.turn-fold[open] > summary::after, details.tool-run[open] > summary::after { transform: rotate(90deg); }
+  .tf-body { margin: 4px 0 2px; padding-left: 12px; border-left: 2px solid var(--border); }
+  details.tool-run { margin: 4px 0; }
+  .tr-failed { color: var(--err); }
+
   .note { color: var(--fg-muted); font-size: 12px; margin: 6px 0; }
   .note.warn { color: var(--warn); }
   .error-block {
@@ -704,6 +721,7 @@
   let thinking = null;        // current thinking block
   const items = new Map();    // tool_use id -> card state
   const pending = new Map();  // request_id -> {tool_use_id, kind, sending}
+  let turn = null;            // the running turn: {startMs, blocks: [{node, at}]} (TRU-209)
 
   function el(tag, cls, text) {
     const e = document.createElement(tag);
@@ -809,6 +827,7 @@
   });
   function append(node) {
     messagesEl.appendChild(node);
+    if (turn) turn.blocks.push({ node, at: replaying ? null : Date.now() });
     scrollIfFollowing();
     return node;
   }
@@ -894,6 +913,204 @@
     earlierBlocks = 0;
     unrenderedMd.clear();
     earlierEl.remove();
+  }
+  // Recount the detached chunks after blocks moved out of them (a fold).
+  function retallyEarlier() {
+    for (let i = earlier.length - 1; i >= 0; i--) if (!earlier[i].childElementCount) earlier.splice(i, 1);
+    earlierBlocks = earlier.reduce((n, frag) => n + frag.childElementCount, 0);
+    renderEarlierControl();
+  }
+
+  // ---- turn folds (TRU-209) ------------------------------------------------
+  // A finished turn folds into one "Worked for <duration>" row: everything
+  // between the human's prompt and the turn's final text (the text after
+  // its last tool call or thinking). Opened, the agent's narration stays as
+  // text and each run of tool cards between two paragraphs is one summary
+  // line that opens to the cards. A message sent mid-turn ends one fold and
+  // starts the next. What needs the human never folds: error blocks,
+  // delegation cards, warnings, a running subagent's card and a card whose
+  // request still waits. A running turn shows its work live. A replay folds
+  // as live did, from the same events; it carries no turn times, so its
+  // rows read "Worked". Folds start closed and are not remembered.
+  function beginTurn() {
+    turn = { startMs: replaying ? null : Date.now(), blocks: [] };
+  }
+  // The turn ended: fold it (`fold`), or leave it as it is (a pi turn, a
+  // prompt that was never sent).
+  function endTurn(fold) {
+    const t = turn;
+    turn = null;
+    if (!t || !fold) return;
+    keepView(() => foldTurn(t, replaying ? null : Date.now()));
+  }
+  // Run `change` to the timeline without moving what the human reads: a
+  // view following the latest stays at the bottom; one scrolled back keeps
+  // its top block where it is (the fold row, when that block folded).
+  function keepView(change) {
+    if (replaying || follow) { change(); scrollIfFollowing(); return; }
+    const top = messagesEl.scrollTop;
+    let anchor = null;
+    for (const c of messagesEl.children) {
+      if (c.offsetTop + c.offsetHeight > top) { anchor = c; break; }
+    }
+    const offset = anchor ? anchor.offsetTop - top : 0;
+    change();
+    if (!anchor) return;
+    if (anchor.parentNode === messagesEl) { messagesEl.scrollTop = anchor.offsetTop - offset; return; }
+    const fold = anchor.closest('.turn-fold');
+    if (fold && fold.parentNode === messagesEl) messagesEl.scrollTop = fold.offsetTop - Math.max(0, offset);
+  }
+  function foldTurn(t, endMs) {
+    const segments = [];
+    let seg = { start: t.startMs, nodes: [] };
+    for (const b of t.blocks) {
+      if (!b.node.parentNode) continue; // withdrawn or replaced since
+      if (b.node.classList.contains('user-msg')) {
+        seg.end = b.at;
+        segments.push(seg);
+        seg = { start: b.at, nodes: [] };
+      } else {
+        seg.nodes.push(b.node);
+      }
+    }
+    seg.end = endMs;
+    segments.push(seg);
+    let folded = false;
+    for (const s of segments) folded = foldSegment(s) || folded;
+    if (!folded || !earlier.length) return;
+    retallyEarlier();
+    // The fold freed room in the document: bring back the chunks that fit.
+    let n = 0, room = WINDOW_KEEP - liveBlocks();
+    for (let i = earlier.length - 1; i >= 0 && earlier[i].childElementCount <= room; i--) {
+      room -= earlier[i].childElementCount;
+      n++;
+    }
+    if (n) showEarlier(n);
+  }
+  const WORK = 'details.tool, details.thinking';
+  function keepsOutOfFold(node) {
+    if (node.matches('.error-block, .dlg, .note.warn')) return true;
+    if (!node.matches('details.tool')) return false;
+    if (node.classList.contains('error')) return true;
+    const id = node.dataset.toolId;
+    const item = items.get(id);
+    if (item && item.sub && item.sub.state === 'running') return true;
+    for (const req of pending.values()) {
+      if (req.tool_use_id === id || subTools.get(req.tool_use_id) === id) return true;
+    }
+    return false;
+  }
+  function foldSegment(s) {
+    let last = -1;
+    s.nodes.forEach((n, i) => { if (n.matches(WORK)) last = i; });
+    if (last < 0) return false; // a reply with no work: nothing to fold
+    const nodes = s.nodes.slice(0, last + 1).filter((n) => !keepsOutOfFold(n));
+    if (!nodes.some((n) => n.matches(WORK))) return false;
+    const fold = el('details', 'turn-fold');
+    const summary = fold.appendChild(el('summary'));
+    summary.appendChild(el('span', 'tf-label',
+      s.start != null && s.end != null ? 'Worked for ' + fmtDur(Math.max(0, s.end - s.start)) : 'Worked'));
+    const failed = s.nodes.filter((n) => n.matches('details.tool.error')).length;
+    if (failed) summary.appendChild(el('span', 'tr-failed', failed + ' failed'));
+    const body = fold.appendChild(el('div', 'tf-body'));
+    nodes[0].parentNode.insertBefore(fold, nodes[0]);
+    let run = [];
+    const flush = () => { if (run.length) appendRun(body, run); run = []; };
+    for (const n of nodes) {
+      if (n.classList.contains('assistant')) { flush(); body.appendChild(n); } else run.push(n);
+    }
+    flush();
+    watchOpen(fold);
+    return true;
+  }
+  // Tool cards between two narration paragraphs (with any thinking and
+  // notes among them) as one line; thinking alone stays as it is.
+  function appendRun(body, nodes) {
+    const cards = nodes.filter((n) => n.matches('details.tool'));
+    if (!cards.length) { for (const n of nodes) body.appendChild(n); return; }
+    const calls = cards.map((n) => {
+      const item = items.get(n.dataset.toolId);
+      const nameEl = n.querySelector('.tool-name');
+      return {
+        name: item ? item.name : (nameEl ? nameEl.textContent : 'tool'),
+        input: item ? item.input : null,
+        failed: n.classList.contains('error'),
+      };
+    });
+    const run = body.appendChild(el('details', 'tool-run'));
+    const summary = run.appendChild(el('summary'));
+    summary.appendChild(el('span', 'tr-label', runLabel(calls)));
+    const failed = calls.filter((c) => c.failed).length;
+    if (failed) summary.appendChild(el('span', 'tr-failed', failed + ' failed'));
+    const names = new Map();
+    for (const c of calls) names.set(c.name, (names.get(c.name) || 0) + 1);
+    summary.title = Array.from(names, ([name, n]) => name + (n > 1 ? ' ×' + n : '')).join(', ');
+    const runBody = run.appendChild(el('div', 'tr-body'));
+    for (const n of nodes) runBody.appendChild(n);
+    watchOpen(run);
+  }
+  // What a tool call does, by the names the cards show: Claude's tools,
+  // the names ACP agents give theirs, else an ACP call's own `kind`.
+  const TOOL_KINDS = {
+    command: ['bash', 'shell', 'run_shell_command', 'execute', 'exec', 'terminal', 'bashoutput', 'killshell'],
+    read: ['read', 'read_file', 'readfile', 'read_many_files', 'notebookread', 'view'],
+    edit: ['edit', 'multiedit', 'write', 'notebookedit', 'write_file', 'edit_file', 'replace', 'apply_patch', 'patch'],
+    search: ['grep', 'glob', 'search', 'find', 'list', 'ls', 'list_directory', 'websearch', 'web_search', 'google_web_search', 'search_file_content', 'codebase_search'],
+  };
+  const ACP_KINDS = { execute: 'command', read: 'read', edit: 'edit', delete: 'edit', move: 'edit', search: 'search' };
+  function toolKind(name, input) {
+    const n = String(name || '').toLowerCase();
+    for (const kind in TOOL_KINDS) if (TOOL_KINDS[kind].includes(n)) return kind;
+    const acp = input && typeof input.kind === 'string' ? ACP_KINDS[input.kind] : null;
+    return acp || 'other';
+  }
+  function toolPath(input) {
+    if (!input || typeof input !== 'object') return null;
+    const p = input.file_path || input.filePath || input.notebook_path || input.path || (Array.isArray(input.paths) ? input.paths[0] : null);
+    return typeof p === 'string' && p ? p : null;
+  }
+  // "Ran 4 commands, read 3 files, edited 2 files, searched 1 time and 2
+  // other actions". Reads and edits count files, the rest calls.
+  function runLabel(calls) {
+    const files = { read: new Set(), edit: new Set() };
+    const counts = { command: 0, search: 0, other: 0 };
+    const others = new Set();
+    calls.forEach((c, i) => {
+      const kind = toolKind(c.name, c.input);
+      if (files[kind]) files[kind].add(toolPath(c.input) || '#' + i);
+      else counts[kind]++;
+      if (kind === 'other') others.add(c.name);
+    });
+    const count = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+    const parts = [];
+    if (counts.command) parts.push('ran ' + count(counts.command, 'command', 'commands'));
+    if (files.read.size) parts.push('read ' + count(files.read.size, 'file', 'files'));
+    if (files.edit.size) parts.push('edited ' + count(files.edit.size, 'file', 'files'));
+    if (counts.search) parts.push('searched ' + count(counts.search, 'time', 'times'));
+    if (counts.other) {
+      if (parts.length) parts.push(count(counts.other, 'other action', 'other actions'));
+      else if (others.size === 1) parts.push('used ' + others.values().next().value + (counts.other > 1 ? ' ' + counts.other + ' times' : ''));
+      else parts.push('used ' + count(counts.other, 'tool', 'tools'));
+    }
+    const text = parts.length > 1 ? parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1] : parts[0];
+    return text.charAt(0).toUpperCase() + text.slice(1);
+  }
+  window.__runLabel = runLabel; // for the page's headless checks
+  // The human opening a fold or a run line to read it: the next streamed
+  // block must not scroll it away, so following stops when the opened
+  // content runs past the bottom (the Latest button brings it back).
+  function watchOpen(details) {
+    details.addEventListener('toggle', () => {
+      if (!details.open || replaying || atBottom()) return;
+      follow = false;
+      jumpBtn.classList.add('visible');
+    });
+  }
+  // Open the folds holding `node` (a roster row's card).
+  function openFoldsAround(node) {
+    for (let p = node.parentElement; p; p = p.parentElement) {
+      if (p.matches('details.turn-fold, details.tool-run')) p.open = true;
+    }
   }
 
   // ---- markdown ----------------------------------------------------------
@@ -1355,6 +1572,7 @@
         }
         sub.tracked = true;
         sub.state = 'running';
+        if (!replaying) keepView(() => openFoldsAround(sub.item.card));
         if (d && d.model) sub.model = d.model;
         break;
       case 'turn_completed': {
@@ -2643,6 +2861,7 @@
     if (!row) return;
     const target = row.target;
     showEarlierUntil(target);
+    openFoldsAround(target);
     if (target.tagName === 'DETAILS') target.open = true;
     if (row.details) row.details.open = true;
     follow = false;
@@ -2891,7 +3110,11 @@
     const item = items.get(d.tool_use_id);
     if (item) item.badge.textContent = d.kind.type === 'question' ? 'waiting for your answer' : 'waiting for approval';
     const subRoot = subTools.has(d.tool_use_id) && items.get(subTools.get(d.tool_use_id));
-    if (subRoot && subRoot.sub) { subRoot.sub.waiting = true; renderSubagent(subRoot.sub); }
+    if (subRoot && subRoot.sub) {
+      subRoot.sub.waiting = true;
+      renderSubagent(subRoot.sub);
+      if (!replaying) keepView(() => openFoldsAround(subRoot.card));
+    }
     setActivity(d.kind.type === 'question' ? 'Waiting for your answer' : 'Waiting for approval: ' + (d.kind.tool_name || ''), 'waiting');
     renderPanel();
   }
@@ -2994,7 +3217,7 @@
       case 'turn_started':
         // Claude starts a turn on its own when a background subagent
         // finishes; show it as running like any other turn.
-        if (!busy) { endSegment(); endThinking(); setBusy(true); startActivity('Starting'); }
+        if (!busy) { endSegment(); endThinking(); beginTurn(); setBusy(true); startActivity('Starting'); }
         break;
       case 'subagent_event':
         subagentEvent(d.parent_tool_use_id, d.event);
@@ -3025,6 +3248,9 @@
         break;
       case 'turn_completed': {
         endSegment(); endThinking();
+        // Folded before the turn's requests clear: a card still waiting
+        // for the human stays out of the fold.
+        endTurn(true);
         clearPending();
         const st = d.status || {};
         const tokens = d.usage && typeof d.usage.output_tokens === 'number' ? d.usage.output_tokens : null;
@@ -3086,6 +3312,7 @@
       case 'process_exited':
         if (linkNote) { linkNote.remove(); linkNote = null; }
         endSegment(); endThinking();
+        endTurn(true);
         clearPending();
         clearPendingMode();
         clearPendingChips();
@@ -3121,10 +3348,11 @@
         for (const r of event.toolResults) addBlock('tool_result', 'Tool result', typeof r === 'string' ? r : JSON.stringify(r, null, 2));
       }
     } else if (t === 'done') {
-      finishActivity('Done', 'done'); setBusy(false);
+      endTurn(false); finishActivity('Done', 'done'); setBusy(false);
     } else if (t === 'stopped') {
-      finishActivity('Stopped', 'stopped'); setBusy(false);
+      endTurn(false); finishActivity('Stopped', 'stopped'); setBusy(false);
     } else if (t === 'error') {
+      endTurn(false);
       errorBlock(event.message || JSON.stringify(event));
       finishActivity('Failed', 'failed'); setBusy(false);
     }
@@ -3165,6 +3393,7 @@
     append(msg);
     follow = true;
     if (isQueued && busy) return;
+    beginTurn();
     setBusy(true);
     startActivity('Starting');
   }
@@ -3179,7 +3408,7 @@
     msg.classList.add('unsent');
     msg.append(el('div', 'user-note', 'Not sent' + (reason ? ': ' + reason : '')));
     // Not queued, it made the page busy; no turn runs for it.
-    if (!q && busy) { finishActivity('Not sent', 'failed'); setBusy(false); }
+    if (!q && busy) { endTurn(false); finishActivity('Not sent', 'failed'); setBusy(false); }
     return true;
   };
 
@@ -3208,6 +3437,13 @@
     } finally {
       replaying = false;
     }
+    // Historical activity should not reopen completed folds. Show only
+    // subagents that still need attention in the replay's final state.
+    for (const item of items.values()) {
+      if (item.sub && (item.sub.state === 'running' || item.sub.waiting)) {
+        openFoldsAround(item.card);
+      }
+    }
     // Only the newest blocks go into layout; the rest wait detached.
     trimWindow();
     renderPendingMarkdown(messagesEl);
@@ -3230,7 +3466,7 @@
   window.__resetConversation = function () {
     messagesEl.innerHTML = '';
     resetWindow();
-    segment = null; thinking = null;
+    segment = null; thinking = null; turn = null;
     items.clear(); pending.clear(); subTools.clear(); queued.clear(); prompts.clear();
     resetDelegations();
     if (activity.timer) { clearInterval(activity.timer); activity.timer = null; }
