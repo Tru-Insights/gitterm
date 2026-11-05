@@ -891,6 +891,8 @@ impl std::fmt::Debug for ClaudeMcpServer {
 
 #[derive(Debug, Clone)]
 pub struct ClaudeSessionConfig {
+    /// Local snapshot metadata directory; None disables snapshots (remote/test sessions).
+    pub snapshot_facts_dir: Option<PathBuf>,
     pub cwd: PathBuf,
     /// `None` leaves the model to the user's Claude settings.
     pub model: Option<String>,
@@ -1036,6 +1038,7 @@ pub fn resolve_claude_program() -> Result<PathBuf, String> {
 /// process down; dropping a remote one on an agent that owns its chats
 /// only detaches (send `Shutdown` first to stop it).
 pub struct ClaudeSession {
+    snapshots_closed: tokio_util::sync::CancellationToken,
     commands: mpsc::UnboundedSender<HarnessCommand>,
     shutdown_on_drop: bool,
 }
@@ -1044,6 +1047,8 @@ impl ClaudeSession {
     /// Start `claude` on a dedicated thread. Spawn failures arrive on the
     /// event channel as `Error` followed by `ProcessExited`.
     pub fn spawn(config: ClaudeSessionConfig) -> (Self, mpsc::UnboundedReceiver<HarnessEvent>) {
+        let snapshots_closed = tokio_util::sync::CancellationToken::new();
+        let close_token = snapshots_closed.clone();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let spawn_result = std::thread::Builder::new()
@@ -1062,7 +1067,7 @@ impl ClaudeSession {
                         return;
                     }
                 };
-                rt.block_on(run_session(config, cmd_rx, ev_tx));
+                rt.block_on(run_session(config, cmd_rx, ev_tx, close_token));
             });
         if let Err(e) = spawn_result {
             eprintln!("[claude-harness] could not spawn session thread: {e}");
@@ -1071,9 +1076,14 @@ impl ClaudeSession {
             Self {
                 commands: cmd_tx,
                 shutdown_on_drop: true,
+                snapshots_closed,
             },
             ev_rx,
         )
+    }
+
+    pub fn close_turn_snapshots(&self) {
+        self.snapshots_closed.cancel();
     }
 
     pub fn send(&self, command: HarnessCommand) -> Result<(), String> {
@@ -1145,6 +1155,7 @@ impl RemoteClaudeChatStart {
     /// canonical form of `self.cwd`).
     pub fn into_config(self, cwd: PathBuf) -> ClaudeSessionConfig {
         ClaudeSessionConfig {
+            snapshot_facts_dir: None,
             cwd,
             model: self.model,
             permission_mode: self.permission_mode,
@@ -1234,6 +1245,7 @@ impl ClaudeSession {
             Self {
                 commands: cmd_tx,
                 shutdown_on_drop: false,
+                snapshots_closed: tokio_util::sync::CancellationToken::new(),
             },
             ev_rx,
         )
@@ -1864,6 +1876,7 @@ async fn run_session(
     config: ClaudeSessionConfig,
     mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
     events: mpsc::UnboundedSender<HarnessEvent>,
+    close_token: tokio_util::sync::CancellationToken,
 ) {
     let fail = |msg: String| {
         harness_log(&msg);
@@ -1874,6 +1887,12 @@ async fn run_session(
         Ok(p) => p,
         Err(e) => return fail(e),
     };
+    let mut snapshots = crate::turn_snapshots::Recorder::new(
+        config.cwd.clone(),
+        config.resume.clone(),
+        config.snapshot_facts_dir.clone(),
+    )
+    .with_close_token(close_token);
     let args = config.args();
     let mut cmd = Command::new(&program);
     cmd.args(&args)
@@ -2019,6 +2038,8 @@ async fn run_session(
                         ParsedFrame::Event(ev) => {
                             let ev = match ev {
                                 HarnessEvent::TurnStarted { session_id, model } => {
+                                    if !in_turn { snapshots.begin().await; }
+                                    if let Some(id) = &session_id { snapshots.bind(id).await; }
                                     in_turn = true;
                                     HarnessEvent::TurnStarted { session_id, model }
                                 }
@@ -2028,6 +2049,7 @@ async fn run_session(
                                     cost_usd,
                                     rate_limit,
                                 } => {
+                                    snapshots.end().await;
                                     in_turn = false;
                                     let status = match status {
                                         TurnStatus::Failed(_) if interrupt_requested => {
@@ -2054,6 +2076,7 @@ async fn run_session(
                                 }
                                 other => other,
                             };
+                            snapshots.observe(&ev);
                             io.emit(ev);
                         }
                         ParsedFrame::PermissionRequest { request_id, tool_use_id, input, event } => {
@@ -2125,6 +2148,7 @@ async fn run_session(
                             prompt.id
                         ));
                         if !in_turn {
+                            snapshots.begin().await;
                             interrupt_requested = false;
                         }
                         io.write(user_message_frame(&prompt)).await
@@ -2253,6 +2277,7 @@ async fn run_session(
         io.emit(HarnessEvent::RuntimeRequestResolved { request_id });
     }
     io.emit(HarnessEvent::ProcessExited { code });
+    snapshots.end().await;
 }
 
 /// Answer a CLI control request GitTerm has no handler for, the way the SDK
@@ -3242,6 +3267,7 @@ mod tests {
     #[test]
     fn args_follow_the_phase_a_contract() {
         let cfg = ClaudeSessionConfig {
+            snapshot_facts_dir: None,
             cwd: PathBuf::from("/tmp"),
             model: Some("haiku".into()),
             permission_mode: "default".into(),
@@ -3256,6 +3282,7 @@ mod tests {
         assert!(cfg.args().contains(&"--chrome".to_string()));
         assert!(!cfg.args().contains(&"--no-chrome".to_string()));
         let off = ClaudeSessionConfig {
+            snapshot_facts_dir: None,
             chrome: false,
             ..cfg.clone()
         }
@@ -3279,6 +3306,7 @@ mod tests {
         assert!(resumed.args().contains(&"--no-chrome".to_string()));
         assert!(resumed.args().contains(&"--resume=sid".to_string()));
         assert!(ClaudeSessionConfig {
+            snapshot_facts_dir: None,
             chrome: true,
             ..resumed.clone()
         }
@@ -3363,6 +3391,7 @@ mod tests {
 
     fn config_with(mcp_servers: Vec<ClaudeMcpServer>) -> ClaudeSessionConfig {
         ClaudeSessionConfig {
+            snapshot_facts_dir: None,
             cwd: PathBuf::from("/tmp"),
             model: None,
             permission_mode: "default".into(),

@@ -387,6 +387,7 @@ async fn main() {
     let workdir = tempfile::tempdir().expect("temp dir");
     let cwd = workdir.path().canonicalize().expect("canonical temp dir");
     let config = ClaudeSessionConfig {
+        snapshot_facts_dir: None,
         cwd: cwd.clone(),
         model: Some(model.clone()),
         permission_mode: "default".into(),

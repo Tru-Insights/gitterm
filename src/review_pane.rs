@@ -268,6 +268,7 @@ pub enum ReviewSource {
     Uncommitted,
     VsBase,
     Commits(Option<CommitRange>),
+    Turns { chat: String, selected: Option<u64> },
 }
 
 impl From<DiffSource> for ReviewSource {
@@ -305,6 +306,7 @@ impl ReviewDiff {
 pub struct ReviewLoad {
     pub diff: ReviewDiff,
     pub commits: Vec<ReviewCommit>,
+    pub turns: Vec<crate::turn_snapshots::Turn>,
     pub commits_truncated: bool,
     pub commits_error: Option<String>,
     /// The marks' key for this checkout.
@@ -1303,7 +1305,7 @@ pub async fn load_review_source(
         .await
         .map_err(|error| format!("cannot resolve {}: {error}", checkout.display()))?;
     let base = match &source {
-        ReviewSource::Uncommitted | ReviewSource::Commits(_) => None,
+        ReviewSource::Uncommitted | ReviewSource::Commits(_) | ReviewSource::Turns { .. } => None,
         ReviewSource::VsBase => Some(target.base.clone().ok_or_else(|| {
             format!(
                 "no base branch found for {}: no task base, tracked branch, or develop/main/master/trunk",
@@ -1322,6 +1324,10 @@ pub async fn load_review_source(
         }
         None => (Vec::new(), false, None),
     };
+    let turns = match &source {
+        ReviewSource::Turns { chat, .. } => crate::turn_snapshots::turns(&checkout, chat).await?,
+        _ => Vec::new(),
+    };
     let selection_range = match &source {
         ReviewSource::Commits(Some(range)) => {
             let first = commits.iter().position(|commit| commit.sha == range.first);
@@ -1338,6 +1344,26 @@ pub async fn load_review_source(
         _ => None,
     };
     let diff_args = match (&source, selection_range.as_ref()) {
+        (ReviewSource::Turns { selected, .. }, _) => match selected {
+            Some(number) => {
+                let turn = turns
+                    .iter()
+                    .find(|turn| turn.number == *number)
+                    .ok_or("selected turn is no longer available")?;
+                vec![
+                    turn.start.clone().ok_or(
+                        "turn has no start snapshot (checkout discovered late or skipped)",
+                    )?,
+                    turn.end
+                        .clone()
+                        .ok_or("turn has no end snapshot (running or skipped)")?,
+                ]
+            }
+            None => {
+                let empty = empty_tree_id(&checkout).await?;
+                vec![empty.clone(), empty]
+            }
+        },
         (ReviewSource::Uncommitted, _) => vec!["HEAD".to_string()],
         (ReviewSource::VsBase, _) => vec![format!("{}...HEAD", base.as_ref().unwrap().reference)],
         (ReviewSource::Commits(None), _) => vec!["HEAD".to_string(), "HEAD".to_string()],
@@ -1349,7 +1375,9 @@ pub async fn load_review_source(
     };
     let diff_source = match &source {
         ReviewSource::VsBase => DiffSource::VsBase,
-        ReviewSource::Uncommitted | ReviewSource::Commits(_) => DiffSource::Uncommitted,
+        ReviewSource::Uncommitted | ReviewSource::Commits(_) | ReviewSource::Turns { .. } => {
+            DiffSource::Uncommitted
+        }
     };
 
     // The file list.
@@ -1370,7 +1398,9 @@ pub async fn load_review_source(
     let summary = parse_raw_numstat(&summary)?;
     let (untracked, untracked_complete) = match &source {
         ReviewSource::Uncommitted => untracked_names(&checkout, UNTRACKED_SCAN_CAP).await?,
-        ReviewSource::VsBase | ReviewSource::Commits(_) => (Vec::new(), true),
+        ReviewSource::VsBase | ReviewSource::Commits(_) | ReviewSource::Turns { .. } => {
+            (Vec::new(), true)
+        }
     };
     let mut all_paths: BTreeSet<String> = summary.iter().map(|e| e.path.clone()).collect();
     all_paths.extend(untracked.iter().cloned());
@@ -1507,7 +1537,14 @@ pub async fn load_review_source(
                 } else if status == FileStatus::Deleted {
                     Some(format!("deleted:{}", entry.old_blob))
                 } else if diff_source == DiffSource::VsBase
-                    || matches!(&source, ReviewSource::Commits(Some(_)))
+                    || matches!(
+                        &source,
+                        ReviewSource::Commits(Some(_))
+                            | ReviewSource::Turns {
+                                selected: Some(_),
+                                ..
+                            }
+                    )
                 {
                     Some(entry.new_blob.clone())
                 } else {
@@ -1590,7 +1627,7 @@ pub async fn load_review_source(
 
     // Every path in the other source, so marks for files still in either
     // diff survive pruning.
-    let live_paths = if !untracked_complete {
+    let live_paths = if !untracked_complete || matches!(&source, ReviewSource::Turns { .. }) {
         None
     } else {
         let other = if matches!(&source, ReviewSource::Commits(_)) {
@@ -1632,6 +1669,7 @@ pub async fn load_review_source(
             unlisted,
         },
         commits,
+        turns,
         commits_truncated,
         commits_error,
         canonical_checkout,
@@ -1811,6 +1849,13 @@ pub enum ReviewIpc {
         source: DiffSource,
         hide_noise: bool,
     },
+    ShowTurns {
+        token: String,
+    },
+    SelectTurn {
+        token: String,
+        number: u64,
+    },
     ShowCommits {
         token: String,
     },
@@ -1839,6 +1884,8 @@ impl ReviewIpc {
     pub fn token(&self) -> &str {
         match self {
             ReviewIpc::SetSource { token, .. }
+            | ReviewIpc::ShowTurns { token }
+            | ReviewIpc::SelectTurn { token, .. }
             | ReviewIpc::ShowCommits { token }
             | ReviewIpc::SelectCommits { token, .. }
             | ReviewIpc::SetViewed { token, .. }
@@ -1857,6 +1904,10 @@ enum WireIpc {
         source: String,
         hide_noise: bool,
     },
+    #[serde(rename = "review.turns")]
+    Turns { token: String },
+    #[serde(rename = "review.turn")]
+    Turn { token: String, number: u64 },
     #[serde(rename = "review.commits")]
     Commits { token: String },
     #[serde(rename = "review.commit_range")]
@@ -1917,6 +1968,8 @@ pub fn parse_ipc(body: &str) -> Result<ReviewIpc, String> {
             path: page_path(path)?,
             viewed,
         },
+        WireIpc::Turns { token } => ReviewIpc::ShowTurns { token },
+        WireIpc::Turn { token, number } => ReviewIpc::SelectTurn { token, number },
         WireIpc::Commits { token } => ReviewIpc::ShowCommits { token },
         WireIpc::CommitRange { token, first, last } => {
             let valid = |sha: &str| {
@@ -2089,6 +2142,8 @@ pub struct ReviewPage<'a> {
     pub target: &'a ReviewTarget,
     pub source: ReviewSource,
     pub commits: &'a [ReviewCommit],
+    pub turns: &'a [crate::turn_snapshots::Turn],
+    pub turns_available: bool,
     pub commits_truncated: bool,
     pub commits_error: Option<&'a str>,
     pub state: PageState<'a>,
@@ -2148,6 +2203,7 @@ pub fn render_page(page: &ReviewPage) -> String {
             ReviewSource::Uncommitted => "uncommitted",
             ReviewSource::VsBase => "vs_base",
             ReviewSource::Commits(_) => "commits",
+            ReviewSource::Turns { .. } => "turns",
         },
         match &page.source {
             ReviewSource::Commits(Some(range)) =>
@@ -2158,6 +2214,7 @@ pub fn render_page(page: &ReviewPage) -> String {
     render_toolbar(&mut html, page);
     html.push_str("<div id=\"body\">\n");
     render_commits(&mut html, page);
+    render_turns(&mut html, page);
     match page.state {
         PageState::Loading => {
             html.push_str(
@@ -2222,6 +2279,15 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
             ""
         }
     ));
+    html.push_str(&format!(
+        "<button type=\"button\" data-source=\"turns\" class=\"src{}\"{} title=\"Review turns of the active local chat\">Turns</button>",
+        if matches!(&page.source, ReviewSource::Turns { .. }) {
+            " on"
+        } else {
+            ""
+        },
+        if page.turns_available { "" } else { " disabled" }
+    ));
     html.push_str("</div>");
     html.push_str(&format!(
         "<label class=\"toggle\"><input type=\"checkbox\" id=\"hide-noise\"{}> Hide tests &amp; generated</label>",
@@ -2265,6 +2331,7 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
                 ReviewSource::Uncommitted => "uncommitted changes",
                 ReviewSource::VsBase => "changes against the base",
                 ReviewSource::Commits(_) => "selected commits",
+                ReviewSource::Turns { .. } => "selected turn",
             };
             html.push_str(&format!(
                 "<div class=\"focus-note\">{} is not in the {view}{}.</div>\n",
@@ -2307,6 +2374,28 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
         html.push_str("</div>\n");
     }
     html.push_str("</header>\n");
+}
+
+fn render_turns(html: &mut String, page: &ReviewPage) {
+    if !matches!(&page.source, ReviewSource::Turns { .. }) {
+        return;
+    }
+    html.push_str(
+        "<aside id=\"turns\"><div class=\"commit-heading\">Turns of the active chat</div>",
+    );
+    if page.turns.is_empty() {
+        html.push_str(
+            "<p class=\"commit-cap\">No turn snapshots for this chat in this checkout.</p>",
+        );
+    }
+    for turn in page.turns {
+        let selected = matches!(&page.source, ReviewSource::Turns { selected: Some(n), .. } if *n == turn.number);
+        html.push_str(&format!("<button type=\"button\" class=\"commit{}\" data-turn=\"{}\"{}>Turn {}<small>{}{}</small></button>",
+            if selected { " selected" } else { "" }, turn.number,
+            if turn.start.is_none() || turn.end.is_none() { " disabled" } else { "" }, turn.number, commit_age(turn.timestamp),
+            if turn.start.is_none() { " · no start snapshot" } else if turn.end.is_none() { " · running or skipped" } else { "" }));
+    }
+    html.push_str("</aside>");
 }
 
 fn render_commits(html: &mut String, page: &ReviewPage) {
@@ -2459,6 +2548,10 @@ fn render_files(html: &mut String, page: &ReviewPage, diff: &ReviewDiff, viewed:
     html.push_str("<main id=\"files\">\n");
     if diff.files.is_empty() {
         let empty = match (&page.source, &page.target.base) {
+            (ReviewSource::Turns { selected: None, .. }, _) => {
+                "Select a completed turn to review its changes".to_string()
+            }
+            (ReviewSource::Turns { .. }, _) => "No changes in the selected turn".to_string(),
             (ReviewSource::Uncommitted, _) => "No uncommitted changes".to_string(),
             (ReviewSource::VsBase, Some(base)) => format!("No changes against {}", base.reference),
             (ReviewSource::VsBase, None) => "No base branch".to_string(),
@@ -3136,6 +3229,8 @@ mod tests {
             target: &target,
             source: ReviewSource::Uncommitted,
             commits: &[],
+            turns: &[],
+            turns_available: true,
             commits_truncated: false,
             commits_error: None,
             state: PageState::Ready {
@@ -3183,6 +3278,8 @@ mod tests {
             target: &target,
             source: ReviewSource::Uncommitted,
             commits: &[],
+            turns: &[],
+            turns_available: true,
             commits_truncated: false,
             commits_error: None,
             state: PageState::Ready {
@@ -3212,6 +3309,8 @@ mod tests {
                 target: &target,
                 source: ReviewSource::VsBase,
                 commits: &[],
+                turns: &[],
+                turns_available: true,
                 commits_truncated: false,
                 commits_error: None,
                 state,
@@ -3224,6 +3323,65 @@ mod tests {
             assert!(html.contains("id=\"close\""));
             assert!(!html.contains("git <failed>"));
         }
+    }
+
+    #[test]
+    fn turns_picker_only_enables_complete_pairs_and_preserves_the_diff_slots() {
+        let (target, diff) = hostile_diff();
+        let turns = [
+            crate::turn_snapshots::Turn {
+                number: 3,
+                start: None,
+                end: Some("b".into()),
+                timestamp: 1,
+            },
+            crate::turn_snapshots::Turn {
+                number: 2,
+                start: Some("a".into()),
+                end: None,
+                timestamp: 1,
+            },
+            crate::turn_snapshots::Turn {
+                number: 1,
+                start: Some("a".into()),
+                end: Some("b".into()),
+                timestamp: 1,
+            },
+        ];
+        let viewed = vec![ViewedState::Unviewed; diff.files.len()];
+        let html = render_page(&ReviewPage {
+            target: &target,
+            source: ReviewSource::Turns {
+                chat: "chat".into(),
+                selected: Some(1),
+            },
+            commits: &[],
+            turns: &turns,
+            turns_available: true,
+            commits_truncated: false,
+            commits_error: None,
+            state: PageState::Ready {
+                diff: &diff,
+                viewed: &viewed,
+            },
+            dark: true,
+            hide_noise: false,
+            token: "turn-token",
+            nonce: "n",
+            focus: None,
+        });
+        assert!(html.contains("data-turn=\"3\" disabled"));
+        assert!(html.contains("data-turn=\"2\" disabled"));
+        assert!(html.contains("class=\"commit selected\" data-turn=\"1\">"));
+        assert!(html.contains("id=\"tree\"") && html.contains("id=\"files\""));
+        assert_eq!(
+            parse_ipc(r#"{"type":"review.turn","token":"turn-token","number":1}"#).unwrap(),
+            ReviewIpc::SelectTurn {
+                token: "turn-token".into(),
+                number: 1
+            }
+        );
+        assert!(parse_ipc(r#"{"type":"review.turn","token":"t","number":"--all"}"#).is_err());
     }
 
     #[test]
@@ -3248,6 +3406,8 @@ mod tests {
                 last: "abcdef1".into(),
             })),
             commits: &commits,
+            turns: &[],
+            turns_available: true,
             commits_truncated: true,
             commits_error: None,
             state: PageState::Ready {
@@ -3677,6 +3837,8 @@ mod tests {
                 target: &target,
                 source: ReviewSource::Uncommitted,
                 commits: &[],
+                turns: &[],
+                turns_available: true,
                 commits_truncated: false,
                 commits_error: None,
                 state: PageState::Ready {

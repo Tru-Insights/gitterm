@@ -412,6 +412,9 @@ impl AgentSession {
         };
         let model = model.trim();
         Some(ClaudeSessionConfig {
+            snapshot_facts_dir: Some(gitterm::chat_facts::facts_dir(
+                &crate::config::global_config_dir(),
+            )),
             cwd,
             model: (!model.is_empty() && model != "default").then(|| model.to_string()),
             permission_mode: permission_mode
@@ -445,6 +448,9 @@ impl AgentSession {
         };
         let model = model.trim();
         Some(AcpSessionConfig {
+            snapshot_facts_dir: Some(gitterm::chat_facts::facts_dir(
+                &crate::config::global_config_dir(),
+            )),
             agent: *agent,
             cwd,
             resume: self.session_id.clone(),
@@ -644,12 +650,17 @@ pub(crate) enum AgentInput {
 /// that it stays `None` and the subscription's stream lives independently of the
 /// handle. See `take_event_receiver`.
 pub(crate) struct AgentTaskHandle {
+    snapshots_closed: tokio_util::sync::CancellationToken,
     input_tx: mpsc::UnboundedSender<AgentInput>,
     stop_slot: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     pending_event_rx: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
 }
 
 impl AgentTaskHandle {
+    pub(crate) fn close_turn_snapshots(&self) {
+        self.snapshots_closed.cancel();
+    }
+
     /// Send a user prompt to the subprocess manager. Returns `Err` if the
     /// background task has dropped its receiver (which should only happen
     /// after a fatal error or shutdown).
@@ -691,10 +702,13 @@ impl AgentTaskHandle {
 /// Closing the receiver / dropping the handle ends the task naturally.
 /// `guidelines_file` is appended to every turn's system prompt (TRU-174).
 pub(crate) fn spawn_agent_task(
+    snapshot_chat: String,
     config: AgentBackendConfig,
     repo_path: PathBuf,
     guidelines_file: Option<PathBuf>,
 ) -> AgentTaskHandle {
+    let snapshots_closed = tokio_util::sync::CancellationToken::new();
+    let close_token = snapshots_closed.clone();
     let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let stop_slot: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
@@ -706,7 +720,16 @@ pub(crate) fn spawn_agent_task(
                 .enable_all()
                 .build()
                 .expect("agent tokio runtime");
+            let snapshots = gitterm::turn_snapshots::Recorder::new(
+                repo_path.clone(),
+                Some(snapshot_chat),
+                Some(gitterm::chat_facts::facts_dir(
+                    &crate::config::global_config_dir(),
+                )),
+            )
+            .with_close_token(close_token);
             rt.block_on(agent_loop(
+                snapshots,
                 config,
                 repo_path,
                 guidelines_file,
@@ -718,6 +741,7 @@ pub(crate) fn spawn_agent_task(
     }
 
     AgentTaskHandle {
+        snapshots_closed,
         input_tx,
         stop_slot,
         pending_event_rx: Mutex::new(Some(event_rx)),
@@ -726,6 +750,7 @@ pub(crate) fn spawn_agent_task(
 
 /// Per-turn loop: wait for a prompt, spawn the subprocess, stream events, repeat.
 async fn agent_loop(
+    mut snapshots: gitterm::turn_snapshots::Recorder,
     config: AgentBackendConfig,
     repo_path: PathBuf,
     guidelines_file: Option<PathBuf>,
@@ -741,6 +766,7 @@ async fn agent_loop(
                     *g = Some(stop_tx);
                 }
 
+                snapshots.begin().await;
                 let result = run_turn(
                     &config,
                     &repo_path,
@@ -750,6 +776,7 @@ async fn agent_loop(
                     stop_rx,
                 )
                 .await;
+                snapshots.end().await;
 
                 if let Ok(mut g) = stop_slot.lock() {
                     g.take();
@@ -764,6 +791,7 @@ async fn agent_loop(
             }
         }
     }
+    snapshots.end().await;
     // input channel closed: tab being dropped — exit
 }
 

@@ -190,6 +190,7 @@ async fn main() {
         return;
     }
     let (session, mut events) = ClaudeSession::spawn(ClaudeSessionConfig {
+        snapshot_facts_dir: None,
         cwd: workdir.clone(),
         model: Some(arg("--model").unwrap_or_else(|| "haiku".into())),
         permission_mode: "default".into(),
@@ -928,6 +929,7 @@ async fn review_scenario(workdir: &Path) {
     let model = arg("--model").unwrap_or_else(|| "haiku".into());
     let reviewer_model = arg("--reviewer-model").unwrap_or_else(|| "haiku".into());
     let (session, mut events) = ClaudeSession::spawn(ClaudeSessionConfig {
+        snapshot_facts_dir: None,
         cwd: repo.clone(),
         model: Some(model.clone()),
         permission_mode: "default".into(),

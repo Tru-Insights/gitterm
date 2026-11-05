@@ -115,6 +115,7 @@ async fn main() {
     let (session, mut events) = ClaudeSession::spawn_remote(
         client,
         ClaudeSessionConfig {
+            snapshot_facts_dir: None,
             cwd: cwd.clone(),
             model: Some(model),
             permission_mode: "default".into(),

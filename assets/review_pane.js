@@ -25,12 +25,16 @@
   document.querySelectorAll('button[data-source]').forEach((button) => {
     button.addEventListener('click', () => {
       if (button.disabled || button.classList.contains('on')) return;
+      if (button.dataset.source === 'turns') { post({ type: 'review.turns' }); return; }
       if (button.dataset.source === 'commits') {
         post({ type: 'review.commits' });
         return;
       }
       post({ type: 'review.source', source: button.dataset.source, hide_noise: !!(hide && hide.checked) });
     });
+  });
+  document.querySelectorAll('button[data-turn]').forEach((button) => {
+    button.addEventListener('click', () => post({ type: 'review.turn', number: Number(button.dataset.turn) }));
   });
   let firstCommit = body.dataset.firstCommit || null;
   document.querySelectorAll('button[data-commit]').forEach((button) => {

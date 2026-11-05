@@ -139,3 +139,7 @@ body[data-source="commits"] #commits { display: flex; flex-direction: column; }
 .commit code { grid-row: span 2; color: var(--accent); font-size: 11px; }
 .commit span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .commit small { color: var(--fg-muted); font-size: 10px; }
+
+#turns { display: flex; flex-direction: column; flex: none; width: 250px; overflow-y: auto; border-right: 1px solid var(--border); padding: 6px 0 20px; background: var(--bg-alt); }
+#turns .commit { grid-template-columns: 1fr; }
+#turns .commit small { grid-column: 1; }
