@@ -11,7 +11,7 @@ pub const MAX_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_FILES: usize = 10_000;
 pub const RETENTION_SECS: i64 = 14 * 24 * 60 * 60;
 const TIMEOUT: Duration = Duration::from_secs(30);
-static MAINTENANCE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const PENDING_PREFIX: &str = "refs/gitterm/pending/";
 
 fn chat_prefix(chat: &str) -> Result<String, String> {
     if chat.is_empty()
@@ -63,7 +63,7 @@ async fn git_run(
     args: &[&str],
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut command = Command::new("git");
     command
         .current_dir(dir)
@@ -85,6 +85,10 @@ async fn git_run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Git gc/add can spawn helpers. A timeout must stop every writer before
+    // the transaction releases its private-store lock.
+    #[cfg(unix)]
+    command.process_group(0);
     // Inherited repository overrides must not redirect writes into another repo.
     for key in [
         "GIT_NAMESPACE",
@@ -123,21 +127,90 @@ async fn git_run(
         .env("GIT_AUTHOR_EMAIL", "snapshots@gitterm.invalid")
         .env("GIT_COMMITTER_NAME", "GitTerm")
         .env("GIT_COMMITTER_EMAIL", "snapshots@gitterm.invalid");
+    let operation = format!("snapshot git {args:?} in {}", dir.display());
+    let mut child = command.spawn().map_err(|e| format!("{operation}: {e}"))?;
+    let child_id = child.id();
     let run = async {
-        let mut child = command.spawn()?;
-        if let Some(input) = input {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| std::io::Error::other("snapshot git stdin unavailable"))?;
-            stdin.write_all(input).await?;
-        }
-        child.wait_with_output().await
+        let mut stdin = child.stdin.take();
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("snapshot git stdout unavailable"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("snapshot git stderr unavailable"))?;
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        // Batch commands can emit more than a pipe buffer before all input is
+        // consumed. Drain both output streams while feeding stdin.
+        tokio::try_join!(
+            async {
+                if let Some(input) = input {
+                    stdin
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("snapshot git stdin unavailable"))?
+                        .write_all(input)
+                        .await?;
+                }
+                drop(stdin);
+                Ok::<_, std::io::Error>(())
+            },
+            stdout.read_to_end(&mut output),
+            stderr.read_to_end(&mut errors),
+        )?;
+        Ok::<_, std::io::Error>(std::process::Output {
+            status: child.wait().await?,
+            stdout: output,
+            stderr: errors,
+        })
     };
-    let out = tokio::time::timeout(TIMEOUT, run)
-        .await
-        .map_err(|_| format!("snapshot git {args:?} timed out in {}", dir.display()))?
-        .map_err(|e| format!("snapshot git {args:?} in {}: {e}", dir.display()))?;
+    let out = match tokio::time::timeout(TIMEOUT, run).await {
+        Ok(Ok(out)) => out,
+        failed => {
+            let error = match failed {
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "timed out".to_string(),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            #[cfg(unix)]
+            if let Some(pid) = child_id.and_then(|pid| i32::try_from(pid).ok()) {
+                // SAFETY: this is the separate group created for this Git child.
+                if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(format!(
+                            "{operation}: {error}; kill process group {pid}: {e}"
+                        ));
+                    }
+                }
+            }
+            #[cfg(windows)]
+            if let Some(pid) = child_id {
+                let stopped = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output()
+                    .await
+                    .map_err(|e| format!("{operation}: {error}; stop process tree {pid}: {e}"))?;
+                if !stopped.status.success() {
+                    return Err(format!(
+                        "{operation}: {error}; stop process tree {pid}: {}",
+                        String::from_utf8_lossy(&stopped.stderr)
+                    ));
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
+            let _ = child_id;
+            // The transaction's store lock must outlive every Git writer.
+            if child.id().is_some() {
+                child
+                    .kill()
+                    .await
+                    .map_err(|e| format!("{operation}: {error}; kill/reap child: {e}"))?;
+            }
+            return Err(format!("{operation}: {error}"));
+        }
+    };
     if !out.status.success() {
         return Err(format!(
             "snapshot git {args:?} in {}: {}",
@@ -296,10 +369,179 @@ impl Drop for TemporaryIndex {
     }
 }
 
+async fn lock_store(store: &Path) -> Result<std::fs::File, String> {
+    let path = store.join("gitterm.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("open snapshot lock {}: {e}", path.display()))?;
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(format!("lock snapshot store {}: {e}", store.display()))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| format!("lock snapshot store {} timed out", store.display()))?
+}
+
+struct PendingPin {
+    path: std::sync::Mutex<PathBuf>,
+    // A separate empty lease avoids Windows locks/deletion blocking Git ref
+    // reads. Stale lease files are swept after the last handle/process exits.
+    _lease: std::fs::File,
+}
+impl Drop for PendingPin {
+    fn drop(&mut self) {
+        let path = self.path.get_mut().unwrap();
+        if let Err(e) = std::fs::remove_file(&*path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("[turns] remove pending snapshot {}: {e}", path.display());
+            }
+        }
+    }
+}
+/// A private snapshot stays rooted until its last handle is dropped, or its
+/// owning chat is deleted. The source repository never receives these objects.
+#[derive(Clone)]
+pub struct Snapshot {
+    oid: String,
+    pin: std::sync::Arc<PendingPin>,
+}
+impl std::ops::Deref for Snapshot {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.oid
+    }
+}
+impl std::fmt::Display for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.oid.fmt(f)
+    }
+}
+impl Snapshot {
+    pub fn as_str(&self) -> &str {
+        &self.oid
+    }
+    fn pin(store: &Path, oid: String, chat: Option<&str>) -> Result<Self, String> {
+        let owner = match chat {
+            Some(chat) => {
+                chat_prefix(chat)?;
+                format!("chat/{chat}")
+            }
+            None => "unbound".into(),
+        };
+        let id = uuid::Uuid::new_v4();
+        let path = store.join(format!("{PENDING_PREFIX}{owner}/{id}"));
+        let leases = store.join("gitterm-leases");
+        std::fs::create_dir_all(&leases)
+            .map_err(|e| format!("create snapshot leases {}: {e}", leases.display()))?;
+        let lease_path = leases.join(id.to_string());
+        std::fs::create_dir_all(path.parent().unwrap())
+            .map_err(|e| format!("create pending snapshot {}: {e}", path.display()))?;
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lease_path)
+            .map_err(|e| format!("create snapshot lease {}: {e}", lease_path.display()))?;
+        let pin = PendingPin {
+            path: std::sync::Mutex::new(path.clone()),
+            _lease: lease,
+        };
+        pin._lease
+            .try_lock()
+            .map_err(|e| format!("lock snapshot lease {}: {e}", lease_path.display()))?;
+        std::fs::write(&path, format!("{oid}\n"))
+            .map_err(|e| format!("write pending snapshot {}: {e}", path.display()))?;
+        Ok(Self {
+            oid,
+            pin: std::sync::Arc::new(pin),
+        })
+    }
+    // Called only while holding the store lock, including the first bind of
+    // a baseline captured before the harness supplied its chat id.
+    fn bind(&self, store: &Path, chat: &str) -> Result<(), String> {
+        chat_prefix(chat)?;
+        let mut path = self.pin.path.lock().unwrap();
+        let parent = store.join(format!("{PENDING_PREFIX}chat/{chat}"));
+        if path.parent() == Some(parent.as_path()) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&parent)
+            .map_err(|e| format!("create pending chat {}: {e}", parent.display()))?;
+        let destination = parent.join(path.file_name().unwrap());
+        std::fs::rename(&*path, &destination)
+            .map_err(|e| format!("bind pending snapshot {} to {chat}: {e}", path.display()))?;
+        *path = destination;
+        Ok(())
+    }
+}
+
+/// Capture an independently leased snapshot. Drop this handle when finished;
+/// Recorder binds its handles to chat ownership before publishing history.
+pub async fn snapshot(dir: &Path) -> Result<Option<Snapshot>, String> {
+    capture_snapshot(dir, None, tokio_util::sync::CancellationToken::new()).await
+}
+async fn capture_snapshot(
+    dir: &Path,
+    chat: Option<&str>,
+    closed: tokio_util::sync::CancellationToken,
+) -> Result<Option<Snapshot>, String> {
+    let dir = dir.to_path_buf();
+    let chat = chat.map(str::to_owned);
+    // Caller cancellation must not release the store lock while Git or its
+    // subprocesses are still writing. Deliver (or drop) the pin under that lock.
+    let (sender, receiver) = tokio::sync::oneshot::channel::<Result<Option<Snapshot>, String>>();
+    tokio::spawn(async move {
+        let result = async {
+            let store = ensure_store(&dir).await?;
+            let guard = lock_store(&store).await?;
+            if closed.is_cancelled() {
+                return Ok((guard, None));
+            }
+            let Some(oid) = snapshot_locked(&dir).await? else {
+                return Ok((guard, None));
+            };
+            let snapshot = Snapshot::pin(&store, oid, chat.as_deref())?;
+            if closed.is_cancelled() {
+                return Ok((guard, None));
+            }
+            Ok::<_, String>((guard, Some(snapshot)))
+        }
+        .await;
+        match result {
+            Ok((guard, snapshot)) => {
+                // A timed-out caller cannot leave a pin rooted through the next GC.
+                let _ = sender.send(Ok(snapshot));
+                drop(guard);
+            }
+            Err(e) => {
+                if let Err(Err(e)) = sender.send(Err(e)) {
+                    eprintln!("[turns] abandoned snapshot capture: {e}");
+                }
+            }
+        }
+    });
+    receiver
+        .await
+        .map_err(|e| format!("snapshot capture task: {e}"))?
+}
+
 /// Returns None, with a log, for unsafe or oversized checkouts. A copied index
 /// retains tracked ignored files and staged additions. Its flags are cleared
 /// so assume-unchanged / skip-worktree cannot hide working-tree edits.
-pub async fn snapshot(dir: &Path) -> Result<Option<String>, String> {
+async fn snapshot_locked(dir: &Path) -> Result<Option<String>, String> {
     remove_legacy_refs(dir).await?;
     let git_dir = text(dir, None, &["rev-parse", "--absolute-git-dir"]).await?;
     for state in ["MERGE_HEAD", "rebase-merge", "rebase-apply"] {
@@ -409,18 +651,68 @@ pub async fn snapshot(dir: &Path) -> Result<Option<String>, String> {
 
 async fn materialize(dir: &Path, store: &Path, oid: &str) -> Result<(), String> {
     let source = common_dir(dir).await?.join("objects");
-    git_run(
+    let objects = store.join("objects");
+    let closure = git_run(
         store,
         None,
-        Some((&store.join("objects"), &source)),
-        &["pack-objects", "--revs", "objects/pack/pack"],
-        Some(format!("{oid}\n").as_bytes()),
+        Some((&objects, &source)),
+        &["rev-list", "--objects", "--no-object-names", oid],
+        None,
     )
     .await?;
+    // Test existence without the source alternate: only missing private objects
+    // need copying. Newly captured dirty blobs already live in this store.
+    let checked = git_input(
+        store,
+        None,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        Some(&closure),
+    )
+    .await?;
+    let checked =
+        String::from_utf8(checked).map_err(|e| format!("snapshot object inventory: {e}"))?;
+    let mut missing = String::new();
+    for line in checked.lines() {
+        if let Some(oid) = line.strip_suffix(" missing") {
+            missing.push_str(oid);
+            missing.push('\n');
+        }
+    }
+    if !missing.is_empty() {
+        git_run(
+            store,
+            None,
+            Some((&objects, &source)),
+            &["pack-objects", "objects/pack/pack"],
+            Some(missing.as_bytes()),
+        )
+        .await?;
+    }
     Ok(())
 }
 
+/// Import a revision into chat history. Independent snapshot handles keep
+/// their own leases until dropped, even if this chat is subsequently deleted.
 pub async fn save(dir: &Path, chat: &str, turn: u64, phase: &str, oid: &str) -> Result<(), String> {
+    let dir = dir.to_path_buf();
+    let chat = chat.to_string();
+    let phase = phase.to_string();
+    let oid = oid.to_string();
+    tokio::spawn(async move {
+        let store = ensure_store(&dir).await?;
+        let _guard = lock_store(&store).await?;
+        save_locked(&dir, &chat, turn, &phase, &oid).await
+    })
+    .await
+    .map_err(|e| format!("snapshot save task: {e}"))?
+}
+async fn save_locked(
+    dir: &Path,
+    chat: &str,
+    turn: u64,
+    phase: &str,
+    oid: &str,
+) -> Result<(), String> {
     if !matches!(phase, "start" | "end") {
         return Err("invalid snapshot phase".into());
     }
@@ -525,8 +817,92 @@ async fn remove_legacy_refs(dir: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+fn sweep_pending(store: &Path, chat: Option<&str>) -> Result<(), String> {
+    let leases = store.join("gitterm-leases");
+    let mut live = BTreeSet::new();
+    match std::fs::read_dir(&leases) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry =
+                    entry.map_err(|e| format!("read snapshot lease {}: {e}", leases.display()))?;
+                let path = entry.path();
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| format!("open snapshot lease {}: {e}", path.display()))?;
+                match file.try_lock() {
+                    Ok(()) => {
+                        drop(file);
+                        std::fs::remove_file(&path).map_err(|e| {
+                            format!("remove stale snapshot lease {}: {e}", path.display())
+                        })?;
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        live.insert(entry.file_name());
+                    }
+                    Err(std::fs::TryLockError::Error(e)) => {
+                        return Err(format!("probe snapshot lease {}: {e}", path.display()))
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("list snapshot leases {}: {e}", leases.display())),
+    }
+    let root = store.join(PENDING_PREFIX);
+    let selected = chat.map(|chat| root.join("chat").join(chat));
+    let mut directories = vec![root];
+    while let Some(dir) = directories.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("list pending snapshots {}: {e}", dir.display())),
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| format!("read pending snapshot {}: {e}", dir.display()))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("stat pending snapshot {}: {e}", path.display()))?;
+            if kind.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            let stale = !live.contains(&entry.file_name());
+            if stale
+                || selected
+                    .as_ref()
+                    .is_some_and(|prefix| path.starts_with(prefix))
+            {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(format!("remove pending snapshot {}: {e}", path.display()))
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 async fn cleanup_store(store: &Path, chat: Option<&str>, now: i64) -> Result<(), String> {
-    let _guard = MAINTENANCE.lock().await;
+    let store = store.to_path_buf();
+    let chat = chat.map(str::to_owned);
+    tokio::spawn(async move {
+        let _guard = lock_store(&store).await?;
+        cleanup_store_locked(&store, chat.as_deref(), now).await
+    })
+    .await
+    .map_err(|e| format!("snapshot cleanup task: {e}"))?
+}
+async fn cleanup_store_locked(store: &Path, chat: Option<&str>, now: i64) -> Result<(), String> {
+    if let Some(chat) = chat {
+        chat_prefix(chat)?;
+    }
+    sweep_pending(store, chat)?;
     let prefix = match chat {
         Some(chat) => chat_prefix(chat)?,
         None => PREFIX.to_string(),
@@ -536,8 +912,22 @@ async fn cleanup_store(store: &Path, chat: Option<&str>, now: i64) -> Result<(),
             git(store, None, &["update-ref", "-d", &reference, &oid]).await?;
         }
     }
-    // Private GC, with Git's normal grace period protecting in-flight captures.
-    git(store, None, &["gc", "--prune=2.weeks.ago"]).await?;
+    // Live candidates are explicitly rooted; serialized writers permit immediate
+    // private pruning. Keep pins loose for RAII removal; parentless snapshots
+    // do not benefit from a commit graph.
+    git(
+        store,
+        None,
+        &[
+            "-c",
+            "gc.packRefs=false",
+            "-c",
+            "gc.writeCommitGraph=false",
+            "gc",
+            "--prune=now",
+        ],
+    )
+    .await?;
     Ok(())
 }
 pub async fn cleanup(dir: &Path, chat: Option<&str>, now: i64) -> Result<(), String> {
@@ -553,13 +943,17 @@ pub async fn cleanup(dir: &Path, chat: Option<&str>, now: i64) -> Result<(), Str
 }
 
 struct CapturedSnapshot {
-    oid: String,
+    oid: Snapshot,
     store: PathBuf,
     checkout_key: String,
 }
 impl CapturedSnapshot {
-    async fn capture(dir: &Path) -> Result<Option<Self>, String> {
-        let Some(oid) = snapshot(dir).await? else {
+    async fn capture(
+        dir: &Path,
+        chat: Option<&str>,
+        closed: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<Self>, String> {
+        let Some(oid) = capture_snapshot(dir, chat, closed).await? else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -623,45 +1017,43 @@ impl Recorder {
         number: u64,
         phase: &str,
     ) -> Result<(), String> {
-        // Serialize ref publication and deletion. A cancelled recorder must not
-        // recreate refs after a cleanup that overtook an in-flight capture.
-        let _guard = MAINTENANCE.lock().await;
-        if self.closed.is_cancelled() {
-            return Ok(());
-        }
         let reference = snapshot.reference(chat, number, phase)?;
-        git(
-            &snapshot.store,
-            None,
-            &["update-ref", &reference, &snapshot.oid],
-        )
-        .await?;
-        if self.closed.is_cancelled() {
-            git(
-                &snapshot.store,
-                None,
-                &["update-ref", "-d", &reference, &snapshot.oid],
-            )
-            .await?;
-        }
-        Ok(())
+        let store = snapshot.store.clone();
+        let oid = snapshot.oid.clone();
+        let chat = chat.to_string();
+        let closed = self.closed.clone();
+        tokio::spawn(async move {
+            let _guard = lock_store(&store).await?;
+            let oid = oid;
+            if closed.is_cancelled() {
+                return Ok(());
+            }
+            oid.bind(&store, &chat)?;
+            git(&store, None, &["update-ref", &reference, &oid]).await?;
+            if closed.is_cancelled() {
+                git(&store, None, &["update-ref", "-d", &reference, &oid]).await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("snapshot publication task: {e}"))?
     }
     pub async fn close(&mut self) {
         self.closed.cancel();
+        let mut dirs = self.known.clone();
+        dirs.extend(self.starts.keys().cloned());
+        self.discard_turn();
         if self.facts_dir.is_none() {
             return;
         }
-        if let Some(chat) = &self.chat {
-            let mut dirs = self.known.clone();
-            dirs.extend(self.starts.keys().cloned());
-            match self.checkouts().await {
-                Ok(more) => dirs.extend(more),
-                Err(e) => eprintln!("[turns] {e}"),
-            }
-            if let Some(facts_dir) = &self.facts_dir {
-                if let Err(e) = maintain(facts_dir.clone(), dirs, Some(vec![chat.clone()])).await {
-                    eprintln!("[turns] {e}");
-                }
+        match self.checkouts().await {
+            Ok(more) => dirs.extend(more),
+            Err(e) => eprintln!("[turns] {e}"),
+        }
+        if let Some(facts_dir) = &self.facts_dir {
+            let chats = self.chat.as_ref().map(|chat| vec![chat.clone()]);
+            if let Err(e) = maintain(facts_dir.clone(), dirs, chats).await {
+                eprintln!("[turns] {e}");
             }
         }
     }
@@ -713,7 +1105,7 @@ impl Recorder {
         self.next_number = number.saturating_add(1);
         self.known.extend(dirs.iter().cloned());
         for dir in dirs {
-            match CapturedSnapshot::capture(&dir).await {
+            match CapturedSnapshot::capture(&dir, self.chat.as_deref(), self.closed.clone()).await {
                 Ok(Some(snapshot)) => {
                     self.starts.insert(dir, snapshot);
                 }
@@ -767,7 +1159,9 @@ impl Recorder {
                         dir.display()
                     );
                 }
-                match CapturedSnapshot::capture(&dir).await {
+                match CapturedSnapshot::capture(&dir, self.chat.as_deref(), self.closed.clone())
+                    .await
+                {
                     Ok(Some(snapshot)) => {
                         self.ends.insert(dir, snapshot);
                     }
@@ -1079,7 +1473,7 @@ mod tests {
         assert!(g(remote.path(), &["for-each-ref", PREFIX]).is_empty());
         assert!(!g(remote.path(), &["rev-list", "--all"])
             .lines()
-            .any(|line| line == oid));
+            .any(|line| line == oid.as_str()));
     }
     async fn configured_push_keeps_snapshots_local(config: &[&str]) {
         for configure_before in [true, false] {
@@ -1115,7 +1509,7 @@ mod tests {
             }
             g(dir, &["push"]);
             assert!(g(remote.path(), &["for-each-ref", PREFIX]).is_empty());
-            for object in [&oid, &g(dir, &["hash-object", "private-untracked"])] {
+            for object in [oid.as_str(), &g(dir, &["hash-object", "private-untracked"])] {
                 for location in [dir, remote.path()] {
                     let out = crate::agentd::git::git_command()
                         .current_dir(location)
@@ -1242,6 +1636,396 @@ mod tests {
                 assert!(g(repo.path(), &["for-each-ref", PREFIX]).is_empty());
             }
         }
+    }
+    fn store_bytes(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    store_bytes(&entry.path())
+                } else {
+                    metadata.len()
+                }
+            })
+            .sum()
+    }
+    fn binary_fixture() -> Vec<u8> {
+        let mut state = 0x123456789abcdef0u64;
+        (0..2 * 1024 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn deleted_chat_objects_are_reclaimed_to_baseline() {
+        let repo = repo();
+        let dir = repo.path();
+        let kept = snapshot(dir).await.unwrap().unwrap();
+        save(dir, "keep", 1, "start", &kept).await.unwrap();
+        let store = store_path(dir).await.unwrap();
+        cleanup(dir, None, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let kept_oid = kept.to_string();
+        drop(kept);
+        cleanup(dir, None, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let baseline = store_bytes(&store);
+        std::fs::write(dir.join("private.bin"), binary_fixture()).unwrap();
+        let deleted = snapshot(dir).await.unwrap().unwrap();
+        save(dir, "deleted", 1, "start", &deleted).await.unwrap();
+        let blob = g(&store, &["rev-parse", &format!("{deleted}:private.bin")]);
+        assert!(store_bytes(&store) > baseline + 1024 * 1024);
+        drop(deleted);
+        cleanup(dir, Some("deleted"), chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert_eq!(
+            store_bytes(&store),
+            baseline,
+            "deleted content must release its physical storage"
+        );
+        let output = crate::agentd::git::git_command()
+            .current_dir(&store)
+            .args(["cat-file", "-e", &blob])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "deleted private content remains readable"
+        );
+        assert_eq!(
+            g(&store, &["show", &format!("{kept_oid}:file.txt")]),
+            "base"
+        );
+        assert_eq!(turns(dir, "keep").await.unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn unchanged_blobs_are_materialized_once() {
+        let repo = repo();
+        let dir = repo.path();
+        std::fs::write(dir.join("unchanged.bin"), binary_fixture()).unwrap();
+        g(dir, &["add", "unchanged.bin"]);
+        g(dir, &["commit", "-qm", "large tracked fixture"]);
+        let store = ensure_store(dir).await.unwrap();
+        let mut first_size = 0;
+        let mut captured = Vec::new();
+        for turn in 1..=6 {
+            std::fs::write(dir.join("file.txt"), format!("edit {turn}\n")).unwrap();
+            let oid = snapshot(dir).await.unwrap().unwrap();
+            save(dir, "dedup", turn, "start", &oid).await.unwrap();
+            if turn == 1 {
+                first_size = store_bytes(&store);
+            }
+            captured.push(oid);
+        }
+        assert!(
+            store_bytes(&store) < first_size + 64 * 1024,
+            "unchanged binary duplicated: first {first_size}, final {}",
+            store_bytes(&store)
+        );
+        let blob = g(
+            &store,
+            &["rev-parse", &format!("{}:unchanged.bin", captured[0])],
+        );
+        let copies: usize = std::fs::read_dir(store.join("objects/pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "idx"))
+            .map(|path| {
+                g(&store, &["verify-pack", "-v", path.to_str().unwrap()])
+                    .lines()
+                    .filter(|line| line.starts_with(&format!("{blob} ")))
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            copies, 1,
+            "unchanged source blob must have one private packed copy"
+        );
+        std::fs::rename(dir.join(".git/objects"), dir.join("source-objects-away")).unwrap();
+        for (index, oid) in captured.iter().enumerate() {
+            assert_eq!(
+                g(&store, &["show", &format!("{oid}:file.txt")]),
+                format!("edit {}", index + 1)
+            );
+            assert_eq!(
+                g(&store, &["cat-file", "-s", &format!("{oid}:unchanged.bin")]),
+                (2 * 1024 * 1024).to_string()
+            );
+        }
+        g(&store, &["fsck", "--full"]);
+    }
+    #[tokio::test]
+    async fn many_source_objects_materialize_without_pipe_deadlock() {
+        let repo = repo();
+        let dir = repo.path();
+        for index in 0..4_000 {
+            std::fs::write(
+                dir.join(format!("fixture-{index}")),
+                format!("blob {index}"),
+            )
+            .unwrap();
+        }
+        g(dir, &["add", "."]);
+        g(dir, &["commit", "-qm", "many source objects"]);
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), snapshot(dir))
+            .await
+            .expect("batch inventory must drain stdout while feeding stdin")
+            .unwrap()
+            .unwrap();
+        let store = store_path(dir).await.unwrap();
+        assert_eq!(
+            g(&store, &["show", &format!("{snapshot}:fixture-3999")]),
+            "blob 3999"
+        );
+    }
+    #[tokio::test]
+    async fn cleanup_protects_unbound_baselines_and_unpublished_stop_candidates() {
+        let repo = repo();
+        let dir = repo.path();
+        let facts = tempfile::tempdir().unwrap();
+        let mut live = Recorder::new(dir.into(), None, Some(facts.path().into()));
+        std::fs::write(dir.join("file.txt"), "unbound baseline").unwrap();
+        live.begin().await;
+        cleanup(dir, Some("deleted"), chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        live.bind("live").await;
+        std::fs::write(dir.join("file.txt"), "unpublished stop").unwrap();
+        live.capture_end().await;
+        cleanup(dir, None, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        live.finish().await;
+        let store = store_path(dir).await.unwrap();
+        let recorded = turns(dir, "live").await.unwrap();
+        assert_eq!(
+            g(
+                &store,
+                &[
+                    "show",
+                    &format!("{}:file.txt", recorded[0].start.as_deref().unwrap())
+                ]
+            ),
+            "unbound baseline"
+        );
+        assert_eq!(
+            g(
+                &store,
+                &[
+                    "show",
+                    &format!("{}:file.txt", recorded[0].end.as_deref().unwrap())
+                ]
+            ),
+            "unpublished stop"
+        );
+        g(&store, &["fsck", "--full"]);
+    }
+    #[tokio::test]
+    async fn cleanup_reclaims_cancelled_recorders_pending_candidates() {
+        let repo = repo();
+        let dir = repo.path();
+        let facts = tempfile::tempdir().unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let store = ensure_store(dir).await.unwrap();
+        cleanup(dir, None, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let baseline = store_bytes(&store);
+        let mut closing = Recorder::new(
+            dir.into(),
+            Some("closing-pending".into()),
+            Some(facts.path().into()),
+        )
+        .with_close_token(token.clone());
+        std::fs::write(dir.join("private.bin"), binary_fixture()).unwrap();
+        closing.begin().await;
+        std::fs::write(dir.join("file.txt"), "pending stop").unwrap();
+        closing.capture_end().await;
+        token.cancel();
+        cleanup(dir, Some("closing-pending"), chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert_eq!(
+            store_bytes(&store),
+            baseline,
+            "closed recorder handles must not retain deleted content"
+        );
+        closing.finish().await;
+        assert!(turns(dir, "closing-pending").await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn closing_unbound_recorder_reclaims_its_baseline() {
+        let repo = repo();
+        let facts = tempfile::tempdir().unwrap();
+        let store = ensure_store(repo.path()).await.unwrap();
+        cleanup(repo.path(), None, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let baseline = store_bytes(&store);
+        let mut recorder = Recorder::new(repo.path().into(), None, Some(facts.path().into()));
+        recorder.begin().await;
+        recorder.close().await;
+        assert_eq!(store_bytes(&store), baseline);
+    }
+    #[tokio::test]
+    async fn cancelled_queued_capture_cannot_write_after_cleanup() {
+        let repo = repo();
+        let store = ensure_store(repo.path()).await.unwrap();
+        cleanup(repo.path(), None, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let baseline = store_bytes(&store);
+        let guard = lock_store(&store).await.unwrap();
+        let closed = tokio_util::sync::CancellationToken::new();
+        let token = closed.clone();
+        let dir = repo.path().to_path_buf();
+        let mut capture =
+            tokio::spawn(async move { capture_snapshot(&dir, Some("queued"), token).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut capture)
+                .await
+                .is_err()
+        );
+        closed.cancel();
+        drop(guard);
+        assert!(capture.await.unwrap().unwrap().is_none());
+        assert_eq!(store_bytes(&store), baseline);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoned_capture_keeps_lock_until_git_exits_and_drops_its_pin() {
+        let repo = repo();
+        let dir = repo.path();
+        let store = ensure_store(dir).await.unwrap();
+        cleanup(dir, None, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let baseline = store_bytes(&store);
+        let control = tempfile::tempdir().unwrap();
+        let filter = control.path().join("filter");
+        std::fs::write(&filter, "#!/bin/sh\ntouch \"$0.started\"\nwhile [ ! -f \"$0.release\" ]; do sleep 0.01; done\ncat\n").unwrap();
+        let command = format!("sh '{}'", filter.display());
+        g(dir, &["config", "filter.capture.clean", &command]);
+        std::fs::write(dir.join(".gitattributes"), "file.txt filter=capture\n").unwrap();
+        std::fs::write(dir.join("file.txt"), "capture in flight").unwrap();
+        let path = dir.to_path_buf();
+        let capture = tokio::spawn(async move { snapshot(&path).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !filter.with_extension("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("capture filter did not start");
+        capture.abort();
+        let path = store.clone();
+        let mut cleanup = tokio::spawn(async move {
+            cleanup_store(&path, Some("deleted"), chrono::Utc::now().timestamp()).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut cleanup)
+                .await
+                .is_err()
+        );
+        std::fs::write(filter.with_extension("release"), "").unwrap();
+        cleanup.await.unwrap().unwrap();
+        assert_eq!(store_bytes(&store), baseline);
+    }
+    #[test]
+    fn pending_lease_child() {
+        let Some(store) = std::env::var_os("GITTERM_V6_SNAPSHOT_LEASE_TEST_STORE") else {
+            return;
+        };
+        let store = PathBuf::from(store);
+        let control =
+            PathBuf::from(std::env::var_os("GITTERM_V6_SNAPSHOT_LEASE_TEST_CONTROL").unwrap());
+        let oid = std::env::var("GITTERM_V6_SNAPSHOT_LEASE_TEST_OID").unwrap();
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store.join("gitterm.lock"))
+            .unwrap();
+        guard.try_lock().unwrap();
+        let _pin = Snapshot::pin(&store, oid, None).unwrap();
+        std::fs::write(control.join("ready"), "").unwrap();
+        let mut guard = Some(guard);
+        for _ in 0..2_000 {
+            if control.join("release").exists() {
+                guard.take();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("parent did not terminate lease fixture");
+    }
+    #[tokio::test]
+    async fn cross_process_lock_and_live_pin_survive_gc_then_crash_is_reclaimed() {
+        let repo = repo();
+        let dir = repo.path();
+        let store = ensure_store(dir).await.unwrap();
+        cleanup(dir, None, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let baseline = store_bytes(&store);
+        let snapshot = snapshot(dir).await.unwrap().unwrap();
+        let oid = snapshot.to_string();
+        drop(snapshot);
+        let control = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "turn_snapshots::tests::pending_lease_child",
+                "--nocapture",
+            ])
+            .env("GITTERM_V6_SNAPSHOT_LEASE_TEST_STORE", &store)
+            .env("GITTERM_V6_SNAPSHOT_LEASE_TEST_CONTROL", control.path())
+            .env("GITTERM_V6_SNAPSHOT_LEASE_TEST_OID", &oid)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !control.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child lease fixture did not start");
+        let path = store.clone();
+        let mut cleanup = tokio::spawn(async move {
+            cleanup_store(&path, None, chrono::Utc::now().timestamp()).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut cleanup)
+                .await
+                .is_err(),
+            "GC must respect another process's store lock"
+        );
+        std::fs::write(control.path().join("release"), "").unwrap();
+        cleanup.await.unwrap().unwrap();
+        assert_eq!(g(&store, &["show", &format!("{oid}:file.txt")]), "base");
+        child.kill().await.unwrap();
+        // A crashed write can leave an incomplete ref; sweep leases before Git
+        // attempts to enumerate either this file or the abandoned live pin.
+        std::fs::write(
+            store.join(format!("{PENDING_PREFIX}unbound/partial")),
+            "incomplete",
+        )
+        .unwrap();
+        cleanup_store(&store, None, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert_eq!(store_bytes(&store), baseline);
     }
     #[tokio::test]
     async fn cleanup_is_chat_scoped_and_expires_after_fourteen_days() {
@@ -1408,7 +2192,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn cancelled_finish_does_not_wait_for_global_cleanup() {
+    async fn cancelled_finish_does_not_wait_for_store_cleanup() {
         let repo = repo();
         let facts = tempfile::tempdir().unwrap();
         let token = tokio_util::sync::CancellationToken::new();
@@ -1419,7 +2203,9 @@ mod tests {
         )
         .with_close_token(token.clone());
         recorder.begin().await;
-        let _slow_cleanup = MAINTENANCE.lock().await;
+        let _slow_cleanup = lock_store(&store_path(repo.path()).await.unwrap())
+            .await
+            .unwrap();
         token.cancel();
         assert!(
             tokio::time::timeout(Duration::from_millis(100), recorder.finish())
@@ -1471,6 +2257,6 @@ mod tests {
                 .as_deref(),
             Some(main.as_str())
         );
-        assert_ne!(oid, main);
+        assert_ne!(oid.as_str(), main.as_str());
     }
 }
