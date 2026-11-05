@@ -11,6 +11,8 @@
 // - `WebviewSurface::Viewer` hosts markdown / HTML / excalidraw HTML, the
 //   plans-viewer URL and the review pane (TRU-178). It is built with an IPC
 //   handler that only the review page's token-stamped messages get through.
+// - `WebviewSurface::Page` hosts remote GitHub and Linear pages, with an
+//   optional persistent WebKit store keyed by the signed-in account/workspace.
 //
 // The app keeps at most one surface visible at a time (see
 // `visible_webview_surface` in main.rs).
@@ -20,6 +22,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 type WebViewBounds = (f32, f32, f32, f32);
 
@@ -27,6 +30,7 @@ type WebViewBounds = (f32, f32, f32, f32);
 /// `window.ipc.postMessage(jsonString)`. Must be `Send + 'static` because wry runs
 /// the handler from the platform's web-process callback path.
 pub type IpcHandler = Box<dyn Fn(String) + Send + 'static>;
+type PageNavigationHandler = Box<dyn Fn(&str) -> bool>;
 
 /// Which child webview an operation targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +41,109 @@ pub enum WebviewSurface {
     /// File viewer HTML (markdown / HTML / excalidraw), the plans viewer URL
     /// and the review pane.
     Viewer,
+    /// A remote GitHub or Linear page, kept separate from the default Viewer store.
+    Page,
+}
+
+/// Persistent cookie-store identity for a remote page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageDataStore {
+    Default,
+    GitHub(String),
+    Linear(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageStoreAction {
+    Navigate,
+    Rebuild,
+}
+
+pub fn page_store_action(
+    current: Option<&PageDataStore>,
+    requested: &PageDataStore,
+) -> PageStoreAction {
+    if current == Some(requested) {
+        PageStoreAction::Navigate
+    } else {
+        PageStoreAction::Rebuild
+    }
+}
+
+impl PageDataStore {
+    /// Normalize GitHub login casing because logins are case-insensitive.
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::GitHub(login) => Self::GitHub(login.to_ascii_lowercase()),
+            store => store,
+        }
+    }
+
+    /// Use shared cookies when custom stores are unavailable on this OS.
+    pub fn for_current_os(self) -> Self {
+        if matches!(&self, Self::Default) {
+            return self.normalized();
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Self::Default;
+        #[cfg(target_os = "macos")]
+        if custom_data_stores_available() {
+            return self.normalized();
+        }
+        #[cfg(target_os = "macos")]
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        #[cfg(target_os = "macos")]
+        LOGGED.call_once(|| {
+            eprintln!("[webview] named page data stores are unavailable; using the default store");
+        });
+        #[cfg(target_os = "macos")]
+        Self::Default
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Default => "default login".to_string(),
+            Self::GitHub(login) => format!("as {login}"),
+            Self::Linear(workspace) => format!("as {workspace}"),
+        }
+    }
+
+    /// A stable, namespaced identifier accepted by wry's Darwin extension.
+    pub fn identifier(&self) -> Option<[u8; 16]> {
+        let (namespace, key) = match self {
+            Self::Default => return None,
+            Self::GitHub(login) => ("github", login.to_ascii_lowercase()),
+            Self::Linear(workspace) => ("linear", workspace.clone()),
+        };
+        let mut input = b"gitterm-v6-webkit-store-v1\0".to_vec();
+        input.extend_from_slice(namespace.as_bytes());
+        input.push(0);
+        input.extend_from_slice(key.as_bytes());
+        let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+        let mut identifier = [0; 16];
+        identifier.copy_from_slice(&digest.as_ref()[..16]);
+        Some(identifier)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn custom_data_stores_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("/usr/bin/sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|version| version.trim().split('.').next()?.parse::<u32>().ok())
+            .is_some_and(|major| major >= 14)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn custom_data_stores_available() -> bool {
+    false
 }
 
 /// What kind of content is staged for the next webview create / reuse. The
@@ -56,8 +163,10 @@ use wry::{Rect, WebView, WebViewBuilder};
 /// after the app hid the surface doesn't pop it up.
 struct SurfaceSlot {
     webview: Option<WebView>,
-    pending: Option<(PendingContent, WebViewBounds)>,
+    pending: Option<(PendingContent, WebViewBounds, Option<[u8; 16]>)>,
+    data_store_identifier: Option<[u8; 16]>,
     pending_ipc_handler: Option<IpcHandler>,
+    page_navigation_handler: Option<Rc<RefCell<PageNavigationHandler>>>,
     visible: bool,
 }
 
@@ -65,7 +174,9 @@ impl SurfaceSlot {
     const EMPTY: SurfaceSlot = SurfaceSlot {
         webview: None,
         pending: None,
+        data_store_identifier: None,
         pending_ipc_handler: None,
+        page_navigation_handler: None,
         visible: false,
     };
 }
@@ -75,6 +186,7 @@ impl SurfaceSlot {
 thread_local! {
     static AGENT_PAGES: RefCell<HashMap<usize, SurfaceSlot>> = RefCell::new(HashMap::new());
     static VIEWER_SURFACE: RefCell<SurfaceSlot> = const { RefCell::new(SurfaceSlot::EMPTY) };
+    static PAGE_SURFACE: RefCell<SurfaceSlot> = const { RefCell::new(SurfaceSlot::EMPTY) };
 }
 
 /// Run `f` on `surface`'s slot, creating an empty agent page slot on demand.
@@ -89,6 +201,7 @@ fn with_slot<R>(surface: WebviewSurface, f: impl FnOnce(&mut SurfaceSlot) -> R) 
                 .or_insert(SurfaceSlot::EMPTY))
         }),
         WebviewSurface::Viewer => VIEWER_SURFACE.with(|slot| f(&mut slot.borrow_mut())),
+        WebviewSurface::Page => PAGE_SURFACE.with(|slot| f(&mut slot.borrow_mut())),
     }
 }
 
@@ -102,6 +215,7 @@ fn with_existing_slot<R>(
             AGENT_PAGES.with(|pages| pages.borrow_mut().get_mut(&tab_id).map(f))
         }
         WebviewSurface::Viewer => VIEWER_SURFACE.with(|slot| Some(f(&mut slot.borrow_mut()))),
+        WebviewSurface::Page => PAGE_SURFACE.with(|slot| Some(f(&mut slot.borrow_mut()))),
     }
 }
 
@@ -151,7 +265,7 @@ pub fn set_pending_content_with_ipc(
     ipc_handler: Option<IpcHandler>,
 ) {
     with_slot(surface, |slot| {
-        slot.pending = Some((PendingContent::Html(html), bounds));
+        slot.pending = Some((PendingContent::Html(html), bounds, None));
         slot.pending_ipc_handler = ipc_handler;
         slot.visible = true;
     });
@@ -177,10 +291,41 @@ pub fn set_pending_url_with_ipc(
     ipc_handler: Option<IpcHandler>,
 ) {
     with_slot(surface, |slot| {
-        slot.pending = Some((PendingContent::Url(url), bounds));
+        slot.pending = Some((PendingContent::Url(url), bounds, None));
         slot.pending_ipc_handler = ipc_handler;
         slot.visible = true;
     });
+}
+
+/// Stage a remote page with a persistent, account-scoped WebKit data store.
+pub fn set_pending_page(url: String, bounds: (f32, f32, f32, f32), store: &PageDataStore) {
+    with_slot(WebviewSurface::Page, |slot| {
+        slot.pending = Some((PendingContent::Url(url), bounds, store.identifier()));
+        slot.pending_ipc_handler = None;
+        slot.visible = true;
+    });
+}
+
+/// Update a live Page's routing policy without replacing its native handler.
+/// Each surface owns its cell, so destroyed surfaces cannot read a new one's policy.
+pub fn set_page_navigation_handler(handler: impl Fn(&str) -> bool + 'static) {
+    with_slot(WebviewSurface::Page, |slot| {
+        if let Some(cell) = &slot.page_navigation_handler {
+            *cell.borrow_mut() = Box::new(handler);
+        } else {
+            slot.page_navigation_handler = Some(Rc::new(RefCell::new(Box::new(handler))));
+        }
+    });
+}
+
+#[cfg(test)]
+pub fn test_page_navigation(url: &str) -> bool {
+    PAGE_SURFACE.with(|slot| {
+        let slot = slot.borrow();
+        slot.page_navigation_handler
+            .as_ref()
+            .is_some_and(|handler| (handler.borrow())(url))
+    })
 }
 
 /// Navigate the live webview on `surface` to a URL. No-op if that surface has no
@@ -210,10 +355,19 @@ pub fn try_create_with_window(
     window: &dyn HasWindowHandle,
 ) -> Result<bool, String> {
     with_existing_slot(surface, |slot| {
-        let Some((content, bounds)) = slot.pending.take() else {
+        let Some((content, bounds, data_store_identifier)) = slot.pending.take() else {
             return Ok(false);
         };
         let ipc_handler = slot.pending_ipc_handler.take();
+
+        // A Page webview cannot change its cookie store after construction.
+        // Drop it before reusing the slot when its staged store differs.
+        if surface == WebviewSurface::Page
+            && slot.webview.is_some()
+            && slot.data_store_identifier != data_store_identifier
+        {
+            slot.webview = None;
+        }
 
         // If WebView already exists, update content and apply visibility.
         if let Some(webview) = slot.webview.as_ref() {
@@ -250,15 +404,69 @@ pub fn try_create_with_window(
             .with_transparent(false)
             .with_visible(slot.visible);
 
+        if matches!(surface, WebviewSurface::Viewer | WebviewSurface::Page) {
+            builder = builder.with_new_window_req_handler(|url| {
+                open_url_in_browser(&url);
+                false
+            });
+        }
+
+        if surface == WebviewSurface::Page {
+            // The independent cell avoids reborrowing SurfaceSlot if load_url
+            // invokes the policy synchronously. A missing policy fails closed.
+            // shortcut: wry 0.48's GTK hook has no frame identity; revisit when
+            // upstream exposes it. macOS/Windows call this for the main frame.
+            let handler = slot.page_navigation_handler.clone();
+            builder = builder.with_navigation_handler(move |url| {
+                handler
+                    .as_ref()
+                    .is_some_and(|handler| (handler.borrow())(&url))
+            });
+        }
+
+        #[cfg(target_os = "macos")]
+        if surface == WebviewSurface::Page {
+            if let Some(identifier) = data_store_identifier {
+                use wry::WebViewBuilderExtDarwin;
+                builder = builder.with_data_store_identifier(identifier);
+            }
+        }
+
         builder = match &content {
             PendingContent::Html(html) => builder.with_html(html),
             PendingContent::Url(url) => builder.with_url(url),
         };
 
         if let Some(handler) = ipc_handler {
-            builder = builder.with_ipc_handler(move |req: wry::http::Request<String>| {
-                handler(req.into_body());
-            });
+            if matches!(surface, WebviewSurface::Agent(_)) {
+                let token = uuid::Uuid::new_v4().to_string();
+                builder = builder
+                    .with_incognito(true)
+                    .with_initialization_script_for_main_only(
+                        gitterm::html_render::FRAME_GUARD_JS,
+                        false,
+                    )
+                    .with_initialization_script_for_main_only(
+                        &gitterm::html_render::ipc_bootstrap(&token),
+                        true,
+                    )
+                    .with_navigation_handler(|url| {
+                        gitterm::html_render::agent_navigation_allowed(&url)
+                    })
+                    .with_new_window_req_handler(|url| {
+                        gitterm::html_render::agent_navigation_allowed(&url)
+                    })
+                    .with_ipc_handler(move |req: wry::http::Request<String>| {
+                        if let Some(message) = gitterm::html_render::ipc_message(req.body(), &token)
+                        {
+                            handler(message);
+                        }
+                    });
+            } else {
+                builder = builder.with_ipc_handler(move |req: wry::http::Request<String>| {
+                    handler(req.into_body());
+                });
+            }
         }
 
         let webview = builder
@@ -266,9 +474,49 @@ pub fn try_create_with_window(
             .map_err(|e| format!("Failed to create {surface:?} WebView: {}", e))?;
 
         slot.webview = Some(webview);
+        slot.data_store_identifier = data_store_identifier;
         Ok(true)
     })
     .unwrap_or(Ok(false))
+}
+
+/// Validate content-controlled URLs before handing them to an OS protocol handler.
+pub fn browser_url(url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("refused URL scheme {}", parsed.scheme()));
+    }
+    Ok(parsed)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_browser_command(url: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("rundll32.exe");
+    command.args(["url.dll,FileProtocolHandler", url]);
+    command
+}
+
+/// Open an HTTP(S) URL using the platform's default browser.
+pub fn open_url_in_browser(url: &str) {
+    let url = match browser_url(url) {
+        Ok(url) => url,
+        Err(error) => {
+            eprintln!("[webview] browser open refused: {error}");
+            return;
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url.as_str()).spawn();
+    #[cfg(target_os = "windows")]
+    let result = windows_browser_command(url.as_str()).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open")
+        .arg(url.as_str())
+        .spawn();
+
+    if let Err(error) = result {
+        eprintln!("[webview] cannot open {url} in the browser: {error}");
+    }
 }
 
 /// Update the bounds (position and size) of `surface`'s webview.
@@ -441,7 +689,8 @@ pub fn focus_app_view() {
         |slot: &mut SurfaceSlot| slot.webview.as_ref().map(|webview| webview.focus_parent());
     let result = AGENT_PAGES
         .with(|pages| pages.borrow_mut().values_mut().find_map(focus_parent))
-        .or_else(|| VIEWER_SURFACE.with(|slot| focus_parent(&mut slot.borrow_mut())));
+        .or_else(|| VIEWER_SURFACE.with(|slot| focus_parent(&mut slot.borrow_mut())))
+        .or_else(|| PAGE_SURFACE.with(|slot| focus_parent(&mut slot.borrow_mut())));
     if let Some(Err(e)) = result {
         eprintln!("[webview] giving keyboard focus back to the app view failed: {e}");
     }
@@ -472,12 +721,132 @@ pub fn destroy(surface: WebviewSurface) {
                 .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), SurfaceSlot::EMPTY));
             drop(old);
         }
+        WebviewSurface::Page => {
+            let old = PAGE_SURFACE
+                .with(|slot| std::mem::replace(&mut *slot.borrow_mut(), SurfaceSlot::EMPTY));
+            drop(old);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::insert_composer_text_script;
+    use super::{insert_composer_text_script, page_store_action, PageDataStore, PageStoreAction};
+
+    #[test]
+    fn page_policy_can_run_under_slot_borrow_and_old_surfaces_keep_their_own_policy() {
+        super::set_page_navigation_handler(|_| false);
+        let old = super::PAGE_SURFACE.with(|slot| {
+            let slot = slot.borrow();
+            let handler = slot.page_navigation_handler.as_ref().unwrap();
+            assert!(!(handler.borrow())("https://example.test/"));
+            handler.clone()
+        });
+        super::set_page_navigation_handler(|_| true);
+        assert!((old.borrow())("https://example.test/"));
+        super::destroy(super::WebviewSurface::Page);
+        super::set_page_navigation_handler(|_| false);
+        assert!((old.borrow())("https://example.test/"));
+        super::PAGE_SURFACE.with(|slot| {
+            let slot = slot.borrow();
+            assert!(!(slot.page_navigation_handler.as_ref().unwrap().borrow())(
+                "https://example.test/"
+            ));
+        });
+        super::destroy(super::WebviewSurface::Page);
+    }
+
+    #[test]
+    fn browser_urls_allow_only_http_and_https() {
+        for url in [
+            "https://example.test/",
+            "http://example.test/",
+            "HTTPS://example.test/",
+        ] {
+            assert!(super::browser_url(url).is_ok(), "{url}");
+        }
+        for (url, scheme) in [
+            ("file:///tmp/example", "file"),
+            ("javascript:alert(1)", "javascript"),
+            ("data:text/html,example", "data"),
+            ("sample-app:open", "sample-app"),
+        ] {
+            let error = super::browser_url(url).unwrap_err();
+            assert!(error.contains(scheme), "{error}");
+        }
+        assert!(super::browser_url("not a URL").is_err());
+    }
+
+    #[test]
+    fn windows_browser_opener_has_no_shell_and_keeps_url_as_one_argument() {
+        let url = "https://example.test/?x=1&sample.exe=2%20value";
+        let command = super::windows_browser_command(url);
+        assert_eq!(command.get_program(), "rundll32.exe");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["url.dll,FileProtocolHandler", url]
+        );
+    }
+
+    #[test]
+    fn a_pending_page_keeps_the_latest_hidden_visibility_request() {
+        let store = PageDataStore::GitHub("sample-login".to_string());
+        super::set_pending_page(
+            "https://github.com/sample-owner/sample-repo/pull/1".to_string(),
+            (0.0, 0.0, 100.0, 100.0),
+            &store,
+        );
+        super::set_visible(super::WebviewSurface::Page, false);
+        super::PAGE_SURFACE.with(|slot| {
+            let slot = slot.borrow();
+            assert!(slot.pending.is_some());
+            assert!(!slot.visible);
+        });
+        super::destroy(super::WebviewSurface::Page);
+    }
+
+    #[test]
+    fn page_store_identifiers_are_stable_and_distinct() {
+        let alpha = PageDataStore::GitHub("sample-login-a".to_string());
+        let beta = PageDataStore::GitHub("sample-login-b".to_string());
+        assert_eq!(
+            alpha.identifier(),
+            Some([
+                0xa9, 0x0d, 0x78, 0xb9, 0x36, 0xe7, 0x7e, 0x9f, 0x1e, 0xe4, 0x3b, 0x89, 0xd3, 0xf8,
+                0xa9, 0x35,
+            ])
+        );
+        assert_eq!(alpha.identifier(), alpha.clone().identifier());
+        assert_ne!(alpha.identifier(), beta.identifier());
+        assert_ne!(
+            alpha.identifier(),
+            PageDataStore::Linear("sample-login-a".to_string()).identifier()
+        );
+    }
+
+    #[test]
+    fn page_store_action_navigates_for_same_store_and_rebuilds_for_another() {
+        let first = PageDataStore::GitHub("sample-login-a".to_string());
+        let other = PageDataStore::GitHub("sample-login-b".to_string());
+        assert_eq!(
+            page_store_action(Some(&first), &first),
+            PageStoreAction::Navigate
+        );
+        assert_eq!(
+            page_store_action(Some(&first), &other),
+            PageStoreAction::Rebuild
+        );
+        assert_eq!(page_store_action(None, &first), PageStoreAction::Rebuild);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn platforms_without_named_webkit_stores_use_the_default_store() {
+        assert_eq!(
+            PageDataStore::GitHub("sample-login".to_string()).for_current_os(),
+            PageDataStore::Default
+        );
+    }
 
     /// The argument the page receives, decoded as the JS engine would read
     /// the JSON literal.

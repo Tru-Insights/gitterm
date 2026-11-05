@@ -39,6 +39,7 @@ mod chat_rank;
 mod chat_summary;
 mod config;
 mod config_import;
+mod editor;
 mod events;
 mod hover_bounds;
 mod plan_limits_view;
@@ -215,9 +216,20 @@ pub enum AgentIpcMessage {
     OpenFile {
         tab_id: usize,
         path: PathBuf,
+        line: Option<usize>,
+    },
+    OpenCheckout {
+        tab_id: usize,
+        path: PathBuf,
     },
     /// A message from the review pane's page on the Viewer (TRU-178).
     Review(gitterm::review_pane::ReviewIpc),
+    /// Native Page navigation, delivered after its policy callback returns.
+    PageNavigation {
+        generation: u64,
+        url: String,
+        reopen: bool,
+    },
     /// An edit card's Open in review (TRU-179): the absolute file it edited.
     OpenReview {
         tab_id: usize,
@@ -565,8 +577,33 @@ fn history_timeline(
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
             .map(|at| at.timestamp_millis());
         let event = tab::AgentEvent::from(timed.entry);
+        let is_prompt = matches!(
+            &event,
+            tab::AgentEvent::Other(value)
+                if value.get("type").and_then(|value| value.as_str()) == Some("user_prompt")
+        );
+        let is_turn_end = matches!(
+            &event,
+            tab::AgentEvent::Harness(HarnessEvent::TurnCompleted { .. })
+        );
         let started = tab::subagent_started(&event).map(str::to_string);
+        if is_turn_end {
+            if let Some(at_ms) = at_ms {
+                timeline.push(tab::AgentEvent::Other(gitterm::chat_page::turn_timing(
+                    None,
+                    Some(at_ms),
+                )));
+            }
+        }
         timeline.push(event);
+        if is_prompt {
+            if let Some(at_ms) = at_ms {
+                timeline.push(tab::AgentEvent::Other(gitterm::chat_page::turn_timing(
+                    Some(at_ms),
+                    None,
+                )));
+            }
+        }
         if let (Some(parent), Some(at_ms)) = (started, at_ms) {
             timeline.push(tab::AgentEvent::Other(tab::subagent_started_at(
                 &parent, at_ms,
@@ -642,14 +679,15 @@ fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guideli
 }
 
 /// What an agent starting now in `cwd` gets appended: the guidelines and,
-/// in a piece of work, the documents note naming `places` (TRU-191), then
-/// how to start Codex in GitTerm (TRU-212). The
-/// work's docs folder is created here, as the agent starts; a failure is
-/// logged and the note still names it.
+/// in a piece of work, the documents note naming `places` (TRU-191), then,
+/// for an agent given GitTerm's task tools (`task_tools`), how to start
+/// Codex in GitTerm (TRU-212). The work's docs folder is created here, as
+/// the agent starts; a failure is logged and the note still names it.
 fn launch_instructions(
     cwd: &Path,
     workspace_off: bool,
     places: Option<&gitterm::guidelines::DocumentPlaces>,
+    task_tools: bool,
 ) -> Option<gitterm::guidelines::Guidelines> {
     if let Some(places) = places {
         if let Err(error) = std::fs::create_dir_all(&places.docs_dir) {
@@ -659,14 +697,11 @@ fn launch_instructions(
             );
         }
     }
-    let launch_dir = config::instance_config_dir();
-    gitterm::guidelines::with_codex_tools_note(
-        gitterm::guidelines::with_documents(
-            launch_guidelines(cwd, workspace_off),
-            places,
-            &launch_dir,
-        ),
-        &launch_dir,
+    gitterm::guidelines::launch_instructions(
+        launch_guidelines(cwd, workspace_off),
+        places,
+        task_tools,
+        &config::instance_config_dir(),
     )
 }
 
@@ -686,13 +721,16 @@ fn config_document_places(cfg: &WorkspaceConfig) -> Option<gitterm::guidelines::
 }
 
 /// A terminal startup command with the guidelines (and the documents note
-/// of `places`) added when it starts `claude`, `pi` or `codex`. Other
-/// commands are not inspected, so they never read the guidelines file.
+/// of `places`, and the Codex tools note when the terminal gets GitTerm's
+/// task tools, `task_tools`) added when it starts `claude`, `pi` or
+/// `codex`. Other commands are not inspected, so they never read the
+/// guidelines file.
 fn terminal_command_with_guidelines(
     command: &str,
     cwd: &Path,
     workspace_off: bool,
     places: Option<&gitterm::guidelines::DocumentPlaces>,
+    task_tools: bool,
 ) -> String {
     // shortcut: the added option is POSIX-quoted, so Windows terminals
     // (cmd, PowerShell) launch without the guidelines until the quoting is
@@ -703,7 +741,7 @@ fn terminal_command_with_guidelines(
     if !gitterm::guidelines::starts_a_harness(command) {
         return command.to_string();
     }
-    match launch_instructions(cwd, workspace_off, places) {
+    match launch_instructions(cwd, workspace_off, places, task_tools) {
         Some(guidelines) => gitterm::guidelines::configure_terminal_command(command, &guidelines),
         None => command.to_string(),
     }
@@ -1064,6 +1102,20 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     return;
                 };
                 AgentIpcMessage::OpenFile {
+                    tab_id,
+                    path: PathBuf::from(path),
+                    line: value
+                        .get("line")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|n| usize::try_from(n).ok()),
+                }
+            }
+            "open_checkout" => {
+                let Some(path) = value.get("path").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] open_checkout without path: {body}");
+                    return;
+                };
+                AgentIpcMessage::OpenCheckout {
                     tab_id,
                     path: PathBuf::from(path),
                 }
@@ -2546,10 +2598,40 @@ struct WorkspaceOverviewState {
     /// Whose repos, branches and issues show (default: the most recently
     /// active coordinator).
     focus: overview::Focus,
+}
+
+/// Per-workspace presentation state for the shared workspace overview data.
+/// Folder-scoped workspaces can share an `OverviewKey`, but their folds and
+/// row disclosures must remain independent (TRU-208).
+#[derive(Debug, Default)]
+struct WorkspaceOverviewPresentation {
     /// The "▸ n older" coordinators are unfolded.
     show_older: bool,
     /// The "Focus ▾" picker is open.
     focus_menu_open: bool,
+    /// Documents is unfolded (starts folded, not persisted).
+    documents_open: bool,
+    /// "Also worked here" is unfolded (starts folded).
+    also_open: bool,
+    /// Rows opened with their ▸ disclosure (several at once); not persisted.
+    open_rows: HashSet<overview::RowKey>,
+}
+
+const OVERVIEW_DISCLOSURE_WIDTH: f32 = 24.0;
+
+/// Keep shrink-sized row metadata inside the fill-sized area, leaving the
+/// disclosure its full fixed width as a sibling.
+fn overview_row_content<'a>(
+    content: Element<'a, Event, Theme, iced::Renderer>,
+) -> Element<'a, Event, Theme, iced::Renderer> {
+    container(content).width(Length::Fill).into()
+}
+
+fn remove_workspace_overview_presentation(
+    presentations: &mut HashMap<u64, WorkspaceOverviewPresentation>,
+    uid: u64,
+) {
+    presentations.remove(&uid);
 }
 
 #[derive(Debug, Clone)]
@@ -6711,6 +6793,10 @@ pub enum Event {
     OpenPlansViewer,
     OpenPlan(plans_viewer::DocumentSource, String),
     ClosePlansViewer,
+    /// Load a public or authenticated web page in the existing Viewer.
+    OpenViewerPage(String),
+    OpenViewerPageInBrowser,
+    CloseViewerPage,
     // Window events
     WindowResized(f32, f32),
     WindowCloseRequested,
@@ -6818,6 +6904,7 @@ pub enum Event {
     /// User submitted a prompt (text plus any attached images) for the
     /// agent tab with this id.
     AgentSubmitPrompt(usize, UserPrompt),
+    AgentSubmitDelegations(usize, gitterm::delegations::SendBatch),
     /// User clicked the stop button on the agent tab with this id.
     AgentStopRequested(usize),
     /// User answered a pending runtime request (Claude permission prompt
@@ -6863,6 +6950,19 @@ pub enum Event {
     DelegationOpenWorkerRequested(usize, String),
     /// A finding's file was clicked on the chat page of this tab.
     DelegationOpenFile(usize, PathBuf),
+    /// A finding's `file:line` opened in the file viewer.
+    DelegationOpenFileAtLine(usize, PathBuf, usize),
+    /// Open a known chat checkout in the configured editor.
+    AgentOpenCheckout(usize, PathBuf),
+    OpenEditor(PathBuf, Option<usize>, Option<usize>),
+    EditorOpenFinished(
+        PathBuf,
+        Option<usize>,
+        String,
+        bool,
+        String,
+        Result<(), String>,
+    ),
     /// User picked a model on the Claude chat tab with this id (TRU-143).
     AgentSetModel(usize, String),
     /// User picked an effort level (`None`: the model's default).
@@ -6896,6 +6996,9 @@ pub enum Event {
     /// A CLI transcript the Chats overview follows was checked (TRU-154):
     /// `Ok(None)` when it had not changed.
     OverviewTranscriptLoaded(PathBuf, Result<Option<Box<TranscriptGist>>, String>),
+    /// A `codex exec` poll (TRU-212): page payloads by tab, and whether
+    /// any run is still followed.
+    CodexExecPolled(Vec<(usize, serde_json::Value)>, bool),
     /// The Agent surface finished building this tab's page. The tab's
     /// buffer is replayed now, from live state, so events that arrived while
     /// the page was under construction (transcript read-back, a fast first
@@ -6999,6 +7102,12 @@ pub enum Event {
     WorkspaceOverviewFocus(overview::Focus),
     WorkspaceOverviewToggleFocusMenu,
     WorkspaceOverviewToggleOlder,
+    /// Unfold or fold the overview's Documents (TRU-208).
+    WorkspaceOverviewToggleDocuments,
+    /// Unfold or fold the overview's "Also worked here" (TRU-208).
+    WorkspaceOverviewToggleAlso,
+    /// Open or close a Work sidebar row's detail and actions (TRU-208).
+    OverviewRowToggle(overview::RowKey),
     /// "Make workspace" on a coordinator: a workspace that owns this local
     /// root chat (TRU-169).
     WorkspaceFromChat(String),
@@ -7390,8 +7499,12 @@ struct App {
     notifications_config: config::NotificationsConfig,
     /// `pr_watch` from settings.json (TRU-197), written back on save.
     pr_watch_config: config::PrWatchConfig,
+    delegations_config: config::DelegationsConfig,
     /// `work_notes` from settings.json (TRU-201), written back on save.
     work_notes_config: config::WorkNotesConfig,
+    /// `editor` from settings.json.
+    editor: String,
+    editor_error: Option<(PathBuf, String)>,
     /// ~/Work committing and pushing itself (TRU-201).
     work_notes: gitterm::work_notes::WorkNotes,
     // Track modifier state for filtering terminal writes
@@ -7444,6 +7557,9 @@ struct App {
     /// one that owns its chats (TRU-169); built when the panel first opens
     /// in that workspace.
     workspace_overviews: HashMap<OverviewKey, WorkspaceOverviewState>,
+    /// Fold and row disclosure state belongs to a workspace, even when its
+    /// overview summary is shared with another folder-scoped workspace.
+    workspace_overview_presentations: HashMap<u64, WorkspaceOverviewPresentation>,
     /// Each open workspace's documents by uid (TRU-191).
     work_documents: HashMap<u64, WorkDocumentsState>,
     /// The document whose copies are listed (its key), if any.
@@ -7540,6 +7656,14 @@ struct App {
     /// changes, for the overview's snapshot key.
     overview_transcripts: HashMap<PathBuf, OverviewTranscript>,
     overview_transcripts_revision: u64,
+    /// `codex exec` runs the local Claude chats started outside GitTerm's
+    /// tools (TRU-212), followed on the tick off the UI thread. The lock
+    /// is taken only by the poll, one at a time (`codex_exec_polling`).
+    codex_exec_watch: Arc<std::sync::Mutex<gitterm::codex_exec::Watcher>>,
+    codex_exec_polling: bool,
+    /// The last poll still followed a run: poll once more even when no
+    /// chat is left, so the run is seen to end.
+    codex_exec_has_runs: bool,
     /// The Chats overview's snapshot and the key it was built for. Built
     /// in `view` on first need and rebuilt only when the key changes, so a
     /// frame costs a cheap key, not a walk of every conversation.
@@ -7633,6 +7757,11 @@ struct App {
     dictation_held: HashMap<usize, String>,
     /// What the Viewer webview surface is presenting (`None` = hidden).
     viewer_webview: ViewerWebview,
+    /// URL currently shown when `viewer_webview` is `Page`.
+    viewer_page_url: Option<String>,
+    viewer_page_generation: u64,
+    /// Store identity bound to the current remote page surface.
+    viewer_page_store: Option<webview::PageDataStore>,
     /// Agent tabs that own a chat page (`WebviewSurface::Agent(tab_id)`),
     /// most recently shown first, at most `MAX_AGENT_PAGES`. A page keeps
     /// receiving its tab's events while hidden, so showing it again needs no
@@ -7652,6 +7781,8 @@ enum ViewerWebview {
     File,
     /// Plans viewer — URL-loaded surface served by warp on localhost.
     PlansViewer,
+    /// A GitHub PR, Linear issue, or other page opened from the Work sidebar.
+    Page,
     /// The review pane (TRU-178), state in `App::review_pane`.
     Review,
 }
@@ -7701,8 +7832,225 @@ fn bar_hint_target(visible: VisibleSurface, console_expanded: bool) -> BarHintTa
     match visible {
         VisibleSurface::None => BarHintTarget::Iced,
         VisibleSurface::Viewer => BarHintTarget::Webview(WebviewSurface::Viewer),
+        VisibleSurface::Page => BarHintTarget::Webview(WebviewSurface::Page),
         VisibleSurface::AgentChat(tab_id) => BarHintTarget::Webview(WebviewSurface::Agent(tab_id)),
     }
+}
+
+/// Global Iced layers that cover native webviews. Keep in sync with view_base.
+#[derive(Default)]
+struct WebviewOverlays {
+    usage: bool,
+    browser_evidence: bool,
+    task_switcher: bool,
+    task_tab_close: bool,
+    task_worktree_delete: bool,
+    task_publish: bool,
+    new_task: bool,
+    help: bool,
+    new_work: bool,
+    park: bool,
+    parked_list: bool,
+    pr_action: bool,
+    ready_list: bool,
+    workspace_settings: bool,
+    bar_menu: bool,
+    tab_picker: bool,
+    phone: bool,
+    remote_connect: bool,
+    folder_picker: bool,
+}
+
+impl WebviewOverlays {
+    fn is_open(&self) -> bool {
+        self.usage
+            || self.browser_evidence
+            || self.task_switcher
+            || self.task_tab_close
+            || self.task_worktree_delete
+            || self.task_publish
+            || self.new_task
+            || self.help
+            || self.new_work
+            || self.park
+            || self.parked_list
+            || self.pr_action
+            || self.ready_list
+            || self.workspace_settings
+            || self.bar_menu
+            || self.tab_picker
+            || self.phone
+            || self.remote_connect
+            || self.folder_picker
+    }
+}
+
+/// Keep stateful content and console siblings at fixed indices across viewer changes.
+fn workspace_column<'a>(
+    tab_bar: Element<'a, Event, Theme, iced::Renderer>,
+    header: Option<Element<'a, Event, Theme, iced::Renderer>>,
+    content: Element<'a, Event, Theme, iced::Renderer>,
+    divider: Option<Element<'a, Event, Theme, iced::Renderer>>,
+    console: Element<'a, Event, Theme, iced::Renderer>,
+    workspace_bar: Element<'a, Event, Theme, iced::Renderer>,
+) -> Column<'a, Event, Theme, iced::Renderer> {
+    // Column::push drops zero-height widgets; from_vec preserves the empty slots.
+    Column::from_vec(vec![
+        tab_bar,
+        header.unwrap_or_else(|| iced::widget::Space::new().height(0).into()),
+        content,
+        divider.unwrap_or_else(|| iced::widget::Space::new().height(0).into()),
+        console,
+        workspace_bar,
+    ])
+    .spacing(0)
+    .width(Length::Fill)
+    .height(Length::Fill)
+}
+
+fn github_page_store(
+    owner: &str,
+    accounts: &std::collections::BTreeMap<String, String>,
+) -> webview::PageDataStore {
+    gitterm::pr_watch::account_for(owner, accounts)
+        .map(webview::PageDataStore::GitHub)
+        .unwrap_or(webview::PageDataStore::Default)
+}
+
+fn linear_page_store(workspace: Option<&str>) -> webview::PageDataStore {
+    workspace
+        .filter(|slug| !slug.is_empty())
+        .map(|slug| webview::PageDataStore::Linear(slug.to_string()))
+        .unwrap_or(webview::PageDataStore::Default)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PageNavigationDecision {
+    Allow,
+    Reopen(webview::PageDataStore),
+    External,
+    Cancel,
+}
+
+struct PageNavigationContext {
+    url: String,
+    store: webview::PageDataStore,
+    github_accounts: std::collections::BTreeMap<String, String>,
+    linear_workspaces: std::collections::BTreeSet<String>,
+}
+
+fn page_navigation_decision(url: &str, context: &PageNavigationContext) -> PageNavigationDecision {
+    use PageNavigationDecision::{Allow, Cancel, External, Reopen};
+    let Ok(destination) = webview::browser_url(url) else {
+        return Cancel;
+    };
+    if destination.scheme() != "https"
+        || !destination.username().is_empty()
+        || destination.password().is_some()
+        || destination.port().is_some()
+    {
+        return External;
+    }
+    let origin = url::Url::parse(&context.url).ok();
+    let same_service = origin.as_ref().and_then(url::Url::host_str) == destination.host_str();
+    let segments: Vec<_> = destination.path_segments().into_iter().flatten().collect();
+    let first = segments.first().copied().unwrap_or_default();
+    // Encoded or empty identity prefixes are ambiguous; let the browser resolve them.
+    if destination.path() != "/" && (first.is_empty() || first.contains('%')) {
+        return External;
+    }
+    let store = match destination.host_str() {
+        Some("github.com") => {
+            // Authentication and account-wide pages must retain the selected login.
+            if destination.path() == "/"
+                || matches!(
+                    first,
+                    "login" | "logout" | "session" | "sessions" | "settings"
+                )
+            {
+                if same_service {
+                    context.store.clone()
+                } else {
+                    webview::PageDataStore::Default
+                }
+            } else {
+                let current_owner = origin
+                    .as_ref()
+                    .filter(|url| url.host_str() == Some("github.com"))
+                    .and_then(|url| url.path_segments()?.next());
+                let canonical_pr = segments.get(2) == Some(&"pull")
+                    && segments
+                        .get(3)
+                        .is_some_and(|number| number.parse::<u64>().is_ok_and(|number| number > 0));
+                let mapped =
+                    gitterm::pr_watch::account_for(first, &context.github_accounts).is_some();
+                if !mapped && !canonical_pr && current_owner != Some(first) {
+                    return External;
+                }
+                github_page_store(first, &context.github_accounts)
+            }
+        }
+        Some("linear.app") => {
+            if destination.path() == "/"
+                || first == "login"
+                || destination.path() == "/oauth/authorize"
+            {
+                if same_service {
+                    context.store.clone()
+                } else {
+                    webview::PageDataStore::Default
+                }
+            } else if let Some(workspace) = gitterm::issue_titles::workspace_from_issue_url(url) {
+                linear_page_store(Some(&workspace))
+            } else {
+                let origin_workspace = origin
+                    .as_ref()
+                    .and_then(|url| gitterm::issue_titles::workspace_from_issue_url(url.as_str()));
+                let current_workspace = match &context.store {
+                    webview::PageDataStore::Linear(workspace) => Some(workspace.as_str()),
+                    _ => origin_workspace.as_deref(),
+                };
+                // Only known workspace prefixes select stores; a valid-looking
+                // slug alone cannot distinguish a workspace from a global route.
+                if context.linear_workspaces.contains(first)
+                    || (same_service && current_workspace == Some(first))
+                {
+                    linear_page_store(Some(first))
+                } else {
+                    return External;
+                }
+            }
+        }
+        _ => return External,
+    }
+    .normalized();
+    if store == context.store {
+        Allow
+    } else {
+        Reopen(store)
+    }
+}
+
+fn effective_page_navigation_decision(
+    url: &str,
+    context: &PageNavigationContext,
+) -> PageNavigationDecision {
+    match page_navigation_decision(url, context) {
+        PageNavigationDecision::Reopen(store)
+            if store.clone().for_current_os() == context.store =>
+        {
+            PageNavigationDecision::Allow
+        }
+        decision => decision,
+    }
+}
+
+fn current_page_navigation(
+    viewer: ViewerWebview,
+    current_generation: u64,
+    generation: u64,
+) -> bool {
+    viewer == ViewerWebview::Page && current_generation == generation
 }
 
 /// A rough bubble width for 15px Menlo text (0.6em a character), enough to
@@ -7736,6 +8084,7 @@ fn bar_hint_show_script(text: &str, x: f32) -> String {
 enum VisibleSurface {
     None,
     Viewer,
+    Page,
     /// The Agent surface, showing this agent tab's chat.
     AgentChat(usize),
 }
@@ -7752,7 +8101,11 @@ fn visible_webview_surface(
         return VisibleSurface::None;
     }
     if viewer != ViewerWebview::None {
-        return VisibleSurface::Viewer;
+        return if viewer == ViewerWebview::Page {
+            VisibleSurface::Page
+        } else {
+            VisibleSurface::Viewer
+        };
     }
     match active {
         ActiveTabSurface::AgentChat(tab_id) => VisibleSurface::AgentChat(tab_id),
@@ -8781,6 +9134,109 @@ impl App {
         }
     }
 
+    /// Borderless text button (TRU-208): transparent, tinted on hover. The
+    /// Work sidebar's rows and controls, which space and type separate.
+    fn flat_button_style(&self) -> impl Fn(&Theme, button::Status) -> button::Style {
+        let hover_bg = self.theme.bg_overlay();
+        let text_color = self.theme.text_primary();
+        let text_muted = self.theme.text_secondary();
+        move |_theme, status| {
+            let (bg, tc) = match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    (Some(hover_bg.into()), text_color)
+                }
+                _ => (None, text_muted),
+            };
+            button::Style {
+                background: bg,
+                text_color: tc,
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Whether a Work sidebar row is open (TRU-208), in the active
+    /// workspace's overview.
+    fn overview_row_open(&self, key: &overview::RowKey) -> bool {
+        self.active_workspace()
+            .and_then(|workspace| self.workspace_overview_presentations.get(&workspace.uid))
+            .is_some_and(|presentation| presentation.open_rows.contains(key))
+    }
+
+    /// A row's ▸ / ▾ disclosure (TRU-208): opens and closes its detail and
+    /// actions. Always in the row, so opening never moves its siblings.
+    fn overview_disclosure<'a>(
+        &self,
+        open: bool,
+        key: overview::RowKey,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        button(
+            text(overview::fold_marker(open))
+                .size(10)
+                .color(self.theme.text_muted()),
+        )
+        .style(self.flat_button_style())
+        .padding([0, 4])
+        .width(Length::Fixed(OVERVIEW_DISCLOSURE_WIDTH))
+        .on_press(Event::OverviewRowToggle(key))
+        .into()
+    }
+
+    /// A Work sidebar section header (TRU-208): the name, its count dim
+    /// beside it, then `trailing` at the right.
+    fn overview_section_header<'a>(
+        &self,
+        label: &str,
+        count: String,
+        trailing: Option<Element<'a, Event, Theme, iced::Renderer>>,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let font_small = self.ui_font_small();
+        let bold = iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..Default::default()
+        };
+        let mut head = row![
+            text(label.to_string())
+                .size(font_small)
+                .color(self.theme.text_secondary())
+                .font(bold),
+            text(count)
+                .size(font_small - 1.0)
+                .color(self.theme.text_muted()),
+            iced::widget::Space::new().width(Length::Fill),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        if let Some(trailing) = trailing {
+            head = head.push(trailing);
+        }
+        head.into()
+    }
+
+    /// A folded section's header (TRU-208): the whole line toggles, with
+    /// "▸" / "▾" at the right.
+    fn overview_fold_header<'a>(
+        &self,
+        label: &str,
+        count: usize,
+        open: bool,
+        toggle: Event,
+    ) -> Element<'a, Event, Theme, iced::Renderer> {
+        let marker = text(overview::fold_marker(open))
+            .size(self.ui_font_small() - 1.0)
+            .color(self.theme.text_muted());
+        button(self.overview_section_header(label, count.to_string(), Some(marker.into())))
+            .style(self.flat_button_style())
+            .padding([2, 0])
+            .width(Length::Fill)
+            .on_press(toggle)
+            .into()
+    }
+
     /// Text input in GitTerm's palette: base fill, accent border when focused.
     fn input_style(&self) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
         let base = self.theme.bg_base();
@@ -9152,6 +9608,7 @@ impl App {
         }
         let started = Instant::now();
         let config = Config {
+            editor: self.editor.clone(),
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
             sidebar_width: self.sidebar_width,
@@ -9179,6 +9636,7 @@ impl App {
             usage: self.usage_config.clone(),
             notifications: self.notifications_config.clone(),
             pr_watch: self.pr_watch_config.clone(),
+            delegations: self.delegations_config.clone(),
             work_notes: self.work_notes_config.clone(),
         };
         if let Err(error) = config.save() {
@@ -9908,8 +10366,7 @@ impl App {
     /// from the cache.
     fn usage_view_changed(&mut self) -> Task<Event> {
         if self.usage_view.open {
-            webview::set_visible(WebviewSurface::Viewer, false);
-            webview::hide_agent_pages();
+            let _ = self.apply_webview_surfaces();
             let limits = self.read_codex_limits();
             return Task::batch([self.request_usage_scan(), limits]);
         }
@@ -13206,6 +13663,7 @@ impl App {
             self.stop_remote_chat_for_closing_tab(tab_id);
         }
         // Its repos stop unless another open workspace lists them.
+        remove_workspace_overview_presentation(&mut self.workspace_overview_presentations, uid);
         self.workspaces.remove(idx);
         self.release_unlisted_repos();
         let kept_active = active_uid.and_then(|active| self.workspace_index_by_uid(active));
@@ -16736,6 +17194,41 @@ impl App {
             .map(|tab| tab.id)
     }
 
+    fn delegation_chat_tab_id(&self, parent: &gitterm::tasks::DelegationParent) -> Option<usize> {
+        gitterm::delegations::parent_tab_id(
+            parent,
+            self.workspaces.iter().flat_map(|ws| {
+                let remote = self.workspace_has_remote_identity(ws);
+                ws.tabs
+                    .iter()
+                    .filter(|tab| tab.agent_session().is_some())
+                    .map(move |tab| {
+                        (
+                            tab.id,
+                            tab.session_uid.as_str(),
+                            tab.chat_session_id.as_deref(),
+                            remote,
+                        )
+                    })
+            }),
+        )
+    }
+
+    /// Newest first, including results requested before Resume as Chat.
+    fn delegations_for_tab(&self, tab_id: usize) -> Vec<&gitterm::tasks::Delegation> {
+        self.task_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .delegations()
+                    .iter()
+                    .rev()
+                    .filter(|d| self.delegation_chat_tab_id(&d.parent) == Some(tab_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The open tab a delegation request came from, by its caller identity.
     fn delegation_caller(
         &self,
@@ -16929,11 +17422,14 @@ impl App {
             };
             match gitterm::delegations::codex_run(delegation, &config_root) {
                 Ok(mut run) => {
+                    // A Codex review or consult runs without the task
+                    // tools, so it is not told to use them.
                     run.guidelines = launch_instructions(
                         &run.cwd,
                         self.workspace_guidelines_off(&delegation.parent.workspace),
                         self.workspace_document_places(&delegation.parent.workspace)
                             .as_ref(),
+                        false,
                     );
                     runs.push((delegation_id, run))
                 }
@@ -17892,7 +18388,7 @@ impl App {
         else {
             return;
         };
-        let Some(tab_id) = self.delegation_parent_tab_id(&delegation.parent.session_uid) else {
+        let Some(tab_id) = self.delegation_chat_tab_id(&delegation.parent) else {
             return;
         };
         if !webview::is_active(WebviewSurface::Agent(tab_id)) {
@@ -17928,19 +18424,7 @@ impl App {
 
     /// Every delegation card of a chat tab, oldest first, for a replay.
     fn delegation_cards_for_tab(&self, tab_id: usize) -> Vec<serde_json::Value> {
-        let Some(session_uid) = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|tab| tab.id == tab_id)
-            .map(|tab| tab.session_uid.as_str())
-        else {
-            return Vec::new();
-        };
-        let Some(store) = self.task_store.as_ref() else {
-            return Vec::new();
-        };
-        let mut delegations = store.delegations_for_parent(session_uid);
+        let mut delegations = self.delegations_for_tab(tab_id);
         delegations.reverse();
         delegations
             .into_iter()
@@ -17959,20 +18443,8 @@ impl App {
     /// (id, created_at) of every delegation of a chat tab, oldest first,
     /// for placing their cards in a transcript read-back.
     fn delegation_times_for_tab(&self, tab_id: usize) -> Vec<(String, String)> {
-        let Some(session_uid) = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|tab| tab.id == tab_id)
-            .map(|tab| tab.session_uid.as_str())
-        else {
-            return Vec::new();
-        };
-        let Some(store) = self.task_store.as_ref() else {
-            return Vec::new();
-        };
-        let mut delegations: Vec<(String, String)> = store
-            .delegations_for_parent(session_uid)
+        let mut delegations: Vec<(String, String)> = self
+            .delegations_for_tab(tab_id)
             .into_iter()
             .map(|delegation| {
                 (
@@ -17995,10 +18467,7 @@ impl App {
         else {
             return Task::none();
         };
-        let has_cards = self
-            .task_store
-            .as_ref()
-            .is_some_and(|store| !store.delegations_for_parent(&tab.session_uid).is_empty());
+        let has_cards = !self.delegations_for_tab(tab_id).is_empty();
         // The HEAD check runs git on this Mac; a remote tab has no
         // delegation cards (remote delegations are refused) anyway.
         if !has_cards || self.tab_remote_id(tab_id).is_some() {
@@ -18015,46 +18484,114 @@ impl App {
         )
     }
 
-    /// Submits a delegation's message as a user message and stamps it
-    /// delivered, so a replay or restart never sends it again.
-    fn deliver_delegation(
+    /// Submit synchronously so the chat's streaming state is set before
+    /// another tick can dispatch. The submit handler acknowledges success.
+    fn deliver_delegations(
         &mut self,
         tab_id: usize,
-        delegation_id: &str,
-        message: String,
+        batch: gitterm::delegations::SendBatch,
     ) -> Task<Event> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let marked = match self.task_store.as_mut() {
-            Some(store) => store
-                .mark_delegation_delivered(delegation_id, &now)
-                .map_err(|error| error.to_string()),
-            None => Err("GitTerm's task store is unavailable".to_string()),
-        };
-        if let Err(error) = marked {
-            eprintln!("[delegation] {delegation_id}: not sent: {error}");
-            agent_webview_note(tab_id, &format!("Not sent: {error}"));
-            return Task::none();
-        }
-        self.push_delegation_card(delegation_id);
-        Task::done(Event::AgentSubmitPrompt(tab_id, message.into()))
-    }
-
-    /// After the parent's turn ends: send the oldest held message.
-    fn flush_held_delegation(&mut self, tab_id: usize) -> Task<Event> {
-        let streaming = self
+        if !self
             .workspaces
             .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|tab| tab.id == tab_id)
-            .and_then(|tab| tab.agent_session())
-            .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming));
-        let Some(held) = self.delegation_held.get_mut(&tab_id) else {
+            .flat_map(|ws| &ws.tabs)
+            .any(|tab| tab.id == tab_id && tab.agent_session().is_some())
+        {
+            eprintln!(
+                "[delegation] {:?}: not sent: requesting chat tab {tab_id} is gone",
+                batch.delegation_ids
+            );
+            return Task::none();
+        }
+        self.update(Event::AgentSubmitDelegations(tab_id, batch))
+    }
+
+    /// Collect every finished outcome at the same moment. Idle chats flush
+    /// now; busy chats keep the existing held queue until their turn ends.
+    fn auto_deliver_delegations(&mut self) -> Task<Event> {
+        if let Some(store) = self.task_store.as_mut() {
+            if let Err(error) = store.retry_delivery_acknowledgements() {
+                eprintln!("[delegation] retry delivery acknowledgements: {error}");
+            }
+        }
+        let parents: Vec<_> = self
+            .task_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .delegations()
+                    .iter()
+                    .filter(|d| {
+                        self.delegations_config.auto_tell
+                            && d.status.is_sendable()
+                            && !d.is_delivered()
+                    })
+                    .map(|d| d.parent.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut tabs: HashSet<usize> = self.delegation_held.keys().copied().collect();
+        for parent in parents {
+            match self.delegation_chat_tab_id(&parent) {
+                Some(tab_id) => {
+                    tabs.insert(tab_id);
+                }
+                None => eprintln!(
+                    "[delegation] results for {} not sent: requesting chat tab is gone",
+                    parent.session_uid
+                ),
+            }
+        }
+        Task::batch(
+            tabs.into_iter()
+                .map(|tab_id| self.flush_held_delegation(tab_id))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Both Tick and turn-end use this path, including results that finished
+    /// since the last tick. There is at most one submitted prompt per chat.
+    fn flush_held_delegation(&mut self, tab_id: usize) -> Task<Event> {
+        let Some(_) = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .find(|tab| tab.id == tab_id && tab.agent_session().is_some())
+        else {
+            self.delegation_held.remove(&tab_id);
+            eprintln!("[delegation] not sent: requesting chat tab {tab_id} is gone");
             return Task::none();
         };
-        let Some(next) = gitterm::delegations::next_held_send(held, streaming) else {
-            return Task::none();
-        };
-        self.deliver_delegation(tab_id, &next.delegation_id, next.message)
+        let streaming = self.chat_turn_running(tab_id);
+        let mut held = self.delegation_held.remove(&tab_id).unwrap_or_default();
+        let mut ids: HashSet<String> = held.iter().map(|send| send.delegation_id.clone()).collect();
+        if let Some(store) = &self.task_store {
+            // A worker may replace a blocked report before it was delivered.
+            held.retain(|send| {
+                store
+                    .delegation(&send.delegation_id)
+                    .is_some_and(|d| d.status.is_sendable() && !d.is_delivered())
+            });
+            let mut delegations = self.delegations_for_tab(tab_id);
+            delegations.reverse();
+            if let Err(error) = gitterm::delegations::queue_auto_sends(
+                &delegations,
+                self.delegations_config.auto_tell,
+                &mut held,
+            ) {
+                eprintln!("[delegation] chat {tab_id}: cannot queue result: {error}");
+            }
+        }
+        ids.extend(held.iter().map(|send| send.delegation_id.clone()));
+        let next = gitterm::delegations::next_held_send(&mut held, streaming);
+        self.delegation_held.insert(tab_id, held);
+        for id in ids {
+            self.push_delegation_card(&id);
+        }
+        match next {
+            Some(batch) => self.deliver_delegations(tab_id, batch),
+            None => Task::none(),
+        }
     }
 
     /// The delegation behind a card on `tab_id`'s page, checked to belong
@@ -18064,20 +18601,13 @@ impl App {
         tab_id: usize,
         delegation_id: &str,
     ) -> Result<&gitterm::tasks::Delegation, String> {
-        let session_uid = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|tab| tab.id == tab_id)
-            .map(|tab| tab.session_uid.as_str())
-            .ok_or_else(|| format!("tab {tab_id} is not open"))?;
         let delegation = self
             .task_store
             .as_ref()
             .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?
             .delegation(delegation_id)
             .ok_or_else(|| format!("delegation {delegation_id} does not exist"))?;
-        if delegation.parent.session_uid != session_uid {
+        if self.delegation_chat_tab_id(&delegation.parent) != Some(tab_id) {
             return Err(format!("delegation {delegation_id} belongs to another tab"));
         }
         Ok(delegation)
@@ -18761,7 +19291,10 @@ impl App {
             needs_you_notifier: NeedsYouNotifier::new(Instant::now()),
             notifications_config: config.notifications.clone(),
             pr_watch_config: config.pr_watch.clone(),
+            delegations_config: config.delegations.clone(),
             work_notes_config: config.work_notes.clone(),
+            editor: config.editor.clone(),
+            editor_error: None,
             work_notes: new_work_notes(config.work_notes.auto_commit),
             current_modifiers: Modifiers::empty(),
             show_help: false,
@@ -18816,9 +19349,13 @@ impl App {
             stt_transcribing: false,
             dictation_held: HashMap::new(),
             viewer_webview: ViewerWebview::None,
+            viewer_page_url: None,
+            viewer_page_generation: 0,
+            viewer_page_store: None,
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
             workspace_overviews: HashMap::new(),
+            workspace_overview_presentations: HashMap::new(),
             work_documents: HashMap::new(),
             work_document_copies_open: None,
             work_documents_all: false,
@@ -18862,6 +19399,9 @@ impl App {
             overview_running_polled: HashMap::new(),
             overview_transcripts: HashMap::new(),
             overview_transcripts_revision: 0,
+            codex_exec_watch: Arc::default(),
+            codex_exec_polling: false,
+            codex_exec_has_runs: false,
             chat_overview_cache: ChatOverviewCache::default(),
             chat_overview_idle_expanded: false,
             roster_reveal_held: HashMap::new(),
@@ -19642,11 +20182,15 @@ fi
 
         // Added at launch only: the stored startup command stays as given.
         let launch_command = startup_command.as_deref().map(|command| {
+            // The terminal gets the task server when it runs (its
+            // environment carries the endpoint; claude and codex are given
+            // the config, pi finds it through its extension).
             let command = terminal_command_with_guidelines(
                 command,
                 &repo_path,
                 guidelines_off,
                 document_places.as_ref(),
+                self.task_mcp.is_some(),
             );
             gitterm::harness::claude::configure_terminal_chrome(&command, claude_in_chrome)
         });
@@ -20603,6 +21147,63 @@ fi
         Task::batch(tasks)
     }
 
+    /// Look for `codex exec` runs under each local Claude chat's `claude`
+    /// process (TRU-212), on a blocking thread: only while a chat's process
+    /// runs (or a run is still followed), one poll at a time.
+    fn poll_codex_exec(&mut self) -> Task<Event> {
+        if self.codex_exec_polling {
+            return Task::none();
+        }
+        let roots: Vec<gitterm::codex_exec::Root> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .filter_map(|tab| {
+                let pid = tab.agent_session()?.harness.as_ref()?.claude_pid()?;
+                match gitterm::codex_exec::Root::capture(tab.id, pid) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        eprintln!(
+                            "[codex-exec] capturing chat {} process {pid}: {error}",
+                            tab.id
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+        if roots.is_empty() && !self.codex_exec_has_runs {
+            return Task::none();
+        }
+        self.codex_exec_polling = true;
+        let watch = self.codex_exec_watch.clone();
+        Task::perform(
+            async move {
+                let polled = tokio::task::spawn_blocking(move || {
+                    let mut watcher = watch
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let payloads = watcher
+                        .poll(&gitterm::codex_exec::Libproc, &roots, now_ms)
+                        .into_iter()
+                        .map(|(tab_id, run)| (tab_id, gitterm::chat_page::codex_exec_payload(&run)))
+                        .collect::<Vec<_>>();
+                    (payloads, watcher.has_runs())
+                })
+                .await;
+                match polled {
+                    Ok(polled) => polled,
+                    Err(error) => {
+                        eprintln!("[codex-exec] the poll task failed: {error}");
+                        (Vec::new(), true)
+                    }
+                }
+            },
+            |(payloads, has_runs)| Event::CodexExecPolled(payloads, has_runs),
+        )
+    }
+
     /// Check the transcripts of this Mac's CLI terminal tabs (Claude CLI,
     /// Codex CLI) the Chats index knows, for the overview's rows: at most
     /// every `OVERVIEW_TRANSCRIPT_POLL` per file, one check at a time, and
@@ -21478,10 +22079,17 @@ fi
     }
 
     fn update(&mut self, event: Event) -> Task<Event> {
+        let overlay_was_open = self.webview_overlay_open();
         let task = self.update_event(event);
-        match self.settle_active_workspace() {
+        let task = match self.settle_active_workspace() {
             Some(settle) => Task::batch([task, settle]),
             None => task,
+        };
+        // Covers every event path, including early returns and nested updates.
+        if overlay_was_open != self.webview_overlay_open() {
+            Task::batch([task, self.apply_webview_surfaces()])
+        } else {
+            task
         }
     }
 
@@ -21520,6 +22128,36 @@ fi
                 self.task_mcp = None;
             }
             Event::TaskControlRequested(envelope) => match envelope.operation {
+                TaskControlOperation::HtmlRender(request) => {
+                    if !gitterm::html_render::NATIVE_HTML_SUPPORTED {
+                        envelope.reply.send(Err("html_render currently requires GitTerm for macOS; this platform lacks the required native subframe navigation guard".into()));
+                        return Task::none();
+                    }
+                    let caller = envelope.caller.as_deref();
+                    let chat = self
+                        .workspaces
+                        .iter()
+                        .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+                        .flat_map(|ws| &ws.tabs)
+                        .find(|tab| {
+                            Some(tab.session_uid.as_str()) == caller
+                                && tab
+                                    .agent_session()
+                                    .is_some_and(|session| session.backend().is_native())
+                        });
+                    let result = request.validate().and_then(|()| {
+                        chat.ok_or_else(|| {
+                            "html_render requires an open local native Claude or ACP chat tab (Pi does not restore conversation history)".to_string()
+                        })?;
+                        // An additive result carried in the conversation works
+                        // even when a harness does not report the raw tool input.
+                        serde_json::to_value(gitterm::html_render::HtmlRenderResult {
+                            html_render: request,
+                        })
+                        .map_err(|error| format!("cannot encode visual reply: {error}"))
+                    });
+                    envelope.reply.send(result);
+                }
                 TaskControlOperation::List(request) => {
                     let Some(store) = self.task_store.as_ref() else {
                         envelope
@@ -22261,6 +22899,7 @@ fi
                 tasks.push(self.poll_work_documents());
                 // The PR watch (TRU-173): one background poll when PRs are due.
                 tasks.push(self.poll_pr_watch());
+                tasks.push(self.auto_deliver_delegations());
                 // Its actionable news, to idle coordinators (TRU-197).
                 tasks.push(self.auto_tell_coordinators());
                 // Titles of the shown Issues, from `linear` (TRU-203).
@@ -22271,6 +22910,8 @@ fi
                 tasks.push(self.poll_work_notes());
                 // Closed tabs release their browser targets (TRU-176).
                 tasks.push(self.sync_browser_owners());
+                // `codex exec` runs under the chats (TRU-212).
+                tasks.push(self.poll_codex_exec());
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
@@ -22631,10 +23272,42 @@ fi
                 }
             }
             Event::AgentWebviewIpc(msg) => {
-                // The IPC bridge already tagged each message with a tab_id
-                // (from window.__currentTabId in the JS). Translate into the
-                // existing AgentSubmitPrompt / AgentStopRequested handlers.
+                // The bridge carries native Page navigation and tab-tagged
+                // chat/review IPC, translated into the host's typed handlers.
                 return match msg {
+                    AgentIpcMessage::PageNavigation {
+                        generation,
+                        url,
+                        reopen,
+                    } => {
+                        if !current_page_navigation(
+                            self.viewer_webview,
+                            self.viewer_page_generation,
+                            generation,
+                        ) {
+                            return Task::none();
+                        }
+                        if reopen {
+                            match page_navigation_decision(&url, &self.page_navigation_context()) {
+                                PageNavigationDecision::Reopen(store) => {
+                                    self.open_page_in_store(url, store)
+                                }
+                                PageNavigationDecision::Allow => self.open_page_in_store(
+                                    url,
+                                    self.viewer_page_store.clone().expect("active Page store"),
+                                ),
+                                PageNavigationDecision::External => {
+                                    webview::open_url_in_browser(&url);
+                                    Task::none()
+                                }
+                                PageNavigationDecision::Cancel => Task::none(),
+                            }
+                        } else {
+                            self.viewer_page_url = Some(url);
+                            self.install_page_navigation_handler();
+                            Task::none()
+                        }
+                    }
                     AgentIpcMessage::Submit {
                         tab_id,
                         text,
@@ -22739,8 +23412,14 @@ fi
                         tab_id,
                         delegation_id,
                     } => Task::done(Event::DelegationOpenWorkerRequested(tab_id, delegation_id)),
-                    AgentIpcMessage::OpenFile { tab_id, path } => {
-                        Task::done(Event::DelegationOpenFile(tab_id, path))
+                    AgentIpcMessage::OpenFile { tab_id, path, line } => match line {
+                        Some(line) => {
+                            Task::done(Event::DelegationOpenFileAtLine(tab_id, path, line))
+                        }
+                        None => Task::done(Event::DelegationOpenFile(tab_id, path)),
+                    },
+                    AgentIpcMessage::OpenCheckout { tab_id, path } => {
+                        Task::done(Event::AgentOpenCheckout(tab_id, path))
                     }
                     AgentIpcMessage::HostKey { key, modifiers } => {
                         // Run the chord through the Iced key handler, so it
@@ -22766,7 +23445,15 @@ fi
                     }
                 };
             }
-            Event::AgentSubmitPrompt(tab_id, prompt) => {
+            event @ (Event::AgentSubmitPrompt(..) | Event::AgentSubmitDelegations(..)) => {
+                let (tab_id, prompt, delivery) = match event {
+                    Event::AgentSubmitPrompt(tab_id, prompt) => (tab_id, prompt, None),
+                    Event::AgentSubmitDelegations(tab_id, batch) => {
+                        (tab_id, batch.message.clone().into(), Some(batch))
+                    }
+                    _ => unreachable!(),
+                };
+                let mut submitted = false;
                 // Find the tab. If it's an Agent tab, ensure a subprocess
                 // manager is spawned (lazy on first prompt) and forward the
                 // prompt. The first spawn returns a Task that bridges the
@@ -22779,6 +23466,7 @@ fi
                 // Claude gets every message with an id, so the CLI reports
                 // its queue state and a queued one can be withdrawn.
                 let mut prompt = prompt;
+                let mut prompt_markers = Vec::new();
                 // Issue keys the human names feed the chat's facts (TRU-166);
                 // written with the turn's tool calls.
                 for ws in &mut self.workspaces {
@@ -22888,10 +23576,20 @@ fi
                                 return Task::none();
                             }
                             if session.harness.is_none() {
+                                let task_tools = acp_mcp_servers
+                                    .iter()
+                                    .any(|server| server.name == "gitterm_tasks");
+                                let guidelines = launch_instructions(
+                                    &repo_path,
+                                    guidelines_off,
+                                    document_places.as_ref(),
+                                    task_tools,
+                                );
                                 let Some(config) = session.acp_session_config(
                                     repo_path,
                                     std::mem::take(&mut acp_mcp_servers),
                                     acp_support_dir(),
+                                    guidelines,
                                 ) else {
                                     return Task::none();
                                 };
@@ -22919,7 +23617,6 @@ fi
                                 prompt.id = Some(uuid::Uuid::new_v4().to_string());
                             }
                             echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
-                            let mut submitted = false;
                             if let Some(harness) = session.harness.as_ref() {
                                 match harness.send(HarnessCommand::SendUserMessage(prompt.clone()))
                                 {
@@ -22927,10 +23624,20 @@ fi
                                         session.state = tab::AgentSessionState::Streaming;
                                         submitted = true;
                                     }
-                                    Err(e) => eprintln!("AgentSubmitPrompt failed: {}", e),
+                                    Err(e) => {
+                                        eprintln!("AgentSubmitPrompt failed: {}", e);
+                                        agent_webview_note(
+                                            tab_id,
+                                            &format!("The prompt was not delivered: {e}"),
+                                        );
+                                    }
                                 }
                             }
-                            session.record(echo.clone());
+                            if !submitted {
+                                session.harness = None;
+                            }
+                            let (_, after) = session.record(echo.clone());
+                            prompt_markers.extend(after);
                             if submitted {
                                 if let Some(task_id) = tab_task_id {
                                     t.task_live_state = Some(TaskSessionLiveState::Working);
@@ -22958,19 +23665,18 @@ fi
                                         session.session_id = None;
                                     }
                                 }
-                                // Remote chats start without the
-                                // guidelines (TRU-174 is local only).
-                                let guidelines_file = remote_chat
-                                    .is_none()
-                                    .then(|| {
-                                        launch_instructions(
-                                            &repo_path,
-                                            guidelines_off,
-                                            document_places.as_ref(),
-                                        )
-                                    })
-                                    .flatten()
-                                    .map(|guidelines| guidelines.path);
+                                // A chat given the task server is told how
+                                // to start Codex through it (TRU-212).
+                                let task_tools = claude_mcp_servers.iter().any(|server| {
+                                    server.config["mcpServers"].get("gitterm_tasks").is_some()
+                                });
+                                let guidelines_file = launch_instructions(
+                                    &repo_path,
+                                    guidelines_off,
+                                    document_places.as_ref(),
+                                    task_tools,
+                                )
+                                .map(|guidelines| guidelines.path);
                                 let Some(config) = session.claude_session_config(
                                     repo_path,
                                     std::mem::take(&mut claude_mcp_servers),
@@ -23011,7 +23717,6 @@ fi
                                 prompt.id = Some(uuid::Uuid::new_v4().to_string());
                             }
                             echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
-                            let mut submitted = false;
                             let mut send_failed = None;
                             if let Some(claude) = session.harness.as_ref() {
                                 match claude.send(HarnessCommand::SendUserMessage(prompt.clone())) {
@@ -23025,7 +23730,8 @@ fi
                                     }
                                 }
                             }
-                            session.record(echo.clone());
+                            let (_, after) = session.record(echo.clone());
+                            prompt_markers.extend(after);
                             if let Some(e) = send_failed {
                                 // The command channel is dead but ProcessExited
                                 // may never arrive (the session thread can fail
@@ -23052,10 +23758,12 @@ fi
                             echo = tab::AgentEvent::user_prompt(&prompt.text);
                         }
                         if session.task_handle.is_none() {
+                            // A per-turn pi process gets no MCP servers.
                             let guidelines_file = launch_instructions(
                                 &repo_path,
                                 guidelines_off,
                                 document_places.as_ref(),
+                                false,
                             )
                             .map(|guidelines| guidelines.path);
                             let handle = tab::spawn_agent_task(
@@ -23069,7 +23777,6 @@ fi
                             bridge = handle.take_event_receiver();
                             session.task_handle = Some(handle);
                         }
-                        let mut submitted = false;
                         if let Some(handle) = session.task_handle.as_ref() {
                             if let Err(e) = handle.submit_prompt(prompt.text.clone()) {
                                 eprintln!("AgentSubmitPrompt failed: {}", e);
@@ -23078,7 +23785,11 @@ fi
                                 submitted = true;
                             }
                         }
-                        session.conversation.push(echo.clone());
+                        if !submitted {
+                            session.task_handle = None;
+                        }
+                        let (_, after) = session.record(echo.clone());
+                        prompt_markers.extend(after);
                         if submitted {
                             if let Some(task_id) = tab_task_id {
                                 t.task_live_state = Some(TaskSessionLiveState::Working);
@@ -23088,11 +23799,42 @@ fi
                         break 'outer_submit;
                     }
                 }
+                if let Some(batch) = delivery {
+                    let recorded = self
+                        .task_store
+                        .as_mut()
+                        .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
+                        .and_then(|store| {
+                            batch
+                                .record_submission(
+                                    store,
+                                    submitted,
+                                    &chrono::Utc::now().to_rfc3339(),
+                                )
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = recorded {
+                        eprintln!(
+                            "[delegation] {:?}: delivery acknowledgement failed: {error}",
+                            batch.delegation_ids
+                        );
+                        agent_webview_note(
+                            tab_id,
+                            &format!("Could not save the delivery acknowledgement; GitTerm will retry saving it: {error}"),
+                        );
+                    }
+                    for id in &batch.delegation_ids {
+                        self.push_delegation_card(id);
+                    }
+                }
                 if let Some(task_id) = task_started {
                     self.apply_task_session_signal(&task_id, None);
                 }
                 // Also push the echo into the tab's chat page, if it has one.
                 push_agent_event_to_webview(tab_id, &echo);
+                for marker in &prompt_markers {
+                    push_agent_event_to_webview(tab_id, marker);
+                }
                 if images_not_sent > 0 {
                     eprintln!(
                         "AgentSubmitPrompt: tab {tab_id}: {images_not_sent} image(s) not sent (non-Claude backend)"
@@ -23624,7 +24366,7 @@ fi
                     .is_some_and(|s| matches!(s.state, tab::AgentSessionState::Streaming));
                 let prepared = self.tab_delegation(tab_id, &delegation_id).and_then(|d| {
                     gitterm::delegations::compose_send_message(d, &finding_ids)
-                        .map(|message| (message, d.delivered_at.is_some()))
+                        .map(|message| (message, d.is_delivered()))
                 });
                 let (message, delivered) = match prepared {
                     Ok(prepared) => prepared,
@@ -23638,12 +24380,18 @@ fi
                 match gitterm::delegations::decide_send(streaming, delivered, held, &delegation_id)
                 {
                     gitterm::delegations::SendDecision::SendNow => {
-                        return self.deliver_delegation(tab_id, &delegation_id, message);
+                        held.push(gitterm::delegations::HeldSend {
+                            delegation_id,
+                            message,
+                            automatic: false,
+                        });
+                        return self.flush_held_delegation(tab_id);
                     }
                     gitterm::delegations::SendDecision::Hold => {
                         held.push(gitterm::delegations::HeldSend {
                             delegation_id: delegation_id.clone(),
                             message,
+                            automatic: false,
                         });
                         self.push_delegation_card(&delegation_id);
                     }
@@ -23758,6 +24506,145 @@ fi
                     return Task::none();
                 }
                 return Task::done(Event::ViewFile(SourcePath::Local(path)));
+            }
+            Event::DelegationOpenFileAtLine(tab_id, path, line) => {
+                if self.tab_remote_id(tab_id).is_some() {
+                    agent_webview_note(tab_id, "Files of a remote chat cannot open from here.");
+                    return Task::none();
+                }
+                let Some(repo_path) = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.repo_path.clone())
+                else {
+                    return Task::none();
+                };
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    repo_path.join(path)
+                };
+                if !path.is_file() {
+                    agent_webview_note(
+                        tab_id,
+                        &format!("{} is not a file in this checkout.", path.display()),
+                    );
+                    return Task::none();
+                }
+                let task = self.update(Event::ViewFile(SourcePath::Local(path.clone())));
+                if let Some(viewer) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id)
+                    .and_then(TabState::file_viewer_mut)
+                {
+                    viewer.line = Some(line);
+                }
+                return task;
+            }
+            Event::AgentOpenCheckout(tab_id, path) => {
+                let Some((workspace_dir, current_checkout, local_source)) =
+                    self.workspaces.iter().find_map(|ws| {
+                        let tab = ws.tabs.iter().find(|tab| tab.id == tab_id)?;
+                        let current_checkout = tab.repo_path.clone();
+                        let local_source = matches!(ws.location, WorkspaceLocation::Local { .. })
+                            && ws.remote_session.is_none()
+                            && self.remote_agent_id_for_workspace(ws).is_none();
+                        Some((ws.dir.clone(), current_checkout, local_source))
+                    })
+                else {
+                    eprintln!(
+                        "[editor] chat {tab_id} has no owning workspace; checkout open refused"
+                    );
+                    return Task::none();
+                };
+                // Trust the checkout choices constructed from GitTerm state;
+                // the page's path is only a selector and is never opened directly.
+                let choices = self.checkout_choices_for(&workspace_dir);
+                let known_paths = choices
+                    .iter()
+                    .map(|choice| choice.path.clone())
+                    .collect::<Vec<_>>();
+                let Some(known_path) = editor::known_checkout_path(
+                    &known_paths,
+                    &current_checkout,
+                    &path,
+                    local_source,
+                ) else {
+                    eprintln!(
+                        "[editor] chat {tab_id} requested unknown checkout {}; refused",
+                        path.display()
+                    );
+                    agent_webview_note(tab_id, "That checkout is not available in this workspace.");
+                    return Task::none();
+                };
+                return Task::done(Event::OpenEditor(known_path, None, Some(tab_id)));
+            }
+            Event::OpenEditor(path, line, tab_id) => {
+                let editor = self.editor.clone();
+                let name = editor::display_name(&editor);
+                let is_bundle_editor = matches!(editor.as_str(), "vscode" | "cursor" | "zed");
+                let built = editor::build_open_command(&editor, &path, line);
+                let command_log = built
+                    .as_ref()
+                    .map(|editor| format!("{:?} {:?}", editor.command.program, editor.command.args))
+                    .unwrap_or_else(|_| editor.clone());
+                let command_path = path.clone();
+                return Task::perform(
+                    async move {
+                        let editor = built?;
+                        eprintln!(
+                            "[editor] running command {:?} {:?} for {}",
+                            editor.command.program,
+                            editor.command.args,
+                            command_path.display()
+                        );
+                        crate::editor::launch_command(editor.command).await
+                    },
+                    move |result| {
+                        Event::EditorOpenFinished(
+                            path,
+                            tab_id,
+                            name,
+                            is_bundle_editor,
+                            command_log,
+                            result,
+                        )
+                    },
+                );
+            }
+            Event::EditorOpenFinished(
+                path,
+                tab_id,
+                name,
+                is_bundle_editor,
+                command_log,
+                result,
+            ) => {
+                match result {
+                    Ok(()) => {
+                        self.editor_error = None;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[editor] command {command_log} failed for {}: {error}",
+                            path.display()
+                        );
+                        let message = if is_bundle_editor {
+                            editor::not_installed_error(&name)
+                        } else {
+                            format!("Could not open in {name}: {error}")
+                        };
+                        self.editor_error = Some((path, message.clone()));
+                        if let Some(tab_id) = tab_id {
+                            agent_webview_note(tab_id, &message);
+                        }
+                    }
+                }
+                return Task::none();
             }
             Event::NewClaudeChatTab => {
                 self.tab_picker_visible = false;
@@ -23897,6 +24784,17 @@ fi
                 // Reset first: an event that arrived between the build and
                 // this message was already pushed live and is in the buffer.
                 reset_agent_webview(tab_id);
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!(
+                        "window.__setAppearance({:?})",
+                        if self.theme == AppTheme::Dark {
+                            "dark"
+                        } else {
+                            "light"
+                        }
+                    ),
+                );
                 let composer = self.chat_composer_state(tab_id);
                 set_agent_webview_tab_id(
                     tab_id,
@@ -24305,8 +25203,14 @@ fi
                                         }
                                     }
                                 }
+                                let (before, after) = session.record(ev.clone());
+                                for marker in &before {
+                                    push_agent_event_to_webview(tab_id, marker);
+                                }
                                 push_agent_event_to_webview(tab_id, &ev);
-                                session.record(ev);
+                                for marker in &after {
+                                    push_agent_event_to_webview(tab_id, marker);
+                                }
                             }
                             if let Some(id) = new_session_id {
                                 // A task's sessions belong to the task, not
@@ -25131,6 +26035,12 @@ fi
                     && matches!(key.as_ref(), Key::Named(key::Named::Escape))
                 {
                     return self.update(Event::ClosePlansViewer);
+                }
+
+                if self.viewer_webview == ViewerWebview::Page
+                    && matches!(key.as_ref(), Key::Named(key::Named::Escape))
+                {
+                    return self.update(Event::CloseViewerPage);
                 }
 
                 // Review pane: Escape closes it (the page handles Escape
@@ -26953,6 +27863,7 @@ fi
                     },
                 };
                 let path = PathBuf::from(source_path.display());
+                let local_editor_path = editor::local_editor_path(&source_path).is_some();
                 let is_dark_theme = self.theme == AppTheme::Dark;
                 let is_markdown = TabState::is_markdown_file(&path);
                 let is_html = TabState::is_html_file(&path);
@@ -27010,6 +27921,7 @@ fi
                     {
                         // Open / replace the file viewer overlay; resets all overlay state.
                         let fv = tab.open_file_viewer(path.clone());
+                        fv.local_source = local_editor_path;
                         fv.load_in_progress = true;
                         fv.load_started_at = Some(Instant::now());
                     }
@@ -27089,6 +28001,19 @@ fi
             }
             Event::ToggleTheme => {
                 self.theme = self.theme.toggle();
+                for tab_id in &self.agent_pages {
+                    webview::evaluate_script(
+                        WebviewSurface::Agent(*tab_id),
+                        &format!(
+                            "window.__setAppearance({:?})",
+                            if self.theme == AppTheme::Dark {
+                                "dark"
+                            } else {
+                                "light"
+                            }
+                        ),
+                    );
+                }
                 self.save_config();
                 self.recreate_terminals();
 
@@ -27313,6 +28238,17 @@ fi
                     return self.present_active_tab_surfaces();
                 }
             }
+            Event::OpenViewerPage(url) => return self.open_viewer_page(url),
+            Event::OpenViewerPageInBrowser => {
+                if let Some(url) = self.viewer_page_url.as_deref() {
+                    webview::open_url_in_browser(url);
+                }
+            }
+            Event::CloseViewerPage => {
+                if self.viewer_webview == ViewerWebview::Page {
+                    return self.present_active_tab_surfaces();
+                }
+            }
             Event::WindowCloseRequested => {
                 if self.workspaces_dirty {
                     self.save_workspaces();
@@ -27366,6 +28302,8 @@ fi
                         tab.last_poll = Instant::now() - Duration::from_secs(60);
                     }
                 }
+                self.request_open_pr_refreshes();
+                return self.poll_pr_watch();
             }
             Event::WindowResized(width, height) => {
                 self.window_size = (width, height);
@@ -27702,8 +28640,13 @@ fi
                     return Task::none();
                 };
                 let dir = OverviewKey::Folder(folder.clone());
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    self.workspace_overview_presentations
+                        .entry(uid)
+                        .or_default()
+                        .focus_menu_open = false;
+                }
                 let state = self.workspace_overviews.entry(dir.clone()).or_default();
-                state.focus_menu_open = false;
                 if state.focus == focus {
                     return Task::none();
                 }
@@ -27745,19 +28688,54 @@ fi
                 }
             }
             Event::WorkspaceOverviewToggleFocusMenu => {
-                if let Some(state) = self
-                    .overview_key()
-                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
-                {
-                    state.focus_menu_open = !state.focus_menu_open;
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    presentation.focus_menu_open = !presentation.focus_menu_open;
                 }
             }
             Event::WorkspaceOverviewToggleOlder => {
-                if let Some(state) = self
-                    .overview_key()
-                    .and_then(|dir| self.workspace_overviews.get_mut(&dir))
-                {
-                    state.show_older = !state.show_older;
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    presentation.show_older = !presentation.show_older;
+                }
+            }
+            Event::WorkspaceOverviewToggleDocuments => {
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    presentation.documents_open = !presentation.documents_open;
+                }
+            }
+            Event::WorkspaceOverviewToggleAlso => {
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    presentation.also_open = !presentation.also_open;
+                }
+            }
+            Event::OverviewRowToggle(key) => {
+                if let Some(uid) = self.active_workspace().map(|workspace| workspace.uid) {
+                    let presentation = self
+                        .workspace_overview_presentations
+                        .entry(uid)
+                        .or_default();
+                    let opened = overview::toggle_row(&mut presentation.open_rows, key.clone());
+                    if opened {
+                        if let overview::RowKey::Pr(id) = key {
+                            self.prs.request_row_refresh(id, opened, Instant::now());
+                            return self.poll_pr_watch();
+                        }
+                    }
                 }
             }
             Event::WorkspaceOverviewOpenChat(id) => {
@@ -27941,6 +28919,20 @@ fi
                     Err(err) => {
                         eprintln!("[chats] remote index fetch for {remote_id} failed: {err}");
                         state.error = Some(err);
+                    }
+                }
+            }
+            Event::CodexExecPolled(payloads, has_runs) => {
+                self.codex_exec_polling = false;
+                self.codex_exec_has_runs = has_runs;
+                // Live only: a page not open now gets running runs back on
+                // the next poll, and finished ones not at all.
+                for (tab_id, payload) in payloads {
+                    if webview::is_active(WebviewSurface::Agent(tab_id)) {
+                        webview::evaluate_script(
+                            WebviewSurface::Agent(tab_id),
+                            &format!("window.__appendEvent({payload})"),
+                        );
                     }
                 }
             }
@@ -29522,22 +30514,30 @@ fi
         }
     }
 
-    /// Something Iced draws covers the content area, so the native
-    /// webviews (which would sit on top of it) stay hidden: the Usage view
-    /// or the folder picker.
-    /// Iced overlays that native webviews would otherwise cover: while one
-    /// is open the chat and viewer pages are hidden.
+    /// Native webviews sit above Iced, so hide them under every covering layer.
     fn webview_overlay_open(&self) -> bool {
-        self.usage_view.open
-            || self.folder_picker.is_some()
-            || self.phone_panel.is_some()
-            || self.remote_connect_form.is_some()
-            || self.new_work_sheet.is_some()
-            || self.park_sheet.is_some()
-            || self.parked_list_open
-            || self.prs.action.is_some()
-            || self.prs.ready_open
-            || self.bar_menu.is_some()
+        WebviewOverlays {
+            usage: self.usage_view.open,
+            browser_evidence: self.browser_evidence_open,
+            task_switcher: self.task_switcher_open,
+            task_tab_close: self.task_tab_close_prompt.is_some(),
+            task_worktree_delete: self.task_worktree_delete_prompt.is_some(),
+            task_publish: self.task_publish_prompt.is_some(),
+            new_task: self.new_task_form.is_some(),
+            help: self.show_help,
+            new_work: self.new_work_sheet.is_some(),
+            park: self.park_sheet.is_some(),
+            parked_list: self.parked_list_open,
+            pr_action: self.prs.action.is_some(),
+            ready_list: self.prs.ready_open,
+            workspace_settings: self.workspace_settings_open,
+            bar_menu: self.bar_menu.is_some(),
+            tab_picker: self.tab_picker_visible,
+            phone: self.phone_panel.is_some(),
+            remote_connect: self.remote_connect_form.is_some(),
+            folder_picker: self.folder_picker.is_some(),
+        }
+        .is_open()
     }
 
     fn visible_webview_surface(&self) -> VisibleSurface {
@@ -29556,6 +30556,7 @@ fi
             webview::update_bounds(WebviewSurface::Agent(tab_id), x, y, width, height);
         }
         webview::update_bounds(WebviewSurface::Viewer, x, y, width, height);
+        webview::update_bounds(WebviewSurface::Page, x, y, width, height);
     }
 
     /// Hide the Viewer surface and let the Agent surface follow the active tab
@@ -29571,7 +30572,16 @@ fi
     /// Record what the Viewer surface presents. The review pane's state
     /// (TRU-178) lives only while the Viewer shows it.
     fn set_viewer_webview(&mut self, viewer: ViewerWebview) {
+        if viewer == ViewerWebview::Page {
+            webview::set_visible(WebviewSurface::Viewer, false);
+        } else {
+            webview::set_visible(WebviewSurface::Page, false);
+        }
         self.viewer_webview = viewer;
+        if viewer != ViewerWebview::Page {
+            self.viewer_page_url = None;
+            self.viewer_page_generation += 1;
+        }
         if viewer != ViewerWebview::Review {
             self.review_pane = None;
         }
@@ -29796,16 +30806,26 @@ fi
         match self.visible_webview_surface() {
             VisibleSurface::Viewer => {
                 webview::hide_agent_pages();
+                webview::set_visible(WebviewSurface::Page, false);
                 self.sync_webview_bounds();
                 webview::set_visible(WebviewSurface::Viewer, true);
                 Task::none()
             }
+            VisibleSurface::Page => {
+                webview::hide_agent_pages();
+                webview::set_visible(WebviewSurface::Viewer, false);
+                self.sync_webview_bounds();
+                webview::set_visible(WebviewSurface::Page, true);
+                Task::none()
+            }
             VisibleSurface::AgentChat(tab_id) => {
                 webview::set_visible(WebviewSurface::Viewer, false);
+                webview::set_visible(WebviewSurface::Page, false);
                 self.show_agent_webview(tab_id)
             }
             VisibleSurface::None => {
                 webview::set_visible(WebviewSurface::Viewer, false);
+                webview::set_visible(WebviewSurface::Page, false);
                 webview::hide_agent_pages();
                 Task::none()
             }
@@ -29988,6 +31008,134 @@ fi
         Self::create_staged_viewer_surface()
     }
 
+    /// Show a remote page in the dedicated page surface with the default store.
+    fn open_viewer_page(&mut self, url: String) -> Task<Event> {
+        self.open_page_in_store(url, webview::PageDataStore::Default)
+    }
+
+    fn open_linear_issue_page(&mut self, url: String, workspace: Option<&str>) -> Task<Event> {
+        let store = linear_page_store(workspace);
+        self.open_page_in_store(url, store)
+    }
+
+    fn open_page_in_store(
+        &mut self,
+        url: String,
+        requested_store: webview::PageDataStore,
+    ) -> Task<Event> {
+        if let Err(error) = webview::browser_url(&url) {
+            eprintln!("[webview] page open refused: {error}");
+            return Task::none();
+        }
+        let store = requested_store.for_current_os();
+        let bounds = self.calculate_webview_bounds();
+        webview::hide_agent_pages();
+        self.viewer_page_url = Some(url.clone());
+        self.viewer_page_generation += 1;
+        self.set_viewer_webview(ViewerWebview::Page);
+        let action = webview::page_store_action(self.viewer_page_store.as_ref(), &store);
+        if action == webview::PageStoreAction::Rebuild {
+            webview::destroy(WebviewSurface::Page);
+        }
+        self.viewer_page_store = Some(store.clone());
+        self.install_page_navigation_handler();
+        if action == webview::PageStoreAction::Navigate && webview::is_active(WebviewSurface::Page)
+        {
+            webview::update_bounds(WebviewSurface::Page, bounds.0, bounds.1, bounds.2, bounds.3);
+            webview::navigate_to_url(WebviewSurface::Page, &url);
+            webview::set_visible(WebviewSurface::Page, !self.webview_overlay_open());
+            return Task::none();
+        }
+
+        let page_label = store.label();
+        let page_url = url.clone();
+        webview::set_pending_page(url, bounds, &store);
+        webview::set_visible(WebviewSurface::Page, !self.webview_overlay_open());
+        Self::create_staged_page_surface(page_url, page_label)
+    }
+
+    fn page_navigation_context(&self) -> PageNavigationContext {
+        PageNavigationContext {
+            url: self.viewer_page_url.clone().expect("active Page URL"),
+            store: self.viewer_page_store.clone().expect("active Page store"),
+            github_accounts: self.github_accounts.clone(),
+            linear_workspaces: self
+                .issues
+                .cache
+                .issues
+                .values()
+                .filter_map(|issue| {
+                    issue.workspace.clone().or_else(|| {
+                        issue
+                            .url
+                            .as_deref()
+                            .and_then(gitterm::issue_titles::workspace_from_issue_url)
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn install_page_navigation_handler(&self) {
+        let context = self.page_navigation_context();
+        let generation = self.viewer_page_generation;
+        let tx = AGENT_IPC_TX.get().cloned();
+        webview::set_page_navigation_handler(move |url| {
+            let reopen = match effective_page_navigation_decision(url, &context) {
+                PageNavigationDecision::Allow => false,
+                PageNavigationDecision::Reopen(_) => true,
+                PageNavigationDecision::External => {
+                    webview::open_url_in_browser(url);
+                    return false;
+                }
+                PageNavigationDecision::Cancel => {
+                    if let Err(error) = webview::browser_url(url) {
+                        eprintln!("[webview] page navigation refused: {error}");
+                    }
+                    return false;
+                }
+            };
+            let message = AgentIpcMessage::PageNavigation {
+                generation,
+                url: url.to_string(),
+                reopen,
+            };
+            match tx.as_ref().map(|tx| tx.send(message)) {
+                Some(Ok(())) => !reopen,
+                failure => {
+                    let reason = if failure.is_none() {
+                        "host channel is uninitialized"
+                    } else {
+                        "host channel is closed"
+                    };
+                    eprintln!("[webview] cannot dispatch page navigation for generation {generation}: {reason}");
+                    false
+                }
+            }
+        });
+    }
+
+    fn create_staged_page_surface(url: String, store_label: String) -> Task<Event> {
+        iced::window::oldest().then(move |opt_id| {
+            if let Some(id) = opt_id {
+                let url = url.clone();
+                let store_label = store_label.clone();
+                iced::window::run(id, move |window| {
+                    if let Err(error) =
+                        webview::try_create_with_window(WebviewSurface::Page, window)
+                    {
+                        eprintln!(
+                            "[webview] page creation failed for {url} ({store_label}): {error}"
+                        );
+                    }
+                })
+                .discard()
+            } else {
+                Task::none()
+            }
+        })
+    }
+
     /// Show the agent chat for `tab_id`. Each agent tab has its own page
     /// (`WebviewSurface::Agent(tab_id)`): a live one is just shown, every other
     /// page hidden, DOM intact (no reset, no replay); a tab without one gets a
@@ -30159,13 +31307,17 @@ fi
         let remote_client = remote_id.as_deref().map(|id| self.remote_chat_client(id));
         // An ACP tab starts its agent here (local workspaces only); it gets
         // GitTerm's MCP servers under the tab's caller identity.
-        let tab_info = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|t| t.id == tab_id)
-            .map(|t| (t.repo_path.clone(), t.session_uid.clone()));
-        let Some((repo_path, caller)) = tab_info else {
+        let tab_info = self.workspaces.iter().find_map(|ws| {
+            ws.tabs.iter().find(|t| t.id == tab_id).map(|t| {
+                (
+                    t.repo_path.clone(),
+                    t.session_uid.clone(),
+                    ws.guidelines_off,
+                    ws.document_places(),
+                )
+            })
+        });
+        let Some((repo_path, caller, guidelines_off, document_places)) = tab_info else {
             return Task::none();
         };
         let acp_mcp_servers: Vec<gitterm::harness::acp::AcpMcpServer> = if remote_id.is_some() {
@@ -30209,9 +31361,21 @@ fi
                 session.history = tab::HistoryLoad::Loaded;
                 return Task::none();
             }
-            let Some(config) =
-                session.acp_session_config(repo_path, acp_mcp_servers, acp_support_dir())
-            else {
+            let task_tools = acp_mcp_servers
+                .iter()
+                .any(|server| server.name == "gitterm_tasks");
+            let guidelines = launch_instructions(
+                &repo_path,
+                guidelines_off,
+                document_places.as_ref(),
+                task_tools,
+            );
+            let Some(config) = session.acp_session_config(
+                repo_path,
+                acp_mcp_servers,
+                acp_support_dir(),
+                guidelines,
+            ) else {
                 return Task::none();
             };
             eprintln!(
@@ -30406,21 +31570,15 @@ fi
         let content = freeze_time!("view_workspace_slide", { self.view_workspace_slide() });
         let console_panel = freeze_time!("view_bottom_panel", { self.view_bottom_panel() });
 
-        let mut main_col = Column::new()
-            .spacing(0)
-            .width(Length::Fill)
-            .height(Length::Fill);
-        main_col = main_col.push(tab_bar);
-        if self.viewer_webview == ViewerWebview::PlansViewer {
-            main_col = main_col.push(self.view_plans_viewer_header());
-        }
-        if self.viewer_webview == ViewerWebview::Review {
-            main_col = main_col.push(self.view_review_header());
-        }
-        main_col = main_col.push(content);
+        let header = match self.viewer_webview {
+            ViewerWebview::PlansViewer => Some(self.view_plans_viewer_header()),
+            ViewerWebview::Page => Some(self.view_page_header()),
+            ViewerWebview::Review => Some(self.view_review_header()),
+            _ => None,
+        };
 
-        // Console divider (only when expanded)
-        if self.console_expanded {
+        // The divider keeps its slot even when collapsed.
+        let divider = if self.console_expanded {
             let theme = &self.theme;
             let divider_color = if self.dragging_console_divider {
                 theme.accent()
@@ -30438,14 +31596,19 @@ fi
             )
             .on_press(Event::ConsoleDividerDragStart)
             .interaction(iced::mouse::Interaction::ResizingVertically);
-            main_col = main_col.push(console_divider);
-        }
+            Some(console_divider.into())
+        } else {
+            None
+        };
 
-        main_col = main_col.push(console_panel);
-
-        // Bottom workspace bar
-        let workspace_bar = self.view_workspace_bar();
-        main_col = main_col.push(workspace_bar);
+        let main_col = workspace_column(
+            tab_bar,
+            header,
+            content,
+            divider,
+            console_panel,
+            self.view_workspace_bar(),
+        );
 
         row![spine, main_col]
             .spacing(0)
@@ -31356,6 +32519,46 @@ fi
         .spacing(8);
         container(header)
             .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(header_bg.into()),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// Header strip for a page opened from the Work sidebar.
+    fn view_page_header(&self) -> Element<'_, Event, Theme, iced::Renderer> {
+        let theme = &self.theme;
+        let font = self.ui_font();
+        let font_small = self.ui_font_small();
+        let header_bg = theme.bg_overlay();
+        let title = self.viewer_page_url.as_deref().unwrap_or_default();
+        let store_label = self
+            .viewer_page_store
+            .as_ref()
+            .map(webview::PageDataStore::label)
+            .unwrap_or_else(|| "default login".to_string());
+        let header = row![
+            text(overview::shorten(title, 100))
+                .size(font_small)
+                .color(theme.text_muted())
+                .width(Length::Fill),
+            text(store_label).size(font_small).color(theme.text_muted()),
+            button(text("Open in browser").size(font_small))
+                .style(self.flat_button_style())
+                .padding([4, 8])
+                .on_press(Event::OpenViewerPageInBrowser),
+            button(text("×").size(font))
+                .style(self.flat_button_style())
+                .padding([2, 8])
+                .on_press(Event::CloseViewerPage),
+        ]
+        .padding(6)
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        container(header)
+            .width(Length::Fill)
+            .height(Length::Fixed(40.0))
             .style(move |_| container::Style {
                 background: Some(header_bg.into()),
                 ..Default::default()
@@ -36276,10 +37479,12 @@ fi
 
     /// The overview's one Repos section (TRU-167, TRU-180, TRU-192): every
     /// repo the workspace lists or the work touched, each with its edit
-    /// count and the owned branches under it. The header carries the repo's
-    /// run command, a remove control (not the home) and opens the Git view
-    /// on a click; `+ add repo` picks a folder. A note offers undo when
-    /// repos joined from the chats' touches. A pure render over `state`.
+    /// count and the owned branches under it. The repo's line carries its
+    /// run command and opens the Git view on a click; editing the command,
+    /// its age and a remove control (not the home) show once ▸ opens the
+    /// line (TRU-208).
+    /// `+ add` picks a folder. A note offers undo when repos joined from
+    /// the chats' touches. A pure render over `state`.
     fn view_overview_repos<'a>(
         &'a self,
         state: Option<&'a WorkspaceOverviewState>,
@@ -36299,36 +37504,18 @@ fi
             state.map_or(&[][..], |state| &state.summary.repos),
             state.map_or(&[][..], |state| &state.branches),
         );
-        let owned_count: usize = groups
-            .iter()
-            .map(|group| group.rows.iter().filter(|row| !row.owned.gone).count())
-            .sum();
-
-        let mut header = Row::new()
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
-            .push(
-                text(format!(
-                    "REPOS \u{00B7} {} \u{00B7} BRANCHES \u{00B7} {owned_count}",
-                    groups.len()
-                ))
-                .size(10)
-                .color(text_muted)
-                .font(mono),
-            )
-            .push(iced::widget::Space::new().width(Length::Fill));
-        if matches!(ws.location, WorkspaceLocation::Local { .. }) {
-            header = header.push(
-                button(
-                    text("+ add repo")
-                        .size(font_small - 1.0)
-                        .color(theme.accent()),
-                )
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::WorkspaceRepoAdd(uid)),
-            );
-        }
+        let bold = iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..Default::default()
+        };
+        let add = matches!(ws.location, WorkspaceLocation::Local { .. }).then(|| {
+            button(text("+ add").size(font_small - 1.0).color(theme.accent()))
+                .style(self.flat_button_style())
+                .padding([0, 4])
+                .on_press(Event::WorkspaceRepoAdd(uid))
+                .into()
+        });
+        let header = self.overview_section_header("Repos", groups.len().to_string(), add);
         let mut section = Column::new().spacing(3).push(header);
 
         if !ws.joined_note.is_empty() {
@@ -36346,11 +37533,11 @@ fi
                         .color(theme.text_secondary())
                         .width(Length::Fill),
                     button(text("Undo").size(font_small - 1.0).color(theme.accent()))
-                        .style(self.ghost_button_style())
+                        .style(self.flat_button_style())
                         .padding([2, 6])
                         .on_press(Event::WorkspaceRepoJoinedUndo(uid)),
                     button(text("\u{00D7}").size(font_small - 1.0).color(text_muted))
-                        .style(self.ghost_button_style())
+                        .style(self.flat_button_style())
                         .padding([2, 4])
                         .on_press(Event::WorkspaceRepoJoinedDismiss(uid)),
                 ]
@@ -36361,7 +37548,7 @@ fi
 
         let home = dirs::home_dir();
         let selected = self.open_review_checkout();
-        let mut repos = Column::new().spacing(6);
+        let mut repos = Column::new().spacing(4);
         for group in groups {
             let repo_state = listed.iter().find(|repo| repo.dir == group.dir);
             // Worktrees git still lists whose folder is gone: one dim
@@ -36369,102 +37556,141 @@ fi
             let (gone, rows): (Vec<_>, Vec<_>) =
                 group.rows.into_iter().partition(|row| row.owned.gone);
             let oldest = rows.iter().map(|row| row.checked_at).min();
-            let mut name = overview::folder_name(&group.dir);
-            if repo_state.is_some_and(|repo| repo.id == ws.home) {
-                name.push_str(" \u{00B7} home");
-            }
-            // The name opens the Git view on the repo (TRU-192).
-            let local = repo_state.is_none_or(|repo| repo.key.is_local());
-            let mut head = row![
-                button(text(name).size(font_small).color(text_primary).font(mono))
-                    .style(self.ghost_button_style())
-                    .padding([0, 2])
-                    .on_press_maybe(local.then(|| {
-                        Event::OpenRepoPanel(SidebarMode::Git, Some(group.dir.clone()))
-                    }))
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
-            if let Some(edits) = group.edits {
-                head = head.push(
-                    text(format!("{edits} edits"))
-                        .size(10)
-                        .color(text_muted)
-                        .font(mono),
-                );
-            }
-            head = head.push(iced::widget::Space::new().width(Length::Fill));
-            // Its run command (TRU-180): `▶` opens it as a terminal tab
-            // below; ✎ edits it. Only this Mac's folders run.
-            if let Some(repo) = repo_state.filter(|repo| repo.key.is_local()) {
-                let editing = self
-                    .editing_run_command
-                    .as_ref()
-                    .filter(|(id, _)| *id == repo.id);
-                head = match (editing, &repo.run_command) {
-                    (Some((_, draft)), _) => head.push(
-                        text_input("npm run dev", draft)
-                            .on_input(Event::RunCommandChanged)
-                            .on_submit(Event::RunCommandSubmit)
-                            .size(font_small - 1.0)
-                            .padding([2, 4])
-                            .width(Length::Fixed(160.0))
-                            .font(mono)
-                            .style(self.input_style()),
-                    ),
-                    (None, Some(command)) => head
-                        .push(
-                            button(
-                                text(format!("\u{25B6} {command}"))
-                                    .size(10)
-                                    .color(theme.success())
-                                    .font(mono),
-                            )
-                            .style(self.ghost_button_style())
-                            .padding([0, 4])
-                            .on_press(Event::RunRepoCommand(repo.id)),
-                        )
-                        .push(
-                            button(text("\u{270E}").size(10).color(text_muted))
-                                .style(self.ghost_button_style())
-                                .padding([0, 4])
-                                .on_press(Event::RunCommandEditStart(repo.id)),
-                        ),
-                    (None, None) => head.push(
-                        button(text("+ run command").size(10).color(text_muted).font(mono))
-                            .style(self.ghost_button_style())
-                            .padding([0, 4])
-                            .on_press(Event::RunCommandEditStart(repo.id)),
-                    ),
-                };
-            }
-            if let Some(oldest) = oldest {
-                head = head.push(
-                    text(overview::age_label(oldest))
-                        .size(10)
-                        .color(text_muted)
-                        .font(mono),
-                );
-            }
-            if let Some(repo) = repo_state.filter(|repo| repo.id != ws.home) {
-                head = head.push(
-                    button(text("\u{00D7}").size(font_small).color(text_muted))
-                        .style(self.ghost_button_style())
-                        .padding([0, 4])
-                        .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
-                );
-            }
-            let mut column = Column::new().spacing(2).push(head);
-            if rows.is_empty() && gone.is_empty() {
-                let note = if group.edits.is_none() {
+            let name = overview::folder_name(&group.dir);
+            let is_home = repo_state.is_some_and(|repo| repo.id == ws.home);
+            // A repo with nothing going on is one line (TRU-208): its note
+            // moves to the line's right side and the name dims.
+            let empty_note = (rows.is_empty() && gone.is_empty()).then(|| {
+                if group.edits.is_none() {
                     "no edits yet"
                 } else if state.is_some_and(|state| state.last_full_refresh.is_none()) {
                     "reading\u{2026}"
                 } else {
                     "no live checkout of this work"
-                };
-                column = column.push(text(note).size(10).color(text_muted));
+                }
+            });
+            let quiet = empty_note.is_some() && group.edits.is_none();
+            let facts = overview::repo_facts(is_home, group.edits, empty_note);
+            let key = overview::RowKey::Repo(group.dir.clone());
+            let expanded = self.overview_row_open(&key);
+            // The name opens the Git view on the repo (TRU-192).
+            let local = repo_state.is_none_or(|repo| repo.key.is_local());
+            let name_button = button(text(name).size(font_small).font(bold).color(if quiet {
+                text_muted
+            } else {
+                text_primary
+            }))
+            .style(self.flat_button_style())
+            .padding([0, 2])
+            .on_press_maybe(
+                local.then(|| Event::OpenRepoPanel(SidebarMode::Git, Some(group.dir.clone()))),
+            );
+            // Its run command (TRU-180): `▶` opens it as a terminal tab
+            // below and stays shown; ✎ edits it, once the line is opened
+            // with ▸. Only this Mac's folders run. Fixed slots: name, run,
+            // gap, actions, facts, disclosure; the input never moves.
+            let local_repo = repo_state.filter(|repo| repo.key.is_local());
+            let editing = local_repo.and_then(|repo| {
+                self.editing_run_command
+                    .as_ref()
+                    .filter(|(id, _)| *id == repo.id)
+                    .map(|(_, draft)| draft)
+            });
+            let run_slot: Element<'a, Event, Theme, iced::Renderer> = match (local_repo, editing) {
+                (Some(_), Some(draft)) => text_input("npm run dev", draft)
+                    .on_input(Event::RunCommandChanged)
+                    .on_submit(Event::RunCommandSubmit)
+                    .size(font_small - 1.0)
+                    .padding([2, 4])
+                    .width(Length::Fixed(160.0))
+                    .font(mono)
+                    .style(self.input_style())
+                    .into(),
+                (Some(repo), None) => match &repo.run_command {
+                    Some(command) => button(
+                        text(format!("\u{25B6} {command}"))
+                            .size(10)
+                            .color(theme.success())
+                            .font(mono),
+                    )
+                    .style(self.flat_button_style())
+                    .padding([0, 4])
+                    .on_press(Event::RunRepoCommand(repo.id))
+                    .into(),
+                    None => iced::widget::Space::new().into(),
+                },
+                (None, _) => iced::widget::Space::new().into(),
+            };
+            let removable = repo_state.filter(|repo| repo.id != ws.home);
+            let has_hidden = local_repo.is_some() || oldest.is_some() || removable.is_some();
+            let mut actions_slot = Row::new().spacing(2).align_y(iced::Alignment::Center);
+            if expanded {
+                if local_repo.is_some() {
+                    let editor_name = editor::display_name(&self.editor);
+                    actions_slot = actions_slot.push(iced::widget::tooltip(
+                        button(text("Open in editor").size(10).color(text_muted))
+                            .style(self.flat_button_style())
+                            .padding([0, 4])
+                            .on_press(Event::OpenEditor(group.dir.clone(), None, None)),
+                        text(format!("Open in {editor_name}")).size(10),
+                        iced::widget::tooltip::Position::Top,
+                    ));
+                }
+                if let Some((error_path, message)) = &self.editor_error {
+                    if error_path == &group.dir {
+                        actions_slot =
+                            actions_slot.push(text(message).size(10).color(theme.danger()));
+                    }
+                }
+                if let Some(repo) = local_repo.filter(|_| editing.is_none()) {
+                    actions_slot = actions_slot.push(match &repo.run_command {
+                        Some(_) => button(text("\u{270E}").size(10).color(text_muted))
+                            .style(self.flat_button_style())
+                            .padding([0, 4])
+                            .on_press(Event::RunCommandEditStart(repo.id)),
+                        None => button(text("+ run command").size(10).color(text_muted).font(mono))
+                            .style(self.flat_button_style())
+                            .padding([0, 4])
+                            .on_press(Event::RunCommandEditStart(repo.id)),
+                    });
+                }
+                if let Some(oldest) = oldest {
+                    actions_slot = actions_slot.push(
+                        text(overview::age_label(oldest))
+                            .size(10)
+                            .color(text_muted)
+                            .font(mono),
+                    );
+                }
+                if let Some(repo) = removable {
+                    actions_slot = actions_slot.push(
+                        button(text("\u{00D7}").size(font_small).color(text_muted))
+                            .style(self.flat_button_style())
+                            .padding([0, 4])
+                            .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
+                    );
+                }
             }
+            let head_content = row![
+                name_button,
+                run_slot,
+                iced::widget::Space::new().width(Length::Fill),
+                actions_slot,
+                text(facts).size(10).color(text_muted).font(mono),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            let head = row![
+                overview_row_content(head_content.into()),
+                if has_hidden {
+                    self.overview_disclosure(expanded, key)
+                } else {
+                    iced::widget::Space::new().into()
+                },
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            let mut column = Column::new().spacing(1).push(head);
             for row in rows {
                 column = column.push(self.view_overview_branch_row(
                     row,
@@ -36508,27 +37734,37 @@ fi
         let text_muted = theme.text_muted();
         let hover = theme.bg_overlay();
         let surface0 = theme.surface0();
-        let section = |label: String| text(label).size(10).color(text_muted).font(mono);
+        let bold = iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..Default::default()
+        };
         let name = self
             .active_workspace()
-            .map(|ws| ws.name.to_uppercase())
-            .unwrap_or_else(|| "WORKSPACE".to_string());
+            .map(|ws| ws.name.clone())
+            .unwrap_or_else(|| "Workspace".to_string());
         let state = self
             .overview_key()
             .and_then(|dir| self.workspace_overviews.get(&dir));
+        let presentation = self
+            .active_workspace()
+            .and_then(|workspace| self.workspace_overview_presentations.get(&workspace.uid));
+        let focus_menu_open = presentation.is_some_and(|state| state.focus_menu_open);
+        let show_older = presentation.is_some_and(|state| state.show_older);
+        let documents_open = presentation.is_some_and(|state| state.documents_open);
+        let also_open = presentation.is_some_and(|state| state.also_open);
         let reading = state.is_some_and(|state| state.in_flight);
         let mut refresh = button(
             text(if reading {
                 "reading\u{2026}"
             } else {
-                "\u{21BB} Refresh"
+                "\u{21BB}"
             })
             .size(11)
-            .color(theme.blue())
+            .color(text_muted)
             .font(mono),
         )
-        .style(self.ghost_button_style())
-        .padding([4, 5]);
+        .style(self.flat_button_style())
+        .padding([2, 5]);
         if state.is_some() && !reading {
             refresh = refresh.on_press(Event::WorkspaceOverviewRefresh);
         }
@@ -36552,23 +37788,23 @@ fi
                 .into(),
             None => row![
                 iced::widget::mouse_area(
-                    text(format!("WORKSPACE \u{00B7} {name}"))
-                        .size(10)
-                        .color(text_muted)
-                        .font(mono),
+                    text(name)
+                        .size(self.ui_font())
+                        .color(text_primary)
+                        .font(bold),
                 )
                 .on_double_click(Event::WorkspaceRenameStart(
                     active_idx,
                     RenameSite::Overview
                 )),
+                iced::widget::Space::new().width(Length::Fill),
                 button(text("\u{270E}").size(10).color(text_muted))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([2, 4])
                     .on_press(Event::WorkspaceRenameStart(
                         active_idx,
                         RenameSite::Overview
                     )),
-                iced::widget::Space::new().width(Length::Fill),
             ]
             .spacing(2)
             .align_y(iced::Alignment::Center)
@@ -36578,7 +37814,7 @@ fi
         let header = row![title, refresh]
             .spacing(4)
             .align_y(iced::Alignment::Center);
-        let mut content = Column::new().spacing(8).padding([10, 8]).push(header);
+        let mut content = Column::new().spacing(10).padding([10, 8]).push(header);
         let finish = |content: Column<'a, Event, Theme, iced::Renderer>| {
             scrollable(content)
                 .height(Length::Fill)
@@ -36613,22 +37849,21 @@ fi
             content = content.push(repos);
         }
         // What the agent has here (TRU-192): opens the Agent view.
-        if let Some(config) = self.active_tab().map(|tab| &tab.claude_config) {
+        // Hidden when it has none of them (TRU-208).
+        let config_line = self.active_tab().and_then(|tab| {
+            let config = &tab.claude_config;
+            overview::agent_config_line(
+                config.skills.len(),
+                config.mcp_servers.len(),
+                config.hooks.len(),
+            )
+        });
+        if let Some(line) = config_line {
             content = content.push(
-                button(
-                    text(format!(
-                        "skills {} \u{00B7} MCPs {} \u{00B7} hooks {}",
-                        config.skills.len(),
-                        config.mcp_servers.len(),
-                        config.hooks.len()
-                    ))
-                    .size(10)
-                    .color(theme.accent())
-                    .font(mono),
-                )
-                .style(self.ghost_button_style())
-                .padding([2, 6])
-                .on_press(Event::SetSidebarMode(SidebarMode::Claude)),
+                button(text(line).size(10).color(theme.accent()).font(mono))
+                    .style(self.flat_button_style())
+                    .padding([2, 0])
+                    .on_press(Event::SetSidebarMode(SidebarMode::Claude)),
             );
         }
         let Some(state) = state else {
@@ -36657,7 +37892,7 @@ fi
                 "Index older chats"
             };
             let mut backfill = button(text(label).size(font_small - 1.0).color(theme.accent()))
-                .style(self.ghost_button_style())
+                .style(self.flat_button_style())
                 .padding([3, 8]);
             if !self.chat_backfill_running && !self.chat_index.is_empty() {
                 backfill = backfill.on_press(Event::ChatFactsBackfill);
@@ -36696,7 +37931,7 @@ fi
                         .size(font_small)
                         .color(text_primary)
                         .width(Length::Fill),
-                    text(if state.focus_menu_open {
+                    text(if focus_menu_open {
                         "\u{25B4}"
                     } else {
                         "\u{25BE}"
@@ -36726,7 +37961,7 @@ fi
             })
             .on_press(Event::WorkspaceOverviewToggleFocusMenu);
             content = content.push(focus_button);
-            if state.focus_menu_open {
+            if focus_menu_open {
                 let option = |label: String, focus: overview::Focus| {
                     let active = summary.focus == focus;
                     button(text(label).size(font_small - 1.0).color(if active {
@@ -36734,7 +37969,7 @@ fi
                     } else {
                         text_primary
                     }))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([3, 8])
                     .width(Length::Fill)
                     .on_press(Event::WorkspaceOverviewFocus(focus))
@@ -36764,11 +37999,11 @@ fi
 
         // An owning workspace lists every root it owns, newest first.
         if summary.owned && !summary.coordinators.is_empty() {
-            content = content.push(section(format!(
-                "CHATS \u{00B7} {}",
-                summary.coordinators.len()
-            )));
-            let mut chats = Column::new().spacing(2);
+            let mut chats = Column::new().spacing(2).push(self.overview_section_header(
+                "Chats",
+                summary.coordinators.len().to_string(),
+                None,
+            ));
             for coordinator in &summary.coordinators {
                 chats = chats.push(self.view_overview_coordinator_row(coordinator, false));
             }
@@ -36782,12 +38017,15 @@ fi
                 summary.coordinators.iter().filter(|c| c.recent).collect();
             let older: Vec<&overview::Coordinator> =
                 summary.coordinators.iter().filter(|c| !c.recent).collect();
-            content = content.push(section(if recent.is_empty() {
-                "CHATS \u{00B7} none in the last 7 days".to_string()
-            } else {
-                format!("CHATS \u{00B7} {} in the last 7 days", recent.len())
-            }));
-            let mut chats = Column::new().spacing(2);
+            let mut chats = Column::new().spacing(2).push(self.overview_section_header(
+                "Chats",
+                if recent.is_empty() {
+                    "none in the last 7 days".to_string()
+                } else {
+                    format!("{} in the last 7 days", recent.len())
+                },
+                None,
+            ));
             for coordinator in recent.iter().take(COORDINATOR_ROWS) {
                 chats = chats.push(self.view_overview_coordinator_row(
                     coordinator,
@@ -36800,7 +38038,7 @@ fi
                         .size(10)
                         .color(theme.accent()),
                 )
-                .style(self.ghost_button_style())
+                .style(self.flat_button_style())
                 .padding([2, 6])
                 .on_press(Event::SetSidebarMode(SidebarMode::Chats))
             };
@@ -36811,57 +38049,68 @@ fi
                 chats = chats.push(
                     button(
                         text(format!(
-                            "{} {} older",
-                            if state.show_older {
-                                "\u{25BE}"
-                            } else {
-                                "\u{25B8}"
-                            },
-                            older.len()
+                            "{} older {}",
+                            older.len(),
+                            overview::fold_marker(show_older)
                         ))
                         .size(10)
-                        .color(text_muted)
-                        .font(mono),
+                        .color(text_muted),
                     )
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([2, 6])
                     .on_press(Event::WorkspaceOverviewToggleOlder),
                 );
-                if state.show_older {
-                    for coordinator in older.iter().take(OLDER_ROWS) {
-                        chats = chats.push(self.view_overview_coordinator_row(
-                            coordinator,
-                            summary.focused.contains(&coordinator.id),
-                        ));
-                    }
-                    if older.len() > OLDER_ROWS {
-                        chats = chats.push(more_in_chats(older.len() - OLDER_ROWS));
-                    }
+                for coordinator in overview::fold_rows(&older, show_older)
+                    .iter()
+                    .take(OLDER_ROWS)
+                {
+                    chats = chats.push(self.view_overview_coordinator_row(
+                        coordinator,
+                        summary.focused.contains(&coordinator.id),
+                    ));
+                }
+                if show_older && older.len() > OLDER_ROWS {
+                    chats = chats.push(more_in_chats(older.len() - OLDER_ROWS));
                 }
             }
             content = content.push(chats);
         }
 
-        // Documents of the work (TRU-191), newest first.
-        if let Some(documents) = self.view_work_documents() {
-            let count = self
-                .active_workspace()
-                .and_then(|ws| self.work_documents.get(&ws.uid))
-                .and_then(|state| state.result.as_ref())
-                .map_or(0, |result| result.documents.len());
-            content = content
-                .push(section(format!("DOCUMENTS \u{00B7} {count}")))
-                .push(documents);
+        // Documents of the work (TRU-191), newest first; folded to a count
+        // until opened (TRU-208).
+        let documents_count = self
+            .active_workspace()
+            .and_then(|ws| self.work_documents.get(&ws.uid))
+            .and_then(|state| state.result.as_ref())
+            .map_or(0, |result| result.documents.len());
+        if documents_count > 0 {
+            let mut documents = Column::new().spacing(2).push(self.overview_fold_header(
+                "Documents",
+                documents_count,
+                documents_open,
+                Event::WorkspaceOverviewToggleDocuments,
+            ));
+            if documents_open {
+                if let Some(list) = self.view_work_documents() {
+                    documents = documents.push(list);
+                }
+            }
+            content = content.push(documents);
         }
 
-        // Coordinators that live in another workspace but edited here.
+        // Coordinators that live in another workspace but edited here;
+        // folded to a count until opened (TRU-208).
         if !summary.also_worked.is_empty() {
-            content = content.push(section(format!(
-                "ALSO WORKED HERE \u{00B7} {}",
-                summary.also_worked.len()
-            )));
-            let mut also = Column::new().spacing(2);
-            for item in summary.also_worked.iter().take(COORDINATOR_ROWS) {
+            let mut also = Column::new().spacing(2).push(self.overview_fold_header(
+                "Also worked here",
+                summary.also_worked.len(),
+                also_open,
+                Event::WorkspaceOverviewToggleAlso,
+            ));
+            for item in overview::fold_rows(&summary.also_worked, also_open)
+                .iter()
+                .take(COORDINATOR_ROWS)
+            {
                 also = also.push(self.view_overview_coordinator_row_with(
                     &item.coordinator,
                     summary.focused.contains(&item.coordinator.id),
@@ -36872,12 +38121,16 @@ fi
         }
 
         if !summary.issue_keys.is_empty() {
-            content = content
-                .push(section(format!(
-                    "ISSUES \u{00B7} {}",
-                    summary.issue_keys.len()
-                )))
-                .push(self.view_work_issues(&summary.issue_keys));
+            content = content.push(
+                Column::new()
+                    .spacing(2)
+                    .push(self.overview_section_header(
+                        "Issues",
+                        summary.issue_keys.len().to_string(),
+                        None,
+                    ))
+                    .push(self.view_work_issues(&summary.issue_keys)),
+            );
         }
         for error in &state.errors {
             content = content.push(
@@ -36889,9 +38142,10 @@ fi
         finish(content)
     }
 
-    /// One coordinator: title and age, latest line, fan-out and indexed
-    /// children. Clicking focuses it; the ↗ beside it opens the conversation in the
-    /// main area, and "open" marks one a tab already hosts.
+    /// One coordinator on one line (TRU-208): title, "open", fan-out and
+    /// age. Its ▸ opens the latest line, the indexed children and ↗,
+    /// which opens the conversation in the main area. Clicking the row
+    /// focuses it (or opens it, in a workspace that owns its chats).
     fn view_overview_coordinator_row<'a>(
         &'a self,
         coordinator: &'a overview::Coordinator,
@@ -36923,72 +38177,90 @@ fi
         let text_muted = theme.text_muted();
         let surface0 = theme.surface0();
         let hover = theme.bg_overlay();
-        let mut body = Column::new().spacing(2).push(
-            row![
-                text("\u{2726}").size(font_small).color(theme.mauve()),
-                text(overview::shorten(&coordinator.title, 70))
-                    .size(font_small)
-                    .color(theme.text_primary())
-                    .width(Length::Fill),
-                text(if is_open { "open" } else { "" })
-                    .size(10)
-                    .color(theme.green()),
-                text(chats::format_age(coordinator.active))
-                    .size(10)
-                    .color(text_muted)
-                    .font(mono),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-        );
-        if let Some(latest) = &coordinator.latest {
-            body = body.push(
-                text(format!("\u{21B3} {}", overview::shorten(latest, 90)))
-                    .size(font_small - 1.0)
-                    .color(theme.text_secondary()),
-            );
-        }
-        if let Some(edits) = edits_here {
-            body = body.push(
-                text(format!(
-                    "{edits} edit{} here",
-                    if edits == 1 { "" } else { "s" }
-                ))
+        let key = overview::RowKey::Chat(coordinator.id.clone());
+        let expanded = self.overview_row_open(&key);
+        // Fixed slots: mark, title, open, edits here, fan-out, age, ↗, ▸.
+        let open = button(text("\u{2197}").size(font_small).color(theme.accent()))
+            .style(self.flat_button_style())
+            .padding([0, 4])
+            .on_press(Event::WorkspaceOverviewOpenChat(coordinator.id.clone()));
+        let open_slot: Element<'a, Event, Theme, iced::Renderer> = if expanded {
+            open.into()
+        } else {
+            iced::widget::Space::new().into()
+        };
+        let line = row![
+            text("\u{2726}").size(font_small).color(theme.mauve()),
+            text(overview::shorten(&coordinator.title, 70))
+                .size(font_small)
+                .color(theme.text_primary())
+                .width(Length::Fill),
+            text(if is_open { "open" } else { "" })
                 .size(10)
-                .color(theme.accent())
+                .color(theme.green()),
+            text(edits_here.map_or_else(String::new, |edits| format!(
+                "{edits} edit{} here",
+                if edits == 1 { "" } else { "s" }
+            )))
+            .size(10)
+            .color(theme.accent())
+            .font(mono),
+            text(
+                coordinator
+                    .fan_out
+                    .as_deref()
+                    .map_or_else(String::new, |fan_out| overview::shorten(fan_out, 28))
+            )
+            .size(10)
+            .color(text_muted)
+            .font(mono),
+            text(chats::format_age(coordinator.active))
+                .size(10)
+                .color(text_muted)
                 .font(mono),
-            );
-        }
-        if let Some(fan_out) = &coordinator.fan_out {
-            body = body.push(text(fan_out.clone()).size(10).color(text_muted).font(mono));
-        }
-        for child in coordinator.children.iter().take(CHILD_ROWS) {
-            let kind = match child.kind {
-                Some(chat_facts::ChildKind::Worker) => "worker",
-                Some(chat_facts::ChildKind::Review) => "review",
-                Some(chat_facts::ChildKind::Consult) => "consult",
-                Some(chat_facts::ChildKind::Subagent) => "subagent",
-                None => "chat",
-            };
-            body = body.push(
-                text(format!(
-                    "   {kind} \u{00B7} {} \u{00B7} {}",
-                    overview::shorten(&child.title, 50),
-                    chats::format_age(child.mtime)
-                ))
-                .size(10)
-                .color(text_muted),
-            );
-        }
-        if coordinator.children.len() > CHILD_ROWS {
-            body = body.push(
-                text(format!(
-                    "   \u{2026} {} more",
-                    coordinator.children.len() - CHILD_ROWS
-                ))
-                .size(10)
-                .color(text_muted),
-            );
+            open_slot,
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        // Opened: the latest line and the indexed children.
+        let mut detail = Column::new().spacing(2);
+        if expanded {
+            if let Some(latest) = &coordinator.latest {
+                detail = detail.push(
+                    text(format!("\u{21B3} {}", overview::shorten(latest, 90)))
+                        .size(font_small - 1.0)
+                        .color(theme.text_secondary()),
+                );
+            }
+            for child in coordinator.children.iter().take(CHILD_ROWS) {
+                let kind = match child.kind {
+                    Some(chat_facts::ChildKind::Worker) => "worker",
+                    Some(chat_facts::ChildKind::Review) => "review",
+                    Some(chat_facts::ChildKind::Consult) => "consult",
+                    Some(chat_facts::ChildKind::Subagent) => "subagent",
+                    None => "chat",
+                };
+                detail = detail.push(
+                    text(format!(
+                        "   {kind} \u{00B7} {} \u{00B7} {}",
+                        overview::shorten(&child.title, 50),
+                        chats::format_age(child.mtime)
+                    ))
+                    .size(10)
+                    .color(text_muted),
+                );
+            }
+            if coordinator.children.len() > CHILD_ROWS {
+                detail = detail.push(
+                    text(format!(
+                        "   \u{2026} {} more",
+                        coordinator.children.len() - CHILD_ROWS
+                    ))
+                    .size(10)
+                    .color(text_muted),
+                );
+            }
         }
         // A workspace that owns its chats has no focus: a row opens its
         // chat. Folder-scoped, a row focuses (TRU-167).
@@ -37000,7 +38272,8 @@ fi
         };
         // "Make workspace", or "Go to <name>" when another workspace owns
         // it (TRU-169): on the focused row of a folder-scoped overview, and
-        // on rows this owning workspace does not own.
+        // on rows this owning workspace does not own. Once opened, or
+        // while the row is focused (TRU-208).
         let owner = self.root_chat_owner(&coordinator.id);
         let owned_here = owning.is_some_and(|ws| ws.chats.contains(&coordinator.id));
         let show_action = if owning.is_some() {
@@ -37008,7 +38281,7 @@ fi
         } else {
             focused
         };
-        if show_action {
+        if show_action && (expanded || focused) {
             let (label, event) = match &owner {
                 Some((name, _)) => (
                     format!("\u{2192} Go to {}", overview::shorten(name, 30)),
@@ -37019,47 +38292,48 @@ fi
                     Event::WorkspaceFromChat(coordinator.id.clone()),
                 ),
             };
-            body = body.push(
+            detail = detail.push(
                 button(text(label).size(10).color(theme.accent()).font(mono))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([1, 0])
                     .on_press(event),
             );
         }
-        let focus = button(body)
-            .width(Length::Fill)
-            .padding([5, 6])
-            .style(move |_, status| button::Style {
-                background: Some(
-                    if focused {
-                        surface0
-                    } else if matches!(status, button::Status::Hovered) {
-                        hover
-                    } else {
-                        iced::Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                border: iced::Border {
-                    radius: 6.0.into(),
+        let body = column![overview_row_content(line.into()), detail].spacing(2);
+        let row = row![
+            button(body)
+                .width(Length::Fill)
+                .padding([4, 6])
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if focused {
+                            surface0
+                        } else if matches!(status, button::Status::Hovered) {
+                            hover
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            })
-            .on_press(press);
-        let open = button(text("\u{2197}").size(font_small).color(theme.accent()))
-            .style(self.ghost_button_style())
-            .padding([4, 5])
-            .on_press(Event::WorkspaceOverviewOpenChat(coordinator.id.clone()));
-        row![focus, open]
-            .spacing(2)
-            .align_y(iced::Alignment::Start)
-            .into()
+                })
+                .on_press(press),
+            self.overview_disclosure(expanded, key),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        row.into()
     }
 
-    /// One owned checkout: branch and dirty count, then checkout, ahead and
-    /// behind its base, push state, PR when known, owner and last activity.
-    /// Opens the review pane (TRU-178): Uncommitted when dirty, else vs base.
+    /// One owned checkout on one line (TRU-208): the branch and the one
+    /// fact that needs you (dirty count, else unpushed ↑n; nothing when
+    /// clean). Its ▸ opens the checkout, ahead and behind its base, push
+    /// state, PR when known, owner and last activity. A click on the row
+    /// opens the review pane (TRU-178): Uncommitted when dirty, else vs base.
     fn view_overview_branch_row<'a>(
         &'a self,
         row: &'a overview::BranchStatus,
@@ -37072,72 +38346,105 @@ fi
         let text_muted = theme.text_muted();
         let surface0 = theme.surface0();
         let hover = theme.bg_overlay();
+        let key = overview::RowKey::Branch(row.owned.checkout.clone());
+        let expanded = self.overview_row_open(&key);
         let branch = row.owned.branch.as_deref().unwrap_or("(detached)");
-        let (dirty, dirty_color) = match &row.status {
-            Some(status) if status.files > 0 => (status.dirty_label(), theme.warning()),
-            Some(status) => (status.dirty_label(), text_muted),
-            None => ("\u{2014}".to_string(), text_muted),
+        let fact = overview::branch_fact(row.status.as_ref());
+        let fact_color = match fact {
+            Some(overview::BranchFact::Dirty(_)) => theme.warning(),
+            _ => text_muted,
         };
-        let mut parts = vec![overview::short_checkout(&row.owned, home)];
-        match (overview::vs_base_label(row), &row.base) {
-            (Some(label), _) => parts.push(label),
-            (None, None) => parts.push("no base".to_string()),
-            (None, Some(_)) => {}
+        let source = match (&row.status, &row.base) {
+            (Some(status), Some(_)) if status.files == 0 => overview::DiffSource::VsBase,
+            _ => overview::DiffSource::Uncommitted,
+        };
+        let open = Event::ReviewOpen(row.owned.checkout.clone(), source);
+        // Fixed slots: name, fact, disclosure.
+        let line = row![
+            text(overview::shorten(branch, 40))
+                .size(font_small)
+                .color(theme.text_primary())
+                .font(mono)
+                .width(Length::Fill),
+            text(
+                fact.as_ref()
+                    .map_or_else(String::new, overview::BranchFact::label)
+            )
+            .size(10)
+            .color(fact_color)
+            .font(mono),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        let mut detail = Column::new().spacing(1);
+        if expanded {
+            let mut parts = vec![overview::short_checkout(&row.owned, home)];
+            match (overview::vs_base_label(row), &row.base) {
+                (Some(label), _) => parts.push(label),
+                (None, None) => parts.push("no base".to_string()),
+                (None, Some(_)) => {}
+            }
+            if let Some(status) = &row.status {
+                parts.push(overview::push_label(status.push_state()));
+            }
+            parts.extend(row.pr_label());
+            parts.push(row.owner_label());
+            if let Some(at) = row.last_activity() {
+                parts.push(chats::format_age(at));
+            }
+            detail = detail.push(text(parts.join(" \u{00B7} ")).size(10).color(text_muted));
+            let editor_name = editor::display_name(&self.editor);
+            detail = detail.push(iced::widget::tooltip(
+                button(text("Open in editor").size(10).color(theme.accent()))
+                    .style(self.flat_button_style())
+                    .padding([0, 2])
+                    .on_press(Event::OpenEditor(row.owned.checkout.clone(), None, None)),
+                text(format!("Open in {editor_name}")).size(10),
+                iced::widget::tooltip::Position::Top,
+            ));
+            if let Some((error_path, message)) = &self.editor_error {
+                if error_path == &row.owned.checkout {
+                    detail = detail.push(text(message).size(10).color(theme.danger()));
+                }
+            }
         }
-        if let Some(status) = &row.status {
-            parts.push(overview::push_label(status.push_state()));
-        }
-        parts.extend(row.pr_label());
-        parts.push(row.owner_label());
-        if let Some(at) = row.last_activity() {
-            parts.push(chats::format_age(at));
-        }
-        let mut body = Column::new().spacing(1).push(
-            row![
-                text(overview::shorten(branch, 40))
-                    .size(font_small)
-                    .color(theme.text_primary())
-                    .font(mono)
-                    .width(Length::Fill),
-                text(dirty).size(10).color(dirty_color).font(mono),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-        );
-        body = body.push(text(parts.join(" \u{00B7} ")).size(10).color(text_muted));
+        // A read failure needs you: always shown.
         if let Some(error) = &row.error {
-            body = body.push(
+            detail = detail.push(
                 text(overview::shorten(error, 160))
                     .size(10)
                     .color(theme.danger()),
             );
         }
-        let source = match (&row.status, &row.base) {
-            (Some(status), Some(_)) if status.files == 0 => overview::DiffSource::VsBase,
-            _ => overview::DiffSource::Uncommitted,
-        };
-        button(body)
-            .width(Length::Fill)
-            .padding([4, 8])
-            .style(move |_, status| button::Style {
-                background: Some(
-                    if selected {
-                        surface0
-                    } else if matches!(status, button::Status::Hovered) {
-                        hover
-                    } else {
-                        iced::Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                border: iced::Border {
-                    radius: 6.0.into(),
+        let body = column![overview_row_content(line.into()), detail].spacing(1);
+        let row = row![
+            button(body)
+                .width(Length::Fill)
+                .padding([3, 8])
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if selected {
+                            surface0
+                        } else if matches!(status, button::Status::Hovered) {
+                            hover
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            })
-            .on_press(Event::ReviewOpen(row.owned.checkout.clone(), source))
-            .into()
+                })
+                .on_press(open),
+            self.overview_disclosure(expanded, key),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        row.into()
     }
 
     fn view_task_rail(&self) -> Element<'_, Event, Theme, iced::Renderer> {
@@ -41667,10 +42974,11 @@ fi
         .into()
     }
 
-    /// The active workspace's documents (TRU-191), newest first. Each row: title and age, then the newest copy's
-    /// source and the path within its checkout, and "N copies" (with
-    /// "copies differ") when there are more; clicking opens the newest copy
-    /// in the markdown viewer and the copies line lists each copy to open.
+    /// The active workspace's documents (TRU-191), newest first. Each row is
+    /// one line, title and age (TRU-208); its ▸ opens the newest copy's
+    /// source and the path within its checkout, and "N copies" when there
+    /// are more (always shown when they differ). Clicking opens the newest
+    /// copy in the markdown viewer; "N copies" lists each copy to open.
     /// `None` while nothing has been read or nothing was found.
     fn view_work_documents(&self) -> Option<Element<'_, Event, Theme, iced::Renderer>> {
         let theme = &self.theme;
@@ -41691,11 +42999,38 @@ fi
         };
         for doc in result.documents.iter().take(shown) {
             let newest = doc.newest();
-            let head = row![
+            let row_key = overview::RowKey::Document(doc.key.clone());
+            let expanded = self.overview_row_open(&row_key);
+            let open = self.work_document_copies_open.as_deref() == Some(doc.key.as_str());
+            // One line per document (TRU-208), its copies merged into it:
+            // "n copies" shows once opened, while listed, or when they
+            // differ.
+            let copies_slot: Element<'_, Event, Theme, iced::Renderer> =
+                if doc.copies.len() > 1 && (expanded || open || doc.differ) {
+                    let label = format!(
+                        "{} copies{} {}",
+                        doc.copies.len(),
+                        if doc.differ { " differ" } else { "" },
+                        overview::fold_marker(open)
+                    );
+                    button(text(label).size(10).color(if doc.differ {
+                        theme.yellow()
+                    } else {
+                        text_muted
+                    }))
+                    .style(self.flat_button_style())
+                    .padding([0, 4])
+                    .on_press(Event::WorkDocumentCopiesToggle(doc.key.clone()))
+                    .into()
+                } else {
+                    iced::widget::Space::new().into()
+                };
+            let head_content = row![
                 text(overview::shorten(&doc.title, 60))
                     .size(font_small)
                     .color(text_primary)
                     .width(Length::Fill),
+                copies_slot,
                 text(overview::age_label(newest.modified))
                     .size(10)
                     .color(text_muted)
@@ -41703,61 +43038,46 @@ fi
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
-            let detail = text(overview::shorten(
-                &format!("{} \u{00B7} {}", newest.source.label(), doc.rel),
-                80,
-            ))
-            .size(10)
-            .color(text_muted);
-            let mut entry = Column::new().spacing(1).push(
-                button(column![head, detail].spacing(1))
-                    .style(self.ghost_button_style())
-                    .padding([4, 6])
+            let mut detail = Column::new();
+            if expanded {
+                detail = detail.push(
+                    text(overview::shorten(
+                        &format!("{} \u{00B7} {}", newest.source.label(), doc.rel),
+                        80,
+                    ))
+                    .size(10)
+                    .color(text_muted),
+                );
+            }
+            let line =
+                button(column![overview_row_content(head_content.into()), detail].spacing(1))
+                    .style(self.flat_button_style())
+                    .padding([3, 6])
                     .width(Length::Fill)
-                    .on_press(Event::ViewFile(SourcePath::Local(newest.path.clone()))),
-            );
-            if doc.copies.len() > 1 {
-                let open = self.work_document_copies_open.as_deref() == Some(doc.key.as_str());
-                let label = format!(
-                    "{} {} copies{}",
-                    if open { "\u{25BE}" } else { "\u{25B8}" },
-                    doc.copies.len(),
-                    if doc.differ {
-                        " \u{00B7} copies differ"
-                    } else {
-                        ""
-                    }
-                );
-                entry = entry.push(
-                    button(text(label).size(10).color(if doc.differ {
-                        theme.yellow()
-                    } else {
-                        text_muted
-                    }))
-                    .style(self.ghost_button_style())
-                    .padding([1, 12])
-                    .on_press(Event::WorkDocumentCopiesToggle(doc.key.clone())),
-                );
-                if open {
-                    for (index, copy) in doc.copies.iter().enumerate() {
-                        let line = format!(
-                            "{}{} \u{00B7} {}",
-                            if index == 0 { "newest \u{00B7} " } else { "" },
-                            copy.source.label(),
-                            overview::age_label(copy.modified)
-                        );
-                        entry = entry.push(
-                            button(
-                                text(overview::shorten(&line, 70))
-                                    .size(10)
-                                    .color(theme.accent()),
-                            )
-                            .style(self.ghost_button_style())
-                            .padding([1, 18])
-                            .width(Length::Fill)
-                            .on_press(Event::ViewFile(SourcePath::Local(copy.path.clone()))),
-                        );
-                    }
+                    .on_press(Event::ViewFile(SourcePath::Local(newest.path.clone())));
+            let line = row![line, self.overview_disclosure(expanded, row_key)]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
+            let mut entry = Column::new().spacing(1).push(line);
+            if open {
+                for (index, copy) in doc.copies.iter().enumerate() {
+                    let line = format!(
+                        "{}{} \u{00B7} {}",
+                        if index == 0 { "newest \u{00B7} " } else { "" },
+                        copy.source.label(),
+                        overview::age_label(copy.modified)
+                    );
+                    entry = entry.push(
+                        button(
+                            text(overview::shorten(&line, 70))
+                                .size(10)
+                                .color(theme.accent()),
+                        )
+                        .style(self.flat_button_style())
+                        .padding([1, 18])
+                        .width(Length::Fill)
+                        .on_press(Event::ViewFile(SourcePath::Local(copy.path.clone()))),
+                    );
                 }
             }
             col = col.push(entry);
@@ -41771,7 +43091,7 @@ fi
             };
             col = col.push(
                 button(text(label).size(10).color(text_muted).font(mono))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([2, 6])
                     .on_press(Event::WorkDocumentsAllToggle),
             );
@@ -42109,11 +43429,37 @@ fi
         let ghost = self.ghost_button_style();
         let ghost2 = self.ghost_button_style();
         let ghost3 = self.ghost_button_style();
+        let editor_name = editor::display_name(&self.editor);
+        let open_editor = iced::widget::tooltip(
+            button(text("Open in editor").size(font))
+                .style(self.ghost_button_style())
+                .padding([4, 12])
+                .on_press_maybe(
+                    fv.local_source
+                        .then(|| Event::OpenEditor(fv.path.clone(), fv.line, None)),
+                ),
+            text(format!("Open in {editor_name}")).size(font_small),
+            iced::widget::tooltip::Position::Top,
+        );
+        let editor_error = self
+            .editor_error
+            .as_ref()
+            .filter(|(error_path, _)| error_path == &fv.path)
+            .map(|(_, message)| message.as_str());
+        let header_title = editor::viewer_header_title(&rel_path, editor_error);
         let header = if is_markdown || is_html || is_excalidraw {
             // Markdown header with "View in Browser" button for Mermaid support
             row![
-                text(rel_path).size(font).color(theme.text_primary()),
+                text(header_title.clone())
+                    .size(font)
+                    .color(if editor_error.is_some() {
+                        theme.danger()
+                    } else {
+                        theme.text_primary()
+                    }),
                 iced::widget::Space::new().width(Length::Fill),
+                open_editor,
+                iced::widget::Space::new().width(Length::Fixed(4.0)),
                 button(text("View in Browser").size(font))
                     .style(ghost)
                     .padding([4, 12])
@@ -42132,8 +43478,16 @@ fi
             .spacing(8)
         } else {
             row![
-                text(rel_path).size(font).color(theme.text_primary()),
+                text(header_title.clone())
+                    .size(font)
+                    .color(if editor_error.is_some() {
+                        theme.danger()
+                    } else {
+                        theme.text_primary()
+                    }),
                 iced::widget::Space::new().width(Length::Fill),
+                open_editor,
+                iced::widget::Space::new().width(Length::Fixed(4.0)),
                 button(text("Copy All").size(font))
                     .style(ghost)
                     .padding([4, 12])
@@ -45095,6 +46449,320 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    fn page_context() -> PageNavigationContext {
+        PageNavigationContext {
+            url: "https://github.com/sample-owner-a/sample-repo/pull/1".to_string(),
+            store: webview::PageDataStore::GitHub("sample-login-a".to_string()),
+            github_accounts: [
+                ("sample-owner-a".to_string(), "sample-login-a".to_string()),
+                ("sample-alias-a".to_string(), "SAMPLE-LOGIN-A".to_string()),
+                ("sample-owner-b".to_string(), "sample-login-b".to_string()),
+            ]
+            .into(),
+            linear_workspaces: [
+                "sample-workspace-a".to_string(),
+                "sample-workspace-b".to_string(),
+            ]
+            .into(),
+        }
+    }
+
+    #[test]
+    fn page_navigation_preserves_same_identity_and_reopens_changed_identities() {
+        use PageNavigationDecision::{Allow, Reopen};
+        let context = page_context();
+        for url in [
+            "https://github.com/sample-owner-a/sample-repo/pull/2",
+            "https://github.com/sample-alias-a/sample-repo",
+            "https://github.com/login?return_to=%2Fsample-owner-a",
+            "https://github.com/login/oauth/authorize",
+            "https://github.com/session",
+            "https://github.com/sessions/two-factor/app",
+            "https://github.com/settings/profile",
+            "https://github.com/logout",
+        ] {
+            assert_eq!(page_navigation_decision(url, &context), Allow, "{url}");
+        }
+        assert_eq!(
+            page_navigation_decision("https://github.com/sample-owner-b/sample-repo", &context),
+            Reopen(webview::PageDataStore::GitHub("sample-login-b".to_string())),
+        );
+        assert_eq!(
+            page_navigation_decision(
+                "https://github.com/unmapped-owner/sample-repo/pull/1",
+                &context
+            ),
+            Reopen(webview::PageDataStore::Default),
+        );
+        assert_eq!(
+            page_navigation_decision(
+                "https://linear.app/sample-workspace-a/issue/ABC-12/example",
+                &context
+            ),
+            Reopen(webview::PageDataStore::Linear(
+                "sample-workspace-a".to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn linear_navigation_uses_canonical_or_known_workspaces_and_preserves_login() {
+        use PageNavigationDecision::{Allow, External, Reopen};
+        let mut context = page_context();
+        context.url = "https://linear.app/sample-workspace-a/issue/ABC-12/example".to_string();
+        context.store = webview::PageDataStore::Linear("sample-workspace-a".to_string());
+        for url in [
+            "https://linear.app/sample-workspace-a/issue/ABC-13/example",
+            "https://linear.app/sample-workspace-a/team/example",
+            "https://linear.app/login",
+            "https://linear.app/oauth/authorize?client_id=sample",
+        ] {
+            assert_eq!(page_navigation_decision(url, &context), Allow, "{url}");
+        }
+        for url in [
+            "https://linear.app/sample-workspace-b/issue/ABC-14/example",
+            "https://linear.app/sample-workspace-b/team/example",
+        ] {
+            assert_eq!(
+                page_navigation_decision(url, &context),
+                Reopen(webview::PageDataStore::Linear(
+                    "sample-workspace-b".to_string()
+                )),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            page_navigation_decision(
+                "https://linear.app/unknown-workspace/team/example",
+                &context
+            ),
+            External
+        );
+    }
+
+    #[test]
+    fn page_navigation_routes_foreign_urls_externally_and_cancels_forbidden_schemes() {
+        use PageNavigationDecision::{Cancel, External};
+        let context = page_context();
+        for url in [
+            "https://example.test/",
+            "http://example.test/",
+            "http://github.com/login",
+            "http://github.com/session",
+            "http://linear.app/login",
+            "https://github.com.example.test/sample-owner-b/repo/pull/1",
+            "https://user@github.com/sample-owner-b/repo/pull/1",
+            "https://github.com:8443/sample-owner-b/repo/pull/1",
+            "https://github.com/explore",
+            "https://github.com/%73ample-owner-b/repo/pull/1",
+            "https://github.com//repo/pull/1",
+            "https://linear.app/%73ample-workspace-b/issue/ABC-12/example",
+        ] {
+            assert_eq!(page_navigation_decision(url, &context), External, "{url}");
+        }
+        for url in [
+            "file:///tmp/example",
+            "javascript:alert(1)",
+            "data:text/plain,example",
+            "sample-app:open",
+            "malformed",
+        ] {
+            assert_eq!(page_navigation_decision(url, &context), Cancel, "{url}");
+        }
+    }
+
+    #[test]
+    fn navigation_with_shared_os_store_does_not_reopen_in_a_loop() {
+        let destination_store =
+            webview::PageDataStore::GitHub("sample-login-b".to_string()).for_current_os();
+        let mut context = page_context();
+        context.store = destination_store;
+        assert_eq!(
+            effective_page_navigation_decision(
+                "https://github.com/sample-owner-b/sample-repo/pull/1",
+                &context
+            ),
+            PageNavigationDecision::Allow,
+        );
+    }
+
+    #[test]
+    fn allowed_navigation_refreshes_the_policy_for_the_next_destination() {
+        let mut context = page_context();
+        context.store = webview::PageDataStore::Default;
+        context.url = "https://github.com/unmapped-owner-a/sample-repo/pull/1".to_string();
+        let next = "https://github.com/unmapped-owner-b/sample-repo/pull/1";
+        assert_eq!(
+            page_navigation_decision(next, &context),
+            PageNavigationDecision::Allow
+        );
+        webview::set_page_navigation_handler(move |url| {
+            page_navigation_decision(url, &context) == PageNavigationDecision::Allow
+        });
+        // Mirrors the accepted-navigation event: refresh the policy after its URL changes.
+        let mut refreshed = page_context();
+        refreshed.store = webview::PageDataStore::Default;
+        refreshed.url = next.to_string();
+        webview::set_page_navigation_handler(move |url| {
+            page_navigation_decision(url, &refreshed) == PageNavigationDecision::Allow
+        });
+        // Exercise the policy through the live cell, just as the native callback does.
+        assert!(webview::test_page_navigation(
+            "https://github.com/unmapped-owner-b/sample-repo"
+        ));
+        webview::destroy(WebviewSurface::Page);
+    }
+
+    #[test]
+    fn stale_page_navigation_cannot_reopen_after_close_or_replacement() {
+        assert!(current_page_navigation(ViewerWebview::Page, 4, 4));
+        assert!(!current_page_navigation(ViewerWebview::Page, 5, 4));
+        assert!(!current_page_navigation(ViewerWebview::None, 4, 4));
+        assert!(!current_page_navigation(ViewerWebview::PlansViewer, 4, 4));
+    }
+
+    #[test]
+    fn workspace_content_and_console_keep_indices_and_state_across_page_changes() {
+        use iced::advanced::widget::Tree;
+        type InputState = iced::widget::text_input::State<
+            <iced::Renderer as iced::advanced::text::Renderer>::Paragraph,
+        >;
+        fn layout(page: bool, expanded: bool) -> Element<'static, Event, Theme, iced::Renderer> {
+            workspace_column(
+                text("tabs").into(),
+                page.then(|| text("page header").into()),
+                text_input("content", "").into(),
+                expanded.then(|| text("divider").into()),
+                text_input("console", "").into(),
+                text("bar").into(),
+            )
+            .into()
+        }
+        let initial = layout(false, false);
+        let mut tree = Tree::new(initial.as_widget());
+        assert_eq!(tree.children.len(), 6);
+        tree.children[2].state.downcast_mut::<InputState>().focus();
+        for (page, expanded) in [(true, false), (true, true), (false, true), (false, false)] {
+            let next = layout(page, expanded);
+            tree.diff(next.as_widget());
+            assert_eq!(tree.children.len(), 6);
+            assert!(tree.children[2]
+                .state
+                .downcast_ref::<InputState>()
+                .is_focused());
+            assert!(!tree.children[4]
+                .state
+                .downcast_ref::<InputState>()
+                .is_focused());
+        }
+    }
+
+    #[test]
+    fn every_covering_overlay_hides_page_viewer_and_agent_and_closing_restores_them() {
+        macro_rules! check_overlays {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    let mut overlays = WebviewOverlays { $field: true, ..Default::default() };
+                    for viewer in [ViewerWebview::Page, ViewerWebview::PlansViewer, ViewerWebview::None] {
+                        assert_eq!(
+                            visible_webview_surface(viewer, ActiveTabSurface::AgentChat(1), overlays.is_open()),
+                            VisibleSurface::None,
+                            stringify!($field),
+                        );
+                    }
+                    overlays.$field = false;
+                    assert!(!overlays.is_open(), stringify!($field));
+                    assert_eq!(
+                        visible_webview_surface(ViewerWebview::Page, ActiveTabSurface::AgentChat(1), overlays.is_open()),
+                        VisibleSurface::Page,
+                        stringify!($field),
+                    );
+                )+
+            }
+        }
+        check_overlays!(
+            usage,
+            browser_evidence,
+            task_switcher,
+            task_tab_close,
+            task_worktree_delete,
+            task_publish,
+            new_task,
+            help,
+            new_work,
+            park,
+            parked_list,
+            pr_action,
+            ready_list,
+            workspace_settings,
+            bar_menu,
+            tab_picker,
+            phone,
+            remote_connect,
+            folder_picker,
+        );
+    }
+
+    #[test]
+    fn pr_page_store_uses_owner_mapping_and_defaults_when_unmapped() {
+        let accounts = std::collections::BTreeMap::from([(
+            "sample-owner".to_string(),
+            "sample-login".to_string(),
+        )]);
+        assert_eq!(
+            github_page_store("SAMPLE-OWNER", &accounts),
+            webview::PageDataStore::GitHub("sample-login".to_string())
+        );
+        assert_eq!(
+            github_page_store("another-owner", &accounts),
+            webview::PageDataStore::Default
+        );
+    }
+
+    #[test]
+    fn linear_page_store_uses_issue_workspace_or_default() {
+        assert_eq!(
+            linear_page_store(Some("sample-workspace")),
+            webview::PageDataStore::Linear("sample-workspace".to_string())
+        );
+        assert_eq!(linear_page_store(None), webview::PageDataStore::Default);
+        assert_eq!(linear_page_store(Some("")), webview::PageDataStore::Default);
+    }
+
+    #[test]
+    fn claude_history_timestamps_become_turn_replay_markers() {
+        use gitterm::harness::transcript::{TimedEntry, TranscriptEntry};
+
+        let timeline = history_timeline(
+            vec![
+                TimedEntry {
+                    at: Some("2026-11-05T10:00:00Z".into()),
+                    entry: TranscriptEntry::UserPrompt("hello".into()),
+                },
+                TimedEntry {
+                    at: Some("2026-11-05T10:00:04Z".into()),
+                    entry: TranscriptEntry::Harness(HarnessEvent::TurnCompleted {
+                        status: TurnStatus::Completed,
+                        usage: serde_json::Value::Null,
+                        cost_usd: None,
+                        rate_limit: None,
+                    }),
+                },
+            ],
+            &[],
+        );
+        let markers: Vec<_> = timeline
+            .iter()
+            .filter_map(|event| match event {
+                tab::AgentEvent::Other(value) if value["kind"] == "turn_timing" => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0]["start_ms"], 1_793_872_800_000_i64);
+        assert_eq!(markers[1]["end_ms"], 1_793_872_804_000_i64);
+    }
+
     #[test]
     fn connect_form_closes_only_when_its_saved_host_connects() {
         let unsaved = RemoteConnectForm::default();
@@ -45120,6 +46788,67 @@ mod tests {
         assert_eq!(clamp_hint_center(995.0, 100.0, 1000.0), 946.0);
         // A page narrower than the bubble centres it.
         assert_eq!(clamp_hint_center(10.0, 100.0, 80.0), 40.0);
+    }
+
+    #[test]
+    fn overview_disclosure_reserves_a_fixed_width_slot() {
+        assert_eq!(OVERVIEW_DISCLOSURE_WIDTH, 24.0);
+    }
+
+    #[test]
+    fn overview_rows_keep_fill_content_and_disclosure_as_fixed_siblings() {
+        let content = overview_row_content(text("long metadata".repeat(30)).into());
+        assert_eq!(content.as_widget().size_hint().width, Length::Fill);
+
+        let disclosure = button(text("▸")).width(Length::Fixed(OVERVIEW_DISCLOSURE_WIDTH));
+        let row: Element<'_, Event, Theme, iced::Renderer> =
+            row![content, disclosure].width(Length::Fixed(212.0)).into();
+        assert_eq!(row.as_widget().size_hint().width, Length::Fixed(212.0));
+        assert_eq!(row.as_widget().children().len(), 2);
+    }
+
+    #[test]
+    fn stopped_workspaces_do_not_accumulate_overview_presentations() {
+        let mut presentations = HashMap::<u64, WorkspaceOverviewPresentation>::new();
+        let row = overview::RowKey::Repo(PathBuf::from("/tmp/repo"));
+
+        for uid in 1..=100 {
+            let presentation = presentations.entry(uid).or_default();
+            overview::toggle_row(&mut presentation.open_rows, row.clone());
+            assert!(presentation.open_rows.contains(&row));
+
+            remove_workspace_overview_presentation(&mut presentations, uid);
+            assert!(!presentations.contains_key(&uid));
+            assert!(presentations.is_empty());
+        }
+
+        // Keep-running parking retains the Workspace and therefore its map entry.
+        presentations.entry(101).or_default().documents_open = true;
+        assert!(presentations[&101].documents_open);
+    }
+
+    #[test]
+    fn overview_row_and_section_folds_are_per_workspace() {
+        let shared_summary_key = OverviewKey::Folder(PathBuf::from("/same/folder"));
+        assert_eq!(
+            shared_summary_key,
+            OverviewKey::Folder(PathBuf::from("/same/folder"))
+        );
+
+        let row = overview::RowKey::Repo(PathBuf::from("/same/folder/repo"));
+        let mut presentations = HashMap::<u64, WorkspaceOverviewPresentation>::new();
+        let first = presentations.entry(101).or_default();
+        overview::toggle_row(&mut first.open_rows, row.clone());
+        first.documents_open = true;
+
+        assert!(presentations[&101].open_rows.contains(&row));
+        assert!(presentations[&101].documents_open);
+        assert!(!presentations
+            .entry(202)
+            .or_default()
+            .open_rows
+            .contains(&row));
+        assert!(!presentations[&202].documents_open);
     }
 
     #[test]
@@ -47704,10 +49433,11 @@ mod tests {
     }
 
     #[test]
-    fn viewer_surface_wins_over_agent_chat() {
+    fn viewer_or_page_surface_wins_over_agent_chat() {
         for viewer in [
             ViewerWebview::File,
             ViewerWebview::PlansViewer,
+            ViewerWebview::Page,
             ViewerWebview::Review,
         ] {
             for active in [
@@ -47717,7 +49447,11 @@ mod tests {
             ] {
                 assert_eq!(
                     visible_webview_surface(viewer, active, false),
-                    VisibleSurface::Viewer,
+                    if viewer == ViewerWebview::Page {
+                        VisibleSurface::Page
+                    } else {
+                        VisibleSurface::Viewer
+                    },
                     "viewer={viewer:?} active={active:?}"
                 );
             }
@@ -47746,11 +49480,24 @@ mod tests {
     }
 
     #[test]
+    fn closing_viewer_page_restores_agent_chat_surface() {
+        assert_eq!(
+            visible_webview_surface(ViewerWebview::Page, ActiveTabSurface::AgentChat(3), false),
+            VisibleSurface::Page
+        );
+        assert_eq!(
+            visible_webview_surface(ViewerWebview::None, ActiveTabSurface::AgentChat(3), false),
+            VisibleSurface::AgentChat(3)
+        );
+    }
+
+    #[test]
     fn attention_view_hides_every_surface() {
         for viewer in [
             ViewerWebview::None,
             ViewerWebview::File,
             ViewerWebview::PlansViewer,
+            ViewerWebview::Page,
             ViewerWebview::Review,
         ] {
             assert_eq!(

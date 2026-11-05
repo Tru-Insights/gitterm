@@ -268,6 +268,14 @@ impl HarnessSession {
             Self::Acp(session) => session.send(command),
         }
     }
+
+    /// The running local `claude` process of a Claude chat (TRU-212).
+    pub fn claude_pid(&self) -> Option<u32> {
+        match self {
+            Self::Claude(session) => session.local_pid(),
+            Self::Acp(_) => None,
+        }
+    }
 }
 
 /// The human's answer to a `RuntimeRequest`.

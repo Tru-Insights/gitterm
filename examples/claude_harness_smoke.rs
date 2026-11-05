@@ -200,6 +200,7 @@ async fn main() {
         mcp_servers: Vec::new(),
         chrome: false,
         guidelines_file: None,
+        guidelines_content: None,
     });
     let mut failures = Vec::new();
     let mut check = |name: &str, ok: bool, detail: String| {
@@ -939,6 +940,7 @@ async fn review_scenario(workdir: &Path) {
         mcp_servers: Vec::new(),
         chrome: false,
         guidelines_file: None,
+        guidelines_content: None,
     });
     let mut failures = Vec::new();
     let mut check = |name: &str, ok: bool, detail: String| {

@@ -269,6 +269,7 @@ async fn main() {
         env: Vec::new(),
         support_dir: workdir.with_extension("support"),
         wire_log_dir: Some(workdir.with_extension("wire")),
+        guidelines: None,
     };
 
     let key_present = std::process::Command::new("/usr/bin/security")

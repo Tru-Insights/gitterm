@@ -1177,6 +1177,7 @@ mod tests {
                 mcp_servers: Vec::new(),
                 chrome: false,
                 guidelines_file: None,
+                guidelines_content: None,
             },
             None,
         );

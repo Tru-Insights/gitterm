@@ -27,6 +27,10 @@
     --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   * { box-sizing: border-box; }
+  .html-render { margin: 10px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg); }
+  .html-render-bar { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; color: var(--fg-muted); }
+  .html-render.expanded { position: fixed; inset: 8px; margin: 0; z-index: 1000; display: flex; flex-direction: column; box-shadow: 0 0 0 12px var(--bg); }
+  .html-render.expanded iframe { flex: 1; min-height: 0; height: 100% !important; }
   html, body {
     margin: 0;
     padding: 0;
@@ -745,7 +749,52 @@
   }
   function postIpc(payload) {
     if (!window.ipc || typeof window.ipc.postMessage !== 'function') return;
-    window.ipc.postMessage(JSON.stringify(Object.assign({}, payload, { tabId: window.__currentTabId })));
+    const message = JSON.stringify(Object.assign({}, payload, { tabId: window.__currentTabId }));
+    if (typeof window.__gittermNativePost === 'function') window.__gittermNativePost(message);
+    else window.ipc.postMessage(message); // phone transport
+  }
+
+  // Visuals are reconstructed from successful tool calls already persisted
+  // in the conversation, including their full (untruncated) HTML results.
+  const htmlRenders = new Set();
+  let appearance = 'dark';
+  window.__setAppearance = (value) => {
+    appearance = value === 'light' ? 'light' : 'dark';
+    for (const render of htmlRenders) render.setTheme(appearance);
+  };
+  function showHtmlRender(item, output) {
+    // Claude's MCP prefix, Gemini's FQN, OpenCode's server_tool name, and
+    // the unprefixed MCP name. Arbitrary tool/file output is never published.
+    if (item.render || !['html_render', 'mcp__gitterm_tasks__html_render', 'mcp_gitterm-tasks_html_render', 'gitterm_tasks_html_render'].includes(item.name) || typeof output !== 'string') return;
+    let result;
+    try { result = JSON.parse(output); } catch (_) { return; }
+    const input = result && result.html_render;
+    if (!input || !GitTermHtml.valid(input.html, input.height)) return;
+    // Browser/phone pages do not have the native subframe navigation policy.
+    if (typeof window.__gittermNativePost !== 'function' || window.__gittermCanRenderHtml !== true) {
+      item.render = append(el('div', 'html-render', 'Visual reply available in GitTerm for macOS.'));
+      return;
+    }
+    endSegment(); endThinking();
+    const block = append(el('section', 'html-render'));
+    block.setAttribute('aria-label', 'Visual reply');
+    const bar = block.appendChild(el('div', 'html-render-bar'));
+    bar.appendChild(el('span', null, 'Visual reply'));
+    const expand = bar.appendChild(el('button', null, 'Expand'));
+    expand.type = 'button';
+    expand.setAttribute('aria-expanded', 'false');
+    const collapse = () => { block.classList.remove('expanded'); expand.textContent = 'Expand'; expand.setAttribute('aria-expanded', 'false'); expand.focus(); };
+    const render = GitTermHtml.create(input.html, input.height, appearance, (url) => postIpc({ type: 'open_url', url }), collapse);
+    htmlRenders.add(render);
+    item.render = block;
+    block.appendChild(render.frame);
+    expand.addEventListener('click', () => {
+      const expanded = block.classList.toggle('expanded');
+      expand.textContent = expanded ? 'Close expanded view' : 'Expand';
+      expand.setAttribute('aria-expanded', String(expanded));
+    });
+    block.addEventListener('keydown', (e) => { if (e.key === 'Escape') collapse(); });
+    scrollIfFollowing();
   }
 
   // ---- V5 conversation pickup (TRU-183) ----------------------------------
@@ -825,9 +874,9 @@
     trimWindow();
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
-  function append(node) {
+  function append(node, atMs = null) {
     messagesEl.appendChild(node);
-    if (turn) turn.blocks.push({ node, at: replaying ? null : Date.now() });
+    if (turn) turn.blocks.push({ node, at: atMs != null ? atMs : (replaying ? null : Date.now()) });
     scrollIfFollowing();
     return node;
   }
@@ -929,11 +978,17 @@
   // line that opens to the cards. A message sent mid-turn ends one fold and
   // starts the next. What needs the human never folds: error blocks,
   // delegation cards, warnings, a running subagent's card and a card whose
-  // request still waits. A running turn shows its work live. A replay folds
-  // as live did, from the same events; it carries no turn times, so its
-  // rows read "Worked". Folds start closed and are not remembered.
+  // request still waits. A running turn shows its work live. Replay timing
+  // markers preserve durations; old conversations without markers keep the
+  // "Worked" label. Folds start closed and are not remembered.
   function beginTurn() {
-    turn = { startMs: replaying ? null : Date.now(), blocks: [] };
+    turn = { startMs: replaying ? null : Date.now(), nextPromptAtMs: null, blocks: [] };
+  }
+  function turnTiming(event) {
+    if (!turn) return;
+    if (typeof event.start_ms === 'number') turn.startMs = event.start_ms;
+    if (typeof event.end_ms === 'number') turn.endMs = event.end_ms;
+    if (typeof event.split_ms === 'number') turn.nextPromptAtMs = event.split_ms;
   }
   // The turn ended: fold it (`fold`), or leave it as it is (a pi turn, a
   // prompt that was never sent).
@@ -941,7 +996,7 @@
     const t = turn;
     turn = null;
     if (!t || !fold) return;
-    keepView(() => foldTurn(t, replaying ? null : Date.now()));
+    keepView(() => foldTurn(t, t.endMs != null ? t.endMs : (replaying ? null : Date.now())));
   }
   // Run `change` to the timeline without moving what the human reads: a
   // view following the latest stays at the bottom; one scrolled back keeps
@@ -989,7 +1044,7 @@
   }
   const WORK = 'details.tool, details.thinking';
   function keepsOutOfFold(node) {
-    if (node.matches('.error-block, .dlg, .note.warn')) return true;
+    if (node.matches('.error-block, .dlg, .note.warn, .html-render')) return true;
     if (!node.matches('details.tool')) return false;
     if (node.classList.contains('error')) return true;
     const id = node.dataset.toolId;
@@ -1480,6 +1535,7 @@
     item.outputEl = item.body.appendChild(el('pre', isError ? 'err' : null, text));
     item.badge.textContent = '';
     item.done = { output: output || '', isError: !!isError };
+    if (!isError) showHtmlRender(item, output);
     markWrite(item);
     item.card.open = false;
     // A foreground subagent is done when its Agent call returns, even if
@@ -2180,14 +2236,19 @@
     checkoutBtn.classList.toggle('locked', !!c.locked);
     setChip(checkoutBtn, 'folder', c.label + (chips.checkoutPending != null ? '…' : ''));
     checkoutBtn.title = (c.path || '') + (c.locked ? '\n' + (c.reason || 'Set when the chat started; start a new chat to change it') : '\nWhere this chat runs');
-    if (c.locked) { checkoutMenuEl.classList.remove('visible'); return; }
     checkoutMenuEl.innerHTML = '';
-    checkoutMenuEl.appendChild(el('div', 'hint', 'Run this chat in'));
-    for (const choice of (c.choices || [])) {
-      const current = choice.path === c.path;
-      menuItem(checkoutMenuEl, current ? '✓' : (choice.path === chips.checkoutPending ? '…' : ''),
-        choice.label, choice.detail || '', () => requestCheckout(choice.path));
+    if (!c.locked) {
+      checkoutMenuEl.appendChild(el('div', 'hint', 'Run this chat in'));
+      for (const choice of (c.choices || [])) {
+        const current = choice.path === c.path;
+        menuItem(checkoutMenuEl, current ? '✓' : (choice.path === chips.checkoutPending ? '…' : ''),
+          choice.label, choice.detail || '', () => requestCheckout(choice.path));
+      }
     }
+    menuItem(checkoutMenuEl, '', 'Open in editor', 'Open this checkout folder', () => {
+      postIpc({ type: 'open_checkout', path: c.path });
+      checkoutMenuEl.classList.remove('visible');
+    });
   }
   function renderChips() { renderModel(); renderEffort(); renderCheckout(); }
   function resetComposerChips(composer) {
@@ -2258,9 +2319,8 @@
   modelBtn.addEventListener('click', (e) => toggleChipMenu(modelMenuEl, e));
   effortBtn.addEventListener('click', (e) => toggleChipMenu(effortMenuEl, e));
   checkoutBtn.addEventListener('click', (e) => {
-    if (chips.checkout && chips.checkout.locked) { e.stopPropagation(); return; }
     // Task worktrees come and go; ask for fresh choices while it is open.
-    if (toggleChipMenu(checkoutMenuEl, e)) postIpc({ type: 'checkout_context' });
+    if (toggleChipMenu(checkoutMenuEl, e) && !(chips.checkout && chips.checkout.locked)) postIpc({ type: 'checkout_context' });
   });
   for (const m of CHIP_MENUS) m.addEventListener('click', (e) => e.stopPropagation());
   document.addEventListener('click', () => closeChipMenus(null));
@@ -2588,7 +2648,7 @@
   function openFinding(f) {
     // Opens the file viewer over the chat (line numbers are shown, the view
     // does not scroll to the line).
-    postIpc({ type: 'open_file', path: f.file });
+    postIpc({ type: 'open_file', path: f.file, line: f.line_start || null });
   }
   function renderCard(card) {
     const d = card.data;
@@ -2623,14 +2683,14 @@
       open.title = (card.worker && card.worker.tab_open) ? 'Switch to the worker\'s terminal tab' : 'The worker tab is not open';
       open.addEventListener('click', () => postIpc({ type: 'delegation_open_worker', delegationId: d.delegation_id }));
     }
-    const sendable = st === 'completed' || (worker && st === 'blocked');
-    if (sendable && !dismissed) {
+    const sendable = st === 'completed' || st === 'failed' || (worker && st === 'blocked');
+    if (sendable && (d.delivered || d.delivered_at)) {
+      actions.appendChild(el('span', 'dlg-note', 'sent to chat ✓'));
+      card.sendBtn = null;
+    } else if (sendable && !dismissed) {
       const send = actions.appendChild(el('button', 'primary', 'Send to Claude'));
       card.sendBtn = send;
-      if (d.delivered_at) {
-        send.textContent = 'Sent to Claude';
-        send.disabled = true;
-      } else if (card.held) {
+      if (card.held) {
         send.textContent = 'Queued, sends when Claude finishes';
         send.disabled = true;
       } else {
@@ -2675,7 +2735,7 @@
         const box = li.appendChild(el('input'));
         box.type = 'checkbox';
         box.checked = card.selected.has(finding.id);
-        box.disabled = !!d.delivered_at;
+        box.disabled = !!(d.delivered || d.delivered_at);
         box.addEventListener('change', () => {
           if (box.checked) card.selected.add(finding.id); else card.selected.delete(finding.id);
           refreshCardSend(card);
@@ -2712,7 +2772,7 @@
   function refreshCardSend(card) {
     const btn = card.sendBtn;
     const d = card.data;
-    if (!btn || !d || d.delivered_at || card.held) return;
+    if (!btn || !d || d.delivered || d.delivered_at || card.held) return;
     const f = findingsOf(d);
     const none = f && f.findings.length > 0 && card.selected && card.selected.size === 0;
     btn.disabled = !!none;
@@ -2806,6 +2866,101 @@
       what, meta, target: card.root, live, time: created, seq: card.seq,
     };
   }
+  // ---- codex exec runs (TRU-212) ----
+  // `codex exec` runs this chat started outside GitTerm's tools (a Bash
+  // `codex exec …`). Rust polls the chat's process tree and sends
+  // {"kind":"codex_exec", run} every 5 s while a run lives and once when
+  // it ends. Live only: nothing is in the conversation, so a rebuilt page
+  // gets running runs back on the next poll. GitTerm only watches them.
+  const execRuns = new Map(); // run key -> card
+  function execStateText(card) {
+    const r = card.data;
+    if (r.state === 'running') return 'running ' + fmtClock(Date.now() - r.started_at_ms);
+    return 'finished · ' + fmtDur(Math.max(0, (r.ended_at_ms || Date.now()) - r.started_at_ms));
+  }
+  function execSubName(sub) { return sub.nickname || sub.agent_path || 'subagent'; }
+  function newExecCard(key) {
+    endSegment(); endThinking();
+    const root = el('details', 'dlg exec running');
+    root.dataset.execRun = key;
+    const summary = root.appendChild(el('summary'));
+    const card = {
+      key, root, data: null, shown: null,
+      kindEl: summary.appendChild(el('span', 'dlg-kind', 'Codex (exec)')),
+      whatEl: summary.appendChild(el('span', 'dlg-what')),
+      stateEl: summary.appendChild(el('span', 'dlg-state')),
+      body: root.appendChild(el('div', 'dlg-body')),
+      seq: ++rosterSeq,
+    };
+    execRuns.set(key, card);
+    append(root);
+    return card;
+  }
+  function renderExecCard(card) {
+    const r = card.data;
+    card.root.className = 'dlg exec ' + (r.state === 'running' ? 'running' : 'done');
+    setText(card.kindEl, 'Codex (exec)' + (r.model ? ' · ' + r.model : ''));
+    setText(card.whatEl, r.checkout ? 'in ' + r.checkout : 'working folder unknown');
+    setText(card.stateEl, execStateText(card));
+    // The body changes only when the run's record does (not every poll).
+    const shown = JSON.stringify(r);
+    if (card.shown === shown) return;
+    card.shown = shown;
+    const body = card.body;
+    body.innerHTML = '';
+    body.appendChild(el('div', 'dlg-line', "Started outside GitTerm's tools (codex exec in a shell). GitTerm only shows it: it cannot stop or adopt this run."));
+    body.appendChild(el('div', 'dlg-path', 'cwd ' + (r.cwd || 'unknown')));
+    for (const dir of r.add_dirs || []) body.appendChild(el('div', 'dlg-path', 'add-dir ' + dir));
+    body.appendChild(el('div', 'dlg-path', 'PID ' + r.pid + (r.sandbox ? ' · sandbox ' + r.sandbox : '') + (r.cli_version ? ' · codex ' + r.cli_version : '')));
+    body.appendChild(el('div', 'dlg-path', r.rollout_path ? 'rollout ' + r.rollout_path : 'rollout not found yet'));
+    if (r.activity) {
+      const a = body.appendChild(el('div', 'dlg-activity', 'Latest: ' + r.activity.text));
+      a.title = r.activity.text;
+    }
+    if ((r.subagents || []).length) {
+      body.appendChild(el('div', 'dlg-section', 'Subagents'));
+      for (const sub of r.subagents) {
+        const line = body.appendChild(el('div', 'dlg-activity',
+          '↳ ' + execSubName(sub) + (sub.nickname && sub.agent_path ? ' (' + sub.agent_path + ')' : '') +
+          ' · ' + sub.state + (sub.activity ? ' — ' + sub.activity.text : '')));
+        line.title = sub.rollout_path;
+      }
+    }
+  }
+  function codexExecEvent(ev) {
+    const r = ev.run;
+    if (!r || !r.key) { console.warn('codex_exec event without a run', ev); return; }
+    const card = execRuns.get(r.key) || newExecCard(r.key);
+    card.data = r;
+    renderExecCard(card);
+    renderRoster();
+  }
+  function execRows(card) {
+    const r = card.data;
+    const running = r.state === 'running';
+    const key = 'cx:' + card.key;
+    const rows = [{
+      key,
+      cls: running ? 'running' : 'done',
+      name: 'Codex (exec)' + (r.model ? ' · ' + r.model : ''),
+      what: (running ? 'running' : 'finished') + (r.checkout ? ' · in ' + r.checkout : '') + (r.activity ? ' — ' + r.activity.text : ''),
+      meta: fmtDur(Math.max(0, (running ? Date.now() : (r.ended_at_ms || Date.now())) - r.started_at_ms)),
+      target: card.root, live: running, time: r.started_at_ms, seq: card.seq,
+    }];
+    for (const sub of r.subagents || []) {
+      const subRunning = sub.state === 'running';
+      rows.push({
+        key: key + ':' + sub.thread_id,
+        under: key,
+        cls: subRunning ? 'running' : 'done',
+        name: '↳ ' + execSubName(sub),
+        what: (sub.nickname && sub.agent_path ? sub.agent_path + ' · ' : '') + sub.state + (sub.activity ? ' — ' + sub.activity.text : ''),
+        meta: '',
+        target: card.root, live: subRunning, time: r.started_at_ms, seq: card.seq,
+      });
+    }
+    return rows;
+  }
   // Finished subagents read back after a restart: the latest few stay so
   // the roster reads as it did before; older ones are history.
   const ROSTER_REPLAYED_SUBAGENTS = 10;
@@ -2819,18 +2974,28 @@
     }
     for (const card of cards.values()) {
       const d = card.data;
-      if (!d || d.dismissed_at || d.delivered_at) continue;
+      if (!d || d.dismissed_at || d.delivered || d.delivered_at) continue;
       rows.push(delegationRow(card));
     }
+    for (const card of execRuns.values()) if (card.data) rows.push(...execRows(card));
     // Running rows first, then newest first: by start time, or by when
     // the row appeared when a start is unknown.
     const newest = (a, b) => {
       if (a.time != null && b.time != null && a.time !== b.time) return b.time - a.time;
       return b.seq - a.seq;
     };
-    return rows
+    const sorted = rows
       .filter((row) => !rosterHidden.has(row.key))
       .sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0) || newest(a, b));
+    // A run's subagent rows follow their run's row, in their own order,
+    // and go when it is hidden.
+    const top = sorted.filter((row) => !row.under);
+    const out = [];
+    for (const row of top) {
+      out.push(row);
+      for (const child of rows) if (child.under === row.key && !rosterHidden.has(child.key)) out.push(child);
+    }
+    return out;
   }
   // Row elements by key, updated in place. The roster re-renders every
   // second while anything runs and on every subagent event; rebuilding the
@@ -2898,6 +3063,7 @@
     if ((live || anyRunningCard) && !rosterTimer) {
       rosterTimer = setInterval(() => {
         for (const card of cards.values()) if (card.data && state(card.data) === 'running') card.stateEl.textContent = stateText(card);
+        for (const card of execRuns.values()) if (card.data && card.data.state === 'running') setText(card.stateEl, execStateText(card));
         renderRoster();
       }, 1000);
     } else if (!live && !anyRunningCard && rosterTimer) {
@@ -2906,6 +3072,7 @@
   }
   function resetDelegations() {
     cards.clear();
+    execRuns.clear();
     subagents.length = 0;
     rosterHidden.clear();
     if (rosterTimer) { clearInterval(rosterTimer); rosterTimer = null; }
@@ -2924,6 +3091,13 @@
     if (key.startsWith('dlg:')) {
       const card = cards.get(key.slice(4));
       return card && card.data ? delegationRow(card) : null;
+    }
+    if (key.startsWith('cx:')) {
+      for (const card of execRuns.values()) {
+        if (!card.data) continue;
+        const row = execRows(card).find((r) => r.key === key);
+        if (row) return row;
+      }
     }
     return null;
   }
@@ -3390,7 +3564,9 @@
     // (and its activity clock) carries on.
     const isQueued = event.queued === true && id != null;
     if (isQueued) markQueued(msg, id);
-    append(msg);
+    const atMs = turn ? turn.nextPromptAtMs : null;
+    if (turn) turn.nextPromptAtMs = null;
+    append(msg, atMs);
     follow = true;
     if (isQueued && busy) return;
     beginTurn();
@@ -3419,7 +3595,9 @@
       if (event.kind === 'harness') { harnessEvent(event.event); return; }
       if (event.kind === 'delegation_anchor') { delegationAnchor(event.delegation_id); return; }
       if (event.kind === 'subagent_started_at') { subagentStartedAt(event.id, event.at_ms); return; }
+      if (event.kind === 'turn_timing') { turnTiming(event); return; }
       if (event.kind === 'delegation') { delegationEvent(event); return; }
+      if (event.kind === 'codex_exec') { codexExecEvent(event); return; }
       if (event.type === 'user_prompt') { showUserPrompt(event); return; }
       legacyEvent(event);
     } catch (e) {
@@ -3464,6 +3642,8 @@
   };
 
   window.__resetConversation = function () {
+    for (const render of htmlRenders) render.dispose();
+    htmlRenders.clear();
     messagesEl.innerHTML = '';
     resetWindow();
     segment = null; thinking = null; turn = null;

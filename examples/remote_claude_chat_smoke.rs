@@ -125,6 +125,7 @@ async fn main() {
             mcp_servers: Vec::new(),
             chrome: false,
             guidelines_file: None,
+            guidelines_content: None,
         },
     );
 

@@ -2228,6 +2228,112 @@ pub fn push_label(state: PushState) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Work sidebar lines (TRU-208): one line per thing, showing only what needs
+// you; the rest waits for hover or a fold.
+
+/// The one fact a branch's line shows. Clean and pushed shows nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchFact {
+    /// Uncommitted changes: "3 dirty", "5000+ dirty".
+    Dirty(String),
+    /// Commits the upstream lacks: "↑2".
+    Unpushed(u32),
+}
+
+impl BranchFact {
+    pub fn label(&self) -> String {
+        match self {
+            BranchFact::Dirty(label) => label.clone(),
+            BranchFact::Unpushed(n) => format!("\u{2191}{n}"),
+        }
+    }
+}
+
+/// What a branch's line says: dirty files first, else commits not pushed
+/// to its upstream, else nothing (also while it was never read). The
+/// upstream's absence and the rest wait for hover.
+pub fn branch_fact(status: Option<&StatusCounts>) -> Option<BranchFact> {
+    let status = status?;
+    if status.files > 0 {
+        return Some(BranchFact::Dirty(status.dirty_label()));
+    }
+    match status.push_state() {
+        PushState::Unpushed(n) if n > 0 => Some(BranchFact::Unpushed(n)),
+        _ => None,
+    }
+}
+
+/// The right side of a repo's line: "home · 348 edits", or for a repo
+/// with no branch rows the note that would have been a second line
+/// ("home · no edits", "12 edits · no live checkout of this work").
+pub fn repo_facts(home: bool, edits: Option<u64>, empty_note: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if home {
+        parts.push("home".to_string());
+    }
+    match (edits, empty_note) {
+        (Some(edits), note) => {
+            parts.push(format!("{edits} edits"));
+            parts.extend(note.map(str::to_string));
+        }
+        (None, Some(_)) => parts.push("no edits".to_string()),
+        (None, None) => {}
+    }
+    parts.join(" \u{00B7} ")
+}
+
+/// "skills 2 · MCPs 1 · hooks 0", or `None` when all three are 0.
+pub fn agent_config_line(skills: usize, mcps: usize, hooks: usize) -> Option<String> {
+    (skills + mcps + hooks > 0)
+        .then(|| format!("skills {skills} \u{00B7} MCPs {mcps} \u{00B7} hooks {hooks}"))
+}
+
+/// The rows a fold shows: all of them open, none folded.
+pub fn fold_rows<T>(items: &[T], open: bool) -> &[T] {
+    if open {
+        items
+    } else {
+        &[]
+    }
+}
+
+/// The marker after a fold's count: "▾" open, "▸" folded.
+pub fn fold_marker(open: bool) -> &'static str {
+    if open {
+        "\u{25BE}"
+    } else {
+        "\u{25B8}"
+    }
+}
+
+/// A Work sidebar row whose detail and actions can be opened with its
+/// ▸ / ▾ disclosure (TRU-208). Hover never opens anything.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RowKey {
+    /// A PR row, by PR id.
+    Pr(String),
+    /// A repo's line, by its folder.
+    Repo(PathBuf),
+    /// A branch row, by its checkout.
+    Branch(PathBuf),
+    /// A chat row, by chat id.
+    Chat(String),
+    /// A document row, by its key.
+    Document(String),
+}
+
+/// Opens `key` in one workspace's set of open rows, or closes it when it
+/// was open; returns whether it is open now. Other rows stay as they are.
+pub fn toggle_row(open: &mut HashSet<RowKey>, key: RowKey) -> bool {
+    if open.remove(&key) {
+        false
+    } else {
+        open.insert(key);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3555,5 +3661,106 @@ mod tests {
         assert_eq!(groups[3].edits, Some(2));
         assert_eq!(groups[4].edits, None);
         assert_eq!(groups[4].rows.len(), 1);
+    }
+
+    fn counts(upstream: Option<(u32, u32)>, files: usize) -> StatusCounts {
+        StatusCounts {
+            head: Some("feature".into()),
+            upstream: upstream.map(|_| "origin/feature".to_string()),
+            upstream_ab: upstream,
+            files,
+            ..StatusCounts::default()
+        }
+    }
+
+    #[test]
+    fn a_branch_line_shows_dirty_first_then_unpushed_and_nothing_when_clean() {
+        let dirty_and_ahead = counts(Some((2, 0)), 3);
+        assert_eq!(
+            branch_fact(Some(&dirty_and_ahead)),
+            Some(BranchFact::Dirty("3 dirty".into()))
+        );
+        let ahead = counts(Some((2, 1)), 0);
+        assert_eq!(branch_fact(Some(&ahead)), Some(BranchFact::Unpushed(2)));
+        assert_eq!(BranchFact::Unpushed(2).label(), "\u{2191}2");
+        let clean = counts(Some((0, 4)), 0);
+        assert_eq!(branch_fact(Some(&clean)), None);
+        // No upstream, a gone upstream or no read yet: nothing on the line.
+        assert_eq!(branch_fact(Some(&counts(None, 0))), None);
+        let mut gone = counts(None, 0);
+        gone.upstream = Some("origin/feature".into());
+        assert_eq!(branch_fact(Some(&gone)), None);
+        assert_eq!(branch_fact(None), None);
+    }
+
+    #[test]
+    fn a_repo_with_nothing_going_on_says_so_on_its_one_line() {
+        assert_eq!(
+            repo_facts(true, None, Some("no edits yet")),
+            "home \u{00B7} no edits"
+        );
+        assert_eq!(repo_facts(false, Some(348), None), "348 edits");
+        assert_eq!(
+            repo_facts(false, Some(12), Some("no live checkout of this work")),
+            "12 edits \u{00B7} no live checkout of this work"
+        );
+        assert_eq!(repo_facts(false, None, None), "");
+    }
+
+    #[test]
+    fn the_agent_config_line_hides_when_all_are_zero() {
+        assert_eq!(agent_config_line(0, 0, 0), None);
+        assert_eq!(
+            agent_config_line(0, 1, 0).as_deref(),
+            Some("skills 0 \u{00B7} MCPs 1 \u{00B7} hooks 0")
+        );
+    }
+
+    #[test]
+    fn a_folded_section_hides_its_rows() {
+        let docs = ["a", "b", "c"];
+        assert!(fold_rows(&docs, false).is_empty());
+        assert_eq!(fold_rows(&docs, true), &docs);
+        assert_eq!(fold_marker(false), "\u{25B8}");
+        assert_eq!(fold_marker(true), "\u{25BE}");
+    }
+
+    #[test]
+    fn a_row_opens_and_closes_on_its_toggle() {
+        let mut open = HashSet::new();
+        let branch = RowKey::Branch(PathBuf::from("/r/a-wt"));
+        assert!(toggle_row(&mut open, branch.clone()));
+        assert!(open.contains(&branch));
+        assert!(!toggle_row(&mut open, branch.clone()));
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn several_rows_stay_open_together() {
+        let mut open = HashSet::new();
+        toggle_row(&mut open, RowKey::Pr("o/r#1".into()));
+        toggle_row(&mut open, RowKey::Chat("c1".into()));
+        toggle_row(&mut open, RowKey::Repo(PathBuf::from("/r/a")));
+        assert_eq!(open.len(), 3);
+        // Closing one leaves the others open.
+        toggle_row(&mut open, RowKey::Chat("c1".into()));
+        assert!(open.contains(&RowKey::Pr("o/r#1".into())));
+        assert!(open.contains(&RowKey::Repo(PathBuf::from("/r/a"))));
+        assert!(!open.contains(&RowKey::Chat("c1".into())));
+    }
+
+    #[test]
+    fn open_rows_are_kept_per_workspace() {
+        let mut by_workspace: HashMap<&str, HashSet<RowKey>> = HashMap::new();
+        let doc = RowKey::Document("plan.md".into());
+        toggle_row(by_workspace.entry("one").or_default(), doc.clone());
+        assert!(by_workspace["one"].contains(&doc));
+        assert!(by_workspace
+            .get("two")
+            .is_none_or(|open| !open.contains(&doc)));
+        toggle_row(by_workspace.entry("two").or_default(), doc.clone());
+        toggle_row(by_workspace.entry("one").or_default(), doc.clone());
+        assert!(!by_workspace["one"].contains(&doc));
+        assert!(by_workspace["two"].contains(&doc));
     }
 }

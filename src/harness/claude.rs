@@ -946,10 +946,17 @@ pub struct ClaudeSessionConfig {
     /// prompt with `--append-system-prompt-file`. The caller checks the
     /// file is readable: a missing one makes the CLI refuse to start.
     pub guidelines_file: Option<PathBuf>,
+    /// Remote-start guidelines supplied by the desktop. Written to a
+    /// temporary file for the Claude process lifetime on the agent.
+    pub guidelines_content: Option<String>,
 }
 
 impl ClaudeSessionConfig {
     pub fn args(&self) -> Vec<String> {
+        self.args_with_guidelines_file(self.guidelines_file.as_deref())
+    }
+
+    fn args_with_guidelines_file(&self, guidelines_file: Option<&Path>) -> Vec<String> {
         let mut args: Vec<String> = [
             "--output-format",
             "stream-json",
@@ -976,7 +983,7 @@ impl ClaudeSessionConfig {
             args.push("--effort".into());
             args.push(effort.clone());
         }
-        if let Some(path) = &self.guidelines_file {
+        if let Some(path) = guidelines_file {
             args.push("--append-system-prompt-file".into());
             args.push(path.to_string_lossy().into_owned());
         }
@@ -1001,6 +1008,44 @@ pub fn chrome_flag(chrome: bool) -> &'static str {
         "--chrome"
     } else {
         "--no-chrome"
+    }
+}
+
+struct RemoteGuidelinesFile(PathBuf);
+
+impl RemoteGuidelinesFile {
+    fn create(text: &str) -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!(
+            "gitterm-v6-remote-guidelines-{}.md",
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("create {}: {error}", path.display()))?;
+        if let Err(error) = file.write_all(text.as_bytes()).and_then(|_| file.flush()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("write {}: {error}", path.display()));
+        }
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for RemoteGuidelinesFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                harness_log(&format!(
+                    "remove temporary remote guidelines {}: {error}",
+                    self.0.display()
+                ));
+            }
+        }
     }
 }
 
@@ -1073,6 +1118,9 @@ pub struct ClaudeSession {
     snapshots_closed: tokio_util::sync::CancellationToken,
     commands: mpsc::UnboundedSender<HarnessCommand>,
     shutdown_on_drop: bool,
+    /// The local `claude` process id while it runs; 0 before the spawn,
+    /// after it exits, and always for a remote chat.
+    pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl ClaudeSession {
@@ -1083,6 +1131,8 @@ impl ClaudeSession {
         let close_token = snapshots_closed.clone();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let session_pid = pid.clone();
         let spawn_result = std::thread::Builder::new()
             .name("claude-session".into())
             .spawn(move || {
@@ -1099,7 +1149,7 @@ impl ClaudeSession {
                         return;
                     }
                 };
-                rt.block_on(run_session(config, cmd_rx, ev_tx, close_token));
+                rt.block_on(run_session(config, cmd_rx, ev_tx, close_token, session_pid));
             });
         if let Err(e) = spawn_result {
             eprintln!("[claude-harness] could not spawn session thread: {e}");
@@ -1109,6 +1159,7 @@ impl ClaudeSession {
                 commands: cmd_tx,
                 shutdown_on_drop: true,
                 snapshots_closed,
+                pid,
             },
             ev_rx,
         )
@@ -1122,6 +1173,16 @@ impl ClaudeSession {
         self.commands
             .send(command)
             .map_err(|_| "the Claude session has exited".to_string())
+    }
+
+    /// The local `claude` process id while it runs (TRU-212: the root of
+    /// the `codex exec` runs the chat starts). `None` before it has
+    /// spawned, once it has exited, and for a remote chat.
+    pub fn local_pid(&self) -> Option<u32> {
+        match self.pid.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            pid => Some(pid),
+        }
     }
 }
 
@@ -1149,6 +1210,9 @@ pub struct RemoteClaudeChatStart {
     pub effort: Option<String>,
     pub resume: Option<String>,
     pub chrome: bool,
+    /// Guideline text read by the desktop from its shared source file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidelines: Option<String>,
 }
 
 impl RemoteClaudeChatStart {
@@ -1167,12 +1231,18 @@ impl RemoteClaudeChatStart {
                 dir.display()
             ));
         }
-        if let Some(path) = &config.guidelines_file {
-            remote_log(&format!(
-                "guidelines {} are local-only; a remote chat starts without them",
-                path.display()
-            ));
-        }
+        let guidelines = config
+            .guidelines_file
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path).map_err(|error| {
+                    format!(
+                        "read guidelines {} for remote chat: {error}",
+                        path.display()
+                    )
+                })
+            })
+            .transpose()?;
         Ok(Self {
             cwd: config.cwd.to_string_lossy().into_owned(),
             model: config.model.clone(),
@@ -1180,6 +1250,7 @@ impl RemoteClaudeChatStart {
             effort: config.effort.clone(),
             resume: config.resume.clone(),
             chrome: config.chrome,
+            guidelines,
         })
     }
 
@@ -1196,10 +1267,8 @@ impl RemoteClaudeChatStart {
             wire_log_dir: None,
             mcp_servers: Vec::new(),
             chrome: self.chrome,
-            // Remote chats are out of TRU-174's scope: carrying them means
-            // a field on `RemoteClaudeChatStart` and the agent reading its
-            // own machine's guidelines file here.
             guidelines_file: None,
+            guidelines_content: self.guidelines,
         }
     }
 }
@@ -1278,6 +1347,7 @@ impl ClaudeSession {
                 commands: cmd_tx,
                 shutdown_on_drop: false,
                 snapshots_closed: tokio_util::sync::CancellationToken::new(),
+                pid: Default::default(),
             },
             ev_rx,
         )
@@ -1909,9 +1979,12 @@ async fn run_session(
     commands: mpsc::UnboundedReceiver<HarnessCommand>,
     events: mpsc::UnboundedSender<HarnessEvent>,
     close_token: tokio_util::sync::CancellationToken,
+    process_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     match resolve_claude_program() {
-        Ok(program) => run_session_program(config, commands, events, close_token, program).await,
+        Ok(program) => {
+            run_session_program(config, commands, events, close_token, program, process_id).await
+        }
         Err(msg) => {
             harness_log(&msg);
             let _ = events.send(HarnessEvent::Error(msg));
@@ -1926,6 +1999,7 @@ async fn run_session_program(
     events: mpsc::UnboundedSender<HarnessEvent>,
     close_token: tokio_util::sync::CancellationToken,
     program: PathBuf,
+    process_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     let fail = |msg: String| {
         harness_log(&msg);
@@ -1938,7 +2012,18 @@ async fn run_session_program(
         config.snapshot_facts_dir.clone(),
     )
     .with_close_token(close_token.clone());
-    let args = config.args();
+    let remote_guidelines = match config.guidelines_content.as_deref() {
+        Some(text) => match RemoteGuidelinesFile::create(text) {
+            Ok(file) => Some(file),
+            Err(error) => return fail(error),
+        },
+        None => None,
+    };
+    let guidelines_file = remote_guidelines
+        .as_ref()
+        .map(|file| file.path())
+        .or(config.guidelines_file.as_deref());
+    let args = config.args_with_guidelines_file(guidelines_file);
     let mut cmd = Command::new(&program);
     cmd.args(&args)
         .current_dir(&config.cwd)
@@ -1987,6 +2072,7 @@ async fn run_session_program(
     else {
         return fail("claude child is missing a stdio pipe".to_string());
     };
+    process_id.store(pid, std::sync::atomic::Ordering::Relaxed);
     let wire = config
         .wire_log_dir
         .as_deref()
@@ -2352,6 +2438,7 @@ async fn run_session_program(
         }
     };
     harness_log(&format!("claude {pid} exited with {code:?}"));
+    process_id.store(0, std::sync::atomic::Ordering::Relaxed);
     if !shutting_down && code != Some(0) {
         let tail = stderr_tail
             .lock()
@@ -3433,11 +3520,13 @@ for line in sys.stdin:
                 mcp_servers: Vec::new(),
                 chrome: false,
                 guidelines_file: None,
+                guidelines_content: None,
             },
             rx,
             tx,
             tokio_util::sync::CancellationToken::new(),
             program,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         ));
         let mut completed = 0;
         while completed < 2 {
@@ -3500,6 +3589,7 @@ for line in sys.stdin:
             mcp_servers: Vec::new(),
             chrome: true,
             guidelines_file: None,
+            guidelines_content: None,
         };
         let args = cfg.args().join(" ");
         assert!(cfg.args().contains(&"--chrome".to_string()));
@@ -3545,10 +3635,9 @@ for line in sys.stdin:
             "effort": null, "resume": null, "chrome": false
         }))
         .unwrap();
-        assert!(older
-            .into_config(PathBuf::from("/tmp"))
-            .args()
-            .contains(&"--no-chrome".to_string()));
+        let older_config = older.into_config(PathBuf::from("/tmp"));
+        assert!(older_config.args().contains(&"--no-chrome".to_string()));
+        assert!(older_config.guidelines_content.is_none());
     }
 
     #[test]
@@ -3624,6 +3713,7 @@ for line in sys.stdin:
             mcp_servers,
             chrome: false,
             guidelines_file: None,
+            guidelines_content: None,
         }
     }
 
@@ -3653,6 +3743,81 @@ for line in sys.stdin:
             local.wire_log_dir = None;
             local.args()
         });
+    }
+
+    #[test]
+    fn remote_start_carries_guideline_text_and_old_payloads_still_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let guidelines_path = dir.path().join("agent-guidelines.md");
+        std::fs::write(&guidelines_path, "Shared guideline text.\n").unwrap();
+        let mut config = config_with(Vec::new());
+        config.guidelines_file = Some(guidelines_path);
+        let start = RemoteClaudeChatStart::from_config(&config).unwrap();
+        assert_eq!(
+            start.guidelines.as_deref(),
+            Some("Shared guideline text.\n")
+        );
+        let payload = serde_json::to_value(&start).unwrap();
+        assert_eq!(payload["guidelines"], "Shared guideline text.\n");
+        #[derive(Deserialize)]
+        struct OlderAgentStart {
+            cwd: String,
+            model: Option<String>,
+            permission_mode: String,
+            effort: Option<String>,
+            resume: Option<String>,
+            chrome: bool,
+        }
+        let older_agent: OlderAgentStart = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(older_agent.cwd, "/tmp");
+        assert_eq!(older_agent.permission_mode, "default");
+        assert!(older_agent.model.is_none());
+        assert!(older_agent.effort.is_none());
+        assert_eq!(older_agent.resume.as_deref(), Some("sid"));
+        assert!(!older_agent.chrome);
+        let back: RemoteClaudeChatStart = serde_json::from_value(payload).unwrap();
+        let remote = back.into_config(PathBuf::from("/tmp"));
+        assert_eq!(
+            remote.guidelines_content.as_deref(),
+            Some("Shared guideline text.\n")
+        );
+
+        let older: RemoteClaudeChatStart = serde_json::from_value(json!({
+            "cwd": "/tmp", "model": null, "permission_mode": "default",
+            "effort": null, "resume": null, "chrome": false
+        }))
+        .unwrap();
+        assert!(older.guidelines.is_none());
+        assert!(older
+            .into_config(PathBuf::from("/tmp"))
+            .guidelines_content
+            .is_none());
+    }
+
+    #[test]
+    fn remote_guidelines_use_a_temporary_prompt_file() {
+        let text = "Guidelines supplied by the desktop.";
+        let file = RemoteGuidelinesFile::create(text).unwrap();
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), text);
+        let config = ClaudeSessionConfig {
+            cwd: PathBuf::from("/tmp"),
+            snapshot_facts_dir: None,
+            model: None,
+            permission_mode: "default".into(),
+            effort: None,
+            resume: None,
+            wire_log_dir: None,
+            mcp_servers: Vec::new(),
+            chrome: false,
+            guidelines_file: None,
+            guidelines_content: None,
+        };
+        let args = config.args_with_guidelines_file(Some(file.path()));
+        let at = args
+            .iter()
+            .position(|arg| arg == "--append-system-prompt-file")
+            .unwrap();
+        assert_eq!(args[at + 1], file.path().to_string_lossy());
     }
 
     #[test]
