@@ -727,9 +727,62 @@ fn known_roots(caller: &CallerTab) -> Vec<PathBuf> {
     roots
 }
 
+/// Worktrees reported by git for a listed repository. Unlike the sidebar's
+/// matcher, authorization requires each reported path to exist and be a
+/// directory, and ignores entries git has marked prunable.
+fn listed_repo_worktrees(repo: &Path) -> Result<Vec<PathBuf>, String> {
+    let output = git_command()
+        .args(["-C"])
+        .arg(repo)
+        .args(["--no-optional-locks", "worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|error| format!("failed to list worktrees for {}: {error}", repo.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git worktree list for {} failed: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut worktrees = Vec::new();
+    let mut current: Option<(PathBuf, bool, bool)> = None;
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let Some((path, prunable, bare)) = current.take() {
+                if !prunable && !bare {
+                    if let Ok(path) = std::fs::canonicalize(&path) {
+                        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                            worktrees.push(path);
+                        }
+                    }
+                }
+            }
+        } else if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some((previous, prunable, bare)) = current.take() {
+                if !prunable && !bare {
+                    if let Ok(previous) = std::fs::canonicalize(previous) {
+                        if std::fs::metadata(&previous).is_ok_and(|metadata| metadata.is_dir()) {
+                            worktrees.push(previous);
+                        }
+                    }
+                }
+            }
+            current = Some((PathBuf::from(path), false, false));
+        } else if let Some((_, prunable, bare)) = current.as_mut() {
+            if line.starts_with("prunable ") {
+                *prunable = true;
+            } else if line == "bare" {
+                *bare = true;
+            }
+        }
+    }
+    Ok(worktrees)
+}
+
 /// Whether the git top level `top` is the workspace's home, one of its
-/// repos, or a registered worktree of one of them
-/// (`git worktree list`, as the sidebar lists them). Blocking.
+/// repos, or a worktree reported for one of them by git. Blocking.
 fn workspace_knows(top: &Path, roots: &[PathBuf]) -> Result<bool, Vec<String>> {
     if roots.iter().any(|root| root == top) {
         return Ok(true);
@@ -742,9 +795,9 @@ fn workspace_knows(top: &Path, roots: &[PathBuf]) -> Result<bool, Vec<String>> {
         if crate::workspace_repos::checkout_root(root).as_deref() != Some(root.as_path()) {
             continue;
         }
-        match crate::worktree_follow::list_worktrees(root) {
+        match listed_repo_worktrees(root) {
             Ok(worktrees) => {
-                if worktrees.iter().any(|worktree| worktree.path == top) {
+                if worktrees.iter().any(|worktree| worktree == top) {
                     return Ok(true);
                 }
             }
@@ -789,6 +842,10 @@ fn unknown_target(field: &str, given: &Path, top: &Path, caller: &CallerTab) -> 
 /// workspace. Returns the work tree's top level, canonical. Blocking.
 pub fn resolve_checkout(field: &str, path: &Path, caller: &CallerTab) -> Result<PathBuf, String> {
     let top = git_top_level(field, path)?;
+    let dir = canonical(field, path)?;
+    if !dir.starts_with(&top) {
+        return Err(unknown_target(field, path, &top, caller));
+    }
     match workspace_knows(&top, &known_roots(caller)) {
         Ok(true) => Ok(top),
         Ok(false) => Err(unknown_target(field, path, &top, caller)),
@@ -2582,7 +2639,7 @@ mod tests {
     #[test]
     fn a_git_worktree_setting_cannot_authorize_an_outside_writable_folder() {
         let targets = Targets::new();
-        let outside = targets.path("api-outside");
+        let outside = targets.path("api ");
         std::fs::create_dir(&outside).unwrap();
         git(&outside, &["init", "-q", "-b", "main"]);
         let listed = targets.canonical("api");
@@ -2591,11 +2648,80 @@ mod tests {
             &["config", "core.worktree", listed.to_str().unwrap()],
         );
         assert_eq!(git_top_level("add_dirs entry", &outside).unwrap(), listed);
+        assert!(resolve_checkout("checkout", &outside, &targets.caller()).is_err());
         let error = resolve_add_dir(&outside, &targets.caller()).unwrap_err();
         assert!(error.contains("add_dirs"), "{error}");
         assert!(error.contains("outside workspace"), "{error}");
         // Registered worktrees and their subfolders remain authorized.
         assert!(resolve_add_dir(&targets.path("api-wt/src"), &targets.caller()).is_ok());
+    }
+
+    #[test]
+    fn hand_made_worktrees_of_listed_repos_are_authorized() {
+        let targets = Targets::new();
+        let repo = targets.path("api");
+        let worktree = targets.path("api-manual");
+        git(
+            &repo,
+            &["worktree", "add", "--detach", worktree.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+
+        assert_eq!(
+            resolve_checkout("checkout", &worktree, &targets.caller()).unwrap(),
+            targets.canonical("api-manual")
+        );
+        assert_eq!(
+            resolve_add_dir(&worktree.join("src"), &targets.caller()).unwrap(),
+            targets.canonical("api-manual/src")
+        );
+    }
+
+    #[test]
+    fn worktrees_of_unlisted_repos_are_not_authorized() {
+        let targets = Targets::new();
+        let worktree = targets.path("other-wt");
+        git(
+            &targets.path("other"),
+            &["worktree", "add", "--detach", worktree.to_str().unwrap()],
+        );
+
+        assert!(resolve_checkout("checkout", &worktree, &targets.caller())
+            .unwrap_err()
+            .contains("outside workspace"));
+        assert!(resolve_add_dir(&worktree, &targets.caller())
+            .unwrap_err()
+            .contains("outside workspace"));
+    }
+
+    #[test]
+    fn missing_and_prunable_worktree_paths_are_not_authorized() {
+        let targets = Targets::new();
+        let repo = targets.path("api");
+        let missing = targets.path("api-missing");
+        git(
+            &repo,
+            &["worktree", "add", "--detach", missing.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(&missing).unwrap();
+        assert!(resolve_checkout("checkout", &missing, &targets.caller())
+            .unwrap_err()
+            .contains("does not exist"));
+        // Recreating the directory leaves Git's worktree entry prunable. It
+        // must not become trusted just because canonicalization succeeds.
+        std::fs::create_dir(&missing).unwrap();
+
+        let output = git_command()
+            .args(["-C"])
+            .arg(&repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("prunable "));
+
+        let listed = listed_repo_worktrees(&targets.canonical("api")).unwrap();
+        assert!(!listed.iter().any(|path| path == &missing));
+        assert!(resolve_checkout("checkout", &missing, &targets.caller()).is_err());
     }
 
     #[test]
