@@ -27,6 +27,10 @@
     --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   * { box-sizing: border-box; }
+  .html-render { margin: 10px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg); }
+  .html-render-bar { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; color: var(--fg-muted); }
+  .html-render.expanded { position: fixed; inset: 8px; margin: 0; z-index: 1000; display: flex; flex-direction: column; box-shadow: 0 0 0 12px var(--bg); }
+  .html-render.expanded iframe { flex: 1; min-height: 0; height: 100% !important; }
   html, body {
     margin: 0;
     padding: 0;
@@ -745,7 +749,52 @@
   }
   function postIpc(payload) {
     if (!window.ipc || typeof window.ipc.postMessage !== 'function') return;
-    window.ipc.postMessage(JSON.stringify(Object.assign({}, payload, { tabId: window.__currentTabId })));
+    const message = JSON.stringify(Object.assign({}, payload, { tabId: window.__currentTabId }));
+    if (typeof window.__gittermNativePost === 'function') window.__gittermNativePost(message);
+    else window.ipc.postMessage(message); // phone transport
+  }
+
+  // Visuals are reconstructed from successful tool calls already persisted
+  // in the conversation, including their full (untruncated) HTML results.
+  const htmlRenders = new Set();
+  let appearance = 'dark';
+  window.__setAppearance = (value) => {
+    appearance = value === 'light' ? 'light' : 'dark';
+    for (const render of htmlRenders) render.setTheme(appearance);
+  };
+  function showHtmlRender(item, output) {
+    // Claude's MCP prefix, Gemini's FQN, OpenCode's server_tool name, and
+    // the unprefixed MCP name. Arbitrary tool/file output is never published.
+    if (item.render || !['html_render', 'mcp__gitterm_tasks__html_render', 'mcp_gitterm-tasks_html_render', 'gitterm_tasks_html_render'].includes(item.name) || typeof output !== 'string') return;
+    let result;
+    try { result = JSON.parse(output); } catch (_) { return; }
+    const input = result && result.html_render;
+    if (!input || !GitTermHtml.valid(input.html, input.height)) return;
+    // Browser/phone pages do not have the native subframe navigation policy.
+    if (typeof window.__gittermNativePost !== 'function' || window.__gittermCanRenderHtml !== true) {
+      item.render = append(el('div', 'html-render', 'Visual reply available in GitTerm for macOS.'));
+      return;
+    }
+    endSegment(); endThinking();
+    const block = append(el('section', 'html-render'));
+    block.setAttribute('aria-label', 'Visual reply');
+    const bar = block.appendChild(el('div', 'html-render-bar'));
+    bar.appendChild(el('span', null, 'Visual reply'));
+    const expand = bar.appendChild(el('button', null, 'Expand'));
+    expand.type = 'button';
+    expand.setAttribute('aria-expanded', 'false');
+    const collapse = () => { block.classList.remove('expanded'); expand.textContent = 'Expand'; expand.setAttribute('aria-expanded', 'false'); expand.focus(); };
+    const render = GitTermHtml.create(input.html, input.height, appearance, (url) => postIpc({ type: 'open_url', url }), collapse);
+    htmlRenders.add(render);
+    item.render = block;
+    block.appendChild(render.frame);
+    expand.addEventListener('click', () => {
+      const expanded = block.classList.toggle('expanded');
+      expand.textContent = expanded ? 'Close expanded view' : 'Expand';
+      expand.setAttribute('aria-expanded', String(expanded));
+    });
+    block.addEventListener('keydown', (e) => { if (e.key === 'Escape') collapse(); });
+    scrollIfFollowing();
   }
 
   // ---- V5 conversation pickup (TRU-183) ----------------------------------
@@ -825,9 +874,9 @@
     trimWindow();
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
-  function append(node) {
+  function append(node, atMs = null) {
     messagesEl.appendChild(node);
-    if (turn) turn.blocks.push({ node, at: replaying ? null : Date.now() });
+    if (turn) turn.blocks.push({ node, at: atMs != null ? atMs : (replaying ? null : Date.now()) });
     scrollIfFollowing();
     return node;
   }
@@ -929,11 +978,17 @@
   // line that opens to the cards. A message sent mid-turn ends one fold and
   // starts the next. What needs the human never folds: error blocks,
   // delegation cards, warnings, a running subagent's card and a card whose
-  // request still waits. A running turn shows its work live. A replay folds
-  // as live did, from the same events; it carries no turn times, so its
-  // rows read "Worked". Folds start closed and are not remembered.
+  // request still waits. A running turn shows its work live. Replay timing
+  // markers preserve durations; old conversations without markers keep the
+  // "Worked" label. Folds start closed and are not remembered.
   function beginTurn() {
-    turn = { startMs: replaying ? null : Date.now(), blocks: [] };
+    turn = { startMs: replaying ? null : Date.now(), nextPromptAtMs: null, blocks: [] };
+  }
+  function turnTiming(event) {
+    if (!turn) return;
+    if (typeof event.start_ms === 'number') turn.startMs = event.start_ms;
+    if (typeof event.end_ms === 'number') turn.endMs = event.end_ms;
+    if (typeof event.split_ms === 'number') turn.nextPromptAtMs = event.split_ms;
   }
   // The turn ended: fold it (`fold`), or leave it as it is (a pi turn, a
   // prompt that was never sent).
@@ -941,7 +996,7 @@
     const t = turn;
     turn = null;
     if (!t || !fold) return;
-    keepView(() => foldTurn(t, replaying ? null : Date.now()));
+    keepView(() => foldTurn(t, t.endMs != null ? t.endMs : (replaying ? null : Date.now())));
   }
   // Run `change` to the timeline without moving what the human reads: a
   // view following the latest stays at the bottom; one scrolled back keeps
@@ -989,7 +1044,7 @@
   }
   const WORK = 'details.tool, details.thinking';
   function keepsOutOfFold(node) {
-    if (node.matches('.error-block, .dlg, .note.warn')) return true;
+    if (node.matches('.error-block, .dlg, .note.warn, .html-render')) return true;
     if (!node.matches('details.tool')) return false;
     if (node.classList.contains('error')) return true;
     const id = node.dataset.toolId;
@@ -1480,6 +1535,7 @@
     item.outputEl = item.body.appendChild(el('pre', isError ? 'err' : null, text));
     item.badge.textContent = '';
     item.done = { output: output || '', isError: !!isError };
+    if (!isError) showHtmlRender(item, output);
     markWrite(item);
     item.card.open = false;
     // A foreground subagent is done when its Agent call returns, even if
@@ -3390,7 +3446,9 @@
     // (and its activity clock) carries on.
     const isQueued = event.queued === true && id != null;
     if (isQueued) markQueued(msg, id);
-    append(msg);
+    const atMs = turn ? turn.nextPromptAtMs : null;
+    if (turn) turn.nextPromptAtMs = null;
+    append(msg, atMs);
     follow = true;
     if (isQueued && busy) return;
     beginTurn();
@@ -3419,6 +3477,7 @@
       if (event.kind === 'harness') { harnessEvent(event.event); return; }
       if (event.kind === 'delegation_anchor') { delegationAnchor(event.delegation_id); return; }
       if (event.kind === 'subagent_started_at') { subagentStartedAt(event.id, event.at_ms); return; }
+      if (event.kind === 'turn_timing') { turnTiming(event); return; }
       if (event.kind === 'delegation') { delegationEvent(event); return; }
       if (event.type === 'user_prompt') { showUserPrompt(event); return; }
       legacyEvent(event);
@@ -3464,6 +3523,8 @@
   };
 
   window.__resetConversation = function () {
+    for (const render of htmlRenders) render.dispose();
+    htmlRenders.clear();
     messagesEl.innerHTML = '';
     resetWindow();
     segment = null; thinking = null; turn = null;

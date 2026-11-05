@@ -571,8 +571,33 @@ fn history_timeline(
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
             .map(|at| at.timestamp_millis());
         let event = tab::AgentEvent::from(timed.entry);
+        let is_prompt = matches!(
+            &event,
+            tab::AgentEvent::Other(value)
+                if value.get("type").and_then(|value| value.as_str()) == Some("user_prompt")
+        );
+        let is_turn_end = matches!(
+            &event,
+            tab::AgentEvent::Harness(HarnessEvent::TurnCompleted { .. })
+        );
         let started = tab::subagent_started(&event).map(str::to_string);
+        if is_turn_end {
+            if let Some(at_ms) = at_ms {
+                timeline.push(tab::AgentEvent::Other(gitterm::chat_page::turn_timing(
+                    None,
+                    Some(at_ms),
+                )));
+            }
+        }
         timeline.push(event);
+        if is_prompt {
+            if let Some(at_ms) = at_ms {
+                timeline.push(tab::AgentEvent::Other(gitterm::chat_page::turn_timing(
+                    Some(at_ms),
+                    None,
+                )));
+            }
+        }
         if let (Some(parent), Some(at_ms)) = (started, at_ms) {
             timeline.push(tab::AgentEvent::Other(tab::subagent_started_at(
                 &parent, at_ms,
@@ -21673,6 +21698,36 @@ fi
                 self.task_mcp = None;
             }
             Event::TaskControlRequested(envelope) => match envelope.operation {
+                TaskControlOperation::HtmlRender(request) => {
+                    if !gitterm::html_render::NATIVE_HTML_SUPPORTED {
+                        envelope.reply.send(Err("html_render currently requires GitTerm for macOS; this platform lacks the required native subframe navigation guard".into()));
+                        return Task::none();
+                    }
+                    let caller = envelope.caller.as_deref();
+                    let chat = self
+                        .workspaces
+                        .iter()
+                        .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+                        .flat_map(|ws| &ws.tabs)
+                        .find(|tab| {
+                            Some(tab.session_uid.as_str()) == caller
+                                && tab
+                                    .agent_session()
+                                    .is_some_and(|session| session.backend().is_native())
+                        });
+                    let result = request.validate().and_then(|()| {
+                        chat.ok_or_else(|| {
+                            "html_render requires an open local native Claude or ACP chat tab (Pi does not restore conversation history)".to_string()
+                        })?;
+                        // An additive result carried in the conversation works
+                        // even when a harness does not report the raw tool input.
+                        serde_json::to_value(gitterm::html_render::HtmlRenderResult {
+                            html_render: request,
+                        })
+                        .map_err(|error| format!("cannot encode visual reply: {error}"))
+                    });
+                    envelope.reply.send(result);
+                }
                 TaskControlOperation::List(request) => {
                     let Some(store) = self.task_store.as_ref() else {
                         envelope
@@ -22933,6 +22988,7 @@ fi
                 // Claude gets every message with an id, so the CLI reports
                 // its queue state and a queued one can be withdrawn.
                 let mut prompt = prompt;
+                let mut prompt_markers = Vec::new();
                 // Issue keys the human names feed the chat's facts (TRU-166);
                 // written with the turn's tool calls.
                 for ws in &mut self.workspaces {
@@ -23038,10 +23094,16 @@ fi
                                 return Task::none();
                             }
                             if session.harness.is_none() {
+                                let guidelines = launch_instructions(
+                                    &repo_path,
+                                    guidelines_off,
+                                    document_places.as_ref(),
+                                );
                                 let Some(config) = session.acp_session_config(
                                     repo_path,
                                     std::mem::take(&mut acp_mcp_servers),
                                     acp_support_dir(),
+                                    guidelines,
                                 ) else {
                                     return Task::none();
                                 };
@@ -23080,7 +23142,8 @@ fi
                                     Err(e) => eprintln!("AgentSubmitPrompt failed: {}", e),
                                 }
                             }
-                            session.record(echo.clone());
+                            let (_, after) = session.record(echo.clone());
+                            prompt_markers.extend(after);
                             if submitted {
                                 if let Some(task_id) = tab_task_id {
                                     t.task_live_state = Some(TaskSessionLiveState::Working);
@@ -23108,19 +23171,12 @@ fi
                                         session.session_id = None;
                                     }
                                 }
-                                // Remote chats start without the
-                                // guidelines (TRU-174 is local only).
-                                let guidelines_file = remote_chat
-                                    .is_none()
-                                    .then(|| {
-                                        launch_instructions(
-                                            &repo_path,
-                                            guidelines_off,
-                                            document_places.as_ref(),
-                                        )
-                                    })
-                                    .flatten()
-                                    .map(|guidelines| guidelines.path);
+                                let guidelines_file = launch_instructions(
+                                    &repo_path,
+                                    guidelines_off,
+                                    document_places.as_ref(),
+                                )
+                                .map(|guidelines| guidelines.path);
                                 let Some(config) = session.claude_session_config(
                                     repo_path,
                                     std::mem::take(&mut claude_mcp_servers),
@@ -23175,7 +23231,8 @@ fi
                                     }
                                 }
                             }
-                            session.record(echo.clone());
+                            let (_, after) = session.record(echo.clone());
+                            prompt_markers.extend(after);
                             if let Some(e) = send_failed {
                                 // The command channel is dead but ProcessExited
                                 // may never arrive (the session thread can fail
@@ -23227,7 +23284,8 @@ fi
                                 submitted = true;
                             }
                         }
-                        session.conversation.push(echo.clone());
+                        let (_, after) = session.record(echo.clone());
+                        prompt_markers.extend(after);
                         if submitted {
                             if let Some(task_id) = tab_task_id {
                                 t.task_live_state = Some(TaskSessionLiveState::Working);
@@ -23242,6 +23300,9 @@ fi
                 }
                 // Also push the echo into the tab's chat page, if it has one.
                 push_agent_event_to_webview(tab_id, &echo);
+                for marker in &prompt_markers {
+                    push_agent_event_to_webview(tab_id, marker);
+                }
                 if images_not_sent > 0 {
                     eprintln!(
                         "AgentSubmitPrompt: tab {tab_id}: {images_not_sent} image(s) not sent (non-Claude backend)"
@@ -24046,6 +24107,17 @@ fi
                 // Reset first: an event that arrived between the build and
                 // this message was already pushed live and is in the buffer.
                 reset_agent_webview(tab_id);
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!(
+                        "window.__setAppearance({:?})",
+                        if self.theme == AppTheme::Dark {
+                            "dark"
+                        } else {
+                            "light"
+                        }
+                    ),
+                );
                 let composer = self.chat_composer_state(tab_id);
                 set_agent_webview_tab_id(
                     tab_id,
@@ -24454,8 +24526,14 @@ fi
                                         }
                                     }
                                 }
+                                let (before, after) = session.record(ev.clone());
+                                for marker in &before {
+                                    push_agent_event_to_webview(tab_id, marker);
+                                }
                                 push_agent_event_to_webview(tab_id, &ev);
-                                session.record(ev);
+                                for marker in &after {
+                                    push_agent_event_to_webview(tab_id, marker);
+                                }
                             }
                             if let Some(id) = new_session_id {
                                 // A task's sessions belong to the task, not
@@ -27241,6 +27319,19 @@ fi
             }
             Event::ToggleTheme => {
                 self.theme = self.theme.toggle();
+                for tab_id in &self.agent_pages {
+                    webview::evaluate_script(
+                        WebviewSurface::Agent(*tab_id),
+                        &format!(
+                            "window.__setAppearance({:?})",
+                            if self.theme == AppTheme::Dark {
+                                "dark"
+                            } else {
+                                "light"
+                            }
+                        ),
+                    );
+                }
                 self.save_config();
                 self.recreate_terminals();
 
@@ -27529,6 +27620,8 @@ fi
                         tab.last_poll = Instant::now() - Duration::from_secs(60);
                     }
                 }
+                self.request_open_pr_refreshes();
+                return self.poll_pr_watch();
             }
             Event::WindowResized(width, height) => {
                 self.window_size = (width, height);
@@ -27954,7 +28047,13 @@ fi
                         .workspace_overview_presentations
                         .entry(uid)
                         .or_default();
-                    overview::toggle_row(&mut presentation.open_rows, key);
+                    let opened = overview::toggle_row(&mut presentation.open_rows, key.clone());
+                    if opened {
+                        if let overview::RowKey::Pr(id) = key {
+                            self.prs.request_row_refresh(id, opened, Instant::now());
+                            return self.poll_pr_watch();
+                        }
+                    }
                 }
             }
             Event::WorkspaceOverviewOpenChat(id) => {
@@ -30512,13 +30611,17 @@ fi
         let remote_client = remote_id.as_deref().map(|id| self.remote_chat_client(id));
         // An ACP tab starts its agent here (local workspaces only); it gets
         // GitTerm's MCP servers under the tab's caller identity.
-        let tab_info = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|t| t.id == tab_id)
-            .map(|t| (t.repo_path.clone(), t.session_uid.clone()));
-        let Some((repo_path, caller)) = tab_info else {
+        let tab_info = self.workspaces.iter().find_map(|ws| {
+            ws.tabs.iter().find(|t| t.id == tab_id).map(|t| {
+                (
+                    t.repo_path.clone(),
+                    t.session_uid.clone(),
+                    ws.guidelines_off,
+                    ws.document_places(),
+                )
+            })
+        });
+        let Some((repo_path, caller, guidelines_off, document_places)) = tab_info else {
             return Task::none();
         };
         let acp_mcp_servers: Vec<gitterm::harness::acp::AcpMcpServer> = if remote_id.is_some() {
@@ -30562,9 +30665,14 @@ fi
                 session.history = tab::HistoryLoad::Loaded;
                 return Task::none();
             }
-            let Some(config) =
-                session.acp_session_config(repo_path, acp_mcp_servers, acp_support_dir())
-            else {
+            let guidelines =
+                launch_instructions(&repo_path, guidelines_off, document_places.as_ref());
+            let Some(config) = session.acp_session_config(
+                repo_path,
+                acp_mcp_servers,
+                acp_support_dir(),
+                guidelines,
+            ) else {
                 return Task::none();
             };
             eprintln!(
@@ -45851,6 +45959,40 @@ mod tests {
         );
         assert_eq!(linear_page_store(None), webview::PageDataStore::Default);
         assert_eq!(linear_page_store(Some("")), webview::PageDataStore::Default);
+    }
+
+    #[test]
+    fn claude_history_timestamps_become_turn_replay_markers() {
+        use gitterm::harness::transcript::{TimedEntry, TranscriptEntry};
+
+        let timeline = history_timeline(
+            vec![
+                TimedEntry {
+                    at: Some("2026-11-05T10:00:00Z".into()),
+                    entry: TranscriptEntry::UserPrompt("hello".into()),
+                },
+                TimedEntry {
+                    at: Some("2026-11-05T10:00:04Z".into()),
+                    entry: TranscriptEntry::Harness(HarnessEvent::TurnCompleted {
+                        status: TurnStatus::Completed,
+                        usage: serde_json::Value::Null,
+                        cost_usd: None,
+                        rate_limit: None,
+                    }),
+                },
+            ],
+            &[],
+        );
+        let markers: Vec<_> = timeline
+            .iter()
+            .filter_map(|event| match event {
+                tab::AgentEvent::Other(value) if value["kind"] == "turn_timing" => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0]["start_ms"], 1_793_872_800_000_i64);
+        assert_eq!(markers[1]["end_ms"], 1_793_872_804_000_i64);
     }
 
     #[test]

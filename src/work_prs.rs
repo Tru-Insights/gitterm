@@ -41,6 +41,8 @@ use serde_json::Value;
 const PR_HOMES_FRESH: Duration = Duration::from_secs(30);
 /// PRs one poll reads at most; the rest are read by the next.
 const PR_POLL_MAX_ITEMS: usize = 25;
+/// An immediate user-triggered refresh is coalesced per PR within this window.
+const PR_IMMEDIATE_DEBOUNCE: Duration = Duration::from_secs(10);
 /// A PR no workspace lists is forgotten this long after its last read.
 const PR_FORGET_AFTER: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Prefix of every line of a prompt that tells the coordinator news.
@@ -188,6 +190,17 @@ fn split_done<K>(
     (open, done)
 }
 
+/// Queued immediate work keeps its request order ahead of periodic candidates.
+fn ordered_poll_ids(wanted: &[String], due_order: &VecDeque<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    due_order
+        .iter()
+        .chain(wanted)
+        .filter(|id| seen.insert((*id).clone()))
+        .cloned()
+        .collect()
+}
+
 /// The fold line for done PRs: "3 merged" or with "n closed".
 fn done_summary(done: &[PrState]) -> String {
     let merged = done.iter().filter(|s| **s == PrState::Merged).count();
@@ -306,6 +319,12 @@ pub struct PrsState {
     /// PRs to read at the next tick whatever their interval (a plan was
     /// just set, an action just ran).
     pub due_now: HashSet<String>,
+    /// The order immediate refreshes were queued, used ahead of periodic work.
+    due_order: VecDeque<String>,
+    /// Requests inside the debounce window, due when the window expires.
+    deferred_due: HashMap<String, Instant>,
+    /// Last immediate user-triggered refresh request per PR.
+    immediate_requested_at: HashMap<String, Instant>,
     /// Login per account (`None` = gh's active account), from polls.
     pub logins: HashMap<Option<String>, String>,
     pub homes: Vec<(PrHome, Vec<RootPrs>)>,
@@ -324,11 +343,74 @@ pub struct PrsState {
 }
 
 impl PrsState {
-    /// An Approve / Merge run for `key` finished. Its PR is read at the
+    /// Queue a refresh, deferring a coalesced request until its debounce ends.
+    pub fn request_immediate_refresh(&mut self, id: String, now: Instant) -> bool {
+        let Some(last) = self.immediate_requested_at.get(&id).copied() else {
+            self.immediate_requested_at.insert(id.clone(), now);
+            self.enqueue_due(id);
+            return true;
+        };
+        let due_at = last + PR_IMMEDIATE_DEBOUNCE;
+        if now < due_at {
+            self.deferred_due
+                .entry(id)
+                .and_modify(|due| *due = (*due).min(due_at))
+                .or_insert(due_at);
+            return false;
+        }
+        self.immediate_requested_at.insert(id.clone(), now);
+        self.enqueue_due(id);
+        true
+    }
+
+    fn enqueue_due(&mut self, id: String) {
+        if self.due_now.insert(id.clone()) {
+            self.due_order.push_back(id);
+        }
+    }
+
+    fn promote_deferred(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .deferred_due
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            self.deferred_due.remove(&id);
+            self.immediate_requested_at.insert(id.clone(), now);
+            self.enqueue_due(id);
+        }
+    }
+
+    fn take_due(&mut self, id: &str) {
+        self.due_now.remove(id);
+        if let Some(position) = self.due_order.iter().position(|queued| queued == id) {
+            self.due_order.remove(position);
+        }
+    }
+
+    fn request_open_workspace_refreshes(&mut self, homes: &[(PrHome, Vec<String>)], now: Instant) {
+        for (home, ids) in homes {
+            if matches!(home, PrHome::Open(_)) {
+                for id in ids {
+                    self.request_immediate_refresh(id.clone(), now);
+                }
+            }
+        }
+    }
+
+    pub(super) fn request_row_refresh(&mut self, id: String, opened: bool, now: Instant) {
+        if opened {
+            self.request_immediate_refresh(id, now);
+        }
+    }
+
+    /// An Approve / Merge / Ready run for `key` finished. Its PR is read at the
     /// next tick either way. The open confirmation for it closes on
     /// success and keeps the error on failure; returns whether it closed.
     pub fn action_done(&mut self, key: &PrKey, result: Result<String, String>) -> bool {
-        self.due_now.insert(key.id());
+        self.request_immediate_refresh(key.id(), Instant::now());
         if !self.action.as_ref().is_some_and(|c| c.key == *key) {
             return false;
         }
@@ -564,6 +646,34 @@ impl App {
         self.prs.watch.prs.get(&key.id())
     }
 
+    /// A window focus refreshes open-workspace PRs, while parked work remains
+    /// on its slower schedule.
+    pub(super) fn request_open_pr_refreshes(&mut self) {
+        if self
+            .prs
+            .homes_built
+            .is_none_or(|at| at.elapsed() >= PR_HOMES_FRESH)
+        {
+            self.rebuild_pr_homes();
+        }
+        let homes: Vec<(PrHome, Vec<String>)> = self
+            .prs
+            .homes
+            .iter()
+            .map(|(home, roots)| {
+                (
+                    home.clone(),
+                    self.keys_of_roots(roots)
+                        .into_iter()
+                        .map(|(_, key)| key.id())
+                        .collect(),
+                )
+            })
+            .collect();
+        self.prs
+            .request_open_workspace_refreshes(&homes, Instant::now());
+    }
+
     // -----------------------------------------------------------------------
     // The watch.
 
@@ -571,6 +681,7 @@ impl App {
     /// the due PRs unless one runs.
     pub(super) fn poll_pr_watch(&mut self) -> Task<Event> {
         let mut tasks: Vec<Task<Event>> = Vec::new();
+        self.prs.promote_deferred(Instant::now());
         // Facts PRs come from the index; load it once if nothing has.
         if !self.prs.index_requested
             && self.chat_index_loaded_at.is_none()
@@ -604,17 +715,31 @@ impl App {
             }
         }
         let mut items: Vec<pr_watch::PollItem> = Vec::new();
-        for (key, interval) in wanted {
+        let wanted_by_id: HashMap<String, (PrKey, Duration)> = wanted
+            .iter()
+            .cloned()
+            .map(|(key, interval)| (key.id(), (key, interval)))
+            .collect();
+        let wanted_ids = wanted.iter().map(|(key, _)| key.id()).collect::<Vec<_>>();
+        let ordered_ids = ordered_poll_ids(&wanted_ids, &self.prs.due_order);
+        let mut selected = HashSet::new();
+        for id in ordered_ids {
             if items.len() >= PR_POLL_MAX_ITEMS {
                 break;
             }
+            if !selected.insert(id.clone()) {
+                continue;
+            }
+            let Some((key, interval)) = wanted_by_id.get(&id) else {
+                continue;
+            };
             let id = key.id();
             let watched = self.prs.watch.prs.get(&id);
             if watched.is_some_and(WatchedPr::done) {
                 continue;
             }
             let due = self.prs.due_now.contains(&id)
-                || watched.is_none_or(|watched| watched.due(watched.interval_for(interval), now));
+                || watched.is_none_or(|watched| watched.due(watched.interval_for(*interval), now));
             if !due {
                 continue;
             }
@@ -622,14 +747,14 @@ impl App {
                 account: pr_watch::account_for(key.owner(), &self.github_accounts),
                 snapshot: watched.map(|w| w.snapshot.clone()).unwrap_or_default(),
                 etags: watched.map(|w| w.etags.clone()).unwrap_or_default(),
-                key,
+                key: key.clone(),
             });
         }
         if items.is_empty() {
             return Task::batch(tasks);
         }
         for item in &items {
-            self.prs.due_now.remove(&item.key.id());
+            self.prs.take_due(&item.key.id());
         }
         self.prs.in_flight = true;
         tasks.push(Task::perform(
@@ -773,7 +898,7 @@ impl App {
         });
         let kept_holds = plan.replace_entries(entries, &chat_facts::now_stamp());
         for entry in &plan.entries {
-            self.prs.due_now.insert(entry.key().id());
+            self.prs.enqueue_due(entry.key().id());
         }
         eprintln!(
             "[merge-plan] {root}: plan set with {} PR(s)",
@@ -1046,11 +1171,14 @@ impl App {
                     Ok(output) => eprintln!("[pr-watch] {}: done: {output}", key.label()),
                     Err(error) => eprintln!("[pr-watch] {}: {error}", key.label()),
                 }
-                if self.prs.action_done(&key, result) {
+                let closed = self.prs.action_done(&key, result);
+                let refresh = self.poll_pr_watch();
+                if closed {
                     // The overview row shows the new state once the
                     // `due_now` read lands.
-                    return self.apply_webview_surfaces();
+                    return Task::batch([self.apply_webview_surfaces(), refresh]);
                 }
+                return refresh;
             }
             PrEvent::ActionClose => {
                 if self.prs.action.as_ref().is_some_and(|c| c.running) {
@@ -2329,6 +2457,107 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_marks_open_workspace_prs_due_but_not_parked_prs() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        prs.request_open_workspace_refreshes(
+            &[
+                (PrHome::Open(1), vec!["open-pr".to_string()]),
+                (
+                    PrHome::Parked(ParkedKey {
+                        name: "parked".to_string(),
+                        dir: "/parked".to_string(),
+                    }),
+                    vec!["parked-pr".to_string()],
+                ),
+            ],
+            now,
+        );
+        assert!(prs.due_now.contains("open-pr"));
+        assert!(!prs.due_now.contains("parked-pr"));
+    }
+
+    #[test]
+    fn opening_a_pr_row_marks_only_that_pr_due() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        prs.request_row_refresh("closed-row".to_string(), false, now);
+        assert!(!prs.due_now.contains("closed-row"));
+        prs.request_row_refresh("opened-row".to_string(), true, now);
+        assert_eq!(prs.due_now, ["opened-row".to_string()].into());
+    }
+
+    #[test]
+    fn immediate_refresh_is_debounced_per_pr_for_ten_seconds() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        assert!(prs.request_immediate_refresh("same-pr".to_string(), now));
+        prs.due_now.clear();
+        assert!(!prs.request_immediate_refresh("same-pr".to_string(), now + Duration::from_secs(9)));
+        assert!(prs.due_now.is_empty());
+        assert_eq!(
+            prs.deferred_due.get("same-pr"),
+            Some(&(now + Duration::from_secs(10)))
+        );
+        prs.promote_deferred(now + Duration::from_secs(9));
+        assert!(prs.due_now.is_empty());
+        prs.promote_deferred(now + Duration::from_secs(10));
+        assert!(prs.due_now.contains("same-pr"));
+    }
+
+    #[test]
+    fn action_refresh_after_a_recent_row_read_is_deferred_not_lost() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        prs.request_row_refresh("owner/repo#1".to_string(), true, now);
+        prs.take_due("owner/repo#1"); // the row refresh completed
+
+        assert!(!prs
+            .request_immediate_refresh("owner/repo#1".to_string(), now + Duration::from_secs(2),)); // Ready / Approve / Merge completed during the debounce window
+        prs.promote_deferred(now + Duration::from_secs(9));
+        assert!(!prs.due_now.contains("owner/repo#1"));
+        prs.promote_deferred(now + Duration::from_secs(10));
+        assert!(prs.due_now.contains("owner/repo#1"));
+    }
+
+    #[test]
+    fn focus_requests_during_a_full_poll_do_not_starve_the_next_pr_batch() {
+        let mut prs = PrsState::default();
+        let now = Instant::now();
+        let ids = (1..=26)
+            .map(|n| format!("owner/repo#{n}"))
+            .collect::<Vec<_>>();
+        for id in &ids {
+            prs.request_immediate_refresh(id.clone(), now);
+        }
+
+        let first_batch = ordered_poll_ids(&ids, &prs.due_order)
+            .into_iter()
+            .take(PR_POLL_MAX_ITEMS)
+            .collect::<Vec<_>>();
+        for id in &first_batch {
+            prs.take_due(id);
+        }
+        assert_eq!(
+            prs.due_order.front().map(String::as_str),
+            Some("owner/repo#26")
+        );
+
+        // Focus repeats while the first 25 PRs are still in flight. Their
+        // requests append after the older, still queued 26th PR.
+        for id in &ids {
+            prs.request_immediate_refresh(id.clone(), now + Duration::from_secs(11));
+        }
+        let next_batch = ordered_poll_ids(&ids, &prs.due_order)
+            .into_iter()
+            .take(PR_POLL_MAX_ITEMS)
+            .collect::<Vec<_>>();
+        assert!(next_batch.iter().any(|id| id == "owner/repo#26"));
+    }
+
     #[test]
     fn split_done_keeps_open_and_unknown_apart_from_final() {
         let states = |k: &&str| match *k {
@@ -2433,8 +2662,6 @@ mod tests {
         assert!(pr_row_parts(true, false).merge_on_title);
         assert!(!pr_row_parts(false, false).merge_on_title);
     }
-
-    use super::*;
 
     #[test]
     fn pr_url_uses_watched_url_or_canonical_fallback() {
