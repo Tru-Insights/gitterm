@@ -1188,7 +1188,7 @@ fn default_ui_font() -> f32 {
 }
 
 fn default_sidebar_width() -> f32 {
-    280.0
+    360.0
 }
 
 fn default_scrollback_lines() -> usize {
@@ -1322,7 +1322,7 @@ pub struct Config {
 /// `auto_tell`: send actionable PR news (merge conflicts, failed checks,
 /// review comments, changes requested) to the coordinator's open chat by
 /// itself when its turn is idle. Off, news only shows on the overview and
-/// the chip, and "Tell coordinator" sends it.
+/// the chip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrWatchConfig {
     #[serde(default = "default_true")]
@@ -1648,7 +1648,7 @@ impl Default for Config {
         Self {
             terminal_font_size: 14.0,
             ui_font_size: 13.0,
-            sidebar_width: 280.0,
+            sidebar_width: 360.0,
             scrollback_lines: 30_000,
             font_size: None,
             theme: "dark".to_string(),

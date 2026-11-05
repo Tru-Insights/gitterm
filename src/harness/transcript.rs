@@ -66,9 +66,8 @@ pub fn parse_claude_transcript(text: &str) -> Vec<TranscriptEntry> {
         .collect()
 }
 
-/// `parse_claude_transcript`, keeping each entry's line time. The turn end
-/// closed by a new prompt takes that prompt's time; the one closing the
-/// file has none.
+/// `parse_claude_transcript`, keeping each entry's line time. A synthetic
+/// turn end has no timestamp: the next prompt's time includes idle time.
 pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
     let mut out = Vec::new();
     // Whether assistant activity has been emitted since the last turn end;
@@ -131,7 +130,10 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
                     match &entry {
                         TranscriptEntry::UserPrompt(_) => {
                             if turn_open {
-                                out.push(timed(TranscriptEntry::Harness(turn_completed())));
+                                out.push(TimedEntry {
+                                    at: None,
+                                    entry: TranscriptEntry::Harness(turn_completed()),
+                                });
                                 turn_open = false;
                             }
                         }
@@ -203,6 +205,7 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
             status: TurnStatus::Interrupted,
             usage: Value::Null,
             cost_usd: None,
+            rate_limit: None,
         };
         out.push(TimedEntry {
             at: None,
@@ -277,6 +280,7 @@ fn foreground_end(result: &Value, is_error: bool) -> HarnessEvent {
             result["totalDurationMs"].as_u64(),
         ),
         cost_usd: None,
+        rate_limit: None,
     }
 }
 
@@ -313,6 +317,7 @@ fn task_notification(content: &Value) -> Option<(String, HarnessEvent)> {
             status,
             usage,
             cost_usd: None,
+            rate_limit: None,
         },
     ))
 }
@@ -331,6 +336,7 @@ fn turn_completed() -> HarnessEvent {
         status: TurnStatus::Completed,
         usage: Value::Null,
         cost_usd: None,
+        rate_limit: None,
     }
 }
 
@@ -400,6 +406,9 @@ fn is_cli_injected(text: &str) -> bool {
 /// cut to `MAX_RESULT_CHARS` with a note of how much was dropped.
 fn result_text(content: &Value) -> String {
     let text = result_text_full(content);
+    if crate::html_render::is_render_output(&text) {
+        return text;
+    }
     let total = text.chars().count();
     if total <= MAX_RESULT_CHARS {
         return text;
@@ -465,6 +474,42 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn visual_reply_survives_transcript_and_serde_without_output_truncation() {
+        let html = format!("<h1>{}</h1>", "é".repeat(100_000));
+        let output = serde_json::to_string(&crate::html_render::HtmlRenderResult {
+            html_render: crate::html_render::HtmlRenderRequest {
+                html: html.clone(),
+                height: 600,
+            },
+        })
+        .unwrap();
+        let transcript = [
+            json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"tool_use","id":"visual","name":"mcp__gitterm_tasks__html_render","input":{"html":html,"height":600}}]}}),
+            json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result","tool_use_id":"visual","content":[{"type":"text","text":output}],"is_error":false}]}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let entries = parse_claude_transcript(&transcript);
+        let encoded = serde_json::to_string(&entries).unwrap();
+        let restored: Vec<TranscriptEntry> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(entries, restored);
+        let Some(TranscriptEntry::Harness(HarnessEvent::ItemCompleted {
+            output: restored,
+            is_error,
+            ..
+        })) = restored.iter().find(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Harness(HarnessEvent::ItemCompleted { .. })
+            )
+        })
+        else {
+            panic!("render completion restored");
+        };
+        assert!(!is_error);
+        assert_eq!(restored, &output);
+        assert!(crate::html_render::is_render_output(restored));
+    }
+
     fn line(v: Value) -> String {
         v.to_string()
     }
@@ -500,6 +545,37 @@ mod tests {
             serde_json::to_value(&entries[0]).unwrap(),
             json!({"at": "2026-10-18T10:00:00Z",
                    "entry": {"type": "user_prompt", "data": "list the files"}})
+        );
+    }
+
+    #[test]
+    fn synthetic_turn_end_does_not_inherit_idle_time_from_the_next_prompt() {
+        let lines = [
+            line(
+                json!({"type":"user","timestamp":"2026-10-18T10:00:00Z","isSidechain":false,"message":{"role":"user","content":"first"}}),
+            ),
+            assistant(
+                json!([{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"true"}}]),
+            ),
+            line(
+                json!({"type":"user","timestamp":"2026-10-18T10:30:00Z","isSidechain":false,"message":{"role":"user","content":"second"}}),
+            ),
+        ];
+
+        let entries = parse_claude_transcript_timed(&lines.join("\n"));
+        let synthetic_end = entries
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.entry,
+                    TranscriptEntry::Harness(HarnessEvent::TurnCompleted { .. })
+                )
+            })
+            .expect("the next prompt still closes the preceding turn");
+        assert_eq!(synthetic_end.at, None);
+        assert_eq!(
+            entries.last().unwrap().at.as_deref(),
+            Some("2026-10-18T10:30:00Z")
         );
     }
 

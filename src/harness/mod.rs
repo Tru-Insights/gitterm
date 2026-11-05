@@ -82,6 +82,18 @@ pub enum MessageState {
     Cancelled,
 }
 
+/// A Claude `rate_limit_event` as it arrived (TRU-211). `info` is the
+/// frame's `rate_limit_info`, passed through: the desktop reads it with
+/// `plan_limits::ClaudeLimits`, so an agent and a desktop of different
+/// versions agree on the wire whatever fields the CLI adds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitReading {
+    /// Unix seconds when the frame reached GitTerm (the agent machine's
+    /// clock for a remote chat).
+    pub observed_at: i64,
+    pub info: Value,
+}
+
 /// One normalized event from a harness session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -152,6 +164,14 @@ pub enum HarnessEvent {
         usage: Value,
         /// Claude reports this cumulatively per process.
         cost_usd: Option<f64>,
+        /// The turn's last `rate_limit_event` (Claude only, TRU-211): the
+        /// plan-limit numbers `/usage` shows. Carried here rather than as an
+        /// event of its own so a remote chat can relay it to an older
+        /// desktop, which ignores the unknown field; an unknown event type
+        /// would reach it as an undecodable event and an error in the chat.
+        /// Absent when the turn reported none, and from older peers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit: Option<RateLimitReading>,
     },
     /// Activity inside a subagent the turn spawned (Claude's Agent tool).
     /// `parent_tool_use_id` is the parent's Agent tool call; `event` is one
@@ -393,6 +413,68 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// TurnCompleted as it was before TRU-211, standing in for an older
+    /// desktop or agent on the other end of a remote chat.
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+    enum OldPeerEvent {
+        TurnCompleted {
+            status: TurnStatus,
+            usage: Value,
+            cost_usd: Option<f64>,
+        },
+    }
+
+    #[test]
+    fn rate_limit_on_turn_completed_is_compatible_both_ways() {
+        let info =
+            json!({"status": "allowed", "unifiedWindows": {"five_hour": {"utilization": 0.5}}});
+        let new = HarnessEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            usage: json!({"input_tokens": 1}),
+            cost_usd: Some(0.25),
+            rate_limit: Some(RateLimitReading {
+                observed_at: 1_800_000_000,
+                info: info.clone(),
+            }),
+        };
+        let wire = serde_json::to_string(&new).unwrap();
+        assert_eq!(serde_json::from_str::<HarnessEvent>(&wire).unwrap(), new);
+        // An older peer ignores the field it does not know.
+        assert_eq!(
+            serde_json::from_str::<OldPeerEvent>(&wire).unwrap(),
+            OldPeerEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                usage: json!({"input_tokens": 1}),
+                cost_usd: Some(0.25),
+            }
+        );
+        // An older peer's event has none.
+        let old = serde_json::to_string(&OldPeerEvent::TurnCompleted {
+            status: TurnStatus::Interrupted,
+            usage: Value::Null,
+            cost_usd: None,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<HarnessEvent>(&old).unwrap(),
+            HarnessEvent::TurnCompleted {
+                status: TurnStatus::Interrupted,
+                usage: Value::Null,
+                cost_usd: None,
+                rate_limit: None,
+            }
+        );
+        // No reading: the wire shape is exactly the old one.
+        let none = HarnessEvent::TurnCompleted {
+            status: TurnStatus::Interrupted,
+            usage: Value::Null,
+            cost_usd: None,
+            rate_limit: None,
+        };
+        assert_eq!(serde_json::to_string(&none).unwrap(), old);
+    }
+
     #[test]
     fn events_serialize_with_type_and_data() {
         let ev = HarnessEvent::TextDelta("hi".into());
@@ -404,6 +486,7 @@ mod tests {
             status: TurnStatus::Failed("boom".into()),
             usage: json!({}),
             cost_usd: Some(0.5),
+            rate_limit: None,
         };
         assert_eq!(
             serde_json::to_value(&ev).unwrap(),
@@ -634,16 +717,19 @@ mod tests {
                 status: TurnStatus::Completed,
                 usage: json!({"input_tokens": 4}),
                 cost_usd: Some(0.00378657),
+                rate_limit: None,
             },
             HarnessEvent::TurnCompleted {
                 status: TurnStatus::Interrupted,
                 usage: Value::Null,
                 cost_usd: None,
+                rate_limit: None,
             },
             HarnessEvent::TurnCompleted {
                 status: TurnStatus::Failed("boom".into()),
                 usage: json!({}),
                 cost_usd: None,
+                rate_limit: None,
             },
             HarnessEvent::SubagentEvent {
                 parent_tool_use_id: "a1".into(),

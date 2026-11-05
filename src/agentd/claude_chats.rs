@@ -841,6 +841,7 @@ mod tests {
             mcp_servers: Vec::new(),
             chrome: false,
             guidelines_file: None,
+            guidelines_content: None,
         }
     }
 
@@ -1128,6 +1129,7 @@ mod tests {
                 status: crate::harness::TurnStatus::Completed,
                 usage: serde_json::Value::Null,
                 cost_usd: None,
+                rate_limit: None,
             },
         );
         let chat = h

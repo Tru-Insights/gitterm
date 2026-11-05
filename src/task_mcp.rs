@@ -6,6 +6,7 @@
 
 use crate::harness::acp::AcpMcpServer;
 use crate::harness::claude::ClaudeMcpServer;
+use crate::html_render::{HtmlPreviewRequest, HtmlRenderRequest};
 use axum::{
     body::Body,
     extract::State,
@@ -306,6 +307,7 @@ pub struct TaskSessionEventRequest {
 
 #[derive(Debug, Clone)]
 pub enum TaskControlOperation {
+    HtmlRender(HtmlRenderRequest),
     List(ListTasksRequest),
     Get(GetTaskRequest),
     Create(CreateTaskRequest),
@@ -708,6 +710,71 @@ pub fn missing_caller_error(tool: &str) -> String {
 
 #[tool_router]
 impl TaskMcpTools {
+    #[tool(
+        description = "Check a self-contained HTML page before html_render. Returns a PNG, contentHeight, capturedHeight and console output from isolated headless Chrome (Chrome must be installed). Width defaults to 760 CSS pixels; try 390 for phones. Theme defaults to dark; check light too. Inline CSS/scripts only, no network or local files; data images allowed. Use responsive normal-flow layout, no viewport-height sizing, and CSS variables --bg, --bg-alt, --bg-block, --fg, --fg-muted, --accent, --border, --user, --result, --tool, --warn, --err, --mono. Fit height to content; content taller than 4000px scrolls.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn html_preview(
+        &self,
+        Parameters(request): Parameters<HtmlPreviewRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        if caller_from_query(parts.uri.query()).is_none() {
+            return tool_error(
+                "html_preview requires the calling chat's MCP URL (?caller=<session id>)",
+            );
+        }
+        if let Err(error) = request.validate() {
+            return tool_error(error);
+        }
+        match crate::browser_control::preview_html(request).await {
+            Ok(mut value) => {
+                let Some(png) = value
+                    .as_object_mut()
+                    .and_then(|v| v.remove("png"))
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                else {
+                    return tool_error("html_preview: Chrome omitted the PNG");
+                };
+                let mut result = CallToolResult::success(vec![
+                    ContentBlock::text(value.to_string()),
+                    ContentBlock::image(png, "image/png"),
+                ]);
+                result.structured_content = Some(value);
+                result
+            }
+            Err(error) => tool_error(format!("html_preview failed: {error}")),
+        }
+    }
+
+    #[tool(
+        description = "Show a finished self-contained HTML page (chart, table, diagram or mockup) inline in this chat above your final reply. Check it with html_preview first and use its contentHeight, bounded to 100–4000 CSS pixels. Use responsive normal-flow layout, width:100%, no fixed viewport-height sizing or external dependencies. Inline CSS/scripts only; no network or local files, data images allowed. Use theme CSS variables --bg, --bg-alt, --bg-block, --fg, --fg-muted, --accent, --border, --user, --result, --tool, --warn, --err, --mono; they follow light/dark. Scripts run in an opaque sandbox without app IPC, parent DOM, cookies, forms or popups. HTTP(S) links open in the system browser. Maximum 512 KiB UTF-8. The page persists with the tool call and stays outside the work fold. Requires a local native Claude or ACP chat tab on macOS. Pi and other platforms are refused until equivalent replay and native navigation guards are available.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn html_render(
+        &self,
+        Parameters(request): Parameters<HtmlRenderRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        if let Err(error) = request.validate() {
+            return tool_error(error);
+        }
+        self.dispatch_with_caller(TaskControlOperation::HtmlRender(request), &parts, || {
+            "html_render requires the calling chat's MCP URL (?caller=<session id>)".into()
+        })
+        .await
+    }
+
     #[tool(
         description = "List durable GitTerm tasks and their current state. Use this instead of reading tasks.json directly.",
         annotations(
@@ -1235,13 +1302,14 @@ mod tests {
     #[test]
     fn tool_surface_separates_read_and_write_operations() {
         let routes = TaskMcpTools::tool_router();
-        assert_eq!(routes.list_all().len(), 13);
+        assert_eq!(routes.list_all().len(), 15);
         for name in [
             "task_list",
             "task_get",
             "delegation_get",
             "delegation_list",
             "merge_plan_get",
+            "html_preview",
         ] {
             assert_eq!(
                 routes
@@ -1262,6 +1330,7 @@ mod tests {
             "consult_request",
             "delegate_task",
             "merge_plan_set",
+            "html_render",
         ] {
             assert_eq!(
                 routes
@@ -1527,7 +1596,7 @@ mod tests {
             .expect("authorized MCP initialization timed out")
             .expect("authorized MCP initialization failed");
         let tools = client.list_tools(Default::default()).await.unwrap();
-        assert_eq!(tools.tools.len(), 13);
+        assert_eq!(tools.tools.len(), 15);
         // The merge plan tools as an agent sees them (TRU-173).
         let schema_of = |name: &str| {
             let tool = tools
@@ -1545,6 +1614,17 @@ mod tests {
         }
         let get = schema_of("merge_plan_get");
         assert!(get.get("required").is_none(), "{get}");
+        let render = schema_of("html_render");
+        assert_eq!(render["required"], serde_json::json!(["html", "height"]));
+        assert_eq!(render["properties"]["height"]["minimum"], 100);
+        assert_eq!(render["properties"]["height"]["maximum"], 4000);
+        assert_eq!(render["properties"]["html"]["maxLength"], 524288);
+        let preview = schema_of("html_preview");
+        assert_eq!(preview["required"], serde_json::json!(["html"]));
+        let preview = preview.to_string();
+        for word in ["width", "theme", "dark", "light", "240", "1600"] {
+            assert!(preview.contains(word), "{preview}");
+        }
         let result = client
             .call_tool(
                 rmcp::model::CallToolRequestParams::new("task_list").with_arguments(

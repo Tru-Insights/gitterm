@@ -362,7 +362,8 @@ pub struct NewsItem {
     pub at: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dismissed: bool,
-    /// Sent to the coordinator, by "Tell coordinator" or by itself.
+    /// Sent to the coordinator by itself (TRU-197); an older watch file may
+    /// also carry items sent by hand.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub told: bool,
     /// [`NewsKind::NewActivity`] that is approvals only: informational.
@@ -639,9 +640,24 @@ impl WatchedPr {
     }
 
     /// `interval`, shortened to [`PENDING_INTERVAL`] while the last read
-    /// had pending checks.
+    /// had pending checks or while an open, non-draft PR is waiting on review.
     pub fn interval_for(&self, interval: Duration) -> Duration {
-        if self.snapshot.core.is_some() && self.snapshot.gate_checks() == ChecksState::Pending {
+        let Some(core) = self.snapshot.core.as_ref() else {
+            return interval;
+        };
+        if core.state == Some(PrState::Draft) {
+            return interval;
+        }
+        let pending_checks = self.snapshot.gate_checks() == ChecksState::Pending;
+        let review_active = interval == OPEN_INTERVAL
+            && core.state == Some(PrState::Open)
+            && matches!(
+                self.snapshot.review_decision(),
+                ReviewDecision::ReviewRequested
+                    | ReviewDecision::Approved
+                    | ReviewDecision::ChangesRequested
+            );
+        if pending_checks || review_active {
             interval.min(PENDING_INTERVAL)
         } else {
             interval
@@ -812,6 +828,8 @@ pub fn valid_login(login: &str) -> bool {
 pub enum PrAction {
     Approve,
     Merge(MergeMethod),
+    /// Mark a draft ready for review.
+    Ready,
 }
 
 impl PrAction {
@@ -819,6 +837,7 @@ impl PrAction {
         match self {
             PrAction::Approve => "Approve",
             PrAction::Merge(_) => "Merge",
+            PrAction::Ready => "Ready for review",
         }
     }
 }
@@ -842,6 +861,13 @@ pub fn action_args(action: PrAction, key: &PrKey) -> Vec<String> {
             "--repo".into(),
             key.repo.clone(),
             method.flag().into(),
+        ],
+        PrAction::Ready => vec![
+            "pr".into(),
+            "ready".into(),
+            number,
+            "--repo".into(),
+            key.repo.clone(),
         ],
     }
 }
@@ -1966,6 +1992,41 @@ mod tests {
     }
 
     #[test]
+    fn open_pr_interval_tracks_review_activity_and_keeps_drafts_and_idle_prs_slow() {
+        let review = |author: &str, state: &str| Activity {
+            id: format!("review:{author}"),
+            author: author.to_string(),
+            review_state: state.to_string(),
+        };
+        let mut pr = WatchedPr::new(PrKey::new("acme/api", 12));
+        pr.snapshot = snapshot(
+            PrState::Draft,
+            "a1",
+            vec![check("build", CheckOutcome::Pending)],
+        );
+        assert_eq!(pr.interval_for(OPEN_INTERVAL), OPEN_INTERVAL);
+
+        pr.snapshot = snapshot(PrState::Open, "a1", vec![]);
+        assert_eq!(pr.interval_for(OPEN_INTERVAL), OPEN_INTERVAL);
+
+        if let Some(core) = pr.snapshot.core.as_mut() {
+            core.requested_reviewers = 1;
+        }
+        assert_eq!(
+            pr.snapshot.review_decision(),
+            ReviewDecision::ReviewRequested
+        );
+        assert_eq!(pr.interval_for(OPEN_INTERVAL), PENDING_INTERVAL);
+
+        pr.snapshot.core.as_mut().unwrap().requested_reviewers = 0;
+        pr.snapshot.reviews = vec![review("reviewer", "APPROVED")];
+        assert_eq!(pr.interval_for(OPEN_INTERVAL), PENDING_INTERVAL);
+
+        pr.snapshot.reviews = vec![review("reviewer", "CHANGES_REQUESTED")];
+        assert_eq!(pr.interval_for(OPEN_INTERVAL), PENDING_INTERVAL);
+    }
+
+    #[test]
     fn own_pr_needs_both_author_and_login() {
         assert!(is_own_pr(Some("dev"), Some("dev")));
         assert!(is_own_pr(Some("Dev"), Some("dev")));
@@ -1996,6 +2057,10 @@ mod tests {
         assert_eq!(
             action_command_line(PrAction::Approve, &key, None),
             "gh pr review 12 --repo acme/api --approve"
+        );
+        assert_eq!(
+            action_command_line(PrAction::Ready, &key, None),
+            "gh pr ready 12 --repo acme/api"
         );
         assert!(valid_login("acme-dev"));
         assert!(!valid_login("acme dev"));
