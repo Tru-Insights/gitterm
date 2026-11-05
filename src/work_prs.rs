@@ -95,7 +95,7 @@ pub struct RootPrs {
 #[derive(Debug, Clone)]
 pub struct PrActionConfirm {
     pub key: PrKey,
-    pub approve: bool,
+    pub kind: ActionKind,
     pub method: MergeMethod,
     /// The plan named the method.
     pub method_from_plan: bool,
@@ -108,12 +108,21 @@ pub struct PrActionConfirm {
 
 impl PrActionConfirm {
     fn action(&self) -> PrAction {
-        if self.approve {
-            PrAction::Approve
-        } else {
-            PrAction::Merge(self.method)
+        match self.kind {
+            ActionKind::Approve => PrAction::Approve,
+            ActionKind::Merge => PrAction::Merge(self.method),
+            ActionKind::Ready => PrAction::Ready,
         }
     }
+}
+
+/// Which row action the confirmation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Approve,
+    Merge,
+    /// Mark a draft ready for review.
+    Ready,
 }
 
 /// A plan write finished: restore `previous` on failure, answer the tool.
@@ -136,8 +145,8 @@ pub enum PrEvent {
     Review(PrKey),
     /// The checkout of the PR's head branch, if the overview knows one.
     ReviewResolved(PrKey, Option<PathBuf>),
-    /// Open the confirmation: PR, approve (else merge).
-    ActionOpen(PrKey, bool),
+    /// Open the confirmation for a row action on a PR.
+    ActionOpen(PrKey, ActionKind),
     ActionMethod(MergeMethod),
     ActionRun,
     ActionDone(PrKey, Result<String, String>),
@@ -851,7 +860,7 @@ impl App {
                     }
                 };
             }
-            PrEvent::ActionOpen(key, approve) => {
+            PrEvent::ActionOpen(key, kind) => {
                 let entry = self
                     .prs
                     .plans
@@ -861,7 +870,7 @@ impl App {
                 self.prs.action = Some(PrActionConfirm {
                     account: pr_watch::account_for(key.owner(), &self.github_accounts),
                     key,
-                    approve,
+                    kind,
                     method: method.unwrap_or_default(),
                     method_from_plan: method.is_some(),
                     running: false,
@@ -887,7 +896,7 @@ impl App {
                 }
                 // Merge re-checks the latest read: the checks may have
                 // turned pending or failing since the sheet opened.
-                let reason = if confirm.approve {
+                let reason = if confirm.kind != ActionKind::Merge {
                     None
                 } else {
                     self.watched(&confirm.key)
@@ -1398,6 +1407,9 @@ impl App {
         let font_small = self.ui_font_small();
         let watched = self.watched(key);
         let is_next = row.is_some_and(|row| row.status == RowStatus::Next);
+        let draft = watched
+            .and_then(WatchedPr::brief)
+            .is_some_and(|brief| brief.state == merge_plan::PrState::Draft);
         let mut head = Row::new().spacing(6).align_y(iced::Alignment::Center);
         if let Some(row) = row {
             head = head.push(
@@ -1427,7 +1439,25 @@ impl App {
                 RowStatus::Held(_) => ("held".to_string(), theme.warning()),
                 other => (other.label().to_string(), theme.text_muted()),
             };
-            head = head.push(text(label).size(10).color(color).font(mono));
+            if row.status != RowStatus::Draft {
+                head = head.push(text(label).size(10).color(color).font(mono));
+            }
+        }
+        // A draft can't be merged; say so where it can't be missed.
+        if draft {
+            let warning = theme.warning();
+            head = head.push(
+                container(text("draft").size(font_small).color(warning).font(mono))
+                    .padding([1, 6])
+                    .style(move |_| container::Style {
+                        border: iced::Border {
+                            color: warning,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+            );
         }
         let mut body = Column::new().spacing(2).push(head);
         if let Some(core) = watched.and_then(|w| w.snapshot.core.as_ref()) {
@@ -1506,7 +1536,9 @@ impl App {
             .map(WatchedPr::checks_gate)
             .unwrap_or(pr_watch::ChecksGate::Running)
             .reason();
+        // A draft can't be approved or merged until it is marked ready.
         let gated = |name: &str| match reason {
+            _ if draft => format!("{name} (draft)"),
             Some(reason) if open => format!("{name} ({reason})"),
             _ => name.to_string(),
         };
@@ -1518,13 +1550,25 @@ impl App {
             actions = actions.push(action(
                 gated("Approve"),
                 (open && reason.is_none())
-                    .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), true))),
+                    .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Approve))),
             ));
         }
         actions = actions.push(action(
             gated("Merge"),
-            (open && reason.is_none()).then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), false))),
+            (open && reason.is_none())
+                .then(|| Event::Pr(PrEvent::ActionOpen(key.clone(), ActionKind::Merge))),
         ));
+        if draft {
+            actions = actions.push(
+                button(text("Ready for review").size(10).color(theme.accent()))
+                    .style(self.ghost_button_style())
+                    .padding([2, 8])
+                    .on_press(Event::Pr(PrEvent::ActionOpen(
+                        key.clone(),
+                        ActionKind::Ready,
+                    ))),
+            );
+        }
         body = body.push(actions);
         if let Some(watched) = watched {
             for item in watched.open_news() {
@@ -1901,7 +1945,7 @@ impl App {
         } else {
             theme.danger()
         }));
-        if !confirm.approve {
+        if confirm.kind == ActionKind::Merge {
             let mut methods = Row::new().spacing(4).align_y(iced::Alignment::Center).push(
                 text("Method:")
                     .size(font_small - 1.0)
@@ -2022,7 +2066,7 @@ mod tests {
         PrsState {
             action: Some(PrActionConfirm {
                 key: key.clone(),
-                approve: false,
+                kind: ActionKind::Merge,
                 method: MergeMethod::default(),
                 method_from_plan: false,
                 account: None,

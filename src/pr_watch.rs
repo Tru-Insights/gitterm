@@ -812,6 +812,8 @@ pub fn valid_login(login: &str) -> bool {
 pub enum PrAction {
     Approve,
     Merge(MergeMethod),
+    /// Mark a draft ready for review.
+    Ready,
 }
 
 impl PrAction {
@@ -819,6 +821,7 @@ impl PrAction {
         match self {
             PrAction::Approve => "Approve",
             PrAction::Merge(_) => "Merge",
+            PrAction::Ready => "Ready for review",
         }
     }
 }
@@ -842,6 +845,13 @@ pub fn action_args(action: PrAction, key: &PrKey) -> Vec<String> {
             "--repo".into(),
             key.repo.clone(),
             method.flag().into(),
+        ],
+        PrAction::Ready => vec![
+            "pr".into(),
+            "ready".into(),
+            number,
+            "--repo".into(),
+            key.repo.clone(),
         ],
     }
 }
@@ -1996,6 +2006,10 @@ mod tests {
         assert_eq!(
             action_command_line(PrAction::Approve, &key, None),
             "gh pr review 12 --repo acme/api --approve"
+        );
+        assert_eq!(
+            action_command_line(PrAction::Ready, &key, None),
+            "gh pr ready 12 --repo acme/api"
         );
         assert!(valid_login("acme-dev"));
         assert!(!valid_login("acme dev"));
