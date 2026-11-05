@@ -84,6 +84,18 @@ pub fn subagent_started_at(parent: &str, at_ms: i64) -> Value {
     serde_json::json!({ "kind": "subagent_started_at", "id": parent, "at_ms": at_ms })
 }
 
+/// The start and end of a chat turn, when known (TRU-209).
+pub fn turn_timing(start_ms: Option<i64>, end_ms: Option<i64>) -> Value {
+    let mut payload = serde_json::json!({ "kind": "turn_timing" });
+    if let Some(start_ms) = start_ms {
+        payload["start_ms"] = serde_json::json!(start_ms);
+    }
+    if let Some(end_ms) = end_ms {
+        payload["end_ms"] = serde_json::json!(end_ms);
+    }
+    payload
+}
+
 /// A transcript read-back as page payloads, each subagent start followed
 /// by when it started (from its transcript line). The desktop adds its
 /// delegation anchors on top of this; an agent has none.

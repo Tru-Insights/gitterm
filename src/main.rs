@@ -565,8 +565,33 @@ fn history_timeline(
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
             .map(|at| at.timestamp_millis());
         let event = tab::AgentEvent::from(timed.entry);
+        let is_prompt = matches!(
+            &event,
+            tab::AgentEvent::Other(value)
+                if value.get("type").and_then(|value| value.as_str()) == Some("user_prompt")
+        );
+        let is_turn_end = matches!(
+            &event,
+            tab::AgentEvent::Harness(HarnessEvent::TurnCompleted { .. })
+        );
         let started = tab::subagent_started(&event).map(str::to_string);
+        if is_turn_end {
+            if let Some(at_ms) = at_ms {
+                timeline.push(tab::AgentEvent::Other(gitterm::chat_page::turn_timing(
+                    None,
+                    Some(at_ms),
+                )));
+            }
+        }
         timeline.push(event);
+        if is_prompt {
+            if let Some(at_ms) = at_ms {
+                timeline.push(tab::AgentEvent::Other(gitterm::chat_page::turn_timing(
+                    Some(at_ms),
+                    None,
+                )));
+            }
+        }
         if let (Some(parent), Some(at_ms)) = (started, at_ms) {
             timeline.push(tab::AgentEvent::Other(tab::subagent_started_at(
                 &parent, at_ms,
@@ -22509,6 +22534,7 @@ fi
                 // Claude gets every message with an id, so the CLI reports
                 // its queue state and a queued one can be withdrawn.
                 let mut prompt = prompt;
+                let mut prompt_markers = Vec::new();
                 // Issue keys the human names feed the chat's facts (TRU-166);
                 // written with the turn's tool calls.
                 for ws in &mut self.workspaces {
@@ -22656,7 +22682,8 @@ fi
                                     Err(e) => eprintln!("AgentSubmitPrompt failed: {}", e),
                                 }
                             }
-                            session.record(echo.clone());
+                            let (_, after) = session.record(echo.clone());
+                            prompt_markers.extend(after);
                             if submitted {
                                 if let Some(task_id) = tab_task_id {
                                     t.task_live_state = Some(TaskSessionLiveState::Working);
@@ -22751,7 +22778,8 @@ fi
                                     }
                                 }
                             }
-                            session.record(echo.clone());
+                            let (_, after) = session.record(echo.clone());
+                            prompt_markers.extend(after);
                             if let Some(e) = send_failed {
                                 // The command channel is dead but ProcessExited
                                 // may never arrive (the session thread can fail
@@ -22803,7 +22831,8 @@ fi
                                 submitted = true;
                             }
                         }
-                        session.conversation.push(echo.clone());
+                        let (_, after) = session.record(echo.clone());
+                        prompt_markers.extend(after);
                         if submitted {
                             if let Some(task_id) = tab_task_id {
                                 t.task_live_state = Some(TaskSessionLiveState::Working);
@@ -22818,6 +22847,9 @@ fi
                 }
                 // Also push the echo into the tab's chat page, if it has one.
                 push_agent_event_to_webview(tab_id, &echo);
+                for marker in &prompt_markers {
+                    push_agent_event_to_webview(tab_id, marker);
+                }
                 if images_not_sent > 0 {
                     eprintln!(
                         "AgentSubmitPrompt: tab {tab_id}: {images_not_sent} image(s) not sent (non-Claude backend)"
@@ -24030,8 +24062,14 @@ fi
                                         }
                                     }
                                 }
+                                let (before, after) = session.record(ev.clone());
+                                for marker in &before {
+                                    push_agent_event_to_webview(tab_id, marker);
+                                }
                                 push_agent_event_to_webview(tab_id, &ev);
-                                session.record(ev);
+                                for marker in &after {
+                                    push_agent_event_to_webview(tab_id, marker);
+                                }
                             }
                             if let Some(id) = new_session_id {
                                 // A task's sessions belong to the task, not
@@ -44816,6 +44854,40 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn claude_history_timestamps_become_turn_replay_markers() {
+        use gitterm::harness::transcript::{TimedEntry, TranscriptEntry};
+
+        let timeline = history_timeline(
+            vec![
+                TimedEntry {
+                    at: Some("2026-11-05T10:00:00Z".into()),
+                    entry: TranscriptEntry::UserPrompt("hello".into()),
+                },
+                TimedEntry {
+                    at: Some("2026-11-05T10:00:04Z".into()),
+                    entry: TranscriptEntry::Harness(HarnessEvent::TurnCompleted {
+                        status: TurnStatus::Completed,
+                        usage: serde_json::Value::Null,
+                        cost_usd: None,
+                        rate_limit: None,
+                    }),
+                },
+            ],
+            &[],
+        );
+        let markers: Vec<_> = timeline
+            .iter()
+            .filter_map(|event| match event {
+                tab::AgentEvent::Other(value) if value["kind"] == "turn_timing" => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0]["start_ms"], 1_793_872_800_000_i64);
+        assert_eq!(markers[1]["end_ms"], 1_793_872_804_000_i64);
+    }
 
     #[test]
     fn connect_form_closes_only_when_its_saved_host_connects() {

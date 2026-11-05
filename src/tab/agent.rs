@@ -280,6 +280,12 @@ pub(crate) fn subagent_started_at(parent: &str, at_ms: i64) -> serde_json::Value
     gitterm::chat_page::subagent_started_at(parent, at_ms)
 }
 
+fn unix_ms(now: std::time::SystemTime) -> Option<i64> {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as i64)
+}
+
 /// Whether a resumed session's earlier timeline has been read back from
 /// its transcript (Claude backend; TRU-140).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,26 +373,59 @@ impl AgentSession {
     /// streaming fragments so tab switches replay a compact buffer. A
     /// subagent's start is followed by when it started, so a rebuilt page
     /// still knows its elapsed time and where it falls in the roster.
-    pub(crate) fn record(&mut self, ev: AgentEvent) {
+    pub(crate) fn record(&mut self, ev: AgentEvent) -> (Vec<AgentEvent>, Vec<AgentEvent>) {
         self.revision = self.revision.wrapping_add(1);
-        self.live_times.observe(&ev, std::time::SystemTime::now());
+        let now = std::time::SystemTime::now();
+        self.live_times.observe(&ev, now);
+        let now_ms = unix_ms(now);
+        let turn_started = matches!(&ev, AgentEvent::Harness(HarnessEvent::TurnStarted { .. }))
+            || matches!(
+                &ev,
+                AgentEvent::Other(value)
+                    if value.get("type").and_then(|v| v.as_str()) == Some("user_prompt")
+                        && value.get("queued").and_then(|v| v.as_bool()) != Some(true)
+            );
+        let turn_ended = matches!(&ev, AgentEvent::Harness(HarnessEvent::TurnCompleted { .. }));
+        let timing =
+            match (turn_started, turn_ended, now_ms) {
+                (true, false, Some(ms)) => Some(AgentEvent::Other(
+                    gitterm::chat_page::turn_timing(Some(ms), None),
+                )),
+                (false, true, Some(ms)) => Some(AgentEvent::Other(
+                    gitterm::chat_page::turn_timing(None, Some(ms)),
+                )),
+                _ => None,
+            };
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        if turn_ended {
+            if let Some(timing) = timing.clone() {
+                self.conversation.push(timing.clone());
+                before.push(timing);
+            }
+        }
         if let (Some(AgentEvent::Harness(last)), AgentEvent::Harness(next)) =
             (self.conversation.last_mut(), &ev)
         {
             if merge_fragment(last, next) {
-                return;
+                return (before, after);
             }
         }
         let started = subagent_started(&ev).map(str::to_string);
         self.conversation.push(ev);
-        if let Some(parent) = started {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            self.conversation
-                .push(AgentEvent::Other(subagent_started_at(&parent, now_ms)));
+        if turn_started {
+            if let Some(timing) = timing {
+                self.conversation.push(timing.clone());
+                after.push(timing);
+            }
         }
+        if let Some(parent) = started {
+            if let Some(now_ms) = now_ms {
+                self.conversation
+                    .push(AgentEvent::Other(subagent_started_at(&parent, now_ms)));
+            }
+        }
+        (before, after)
     }
 
     /// The Claude process settings for this tab. `model` "default" (or
@@ -1132,6 +1171,93 @@ mod tests {
                 .unwrap(),
             serde_json::json!({"type": "user_prompt", "text": "hi"})
         );
+    }
+
+    #[test]
+    fn recorded_turn_times_round_trip_into_replay_payloads() {
+        let mut session = AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        session.record(AgentEvent::user_prompt("timed"));
+        session.record(AgentEvent::Harness(HarnessEvent::TurnStarted {
+            session_id: None,
+            model: None,
+        }));
+        session.record(AgentEvent::Harness(HarnessEvent::ItemStarted {
+            id: "tool-1".into(),
+            kind: gitterm::harness::ItemKind::ToolCall {
+                name: "Bash".into(),
+                input: serde_json::json!({"command":"true"}),
+            },
+        }));
+        session.record(AgentEvent::Harness(HarnessEvent::TurnCompleted {
+            status: gitterm::harness::TurnStatus::Completed,
+            usage: serde_json::Value::Null,
+            cost_usd: None,
+            rate_limit: None,
+        }));
+
+        let payloads: Vec<_> = session
+            .conversation
+            .iter()
+            .filter_map(AgentEvent::webview_payload)
+            .collect();
+        let encoded = serde_json::to_string(&payloads).unwrap();
+        let replay: Vec<serde_json::Value> = serde_json::from_str(&encoded).unwrap();
+        let start = replay
+            .iter()
+            .find(|payload| payload["kind"] == "turn_timing" && payload.get("start_ms").is_some())
+            .unwrap();
+        let end = replay
+            .iter()
+            .find(|payload| payload["kind"] == "turn_timing" && payload.get("end_ms").is_some())
+            .unwrap();
+        assert!(start["start_ms"].as_i64().is_some());
+        assert!(end["end_ms"].as_i64().is_some());
+        assert!(replay
+            .iter()
+            .any(|payload| payload["event"]["type"] == "turn_started"));
+        assert!(replay
+            .iter()
+            .any(|payload| payload["event"]["type"] == "turn_completed"));
+    }
+
+    #[test]
+    fn legacy_conversation_without_turn_times_still_has_replay_events() {
+        let old_conversation = vec![
+            AgentEvent::user_prompt("legacy"),
+            AgentEvent::Harness(HarnessEvent::TurnCompleted {
+                status: gitterm::harness::TurnStatus::Completed,
+                usage: serde_json::Value::Null,
+                cost_usd: None,
+                rate_limit: None,
+            }),
+        ];
+        let payloads: Vec<_> = old_conversation
+            .iter()
+            .filter_map(AgentEvent::webview_payload)
+            .collect();
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads
+            .iter()
+            .all(|payload| payload["kind"] != "turn_timing"));
+
+        let mut queued = AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        queued.record(AgentEvent::relayed_prompt(
+            Some("queued-1"),
+            "next",
+            0,
+            true,
+        ));
+        assert!(queued.conversation.iter().all(|event| event
+            .webview_payload()
+            .is_none_or(|p| p["kind"] != "turn_timing")));
     }
 
     #[test]

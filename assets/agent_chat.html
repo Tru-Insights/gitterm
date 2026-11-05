@@ -929,11 +929,16 @@
   // line that opens to the cards. A message sent mid-turn ends one fold and
   // starts the next. What needs the human never folds: error blocks,
   // delegation cards, warnings, a running subagent's card and a card whose
-  // request still waits. A running turn shows its work live. A replay folds
-  // as live did, from the same events; it carries no turn times, so its
-  // rows read "Worked". Folds start closed and are not remembered.
+  // request still waits. A running turn shows its work live. Replay timing
+  // markers preserve durations; old conversations without markers keep the
+  // "Worked" label. Folds start closed and are not remembered.
   function beginTurn() {
     turn = { startMs: replaying ? null : Date.now(), blocks: [] };
+  }
+  function turnTiming(event) {
+    if (!turn) return;
+    if (typeof event.start_ms === 'number') turn.startMs = event.start_ms;
+    if (typeof event.end_ms === 'number') turn.endMs = event.end_ms;
   }
   // The turn ended: fold it (`fold`), or leave it as it is (a pi turn, a
   // prompt that was never sent).
@@ -941,7 +946,7 @@
     const t = turn;
     turn = null;
     if (!t || !fold) return;
-    keepView(() => foldTurn(t, replaying ? null : Date.now()));
+    keepView(() => foldTurn(t, t.endMs != null ? t.endMs : (replaying ? null : Date.now())));
   }
   // Run `change` to the timeline without moving what the human reads: a
   // view following the latest stays at the bottom; one scrolled back keeps
@@ -3419,6 +3424,7 @@
       if (event.kind === 'harness') { harnessEvent(event.event); return; }
       if (event.kind === 'delegation_anchor') { delegationAnchor(event.delegation_id); return; }
       if (event.kind === 'subagent_started_at') { subagentStartedAt(event.id, event.at_ms); return; }
+      if (event.kind === 'turn_timing') { turnTiming(event); return; }
       if (event.kind === 'delegation') { delegationEvent(event); return; }
       if (event.type === 'user_prompt') { showUserPrompt(event); return; }
       legacyEvent(event);
