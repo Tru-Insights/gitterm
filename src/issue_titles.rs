@@ -136,6 +136,28 @@ pub fn try_order(
     order
 }
 
+/// Workspace segment from a canonical Linear issue URL, for caches written
+/// before workspace identity was stored explicitly.
+pub fn workspace_from_issue_url(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("linear.app")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    let workspace = segments.next()?;
+    let issue_segment = segments.next()?;
+    let key = segments.next()?;
+    if !valid_slug(workspace) || issue_segment != "issue" || key_prefix(key).is_none() {
+        return None;
+    }
+    Some(workspace.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Issues.
 
@@ -224,6 +246,9 @@ pub struct CachedIssue {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The workspace that resolved this issue, retained for page-store selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,10 +261,11 @@ pub struct CachedIssue {
 }
 
 impl CachedIssue {
-    pub fn found(info: IssueInfo, at: &str) -> Self {
+    pub fn found(info: IssueInfo, workspace: &str, at: &str) -> Self {
         Self {
             title: Some(info.title),
             url: Some(info.url),
+            workspace: Some(workspace.to_string()),
             state: Some(info.state),
             assignee: info.assignee,
             fetched_at: at.to_string(),
@@ -263,6 +289,9 @@ pub fn needs_fetch(entry: Option<&CachedIssue>, now: chrono::DateTime<chrono::Ut
     let Some(entry) = entry else {
         return true;
     };
+    if !entry.not_found && entry.workspace.is_none() {
+        return true;
+    }
     let Some(age) = chrono::DateTime::parse_from_rfc3339(&entry.fetched_at)
         .ok()
         .map(|at| now.signed_duration_since(at))
@@ -336,7 +365,7 @@ impl IssueTitlesFile {
                         self.prefixes.insert(prefix.to_string(), workspace.clone());
                     }
                     self.issues
-                        .insert(key.clone(), CachedIssue::found(info.clone(), at));
+                        .insert(key.clone(), CachedIssue::found(info.clone(), workspace, at));
                 }
                 KeyResult::NotFound => {
                     self.issues.insert(key.clone(), CachedIssue::not_found(at));
@@ -683,6 +712,28 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
         assert_eq!(try_order("ABC-1", &prefixes, &workspaces), workspaces);
     }
 
+    #[test]
+    fn legacy_issue_cache_uses_a_validated_linear_url_and_refreshes() {
+        let legacy: CachedIssue = serde_json::from_str(
+            r#"{"url":"https://linear.app/sample-workspace/issue/ABC-12/sample-title","fetched_at":"2026-01-01T10:00:00Z","title":"Sample issue","state":"Todo"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.workspace, None);
+        assert_eq!(
+            workspace_from_issue_url(legacy.url.as_deref().unwrap()),
+            Some("sample-workspace".to_string())
+        );
+        assert!(needs_fetch(Some(&legacy), at("2026-01-01T10:00:01Z")));
+        assert_eq!(
+            workspace_from_issue_url("https://example.test/sample-workspace/issue/ABC-12/x"),
+            None
+        );
+        assert_eq!(
+            workspace_from_issue_url("https://linear.app/sample-workspace/issue/not-an-issue/x"),
+            None
+        );
+    }
+
     fn at(stamp: &str) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339(stamp)
             .unwrap()
@@ -695,7 +746,7 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
 
     #[test]
     fn found_entries_refresh_after_an_hour() {
-        let entry = CachedIssue::found(info(), "2026-01-01T10:00:00Z");
+        let entry = CachedIssue::found(info(), "globex", "2026-01-01T10:00:00Z");
         assert!(!needs_fetch(Some(&entry), at("2026-01-01T10:59:59Z")));
         assert!(needs_fetch(Some(&entry), at("2026-01-01T11:00:00Z")));
         assert!(needs_fetch(None, at("2026-01-01T10:00:00Z")));
@@ -711,7 +762,7 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
 
     #[test]
     fn bad_or_future_stamps_are_stale() {
-        let mut entry = CachedIssue::found(info(), "yesterday");
+        let mut entry = CachedIssue::found(info(), "globex", "yesterday");
         assert!(needs_fetch(Some(&entry), at("2026-01-01T10:00:00Z")));
         entry.fetched_at = "2026-01-01T12:00:00Z".to_string();
         assert!(needs_fetch(Some(&entry), at("2026-01-01T10:00:00Z")));
@@ -722,7 +773,7 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
         let mut file = IssueTitlesFile::default();
         file.issues.insert(
             "XYZ-3".to_string(),
-            CachedIssue::found(info(), "2026-01-01T09:00:00Z"),
+            CachedIssue::found(info(), "globex", "2026-01-01T09:00:00Z"),
         );
         let outcome = RoundOutcome {
             results: vec![
@@ -744,6 +795,7 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
         assert_eq!(file.prefixes.get("ABC").map(String::as_str), Some("globex"));
         let found = &file.issues["ABC-12"];
         assert_eq!(found.title.as_deref(), Some("Make the widget faster"));
+        assert_eq!(found.workspace.as_deref(), Some("globex"));
         assert!(!found.not_found);
         assert!(file.issues["ABC-99"].not_found);
         assert_eq!(file.issues["ABC-99"].url, None);
@@ -758,7 +810,7 @@ globex      Globex Corp Pat Example <pat@example.com>\n";
         let mut file = IssueTitlesFile::default();
         file.issues.insert(
             "ABC-12".to_string(),
-            CachedIssue::found(info(), "2026-01-01T10:00:00Z"),
+            CachedIssue::found(info(), "globex", "2026-01-01T10:00:00Z"),
         );
         file.issues.insert(
             "ABC-99".to_string(),

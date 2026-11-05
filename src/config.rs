@@ -973,6 +973,21 @@ mod tests {
     }
 
     #[test]
+    fn delegation_auto_tell_defaults_on_and_persists_the_off_setting() {
+        let missing: Config = serde_json::from_str(r#"{}"#).unwrap();
+        let empty: Config = serde_json::from_str(r#"{"delegations":{}}"#).unwrap();
+        assert!(missing.delegations.auto_tell && empty.delegations.auto_tell);
+        assert!(Config::default().delegations.auto_tell);
+        let off: Config = serde_json::from_str(r#"{"delegations":{"auto_tell":false}}"#).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        save_settings_to(dir.path(), &off).unwrap();
+        let saved: Config =
+            serde_json::from_slice(&std::fs::read(dir.path().join(SETTINGS_FILE)).unwrap())
+                .unwrap();
+        assert!(!saved.delegations.auto_tell);
+    }
+
+    #[test]
     fn pr_watch_auto_tell_defaults_on_and_can_be_switched_off() {
         let config: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert!(config.pr_watch.auto_tell);
@@ -1173,7 +1188,7 @@ fn default_ui_font() -> f32 {
 }
 
 fn default_sidebar_width() -> f32 {
-    280.0
+    360.0
 }
 
 fn default_scrollback_lines() -> usize {
@@ -1290,6 +1305,9 @@ pub struct Config {
     /// The PR watch (TRU-197).
     #[serde(default)]
     pub pr_watch: PrWatchConfig,
+    /// Automatic delegation results in chat (TRU-218).
+    #[serde(default)]
+    pub delegations: DelegationsConfig,
     /// ~/Work committing and pushing itself (TRU-201).
     #[serde(default)]
     pub work_notes: WorkNotesConfig,
@@ -1304,7 +1322,7 @@ pub struct Config {
 /// `auto_tell`: send actionable PR news (merge conflicts, failed checks,
 /// review comments, changes requested) to the coordinator's open chat by
 /// itself when its turn is idle. Off, news only shows on the overview and
-/// the chip, and "Tell coordinator" sends it.
+/// the chip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrWatchConfig {
     #[serde(default = "default_true")]
@@ -1312,6 +1330,20 @@ pub struct PrWatchConfig {
 }
 
 impl Default for PrWatchConfig {
+    fn default() -> Self {
+        Self { auto_tell: true }
+    }
+}
+
+/// `"delegations": { "auto_tell": false }` in settings.json leaves
+/// results on their cards for manual delivery. Defaults on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationsConfig {
+    #[serde(default = "default_true")]
+    pub auto_tell: bool,
+}
+
+impl Default for DelegationsConfig {
     fn default() -> Self {
         Self { auto_tell: true }
     }
@@ -1616,7 +1648,7 @@ impl Default for Config {
         Self {
             terminal_font_size: 14.0,
             ui_font_size: 13.0,
-            sidebar_width: 280.0,
+            sidebar_width: 360.0,
             scrollback_lines: 30_000,
             font_size: None,
             theme: "dark".to_string(),
@@ -1638,6 +1670,7 @@ impl Default for Config {
             usage: gitterm::usage::UsageConfig::default(),
             notifications: NotificationsConfig::default(),
             pr_watch: PrWatchConfig::default(),
+            delegations: DelegationsConfig::default(),
             work_notes: WorkNotesConfig::default(),
         }
     }
