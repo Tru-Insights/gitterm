@@ -42,6 +42,29 @@
     check('failed tool does not publish', document.querySelectorAll('.html-render iframe').length === 1);
     window.__appendEvent(start('unrelated','Read',input));window.__appendEvent(H('item_completed',{id:'unrelated',output:JSON.stringify({html_render:input}),is_error:false}));
     check('unrelated tool output cannot publish HTML',document.querySelectorAll('.html-render iframe').length===1);
+    const baseMs = Date.now() - 5000;
+    window.__resetConversation();
+    window.__replay([
+      prompt,
+      { kind: 'turn_timing', start_ms: baseMs },
+      H('turn_started', {}), start('first-work', 'Read', {}), done('first-work'),
+      { kind: 'turn_timing', split_ms: baseMs + 2000 },
+      { type: 'user_prompt', text: 'Queued follow-up', id: 'queued-follow-up', queued: true },
+      start('second-work', 'Read', {}), done('second-work'),
+      { kind: 'turn_timing', end_ms: baseMs + 5000 },
+      H('text_delta', 'Finished'), end,
+    ]);
+    check('replay preserves durations on both sides of a queued prompt',
+      Array.from(document.querySelectorAll('.turn-fold .tf-label')).map((el) => el.textContent).join('|') === 'Worked for 2s|Worked for 3s');
+    window.__resetConversation();
+    window.__replay([
+      prompt, { kind: 'turn_timing', start_ms: baseMs }, H('turn_started', {}),
+      start('exited-work', 'Read', {}), done('exited-work'),
+      { kind: 'turn_timing', end_ms: baseMs + 4000 },
+      H('process_exited', { code: 1 }),
+    ]);
+    check('replay preserves duration when the process exits mid-turn',
+      document.querySelector('.turn-fold .tf-label')?.textContent === 'Worked for 4s');
     check('byte and height limits in UI', !GitTermHtml.valid('é'.repeat(262145), 240) && !GitTermHtml.valid('ok', 99) && !GitTermHtml.valid('ok', 4001));
     check('safe URLs reject scripts/files/relative/credentials', ['javascript:alert(1)', 'file:///tmp/x', '//example.com', 'https://u:p@example.com'].every((url) => GitTermHtml.httpUrl(url) === null));
     check('safe URL accepts http(s)', GitTermHtml.httpUrl('https://example.com/path') === 'https://example.com/path');

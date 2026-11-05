@@ -97,6 +97,11 @@ pub fn turn_timing(start_ms: Option<i64>, end_ms: Option<i64>) -> Value {
     payload
 }
 
+/// The timestamp at which a queued prompt splits an active turn fold.
+pub fn turn_split_time(split_ms: i64) -> Value {
+    serde_json::json!({ "kind": "turn_timing", "split_ms": split_ms })
+}
+
 /// A transcript read-back as page payloads, each subagent start followed
 /// by when it started (from its transcript line). The desktop adds its
 /// delegation anchors on top of this; an agent has none.

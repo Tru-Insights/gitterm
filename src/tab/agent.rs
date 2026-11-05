@@ -385,7 +385,18 @@ impl AgentSession {
                     if value.get("type").and_then(|v| v.as_str()) == Some("user_prompt")
                         && value.get("queued").and_then(|v| v.as_bool()) != Some(true)
             );
-        let turn_ended = matches!(&ev, AgentEvent::Harness(HarnessEvent::TurnCompleted { .. }));
+        let queued_prompt = matches!(
+            &ev,
+            AgentEvent::Other(value)
+                if value.get("type").and_then(|v| v.as_str()) == Some("user_prompt")
+                    && value.get("queued").and_then(|v| v.as_bool()) == Some(true)
+        );
+        let turn_ended = matches!(
+            &ev,
+            AgentEvent::Harness(
+                HarnessEvent::TurnCompleted { .. } | HarnessEvent::ProcessExited { .. }
+            )
+        );
         let timing =
             match (turn_started, turn_ended, now_ms) {
                 (true, false, Some(ms)) => Some(AgentEvent::Other(
@@ -402,6 +413,13 @@ impl AgentSession {
             if let Some(timing) = timing.clone() {
                 self.conversation.push(timing.clone());
                 before.push(timing);
+            }
+        }
+        if queued_prompt {
+            if let Some(ms) = now_ms {
+                let marker = AgentEvent::Other(gitterm::chat_page::turn_split_time(ms));
+                self.conversation.push(marker.clone());
+                before.push(marker);
             }
         }
         if let (Some(AgentEvent::Harness(last)), AgentEvent::Harness(next)) =
@@ -1225,6 +1243,55 @@ mod tests {
     }
 
     #[test]
+    fn queued_prompt_and_process_exit_timing_survive_conversation_replay() {
+        let mut session = AgentSession::new(AgentBackendConfig::Claude {
+            model: "default".into(),
+            permission_mode: None,
+            effort: None,
+        });
+        session.record(AgentEvent::user_prompt("first"));
+        session.record(AgentEvent::Harness(HarnessEvent::ItemStarted {
+            id: "tool-1".into(),
+            kind: gitterm::harness::ItemKind::ToolCall {
+                name: "Bash".into(),
+                input: serde_json::json!({"command":"true"}),
+            },
+        }));
+        session.record(AgentEvent::relayed_prompt(
+            Some("queued-1"),
+            "second",
+            0,
+            true,
+        ));
+        session.record(AgentEvent::Harness(HarnessEvent::ProcessExited {
+            code: Some(1),
+        }));
+
+        let replay: Vec<_> = session
+            .conversation
+            .iter()
+            .filter_map(AgentEvent::webview_payload)
+            .collect();
+        let split = replay
+            .iter()
+            .position(|payload| {
+                payload["kind"] == "turn_timing" && payload.get("split_ms").is_some()
+            })
+            .expect("queued prompt split timestamp is persisted");
+        let queued = replay
+            .iter()
+            .position(|payload| payload["type"] == "user_prompt" && payload["id"] == "queued-1")
+            .expect("queued prompt is persisted");
+        assert!(split < queued, "split time precedes its prompt boundary");
+        assert!(
+            replay.iter().any(|payload| {
+                payload["kind"] == "turn_timing" && payload["end_ms"].as_i64().is_some()
+            }),
+            "process exit persists a turn end time"
+        );
+    }
+
+    #[test]
     fn legacy_conversation_without_turn_times_still_has_replay_events() {
         let old_conversation = vec![
             AgentEvent::user_prompt("legacy"),
@@ -1255,9 +1322,14 @@ mod tests {
             0,
             true,
         ));
-        assert!(queued.conversation.iter().all(|event| event
-            .webview_payload()
-            .is_none_or(|p| p["kind"] != "turn_timing")));
+        let queued_timing: Vec<_> = queued
+            .conversation
+            .iter()
+            .filter_map(AgentEvent::webview_payload)
+            .filter(|payload| payload["kind"] == "turn_timing")
+            .collect();
+        assert_eq!(queued_timing.len(), 1);
+        assert!(queued_timing[0]["split_ms"].as_i64().is_some());
     }
 
     #[test]

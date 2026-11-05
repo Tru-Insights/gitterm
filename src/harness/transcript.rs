@@ -66,9 +66,8 @@ pub fn parse_claude_transcript(text: &str) -> Vec<TranscriptEntry> {
         .collect()
 }
 
-/// `parse_claude_transcript`, keeping each entry's line time. The turn end
-/// closed by a new prompt takes that prompt's time; the one closing the
-/// file has none.
+/// `parse_claude_transcript`, keeping each entry's line time. A synthetic
+/// turn end has no timestamp: the next prompt's time includes idle time.
 pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
     let mut out = Vec::new();
     // Whether assistant activity has been emitted since the last turn end;
@@ -131,7 +130,10 @@ pub fn parse_claude_transcript_timed(text: &str) -> Vec<TimedEntry> {
                     match &entry {
                         TranscriptEntry::UserPrompt(_) => {
                             if turn_open {
-                                out.push(timed(TranscriptEntry::Harness(turn_completed())));
+                                out.push(TimedEntry {
+                                    at: None,
+                                    entry: TranscriptEntry::Harness(turn_completed()),
+                                });
                                 turn_open = false;
                             }
                         }
@@ -543,6 +545,37 @@ mod tests {
             serde_json::to_value(&entries[0]).unwrap(),
             json!({"at": "2026-10-18T10:00:00Z",
                    "entry": {"type": "user_prompt", "data": "list the files"}})
+        );
+    }
+
+    #[test]
+    fn synthetic_turn_end_does_not_inherit_idle_time_from_the_next_prompt() {
+        let lines = [
+            line(
+                json!({"type":"user","timestamp":"2026-10-18T10:00:00Z","isSidechain":false,"message":{"role":"user","content":"first"}}),
+            ),
+            assistant(
+                json!([{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"true"}}]),
+            ),
+            line(
+                json!({"type":"user","timestamp":"2026-10-18T10:30:00Z","isSidechain":false,"message":{"role":"user","content":"second"}}),
+            ),
+        ];
+
+        let entries = parse_claude_transcript_timed(&lines.join("\n"));
+        let synthetic_end = entries
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.entry,
+                    TranscriptEntry::Harness(HarnessEvent::TurnCompleted { .. })
+                )
+            })
+            .expect("the next prompt still closes the preceding turn");
+        assert_eq!(synthetic_end.at, None);
+        assert_eq!(
+            entries.last().unwrap().at.as_deref(),
+            Some("2026-10-18T10:30:00Z")
         );
     }
 
