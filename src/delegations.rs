@@ -1440,6 +1440,37 @@ pub struct SendBatch {
     pub message: String,
 }
 
+impl SendBatch {
+    /// No durable in-flight marker: failure or a crash before acknowledgement
+    /// leaves the report retryable. A crash after sending can cause a duplicate.
+    pub fn record_submission(
+        &self,
+        store: &mut TaskStore,
+        submitted: bool,
+        timestamp: &str,
+    ) -> Result<(), crate::tasks::TaskStoreError> {
+        if submitted {
+            store.mark_delegations_delivered(&self.delegation_ids, timestamp)?;
+        }
+        Ok(())
+    }
+}
+
+/// Prefer the original chat tab; Resume as Chat can host the persisted
+/// conversation under a new tab identity. Callers supply chat tabs only.
+pub fn parent_tab_id<'a>(
+    parent: &DelegationParent,
+    tabs: impl Iterator<Item = (usize, &'a str, Option<&'a str>)> + Clone,
+) -> Option<usize> {
+    tabs.clone()
+        .find(|(_, uid, _)| *uid == parent.session_uid)
+        .or_else(|| {
+            let chat = parent.chat_session_id.as_deref()?;
+            tabs.into_iter().find(|(_, _, id)| *id == Some(chat))
+        })
+        .map(|(id, _, _)| id)
+}
+
 /// One bounded prompt for all waiting results. Reserve a full-record pointer
 /// for each, sharing the remaining space equally. If even the pointers do not
 /// fit, the overflow stays queued for the next turn.
@@ -2104,6 +2135,98 @@ mod tests {
     }
 
     #[test]
+    fn failed_submission_and_crash_before_acknowledgement_leave_results_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(crate::tasks::TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        let finished = completed_review(1);
+        let mut requested = finished.clone();
+        requested.status = DelegationStatus::Requested;
+        requested.result = None;
+        store.insert_delegation(requested).unwrap();
+        store
+            .complete_delegation("d-7", finished.result.unwrap(), "t2")
+            .unwrap();
+        let mut held = Vec::new();
+        queue_auto_sends(&[store.delegation("d-7").unwrap()], true, &mut held).unwrap();
+        let batch = next_held_send(&mut held, false).unwrap();
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+        drop(receiver);
+        let submitted = sender.send(batch.message.clone()).is_ok();
+        assert!(!submitted);
+        batch
+            .record_submission(&mut store, submitted, "t3")
+            .unwrap();
+        let result = store.delegation("d-7").unwrap();
+        assert!(!result.is_delivered());
+        assert_eq!(
+            decide_send(false, result.is_delivered(), &held, "d-7"),
+            SendDecision::SendNow
+        );
+        let card = card_payload(result, None, false, None, temp.path()).unwrap();
+        assert!(card["delegation"].get("delivered").is_none());
+        assert!(card["delegation"].get("delivered_at").is_none());
+
+        // A later tick reconstructs the failed batch from the durable results.
+        queue_auto_sends(&[result], true, &mut held).unwrap();
+        assert_eq!(next_held_send(&mut held, false).unwrap(), batch);
+        // Simulate a crash after preparing the send (no acknowledgement).
+        drop(store);
+        let store = TaskStore::load(&path).unwrap();
+        held.clear();
+        queue_auto_sends(&[store.delegation("d-7").unwrap()], true, &mut held).unwrap();
+        let retry = next_held_send(&mut held, false).unwrap();
+        assert_eq!(retry, batch);
+
+        // Accept the retry, then crash before writing the acknowledgement:
+        // a duplicate is allowed, but the result must remain resendable.
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        sender.send(retry.message.clone()).unwrap();
+        drop(store);
+        let mut store = TaskStore::load(&path).unwrap();
+        assert!(!store.delegation("d-7").unwrap().is_delivered());
+        assert_eq!(receiver.try_recv().unwrap(), retry.message);
+        retry.record_submission(&mut store, true, "t4").unwrap();
+        let store = TaskStore::load(&path).unwrap();
+        assert!(store.delegation("d-7").unwrap().is_delivered());
+        queue_auto_sends(&[store.delegation("d-7").unwrap()], true, &mut held).unwrap();
+        assert!(next_held_send(&mut held, false).is_none());
+    }
+
+    #[test]
+    fn resumed_chat_receives_pending_results_by_persisted_conversation() {
+        let mut result = completed_review(1);
+        result.parent.chat_session_id = Some("conversation-1".into());
+        let original = (
+            1,
+            result.parent.session_uid.as_str(),
+            Some("conversation-1"),
+        );
+        let resumed = (2, "fresh-tab-uid", Some("conversation-1"));
+        let unrelated = (3, "other-tab", Some("conversation-2"));
+        assert_eq!(
+            parent_tab_id(&result.parent, [resumed, original].into_iter()),
+            Some(1)
+        );
+        let tabs = [unrelated, resumed];
+        assert_eq!(parent_tab_id(&result.parent, tabs.into_iter()), Some(2));
+        assert_eq!(parent_tab_id(&result.parent, [unrelated].into_iter()), None);
+        let pending: Vec<_> = [&result]
+            .into_iter()
+            .filter(|d| parent_tab_id(&d.parent, tabs.into_iter()) == Some(2))
+            .collect();
+        let mut held = Vec::new();
+        queue_auto_sends(&pending, true, &mut held).unwrap();
+        assert_eq!(
+            next_held_send(&mut held, false).unwrap().delegation_ids,
+            ["d-7"]
+        );
+        result.parent.chat_session_id = None;
+        assert_eq!(parent_tab_id(&result.parent, tabs.into_iter()), None);
+    }
+
+    #[test]
     fn automatic_delivery_is_once_while_idle_and_survives_reload() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(crate::tasks::TASKS_FILE_NAME);
@@ -2374,6 +2497,79 @@ mod tests {
             "Do not merge or push unless the objective says so.",
         ] {
             assert!(section.contains(needle), "{needle} missing from {section}");
+        }
+    }
+
+    #[test]
+    fn each_worker_final_report_can_be_sent_in_automatic_and_manual_modes() {
+        for automatic in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(crate::tasks::TASKS_FILE_NAME);
+            let mut store = TaskStore::load(&path).unwrap();
+            store.insert(test_task("task-1", temp.path())).unwrap();
+            let worker = Delegation::new_requested(
+                worker_delegation(
+                    &caller(),
+                    "task-1",
+                    "Fix",
+                    "Do it",
+                    &worker_choice(),
+                    &DelegationRunOptions::default(),
+                )
+                .unwrap(),
+                "t1",
+            );
+            let id = worker.delegation_id.clone();
+            store.insert_delegation(worker).unwrap();
+            store
+                .upsert_session("task-1", session("session-1"), "t2")
+                .unwrap();
+            store
+                .attach_worker_session(&id, "session-1", None, "t2")
+                .unwrap();
+            for (status, summary, timestamp) in [
+                (HandoffStatus::Blocked, "Need access", "t3"),
+                (HandoffStatus::Blocked, "Need a different decision", "t5"),
+                (HandoffStatus::Done, "Fixed, tests pass", "t7"),
+            ] {
+                record_handoff(
+                    &mut store,
+                    "task-1",
+                    handoff(summary, &[]),
+                    status,
+                    Some("session-1"),
+                    timestamp,
+                )
+                .unwrap();
+                store = TaskStore::load(&path).unwrap();
+                let result = store.delegation(&id).unwrap();
+                assert!(!result.is_delivered());
+                assert_eq!(result.delivered_at, None);
+                let card = card_payload(result, None, false, None, temp.path()).unwrap();
+                assert!(card["delegation"].get("delivered").is_none());
+                assert!(card["delegation"].get("delivered_at").is_none());
+                let mut held = Vec::new();
+                queue_auto_sends(&[result], automatic, &mut held).unwrap();
+                if !automatic {
+                    assert!(held.is_empty());
+                    assert_eq!(
+                        decide_send(false, result.is_delivered(), &held, &id),
+                        SendDecision::SendNow
+                    );
+                    held.push(HeldSend {
+                        delegation_id: id.clone(),
+                        message: compose_send_message(result, &[]).unwrap(),
+                        automatic: false,
+                    });
+                }
+                let batch = next_held_send(&mut held, false).unwrap();
+                assert!(batch.message.contains(summary));
+                batch
+                    .record_submission(&mut store, true, timestamp)
+                    .unwrap();
+                store = TaskStore::load(&path).unwrap();
+                assert!(store.delegation(&id).unwrap().is_delivered());
+            }
         }
     }
 

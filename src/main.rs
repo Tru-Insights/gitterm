@@ -6812,6 +6812,7 @@ pub enum Event {
     /// User submitted a prompt (text plus any attached images) for the
     /// agent tab with this id.
     AgentSubmitPrompt(usize, UserPrompt),
+    AgentSubmitDelegations(usize, gitterm::delegations::SendBatch),
     /// User clicked the stop button on the agent tab with this id.
     AgentStopRequested(usize),
     /// User answered a pending runtime request (Claude permission prompt
@@ -16493,6 +16494,38 @@ impl App {
             .map(|tab| tab.id)
     }
 
+    fn delegation_chat_tab_id(&self, parent: &gitterm::tasks::DelegationParent) -> Option<usize> {
+        gitterm::delegations::parent_tab_id(
+            parent,
+            self.workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .filter(|tab| tab.agent_session().is_some())
+                .map(|tab| {
+                    (
+                        tab.id,
+                        tab.session_uid.as_str(),
+                        tab.chat_session_id.as_deref(),
+                    )
+                }),
+        )
+    }
+
+    /// Newest first, including results requested before Resume as Chat.
+    fn delegations_for_tab(&self, tab_id: usize) -> Vec<&gitterm::tasks::Delegation> {
+        self.task_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .delegations()
+                    .iter()
+                    .rev()
+                    .filter(|d| self.delegation_chat_tab_id(&d.parent) == Some(tab_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The open tab a delegation request came from, by its caller identity.
     fn delegation_caller(
         &self,
@@ -17649,7 +17682,7 @@ impl App {
         else {
             return;
         };
-        let Some(tab_id) = self.delegation_parent_tab_id(&delegation.parent.session_uid) else {
+        let Some(tab_id) = self.delegation_chat_tab_id(&delegation.parent) else {
             return;
         };
         if !webview::is_active(WebviewSurface::Agent(tab_id)) {
@@ -17685,19 +17718,7 @@ impl App {
 
     /// Every delegation card of a chat tab, oldest first, for a replay.
     fn delegation_cards_for_tab(&self, tab_id: usize) -> Vec<serde_json::Value> {
-        let Some(session_uid) = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|tab| tab.id == tab_id)
-            .map(|tab| tab.session_uid.as_str())
-        else {
-            return Vec::new();
-        };
-        let Some(store) = self.task_store.as_ref() else {
-            return Vec::new();
-        };
-        let mut delegations = store.delegations_for_parent(session_uid);
+        let mut delegations = self.delegations_for_tab(tab_id);
         delegations.reverse();
         delegations
             .into_iter()
@@ -17716,20 +17737,8 @@ impl App {
     /// (id, created_at) of every delegation of a chat tab, oldest first,
     /// for placing their cards in a transcript read-back.
     fn delegation_times_for_tab(&self, tab_id: usize) -> Vec<(String, String)> {
-        let Some(session_uid) = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|tab| tab.id == tab_id)
-            .map(|tab| tab.session_uid.as_str())
-        else {
-            return Vec::new();
-        };
-        let Some(store) = self.task_store.as_ref() else {
-            return Vec::new();
-        };
-        let mut delegations: Vec<(String, String)> = store
-            .delegations_for_parent(session_uid)
+        let mut delegations: Vec<(String, String)> = self
+            .delegations_for_tab(tab_id)
             .into_iter()
             .map(|delegation| {
                 (
@@ -17752,10 +17761,7 @@ impl App {
         else {
             return Task::none();
         };
-        let has_cards = self
-            .task_store
-            .as_ref()
-            .is_some_and(|store| !store.delegations_for_parent(&tab.session_uid).is_empty());
+        let has_cards = !self.delegations_for_tab(tab_id).is_empty();
         // The HEAD check runs git on this Mac; a remote tab has no
         // delegation cards (remote delegations are refused) anyway.
         if !has_cards || self.tab_remote_id(tab_id).is_some() {
@@ -17772,8 +17778,8 @@ impl App {
         )
     }
 
-    /// Persist the whole batch once, then submit synchronously so the chat's
-    /// streaming state is set before another tick or result can dispatch.
+    /// Submit synchronously so the chat's streaming state is set before
+    /// another tick can dispatch. The submit handler acknowledges success.
     fn deliver_delegations(
         &mut self,
         tab_id: usize,
@@ -17791,28 +17797,13 @@ impl App {
             );
             return Task::none();
         }
-        let now = chrono::Utc::now().to_rfc3339();
-        let marked = match self.task_store.as_mut() {
-            Some(store) => store
-                .mark_delegations_delivered(&batch.delegation_ids, &now)
-                .map_err(|error| error.to_string()),
-            None => Err("GitTerm's task store is unavailable".to_string()),
-        };
-        if let Err(error) = marked {
-            eprintln!("[delegation] {:?}: not sent: {error}", batch.delegation_ids);
-            agent_webview_note(tab_id, &format!("Not sent: {error}"));
-            return Task::none();
-        }
-        for id in &batch.delegation_ids {
-            self.push_delegation_card(id);
-        }
-        self.update(Event::AgentSubmitPrompt(tab_id, batch.message.into()))
+        self.update(Event::AgentSubmitDelegations(tab_id, batch))
     }
 
     /// Collect every finished outcome at the same moment. Idle chats flush
     /// now; busy chats keep the existing held queue until their turn ends.
     fn auto_deliver_delegations(&mut self) -> Task<Event> {
-        let parents: HashSet<String> = self
+        let parents: Vec<_> = self
             .task_store
             .as_ref()
             .map(|store| {
@@ -17824,18 +17815,19 @@ impl App {
                             && d.status.is_sendable()
                             && !d.is_delivered()
                     })
-                    .map(|d| d.parent.session_uid.clone())
+                    .map(|d| d.parent.clone())
                     .collect()
             })
             .unwrap_or_default();
         let mut tabs: HashSet<usize> = self.delegation_held.keys().copied().collect();
         for parent in parents {
-            match self.delegation_parent_tab_id(&parent) {
+            match self.delegation_chat_tab_id(&parent) {
                 Some(tab_id) => {
                     tabs.insert(tab_id);
                 }
                 None => eprintln!(
-                    "[delegation] results for {parent} not sent: requesting chat tab is gone"
+                    "[delegation] results for {} not sent: requesting chat tab is gone",
+                    parent.session_uid
                 ),
             }
         }
@@ -17849,19 +17841,18 @@ impl App {
     /// Both Tick and turn-end use this path, including results that finished
     /// since the last tick. There is at most one submitted prompt per chat.
     fn flush_held_delegation(&mut self, tab_id: usize) -> Task<Event> {
-        let Some(parent) = self
+        let Some(_) = self
             .workspaces
             .iter()
             .flat_map(|ws| &ws.tabs)
             .find(|tab| tab.id == tab_id && tab.agent_session().is_some())
-            .map(|tab| tab.session_uid.clone())
         else {
             self.delegation_held.remove(&tab_id);
             eprintln!("[delegation] not sent: requesting chat tab {tab_id} is gone");
             return Task::none();
         };
         let streaming = self.chat_turn_running(tab_id);
-        let held = self.delegation_held.entry(tab_id).or_default();
+        let mut held = self.delegation_held.remove(&tab_id).unwrap_or_default();
         let mut ids: HashSet<String> = held.iter().map(|send| send.delegation_id.clone()).collect();
         if let Some(store) = &self.task_store {
             // A worker may replace a blocked report before it was delivered.
@@ -17870,18 +17861,19 @@ impl App {
                     .delegation(&send.delegation_id)
                     .is_some_and(|d| d.status.is_sendable() && !d.is_delivered())
             });
-            let mut delegations = store.delegations_for_parent(&parent);
+            let mut delegations = self.delegations_for_tab(tab_id);
             delegations.reverse();
             if let Err(error) = gitterm::delegations::queue_auto_sends(
                 &delegations,
                 self.delegations_config.auto_tell,
-                held,
+                &mut held,
             ) {
                 eprintln!("[delegation] chat {tab_id}: cannot queue result: {error}");
             }
         }
         ids.extend(held.iter().map(|send| send.delegation_id.clone()));
-        let next = gitterm::delegations::next_held_send(held, streaming);
+        let next = gitterm::delegations::next_held_send(&mut held, streaming);
+        self.delegation_held.insert(tab_id, held);
         for id in ids {
             self.push_delegation_card(&id);
         }
@@ -17898,20 +17890,13 @@ impl App {
         tab_id: usize,
         delegation_id: &str,
     ) -> Result<&gitterm::tasks::Delegation, String> {
-        let session_uid = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|tab| tab.id == tab_id)
-            .map(|tab| tab.session_uid.as_str())
-            .ok_or_else(|| format!("tab {tab_id} is not open"))?;
         let delegation = self
             .task_store
             .as_ref()
             .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?
             .delegation(delegation_id)
             .ok_or_else(|| format!("delegation {delegation_id} does not exist"))?;
-        if delegation.parent.session_uid != session_uid {
+        if self.delegation_chat_tab_id(&delegation.parent) != Some(tab_id) {
             return Err(format!("delegation {delegation_id} belongs to another tab"));
         }
         Ok(delegation)
@@ -22567,7 +22552,15 @@ fi
                     }
                 };
             }
-            Event::AgentSubmitPrompt(tab_id, prompt) => {
+            event @ (Event::AgentSubmitPrompt(..) | Event::AgentSubmitDelegations(..)) => {
+                let (tab_id, prompt, delivery) = match event {
+                    Event::AgentSubmitPrompt(tab_id, prompt) => (tab_id, prompt, None),
+                    Event::AgentSubmitDelegations(tab_id, batch) => {
+                        (tab_id, batch.message.clone().into(), Some(batch))
+                    }
+                    _ => unreachable!(),
+                };
+                let mut submitted = false;
                 // Find the tab. If it's an Agent tab, ensure a subprocess
                 // manager is spawned (lazy on first prompt) and forward the
                 // prompt. The first spawn returns a Task that bridges the
@@ -22716,7 +22709,6 @@ fi
                                 prompt.id = Some(uuid::Uuid::new_v4().to_string());
                             }
                             echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
-                            let mut submitted = false;
                             if let Some(harness) = session.harness.as_ref() {
                                 match harness.send(HarnessCommand::SendUserMessage(prompt.clone()))
                                 {
@@ -22724,8 +22716,17 @@ fi
                                         session.state = tab::AgentSessionState::Streaming;
                                         submitted = true;
                                     }
-                                    Err(e) => eprintln!("AgentSubmitPrompt failed: {}", e),
+                                    Err(e) => {
+                                        eprintln!("AgentSubmitPrompt failed: {}", e);
+                                        agent_webview_note(
+                                            tab_id,
+                                            &format!("The prompt was not delivered: {e}"),
+                                        );
+                                    }
                                 }
+                            }
+                            if !submitted {
+                                session.harness = None;
                             }
                             session.record(echo.clone());
                             if submitted {
@@ -22808,7 +22809,6 @@ fi
                                 prompt.id = Some(uuid::Uuid::new_v4().to_string());
                             }
                             echo = tab::AgentEvent::submitted_prompt(&prompt, queued);
-                            let mut submitted = false;
                             let mut send_failed = None;
                             if let Some(claude) = session.harness.as_ref() {
                                 match claude.send(HarnessCommand::SendUserMessage(prompt.clone())) {
@@ -22865,7 +22865,6 @@ fi
                             bridge = handle.take_event_receiver();
                             session.task_handle = Some(handle);
                         }
-                        let mut submitted = false;
                         if let Some(handle) = session.task_handle.as_ref() {
                             if let Err(e) = handle.submit_prompt(prompt.text.clone()) {
                                 eprintln!("AgentSubmitPrompt failed: {}", e);
@@ -22873,6 +22872,9 @@ fi
                                 session.state = tab::AgentSessionState::Streaming;
                                 submitted = true;
                             }
+                        }
+                        if !submitted {
+                            session.task_handle = None;
                         }
                         session.conversation.push(echo.clone());
                         if submitted {
@@ -22882,6 +22884,34 @@ fi
                             }
                         }
                         break 'outer_submit;
+                    }
+                }
+                if let Some(batch) = delivery {
+                    let recorded = self
+                        .task_store
+                        .as_mut()
+                        .ok_or_else(|| "GitTerm's task store is unavailable".to_string())
+                        .and_then(|store| {
+                            batch
+                                .record_submission(
+                                    store,
+                                    submitted,
+                                    &chrono::Utc::now().to_rfc3339(),
+                                )
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = recorded {
+                        eprintln!(
+                            "[delegation] {:?}: delivery acknowledgement failed: {error}",
+                            batch.delegation_ids
+                        );
+                        agent_webview_note(
+                            tab_id,
+                            &format!("Delivery was not recorded; results remain pending: {error}"),
+                        );
+                    }
+                    for id in &batch.delegation_ids {
+                        self.push_delegation_card(id);
                     }
                 }
                 if let Some(task_id) = task_started {

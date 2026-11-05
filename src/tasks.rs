@@ -1937,9 +1937,11 @@ impl TaskStore {
             ));
         }
         if delegation.status == DelegationStatus::Blocked {
-            // Keep the once-only delivery markers while updating the card.
             delegation.dismissed_at = None;
         }
+        // Delivery belongs to the report, not the worker's whole lifetime.
+        delegation.delivered = false;
+        delegation.delivered_at = None;
         delegation.status = DelegationStatus::Completed;
         delegation.result = Some(result);
         delegation.updated_at = timestamp.to_string();
@@ -1948,7 +1950,7 @@ impl TaskStore {
 
     /// A worker reported itself blocked (S6): the delegation becomes
     /// `Blocked` with the worker's handoff as its result. Reporting blocked
-    /// again replaces the card's result without sending it twice.
+    /// again replaces the card's result and makes the new report sendable.
     /// Only implementation delegations block.
     pub fn block_delegation(
         &mut self,
@@ -1980,6 +1982,8 @@ impl TaskStore {
         }
         delegation.status = DelegationStatus::Blocked;
         delegation.result = Some(result);
+        delegation.delivered = false;
+        delegation.delivered_at = None;
         delegation.dismissed_at = None;
         delegation.updated_at = timestamp.to_string();
         self.commit_delegation(index, delegation)
@@ -2070,7 +2074,7 @@ impl TaskStore {
             .collect()
     }
 
-    /// Marks a batch in one atomic store write, before submitting its prompt.
+    /// Marks a batch in one atomic store write, after submitting its prompt.
     pub fn mark_delegations_delivered(
         &mut self,
         delegation_ids: &[String],
@@ -3535,9 +3539,9 @@ mod tests {
                 .summary,
             "Done, tests pass"
         );
-        // The card updates, but this delegation is delivered only once.
-        assert_eq!(worker.delivered_at.as_deref(), Some("t5"));
-        assert!(worker.is_delivered());
+        // The done report needs its own delivery in automatic or manual mode.
+        assert_eq!(worker.delivered_at, None);
+        assert!(!worker.is_delivered());
         assert_eq!(worker.dismissed_at, None);
         assert!(reloaded.open_worker_delegations("task-1").is_empty());
 
