@@ -23,6 +23,10 @@
 //! decisions repo. It goes in through the same options; for the harnesses
 //! that read a file, the guidelines and the note are written together to a
 //! per-launch file.
+//!
+//! Whenever a launch carries any of that, a short note on starting Codex
+//! through GitTerm's task tools follows it (TRU-212,
+//! [`with_codex_tools_note`]).
 
 use std::path::{Path, PathBuf};
 
@@ -277,6 +281,40 @@ pub fn with_documents(
     }
 }
 
+/// How agents in GitTerm start Codex (TRU-212): through GitTerm's task
+/// tools, which GitTerm shows, never `codex exec` in a background shell,
+/// which it cannot see.
+pub const CODEX_TOOLS_NOTE: &str = "# Starting Codex in GitTerm (added by GitTerm)\n\n\
+In GitTerm, start Codex workers with GitTerm's task tools: `delegate_task` for implementation, \
+`consult_request` for advice and `review_request` for code review. To work in another repository \
+or an existing worktree of this workspace, pass `checkout` (or, for `delegate_task`, `repo` to \
+make a new worktree from that repository); pass `time_limit_minutes` and `effort` when the job \
+needs them. Do not run `codex exec` in a background shell: GitTerm cannot see those runs, so the \
+user cannot follow or stop them.\n";
+
+/// The instructions a launch already carries, with [`CODEX_TOOLS_NOTE`]
+/// after them, written to a launch file in `launch_dir` like
+/// [`with_documents`]. No instructions stay none: an agent whose
+/// guidelines are off and that has no documents note gets nothing from
+/// GitTerm. A file that cannot be written is logged and the launch carries
+/// what it had; a launch is never blocked.
+pub fn with_codex_tools_note(
+    instructions: Option<Guidelines>,
+    launch_dir: &Path,
+) -> Option<Guidelines> {
+    let instructions = instructions?;
+    let text = format!("{}\n\n{CODEX_TOOLS_NOTE}", instructions.text.trim_end());
+    match write_launch_file(launch_dir, &text) {
+        Ok(path) => Some(Guidelines { path, text }),
+        Err(error) => {
+            log(&format!(
+                "{error}; starting the agent without the Codex tools note"
+            ));
+            Some(instructions)
+        }
+    }
+}
+
 fn write_launch_file(launch_dir: &Path, text: &str) -> Result<PathBuf, String> {
     let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
     let name: String = digest.as_ref()[..8]
@@ -372,7 +410,9 @@ pub fn configure_terminal_command(command: &str, guidelines: &Guidelines) -> Str
 
 /// `value` as one POSIX shell word: bare when it holds only safe characters,
 /// otherwise single-quoted.
-fn shell_word(value: &str) -> String {
+/// `value` as one POSIX shell word: as is when it is plainly safe, else
+/// single-quoted.
+pub(crate) fn shell_word(value: &str) -> String {
     let safe = !value.is_empty()
         && value
             .chars()
@@ -599,6 +639,30 @@ mod tests {
         assert!(alone.text.starts_with("# Documents for this work"));
         assert!(alone.text.contains("`/work/example-work/docs`"));
         assert!(alone.text.contains("No decisions repo is set"));
+    }
+
+    #[test]
+    fn launches_with_instructions_get_the_codex_tools_note() {
+        let launch = tempfile::tempdir().unwrap();
+        let noted = with_codex_tools_note(Some(sample()), launch.path()).unwrap();
+        assert!(noted.text.starts_with("Say \"why\"."));
+        assert!(noted.text.ends_with(CODEX_TOOLS_NOTE));
+        for word in [
+            "delegate_task",
+            "consult_request",
+            "review_request",
+            "`checkout`",
+            "`repo`",
+            "time_limit_minutes",
+            "effort",
+            "codex exec",
+        ] {
+            assert!(CODEX_TOOLS_NOTE.contains(word), "{word}");
+        }
+        assert!(noted.path.starts_with(launch.path()));
+        assert_eq!(std::fs::read_to_string(&noted.path).unwrap(), noted.text);
+        assert!(codex_config_value(&noted).contains("delegate_task"));
+        assert_eq!(with_codex_tools_note(None, launch.path()), None);
     }
 
     #[test]

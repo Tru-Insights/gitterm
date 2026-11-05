@@ -844,6 +844,70 @@ pub struct Delegation {
     /// and leaves the roster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_at: Option<String>,
+    /// Where and how the job runs when the request said so (TRU-212).
+    #[serde(default, skip_serializing_if = "DelegationRunOptions::is_default")]
+    pub options: DelegationRunOptions,
+    /// When GitTerm stopped the job at its time limit (TRU-212). The status
+    /// is then `failed` with a message saying so: older GitTerm builds share
+    /// `tasks.json` and know no other state for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limit_reached_at: Option<String>,
+    /// Worker launch time + limit, in Unix milliseconds. Additive so older
+    /// builds can still read the same task document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limit_deadline_unix_ms: Option<i64>,
+}
+
+/// A session-bound timer identity, stable across app restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkerTimeLimit {
+    pub delegation_id: String,
+    pub session_id: String,
+    pub deadline_unix_ms: i64,
+}
+
+impl WorkerTimeLimit {
+    pub fn remaining(&self, now_unix_ms: i64) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.deadline_unix_ms.saturating_sub(now_unix_ms).max(0) as u64
+        )
+    }
+}
+
+fn worker_deadline(timestamp: &str, minutes: u32) -> Result<i64, String> {
+    let start = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|error| format!("invalid worker start timestamp {timestamp:?}: {error}"))?;
+    start
+        .timestamp_millis()
+        .checked_add(i64::from(minutes) * 60_000)
+        .ok_or_else(|| {
+            format!("worker deadline overflows for start {timestamp:?} and limit {minutes}")
+        })
+}
+
+/// A delegation's run options from `review_request`, `consult_request` or
+/// `delegate_task` (TRU-212). Paths are stored after GitTerm checked them
+/// against the requesting chat's workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DelegationRunOptions {
+    /// The checkout the job runs in, in place of the calling tab's (a Codex
+    /// run) or of a new task worktree (a worker): its git top level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<PathBuf>,
+    /// Extra writable folders (`--add-dir`), for workers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_dirs: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::workers::ReasoningEffort>,
+    /// GitTerm stops the job after this many minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limit_minutes: Option<u32>,
+}
+
+impl DelegationRunOptions {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -854,6 +918,7 @@ pub struct NewDelegation {
     pub brief: String,
     pub target: Option<ReviewTarget>,
     pub previous: Option<String>,
+    pub options: DelegationRunOptions,
 }
 
 impl Delegation {
@@ -875,7 +940,16 @@ impl Delegation {
             updated_at: timestamp,
             delivered_at: None,
             dismissed_at: None,
+            options: input.options,
+            time_limit_reached_at: None,
+            time_limit_deadline_unix_ms: None,
         }
+    }
+
+    /// The checkout the job runs in: the requested one, else the calling
+    /// tab's (TRU-212).
+    pub fn run_checkout(&self) -> &Path {
+        self.options.checkout.as_deref().unwrap_or(&self.parent.cwd)
     }
 
     /// The Codex run's thread id and model, for a delegation GitTerm runs
@@ -1673,6 +1747,51 @@ impl TaskStore {
             .find(|delegation| delegation.delegation_id == delegation_id)
     }
 
+    /// Restores the original timer, including legacy records written before
+    /// deadlines were persisted. A missing/malformed legacy start is an error.
+    pub fn worker_time_limit(
+        &self,
+        delegation_id: &str,
+    ) -> Result<Option<WorkerTimeLimit>, String> {
+        let delegation = self
+            .delegation(delegation_id)
+            .ok_or_else(|| format!("delegation {delegation_id} does not exist"))?;
+        let DelegationChild::TaskSession {
+            task_id,
+            task_session_id: Some(session_id),
+            ..
+        } = &delegation.child
+        else {
+            return Ok(None);
+        };
+        let Some(minutes) = delegation.options.time_limit_minutes else {
+            return Ok(None);
+        };
+        if !delegation.status.is_active() {
+            return Ok(None);
+        }
+        let deadline_unix_ms = match delegation.time_limit_deadline_unix_ms {
+            Some(deadline) => deadline,
+            None => {
+                let session = self
+                    .get(task_id)
+                    .and_then(|task| {
+                        task.sessions.iter().find(|session| &session.task_session_id == session_id)
+                    })
+                    .ok_or_else(|| {
+                        format!("delegation {delegation_id}: task {task_id} has no worker session {session_id} to restore its time limit")
+                    })?;
+                worker_deadline(&session.created_at, minutes)
+                    .map_err(|error| format!("delegation {delegation_id}: {error}"))?
+            }
+        };
+        Ok(Some(WorkerTimeLimit {
+            delegation_id: delegation_id.to_string(),
+            session_id: session_id.clone(),
+            deadline_unix_ms,
+        }))
+    }
+
     /// Delegations requested by one parent session, newest first. The store
     /// appends on insert, so newest means most recently inserted.
     pub fn delegations_for_parent(&self, session_uid: &str) -> Vec<&Delegation> {
@@ -1752,6 +1871,33 @@ impl TaskStore {
             ));
         }
         delegation.status = status;
+        delegation.updated_at = timestamp.to_string();
+        self.commit_delegation(index, delegation)
+    }
+
+    /// GitTerm stopped the job at its time limit (TRU-212): the delegation
+    /// fails with `message` and remembers when the limit was reached.
+    pub fn stop_delegation_at_time_limit(
+        &mut self,
+        delegation_id: &str,
+        message: String,
+        timestamp: &str,
+    ) -> Result<(), TaskStoreError> {
+        const OPERATION: &str = "stop a delegation at its time limit in";
+        let (index, mut delegation) = self.delegation_for_update(OPERATION, delegation_id)?;
+        let status = DelegationStatus::Failed { message };
+        if !delegation.status.can_transition_to(&status) {
+            return Err(TaskStoreError::new(
+                OPERATION,
+                &self.path,
+                format!(
+                    "delegation {delegation_id} is {} and cannot be stopped",
+                    delegation.status.label()
+                ),
+            ));
+        }
+        delegation.status = status;
+        delegation.time_limit_reached_at = Some(timestamp.to_string());
         delegation.updated_at = timestamp.to_string();
         self.commit_delegation(index, delegation)
     }
@@ -1855,17 +2001,34 @@ impl TaskStore {
                 format!("delegation {delegation_id} has no task-session worker"),
             ));
         };
-        let known = self.get(task_id).is_some_and(|task| {
-            task.sessions
-                .iter()
-                .any(|session| session.task_session_id == task_session_id)
-        });
-        if !known {
-            return Err(TaskStoreError::new(
-                OPERATION,
-                &self.path,
-                format!("task {task_id} has no session {task_session_id}"),
-            ));
+        let session = self
+            .get(task_id)
+            .and_then(|task| {
+                task.sessions
+                    .iter()
+                    .find(|session| session.task_session_id == task_session_id)
+            })
+            .ok_or_else(|| {
+                TaskStoreError::new(
+                    OPERATION,
+                    &self.path,
+                    format!("task {task_id} has no session {task_session_id}"),
+                )
+            })?;
+        if session_slot.as_deref() != Some(task_session_id)
+            || delegation.time_limit_deadline_unix_ms.is_none()
+        {
+            let start = if session_slot.as_deref() == Some(task_session_id) {
+                session.created_at.as_str()
+            } else {
+                timestamp
+            };
+            delegation.time_limit_deadline_unix_ms = delegation
+                .options
+                .time_limit_minutes
+                .map(|minutes| worker_deadline(start, minutes))
+                .transpose()
+                .map_err(|detail| TaskStoreError::new(OPERATION, &self.path, detail))?;
         }
         *session_slot = Some(task_session_id.to_string());
         *conversation_slot = conversation;
@@ -2606,6 +2769,7 @@ mod tests {
                     focus: Some("error handling".to_string()),
                 }),
                 previous: None,
+                options: Default::default(),
             },
             timestamp,
         );
@@ -2749,6 +2913,7 @@ mod tests {
                 brief: first.brief.clone(),
                 target: first.target.clone(),
                 previous: None,
+                options: Default::default(),
             },
             "2026-10-08T10:00:00Z",
         )
@@ -3067,6 +3232,159 @@ mod tests {
                 "t2",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn worker_deadlines_survive_restore_and_expire_at_the_original_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        let mut worker = worker_delegation("timed", "task-1");
+        worker.options.time_limit_minutes = Some(1);
+        store.insert_delegation(worker).unwrap();
+        // A queued delegation has no timer until it actually launches.
+        assert_eq!(store.worker_time_limit("timed").unwrap(), None);
+        add_session(&mut store, "task-1", "session-1");
+        let start = "2026-10-20T10:00:00Z";
+        let deadline = chrono::DateTime::parse_from_rfc3339("2026-10-20T10:01:00Z")
+            .unwrap()
+            .timestamp_millis();
+        store
+            .attach_worker_session("timed", "session-1", None, start)
+            .unwrap();
+        store
+            .attach_worker_session("timed", "session-1", None, "2026-10-20T10:00:30Z")
+            .unwrap();
+
+        let mut restored = TaskStore::load(&path).unwrap();
+        restored
+            .reconcile_after_restart("2026-10-20T10:00:40Z")
+            .unwrap();
+        assert_eq!(
+            restored
+                .delegation("timed")
+                .unwrap()
+                .time_limit_deadline_unix_ms,
+            Some(deadline)
+        );
+        let timer = restored.worker_time_limit("timed").unwrap().unwrap();
+        assert_eq!(timer.session_id, "session-1");
+        assert_eq!(
+            timer.remaining(deadline - 20_000),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(timer.remaining(deadline), std::time::Duration::ZERO);
+        assert_eq!(
+            timer.remaining(deadline + 20_000),
+            std::time::Duration::ZERO
+        );
+        restored
+            .stop_delegation_at_time_limit(
+                "timed",
+                "Stopped at the time limit".into(),
+                "2026-10-20T10:01:20Z",
+            )
+            .unwrap();
+        let stopped = TaskStore::load(&path).unwrap();
+        assert_eq!(
+            stopped
+                .delegation("timed")
+                .unwrap()
+                .time_limit_reached_at
+                .as_deref(),
+            Some("2026-10-20T10:01:20Z")
+        );
+        assert_eq!(stopped.worker_time_limit("timed").unwrap(), None);
+
+        // A different session gets a fresh limit; its identity invalidates
+        // any pending event from the original session.
+        add_session(&mut store, "task-1", "session-2");
+        store
+            .attach_worker_session("timed", "session-2", None, "2026-10-20T11:00:00Z")
+            .unwrap();
+        let relaunched = store.worker_time_limit("timed").unwrap().unwrap();
+        assert_eq!(relaunched.session_id, "session-2");
+        assert_eq!(relaunched.deadline_unix_ms, deadline + 3_600_000);
+        assert_ne!(relaunched, timer);
+    }
+
+    #[test]
+    fn legacy_worker_deadlines_use_the_linked_session_start_and_refuse_bad_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        let mut task = sample_task("task-1");
+        task.sessions.push(TaskSessionRecord {
+            task_session_id: "session-1".into(),
+            label: "Codex".into(),
+            harness: None,
+            conversation: None,
+            objective_delivery: ObjectiveDeliveryState::Delivered,
+            created_at: "2026-10-20T10:00:00Z".into(),
+            updated_at: "2026-10-20T10:00:30Z".into(),
+        });
+        store.insert(task).unwrap();
+        let mut worker = worker_delegation("legacy", "task-1");
+        worker.options.time_limit_minutes = Some(1);
+        if let DelegationChild::TaskSession {
+            task_session_id, ..
+        } = &mut worker.child
+        {
+            *task_session_id = Some("session-1".into());
+        }
+        store.insert_delegation(worker).unwrap();
+        let restored = TaskStore::load(&path).unwrap();
+        assert_eq!(
+            restored
+                .delegation("legacy")
+                .unwrap()
+                .time_limit_deadline_unix_ms,
+            None
+        );
+        let timer = restored.worker_time_limit("legacy").unwrap().unwrap();
+        assert_eq!(
+            timer.deadline_unix_ms,
+            chrono::DateTime::parse_from_rfc3339("2026-10-20T10:01:00Z")
+                .unwrap()
+                .timestamp_millis()
+        );
+        store
+            .attach_worker_session("legacy", "session-1", None, "2026-10-20T11:00:00Z")
+            .unwrap();
+        assert_eq!(store.worker_time_limit("legacy").unwrap().unwrap(), timer);
+
+        let mut bad = worker_delegation("bad", "task-1");
+        bad.options.time_limit_minutes = Some(1);
+        store.insert_delegation(bad).unwrap();
+        let error = store
+            .attach_worker_session("bad", "session-1", None, "invalid")
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid worker start timestamp"));
+        let bad = store.delegation("bad").unwrap();
+        assert_eq!(bad.status, DelegationStatus::Requested);
+        assert_eq!(bad.time_limit_deadline_unix_ms, None);
+        assert!(matches!(
+            &bad.child,
+            DelegationChild::TaskSession {
+                task_session_id: None,
+                ..
+            }
+        ));
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["delegations"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("time_limit_deadline_unix_ms");
+        document["tasks"][0]["sessions"][0]["created_at"] = serde_json::json!("invalid");
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let corrupted = TaskStore::load(&path).unwrap();
+        assert!(corrupted
+            .worker_time_limit("legacy")
+            .unwrap_err()
+            .contains("invalid worker start timestamp"));
     }
 
     #[test]

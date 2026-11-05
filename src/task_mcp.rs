@@ -144,7 +144,7 @@ impl HandoffStatus {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct DelegateTaskRequest {
     /// Short task title visible in GitTerm.
     pub title: String,
@@ -172,6 +172,30 @@ pub struct DelegateTaskRequest {
     /// Optional GitTerm workspace label for the task. Defaults to the
     /// repository directory name.
     pub workspace_name: Option<String>,
+    /// Work in this existing checkout instead of a new task worktree: an
+    /// absolute path to a git checkout or worktree of one of your
+    /// workspace's repos (or the workspace home). The worker runs there with
+    /// the preset's usual write access; base_reference does not apply. Not
+    /// with repo.
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
+    /// Make the new task worktree from this repository instead of your tab's:
+    /// an absolute path to one of your workspace's repos or their worktrees.
+    /// Not with checkout.
+    #[serde(default)]
+    pub repo: Option<PathBuf>,
+    /// Extra folders the worker may write to (`--add-dir`): absolute paths
+    /// in your workspace (its home, its repos or their worktrees).
+    #[serde(default)]
+    pub add_dirs: Vec<PathBuf>,
+    /// Reasoning effort for the worker: low, medium, high or xhigh. Omit it
+    /// for the CLI's configured effort.
+    #[serde(default)]
+    pub effort: Option<crate::workers::ReasoningEffort>,
+    /// GitTerm stops the worker (closes its tab) after this many minutes and
+    /// reports it as stopped at the time limit. Omit it for no limit.
+    #[serde(default)]
+    pub time_limit_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
@@ -210,9 +234,22 @@ pub struct ReviewDelegationRequest {
     pub reviewer: Option<String>,
     /// Codex model (`codex -m`). Omit it for GitTerm's configured Codex model.
     pub model: Option<String>,
+    /// Review this checkout instead of your tab's: an absolute path to a git
+    /// checkout or worktree of one of your workspace's repos (or the
+    /// workspace home).
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
+    /// Codex reasoning effort: low, medium, high or xhigh. Omit it for
+    /// Codex's configured effort.
+    #[serde(default)]
+    pub effort: Option<crate::workers::ReasoningEffort>,
+    /// GitTerm stops the review after this many minutes and reports it as
+    /// stopped at the time limit. Omit it for no limit.
+    #[serde(default)]
+    pub time_limit_minutes: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ConsultDelegationRequest {
     /// The full question or brief for the consultant: context, what to
     /// decide, and the answer shape you want. It runs read-only in your
@@ -220,6 +257,19 @@ pub struct ConsultDelegationRequest {
     pub brief: String,
     /// Codex model (`codex -m`). Omit it for GitTerm's configured Codex model.
     pub model: Option<String>,
+    /// Run in this checkout instead of your tab's (still read-only): an
+    /// absolute path to a git checkout or worktree of one of your
+    /// workspace's repos (or the workspace home).
+    #[serde(default)]
+    pub checkout: Option<PathBuf>,
+    /// Codex reasoning effort: low, medium, high or xhigh. Omit it for
+    /// Codex's configured effort.
+    #[serde(default)]
+    pub effort: Option<crate::workers::ReasoningEffort>,
+    /// GitTerm stops the consult after this many minutes and reports it as
+    /// stopped at the time limit. Omit it for no limit.
+    #[serde(default)]
+    pub time_limit_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -798,7 +848,7 @@ impl TaskMcpTools {
     }
 
     #[tool(
-        description = "Ask Codex to review code in your GitTerm tab's checkout, in the background. Returns {delegation_id} at once; the review takes a minute or more. Do not wait or poll for it: end your turn. The findings appear as a card in the requesting chat tab, and the human sends the ones they want back to you. Read the full result any time with delegation_get. Targets: uncommitted, base (with base_ref; includes uncommitted changes) or commit (with commit). Only reviewer \"codex\" is supported; for a Claude review, spawn a review subagent with your own Agent tool.",
+        description = "Ask Codex to review code in your GitTerm tab's checkout, or in another checkout of your workspace (checkout: an absolute path to one of its repos or their worktrees), in the background. Returns {delegation_id} at once; the review takes a minute or more. Do not wait or poll for it: end your turn. The findings appear as a card in the requesting chat tab, and the human sends the ones they want back to you. Read the full result any time with delegation_get. Targets: uncommitted, base (with base_ref; includes uncommitted changes) or commit (with commit). Optional effort (low, medium, high, xhigh) and time_limit_minutes (GitTerm stops the run then and reports it as stopped at the time limit). Only reviewer \"codex\" is supported; for a Claude review, spawn a review subagent with your own Agent tool. Use this rather than running codex exec in a shell, which GitTerm cannot see.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -820,7 +870,7 @@ impl TaskMcpTools {
     }
 
     #[tool(
-        description = "Ask Codex for advice (brainstorming, architecture, investigation) on a self-contained brief. It runs read-only in your GitTerm tab's checkout, in the background, and cannot see this conversation. Returns {delegation_id} at once; do not wait or poll for it. The answer appears as a card in the requesting chat tab; read it with delegation_get.",
+        description = "Ask Codex for advice (brainstorming, architecture, investigation) on a self-contained brief. It runs read-only in your GitTerm tab's checkout, or in another checkout of your workspace (checkout: an absolute path to one of its repos or their worktrees), in the background, and cannot see this conversation. Optional effort (low, medium, high, xhigh) and time_limit_minutes (GitTerm stops the run then and reports it as stopped at the time limit). Returns {delegation_id} at once; do not wait or poll for it. The answer appears as a card in the requesting chat tab; read it with delegation_get. Use this rather than running codex exec in a shell, which GitTerm cannot see.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -842,7 +892,7 @@ impl TaskMcpTools {
     }
 
     #[tool(
-        description = "Hand an implementation task to a worker agent in the background. GitTerm creates a task with its own git worktree and branch from your GitTerm tab's repository, and launches the worker (a configured preset: Codex by default, or Claude Code) in a background tab with the objective as its brief. Returns {delegation_id, task_id, task_session_id, worktree_path, branch} once the worktree exists; do not wait or poll after that: end your turn. The worker records progress and reports done or blocked with task_update_handoff; the report appears as a card in the requesting chat tab, and delegation_get reads it. role (scoped, judgment, specialist) picks the model from GitTerm's policy; model overrides it.",
+        description = "Hand an implementation task to a worker agent in the background. By default GitTerm creates a task with its own git worktree and branch from your GitTerm tab's repository; repo (an absolute path to another of your workspace's repos) makes the worktree from that repo instead, and checkout (an absolute path to an existing checkout or worktree of one of your workspace's repos) runs the worker in that checkout with no new worktree. GitTerm launches the worker (a configured preset: Codex by default, or Claude Code) in a background tab with the objective as its brief. Returns {delegation_id, task_id, task_session_id, worktree_path, branch} once the worktree exists; do not wait or poll after that: end your turn. The worker records progress and reports done or blocked with task_update_handoff; the report appears as a card in the requesting chat tab, and delegation_get reads it. role (scoped, judgment, specialist) picks the model from GitTerm's policy; model overrides it. Optional add_dirs (extra writable folders in your workspace), effort (low, medium, high, xhigh) and time_limit_minutes (GitTerm closes the worker's tab then and reports it as stopped at the time limit). Use this rather than running codex exec in a shell, which GitTerm cannot see.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -953,7 +1003,7 @@ impl ServerHandler for TaskMcpTools {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "These tools control GitTerm's durable tasks. A task is an isolated job with its own git worktree; a task session is one visible harness or terminal inside that task. Use task_create_batch for an approved set of independent issues, then task_launch_session for each worker. Task creation and session launch are distinct: launching an agent preset opens the harness with the stored objective and latest handoff delivered as its initial prompt; a plain terminal session receives nothing. Before stopping or handing work to another harness, use task_update_handoff to record a concise durable summary, decisions, next steps, and blockers. Never edit GitTerm's tasks.json or worktree registry directly. For a second opinion from Codex, review_request (code review) and consult_request (advice) run in the background and return a delegation id at once; do not wait for them, the result reaches the requesting chat tab and delegation_get reads it. To hand implementation work to a worker agent, delegate_task creates the task and launches the worker in one call; the worker reports done or blocked with task_update_handoff and the requesting chat tab is told.",
+                "These tools control GitTerm's durable tasks. A task is an isolated job with its own git worktree; a task session is one visible harness or terminal inside that task. Use task_create_batch for an approved set of independent issues, then task_launch_session for each worker. Task creation and session launch are distinct: launching an agent preset opens the harness with the stored objective and latest handoff delivered as its initial prompt; a plain terminal session receives nothing. Before stopping or handing work to another harness, use task_update_handoff to record a concise durable summary, decisions, next steps, and blockers. Never edit GitTerm's tasks.json or worktree registry directly. For a second opinion from Codex, review_request (code review) and consult_request (advice) run in the background and return a delegation id at once; do not wait for them, the result reaches the requesting chat tab and delegation_get reads it. To hand implementation work to a worker agent, delegate_task creates the task and launches the worker in one call; the worker reports done or blocked with task_update_handoff and the requesting chat tab is told. All three take checkout (delegate_task also repo) to work in another repo or an existing worktree of your workspace, plus effort and time_limit_minutes; start Codex through them, never as codex exec in a background shell, which GitTerm cannot see.",
             )
     }
 }
@@ -1634,6 +1684,8 @@ mod tests {
                     workspace: "scratch".to_string(),
                     cwd: store_dir.clone(),
                     remote: false,
+                    home: store_dir.clone(),
+                    repos: Vec::new(),
                 };
                 clock += 1;
                 let now = format!("2026-10-08T10:00:{clock:02}Z");
@@ -1899,6 +1951,8 @@ mod tests {
                                 workspace: "scratch".to_string(),
                                 cwd: store_dir.clone(),
                                 remote: false,
+                                home: store_dir.clone(),
+                                repos: Vec::new(),
                             };
                             let choice = resolve_worker(
                                 &presets,
@@ -1920,6 +1974,7 @@ mod tests {
                                     &request.title,
                                     &request.objective,
                                     &choice,
+                                    &Default::default(),
                                 )?,
                                 now.clone(),
                             );

@@ -340,9 +340,173 @@ pub fn with_model_flag(command: &str, model: &str) -> Result<String, String> {
     ))
 }
 
+/// A worker's or Codex run's reasoning effort (TRU-212).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+
+    /// Codex's `-c` value: `model_reasoning_effort` is the config key
+    /// (`~/.codex/config.toml` uses it; codex-cli 0.164.0 knows low,
+    /// medium, high and xhigh), the value a TOML string.
+    pub fn codex_config_value(self) -> String {
+        format!("model_reasoning_effort=\"{}\"", self.label())
+    }
+}
+
+/// `command` with the worker's effort and extra writable folders added
+/// after the executable (TRU-212). Codex: `-c model_reasoning_effort="…"`
+/// and `--add-dir <dir>` (codex-cli 0.164.0 `--help`); Claude:
+/// `--effort <level>` and `--add-dir <dir>` (claude 2.1.318 `--help`).
+/// Other CLIs: an error, since GitTerm does not know their options. The
+/// folders are shell-quoted; with neither option the command is unchanged.
+pub fn with_launch_options(
+    command: &str,
+    effort: Option<ReasoningEffort>,
+    add_dirs: &[std::path::PathBuf],
+) -> Result<String, String> {
+    with_launch_options_for_shell(command, effort, add_dirs, cfg!(unix))
+}
+
+fn with_launch_options_for_shell(
+    command: &str,
+    effort: Option<ReasoningEffort>,
+    add_dirs: &[std::path::PathBuf],
+    posix_shell: bool,
+) -> Result<String, String> {
+    if !posix_shell {
+        let option = if !add_dirs.is_empty() {
+            Some("add_dirs")
+        } else {
+            effort.map(|_| "effort")
+        };
+        if let Some(option) = option {
+            return Err(format!(
+                "{option} requires a POSIX shell; GitTerm cannot safely pass it to this worker shell"
+            ));
+        }
+    }
+    if effort.is_none() && add_dirs.is_empty() {
+        return Ok(command.to_string());
+    }
+    let provider = provider_for_command(command);
+    let mut options: Vec<String> = Vec::new();
+    match (provider, effort) {
+        (_, None) => {}
+        (WorkerProvider::Codex, Some(effort)) => {
+            options.push("-c".to_string());
+            options.push(crate::guidelines::shell_word(&effort.codex_config_value()));
+        }
+        (WorkerProvider::Claude, Some(effort)) => {
+            options.push("--effort".to_string());
+            options.push(effort.label().to_string());
+        }
+        (WorkerProvider::Other, Some(_)) => {
+            return Err(format!(
+                "GitTerm does not know the reasoning effort option of {:?}; effort works with \
+                 Codex and Claude Code presets",
+                executable_name(command)
+            ))
+        }
+    }
+    if !add_dirs.is_empty() && provider == WorkerProvider::Other {
+        return Err(format!(
+            "GitTerm does not know the extra folder option of {:?}; add_dirs works with Codex \
+             and Claude Code presets",
+            executable_name(command)
+        ));
+    }
+    for dir in add_dirs {
+        options.push("--add-dir".to_string());
+        options.push(crate::guidelines::shell_word(&dir.to_string_lossy()));
+    }
+    let trimmed = command.trim();
+    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    Ok(format!(
+        "{} {}{}",
+        &trimmed[..end],
+        options.join(" "),
+        &trimmed[end..]
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_posix_shells_refuse_interpolated_launch_options() {
+        let dirs = [std::path::PathBuf::from(r"C:\work\a&whoami&b")];
+        for command in ["codex", "claude"] {
+            assert!(with_launch_options_for_shell(command, None, &dirs, false)
+                .unwrap_err()
+                .contains("add_dirs"));
+            assert!(with_launch_options_for_shell(
+                command,
+                Some(ReasoningEffort::High),
+                &[],
+                false
+            )
+            .unwrap_err()
+            .contains("effort"));
+            assert_eq!(
+                with_launch_options_for_shell(command, None, &[], false).unwrap(),
+                command
+            );
+        }
+    }
+
+    #[test]
+    fn launch_options_reach_codex_and_claude_and_refuse_other_clis() {
+        let dirs = [
+            std::path::PathBuf::from("/work/notes"),
+            std::path::PathBuf::from("/repos/api wt"),
+        ];
+        assert_eq!(
+            with_launch_options_for_shell(
+                "codex -m gpt-6-luna",
+                Some(ReasoningEffort::Xhigh),
+                &dirs,
+                true
+            )
+            .unwrap(),
+            "codex -c 'model_reasoning_effort=\"xhigh\"' --add-dir /work/notes --add-dir \
+             '/repos/api wt' -m gpt-6-luna"
+        );
+        assert_eq!(
+            with_launch_options_for_shell("claude", Some(ReasoningEffort::High), &dirs[..1], true)
+                .unwrap(),
+            "claude --effort high --add-dir /work/notes"
+        );
+        assert_eq!(
+            with_launch_options("pi", None, &[]).unwrap(),
+            "pi",
+            "no options leave any command alone"
+        );
+        assert!(with_launch_options("pi", Some(ReasoningEffort::Low), &[])
+            .unwrap_err()
+            .contains("effort"));
+        assert!(with_launch_options("gemini", None, &dirs)
+            .unwrap_err()
+            .contains("add_dirs"));
+        let effort: ReasoningEffort = serde_json::from_str("\"xhigh\"").unwrap();
+        assert_eq!(effort, ReasoningEffort::Xhigh);
+        assert!(serde_json::from_str::<ReasoningEffort>("\"max\"").is_err());
+    }
 
     fn presets() -> Vec<PresetRef<'static>> {
         vec![

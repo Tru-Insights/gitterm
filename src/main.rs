@@ -642,7 +642,8 @@ fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guideli
 }
 
 /// What an agent starting now in `cwd` gets appended: the guidelines and,
-/// in a piece of work, the documents note naming `places` (TRU-191). The
+/// in a piece of work, the documents note naming `places` (TRU-191), then
+/// how to start Codex in GitTerm (TRU-212). The
 /// work's docs folder is created here, as the agent starts; a failure is
 /// logged and the note still names it.
 fn launch_instructions(
@@ -658,10 +659,14 @@ fn launch_instructions(
             );
         }
     }
-    gitterm::guidelines::with_documents(
-        launch_guidelines(cwd, workspace_off),
-        places,
-        &config::instance_config_dir(),
+    let launch_dir = config::instance_config_dir();
+    gitterm::guidelines::with_codex_tools_note(
+        gitterm::guidelines::with_documents(
+            launch_guidelines(cwd, workspace_off),
+            places,
+            &launch_dir,
+        ),
+        &launch_dir,
     )
 }
 
@@ -4548,6 +4553,114 @@ pub struct PendingTaskLaunch {
 pub struct PendingWorker {
     caller: gitterm::delegations::CallerTab,
     choice: gitterm::workers::WorkerChoice,
+    /// The request's run options, checked (TRU-212).
+    options: gitterm::tasks::DelegationRunOptions,
+}
+
+/// A `delegate_task` request on its way through the target checks
+/// (TRU-212).
+#[derive(Debug, Clone)]
+pub struct DelegateTargets {
+    request: task_mcp::DelegateTaskRequest,
+    caller: Option<String>,
+    tab: gitterm::delegations::CallerTab,
+    choice: gitterm::workers::WorkerChoice,
+    place: gitterm::delegations::WorkerPlace,
+    options: gitterm::tasks::DelegationRunOptions,
+    /// How to set a task up around the requested checkout.
+    adoption: Option<AdoptedWorktreeResolution>,
+}
+
+/// Checks a `delegate_task` request's paths against the caller's workspace
+/// (TRU-212) and, for a checkout, resolves how a task is set up around it.
+/// A `repo` folds to its main checkout, so the task's workspace is the
+/// repository's. Blocking.
+fn check_delegate_targets(mut targets: DelegateTargets) -> Result<DelegateTargets, String> {
+    gitterm::delegations::resolve_targets(&mut targets.options, &targets.tab)?;
+    match &targets.place {
+        gitterm::delegations::WorkerPlace::TabRepository => {}
+        gitterm::delegations::WorkerPlace::Repository(repo) => {
+            let top = gitterm::delegations::resolve_checkout("repo", repo, &targets.tab)?;
+            targets.place = gitterm::delegations::WorkerPlace::Repository(
+                gitterm::workspace_repos::main_checkout(&top),
+            );
+        }
+        gitterm::delegations::WorkerPlace::Checkout(_) => {
+            let checkout = targets.options.checkout.clone().ok_or_else(|| {
+                "delegate_task lost its checkout during the target check".to_string()
+            })?;
+            let request = AdoptWorktreeRequest {
+                repository_path: gitterm::workspace_repos::main_checkout(&checkout),
+                worktree_path: checkout.clone(),
+            };
+            let resolution = gitterm::task_worktree::resolve_worktree_adoption_blocking(&request)
+                .map_err(|error| {
+                format!(
+                    "checkout {} cannot carry a worker: {error}",
+                    checkout.display()
+                )
+            })?;
+            targets.adoption = Some(resolution);
+            targets.place = gitterm::delegations::WorkerPlace::Checkout(checkout);
+        }
+    }
+    Ok(targets)
+}
+
+/// The task MCP's stopping boundary as the store's.
+fn stopping_boundary_from_control(boundary: Option<TaskStoppingBoundary>) -> StoppingBoundary {
+    match boundary.unwrap_or(TaskStoppingBoundary::ImplementUntilTestsPass) {
+        TaskStoppingBoundary::PlanOnly => StoppingBoundary::PlanOnly,
+        TaskStoppingBoundary::ImplementUntilTestsPass => StoppingBoundary::ImplementUntilTestsPass,
+        TaskStoppingBoundary::PrepareDraftPr => StoppingBoundary::PrepareDraftPr,
+    }
+}
+
+/// Restored tabs subscribe to the same durable deadline as newly launched ones.
+fn worker_time_limit_stream(
+    timer: &gitterm::tasks::WorkerTimeLimit,
+) -> impl iced::futures::Stream<Item = Event> + Send + 'static {
+    let timer = timer.clone();
+    iced::futures::stream::once(async move {
+        tokio::time::sleep(timer.remaining(chrono::Utc::now().timestamp_millis())).await;
+        Event::WorkerTimeLimitReached(timer.delegation_id, timer.session_id)
+    })
+}
+
+fn worker_time_limit_subscriptions(
+    store: &TaskStore,
+    workspaces: &[Workspace],
+) -> Vec<Subscription<Event>> {
+    store
+        .delegations()
+        .iter()
+        .filter_map(|delegation| {
+            let gitterm::tasks::DelegationChild::TaskSession {
+                task_session_id: Some(session_id),
+                ..
+            } = &delegation.child
+            else {
+                return None;
+            };
+            find_task_session_tab(workspaces, session_id)?;
+            let timer = match store.worker_time_limit(&delegation.delegation_id) {
+                Ok(timer) => timer?,
+                Err(error) => {
+                    // Fail closed: an invalid legacy timestamp must not leave a
+                    // restored worker running without a limit.
+                    eprintln!(
+                        "[delegation] cannot restore worker time limit: {error}; stopping worker"
+                    );
+                    gitterm::tasks::WorkerTimeLimit {
+                        delegation_id: delegation.delegation_id.clone(),
+                        session_id: session_id.clone(),
+                        deadline_unix_ms: 0,
+                    }
+                }
+            };
+            Some(Subscription::run_with(timer, worker_time_limit_stream))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -6725,10 +6838,16 @@ pub enum Event {
     ),
     /// Progress from a running Codex delegation.
     DelegationProgress(String, gitterm::codex_runner::CodexRunEvent),
+    /// A `delegate_task` request's checkout, repo and extra folders were
+    /// checked off the UI thread (TRU-212).
+    DelegateTaskTargetsChecked(Result<Box<DelegateTargets>, String>, TaskControlReply),
+    /// A worker's time limit is up: delegation, worker task session
+    /// (TRU-212).
+    WorkerTimeLimitReached(String, String),
     /// A Codex delegation run ended.
     DelegationFinished(
         String,
-        Result<Box<gitterm::codex_runner::CodexRunOutcome>, String>,
+        Result<Box<gitterm::codex_runner::CodexRunOutcome>, gitterm::delegations::RunFailure>,
     ),
     /// The parent tab's checkout HEAD, for the cards' "branch has moved".
     DelegationHeadLoaded(usize, Result<String, String>),
@@ -12112,7 +12231,11 @@ impl App {
         } else {
             None
         };
-        let worker_model = worker.as_ref().and_then(|(_, model)| model.clone());
+        let worker_model = worker.as_ref().and_then(|(_, model, _)| model.clone());
+        let worker_options = worker
+            .as_ref()
+            .map(|(_, _, options)| options.clone())
+            .unwrap_or_default();
         let (command, harness) = match (command, worker_model.as_deref()) {
             (Some(command), Some(model)) => (
                 Some(
@@ -12126,6 +12249,23 @@ impl App {
                 }),
             ),
             (command, _) => (command, harness),
+        };
+        // TRU-212: the worker's effort and extra folders go on the command
+        // too, so a restart's persisted command keeps them.
+        let command = match command {
+            Some(command) => Some(
+                gitterm::workers::with_launch_options(
+                    &command,
+                    worker_options.effort,
+                    &worker_options.add_dirs,
+                )
+                .map_err(|error| {
+                    format!(
+                        "The worker's options cannot be passed to preset {child_label}: {error}"
+                    )
+                })?,
+            ),
+            None => None,
         };
         let (command, chat_session_id) = match command {
             Some(command) => {
@@ -12217,7 +12357,7 @@ impl App {
                     &task,
                     worker
                         .as_ref()
-                        .map(|(delegation_id, _)| delegation_id.as_str()),
+                        .map(|(delegation_id, _, _)| delegation_id.as_str()),
                 ) {
                     Ok(brief_path) => (
                         Some(command_with_initial_prompt(&launch, &brief_path)),
@@ -12262,7 +12402,19 @@ impl App {
                 .as_deref()
                 .map(|model| format!("--model {model} "))
                 .unwrap_or_default();
-            tab.set_startup_command(Some(format!("claude {model}--resume {chat_session_id}")));
+            let resume = format!("claude {model}--resume {chat_session_id}");
+            let resume = gitterm::workers::with_launch_options(
+                &resume,
+                worker_options.effort,
+                &worker_options.add_dirs,
+            )
+            .unwrap_or_else(|error| {
+                // The launch command took the same options, so this
+                // cannot refuse; keep the plain resume if it ever does.
+                eprintln!("[tasks] worker resume command for {chat_session_id}: {error}");
+                resume
+            });
+            tab.set_startup_command(Some(resume));
         } else if objective_delivery == ObjectiveDeliveryState::Delivered {
             // Codex/Pi have no persisted resume; a restart re-runs the launch
             // command, which must stay brief-free so the objective is never
@@ -12292,15 +12444,16 @@ impl App {
         store
             .upsert_session(task_id, task_session, &timestamp)
             .map_err(|error| error.to_string())?;
-        if let Some((delegation_id, _)) = &worker {
+        if let Some((delegation_id, _, _)) = &worker {
             // The worker is running; its report reaches the delegation.
             if let Err(error) =
                 store.attach_worker_session(delegation_id, &session_id, conversation, &timestamp)
             {
-                eprintln!(
-                    "[delegation] {delegation_id}: worker session {session_id} launched but \
-                     could not be attached: {error}"
-                );
+                // `tab` has not entered the workspace yet. Dropping it stops
+                // the terminal instead of leaving an untracked timed worker.
+                return Err(format!(
+                    "worker session {session_id} could not attach to delegation {delegation_id}: {error}; stopping worker"
+                ));
             }
         }
         self.workspaces[workspace_idx].tabs.push(tab);
@@ -16317,7 +16470,13 @@ fn delegation_run_stream(
                 .send(Event::DelegationProgress(delegation_id.clone(), event))
                 .await;
         }
-        let outcome = outcome.map(Box::new).map_err(|error| error.to_string());
+        let outcome = outcome.map(Box::new).map_err(|error| {
+            if error.is_time_limit() {
+                gitterm::delegations::RunFailure::TimeLimit
+            } else {
+                gitterm::delegations::RunFailure::Failed(error.to_string())
+            }
+        });
         if let Err(error) = output
             .send(Event::DelegationFinished(delegation_id.clone(), outcome))
             .await
@@ -16356,6 +16515,13 @@ impl App {
                     workspace: workspace.name.clone(),
                     cwd: tab.repo_path.clone(),
                     remote: self.workspace_has_remote_identity(workspace),
+                    home: workspace.dir.clone(),
+                    repos: self
+                        .local_repos(workspace)
+                        .iter()
+                        .map(|repo| repo.dir.clone())
+                        .chain(workspace.pending_repos.iter().cloned())
+                        .collect(),
                 });
             }
         }
@@ -16415,14 +16581,32 @@ impl App {
             Self::report_delegation_error(&origin, "GitTerm's task store is unavailable".into());
             return Task::none();
         }
-        let cwd = new.parent.cwd.clone();
+        // The requested checkout is checked against the workspace of the
+        // tab that asked (TRU-212), then the checkout Codex runs in.
+        let caller = match self.delegation_caller(&new.parent.session_uid) {
+            Ok(caller) => caller,
+            Err(error) => {
+                Self::report_delegation_error(&origin, error);
+                return Task::none();
+            }
+        };
+        let unchecked = new.clone();
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || gitterm::delegations::check_checkout(&cwd))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("the checkout check failed: {error}")))
+                tokio::task::spawn_blocking(move || {
+                    let mut new = new;
+                    let result = gitterm::delegations::check_run(&mut new, &caller);
+                    (new, result)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    (
+                        unchecked,
+                        Err(format!("the checkout check failed: {error}")),
+                    )
+                })
             },
-            move |result| Event::DelegationChecked(Box::new(new), origin, result),
+            move |(new, result)| Event::DelegationChecked(Box::new(new), origin, result),
         )
     }
 
@@ -16534,7 +16718,10 @@ impl App {
             tasks.push(task);
         }
         for (delegation_id, error) in unrunnable {
-            tasks.push(self.finish_delegation(&delegation_id, Err(error)));
+            tasks.push(self.finish_delegation(
+                &delegation_id,
+                Err(gitterm::delegations::RunFailure::Failed(error)),
+            ));
         }
         Task::batch(tasks)
     }
@@ -16571,7 +16758,10 @@ impl App {
     fn finish_delegation(
         &mut self,
         delegation_id: &str,
-        outcome: Result<Box<gitterm::codex_runner::CodexRunOutcome>, String>,
+        outcome: Result<
+            Box<gitterm::codex_runner::CodexRunOutcome>,
+            gitterm::delegations::RunFailure,
+        >,
     ) -> Task<Event> {
         self.delegation_runs.remove(delegation_id);
         self.delegation_activity.remove(delegation_id);
@@ -16609,7 +16799,21 @@ impl App {
                     false
                 }
             },
-            Err(message) => {
+            Err(gitterm::delegations::RunFailure::TimeLimit) => {
+                let message = gitterm::delegations::time_limit_message(
+                    delegation.options.time_limit_minutes.unwrap_or_default(),
+                    Some(delegation.run_checkout()),
+                    false,
+                );
+                eprintln!("[delegation] {delegation_id}: {message}");
+                if let Err(error) =
+                    store.stop_delegation_at_time_limit(delegation_id, message, &now)
+                {
+                    eprintln!("[delegation] {delegation_id}: {error}");
+                }
+                false
+            }
+            Err(gitterm::delegations::RunFailure::Failed(message)) => {
                 eprintln!("[delegation] {delegation_id} failed: {message}");
                 if let Err(error) = store.set_delegation_status(
                     delegation_id,
@@ -16649,14 +16853,15 @@ impl App {
     }
 
     /// The open worker delegation on `task_id` that a launch of preset
-    /// `preset_name` carries out (TRU-142 S6): its id and model. Only a
+    /// `preset_name` carries out (TRU-142 S6): its id, model and run
+    /// options (TRU-212). Only a
     /// delegation whose session is not live qualifies — none attached yet
     /// (first or queued launch), or one whose tab is gone (a relaunch).
     fn worker_awaiting_launch(
         &self,
         task_id: &str,
         preset_name: &str,
-    ) -> Option<(String, Option<String>)> {
+    ) -> Option<(String, Option<String>, gitterm::tasks::DelegationRunOptions)> {
         let store = self.task_store.as_ref()?;
         store
             .open_worker_delegations(task_id)
@@ -16672,7 +16877,11 @@ impl App {
                         find_task_session_tab(&self.workspaces, session).is_none()
                     }) =>
                 {
-                    Some((delegation.delegation_id.clone(), model.clone()))
+                    Some((
+                        delegation.delegation_id.clone(),
+                        model.clone(),
+                        delegation.options.clone(),
+                    ))
                 }
                 _ => None,
             })
@@ -16680,7 +16889,10 @@ impl App {
 
     /// `delegate_task` (TRU-142 S6): resolve the worker, then create the
     /// task through the same path as `task_create`. The worker is launched
-    /// in `start_delegated_worker` once the worktree is ready.
+    /// in `start_delegated_worker` once the worktree is ready. A request
+    /// naming a checkout, a repo or extra folders (TRU-212) has its paths
+    /// checked against the caller's workspace off the UI thread first
+    /// (`DelegateTaskTargetsChecked`).
     fn delegate_task_requested(
         &mut self,
         request: task_mcp::DelegateTaskRequest,
@@ -16712,10 +16924,88 @@ impl App {
                 request.model.as_deref(),
                 &self.model_policy,
             )?;
+            let (place, options) = gitterm::delegations::worker_targets(&request)?;
+            // Refuse options the preset's CLI cannot take before any
+            // worktree or task exists.
+            let preset_command = self
+                .agent_presets
+                .get(choice.preset_index)
+                .map(|preset| preset.command.as_str())
+                .ok_or_else(|| format!("preset {} is unavailable", choice.preset_name))?;
+            gitterm::workers::with_launch_options(
+                preset_command,
+                options.effort,
+                &options.add_dirs,
+            )
+            .map_err(|error| format!("preset {}: {error}", choice.preset_name))?;
+            Ok(DelegateTargets {
+                request,
+                caller: caller.clone(),
+                tab,
+                choice,
+                place,
+                options,
+                adoption: None,
+            })
+        })();
+        let targets = match prepared {
+            Ok(targets) => targets,
+            Err(error) => {
+                reply.send(Err(error));
+                return Task::none();
+            }
+        };
+        if targets.place == gitterm::delegations::WorkerPlace::TabRepository
+            && targets.options.add_dirs.is_empty()
+        {
+            return self.delegate_task_targets_checked(Ok(Box::new(targets)), reply);
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || check_delegate_targets(targets))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("the target check failed: {error}")))
+            },
+            move |result| Event::DelegateTaskTargetsChecked(result.map(Box::new), reply),
+        )
+    }
+
+    /// `delegate_task` with its paths checked: create the task worktree
+    /// (from the tab's repository or the requested repo), or set the task up
+    /// around the requested checkout.
+    fn delegate_task_targets_checked(
+        &mut self,
+        result: Result<Box<DelegateTargets>, String>,
+        reply: TaskControlReply,
+    ) -> Task<Event> {
+        let targets = match result {
+            Ok(targets) => *targets,
+            Err(error) => {
+                reply.send(Err(error));
+                return Task::none();
+            }
+        };
+        let repository = match &targets.place {
+            gitterm::delegations::WorkerPlace::TabRepository => targets.tab.cwd.clone(),
+            gitterm::delegations::WorkerPlace::Repository(repo) => repo.clone(),
+            gitterm::delegations::WorkerPlace::Checkout(checkout) => {
+                let checkout = checkout.clone();
+                return self.delegate_task_in_checkout(targets, checkout, reply);
+            }
+        };
+        let DelegateTargets {
+            request,
+            caller,
+            tab,
+            choice,
+            options,
+            ..
+        } = targets;
+        let prepared = (|| {
             let create = McpCreateTaskRequest {
                 title: request.title.clone(),
                 objective: request.objective.clone(),
-                repository_path: tab.cwd.clone(),
+                repository_path: repository,
                 workspace_name: request.workspace_name.clone(),
                 issue_key: request.issue_key.clone(),
                 base_reference: request.base_reference.clone(),
@@ -16730,10 +17020,12 @@ impl App {
                 &pending.title,
                 &pending.objective,
                 &choice,
+                &options,
             )?;
             pending.worker = Some(PendingWorker {
                 caller: tab,
                 choice,
+                options,
             });
             Ok(pending)
         })();
@@ -16748,6 +17040,267 @@ impl App {
         Task::perform(resolve_task_preparation(worktree_request), move |result| {
             Event::TaskMetadataResolved(pending, result.map_err(|error| error.to_string()))
         })
+    }
+
+    /// `delegate_task` in an existing checkout (TRU-212): the task that owns
+    /// it carries the new objective, or a new task is set up around it (as
+    /// Adopt does), and the worker launches there. Nothing is written when
+    /// the request is refused: an archived task, or one with a worker or a
+    /// live session still in it.
+    fn delegate_task_in_checkout(
+        &mut self,
+        targets: DelegateTargets,
+        checkout: PathBuf,
+        reply: TaskControlReply,
+    ) -> Task<Event> {
+        let DelegateTargets {
+            request,
+            caller,
+            tab,
+            choice,
+            options,
+            adoption,
+            ..
+        } = targets;
+        let prepared = (|| {
+            let title = request.title.trim().to_string();
+            let objective = request.objective.trim().to_string();
+            let issue_key = request
+                .issue_key
+                .as_deref()
+                .map(|key| key.trim().to_uppercase())
+                .filter(|key| !key.is_empty());
+            if issue_key
+                .as_deref()
+                .is_some_and(|key| !is_linear_issue_key(key))
+            {
+                return Err("Linear issue must look like TRU-106".to_string());
+            }
+            let stopping_boundary = stopping_boundary_from_control(request.stopping_boundary);
+            let store = self
+                .task_store
+                .as_ref()
+                .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
+            let owner = self.worktree_task(&checkout).cloned();
+            let task_id = match &owner {
+                Some(task) => task.task_id.clone(),
+                None => uuid::Uuid::new_v4().to_string(),
+            };
+            gitterm::delegations::worker_delegation(
+                &tab, &task_id, &title, &objective, &choice, &options,
+            )?;
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let issue = issue_key.map(|key| IssueReference {
+                provider: IssueProvider::Linear,
+                key,
+                url: None,
+            });
+            match owner {
+                Some(mut task) => {
+                    if task.archived_at.is_some() {
+                        return Err(format!(
+                            "checkout {} is the worktree of archived task \"{}\" ({}); \
+                             delegate to another checkout",
+                            checkout.display(),
+                            task.title,
+                            task.task_id
+                        ));
+                    }
+                    if let Some(open) = store.open_worker_delegations(&task.task_id).first() {
+                        return Err(format!(
+                            "checkout {} is task \"{}\"'s worktree, and worker delegation {} \
+                             is still open there; wait for its report, or stop tracking it, \
+                             before handing that checkout more work",
+                            checkout.display(),
+                            task.title,
+                            open.delegation_id
+                        ));
+                    }
+                    let live = self
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| workspace.tabs.iter())
+                        .any(|open| {
+                            open.task_id.as_deref() == Some(task.task_id.as_str())
+                                && open.task_live_state.is_some()
+                        });
+                    if live {
+                        return Err(format!(
+                            "checkout {} is task \"{}\"'s worktree, and a session is still \
+                             running in it; stop it before handing that checkout more work",
+                            checkout.display(),
+                            task.title
+                        ));
+                    }
+                    // The task now carries this work; its last handoff
+                    // stays as the worker's context.
+                    task.title = title;
+                    task.objective = objective;
+                    if issue.is_some() {
+                        task.issue = issue;
+                    }
+                    task.stopping_boundary = stopping_boundary;
+                    task.updated_at = timestamp;
+                    let store = self
+                        .task_store
+                        .as_mut()
+                        .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
+                    store.replace(task).map_err(|error| error.to_string())?;
+                }
+                None => {
+                    let resolution = adoption.ok_or_else(|| {
+                        format!(
+                            "checkout {} was not resolved as a worktree; try again",
+                            checkout.display()
+                        )
+                    })?;
+                    let workspace_name = request
+                        .workspace_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            gitterm::workspace_repos::repo_name(&resolution.repository.top_level)
+                        });
+                    let mut record = TaskRecord::new_draft(
+                        NewTaskRecord {
+                            task_id: task_id.clone(),
+                            title,
+                            objective,
+                            workspace: TaskWorkspaceIdentity {
+                                name: workspace_name,
+                                location: WorkspaceLocationIdentity::Local {
+                                    directory: resolution.repository.top_level.clone(),
+                                },
+                            },
+                            repository: resolution.repository.identity.clone(),
+                            issue,
+                            base: resolution.base.clone(),
+                            branch: resolution.branch.clone(),
+                            executor: ExecutorTarget::Local,
+                            harness: None,
+                            stopping_boundary,
+                        },
+                        timestamp.clone(),
+                    );
+                    record.created_by = Some(TaskCreator {
+                        kind: TaskCreatorKind::Coordinator,
+                        session_id: caller.clone(),
+                        harness_label: None,
+                        created_at: timestamp.clone(),
+                    });
+                    record.lifecycle = TaskLifecycle::Preparing;
+                    record.worktree = TaskWorktree {
+                        state: TaskWorktreeState::Preparing,
+                        path: None,
+                    };
+                    let store = self
+                        .task_store
+                        .as_mut()
+                        .ok_or_else(|| "GitTerm's task store is unavailable".to_string())?;
+                    store
+                        .insert(record)
+                        .and_then(|()| {
+                            store.complete_worktree_preparation(
+                                &task_id,
+                                CompletedWorktreePreparation {
+                                    repository: resolution.repository.identity.clone(),
+                                    base: resolution.base.clone(),
+                                    branch: resolution.branch.clone(),
+                                    path: checkout.clone(),
+                                },
+                                &timestamp,
+                            )
+                        })
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            Ok(task_id)
+        })();
+        match prepared {
+            Ok(task_id) => {
+                self.mark_log_server_dirty();
+                self.start_delegated_worker(
+                    &task_id,
+                    PendingWorker {
+                        caller: tab,
+                        choice,
+                        options,
+                    },
+                    reply,
+                )
+            }
+            Err(error) => {
+                reply.send(Err(error));
+                Task::none()
+            }
+        }
+    }
+
+    /// A worker's time limit is up (TRU-212): unless it already reported or
+    /// was relaunched, close its tab (as Stop and close does, which ends the
+    /// harness), and fail the delegation as stopped at the time limit.
+    fn worker_time_limit_reached(&mut self, delegation_id: &str, session_id: &str) -> Task<Event> {
+        let Some(store) = self.task_store.as_ref() else {
+            eprintln!("[delegation] {delegation_id}: time limit reached, but the task store is unavailable");
+            return Task::none();
+        };
+        let Some(delegation) = store.delegation(delegation_id) else {
+            return Task::none();
+        };
+        let gitterm::tasks::DelegationChild::TaskSession {
+            task_id,
+            task_session_id,
+            ..
+        } = &delegation.child
+        else {
+            return Task::none();
+        };
+        if !delegation.status.is_active() || task_session_id.as_deref() != Some(session_id) {
+            return Task::none();
+        }
+        let task_id = task_id.clone();
+        let minutes = delegation.options.time_limit_minutes.unwrap_or_default();
+        let parent = delegation.parent.session_uid.clone();
+        let place = store
+            .get(&task_id)
+            .and_then(|task| task.worktree.path.clone());
+        let message = gitterm::delegations::time_limit_message(minutes, place.as_deref(), true);
+        eprintln!("[delegation] {delegation_id}: {message}");
+        let close = match find_task_session_tab(&self.workspaces, session_id) {
+            Some((workspace_idx, tab_idx)) => self.close_task_tab(TaskTabClosePrompt {
+                workspace_idx,
+                tab_idx,
+                task_id,
+            }),
+            None => Task::none(),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(store) = self.task_store.as_mut() {
+            if let Err(error) = store.stop_delegation_at_time_limit(delegation_id, message, &now) {
+                eprintln!("[delegation] {delegation_id}: {error}");
+            }
+        }
+        if let Some(tab_id) = self.delegation_parent_tab_id(&parent) {
+            let in_front = self.active_tab().map(|tab| tab.id) == Some(tab_id);
+            if !in_front {
+                if let Some(tab) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id)
+                {
+                    tab.set_attention(AttentionReason::DelegationFailed(
+                        gitterm::tasks::DelegationKind::Implement,
+                    ));
+                }
+            }
+        }
+        self.mark_workspaces_dirty();
+        self.mark_log_server_dirty();
+        self.push_delegation_card(delegation_id);
+        close
     }
 
     /// The delegated task's worktree is ready: record the worker delegation,
@@ -16776,6 +17329,7 @@ impl App {
             &task.title,
             &task.objective,
             &worker.choice,
+            &worker.options,
         ) {
             Ok(new) => new,
             Err(error) => {
@@ -20595,6 +21149,10 @@ fi
             }),
         ];
 
+        if let Some(store) = &self.task_store {
+            subs.extend(worker_time_limit_subscriptions(store, &self.workspaces));
+        }
+
         if self.browser_mcp.is_some() {
             subs.push(
                 iced::time::every(Duration::from_millis(1000))
@@ -22734,6 +23292,7 @@ fi
                             &task_mcp::ConsultDelegationRequest {
                                 brief: request.brief.clone(),
                                 model: Some(request.model.clone()),
+                                ..Default::default()
                             },
                             &caller,
                             self.review_config.codex_model.as_deref(),
@@ -22757,6 +23316,12 @@ fi
             Event::DelegationProgress(delegation_id, event) => {
                 self.delegation_progress(&delegation_id, event);
                 return Task::none();
+            }
+            Event::DelegateTaskTargetsChecked(result, reply) => {
+                return self.delegate_task_targets_checked(result, reply);
+            }
+            Event::WorkerTimeLimitReached(delegation_id, session_id) => {
+                return self.worker_time_limit_reached(&delegation_id, &session_id);
             }
             Event::DelegationFinished(delegation_id, outcome) => {
                 return self.finish_delegation(&delegation_id, outcome);
@@ -44564,6 +45129,117 @@ mod tests {
         assert_eq!(
             preset_conversation_backend(&preset("Review shell", "zsh")),
             None
+        );
+    }
+
+    #[test]
+    fn restored_worker_tabs_rearm_session_bound_deadline_subscriptions() {
+        use gitterm::tasks::{
+            Delegation, DelegationChild, DelegationKind, DelegationParent, NewDelegation,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tasks.json");
+        let mut store = TaskStore::load(&path).unwrap();
+        let task = slot_task(ExecutorTarget::Local, TaskLifecycle::Ready);
+        let task_id = task.task_id.clone();
+        store.insert(task).unwrap();
+        let mut worker = Delegation::new_requested(
+            NewDelegation {
+                kind: DelegationKind::Implement,
+                parent: DelegationParent {
+                    session_uid: "parent".into(),
+                    chat_session_id: None,
+                    workspace: "work".into(),
+                    cwd: PathBuf::from("/repo"),
+                },
+                child: DelegationChild::TaskSession {
+                    task_id: task_id.clone(),
+                    task_session_id: Some("session-1".into()),
+                    conversation: None,
+                    preset_name: None,
+                    model: None,
+                    role: None,
+                },
+                brief: "Fix the test".into(),
+                target: None,
+                previous: None,
+                options: gitterm::tasks::DelegationRunOptions {
+                    time_limit_minutes: Some(1),
+                    ..Default::default()
+                },
+            },
+            "2026-10-20T10:00:00Z",
+        );
+        let id = worker.delegation_id.clone();
+        worker.time_limit_deadline_unix_ms = Some(chrono::Utc::now().timestamp_millis() + 60_000);
+        store.insert_delegation(worker).unwrap();
+        let restored = TaskStore::load(&path).unwrap();
+        let mut workspace =
+            Workspace::new("work".into(), PathBuf::from("/repo"), WorkspaceColor::Blue);
+        let mut tab = TabState::new(1, PathBuf::from("/repo"));
+        tab.task_id = Some(task_id);
+        tab.task_session_id = Some("session-1".into());
+        workspace.tabs.push(tab);
+        assert_eq!(
+            worker_time_limit_subscriptions(&restored, std::slice::from_ref(&workspace)).len(),
+            1
+        );
+        assert!(worker_time_limit_subscriptions(&restored, &[]).is_empty());
+        workspace.tabs[0].task_session_id = Some("replacement".into());
+        assert!(
+            worker_time_limit_subscriptions(&restored, std::slice::from_ref(&workspace)).is_empty()
+        );
+
+        // Legacy records without a linked start fail closed to an immediate
+        // subscription rather than silently dropping their timer.
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["delegations"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("time_limit_deadline_unix_ms");
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let legacy = TaskStore::load(&path).unwrap();
+        assert!(legacy.worker_time_limit(&id).is_err());
+        workspace.tabs[0].task_session_id = Some("session-1".into());
+        assert_eq!(
+            worker_time_limit_subscriptions(&legacy, &[workspace]).len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_worker_timer_fires_at_its_deadline_or_at_once_if_expired() {
+        use iced::futures::StreamExt;
+        let mut timer = gitterm::tasks::WorkerTimeLimit {
+            delegation_id: "timed".into(),
+            session_id: "original-session".into(),
+            deadline_unix_ms: chrono::Utc::now().timestamp_millis() - 1_000,
+        };
+        let stream = worker_time_limit_stream(&timer);
+        iced::futures::pin_mut!(stream);
+        let event = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(event, Event::WorkerTimeLimitReached(id, session) if id == "timed" && session == "original-session")
+        );
+
+        timer.deadline_unix_ms = chrono::Utc::now().timestamp_millis() + 100;
+        let stream = worker_time_limit_stream(&timer);
+        iced::futures::pin_mut!(stream);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), stream.next())
+                .await
+                .is_err()
+        );
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(event, Event::WorkerTimeLimitReached(id, session) if id == "timed" && session == "original-session")
         );
     }
 

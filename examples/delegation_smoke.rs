@@ -439,6 +439,8 @@ async fn request_review(
         workspace: "delegation-smoke".to_string(),
         cwd: bridge.repo.clone(),
         remote: false,
+        home: bridge.repo.clone(),
+        repos: Vec::new(),
     };
     let new = delegations::review_delegation(request, &tab, None, None)?;
     let cwd = tab.cwd.clone();
