@@ -349,7 +349,8 @@ pub fn backfill_plan(
             .enumerate()
             .filter(|(_, (other, brief))| {
                 other.repo.eq_ignore_ascii_case(&key.repo)
-                    && brief.head_repo.eq_ignore_ascii_case(&key.repo)
+                    && (brief.head_repo.is_empty()
+                        || brief.head_repo.eq_ignore_ascii_case(&key.repo))
                     && !brief.head_ref.is_empty()
                     && brief.head_ref == pr.base_ref
             })
@@ -797,7 +798,8 @@ pub fn order_plan(plan: &MergePlan, live: &HashMap<String, PrBrief>) -> Vec<Orde
             j != i
                 && other.repo.to_ascii_lowercase() == repo
                 && live.get(&ids[j]).is_some_and(|other| {
-                    other.head_repo.eq_ignore_ascii_case(&entry.repo)
+                    (other.head_repo.is_empty()
+                        || other.head_repo.eq_ignore_ascii_case(&entry.repo))
                         && !other.head_ref.is_empty()
                         && other.head_ref == own.base_ref
                 })
@@ -982,6 +984,20 @@ mod tests {
         let live = prs.into_iter().map(|(key, pr)| (key.id(), pr)).collect();
         let rows = order_plan(&plan, &live);
         assert!(rows.iter().all(|row| !row.stacked && row.waits.is_empty()));
+    }
+
+    #[test]
+    fn backfill_does_not_treat_unknown_head_repo_as_a_mismatch() {
+        let mut parent = brief(PrState::Open, "topic", "main");
+        parent.head_repo.clear();
+        let prs = vec![
+            watched(1, "child", "topic"),
+            (PrKey::new("acme/api", 2), parent),
+        ];
+
+        let plan = backfill_plan("root", &prs, "now").unwrap();
+        let child = plan.entry(&PrKey::new("acme/api", 1)).unwrap();
+        assert_eq!(child.after, vec!["acme/api#2"]);
     }
 
     #[test]

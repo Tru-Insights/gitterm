@@ -1256,6 +1256,22 @@ pub struct Fetched {
     pub etags: BTreeMap<String, String>,
 }
 
+fn etags_for_pull(
+    key: &PrKey,
+    previous: &PrSnapshot,
+    etags: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut usable = etags.clone();
+    if previous
+        .core
+        .as_ref()
+        .is_none_or(|core| core.head_repo.is_empty())
+    {
+        usable.remove(&format!("repos/{}/pulls/{}", key.repo, key.number));
+    }
+    usable
+}
+
 /// Fetches `key` given its previous snapshot and ETags. Merged or closed,
 /// only the pull is read.
 pub async fn fetch_pr(
@@ -1265,13 +1281,14 @@ pub async fn fetch_pr(
     token: Option<&str>,
 ) -> Result<Fetched, String> {
     let repo = &key.repo;
+    let pull_path = format!("repos/{repo}/pulls/{}", key.number);
+    let usable_etags = etags_for_pull(key, previous, etags);
     let mut reader = Reader {
         token,
-        previous: etags,
+        previous: &usable_etags,
         etags: BTreeMap::new(),
     };
     let mut snapshot = previous.clone();
-    let pull_path = format!("repos/{repo}/pulls/{}", key.number);
     match reader.read(&pull_path).await? {
         Read::Changed(value) => snapshot.core = Some(parse_pull(&value)?),
         Read::Unchanged if previous.core.is_some() => {}
@@ -1508,6 +1525,26 @@ mod tests {
             check_runs: checks,
             ..PrSnapshot::default()
         }
+    }
+
+    #[test]
+    fn missing_head_repo_invalidates_only_the_pull_etag() {
+        let key = PrKey::new("acme/api", 12);
+        let pull = "repos/acme/api/pulls/12".to_string();
+        let checks = "repos/acme/api/commits/sha/check-runs?per_page=100".to_string();
+        let etags = BTreeMap::from([
+            (pull.clone(), "pull-etag".to_string()),
+            (checks.clone(), "checks-etag".to_string()),
+        ]);
+        let mut previous = snapshot(PrState::Open, "sha", vec![]);
+        previous.core.as_mut().unwrap().head_repo.clear();
+
+        let usable = etags_for_pull(&key, &previous, &etags);
+        assert!(!usable.contains_key(&pull));
+        assert_eq!(usable.get(&checks).map(String::as_str), Some("checks-etag"));
+
+        previous.core.as_mut().unwrap().head_repo = "acme/api".to_string();
+        assert_eq!(etags_for_pull(&key, &previous, &etags), etags);
     }
 
     fn fetched(snapshot: PrSnapshot) -> Fetched {
