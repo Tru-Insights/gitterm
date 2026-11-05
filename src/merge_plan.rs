@@ -18,6 +18,9 @@
 //!   stays until the user clears it from the row: a replacing plan that
 //!   omits it keeps it ([`MergePlan::replace_entries`]).
 //!
+//! Backfill (TRU-187) builds a snapshot from the workspace watch on demand,
+//! preserving unsafe dependencies as unordered entries with a reason.
+//!
 //! Live state comes from `pr_watch`; nothing here talks to GitHub.
 
 use std::collections::{HashMap, HashSet};
@@ -245,6 +248,9 @@ pub struct PlanEntry {
     /// How to merge it: merge (the default), squash or rebase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<MergeMethod>,
+    /// Why backfill could not safely order this PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unordered_reason: Option<String>,
     /// A short note for the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -266,6 +272,9 @@ impl PlanEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergePlan {
     pub root_chat_id: String,
+    /// How this plan was built; absent for agent-set and older plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// RFC 3339 UTC of the last change.
     #[serde(default)]
     pub updated_at: String,
@@ -295,6 +304,7 @@ impl MergePlan {
             }
         }
         self.entries = entries;
+        self.source = None;
         self.updated_at = at.to_string();
         kept
     }
@@ -314,6 +324,110 @@ impl MergePlan {
         self.updated_at = at.to_string();
         true
     }
+}
+
+/// Builds a snapshot from the workspace's watched PRs. Independent PRs use
+/// case-insensitive repo name, then PR number ascending (oldest in that repo).
+/// Only open/draft PRs supply dependencies; closed/merged branches are roots.
+/// Unresolvable PRs remain in the normal plan, without a merge position.
+pub fn backfill_plan(
+    root: &str,
+    watched: &[(PrKey, PrBrief)],
+    at: &str,
+) -> Result<MergePlan, String> {
+    let mut open: Vec<_> = watched
+        .iter()
+        .filter(|(_, pr)| !pr.state.is_final())
+        .collect();
+    open.sort_by_key(|(key, _)| (key.repo.to_ascii_lowercase(), key.number));
+    open.dedup_by_key(|(key, _)| key.id());
+    let mut entries = Vec::new();
+    let mut parents = Vec::new();
+    for (key, pr) in &open {
+        let candidates: Vec<_> = open
+            .iter()
+            .enumerate()
+            .filter(|(_, (other, brief))| {
+                other.repo.eq_ignore_ascii_case(&key.repo)
+                    && !brief.head_ref.is_empty()
+                    && brief.head_ref == pr.base_ref
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let reason = if pr.base_ref.is_empty() || pr.head_ref.is_empty() {
+            Some("branch information is missing from the PR watch".to_string())
+        } else if candidates.len() > 1 {
+            Some(format!(
+                "ambiguous base {}: multiple open PRs have this head branch",
+                pr.base_ref
+            ))
+        } else {
+            None
+        };
+        parents.push((candidates.len() == 1).then(|| candidates[0]));
+        entries.push(PlanEntry {
+            repo: key.repo.clone(),
+            number: key.number,
+            step: None,
+            after: Vec::new(),
+            hold: None,
+            method: None,
+            note: None,
+            unordered_reason: reason,
+        });
+    }
+    let mut placed = vec![false; entries.len()];
+    let mut ordered = Vec::new();
+    while let Some(i) = (0..entries.len()).find(|&i| {
+        !placed[i]
+            && entries[i].unordered_reason.is_none()
+            && parents[i].is_none_or(|parent| placed[parent])
+    }) {
+        placed[i] = true;
+        let mut entry = entries[i].clone();
+        entry.step =
+            Some(u32::try_from(ordered.len() + 1).map_err(|_| "too many PRs to backfill")?);
+        if let Some(parent) = parents[i] {
+            entry.after.push(entries[parent].key().label());
+        }
+        ordered.push(entry);
+    }
+    for i in 0..entries.len() {
+        if placed[i] || entries[i].unordered_reason.is_some() {
+            continue;
+        }
+        let mut path = HashSet::new();
+        let mut current = i;
+        let reason = loop {
+            if !path.insert(current) {
+                break "base-branch dependency chain contains a cycle".to_string();
+            }
+            if entries[current].unordered_reason.is_some() {
+                break format!(
+                    "depends on unordered base PR {}",
+                    entries[current].key().label()
+                );
+            }
+            // Unplaced entries without their own reason must have an unplaced parent.
+            current = parents[current].expect("unplaced PR has a base dependency");
+        };
+        entries[i].unordered_reason = Some(reason);
+    }
+    ordered.extend(
+        entries
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, entry)| (!placed[i]).then_some(entry)),
+    );
+    if ordered.is_empty() {
+        return Err("no open PRs with known state in this workspace's PR watch yet".to_string());
+    }
+    Ok(MergePlan {
+        root_chat_id: root.to_string(),
+        source: Some("backfill".to_string()),
+        updated_at: at.to_string(),
+        entries: validate_entries(ordered)?,
+    })
 }
 
 fn trimmed_text(text: Option<String>) -> Option<String> {
@@ -352,6 +466,7 @@ pub fn validate_entries(entries: Vec<PlanEntry>) -> Result<Vec<PlanEntry>, Strin
         }
         entry.hold = trimmed_text(entry.hold);
         entry.note = trimmed_text(entry.note);
+        entry.unordered_reason = trimmed_text(entry.unordered_reason);
         out.push(entry);
     }
     for entry in &mut out {
@@ -593,6 +708,8 @@ pub enum RowStatus {
     Blocked(Vec<String>),
     /// The plan holds it, with this reason.
     Held(String),
+    /// Backfill could not infer a safe order.
+    Unordered(String),
     Draft,
     Merged,
     Closed,
@@ -611,6 +728,7 @@ impl RowStatus {
             RowStatus::Merged => "merged",
             RowStatus::Closed => "closed",
             RowStatus::Unknown => "unknown",
+            RowStatus::Unordered(_) => "unordered",
         }
     }
 }
@@ -618,7 +736,7 @@ impl RowStatus {
 /// One plan entry in merge order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderedRow {
-    /// 1-based merge position.
+    /// 1-based display position; unordered entries have no merge position.
     pub position: usize,
     pub entry: PlanEntry,
     /// Every PR it waits for: explicit `after` entries, or the PR whose head
@@ -656,6 +774,9 @@ pub fn order_plan(plan: &MergePlan, live: &HashMap<String, PrBrief>) -> Vec<Orde
     let mut waits: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
     let mut stacked = vec![false; entries.len()];
     for (i, entry) in entries.iter().enumerate() {
+        if entry.unordered_reason.is_some() {
+            continue;
+        }
         if entry.explicit() {
             waits[i] = entry
                 .after
@@ -690,7 +811,7 @@ pub fn order_plan(plan: &MergePlan, live: &HashMap<String, PrBrief>) -> Vec<Orde
             (0..entries.len())
                 .filter(|&i| !placed[i])
                 .filter(|&i| !need_ready || waits[i].iter().all(|&j| placed[j]))
-                .min_by_key(|&i| (rank[i], i))
+                .min_by_key(|&i| (entries[i].unordered_reason.is_some(), rank[i], i))
         };
         let Some(next) = pick(true).or_else(|| pick(false)) else {
             break;
@@ -714,6 +835,12 @@ pub fn order_plan(plan: &MergePlan, live: &HashMap<String, PrBrief>) -> Vec<Orde
                 .map(|&j| entries[j].key().label())
                 .collect();
             let status = match state_of(i) {
+                state
+                    if !state.is_some_and(PrState::is_final)
+                        && entry.unordered_reason.is_some() =>
+                {
+                    RowStatus::Unordered(entry.unordered_reason.clone().unwrap())
+                }
                 None => RowStatus::Unknown,
                 Some(PrState::Merged) => RowStatus::Merged,
                 Some(PrState::Closed) => RowStatus::Closed,
@@ -757,6 +884,7 @@ mod tests {
             hold: None,
             method: None,
             note: None,
+            unordered_reason: None,
         }
     }
 
@@ -764,6 +892,7 @@ mod tests {
         MergePlan {
             root_chat_id: "root-1".to_string(),
             updated_at: String::new(),
+            source: None,
             entries,
         }
     }
@@ -778,6 +907,133 @@ mod tests {
 
     fn order_labels(rows: &[OrderedRow]) -> Vec<String> {
         rows.iter().map(|row| row.entry.key().label()).collect()
+    }
+
+    fn watched(number: u64, head: &str, base: &str) -> (PrKey, PrBrief) {
+        (
+            PrKey::new("acme/api", number),
+            brief(PrState::Open, head, base),
+        )
+    }
+
+    #[test]
+    fn backfill_orders_stack_and_persists_dependencies() {
+        let prs = vec![
+            watched(1, "c", "b"),
+            watched(3, "a", "main"),
+            watched(2, "b", "a"),
+        ];
+        let plan = backfill_plan("root", &prs, "now").unwrap();
+        assert_eq!(
+            plan.entries.iter().map(|e| e.number).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        assert_eq!(plan.entries[1].after, vec!["acme/api#3"]);
+        assert_eq!(plan.entries[2].after, vec!["acme/api#2"]);
+        assert_eq!(plan.source.as_deref(), Some("backfill"));
+        assert!(validate_entries(plan.entries.clone()).is_ok());
+        let live = prs.into_iter().map(|(key, pr)| (key.id(), pr)).collect();
+        let rows = order_plan(&plan, &live);
+        assert_eq!(rows[0].status, RowStatus::Next);
+        assert!(matches!(rows[1].status, RowStatus::Blocked(_)));
+        assert_eq!(
+            order_labels(&rows),
+            vec!["acme/api#3", "acme/api#2", "acme/api#1"]
+        );
+    }
+
+    #[test]
+    fn backfill_independent_order_is_stable_across_input_orders_and_repos() {
+        let mut prs = vec![
+            watched(9, "later", "main"),
+            watched(2, "earlier", "main"),
+            (
+                PrKey::new("acme/web", 1),
+                brief(PrState::Draft, "web", "earlier"),
+            ),
+        ];
+        let first = backfill_plan("root", &prs, "now").unwrap();
+        prs.reverse();
+        assert_eq!(first, backfill_plan("root", &prs, "now").unwrap());
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|e| e.key().label())
+                .collect::<Vec<_>>(),
+            vec!["acme/api#2", "acme/api#9", "acme/web#1"]
+        );
+        assert!(first.entries.iter().all(|e| e.after.is_empty()));
+    }
+
+    #[test]
+    fn backfill_ignores_closed_and_merged_parents() {
+        for final_state in [PrState::Closed, PrState::Merged] {
+            let prs = vec![
+                (PrKey::new("acme/api", 1), brief(final_state, "old", "main")),
+                watched(2, "new", "old"),
+            ];
+            let plan = backfill_plan("root", &prs, "now").unwrap();
+            assert_eq!(plan.entries.len(), 1);
+            assert_eq!(plan.entries[0].number, 2);
+            assert!(plan.entries[0].after.is_empty());
+            let live = prs.into_iter().map(|(key, pr)| (key.id(), pr)).collect();
+            assert_eq!(order_plan(&plan, &live)[0].status, RowStatus::Next);
+        }
+    }
+
+    #[test]
+    fn backfill_leaves_cycles_ambiguity_and_their_dependents_unordered() {
+        let prs = vec![
+            watched(1, "a", "b"),
+            watched(2, "b", "a"),
+            watched(3, "c", "a"),
+            watched(4, "dup", "main"),
+            watched(5, "dup", "main"),
+            watched(6, "ambiguous", "dup"),
+            watched(7, "child", "ambiguous"),
+            watched(8, "self", "self"),
+        ];
+        let plan = backfill_plan("root", &prs, "now").unwrap();
+        let live = prs.into_iter().map(|(key, pr)| (key.id(), pr)).collect();
+        let rows = order_plan(&plan, &live);
+        for number in [1, 2, 3, 6, 7, 8] {
+            let row = rows.iter().find(|r| r.entry.number == number).unwrap();
+            assert!(matches!(row.status, RowStatus::Unordered(_)));
+            assert!(row.entry.step.is_none());
+            assert!(row.entry.after.is_empty());
+        }
+        assert!(plan
+            .entry(&PrKey::new("acme/api", 1))
+            .unwrap()
+            .unordered_reason
+            .as_ref()
+            .unwrap()
+            .contains("cycle"));
+        assert!(plan
+            .entry(&PrKey::new("acme/api", 6))
+            .unwrap()
+            .unordered_reason
+            .as_ref()
+            .unwrap()
+            .contains("ambiguous"));
+        assert_eq!(next_to_merge(&rows).unwrap().entry.number, 4);
+        // A cycle alone never invents a next PR.
+        let cyclic =
+            backfill_plan("root", &[watched(1, "a", "b"), watched(2, "b", "a")], "now").unwrap();
+        assert!(next_to_merge(&order_plan(&cyclic, &live)).is_none());
+    }
+
+    #[test]
+    fn backfill_round_trips_unordered_reasons_in_normal_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = backfill_plan("root", &[watched(1, "self", "self")], "now").unwrap();
+        write_plan(dir.path(), &plan).unwrap();
+        assert_eq!(load_plans(dir.path())["root"], plan);
+        let mut agent_replacement = plan.clone();
+        agent_replacement.replace_entries(vec![entry("acme/api", 2)], "later");
+        assert_eq!(agent_replacement.source, None);
+        assert!(backfill_plan("root", &[], "now").is_err());
     }
 
     #[test]
@@ -1035,6 +1291,7 @@ mod tests {
             root_chat_id: "root-1".to_string(),
             updated_at: "2026-10-31T10:00:00Z".to_string(),
             entries: vec![stepped],
+            source: Some("backfill".to_string()),
         };
         write_plan(&dir, &p).unwrap();
         // A hand-written file with only the required fields.
@@ -1047,6 +1304,7 @@ mod tests {
         let plans = load_plans(&dir);
         assert_eq!(plans.len(), 2);
         assert_eq!(plans["root-1"], p);
+        assert_eq!(plans["root-2"].source, None);
         assert_eq!(plans["root-2"].entries[0], entry("acme/web", 3));
         let text = std::fs::read_to_string(dir.join("root-1.json")).unwrap();
         assert!(text.contains("\"method\": \"squash\""), "{text}");

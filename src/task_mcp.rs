@@ -978,7 +978,7 @@ impl TaskMcpTools {
     }
 
     #[tool(
-        description = "Read the merge plan of your chat's root (coordinator) chat with live GitHub state per PR: state (open, draft, merged, closed), checks, review decision, conflicts, its position, its status (next, ready, blocked, held, draft, merged, closed, unknown) and what it waits for, plus the next PR to merge and the PRs this work created that the plan does not list yet (unplanned_prs). Live state comes from GitTerm's watch, polled every couple of minutes; a PR not read yet has live: null.",
+        description = "Read the merge plan of your chat's root (coordinator) chat with live GitHub state per PR: state (open, draft, merged, closed), checks, review decision, conflicts, its position (null when unordered), its status (next, ready, blocked, held, unordered, draft, merged, closed, unknown) and what it waits for, the plan source (backfill when built from open PRs) and unordered_reason for unresolved branch dependencies, plus the next PR to merge and the PRs this work created that the plan does not list yet (unplanned_prs). Live state comes from GitTerm's watch, polled every couple of minutes; a PR not read yet has live: null.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

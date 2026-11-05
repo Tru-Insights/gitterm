@@ -140,6 +140,8 @@ pub enum PrEvent {
     Polled(Box<pr_watch::PollOutcome>),
     Saved(Result<(), String>),
     PlanWritten(Box<MergePlanWrite>),
+    /// Build only when this root has no plan, from its workspace watch.
+    BuildPlan(u64, String),
     /// The user cleared a hold: root chat, PR.
     ClearHold(String, PrKey),
     Review(PrKey),
@@ -194,6 +196,9 @@ fn done_summary(done: &[PrState]) -> String {
 pub struct PrsState {
     /// Merge plans by root chat id.
     pub plans: HashMap<String, MergePlan>,
+    /// Serialize writes per root so a stale completion cannot replace a newer plan.
+    pub plan_writes: HashSet<String>,
+    pub plan_errors: HashMap<String, String>,
     pub watch: pr_watch::WatchFile,
     pub in_flight: bool,
     /// PRs to read at the next tick whatever their interval (a plan was
@@ -217,6 +222,36 @@ pub struct PrsState {
 }
 
 impl PrsState {
+    /// Refuses even an empty existing plan, including one still being saved.
+    fn prepare_backfill(&mut self, root: &str, keys: &[PrKey]) -> Result<MergePlan, String> {
+        if self.plans.contains_key(root) || self.plan_writes.contains(root) {
+            return Err(
+                "a merge plan already exists or is being saved; backfill will not replace it"
+                    .to_string(),
+            );
+        }
+        let watched: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                self.watch
+                    .prs
+                    .get(&key.id())
+                    .and_then(WatchedPr::brief)
+                    .map(|brief| (key.clone(), brief))
+                    .ok_or_else(|| {
+                        format!(
+                            "{} has no known PR state yet; wait for the PR watch and try again",
+                            key.label()
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let plan = merge_plan::backfill_plan(root, &watched, &chat_facts::now_stamp())?;
+        self.plans.insert(root.to_string(), plan.clone());
+        self.homes_built = None;
+        Ok(plan)
+    }
+
     /// An Approve / Merge run for `key` finished. Its PR is read at the
     /// next tick either way. The open confirmation for it closes on
     /// success and keeps the error on failure; returns whether it closed.
@@ -659,6 +694,12 @@ impl App {
                 return Task::none();
             }
         };
+        if self.prs.plan_writes.contains(&root) {
+            reply.send(Err(
+                "the merge plan is being saved; retry merge_plan_set after it finishes".to_string(),
+            ));
+            return Task::none();
+        }
         let previous = self.prs.plans.get(&root).cloned();
         let mut plan = previous.clone().unwrap_or_else(|| MergePlan {
             root_chat_id: root.clone(),
@@ -678,7 +719,7 @@ impl App {
     }
 
     fn write_merge_plan(
-        &self,
+        &mut self,
         plan: MergePlan,
         previous: Option<MergePlan>,
         reply: Option<TaskControlReply>,
@@ -686,6 +727,8 @@ impl App {
     ) -> Task<Event> {
         let dir = merge_plan::plans_dir(&config::global_config_dir());
         let root = plan.root_chat_id.clone();
+        self.prs.plan_writes.insert(root.clone());
+        self.prs.plan_errors.remove(&root);
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || merge_plan::write_plan(&dir, &plan))
@@ -705,6 +748,7 @@ impl App {
     }
 
     fn merge_plan_written(&mut self, write: MergePlanWrite) {
+        self.prs.plan_writes.remove(&write.root);
         match write.result {
             Ok(()) => {
                 if let Some(reply) = write.reply {
@@ -721,6 +765,10 @@ impl App {
             }
             Err(error) => {
                 eprintln!("[merge-plan] {}: {error}", write.root);
+                self.prs.plan_errors.insert(
+                    write.root.clone(),
+                    format!("the merge plan was not saved: {error}"),
+                );
                 match write.previous {
                     Some(previous) => {
                         self.prs.plans.insert(write.root.clone(), previous);
@@ -758,7 +806,8 @@ impl App {
                     _ => Vec::new(),
                 };
                 serde_json::json!({
-                    "position": row.position,
+                    "position": row.entry.unordered_reason.is_none().then_some(row.position),
+                    "unordered_reason": row.entry.unordered_reason,
                     "pr": key.label(),
                     "repo": row.entry.repo,
                     "number": row.entry.number,
@@ -792,6 +841,7 @@ impl App {
         serde_json::json!({
             "root_chat_id": root,
             "updated_at": plan.map(|plan| plan.updated_at.clone()),
+            "source": plan.and_then(|plan| plan.source.as_deref()),
             "next": merge_plan::next_to_merge(&rows).map(|row| row.entry.key().label()),
             "entries": entries,
             "unplanned_prs": unplanned,
@@ -837,8 +887,32 @@ impl App {
                     return self.save_pr_watch();
                 }
             }
+            PrEvent::BuildPlan(uid, root) => {
+                // Recheck membership and existence at click time, not just render time.
+                self.rebuild_pr_homes();
+                let Some(roots) = self.home_roots(&PrHome::Open(uid)) else {
+                    return Task::none();
+                };
+                if !roots.iter().any(|known| known.root == root) {
+                    return Task::none();
+                }
+                let keys: Vec<_> = self
+                    .keys_of_roots(roots)
+                    .into_iter()
+                    .map(|(_, key)| key)
+                    .collect();
+                match self.prs.prepare_backfill(&root, &keys) {
+                    Ok(plan) => return self.write_merge_plan(plan, None, None, Vec::new()),
+                    Err(error) => {
+                        self.prs.plan_errors.insert(root, error);
+                    }
+                }
+            }
             PrEvent::PlanWritten(write) => self.merge_plan_written(*write),
             PrEvent::ClearHold(root, key) => {
+                if self.prs.plan_writes.contains(&root) {
+                    return Task::none();
+                }
                 let Some(plan) = self.prs.plans.get_mut(&root) else {
                     return Task::none();
                 };
@@ -1411,7 +1485,7 @@ impl App {
             .and_then(WatchedPr::brief)
             .is_some_and(|brief| brief.state == merge_plan::PrState::Draft);
         let mut head = Row::new().spacing(6).align_y(iced::Alignment::Center);
-        if let Some(row) = row {
+        if let Some(row) = row.filter(|r| r.entry.unordered_reason.is_none()) {
             head = head.push(
                 text(format!("{}", row.position))
                     .size(font_small)
@@ -1437,6 +1511,7 @@ impl App {
                 RowStatus::Ready => ("ready".to_string(), theme.success()),
                 RowStatus::Blocked(_) => ("blocked".to_string(), theme.warning()),
                 RowStatus::Held(_) => ("held".to_string(), theme.warning()),
+                RowStatus::Unordered(_) => ("unordered".to_string(), theme.warning()),
                 other => (other.label().to_string(), theme.text_muted()),
             };
             if row.status != RowStatus::Draft {
@@ -1481,6 +1556,13 @@ impl App {
                         ))
                         .size(10)
                         .color(theme.warning()),
+                    );
+                }
+                RowStatus::Unordered(reason) => {
+                    body = body.push(
+                        text(format!("unordered: {reason}"))
+                            .size(10)
+                            .color(theme.warning()),
                     );
                 }
                 RowStatus::Held(hold) => {
@@ -1641,7 +1723,7 @@ impl App {
                 let (rows, done_rows): (Vec<_>, Vec<_>) = all_rows
                     .into_iter()
                     .partition(|row| !state_of(&row.entry.key()).is_some_and(PrState::is_final));
-                let planned = !rows.is_empty() || !done_rows.is_empty();
+                let planned = plan.is_some();
                 let (unplanned, mut done) = split_done(all_unplanned, state_of);
                 for row in &done_rows {
                     if let Some(state) = state_of(&row.entry.key()) {
@@ -1699,10 +1781,30 @@ impl App {
             }
             if !planned {
                 section = section.push(
-                    text("no merge plan yet; the coordinator sets one with merge_plan_set")
+                    row![
+                        text("no merge plan yet").size(10).color(theme.text_muted()),
+                        button(text("Build plan from open PRs").size(10))
+                            .style(self.ghost_button_style())
+                            .padding([2, 6])
+                            .on_press(Event::Pr(PrEvent::BuildPlan(uid, root.root.clone()))),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                );
+            } else if self
+                .prs
+                .plans
+                .get(&root.root)
+                .is_some_and(|p| p.source.as_deref() == Some("backfill"))
+            {
+                section = section.push(
+                    text("built from open PRs · independent PRs by repo, then PR number ascending")
                         .size(10)
                         .color(theme.text_muted()),
                 );
+            }
+            if let Some(error) = self.prs.plan_errors.get(&root.root) {
+                section = section.push(text(error.clone()).size(10).color(theme.danger()));
             }
             for row in &rows {
                 section = section.push(self.view_pr_row(&root.root, &row.entry.key(), Some(row)));
@@ -1913,6 +2015,9 @@ impl App {
                     format!("the plan has it wait for {}", waits.join(", ")),
                     theme.warning(),
                 )),
+                RowStatus::Unordered(reason) => {
+                    Some((format!("unordered: {reason}"), theme.warning()))
+                }
                 RowStatus::Held(hold) => {
                     Some((format!("the plan holds it: {hold}"), theme.warning()))
                 }
@@ -2075,6 +2180,54 @@ mod tests {
             }),
             ..PrsState::default()
         }
+    }
+
+    #[test]
+    fn backfill_only_uses_selected_workspace_watch_and_never_replaces_a_plan() {
+        let mut prs = PrsState::default();
+        let key = PrKey::new("acme/api", 12);
+        let mut watched = WatchedPr::new(key.clone());
+        watched.snapshot.core = Some(pr_watch::PullCore {
+            state: Some(PrState::Open),
+            head_ref: "feature".to_string(),
+            base_ref: "main".to_string(),
+            ..Default::default()
+        });
+        prs.watch.prs.insert(key.id(), watched);
+        let other = PrKey::new("other/repo", 1);
+        let mut unrelated = WatchedPr::new(other.clone());
+        unrelated.snapshot.core = Some(pr_watch::PullCore {
+            state: Some(PrState::Open),
+            head_ref: "other".to_string(),
+            base_ref: "main".to_string(),
+            ..Default::default()
+        });
+        prs.watch.prs.insert(other.id(), unrelated);
+        let backfilled = prs
+            .prepare_backfill("root", std::slice::from_ref(&key))
+            .unwrap();
+        assert_eq!(backfilled.entries.len(), 1);
+        assert_eq!(backfilled.entries[0].key(), key);
+        assert!(prs
+            .prepare_backfill("root", std::slice::from_ref(&other))
+            .is_err());
+        assert_eq!(prs.plans["root"], backfilled);
+        let agent_plan = MergePlan {
+            root_chat_id: "agent".to_string(),
+            ..Default::default()
+        };
+        prs.plans.insert("agent".to_string(), agent_plan.clone());
+        assert!(prs.prepare_backfill("agent", &[key]).is_err());
+        assert_eq!(prs.plans["agent"], agent_plan);
+        prs.plan_writes.insert("pending".to_string());
+        assert!(prs.prepare_backfill("pending", &[]).is_err());
+        assert!(!prs.plans.contains_key("pending"));
+        let unread = PrKey::new("acme/api", 99);
+        assert!(prs
+            .prepare_backfill("unread", &[unread])
+            .unwrap_err()
+            .contains("no known PR state"));
+        assert!(!prs.plans.contains_key("unread"));
     }
 
     #[test]
