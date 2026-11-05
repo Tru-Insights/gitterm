@@ -6,6 +6,7 @@ pub mod browser_mcp;
 pub mod chat_facts;
 pub mod chat_page;
 pub mod chats;
+pub mod codex_exec;
 pub mod codex_review;
 pub mod codex_runner;
 pub mod delegations;

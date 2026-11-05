@@ -667,14 +667,15 @@ fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guideli
 }
 
 /// What an agent starting now in `cwd` gets appended: the guidelines and,
-/// in a piece of work, the documents note naming `places` (TRU-191), then
-/// how to start Codex in GitTerm (TRU-212). The
-/// work's docs folder is created here, as the agent starts; a failure is
-/// logged and the note still names it.
+/// in a piece of work, the documents note naming `places` (TRU-191), then,
+/// for an agent given GitTerm's task tools (`task_tools`), how to start
+/// Codex in GitTerm (TRU-212). The work's docs folder is created here, as
+/// the agent starts; a failure is logged and the note still names it.
 fn launch_instructions(
     cwd: &Path,
     workspace_off: bool,
     places: Option<&gitterm::guidelines::DocumentPlaces>,
+    task_tools: bool,
 ) -> Option<gitterm::guidelines::Guidelines> {
     if let Some(places) = places {
         if let Err(error) = std::fs::create_dir_all(&places.docs_dir) {
@@ -684,14 +685,11 @@ fn launch_instructions(
             );
         }
     }
-    let launch_dir = config::instance_config_dir();
-    gitterm::guidelines::with_codex_tools_note(
-        gitterm::guidelines::with_documents(
-            launch_guidelines(cwd, workspace_off),
-            places,
-            &launch_dir,
-        ),
-        &launch_dir,
+    gitterm::guidelines::launch_instructions(
+        launch_guidelines(cwd, workspace_off),
+        places,
+        task_tools,
+        &config::instance_config_dir(),
     )
 }
 
@@ -711,13 +709,16 @@ fn config_document_places(cfg: &WorkspaceConfig) -> Option<gitterm::guidelines::
 }
 
 /// A terminal startup command with the guidelines (and the documents note
-/// of `places`) added when it starts `claude`, `pi` or `codex`. Other
-/// commands are not inspected, so they never read the guidelines file.
+/// of `places`, and the Codex tools note when the terminal gets GitTerm's
+/// task tools, `task_tools`) added when it starts `claude`, `pi` or
+/// `codex`. Other commands are not inspected, so they never read the
+/// guidelines file.
 fn terminal_command_with_guidelines(
     command: &str,
     cwd: &Path,
     workspace_off: bool,
     places: Option<&gitterm::guidelines::DocumentPlaces>,
+    task_tools: bool,
 ) -> String {
     // shortcut: the added option is POSIX-quoted, so Windows terminals
     // (cmd, PowerShell) launch without the guidelines until the quoting is
@@ -728,7 +729,7 @@ fn terminal_command_with_guidelines(
     if !gitterm::guidelines::starts_a_harness(command) {
         return command.to_string();
     }
-    match launch_instructions(cwd, workspace_off, places) {
+    match launch_instructions(cwd, workspace_off, places, task_tools) {
         Some(guidelines) => gitterm::guidelines::configure_terminal_command(command, &guidelines),
         None => command.to_string(),
     }
@@ -6947,6 +6948,9 @@ pub enum Event {
     /// A CLI transcript the Chats overview follows was checked (TRU-154):
     /// `Ok(None)` when it had not changed.
     OverviewTranscriptLoaded(PathBuf, Result<Option<Box<TranscriptGist>>, String>),
+    /// A `codex exec` poll (TRU-212): page payloads by tab, and whether
+    /// any run is still followed.
+    CodexExecPolled(Vec<(usize, serde_json::Value)>, bool),
     /// The Agent surface finished building this tab's page. The tab's
     /// buffer is replayed now, from live state, so events that arrived while
     /// the page was under construction (transcript read-back, a fast first
@@ -7598,6 +7602,14 @@ struct App {
     /// changes, for the overview's snapshot key.
     overview_transcripts: HashMap<PathBuf, OverviewTranscript>,
     overview_transcripts_revision: u64,
+    /// `codex exec` runs the local Claude chats started outside GitTerm's
+    /// tools (TRU-212), followed on the tick off the UI thread. The lock
+    /// is taken only by the poll, one at a time (`codex_exec_polling`).
+    codex_exec_watch: Arc<std::sync::Mutex<gitterm::codex_exec::Watcher>>,
+    codex_exec_polling: bool,
+    /// The last poll still followed a run: poll once more even when no
+    /// chat is left, so the run is seen to end.
+    codex_exec_has_runs: bool,
     /// The Chats overview's snapshot and the key it was built for. Built
     /// in `view` on first need and rebuilt only when the key changes, so a
     /// frame costs a cheap key, not a walk of every conversation.
@@ -16859,11 +16871,14 @@ impl App {
             };
             match gitterm::delegations::codex_run(delegation, &config_root) {
                 Ok(mut run) => {
+                    // A Codex review or consult runs without the task
+                    // tools, so it is not told to use them.
                     run.guidelines = launch_instructions(
                         &run.cwd,
                         self.workspace_guidelines_off(&delegation.parent.workspace),
                         self.workspace_document_places(&delegation.parent.workspace)
                             .as_ref(),
+                        false,
                     );
                     runs.push((delegation_id, run))
                 }
@@ -18792,6 +18807,9 @@ impl App {
             overview_running_polled: HashMap::new(),
             overview_transcripts: HashMap::new(),
             overview_transcripts_revision: 0,
+            codex_exec_watch: Arc::default(),
+            codex_exec_polling: false,
+            codex_exec_has_runs: false,
             chat_overview_cache: ChatOverviewCache::default(),
             chat_overview_idle_expanded: false,
             roster_reveal_held: HashMap::new(),
@@ -19572,11 +19590,15 @@ fi
 
         // Added at launch only: the stored startup command stays as given.
         let launch_command = startup_command.as_deref().map(|command| {
+            // The terminal gets the task server when it runs (its
+            // environment carries the endpoint; claude and codex are given
+            // the config, pi finds it through its extension).
             let command = terminal_command_with_guidelines(
                 command,
                 &repo_path,
                 guidelines_off,
                 document_places.as_ref(),
+                self.task_mcp.is_some(),
             );
             gitterm::harness::claude::configure_terminal_chrome(&command, claude_in_chrome)
         });
@@ -20531,6 +20553,63 @@ fi
             self.overview_running_polled.insert(remote_id, (now, true));
         }
         Task::batch(tasks)
+    }
+
+    /// Look for `codex exec` runs under each local Claude chat's `claude`
+    /// process (TRU-212), on a blocking thread: only while a chat's process
+    /// runs (or a run is still followed), one poll at a time.
+    fn poll_codex_exec(&mut self) -> Task<Event> {
+        if self.codex_exec_polling {
+            return Task::none();
+        }
+        let roots: Vec<gitterm::codex_exec::Root> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .filter_map(|tab| {
+                let pid = tab.agent_session()?.harness.as_ref()?.claude_pid()?;
+                match gitterm::codex_exec::Root::capture(tab.id, pid) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        eprintln!(
+                            "[codex-exec] capturing chat {} process {pid}: {error}",
+                            tab.id
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+        if roots.is_empty() && !self.codex_exec_has_runs {
+            return Task::none();
+        }
+        self.codex_exec_polling = true;
+        let watch = self.codex_exec_watch.clone();
+        Task::perform(
+            async move {
+                let polled = tokio::task::spawn_blocking(move || {
+                    let mut watcher = watch
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let payloads = watcher
+                        .poll(&gitterm::codex_exec::Libproc, &roots, now_ms)
+                        .into_iter()
+                        .map(|(tab_id, run)| (tab_id, gitterm::chat_page::codex_exec_payload(&run)))
+                        .collect::<Vec<_>>();
+                    (payloads, watcher.has_runs())
+                })
+                .await;
+                match polled {
+                    Ok(polled) => polled,
+                    Err(error) => {
+                        eprintln!("[codex-exec] the poll task failed: {error}");
+                        (Vec::new(), true)
+                    }
+                }
+            },
+            |(payloads, has_runs)| Event::CodexExecPolled(payloads, has_runs),
+        )
     }
 
     /// Check the transcripts of this Mac's CLI terminal tabs (Claude CLI,
@@ -22219,6 +22298,8 @@ fi
                 tasks.push(self.poll_work_notes());
                 // Closed tabs release their browser targets (TRU-176).
                 tasks.push(self.sync_browser_owners());
+                // `codex exec` runs under the chats (TRU-212).
+                tasks.push(self.poll_codex_exec());
                 let workspace_dirty = false;
 
                 // Poll git status for the active tab with adaptive cadence.
@@ -22814,10 +22895,14 @@ fi
                                 return Task::none();
                             }
                             if session.harness.is_none() {
+                                let task_tools = acp_mcp_servers
+                                    .iter()
+                                    .any(|server| server.name == "gitterm_tasks");
                                 let guidelines = launch_instructions(
                                     &repo_path,
                                     guidelines_off,
                                     document_places.as_ref(),
+                                    task_tools,
                                 );
                                 let Some(config) = session.acp_session_config(
                                     repo_path,
@@ -22891,10 +22976,16 @@ fi
                                         session.session_id = None;
                                     }
                                 }
+                                // A chat given the task server is told how
+                                // to start Codex through it (TRU-212).
+                                let task_tools = claude_mcp_servers.iter().any(|server| {
+                                    server.config["mcpServers"].get("gitterm_tasks").is_some()
+                                });
                                 let guidelines_file = launch_instructions(
                                     &repo_path,
                                     guidelines_off,
                                     document_places.as_ref(),
+                                    task_tools,
                                 )
                                 .map(|guidelines| guidelines.path);
                                 let Some(config) = session.claude_session_config(
@@ -22979,10 +23070,12 @@ fi
                             echo = tab::AgentEvent::user_prompt(&prompt.text);
                         }
                         if session.task_handle.is_none() {
+                            // A per-turn pi process gets no MCP servers.
                             let guidelines_file = launch_instructions(
                                 &repo_path,
                                 guidelines_off,
                                 document_places.as_ref(),
+                                false,
                             )
                             .map(|guidelines| guidelines.path);
                             let handle = tab::spawn_agent_task(
@@ -27943,6 +28036,20 @@ fi
                     }
                 }
             }
+            Event::CodexExecPolled(payloads, has_runs) => {
+                self.codex_exec_polling = false;
+                self.codex_exec_has_runs = has_runs;
+                // Live only: a page not open now gets running runs back on
+                // the next poll, and finished ones not at all.
+                for (tab_id, payload) in payloads {
+                    if webview::is_active(WebviewSurface::Agent(tab_id)) {
+                        webview::evaluate_script(
+                            WebviewSurface::Agent(tab_id),
+                            &format!("window.__appendEvent({payload})"),
+                        );
+                    }
+                }
+            }
             Event::OverviewTranscriptLoaded(path, result) => {
                 let Some(state) = self.overview_transcripts.get_mut(&path) else {
                     // Its tab closed while the read was out.
@@ -30212,8 +30319,15 @@ fi
                 session.history = tab::HistoryLoad::Loaded;
                 return Task::none();
             }
-            let guidelines =
-                launch_instructions(&repo_path, guidelines_off, document_places.as_ref());
+            let task_tools = acp_mcp_servers
+                .iter()
+                .any(|server| server.name == "gitterm_tasks");
+            let guidelines = launch_instructions(
+                &repo_path,
+                guidelines_off,
+                document_places.as_ref(),
+                task_tools,
+            );
             let Some(config) = session.acp_session_config(
                 repo_path,
                 acp_mcp_servers,
