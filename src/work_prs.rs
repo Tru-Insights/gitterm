@@ -1319,7 +1319,7 @@ impl App {
 
     /// Whether chat tab `tab_id` is mid-turn: the state the chat strip's
     /// running marker and held delegation sends go by.
-    fn chat_turn_running(&self, tab_id: usize) -> bool {
+    pub(super) fn chat_turn_running(&self, tab_id: usize) -> bool {
         self.workspaces
             .iter()
             .flat_map(|ws| ws.tabs.iter())
