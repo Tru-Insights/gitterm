@@ -763,23 +763,26 @@ impl Watcher {
 fn refresh_run(run: &mut Run, procs: &dyn Processes, errors: &mut Vec<(&'static str, String)>) {
     // Only a writable descriptor can establish ownership. A transcript on
     // stdin is history, even if its session_meta says "exec".
-    if run.rollout.is_none() {
-        let files = procs.open_files(run.pid);
-        match procs.info(run.pid) {
-            Ok(Some(info)) if info.start_us == run.start_us => {}
-            Ok(_) => return,
-            Err(error) => {
-                errors.push(("checking a codex process after reading open files", error));
-                return;
-            }
+    let files = procs.open_files(run.pid);
+    match procs.info(run.pid) {
+        Ok(Some(info)) if info.start_us == run.start_us => {}
+        Ok(_) => return,
+        Err(error) => {
+            errors.push(("checking a codex process after reading open files", error));
+            return;
         }
-        match files {
-            Ok(files) => {
-                let mut paths: Vec<_> = files
-                    .into_iter()
-                    .filter(|file| file.writable && is_rollout_path(&file.path))
-                    .map(|file| file.path)
-                    .collect();
+    }
+    let mut candidates = std::collections::BTreeSet::new();
+    match files {
+        Ok(files) => {
+            let mut paths: Vec<_> = files
+                .into_iter()
+                .filter(|file| file.writable && is_rollout_path(&file.path))
+                .map(|file| file.path)
+                .collect();
+            // A still-open subagent can be outside both scanned day folders.
+            candidates.extend(paths.iter().cloned());
+            if run.rollout.is_none() {
                 paths.sort_by_key(|path| {
                     std::cmp::Reverse((rollout_name_time_ms(path), path.clone()))
                 });
@@ -795,8 +798,8 @@ fn refresh_run(run: &mut Run, procs: &dyn Processes, errors: &mut Vec<(&'static 
                     }
                 }
             }
-            Err(e) => errors.push(("listing a codex process's open files", e)),
         }
+        Err(e) => errors.push(("listing a codex process's open files", e)),
     }
     let Some(run_path) = run.rollout.as_ref().map(|(path, _, _)| path.clone()) else {
         return;
@@ -814,7 +817,6 @@ fn refresh_run(run: &mut Run, procs: &dyn Processes, errors: &mut Vec<(&'static 
             dirs.push(today);
         }
     }
-    let mut candidates = std::collections::BTreeSet::new();
     // A previously seen child may leave the scanned day folders before its
     // parent appears. Its complete metadata must still be reconsidered.
     for (path, meta) in &run.heads {
@@ -1818,6 +1820,53 @@ mod tests {
     }
 
     #[test]
+    fn an_adopted_run_discovers_writable_subagent_descriptors_outside_scanned_days() {
+        let sessions = tempfile::tempdir().unwrap();
+        let today = chrono::Local::now().date_naive();
+        let own_day = today - chrono::Duration::days(2);
+        let child_day = today - chrono::Duration::days(1);
+        let own_dir = sessions.path().join(own_day.format("%Y/%m/%d").to_string());
+        let child_dir = sessions
+            .path()
+            .join(child_day.format("%Y/%m/%d").to_string());
+        std::fs::create_dir_all(&own_dir).unwrap();
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let own = own_dir.join(format!("rollout-{own_day}T10-00-00-own.jsonl"));
+        let child = child_dir.join(format!("rollout-{child_day}T10-00-00-child.jsonl"));
+        write_meta(&own, "own", r#""exec""#);
+        let (mut procs, root) = exec_fixture(&own);
+        let mut watcher = Watcher::default();
+        let first = watcher.poll(&procs, &[root], 5);
+        assert_eq!(first[0].1.thread_id.as_deref(), Some("own"));
+        assert!(first[0].1.subagents.is_empty());
+
+        // The intervening day's file is visible only through its descriptor.
+        let source = r#"{"subagent":{"thread_spawn":{"parent_thread_id":"own"}}}"#;
+        write_meta(&child, "child", source);
+        procs.open.get_mut(&103).unwrap().push(OpenFile {
+            path: child.clone(),
+            writable: false,
+        });
+        assert!(watcher.poll(&procs, &[root], 10)[0].1.subagents.is_empty());
+        assert!(!watcher.runs[&(103, 1001)].heads.contains_key(&child));
+
+        procs.open.get_mut(&103).unwrap()[1].writable = true;
+        std::fs::write(&child, "{\"type\":").unwrap();
+        assert!(watcher.poll(&procs, &[root], 15)[0].1.subagents.is_empty());
+        assert!(!watcher.runs[&(103, 1001)].heads.contains_key(&child));
+
+        write_meta(&child, "child", source);
+        for now_ms in [20, 25] {
+            let out = watcher.poll(&procs, &[root], now_ms);
+            assert_eq!(out[0].1.thread_id.as_deref(), Some("own"));
+            assert_eq!(out[0].1.subagents.len(), 1);
+            assert_eq!(out[0].1.subagents[0].thread_id, "child");
+            assert_eq!(out[0].1.subagents[0].rollout_path, child.to_str().unwrap());
+        }
+        assert!(watcher.logged.is_empty(), "{:?}", watcher.logged);
+    }
+
+    #[test]
     fn stdin_history_is_ignored_and_the_newest_writable_exec_is_selected() {
         let dir = tempfile::tempdir().unwrap();
         let history = dir.path().join("rollout-2026-01-02T11-00-00-history.jsonl");
@@ -2006,6 +2055,38 @@ mod tests {
                 assert!(watcher.not_runs.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn pid_reuse_during_descriptor_refresh_does_not_adopt_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("rollout-2026-01-02T10-00-00-own.jsonl");
+        write_meta(&own, "own", r#""exec""#);
+        let (mut base, root) = exec_fixture(&own);
+        let mut watcher = Watcher::default();
+        assert_eq!(
+            watcher.poll(&base, &[root], 5)[0].1.thread_id.as_deref(),
+            Some("own")
+        );
+        let child_dir = dir.path().join("unscanned");
+        std::fs::create_dir(&child_dir).unwrap();
+        let child = child_dir.join("rollout-2026-01-02T10-01-00-child.jsonl");
+        write_meta(
+            &child,
+            "child",
+            r#"{"subagent":{"thread_spawn":{"parent_thread_id":"own"}}}"#,
+        );
+        base.open.get_mut(&103).unwrap().push(writable(&child));
+        let procs = RacingProcs {
+            base,
+            phase: ReadPhase::Files,
+            changed: std::cell::Cell::new(false),
+        };
+        let out = watcher.poll(&procs, &[], 10);
+        assert!(procs.changed.get());
+        assert!(out[0].1.subagents.is_empty());
+        assert!(!watcher.runs[&(103, 1001)].heads.contains_key(&child));
+        assert_eq!(watcher.poll(&procs, &[], 15)[0].1.state, RunState::Finished);
     }
 
     #[test]
