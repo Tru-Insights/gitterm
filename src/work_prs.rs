@@ -265,16 +265,18 @@ struct PrRowParts {
     open_on_github: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrTitleRowControl {
-    Merge,
-    Disclosure,
+fn pr_title_row<'a>(
+    line: Row<'a, Event, Theme, iced::Renderer>,
+    title: Element<'a, Event, Theme, iced::Renderer>,
+    facts: Element<'a, Event, Theme, iced::Renderer>,
+    merge: Option<Element<'a, Event, Theme, iced::Renderer>>,
+    disclosure: Element<'a, Event, Theme, iced::Renderer>,
+) -> Row<'a, Event, Theme, iced::Renderer> {
+    line.push(title)
+        .push(facts)
+        .push(merge.unwrap_or_else(|| iced::widget::Space::new().into()))
+        .push(disclosure)
 }
-
-// The disclosure's child index must not shift when the due Merge action
-// disappears. Iced keeps button interaction state by child position.
-const PR_TITLE_ROW_CONTROLS: [PrTitleRowControl; 2] =
-    [PrTitleRowControl::Merge, PrTitleRowControl::Disclosure];
 
 fn pr_row_parts(is_next: bool, expanded: bool) -> PrRowParts {
     PrRowParts {
@@ -1651,20 +1653,13 @@ impl App {
                 .width(Length::Fill)
                 .into(),
         };
-        line = line.push(title_widget).push(facts);
-        for control in PR_TITLE_ROW_CONTROLS {
-            line = match control {
-                PrTitleRowControl::Merge => line.push(match merge_on_title.take() {
-                    Some(merge) => merge,
-                    // Zero-width: Iced matches children by index, so the slot
-                    // only has to exist; a wide gap would cost every row's title.
-                    None => iced::widget::Space::new().width(Length::Fixed(0.0)).into(),
-                }),
-                PrTitleRowControl::Disclosure => {
-                    line.push(self.overview_disclosure(expanded, row_key.clone()))
-                }
-            };
-        }
+        line = pr_title_row(
+            line,
+            title_widget,
+            facts.into(),
+            merge_on_title.take(),
+            self.overview_disclosure(expanded, row_key.clone()),
+        );
 
         // Opened: only what the title line does not say.
         let mut detail = Column::new().spacing(2);
@@ -2404,12 +2399,23 @@ mod tests {
 
     #[test]
     fn title_row_keeps_the_merge_and_disclosure_child_slots() {
-        assert_eq!(PR_TITLE_ROW_CONTROLS.len(), 2);
-        assert_eq!(PR_TITLE_ROW_CONTROLS[0], PrTitleRowControl::Merge);
-        assert_eq!(PR_TITLE_ROW_CONTROLS[1], PrTitleRowControl::Disclosure);
+        let title = || text("title").into();
+        let facts = || text("facts").into();
+        let disclosure = || text("disclosure").into();
+        let merge = || text("merge").into();
+        let prefix = || Row::new().push(text("position")).push(text("number"));
+        let with_merge: Element<'_, Event, Theme, iced::Renderer> =
+            pr_title_row(prefix(), title(), facts(), Some(merge()), disclosure()).into();
+        let without_merge: Element<'_, Event, Theme, iced::Renderer> =
+            pr_title_row(prefix(), title(), facts(), None, disclosure()).into();
 
-        // The optional Merge content keeps an empty slot when absent; the
-        // disclosure remains the second trailing child.
+        // Inspect the real Iced row widget trees built by production code.
+        // The disclosure is appended last, so equal child counts preserve its index.
+        let with_merge_children = with_merge.as_widget().children().len();
+        let without_merge_children = without_merge.as_widget().children().len();
+        assert_eq!(with_merge_children, 6);
+        assert_eq!(without_merge_children, with_merge_children);
+        assert_eq!(without_merge_children - 1, 5);
         assert!(pr_row_parts(true, false).merge_on_title);
         assert!(!pr_row_parts(false, false).merge_on_title);
     }

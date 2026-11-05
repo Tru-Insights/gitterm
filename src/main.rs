@@ -2556,6 +2556,21 @@ struct WorkspaceOverviewPresentation {
 
 const OVERVIEW_DISCLOSURE_WIDTH: f32 = 24.0;
 
+/// Keep shrink-sized row metadata inside the fill-sized area, leaving the
+/// disclosure its full fixed width as a sibling.
+fn overview_row_content<'a>(
+    content: Element<'a, Event, Theme, iced::Renderer>,
+) -> Element<'a, Event, Theme, iced::Renderer> {
+    container(content).width(Length::Fill).into()
+}
+
+fn remove_workspace_overview_presentation(
+    presentations: &mut HashMap<u64, WorkspaceOverviewPresentation>,
+    uid: u64,
+) {
+    presentations.remove(&uid);
+}
+
 #[derive(Debug, Clone)]
 pub struct GitWorktreeEntry {
     path: PathBuf,
@@ -13094,6 +13109,7 @@ impl App {
             self.stop_remote_chat_for_closing_tab(tab_id);
         }
         // Its repos stop unless another open workspace lists them.
+        remove_workspace_overview_presentation(&mut self.workspace_overview_presentations, uid);
         self.workspaces.remove(idx);
         self.release_unlisted_repos();
         let kept_active = active_uid.and_then(|active| self.workspace_index_by_uid(active));
@@ -35745,12 +35761,17 @@ fi
                     );
                 }
             }
-            let head = row![
+            let head_content = row![
                 name_button,
                 run_slot,
                 iced::widget::Space::new().width(Length::Fill),
                 actions_slot,
                 text(facts).size(10).color(text_muted).font(mono),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            let head = row![
+                overview_row_content(head_content.into()),
                 if has_hidden {
                     self.overview_disclosure(expanded, key)
                 } else {
@@ -36288,7 +36309,6 @@ fi
                 .color(text_muted)
                 .font(mono),
             open_slot,
-            self.overview_disclosure(expanded, key),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center);
@@ -36369,28 +36389,33 @@ fi
                     .on_press(event),
             );
         }
-        let body = column![line, detail].spacing(2);
-        let row = button(body)
-            .width(Length::Fill)
-            .padding([4, 6])
-            .style(move |_, status| button::Style {
-                background: Some(
-                    if focused {
-                        surface0
-                    } else if matches!(status, button::Status::Hovered) {
-                        hover
-                    } else {
-                        iced::Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                border: iced::Border {
-                    radius: 6.0.into(),
+        let body = column![overview_row_content(line.into()), detail].spacing(2);
+        let row = row![
+            button(body)
+                .width(Length::Fill)
+                .padding([4, 6])
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if focused {
+                            surface0
+                        } else if matches!(status, button::Status::Hovered) {
+                            hover
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            })
-            .on_press(press);
+                })
+                .on_press(press),
+            self.overview_disclosure(expanded, key),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
         row.into()
     }
 
@@ -36438,7 +36463,6 @@ fi
             .size(10)
             .color(fact_color)
             .font(mono),
-            self.overview_disclosure(expanded, key),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center);
@@ -36469,28 +36493,33 @@ fi
                     .color(theme.danger()),
             );
         }
-        let body = column![line, detail].spacing(1);
-        let row = button(body)
-            .width(Length::Fill)
-            .padding([3, 8])
-            .style(move |_, status| button::Style {
-                background: Some(
-                    if selected {
-                        surface0
-                    } else if matches!(status, button::Status::Hovered) {
-                        hover
-                    } else {
-                        iced::Color::TRANSPARENT
-                    }
-                    .into(),
-                ),
-                border: iced::Border {
-                    radius: 6.0.into(),
+        let body = column![overview_row_content(line.into()), detail].spacing(1);
+        let row = row![
+            button(body)
+                .width(Length::Fill)
+                .padding([3, 8])
+                .style(move |_, status| button::Style {
+                    background: Some(
+                        if selected {
+                            surface0
+                        } else if matches!(status, button::Status::Hovered) {
+                            hover
+                        } else {
+                            iced::Color::TRANSPARENT
+                        }
+                        .into(),
+                    ),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            })
-            .on_press(open);
+                })
+                .on_press(open),
+            self.overview_disclosure(expanded, key),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
         row.into()
     }
 
@@ -41070,7 +41099,7 @@ fi
                 } else {
                     iced::widget::Space::new().into()
                 };
-            let head = row![
+            let head_content = row![
                 text(overview::shorten(&doc.title, 60))
                     .size(font_small)
                     .color(text_primary)
@@ -41080,7 +41109,6 @@ fi
                     .size(10)
                     .color(text_muted)
                     .font(mono),
-                self.overview_disclosure(expanded, row_key),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
@@ -41095,11 +41123,15 @@ fi
                     .color(text_muted),
                 );
             }
-            let line = button(column![head, detail].spacing(1))
-                .style(self.flat_button_style())
-                .padding([3, 6])
-                .width(Length::Fill)
-                .on_press(Event::ViewFile(SourcePath::Local(newest.path.clone())));
+            let line =
+                button(column![overview_row_content(head_content.into()), detail].spacing(1))
+                    .style(self.flat_button_style())
+                    .padding([3, 6])
+                    .width(Length::Fill)
+                    .on_press(Event::ViewFile(SourcePath::Local(newest.path.clone())));
+            let line = row![line, self.overview_disclosure(expanded, row_key)]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
             let mut entry = Column::new().spacing(1).push(line);
             if open {
                 for (index, copy) in doc.copies.iter().enumerate() {
@@ -44487,6 +44519,38 @@ mod tests {
     #[test]
     fn overview_disclosure_reserves_a_fixed_width_slot() {
         assert_eq!(OVERVIEW_DISCLOSURE_WIDTH, 24.0);
+    }
+
+    #[test]
+    fn overview_rows_keep_fill_content_and_disclosure_as_fixed_siblings() {
+        let content = overview_row_content(text("long metadata".repeat(30)).into());
+        assert_eq!(content.as_widget().size_hint().width, Length::Fill);
+
+        let disclosure = button(text("▸")).width(Length::Fixed(OVERVIEW_DISCLOSURE_WIDTH));
+        let row: Element<'_, Event, Theme, iced::Renderer> =
+            row![content, disclosure].width(Length::Fixed(212.0)).into();
+        assert_eq!(row.as_widget().size_hint().width, Length::Fixed(212.0));
+        assert_eq!(row.as_widget().children().len(), 2);
+    }
+
+    #[test]
+    fn stopped_workspaces_do_not_accumulate_overview_presentations() {
+        let mut presentations = HashMap::<u64, WorkspaceOverviewPresentation>::new();
+        let row = overview::RowKey::Repo(PathBuf::from("/tmp/repo"));
+
+        for uid in 1..=100 {
+            let presentation = presentations.entry(uid).or_default();
+            overview::toggle_row(&mut presentation.open_rows, row.clone());
+            assert!(presentation.open_rows.contains(&row));
+
+            remove_workspace_overview_presentation(&mut presentations, uid);
+            assert!(!presentations.contains_key(&uid));
+            assert!(presentations.is_empty());
+        }
+
+        // Keep-running parking retains the Workspace and therefore its map entry.
+        presentations.entry(101).or_default().documents_open = true;
+        assert!(presentations[&101].documents_open);
     }
 
     #[test]
