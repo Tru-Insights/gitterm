@@ -306,6 +306,7 @@ pub struct TaskSessionEventRequest {
 
 #[derive(Debug, Clone)]
 pub enum TaskControlOperation {
+    PlanLimits,
     List(ListTasksRequest),
     Get(GetTaskRequest),
     Create(CreateTaskRequest),
@@ -708,6 +709,22 @@ pub fn missing_caller_error(tool: &str) -> String {
 
 #[tool_router]
 impl TaskMcpTools {
+    #[tool(
+        description = "Read subscription windows, usage pace, warnings and shared routing. Check before starting workers or reviewers; follow routing and relay its reason and warnings to the user. Stale or missing readings are not spare capacity.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn plan_limits(&self, Extension(parts): Extension<Parts>) -> CallToolResult {
+        task_result(
+            self.dispatch(TaskControlOperation::PlanLimits, &parts)
+                .await,
+        )
+    }
+
     #[tool(
         description = "List durable GitTerm tasks and their current state. Use this instead of reading tasks.json directly.",
         annotations(
@@ -1235,8 +1252,9 @@ mod tests {
     #[test]
     fn tool_surface_separates_read_and_write_operations() {
         let routes = TaskMcpTools::tool_router();
-        assert_eq!(routes.list_all().len(), 13);
+        assert_eq!(routes.list_all().len(), 14);
         for name in [
+            "plan_limits",
             "task_list",
             "task_get",
             "delegation_get",
@@ -1273,6 +1291,45 @@ mod tests {
                 Some(false)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn plan_limits_bridges_a_read_only_snapshot_with_its_output_shape() {
+        let (commands, mut requests) = mpsc::unbounded_channel();
+        let tool = TaskMcpTools::new(commands);
+        let bridge = tokio::spawn(async move {
+            let envelope = requests.recv().await.unwrap();
+            assert!(matches!(
+                envelope.operation,
+                TaskControlOperation::PlanLimits
+            ));
+            let mut file = crate::plan_limits::PlanLimitsFile::default();
+            file.claude = Some(crate::plan_limits::claude_limits(
+                &serde_json::json!({
+                    "unifiedWindows":{"seven_day":{"utilization":0.85,"resetsAt":1_800_432_000}}
+                }),
+                1_800_000_000,
+            ));
+            file.claude.as_mut().unwrap().local = Some(true);
+            let report = crate::plan_limits::evaluate_policy(&file, 1_800_000_000).report;
+            envelope
+                .reply
+                .send(serde_json::to_value(report).map_err(|error| error.to_string()));
+        });
+        let (parts, _) = Request::builder()
+            .uri("/mcp")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let result = tool.plan_limits(Extension(parts)).await;
+        assert!(!result.is_error.unwrap_or(false));
+        let value = structured(&result);
+        assert_eq!(value["claude"]["windows"][1]["state"], "hot");
+        assert!((value["claude"]["windows"][1]["pace"].as_f64().unwrap() - 297.5).abs() < 0.01);
+        assert_eq!(value["routing"]["state"], "balanced");
+        assert!(value["routing"]["pinned"].is_null());
+        println!("plan_limits sample: {value}");
+        bridge.await.unwrap();
     }
 
     #[test]
@@ -1527,7 +1584,7 @@ mod tests {
             .expect("authorized MCP initialization timed out")
             .expect("authorized MCP initialization failed");
         let tools = client.list_tools(Default::default()).await.unwrap();
-        assert_eq!(tools.tools.len(), 13);
+        assert_eq!(tools.tools.len(), 14);
         // The merge plan tools as an agent sees them (TRU-173).
         let schema_of = |name: &str| {
             let tool = tools

@@ -16639,6 +16639,8 @@ impl App {
             reply.send(Ok(serde_json::json!({
                 "delegation_id": delegation_id,
                 "status": "requested",
+                "routing": self.plan_limits_routing(),
+                "provider": "codex",
                 "queued": queued,
                 "detail": if queued {
                     "Queued behind other Codex runs; it starts when a slot frees. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
@@ -17392,6 +17394,8 @@ impl App {
         reply.send(Ok(serde_json::json!({
             "delegation_id": delegation_id,
             "task_id": task_id,
+            "routing": self.plan_limits_routing(),
+            "provider": worker.choice.provider.label(),
             "task_session_id": task_session_id,
             "worktree_path": task.worktree.path,
             "branch": task.branch,
@@ -21281,6 +21285,9 @@ fi
                 self.task_mcp = None;
             }
             Event::TaskControlRequested(envelope) => match envelope.operation {
+                TaskControlOperation::PlanLimits => {
+                    envelope.reply.send(self.plan_limits_snapshot());
+                }
                 TaskControlOperation::List(request) => {
                     let Some(store) = self.task_store.as_ref() else {
                         envelope
@@ -23762,13 +23769,15 @@ fi
                 ));
             }
             Event::AgentEventReceived(tab_id, ev) => {
-                // Any Claude chat's plan limits, local or remote (TRU-211).
+                // Remote credentials may belong to another subscription.
                 if let tab::AgentEvent::Harness(HarnessEvent::TurnCompleted {
                     rate_limit: Some(reading),
                     ..
                 }) = &ev
                 {
-                    self.observe_claude_rate_limit(reading);
+                    if plan_limits_view::local_limit_source(&self.workspaces, tab_id) {
+                        self.observe_claude_rate_limit(reading);
+                    }
                 }
                 // Append to the conversation buffer and push the event live
                 // into the tab's chat page, visible or hidden, so a hidden page
@@ -24146,6 +24155,7 @@ fi
                     };
                     return Task::batch([
                         self.flush_held_delegation(tab_id),
+                        self.tell_plan_limit_coordinators(),
                         self.refresh_delegation_head(tab_id),
                         follow_task,
                         index,

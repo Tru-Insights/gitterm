@@ -4,7 +4,7 @@
 //! work and the widgets.
 //!
 //! Claude readings arrive on `TurnCompleted.rate_limit` from any chat tab,
-//! local or remote, and are taken in `update()` (a cheap in-memory merge).
+//! local only, and are taken in `update()` (a cheap in-memory merge).
 //! The Codex reading is a tail read of the newest rollout, run off the UI
 //! thread from `Tick` every [`CODEX_READ_EVERY`], and at once when the
 //! Usage view opens or refreshes. Changes are written to
@@ -38,9 +38,46 @@ pub struct PlanLimitsState {
     /// A change not yet written.
     dirty: bool,
     save_in_flight: bool,
+    /// One combined prompt per chat, held until its turn finishes.
+    pending_notices: HashMap<String, Vec<String>>,
 }
 
 impl PlanLimitsState {
+    fn queue_notices(&mut self, chats: &[String], lines: &[String]) {
+        self.pending_notices.retain(|chat, _| chats.contains(chat));
+        if lines.is_empty() {
+            return;
+        }
+        for chat in chats {
+            let pending = self.pending_notices.entry(chat.clone()).or_default();
+            if lines.iter().any(|line| line.starts_with("Routing:")) {
+                pending.retain(|line| !line.starts_with("Routing:"));
+            }
+            for line in lines {
+                if !pending.contains(line) {
+                    pending.push(line.clone());
+                }
+            }
+        }
+    }
+
+    fn notice(&self, chat: &str, busy: bool) -> Option<String> {
+        if busy {
+            return None;
+        }
+        self.pending_notices.get(chat).map(|lines| {
+            format!("GitTerm plan limits: {}\nRelay this heads-up to the user and follow `plan_limits` routing for new work. An explicit user model choice wins; never restart running workers to change routing.", lines.join("\n"))
+        })
+    }
+
+    fn finish_notice(&mut self, chat: &str, accepted: bool) {
+        if accepted {
+            self.pending_notices.remove(chat);
+        } else {
+            eprintln!("[plan-limits] coordinator {chat} did not accept the notice; retaining it for retry");
+        }
+    }
+
     /// The persisted readings from the config dir (a small read).
     pub fn load(config_dir: &Path) -> Self {
         Self {
@@ -64,18 +101,97 @@ fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+pub(super) fn local_limit_source(workspaces: &[Workspace], tab_id: usize) -> bool {
+    workspaces.iter().any(|ws| {
+        matches!(ws.location, WorkspaceLocation::Local { .. })
+            && ws.tabs.iter().any(|tab| tab.id == tab_id)
+    })
+}
+
 impl App {
+    pub(super) fn plan_limits_routing(&self) -> plan_limits::RoutingReport {
+        plan_limits::evaluate_policy(&self.plan_limits.file, now_unix())
+            .report
+            .routing
+    }
+
+    pub(super) fn plan_limits_snapshot(&self) -> Result<serde_json::Value, String> {
+        serde_json::to_value(
+            plan_limits::evaluate_policy(&self.plan_limits.file, now_unix()).report,
+        )
+        .map_err(|error| format!("cannot encode plan_limits result: {error}"))
+    }
+
+    fn plan_limit_chats(&self) -> Vec<(usize, String, bool)> {
+        if self.task_mcp.is_none() {
+            return Vec::new();
+        }
+        self.workspaces
+            .iter()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|ws| &ws.tabs)
+            .filter_map(|tab| {
+                let session = tab.agent_session()?;
+                (session.backend() == tab::AgentBackend::Claude).then(|| {
+                    (
+                        tab.id,
+                        tab.session_uid.clone(),
+                        !matches!(session.state, tab::AgentSessionState::Idle),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn evaluate_plan_limits(&mut self) {
+        let evaluation = plan_limits::evaluate_policy(&self.plan_limits.file, now_unix());
+        if self.plan_limits.file.policy.as_ref() != Some(&evaluation.policy) {
+            self.plan_limits.file.policy = Some(evaluation.policy);
+            self.plan_limits.dirty = true;
+        }
+        let chats = self
+            .plan_limit_chats()
+            .into_iter()
+            .map(|(_, uid, _)| uid)
+            .collect::<Vec<_>>();
+        self.plan_limits.queue_notices(&chats, &evaluation.notices);
+    }
+
+    /// As with PR news, busy chats wait until the turn ends. Submit through
+    /// the normal path synchronously so a rejected send remains pending.
+    pub(super) fn tell_plan_limit_coordinators(&mut self) -> Task<Event> {
+        let mut tasks = Vec::new();
+        for (id, uid, busy) in self.plan_limit_chats() {
+            let Some(prompt) = self.plan_limits.notice(&uid, busy) else {
+                continue;
+            };
+            tasks.push(self.update(Event::AgentSubmitPrompt(id, prompt.into())));
+            let accepted = self
+                .workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .find(|tab| tab.id == id)
+                .and_then(|tab| tab.agent_session())
+                .is_some_and(|session| matches!(session.state, tab::AgentSessionState::Streaming));
+            self.plan_limits.finish_notice(&uid, accepted);
+        }
+        Task::batch(tasks)
+    }
+
     /// A Claude chat's turn reported its plan limits: the latest wins.
     pub(super) fn observe_claude_rate_limit(&mut self, reading: &RateLimitReading) {
-        let limits = plan_limits::claude_limits(&reading.info, reading.observed_at);
+        let mut limits = plan_limits::claude_limits(&reading.info, reading.observed_at);
+        limits.local = Some(true);
         if self.plan_limits.file.absorb(limits) {
             self.plan_limits.dirty = true;
+            self.evaluate_plan_limits();
         }
     }
 
     /// Tick: a Codex read when one is due, and a save when anything
     /// changed.
     pub(super) fn poll_plan_limits(&mut self) -> Task<Event> {
+        self.evaluate_plan_limits();
         let due = self
             .plan_limits
             .codex_read_at
@@ -85,7 +201,11 @@ impl App {
         } else {
             Task::none()
         };
-        Task::batch([read, self.save_plan_limits()])
+        Task::batch([
+            read,
+            self.tell_plan_limit_coordinators(),
+            self.save_plan_limits(),
+        ])
     }
 
     /// Read the newest Codex rollout's limits now, unless a read runs.
@@ -143,6 +263,7 @@ impl App {
                 if let Some(limits) = limits {
                     if self.plan_limits.file.absorb(*limits) {
                         self.plan_limits.dirty = true;
+                        self.evaluate_plan_limits();
                         return self.save_plan_limits();
                     }
                 }
@@ -396,6 +517,45 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_existing_local_tab_can_supply_local_allowances() {
+        let mut ws = Workspace::new("work".into(), PathBuf::from("/repo"), WorkspaceColor::Blue);
+        ws.tabs.push(TabState::new(1, PathBuf::from("/repo")));
+        assert!(local_limit_source(std::slice::from_ref(&ws), 1));
+        assert!(!local_limit_source(std::slice::from_ref(&ws), 99));
+        ws.location = WorkspaceLocation::RemoteAgent {
+            remote_id: "remote".into(),
+            workspace_id: "work".into(),
+            root: "/repo".into(),
+        };
+        assert!(!local_limit_source(&[ws], 1));
+    }
+
+    #[test]
+    fn notices_are_deduplicated_per_chat_grouped_and_held_until_idle() {
+        let mut state = PlanLimitsState::default();
+        let chats = vec!["first".into(), "second".into()];
+        let lines = vec!["hot".into(), "routing changed".into()];
+        state.queue_notices(&chats, &lines);
+        state.queue_notices(&chats, &lines);
+        assert!(state.notice("first", true).is_none());
+        let second = state.notice("second", false).unwrap();
+        assert_eq!(second.matches("hot").count(), 1);
+        assert!(second.contains("routing changed"));
+        state.finish_notice("second", false);
+        assert!(state.notice("second", false).is_some());
+        state.finish_notice("second", true);
+        assert!(state.notice("second", false).is_none());
+        assert!(state.notice("first", false).is_some());
+        state.finish_notice("first", true);
+        assert!(state.notice("first", false).is_none());
+        state.queue_notices(&chats, &["Routing: hold_claude".into()]);
+        state.queue_notices(&chats, &["Routing: balanced".into()]);
+        let prompt = state.notice("first", false).unwrap();
+        assert!(!prompt.contains("hold_claude"));
+        assert!(prompt.contains("Routing: balanced"));
+    }
 
     #[test]
     fn failed_save_restores_dirty_state_for_a_later_tick() {

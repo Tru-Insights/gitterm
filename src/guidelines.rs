@@ -290,7 +290,8 @@ In GitTerm, start Codex workers with GitTerm's task tools: `delegate_task` for i
 or an existing worktree of this workspace, pass `checkout` (or, for `delegate_task`, `repo` to \
 make a new worktree from that repository); pass `time_limit_minutes` and `effort` when the job \
 needs them. Do not run `codex exec` in a background shell: GitTerm cannot see those runs, so the \
-user cannot follow or stop them.\n";
+user cannot follow or stop them.\n\
+Check `plan_limits` before starting workers or reviewers, follow `routing`, and relay warnings to the user.\n";
 
 /// The instructions a launch already carries, with [`CODEX_TOOLS_NOTE`]
 /// after them, written to a launch file in `launch_dir` like
@@ -656,6 +657,9 @@ mod tests {
             "time_limit_minutes",
             "effort",
             "codex exec",
+            "plan_limits",
+            "follow `routing`",
+            "relay warnings",
         ] {
             assert!(CODEX_TOOLS_NOTE.contains(word), "{word}");
         }
