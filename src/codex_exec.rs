@@ -501,7 +501,7 @@ pub struct SubagentView {
 /// An exec run, as the page shows it (`{"kind":"codex_exec","run":…}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunView {
-    /// `<pid>-<start ms>`: a pid reused later is another run.
+    /// `<pid>-<start microseconds>`: a pid reused later is another run.
     pub key: String,
     pub pid: u32,
     pub state: RunState,
@@ -530,9 +530,10 @@ pub struct RunView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcInfo {
     pub pid: u32,
+    pub ppid: u32,
     /// The kernel's short name (`p_comm`, 16 bytes).
     pub comm: String,
-    pub start_ms: i64,
+    pub start_us: i64,
 }
 
 /// A local Claude chat: its tab and its `claude` process.
@@ -540,14 +541,39 @@ pub struct ProcInfo {
 pub struct Root {
     pub tab_id: usize,
     pub pid: u32,
+    pub start_us: i64,
+}
+
+impl Root {
+    /// Capture the birth identity before the UI hands the root to a worker.
+    #[cfg(target_os = "macos")]
+    pub fn capture(tab_id: usize, pid: u32) -> Result<Option<Self>, String> {
+        Ok(Libproc.info(pid)?.map(|info| Self {
+            tab_id,
+            pid,
+            start_us: info.start_us,
+        }))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn capture(_tab_id: usize, _pid: u32) -> Result<Option<Self>, String> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFile {
+    pub path: PathBuf,
+    pub writable: bool,
 }
 
 /// What discovery needs from the OS; the real one is [`Libproc`].
 pub trait Processes {
+    fn info(&self, pid: u32) -> Result<Option<ProcInfo>, String>;
     /// `pid` and every process below it, `pid` excluded.
     fn descendants(&self, pid: u32) -> Result<Vec<ProcInfo>, String>;
     fn argv(&self, pid: u32) -> Result<Vec<String>, String>;
-    fn open_files(&self, pid: u32) -> Result<Vec<PathBuf>, String>;
+    fn open_files(&self, pid: u32) -> Result<Vec<OpenFile>, String>;
 }
 
 type RunKey = (u32, i64);
@@ -584,12 +610,13 @@ struct Sub {
 struct Run {
     tab_id: usize,
     pid: u32,
+    start_us: i64,
     started_at_ms: i64,
     args: ExecArgs,
     rollout: Option<(PathBuf, SessionMeta, TailCache)>,
     subs: Vec<Sub>,
-    /// Rollout heads read for this run: `None` for one not to look at
-    /// again (unreadable, or not this run's). Heads never change.
+    /// Heads never change, but a subagent's parent may be found later.
+    /// `None` is an unreadable head; unresolved metadata stays cached.
     heads: HashMap<PathBuf, Option<SessionMeta>>,
 }
 
@@ -616,6 +643,16 @@ impl Watcher {
         }
     }
 
+    fn matches(&mut self, procs: &dyn Processes, key: RunKey) -> bool {
+        match procs.info(key.0) {
+            Ok(info) => info.is_some_and(|info| info.start_us == key.1),
+            Err(error) => {
+                self.log_once("checking a process's identity", &error);
+                false
+            }
+        }
+    }
+
     /// One poll: the runs under `roots` now, as page payloads by tab. A
     /// running run is sent every poll (a rebuilt page gets it back); one
     /// whose process is gone is sent once, finished, and forgotten.
@@ -625,9 +662,11 @@ impl Watcher {
         roots: &[Root],
         now_ms: i64,
     ) -> Vec<(usize, RunView)> {
-        let mut seen: HashSet<RunKey> = HashSet::new();
         let mut codex_seen: HashSet<RunKey> = HashSet::new();
         for root in roots {
+            if !self.matches(procs, (root.pid, root.start_us)) {
+                continue;
+            }
             let descendants = match procs.descendants(root.pid) {
                 Ok(list) => list,
                 Err(e) => {
@@ -635,13 +674,19 @@ impl Watcher {
                     continue;
                 }
             };
+            if !self.matches(procs, (root.pid, root.start_us)) {
+                continue;
+            }
             for proc in descendants.into_iter().filter(|p| p.comm == "codex") {
-                let key = (proc.pid, proc.start_ms);
+                let key = (proc.pid, proc.start_us);
                 codex_seen.insert(key);
                 if self.not_runs.contains(&key) {
                     continue;
                 }
                 if !self.runs.contains_key(&key) {
+                    if !self.matches(procs, key) {
+                        continue;
+                    }
                     let argv = match procs.argv(proc.pid) {
                         Ok(argv) => argv,
                         Err(e) => {
@@ -649,6 +694,9 @@ impl Watcher {
                             continue;
                         }
                     };
+                    if !self.matches(procs, key) {
+                        continue;
+                    }
                     if !is_exec_run(&argv) {
                         self.not_runs.insert(key);
                         continue;
@@ -658,7 +706,8 @@ impl Watcher {
                         Run {
                             tab_id: root.tab_id,
                             pid: proc.pid,
-                            started_at_ms: proc.start_ms,
+                            start_us: proc.start_us,
+                            started_at_ms: proc.start_us / 1000,
                             args: parse_exec_args(&argv),
                             rollout: None,
                             subs: Vec::new(),
@@ -666,10 +715,6 @@ impl Watcher {
                         },
                     );
                 }
-                if let Some(run) = self.runs.get_mut(&key) {
-                    run.tab_id = root.tab_id;
-                }
-                seen.insert(key);
             }
         }
         self.not_runs.retain(|key| codex_seen.contains(key));
@@ -680,11 +725,22 @@ impl Watcher {
             let Some(mut run) = self.runs.remove(&key) else {
                 continue;
             };
-            let live = seen.contains(&key);
+            // An adopted run can outlive its chat and be reparented.
+            // A query error is not evidence of exit; retain it and retry.
+            let identity = procs.info(run.pid);
+            let live = match &identity {
+                Ok(info) => info
+                    .as_ref()
+                    .is_some_and(|info| info.start_us == run.start_us),
+                Err(error) => {
+                    self.log_once("checking a codex process's identity", error);
+                    true
+                }
+            };
             let mut errors = Vec::new();
-            if live {
+            if live && identity.is_ok() {
                 refresh_run(&mut run, procs, &mut errors);
-            } else {
+            } else if !live {
                 // One last look at what it did before it ended.
                 if let Some((path, _, tail)) = run.rollout.as_mut() {
                     if let Err(e) = tail.refresh(path) {
@@ -705,17 +761,42 @@ impl Watcher {
 }
 
 fn refresh_run(run: &mut Run, procs: &dyn Processes, errors: &mut Vec<(&'static str, String)>) {
-    // The run's rollouts: the ones its process holds open. Codex opens
-    // the run's own when the thread starts; until then, try again.
-    match procs.open_files(run.pid) {
-        Ok(files) => {
-            for path in files.into_iter().filter(|p| is_rollout_path(p)) {
-                if let Some(meta) = head(run, &path, errors) {
-                    adopt(run, path, meta);
-                }
+    // Only a writable descriptor can establish ownership. A transcript on
+    // stdin is history, even if its session_meta says "exec".
+    if run.rollout.is_none() {
+        let files = procs.open_files(run.pid);
+        match procs.info(run.pid) {
+            Ok(Some(info)) if info.start_us == run.start_us => {}
+            Ok(_) => return,
+            Err(error) => {
+                errors.push(("checking a codex process after reading open files", error));
+                return;
             }
         }
-        Err(e) => errors.push(("listing a codex process's open files", e)),
+        match files {
+            Ok(files) => {
+                let mut paths: Vec<_> = files
+                    .into_iter()
+                    .filter(|file| file.writable && is_rollout_path(&file.path))
+                    .map(|file| file.path)
+                    .collect();
+                paths.sort_by_key(|path| {
+                    std::cmp::Reverse((rollout_name_time_ms(path), path.clone()))
+                });
+                for path in paths {
+                    let Some(meta) = head(run, &path, errors) else {
+                        // The newest writer may still be writing session_meta.
+                        // Do not lock onto an older rollout while it is pending.
+                        break;
+                    };
+                    if meta.source == RolloutSource::Exec {
+                        run.rollout = Some((path, meta, TailCache::default()));
+                        break;
+                    }
+                }
+            }
+            Err(e) => errors.push(("listing a codex process's open files", e)),
+        }
     }
     let Some(run_path) = run.rollout.as_ref().map(|(path, _, _)| path.clone()) else {
         return;
@@ -733,7 +814,17 @@ fn refresh_run(run: &mut Run, procs: &dyn Processes, errors: &mut Vec<(&'static 
             dirs.push(today);
         }
     }
-    let mut candidates: Vec<(i64, PathBuf)> = Vec::new();
+    let mut candidates = std::collections::BTreeSet::new();
+    // A previously seen child may leave the scanned day folders before its
+    // parent appears. Its complete metadata must still be reconsidered.
+    for (path, meta) in &run.heads {
+        if meta
+            .as_ref()
+            .is_some_and(|meta| matches!(meta.source, RolloutSource::Subagent { .. }))
+        {
+            candidates.insert(path.clone());
+        }
+    }
     for dir in dirs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -748,21 +839,29 @@ fn refresh_run(run: &mut Run, procs: &dyn Processes, errors: &mut Vec<(&'static 
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if run.heads.contains_key(&path) || !is_rollout_path(&path) {
+            if matches!(run.heads.get(&path), Some(None)) || !is_rollout_path(&path) {
                 continue;
             }
             // Names carry seconds; allow for the second the run began in.
             match rollout_name_time_ms(&path) {
-                Some(at) if at + 1000 >= run.started_at_ms => candidates.push((at, path)),
+                Some(at) if at + 1000 >= run.started_at_ms => {
+                    candidates.insert(path);
+                }
                 _ => {}
             }
         }
     }
-    // Oldest first, so a parent is known before the subagents it spawned.
-    candidates.sort();
-    for (_, path) in candidates {
-        if let Some(meta) = head(run, &path, errors) {
-            adopt(run, path, meta);
+    let mut pending: Vec<_> = candidates
+        .into_iter()
+        .filter_map(|path| head(run, &path, errors).map(|meta| (path, meta)))
+        .collect();
+    // File and descriptor order need not match parent order. Keep trying
+    // cached metadata until no more parents can be linked in this poll.
+    loop {
+        let before = run.subs.len();
+        pending.retain(|(path, meta)| !adopt_subagent(run, path, meta));
+        if run.subs.len() == before {
+            break;
         }
     }
     if let Some((path, _, tail)) = run.rollout.as_mut() {
@@ -801,44 +900,31 @@ fn head(
     }
 }
 
-/// Take `meta` as the run's own rollout or one of its subagents', or mark
-/// it as neither.
-fn adopt(run: &mut Run, path: PathBuf, meta: SessionMeta) {
-    if run.rollout.as_ref().is_some_and(|(p, _, _)| *p == path)
-        || run.subs.iter().any(|sub| sub.path == path)
+/// Return true for linked or already-known subagents; unresolved parents
+/// remain eligible on the next pass and on later polls.
+fn adopt_subagent(run: &mut Run, path: &Path, meta: &SessionMeta) -> bool {
+    if run.subs.iter().any(|sub| sub.path == path) {
+        return true;
+    }
+    if let RolloutSource::Subagent {
+        parent_thread_id, ..
+    } = &meta.source
     {
-        return;
-    }
-    match &meta.source {
-        RolloutSource::Exec if run.rollout.is_none() => {
-            run.rollout = Some((path, meta, TailCache::default()));
-        }
-        RolloutSource::Subagent {
-            parent_thread_id, ..
-        } => {
-            let ours = run
-                .rollout
-                .as_ref()
-                .is_some_and(|(_, m, _)| m.id == *parent_thread_id)
-                || run.subs.iter().any(|sub| sub.meta.id == *parent_thread_id);
-            if ours {
-                run.subs.push(Sub {
-                    path,
-                    meta,
-                    tail: TailCache::default(),
-                });
-            } else if run.rollout.is_some() {
-                // Another run's; its parent will not appear later.
-                run.heads.insert(path, None);
-            } else {
-                // The run's own thread is not known yet: look again.
-                run.heads.remove(&path);
-            }
-        }
-        _ => {
-            run.heads.insert(path, None);
+        let ours = run
+            .rollout
+            .as_ref()
+            .is_some_and(|(_, m, _)| m.id == *parent_thread_id)
+            || run.subs.iter().any(|sub| sub.meta.id == *parent_thread_id);
+        if ours {
+            run.subs.push(Sub {
+                path: path.to_path_buf(),
+                meta: meta.clone(),
+                tail: TailCache::default(),
+            });
+            return true;
         }
     }
+    false
 }
 
 fn view(run: &Run, live: bool, now_ms: i64) -> RunView {
@@ -849,7 +935,7 @@ fn view(run: &Run, live: bool, now_ms: i64) -> RunView {
         .clone()
         .or_else(|| meta.and_then(|m| m.cwd.clone()));
     RunView {
-        key: format!("{}-{}", run.pid, run.started_at_ms),
+        key: format!("{}-{}", run.pid, run.start_us),
         pid: run.pid,
         state: if live {
             RunState::Running
@@ -915,7 +1001,7 @@ pub struct Libproc;
 
 #[cfg(target_os = "macos")]
 mod sys {
-    use super::ProcInfo;
+    use super::{OpenFile, ProcInfo};
     use std::ffi::c_void;
     use std::path::PathBuf;
 
@@ -982,9 +1068,15 @@ mod sys {
             .collect();
         Ok(Some(ProcInfo {
             pid,
+            ppid: info.pbi_ppid,
             comm: String::from_utf8_lossy(&comm).into_owned(),
-            start_ms: info.pbi_start_tvsec as i64 * 1000 + info.pbi_start_tvusec as i64 / 1000,
+            start_us: info.pbi_start_tvsec as i64 * 1_000_000 + info.pbi_start_tvusec as i64,
         }))
+    }
+
+    pub fn child_info(parent: u32, pid: u32) -> Result<Option<ProcInfo>, String> {
+        // The enumerated pid may have exited and been reused before info().
+        Ok(info(pid)?.filter(|child| child.ppid == parent))
     }
 
     pub fn argv(pid: u32) -> Result<Vec<String>, String> {
@@ -1046,16 +1138,29 @@ mod sys {
 
     const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
 
-    /// `struct vnode_fdinfowithpath` (sys/proc_info.h): `proc_fileinfo`
-    /// (24 bytes), `vnode_info` (152), then the path (MAXPATHLEN).
-    #[repr(C, align(8))]
-    struct VnodeFdInfoWithPath {
-        _pfi: [u8; 24],
-        _vip: [u8; 152],
-        path: [u8; 1024],
+    /// sys/proc_info.h; fi_openflags uses kernel FREAD/FWRITE encoding,
+    /// not O_RDONLY/O_WRONLY/O_RDWR (sys/fcntl.h).
+    #[repr(C)]
+    pub(super) struct ProcFileInfo {
+        pub(super) fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: i64,
+        fi_type: i32,
+        fi_guardflags: u32,
     }
 
-    pub fn open_files(pid: u32) -> Result<Vec<PathBuf>, String> {
+    const FWRITE: u32 = 0x00000002;
+
+    /// SDK vnode_fdinfowithpath: proc_fileinfo (24), vnode_info (152),
+    /// then vnode_info_path.vip_path (MAXPATHLEN).
+    #[repr(C)]
+    pub(super) struct VnodeFdInfoWithPath {
+        pub(super) pfi: ProcFileInfo,
+        _vip: [u8; 152],
+        pub(super) path: [u8; 1024],
+    }
+
+    pub fn open_files(pid: u32) -> Result<Vec<OpenFile>, String> {
         let entry = std::mem::size_of::<libc::proc_fdinfo>();
         // SAFETY: a null buffer asks for the size needed.
         let need = unsafe {
@@ -1115,9 +1220,10 @@ mod sys {
                 .position(|b| *b == 0)
                 .unwrap_or(info.path.len());
             if end > 0 {
-                paths.push(PathBuf::from(
-                    String::from_utf8_lossy(&info.path[..end]).into_owned(),
-                ));
+                paths.push(OpenFile {
+                    path: PathBuf::from(String::from_utf8_lossy(&info.path[..end]).into_owned()),
+                    writable: info.pfi.fi_openflags & FWRITE != 0,
+                });
             }
         }
         Ok(paths)
@@ -1129,16 +1235,30 @@ mod sys {
 
 #[cfg(target_os = "macos")]
 impl Processes for Libproc {
+    fn info(&self, pid: u32) -> Result<Option<ProcInfo>, String> {
+        sys::info(pid)
+    }
+
     fn descendants(&self, pid: u32) -> Result<Vec<ProcInfo>, String> {
         let mut out = Vec::new();
-        let mut queue = vec![pid];
+        let mut queue: Vec<_> = sys::info(pid)?.into_iter().collect();
         while let Some(parent) = queue.pop() {
-            for child in sys::child_pids(parent)? {
-                if let Some(info) = sys::info(child)? {
-                    out.push(info);
-                    queue.push(child);
-                }
+            if sys::info(parent.pid)?.as_ref() != Some(&parent) {
+                continue;
             }
+            let children: Vec<_> = sys::child_pids(parent.pid)?
+                .into_iter()
+                .map(|child| sys::child_info(parent.pid, child))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            // A reused intermediate pid must not introduce another tree.
+            if sys::info(parent.pid)?.as_ref() != Some(&parent) {
+                continue;
+            }
+            queue.extend(children.iter().cloned());
+            out.extend(children);
             if out.len() > 4096 {
                 return Err(format!("more than 4096 processes under {pid}"));
             }
@@ -1150,13 +1270,17 @@ impl Processes for Libproc {
         sys::argv(pid)
     }
 
-    fn open_files(&self, pid: u32) -> Result<Vec<PathBuf>, String> {
+    fn open_files(&self, pid: u32) -> Result<Vec<OpenFile>, String> {
         sys::open_files(pid)
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 impl Processes for Libproc {
+    fn info(&self, _pid: u32) -> Result<Option<ProcInfo>, String> {
+        Err("finding codex exec runs is only implemented on macOS".to_string())
+    }
+
     fn descendants(&self, _pid: u32) -> Result<Vec<ProcInfo>, String> {
         Err("finding codex exec runs is only implemented on macOS".to_string())
     }
@@ -1165,7 +1289,7 @@ impl Processes for Libproc {
         Err("finding codex exec runs is only implemented on macOS".to_string())
     }
 
-    fn open_files(&self, _pid: u32) -> Result<Vec<PathBuf>, String> {
+    fn open_files(&self, _pid: u32) -> Result<Vec<OpenFile>, String> {
         Err("finding codex exec runs is only implemented on macOS".to_string())
     }
 }
@@ -1469,10 +1593,18 @@ mod tests {
     struct FakeProcs {
         tree: HashMap<u32, Vec<ProcInfo>>,
         argv: HashMap<u32, Vec<String>>,
-        open: HashMap<u32, Vec<PathBuf>>,
+        open: HashMap<u32, Vec<OpenFile>>,
+        identities: HashMap<u32, ProcInfo>,
+        fail_info: bool,
     }
 
     impl Processes for FakeProcs {
+        fn info(&self, pid: u32) -> Result<Option<ProcInfo>, String> {
+            if self.fail_info {
+                return Err(format!("cannot query process {pid}"));
+            }
+            Ok(self.identities.get(&pid).cloned())
+        }
         fn descendants(&self, pid: u32) -> Result<Vec<ProcInfo>, String> {
             self.tree
                 .get(&pid)
@@ -1485,7 +1617,7 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| format!("no argv {pid}"))
         }
-        fn open_files(&self, pid: u32) -> Result<Vec<PathBuf>, String> {
+        fn open_files(&self, pid: u32) -> Result<Vec<OpenFile>, String> {
             Ok(self.open.get(&pid).cloned().unwrap_or_default())
         }
     }
@@ -1493,8 +1625,16 @@ mod tests {
     fn proc(pid: u32, comm: &str, start_ms: i64) -> ProcInfo {
         ProcInfo {
             pid,
+            ppid: 100,
             comm: comm.into(),
-            start_ms,
+            start_us: start_ms * 1000,
+        }
+    }
+
+    fn writable(path: &Path) -> OpenFile {
+        OpenFile {
+            path: path.to_path_buf(),
+            writable: true,
         }
     }
 
@@ -1556,6 +1696,12 @@ mod tests {
                 proc(104, "codex", start_ms - 60_000),
             ],
         );
+        procs
+            .identities
+            .insert(100, proc(100, "claude", start_ms - 10));
+        for child in &procs.tree[&100] {
+            procs.identities.insert(child.pid, child.clone());
+        }
         procs.argv.insert(
             103,
             argv(&[
@@ -1569,20 +1715,22 @@ mod tests {
             ]),
         );
         procs.argv.insert(104, argv(&[NATIVE, "app-server"]));
-        procs
-            .open
-            .insert(103, vec![PathBuf::from("/dev/null"), run_path.clone()]);
+        procs.open.insert(
+            103,
+            vec![writable(Path::new("/dev/null")), writable(&run_path)],
+        );
 
         let mut watcher = Watcher::default();
         let roots = [Root {
             tab_id: 7,
             pid: 100,
+            start_us: (start_ms - 10) * 1000,
         }];
         let out = watcher.poll(&procs, &roots, start_ms + 60_000);
         assert_eq!(out.len(), 1);
         let (tab, run) = &out[0];
         assert_eq!(*tab, 7);
-        assert_eq!(run.key, format!("103-{start_ms}"));
+        assert_eq!(run.key, format!("103-{}", start_ms * 1000));
         assert_eq!(run.state, RunState::Running);
         assert_eq!(run.ended_at_ms, None);
         assert_eq!(run.cwd.as_deref(), Some("/work/repo-a"));
@@ -1602,7 +1750,9 @@ mod tests {
         assert_eq!(sub.state, "done");
         assert_eq!(sub.activity.as_ref().unwrap().text, "Finished: Reviewed.");
         // The app-server's args were read once and it is remembered as no run.
-        assert!(watcher.not_runs.contains(&(104, start_ms - 60_000)));
+        assert!(watcher
+            .not_runs
+            .contains(&(104, (start_ms - 60_000) * 1000)));
         procs.argv.remove(&104);
 
         // The rollout grows: the next poll sees the new activity.
@@ -1619,6 +1769,7 @@ mod tests {
 
         // The process exits: one finished payload, then nothing.
         procs.tree.insert(100, vec![proc(101, "zsh", start_ms - 5)]);
+        procs.identities.remove(&103);
         let out = watcher.poll(&procs, &roots, start_ms + 70_000);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].1.state, RunState::Finished);
@@ -1629,11 +1780,303 @@ mod tests {
         assert!(watcher.not_runs.is_empty());
     }
 
+    fn exec_fixture(path: &Path) -> (FakeProcs, Root) {
+        let root = Root {
+            tab_id: 7,
+            pid: 100,
+            start_us: 10,
+        };
+        let child = ProcInfo {
+            pid: 103,
+            ppid: 100,
+            comm: "codex".into(),
+            start_us: 1001,
+        };
+        let mut procs = FakeProcs::default();
+        procs.identities.insert(
+            root.pid,
+            ProcInfo {
+                pid: root.pid,
+                ppid: 1,
+                comm: "claude".into(),
+                start_us: root.start_us,
+            },
+        );
+        procs.identities.insert(child.pid, child.clone());
+        procs.tree.insert(root.pid, vec![child]);
+        procs.argv.insert(103, argv(&[NATIVE, "exec", "-"]));
+        procs.open.insert(103, vec![writable(path)]);
+        (procs, root)
+    }
+
+    fn write_meta(path: &Path, id: &str, source: &str) {
+        std::fs::write(
+            path,
+            format!("{}\n", meta_line(source).replace("thread-1", id)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stdin_history_is_ignored_and_the_newest_writable_exec_is_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("rollout-2026-01-02T11-00-00-history.jsonl");
+        let older = dir.path().join("rollout-2026-01-02T09-00-00-older.jsonl");
+        let own = dir.path().join("rollout-2026-01-02T10-00-00-own.jsonl");
+        write_meta(&history, "history", r#""exec""#);
+        write_meta(&older, "older", r#""exec""#);
+        write_meta(&own, "own", r#""exec""#);
+        let (mut procs, root) = exec_fixture(&own);
+        procs.open.insert(
+            103,
+            vec![
+                OpenFile {
+                    path: history,
+                    writable: false,
+                },
+                writable(&older),
+                writable(&own),
+            ],
+        );
+        let out = Watcher::default().poll(&procs, &[root], 5);
+        assert_eq!(out[0].1.thread_id.as_deref(), Some("own"));
+        assert_eq!(out[0].1.rollout_path.as_deref(), own.to_str());
+    }
+
+    #[test]
+    fn incomplete_newest_writable_rollout_is_retried_before_older_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("rollout-2026-01-02T09-00-00-older.jsonl");
+        let own = dir.path().join("rollout-2026-01-02T10-00-00-own.jsonl");
+        write_meta(&older, "older", r#""exec""#);
+        std::fs::write(&own, "{\"type\":").unwrap();
+        let (mut procs, root) = exec_fixture(&own);
+        procs
+            .open
+            .insert(103, vec![writable(&older), writable(&own)]);
+        let mut watcher = Watcher::default();
+        assert!(watcher.poll(&procs, &[root], 5)[0].1.thread_id.is_none());
+        write_meta(&own, "own", r#""exec""#);
+        assert_eq!(
+            watcher.poll(&procs, &[root], 10)[0].1.thread_id.as_deref(),
+            Some("own")
+        );
+    }
+
+    #[test]
+    fn an_adopted_run_survives_reparenting_and_finishes_on_exit_or_pid_reuse() {
+        for reused in [false, true] {
+            let (mut procs, root) = exec_fixture(Path::new("/dev/null"));
+            let mut watcher = Watcher::default();
+            let key = watcher.poll(&procs, &[root], 5)[0].1.key.clone();
+            assert_eq!(key, "103-1001");
+            procs.tree.remove(&100);
+            procs.identities.remove(&100);
+            let out = watcher.poll(&procs, &[], 10);
+            assert_eq!(out[0].0, 7);
+            assert_eq!(out[0].1.state, RunState::Running);
+            // A new ancestry must not move the adopted run to another chat.
+            procs.identities.insert(
+                200,
+                ProcInfo {
+                    pid: 200,
+                    ppid: 1,
+                    comm: "launchd".into(),
+                    start_us: 20,
+                },
+            );
+            procs.tree.insert(200, vec![procs.identities[&103].clone()]);
+            let out = watcher.poll(
+                &procs,
+                &[Root {
+                    tab_id: 8,
+                    pid: 200,
+                    start_us: 20,
+                }],
+                15,
+            );
+            assert_eq!(out[0].0, 7);
+            if reused {
+                // Same millisecond, different microsecond: a different process.
+                procs.identities.get_mut(&103).unwrap().start_us += 1;
+            } else {
+                procs.identities.remove(&103);
+            }
+            let out = watcher.poll(&procs, &[], 20);
+            assert_eq!(out[0].1.key, key);
+            assert_eq!(out[0].1.state, RunState::Finished);
+            assert_eq!(out[0].1.ended_at_ms, Some(20));
+            assert!(!watcher.has_runs());
+        }
+    }
+
+    #[test]
+    fn a_reused_root_pid_is_refused_before_walking() {
+        let (mut procs, root) = exec_fixture(Path::new("/dev/null"));
+        procs.identities.get_mut(&100).unwrap().start_us += 1;
+        let mut watcher = Watcher::default();
+        assert!(watcher.poll(&procs, &[root], 5).is_empty());
+        assert!(watcher.runs.is_empty());
+        assert!(watcher.not_runs.is_empty());
+    }
+
+    #[test]
+    fn an_identity_query_error_does_not_finish_an_adopted_run() {
+        let (mut procs, root) = exec_fixture(Path::new("/dev/null"));
+        let mut watcher = Watcher::default();
+        watcher.poll(&procs, &[root], 5);
+        procs.fail_info = true;
+        assert_eq!(watcher.poll(&procs, &[], 10)[0].1.state, RunState::Running);
+        assert!(watcher.has_runs());
+        procs.fail_info = false;
+        procs.identities.remove(&103);
+        assert_eq!(watcher.poll(&procs, &[], 15)[0].1.state, RunState::Finished);
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ReadPhase {
+        Tree,
+        Args,
+        Files,
+    }
+
+    struct RacingProcs {
+        base: FakeProcs,
+        phase: ReadPhase,
+        changed: std::cell::Cell<bool>,
+    }
+
+    impl Processes for RacingProcs {
+        fn info(&self, pid: u32) -> Result<Option<ProcInfo>, String> {
+            let mut info = self.base.info(pid)?;
+            let target = if self.phase == ReadPhase::Tree {
+                100
+            } else {
+                103
+            };
+            if self.changed.get() && pid == target {
+                if let Some(info) = &mut info {
+                    info.start_us += 1;
+                }
+            }
+            Ok(info)
+        }
+        fn descendants(&self, pid: u32) -> Result<Vec<ProcInfo>, String> {
+            if self.phase == ReadPhase::Tree {
+                self.changed.set(true);
+            }
+            self.base.descendants(pid)
+        }
+        fn argv(&self, pid: u32) -> Result<Vec<String>, String> {
+            if self.phase == ReadPhase::Args {
+                self.changed.set(true);
+            }
+            self.base.argv(pid)
+        }
+        fn open_files(&self, pid: u32) -> Result<Vec<OpenFile>, String> {
+            if self.phase == ReadPhase::Files {
+                self.changed.set(true);
+            }
+            self.base.open_files(pid)
+        }
+    }
+
+    #[test]
+    fn pid_reuse_during_tree_args_or_descriptor_reads_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("rollout-2026-01-02T10-00-00-own.jsonl");
+        write_meta(&own, "own", r#""exec""#);
+        for phase in [ReadPhase::Tree, ReadPhase::Args, ReadPhase::Files] {
+            let (base, root) = exec_fixture(&own);
+            let procs = RacingProcs {
+                base,
+                phase,
+                changed: std::cell::Cell::new(false),
+            };
+            let mut watcher = Watcher::default();
+            let out = watcher.poll(&procs, &[root], 5);
+            if phase == ReadPhase::Files {
+                assert_eq!(out.len(), 1);
+                assert!(out[0].1.rollout_path.is_none());
+                assert!(watcher.runs.values().all(|run| run.heads.is_empty()));
+                assert_eq!(watcher.poll(&procs, &[], 10)[0].1.state, RunState::Finished);
+            } else {
+                assert!(out.is_empty());
+                assert!(!watcher.has_runs());
+                assert!(watcher.not_runs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_before_its_parent_links_in_the_same_poll_and_on_later_polls() {
+        for (later_poll, child_leaves_scan) in [(false, false), (true, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let own = dir.path().join("rollout-2026-01-02T10-00-00-own.jsonl");
+            let child = dir.path().join("rollout-2026-01-02T10-00-01-child.jsonl");
+            let parent = dir.path().join("rollout-2026-01-02T10-00-02-parent.jsonl");
+            write_meta(&own, "own", r#""exec""#);
+            write_meta(
+                &child,
+                "child",
+                r#"{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}"#,
+            );
+            let parent_source = r#"{"subagent":{"thread_spawn":{"parent_thread_id":"own"}}}"#;
+            if !later_poll {
+                write_meta(&parent, "parent", parent_source);
+            }
+            let (mut procs, root) = exec_fixture(&own);
+            // Child descriptor before parent, with filenames also out of order.
+            procs
+                .open
+                .get_mut(&103)
+                .unwrap()
+                .insert(0, writable(&child));
+            let mut watcher = Watcher::default();
+            let first = watcher.poll(&procs, &[root], 5);
+            if later_poll {
+                assert!(first[0].1.subagents.is_empty());
+                if child_leaves_scan {
+                    std::fs::remove_file(&child).unwrap();
+                }
+                write_meta(&parent, "parent", parent_source);
+            }
+            let out = if later_poll {
+                watcher.poll(&procs, &[root], 10)
+            } else {
+                first
+            };
+            assert_eq!(
+                out[0]
+                    .1
+                    .subagents
+                    .iter()
+                    .map(|s| s.thread_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["parent", "child"]
+            );
+        }
+    }
+
     #[test]
     fn discovery_failures_are_logged_once() {
-        let procs = FakeProcs::default();
+        let procs = FakeProcs {
+            fail_info: true,
+            ..FakeProcs::default()
+        };
         let mut watcher = Watcher::default();
-        let roots = [Root { tab_id: 1, pid: 5 }, Root { tab_id: 2, pid: 6 }];
+        let roots = [
+            Root {
+                tab_id: 1,
+                pid: 5,
+                start_us: 1,
+            },
+            Root {
+                tab_id: 2,
+                pid: 6,
+                start_us: 2,
+            },
+        ];
         assert!(watcher.poll(&procs, &roots, 0).is_empty());
         assert!(watcher.poll(&procs, &roots, 0).is_empty());
         assert_eq!(watcher.logged.len(), 1);
@@ -1684,39 +2127,91 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn libproc_finds_children_their_args_and_open_files() {
-        assert_eq!(sys::VNODE_INFO_SIZE, 1200);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout-2026-01-02T10-00-00-open.jsonl");
-        std::fs::write(&path, "x\n").unwrap();
-        let _held = File::open(&path).unwrap();
-        let me = std::process::id();
-        let open = Libproc.open_files(me).unwrap();
-        let canonical = path.canonicalize().unwrap();
-        assert!(open.contains(&canonical), "{canonical:?} not in {open:?}");
+    struct SleepChild(std::process::Child);
 
-        let mut child = std::process::Command::new("/bin/sleep")
-            .args(["30", "exec"])
-            .spawn()
+    #[cfg(target_os = "macos")]
+    impl Drop for SleepChild {
+        fn drop(&mut self) {
+            self.0.kill().expect("kill test sleep");
+            self.0.wait().expect("reap test sleep");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn libproc_finds_children_their_birth_identity_args_and_descriptor_modes() {
+        // Verified against sys/proc_info.h with a compiled SDK C probe.
+        assert_eq!(sys::VNODE_INFO_SIZE, 1200);
+        assert_eq!(std::mem::align_of::<sys::VnodeFdInfoWithPath>(), 8);
+        assert_eq!(std::mem::size_of::<sys::ProcFileInfo>(), 24);
+        assert_eq!(std::mem::offset_of!(sys::ProcFileInfo, fi_openflags), 0);
+        assert_eq!(std::mem::offset_of!(sys::VnodeFdInfoWithPath, pfi), 0);
+        assert_eq!(std::mem::offset_of!(sys::VnodeFdInfoWithPath, path), 176);
+        assert_eq!(std::mem::size_of::<libc::proc_bsdinfo>(), 136);
+        assert_eq!(std::mem::offset_of!(libc::proc_bsdinfo, pbi_ppid), 16);
+        assert_eq!(
+            std::mem::offset_of!(libc::proc_bsdinfo, pbi_start_tvsec),
+            120
+        );
+        assert_eq!(
+            std::mem::offset_of!(libc::proc_bsdinfo, pbi_start_tvusec),
+            128
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("rollout-2026-01-02T09-00-00-old.jsonl");
+        let own = dir.path().join("rollout-2026-01-02T10-00-00-own.jsonl");
+        std::fs::write(&old, "history\n").unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .read(true)
+            .open(&own)
             .unwrap();
-        let found = Libproc.descendants(me);
-        let argv = Libproc.argv(child.id());
-        child.kill().unwrap();
-        child.wait().unwrap();
-        let found = found.unwrap();
+        let child = SleepChild(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(File::open(&old).unwrap())
+                .stdout(File::create(&own).unwrap())
+                .stderr(writer)
+                .spawn()
+                .unwrap(),
+        );
+        let me = std::process::id();
+        let root = Root::capture(7, me).unwrap().unwrap();
+        assert_eq!(Libproc.info(me).unwrap().unwrap().start_us, root.start_us);
+        let found = Libproc.descendants(me).unwrap();
         let sleep = found
             .iter()
-            .find(|p| p.pid == child.id())
+            .find(|p| p.pid == child.0.id())
             .expect("the child");
         assert_eq!(sleep.comm, "sleep");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        assert!(
-            (now_ms - sleep.start_ms).abs() < 60_000,
-            "{}",
-            sleep.start_ms
+        assert_eq!(sleep.ppid, me);
+        assert!(found.iter().any(|p| p.pid == child.0.id() && p.ppid == me));
+        assert!((chrono::Utc::now().timestamp_micros() - sleep.start_us).abs() < 60_000_000);
+        assert_eq!(Libproc.info(child.0.id()).unwrap().as_ref(), Some(sleep));
+        assert_eq!(
+            sys::child_info(me, child.0.id()).unwrap().as_ref(),
+            Some(sleep)
         );
-        assert_eq!(argv.unwrap(), ["/bin/sleep", "30", "exec"]);
+        assert_eq!(sys::child_info(child.0.id(), child.0.id()).unwrap(), None);
+        assert_eq!(Libproc.argv(child.0.id()).unwrap(), ["/bin/sleep", "30"]);
+        let open = Libproc.open_files(child.0.id()).unwrap();
+        let old = old.canonicalize().unwrap();
+        let own = own.canonicalize().unwrap();
+        assert!(
+            open.iter().any(|f| f.path == old && !f.writable),
+            "{open:?}"
+        );
+        // O_WRONLY and O_RDWR both carry FWRITE in fi_openflags.
+        assert_eq!(
+            open.iter().filter(|f| f.path == own && f.writable).count(),
+            2,
+            "{open:?}"
+        );
+        let pid = child.0.id();
+        drop(child);
+        assert_eq!(Libproc.info(pid).unwrap(), None);
     }
 
     #[cfg(target_os = "macos")]

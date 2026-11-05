@@ -20399,10 +20399,16 @@ fi
             .flat_map(|ws| ws.tabs.iter())
             .filter_map(|tab| {
                 let pid = tab.agent_session()?.harness.as_ref()?.claude_pid()?;
-                Some(gitterm::codex_exec::Root {
-                    tab_id: tab.id,
-                    pid,
-                })
+                match gitterm::codex_exec::Root::capture(tab.id, pid) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        eprintln!(
+                            "[codex-exec] capturing chat {} process {pid}: {error}",
+                            tab.id
+                        );
+                        None
+                    }
+                }
             })
             .collect();
         if roots.is_empty() && !self.codex_exec_has_runs {
