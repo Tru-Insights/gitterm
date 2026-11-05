@@ -36,6 +36,7 @@ use crate::SyntaxHighlightLine;
 /// tab's own content again.
 pub(crate) struct FileViewerOverlay {
     pub(crate) path: PathBuf,
+    pub(crate) line: Option<usize>,
     pub(crate) file_content: String,
     pub(crate) image_handle: Option<image::Handle>,
     /// Rendered HTML for markdown / excalidraw / .html files (driven through the wry webview).
@@ -55,6 +56,7 @@ impl FileViewerOverlay {
     pub(crate) fn for_path(path: PathBuf) -> Self {
         Self {
             path,
+            line: None,
             file_content: String::new(),
             image_handle: None,
             webview_content: None,
