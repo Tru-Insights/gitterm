@@ -75,6 +75,13 @@ pub enum HostRequest {
     WithdrawMessage(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotHook {
+    Submit,
+    Tool,
+    Stop,
+}
+
 /// One thing the parser found in a CLI stdout line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedFrame {
@@ -86,6 +93,12 @@ pub enum ParsedFrame {
         tool_use_id: String,
         input: Value,
         event: HarnessEvent,
+    },
+    /// A synchronous SDK callback, acknowledged only after capture finishes.
+    SnapshotBoundary {
+        request_id: String,
+        session_id: String,
+        hook: SnapshotHook,
     },
     /// Any other CLI-initiated control request; the session answers it the
     /// way the SDK does when no callback is configured.
@@ -703,6 +716,25 @@ fn parse_control_request(v: &Value) -> Vec<ParsedFrame> {
         )))];
     };
     let subtype = v.pointer("/request/subtype").and_then(Value::as_str);
+    if subtype == Some("hook_callback") {
+        let hook = match (
+            v["request"]["callback_id"].as_str(),
+            v["request"]["input"]["hook_event_name"].as_str(),
+        ) {
+            (Some("gitterm_turn_start"), Some("UserPromptSubmit")) => Some(SnapshotHook::Submit),
+            (Some("gitterm_turn_tool"), Some("PreToolUse")) => Some(SnapshotHook::Tool),
+            (Some("gitterm_turn_stop"), Some("Stop")) => Some(SnapshotHook::Stop),
+            _ => None,
+        };
+        if let (Some(hook), Some(session_id)) = (hook, v["request"]["input"]["session_id"].as_str())
+        {
+            return vec![ParsedFrame::SnapshotBoundary {
+                request_id: request_id.into(),
+                session_id: session_id.into(),
+                hook,
+            }];
+        }
+    }
     if subtype != Some("can_use_tool") {
         return vec![ParsedFrame::ControlRequest {
             request_id: request_id.to_string(),
@@ -1874,25 +1906,38 @@ impl SessionIo {
 
 async fn run_session(
     config: ClaudeSessionConfig,
+    commands: mpsc::UnboundedReceiver<HarnessCommand>,
+    events: mpsc::UnboundedSender<HarnessEvent>,
+    close_token: tokio_util::sync::CancellationToken,
+) {
+    match resolve_claude_program() {
+        Ok(program) => run_session_program(config, commands, events, close_token, program).await,
+        Err(msg) => {
+            harness_log(&msg);
+            let _ = events.send(HarnessEvent::Error(msg));
+            let _ = events.send(HarnessEvent::ProcessExited { code: None });
+        }
+    }
+}
+
+async fn run_session_program(
+    config: ClaudeSessionConfig,
     mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
     events: mpsc::UnboundedSender<HarnessEvent>,
     close_token: tokio_util::sync::CancellationToken,
+    program: PathBuf,
 ) {
     let fail = |msg: String| {
         harness_log(&msg);
         let _ = events.send(HarnessEvent::Error(msg));
         let _ = events.send(HarnessEvent::ProcessExited { code: None });
     };
-    let program = match resolve_claude_program() {
-        Ok(p) => p,
-        Err(e) => return fail(e),
-    };
     let mut snapshots = crate::turn_snapshots::Recorder::new(
         config.cwd.clone(),
         config.resume.clone(),
         config.snapshot_facts_dir.clone(),
     )
-    .with_close_token(close_token);
+    .with_close_token(close_token.clone());
     let args = config.args();
     let mut cmd = Command::new(&program);
     cmd.args(&args)
@@ -1995,6 +2040,7 @@ async fn run_session(
     // Between `system/init` and `result`. A message sent mid-turn must not
     // clear an interrupt that turn is still answering.
     let mut in_turn = false;
+    let mut snapshot_hooks_applied = false;
 
     // Handshake. Its reply becomes `Ready`.
     let init_id = new_request_id();
@@ -2007,7 +2053,13 @@ async fn run_session(
     if let Err(e) = io
         .write(control_request_frame(
             &init_id,
-            json!({"subtype": "initialize", "hooks": {}}),
+            json!({"subtype": "initialize", "hooks": if config.snapshot_facts_dir.is_some() {
+                json!({
+                    "UserPromptSubmit": [{"hookCallbackIds": ["gitterm_turn_start"], "timeout": 60}],
+                    "PreToolUse": [{"hookCallbackIds": ["gitterm_turn_tool"], "timeout": 60}],
+                    "Stop": [{"hookCallbackIds": ["gitterm_turn_stop"], "timeout": 60}]
+                })
+            } else { json!({}) }}),
         ))
         .await
     {
@@ -2038,7 +2090,6 @@ async fn run_session(
                         ParsedFrame::Event(ev) => {
                             let ev = match ev {
                                 HarnessEvent::TurnStarted { session_id, model } => {
-                                    if !in_turn { snapshots.begin().await; }
                                     if let Some(id) = &session_id { snapshots.bind(id).await; }
                                     in_turn = true;
                                     HarnessEvent::TurnStarted { session_id, model }
@@ -2049,7 +2100,12 @@ async fn run_session(
                                     cost_usd,
                                     rate_limit,
                                 } => {
-                                    snapshots.end().await;
+                                    // A queued hook's deadline may already be running.
+                                    // Leave room for its bounded baseline capture.
+                                    if tokio::time::timeout(Duration::from_secs(5), snapshots.finish()).await.is_err() {
+                                        snapshots.discard_turn();
+                                        io.emit(HarnessEvent::Error("Turn snapshot publication timed out; history may be incomplete".into()));
+                                    }
                                     in_turn = false;
                                     let status = match status {
                                         TurnStatus::Failed(_) if interrupt_requested => {
@@ -2078,6 +2134,34 @@ async fn run_session(
                             };
                             snapshots.observe(&ev);
                             io.emit(ev);
+                        }
+                        ParsedFrame::SnapshotBoundary { request_id, session_id, hook } => {
+                            if snapshot_hooks_applied {
+                                let capture = async {
+                                    snapshots.bind(&session_id).await;
+                                    if hook == SnapshotHook::Tool { snapshots.invalidate_end(); }
+                                    snapshots.begin().await;
+                                    if hook == SnapshotHook::Stop { snapshots.capture_end().await; }
+                                };
+                                // Leave headroom under the registered SDK callback timeout.
+                                let result = tokio::select! {
+                                    _ = close_token.cancelled() => Err("snapshot chat closed".to_string()),
+                                    result = tokio::time::timeout(Duration::from_secs(45), capture) => result.map_err(|_| "snapshot callback timed out; turn history is incomplete".to_string()),
+                                };
+                                if let Err(e) = result {
+                                    snapshots.invalidate_end();
+                                    // Do not put cleanup/GC ahead of the callback reply
+                                    // or Shutdown. Sweep after the child is reaped.
+                                    if close_token.is_cancelled() { snapshots.discard_turn(); }
+                                    else { io.emit(HarnessEvent::Error(e)); }
+                                }
+                            }
+                            in_turn = true;
+                            if let Err(e) = io.write(control_response_frame(ControlResponseBody::Success {
+                                request_id, response: json!({}),
+                            })).await {
+                                io.emit(HarnessEvent::Error(e));
+                            }
                         }
                         ParsedFrame::PermissionRequest { request_id, tool_use_id, input, event } => {
                             harness_log(&format!(
@@ -2111,6 +2195,13 @@ async fn run_session(
                                     Err(e) => format!("error {e}"),
                                 }
                             ));
+                            if let (HostRequest::Initialize { .. }, Ok(body)) = (&request, &result) {
+                                snapshot_hooks_applied = config.snapshot_facts_dir.is_some()
+                                    && body["hooks_applied"] == true;
+                                if config.snapshot_facts_dir.is_some() && !snapshot_hooks_applied {
+                                    io.emit(HarnessEvent::Error("Turn snapshots unavailable: Claude did not register synchronous snapshot hooks".into()));
+                                }
+                            }
                             // An accepted effort change is confirmed by
                             // reading the session's settings back.
                             if let (HostRequest::SetEffort(effort), Ok(_)) = (&request, &result) {
@@ -2148,7 +2239,6 @@ async fn run_session(
                             prompt.id
                         ));
                         if !in_turn {
-                            snapshots.begin().await;
                             interrupt_requested = false;
                         }
                         io.write(user_message_frame(&prompt)).await
@@ -2277,7 +2367,10 @@ async fn run_session(
         io.emit(HarnessEvent::RuntimeRequestResolved { request_id });
     }
     io.emit(HarnessEvent::ProcessExited { code });
-    snapshots.end().await;
+    snapshots.finish().await;
+    if close_token.is_cancelled() {
+        snapshots.close().await;
+    }
 }
 
 /// Answer a CLI control request GitTerm has no handler for, the way the SDK
@@ -3262,6 +3355,136 @@ mod tests {
             p.parse_line("not json"),
             vec![ParsedFrame::Unparsed("not json".into())]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_owned_queued_turn_waits_for_snapshot_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempfile::tempdir().unwrap();
+        let facts = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-qb", "main"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            assert!(crate::agentd::git::git_command()
+                .current_dir(repo.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let program = facts.path().join("claude-mock");
+        std::fs::write(&program, r#"#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+def emit(x):
+    print(json.dumps(x), flush=True)
+def read():
+    return json.loads(sys.stdin.readline())
+init = read()
+hooks = init['request']['hooks']
+emit({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{'hooks_applied':True}}})
+def boundary(event='UserPromptSubmit'):
+    matchers = hooks.get(event, [])
+    if matchers:
+        callback = matchers[0]['hookCallbackIds'][0]
+        emit({'type':'control_request','request_id':'boundary','request':{'subtype':'hook_callback','callback_id':callback,'input':{'hook_event_name':event,'session_id':'queued-chat'}}})
+        reply = read()
+        assert reply['response']['request_id'] == 'boundary'
+read() # first user message
+boundary()
+emit({'type':'system','subtype':'init','session_id':'queued-chat','model':'fixture'})
+read() # second user message queued in the CLI, not the host
+boundary() # prompt hooks may run at submission, while turn one is active
+boundary('PreToolUse')
+Path('file.txt').write_text('one')
+boundary('Stop')
+emit({'type':'result','subtype':'success'})
+# No sleeping: only the callback response can prevent racing capture.
+boundary('PreToolUse')
+Path('file.txt').write_text('two')
+boundary('Stop')
+emit({'type':'result','subtype':'success'})
+for line in sys.stdin:
+    pass
+"#).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (commands, rx) = mpsc::unbounded_channel();
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_session_program(
+            ClaudeSessionConfig {
+                cwd: repo.path().into(),
+                snapshot_facts_dir: Some(facts.path().into()),
+                model: None,
+                permission_mode: "default".into(),
+                effort: None,
+                resume: None,
+                wire_log_dir: None,
+                mcp_servers: Vec::new(),
+                chrome: false,
+                guidelines_file: None,
+            },
+            rx,
+            tx,
+            tokio_util::sync::CancellationToken::new(),
+            program,
+        ));
+        let mut completed = 0;
+        while completed < 2 {
+            let event = tokio::time::timeout(Duration::from_secs(20), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                HarnessEvent::Ready { .. } => commands
+                    .send(HarnessCommand::SendUserMessage(UserPrompt::from("one")))
+                    .unwrap(),
+                HarnessEvent::TurnStarted { .. } => commands
+                    .send(HarnessCommand::SendUserMessage(UserPrompt::from("two")))
+                    .unwrap(),
+                HarnessEvent::TurnCompleted { .. } => completed += 1,
+                HarnessEvent::Error(e) => panic!("mock session: {e}"),
+                _ => {}
+            }
+        }
+        commands.send(HarnessCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let turns = crate::turn_snapshots::turns(repo.path(), "queued-chat")
+            .await
+            .unwrap();
+        assert_eq!(
+            turns.len(),
+            2,
+            "each CLI-owned turn needs its own snapshots"
+        );
+        let store = crate::turn_snapshots::store_path(repo.path())
+            .await
+            .unwrap();
+        let show = |oid: &str| {
+            let output = crate::agentd::git::git_command()
+                .current_dir(&store)
+                .args(["show", &format!("{oid}:file.txt")])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert_eq!(show(turns[1].end.as_deref().unwrap()), "one");
+        assert_eq!(show(turns[0].start.as_deref().unwrap()), "one");
+        assert_eq!(show(turns[0].end.as_deref().unwrap()), "two");
     }
 
     #[test]

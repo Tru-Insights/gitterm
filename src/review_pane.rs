@@ -1351,6 +1351,17 @@ pub async fn load_review_source(
         ReviewSource::Turns { chat, .. } => crate::turn_snapshots::turns(&checkout, chat).await?,
         _ => Vec::new(),
     };
+    let diff_checkout = if matches!(
+        &source,
+        ReviewSource::Turns {
+            selected: Some(_),
+            ..
+        }
+    ) {
+        crate::turn_snapshots::store_path(&checkout).await?
+    } else {
+        checkout.clone()
+    };
     let selection_range = match &source {
         ReviewSource::Commits(Some(range)) => {
             let first = commits.iter().position(|commit| commit.sha == range.first);
@@ -1380,10 +1391,10 @@ pub async fn load_review_source(
                 let end = turn
                     .end
                     .as_deref()
-                    .ok_or("turn has no end snapshot (running or skipped)")?;
+                    .ok_or("turn has no end snapshot (running or incomplete)")?;
                 vec![
-                    resolve_commit(&checkout, start).await?,
-                    resolve_commit(&checkout, end).await?,
+                    resolve_commit(&diff_checkout, start).await?,
+                    resolve_commit(&diff_checkout, end).await?,
                 ]
             }
             None => {
@@ -1424,7 +1435,7 @@ pub async fn load_review_source(
     ];
     summary_args.extend(diff_args.iter().map(String::as_str));
     summary_args.push("--");
-    let summary = git_bytes(&checkout, &summary_args).await?;
+    let summary = git_bytes(&diff_checkout, &summary_args).await?;
     let summary = parse_raw_numstat(&summary)?;
     let (untracked, untracked_complete) = match &source {
         ReviewSource::Uncommitted => untracked_names(&checkout, UNTRACKED_SCAN_CAP).await?,
@@ -1505,7 +1516,7 @@ pub async fn load_review_source(
         args.extend(diff_args.iter().map(String::as_str));
         args.push("--");
         args.extend(pathspecs.iter().map(String::as_str));
-        run_git_records(&checkout, &args, GIT_TIMEOUT, b'\n', |record| {
+        run_git_records(&diff_checkout, &args, GIT_TIMEOUT, b'\n', |record| {
             Ok(parser.feed(&String::from_utf8_lossy(record)))
         })
         .await?;
@@ -2443,7 +2454,7 @@ fn render_turns(html: &mut String, page: &ReviewPage) {
         html.push_str(&format!("<button type=\"button\" class=\"commit{}\" data-turn=\"{}\"{}>Turn {}<small>{}{}</small></button>",
             if selected { " selected" } else { "" }, turn.number,
             if turn.start.is_none() || turn.end.is_none() { " disabled" } else { "" }, turn.number, commit_age(turn.timestamp),
-            if turn.start.is_none() { " · no start snapshot" } else if turn.end.is_none() { " · running or skipped" } else { "" }));
+            if turn.start.is_none() { " · no start snapshot" } else if turn.end.is_none() { " · running or incomplete" } else { "" }));
     }
     html.push_str("</aside>");
 }
@@ -3423,6 +3434,7 @@ mod tests {
         });
         assert!(html.contains("data-turn=\"3\" disabled"));
         assert!(html.contains("data-turn=\"2\" disabled"));
+        assert!(html.contains("running or incomplete"));
         assert!(html.contains("class=\"commit selected\" data-turn=\"1\">"));
         assert!(html.contains("id=\"tree\"") && html.contains("id=\"files\""));
         assert_eq!(

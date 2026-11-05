@@ -8377,6 +8377,55 @@ fn repos_common_parent_below_home(repos: &[PathBuf], home: &Path) -> Option<Path
     (common.starts_with(home) && common != home).then_some(common)
 }
 
+fn parked_snapshot_chats(
+    workspaces: &[Workspace],
+    closed: &[WorkspaceConfig],
+    key: &ParkedKey,
+) -> Vec<String> {
+    if let Some(idx) = running_parked_index(workspaces, key) {
+        return workspaces[idx]
+            .chats
+            .iter()
+            .cloned()
+            .chain(
+                workspaces[idx]
+                    .tabs
+                    .iter()
+                    .filter_map(turn_snapshot_chat_id),
+            )
+            .collect();
+    }
+    closed
+        .iter()
+        .find(|cfg| ParkedKey::of(cfg) == *key)
+        .map(|cfg| {
+            cfg.chats
+                .iter()
+                .cloned()
+                .chain(cfg.tabs.iter().filter_map(|tab| {
+                    tab.chat_session_id.clone().or_else(|| {
+                        matches!(tab.agent_config, Some(AgentBackendConfig::Pi { .. }))
+                            .then(|| tab.session_uid.clone())
+                            .flatten()
+                    })
+                }))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn task_snapshot_chats(workspaces: &[Workspace], task_id: &str) -> Vec<String> {
+    workspaces
+        .iter()
+        .flat_map(|ws| &ws.tabs)
+        .filter(|tab| tab.task_id.as_deref() == Some(task_id))
+        .filter_map(|tab| {
+            close_turn_snapshots(tab);
+            turn_snapshot_chat_id(tab)
+        })
+        .collect()
+}
+
 fn close_turn_snapshots(tab: &TabState) {
     if let Some(session) = tab.agent_session() {
         if let Some(harness) = &session.harness {
@@ -13344,24 +13393,7 @@ impl App {
     /// Done: the entry leaves the Parked list and stays in the file. A
     /// running parked one stops first, the way park stops (TRU-186).
     fn mark_parked_done(&mut self, key: &ParkedKey) -> Task<Event> {
-        let chats = self
-            .closed_workspace_configs
-            .iter()
-            .find(|cfg| ParkedKey::of(cfg) == *key)
-            .map(|cfg| {
-                cfg.chats
-                    .iter()
-                    .cloned()
-                    .chain(cfg.tabs.iter().filter_map(|tab| {
-                        tab.chat_session_id.clone().or_else(|| {
-                            matches!(tab.agent_config, Some(AgentBackendConfig::Pi { .. }))
-                                .then(|| tab.session_uid.clone())
-                                .flatten()
-                        })
-                    }))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let chats = parked_snapshot_chats(&self.workspaces, &self.closed_workspace_configs, key);
         let task = match running_parked_index(&self.workspaces, key) {
             Some(idx) => {
                 for tab in &self.workspaces[idx].tabs {
@@ -25873,6 +25905,9 @@ fi
                 // Close every open session tab of the task, in any workspace,
                 // then record the task Stopped. The PTY children die with
                 // their tabs; the worktree and conversations stay resumable.
+                // Capture paths and cancel recorders before tabs (including exited chats) disappear.
+                let chats = task_snapshot_chats(&self.workspaces, &task_id);
+                let snapshot_cleanup = self.maintain_turn_snapshots(Some(chats));
                 for workspace_idx in 0..self.workspaces.len() {
                     while let Some(tab_idx) = self.workspaces[workspace_idx]
                         .tabs
@@ -25902,7 +25937,7 @@ fi
                 self.mark_log_server_dirty();
                 // Stopping frees a slot — hand it to the queue right away.
                 let promoted = self.promote_queued_tasks();
-                return Task::batch([self.scroll_to_active_tab(), promoted]);
+                return Task::batch([self.scroll_to_active_tab(), promoted, snapshot_cleanup]);
             }
             Event::TaskResume(task_id) => {
                 // Prefer resuming the most recent recorded conversation —
@@ -48680,6 +48715,128 @@ mod tests {
         assert_eq!(persisted_active_index(2, &[false, true, false]), 1);
         assert_eq!(persisted_active_index(0, &[true, false]), 0);
         assert_eq!(persisted_active_index(2, &[false, false, false]), 2);
+    }
+
+    fn snapshot_cleanup_test_child(name: &str) -> bool {
+        const CHILD: &str = "GITTERM_V6_SNAPSHOT_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let config = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(config::CONFIG_DIR_ENV, config.path())
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    async fn snapshot_cleanup_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+        let repo = tempfile::tempdir().unwrap();
+        let facts = tempfile::tempdir().unwrap();
+        let g = |args: &[&str]| {
+            let out = gitterm::agentd::git::git_command()
+                .current_dir(repo.path())
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        g(&["init", "-qb", "main"]);
+        std::fs::write(repo.path().join("file"), "base").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "fixture"]);
+        let oid = gitterm::turn_snapshots::snapshot(repo.path())
+            .await
+            .unwrap()
+            .unwrap();
+        gitterm::turn_snapshots::save(repo.path(), "cleanup-chat", 1, "start", &oid)
+            .await
+            .unwrap();
+        (repo, facts)
+    }
+
+    #[tokio::test]
+    async fn task_stop_removal_cleans_completed_chat_snapshots_without_a_harness() {
+        if snapshot_cleanup_test_child(
+            "tests::task_stop_removal_cleans_completed_chat_snapshots_without_a_harness",
+        ) {
+            return;
+        }
+        let (repo, facts) = snapshot_cleanup_fixture().await;
+        let mut tab = TabState::new(1, repo.path().into());
+        tab.chat_session_id = Some("cleanup-chat".into());
+        tab.task_id = Some("task".into());
+        let mut ws = Workspace::new("task".into(), repo.path().into(), WorkspaceColor::Blue);
+        ws.tabs.push(tab);
+        let mut workspaces = vec![ws];
+        let chats = task_snapshot_chats(&workspaces, "task");
+        workspaces[0].tabs.remove(0);
+        gitterm::turn_snapshots::maintain(
+            facts.path().into(),
+            [repo.path().into()].into(),
+            Some(chats),
+        )
+        .await
+        .unwrap();
+        assert!(gitterm::turn_snapshots::turns(repo.path(), "cleanup-chat")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(workspaces[0].tabs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_parked_done_cleans_chat_snapshots_without_a_harness() {
+        if snapshot_cleanup_test_child(
+            "tests::running_parked_done_cleans_chat_snapshots_without_a_harness",
+        ) {
+            return;
+        }
+        let (repo, facts) = snapshot_cleanup_fixture().await;
+        let mut ws = Workspace::new("parked".into(), repo.path().into(), WorkspaceColor::Blue);
+        ws.running_park = Some(ParkedInfo {
+            note: String::new(),
+            parked_at: "now".into(),
+        });
+        let mut tab = TabState::new(1, repo.path().into());
+        tab.chat_session_id = Some("cleanup-chat".into());
+        ws.tabs.push(tab);
+        ws.chats.push("owned-exited-chat".into());
+        let key = ParkedKey {
+            name: ws.name.clone(),
+            dir: workspace_config_dir(&ws),
+        };
+        let chats = parked_snapshot_chats(&[ws], &[], &key);
+        assert!(chats.contains(&"owned-exited-chat".to_string()));
+        gitterm::turn_snapshots::maintain(
+            facts.path().into(),
+            [repo.path().into()].into(),
+            Some(chats),
+        )
+        .await
+        .unwrap();
+        assert!(gitterm::turn_snapshots::turns(repo.path(), "cleanup-chat")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
