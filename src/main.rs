@@ -4670,12 +4670,33 @@ struct TaskTabClosePrompt {
     task_id: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TaskLaunchOrigin {
+    User,
+    Agent,
+}
+
+impl TaskLaunchOrigin {
+    fn policy_blocked(
+        self,
+        has_delegation: bool,
+        evaluation: &gitterm::plan_limits::PolicyEvaluation,
+        provider: gitterm::plan_limits::Provider,
+        parallel: bool,
+        user_model_choice: bool,
+    ) -> bool {
+        (matches!(self, Self::Agent) || has_delegation)
+            && !evaluation.allows_start(provider, parallel, user_model_choice)
+    }
+}
+
 /// A dispatch the local concurrency limit deferred: the task sits in the
 /// store as `Queued`; this remembers which preset to start when a slot frees.
 #[derive(Debug, Clone)]
 struct QueuedTaskLaunch {
     task_id: String,
     preset_idx: Option<usize>,
+    origin: TaskLaunchOrigin,
 }
 
 /// Outcome of asking for a task child session: it started, or the local
@@ -11902,7 +11923,7 @@ impl App {
     }
 
     fn launch_task_child(&mut self, task_id: &str, preset_idx: Option<usize>) -> Task<Event> {
-        match self.try_launch_task_child(task_id, preset_idx, true) {
+        match self.try_launch_task_child(task_id, preset_idx, true, TaskLaunchOrigin::User) {
             Ok(TaskChildLaunch::Started(task, _session)) => task,
             Ok(TaskChildLaunch::Queued { .. }) => {
                 // The rail and overview state row show "Queued · #N" — no
@@ -12124,7 +12145,8 @@ impl App {
             if !still_queued {
                 continue;
             }
-            match self.try_launch_task_child(&entry.task_id, entry.preset_idx, false) {
+            match self.try_launch_task_child(&entry.task_id, entry.preset_idx, false, entry.origin)
+            {
                 Ok(TaskChildLaunch::Started(task, _session)) => started.push(task),
                 Ok(TaskChildLaunch::Queued { .. }) => continue,
                 Err(error) => {
@@ -12180,6 +12202,7 @@ impl App {
         task_id: &str,
         preset_idx: Option<usize>,
         focus: bool,
+        origin: TaskLaunchOrigin,
     ) -> Result<TaskChildLaunch, String> {
         let Some(task) = self
             .task_store
@@ -12281,27 +12304,24 @@ impl App {
             return Err("Remote task sessions require the later remote-executor slice".to_string());
         };
         // A delegation may have queued before its provider crossed a limit.
-        // Manual task launches are the user's own choice; agent-selected
-        // workers need explicit model-choice attribution to override a hold.
-        let policy_blocked = worker.is_some()
-            && command.as_deref().is_some_and(|command| {
-                let provider = match gitterm::workers::provider_for_command(command) {
-                    gitterm::workers::WorkerProvider::Claude => {
-                        gitterm::plan_limits::Provider::Claude
-                    }
-                    gitterm::workers::WorkerProvider::Codex => {
-                        gitterm::plan_limits::Provider::Codex
-                    }
-                    gitterm::workers::WorkerProvider::Other => return false,
-                };
-                !self.plan_limits.evaluation_for_launch().allows_start(
-                    provider,
-                    self.plan_limit_running_workers(provider) > 0
-                        || (provider == gitterm::plan_limits::Provider::Codex
-                            && !self.delegation_runs.is_empty()),
-                    worker_options.user_model_choice,
-                )
-            });
+        // UI launches are the user's own choice. MCP launches, including
+        // tasks without delegations, must pass policy unless explicitly overridden.
+        let policy_blocked = command.as_deref().is_some_and(|command| {
+            let provider = match gitterm::workers::provider_for_command(command) {
+                gitterm::workers::WorkerProvider::Claude => gitterm::plan_limits::Provider::Claude,
+                gitterm::workers::WorkerProvider::Codex => gitterm::plan_limits::Provider::Codex,
+                gitterm::workers::WorkerProvider::Other => return false,
+            };
+            origin.policy_blocked(
+                worker.is_some(),
+                &self.plan_limits.evaluation_for_launch(),
+                provider,
+                self.plan_limit_running_workers(provider) > 0
+                    || (provider == gitterm::plan_limits::Provider::Codex
+                        && !self.delegation_runs.is_empty()),
+                worker_options.user_model_choice,
+            )
+        });
         if policy_blocked
             && matches!(
                 task.lifecycle,
@@ -12352,6 +12372,7 @@ impl App {
                 self.task_launch_queue.push(QueuedTaskLaunch {
                     task_id: task_id.to_string(),
                     preset_idx,
+                    origin,
                 });
                 return Ok(TaskChildLaunch::Queued {
                     position: self.task_launch_queue.len(),
@@ -17394,7 +17415,12 @@ impl App {
             return Task::none();
         }
         self.anchor_delegation_card(&worker.caller.session_uid, &delegation_id);
-        let launch = self.try_launch_task_child(task_id, Some(worker.choice.preset_index), false);
+        let launch = self.try_launch_task_child(
+            task_id,
+            Some(worker.choice.preset_index),
+            false,
+            TaskLaunchOrigin::Agent,
+        );
         let (focus, task_session_id, queue_position) = match launch {
             Ok(TaskChildLaunch::Started(focus, session)) => (
                 focus,
@@ -18426,6 +18452,9 @@ impl App {
                         QueuedTaskLaunch {
                             task_id: task.task_id.clone(),
                             preset_idx,
+                            // Restored launches are automatic; a new UI choice can
+                            // override policy again after restart.
+                            origin: TaskLaunchOrigin::Agent,
                         }
                     })
                     .collect()
@@ -21414,7 +21443,12 @@ fi
                         },
                         None => None,
                     };
-                    match self.try_launch_task_child(&request.task_id, preset_idx, false) {
+                    match self.try_launch_task_child(
+                        &request.task_id,
+                        preset_idx,
+                        false,
+                        TaskLaunchOrigin::Agent,
+                    ) {
                         Ok(TaskChildLaunch::Started(task, session)) => {
                             envelope.reply.send(Ok(session));
                             return task;
@@ -21424,7 +21458,7 @@ fi
                                 "task_id": request.task_id,
                                 "queued": true,
                                 "queue_position": position,
-                                "detail": "The local concurrency limit deferred this launch; it starts automatically when a slot frees.",
+                                "detail": "Concurrency or plan limits deferred this launch; it starts automatically when capacity permits.",
                             })));
                         }
                         Err(error) => envelope.reply.send(Err(error)),
@@ -25742,7 +25776,12 @@ fi
                     Some((workspace_idx, tab_idx)) => {
                         self.focus_workspace_tab(workspace_idx, tab_idx)
                     }
-                    None => match self.try_launch_task_child(&task_id, None, true) {
+                    None => match self.try_launch_task_child(
+                        &task_id,
+                        None,
+                        true,
+                        TaskLaunchOrigin::User,
+                    ) {
                         // A plain terminal never hits the concurrency gate.
                         Ok(TaskChildLaunch::Started(focus, _session)) => focus,
                         Ok(TaskChildLaunch::Queued { .. }) => Task::none(),
@@ -45012,6 +45051,35 @@ mod tests {
         );
         task.lifecycle = lifecycle;
         task
+    }
+
+    #[test]
+    fn third_round_mcp_launch_without_delegation_requires_policy() {
+        use gitterm::plan_limits::{self, LimitWindow, PlanLimits, PlanLimitsFile, Provider};
+        let now = 1_800_000_000;
+        for provider in [Provider::Claude, Provider::Codex] {
+            let limits = PlanLimits {
+                provider,
+                observed_at: now,
+                local: Some(true),
+                windows: vec![LimitWindow {
+                    label: "7d".into(),
+                    used_percent: Some(95.0),
+                    resets_at: Some(now + 86400),
+                }],
+                alerts: vec![],
+                plan_type: None,
+                credits: None,
+            };
+            let mut file = PlanLimitsFile::default();
+            file.absorb(limits);
+            let held = plan_limits::evaluate_policy(&file, now);
+            // MCP task_create + task_launch_session has no worker delegation.
+            assert!(TaskLaunchOrigin::Agent.policy_blocked(false, &held, provider, false, false));
+            assert!(TaskLaunchOrigin::Agent.policy_blocked(true, &held, provider, false, false));
+            assert!(!TaskLaunchOrigin::Agent.policy_blocked(true, &held, provider, false, true));
+            assert!(!TaskLaunchOrigin::User.policy_blocked(false, &held, provider, false, false));
+        }
     }
 
     #[test]

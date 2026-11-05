@@ -735,6 +735,9 @@ pub enum RoutingState {
 pub struct RoutingPolicy {
     pub state: RoutingState,
     pub since: i64,
+    /// Balanced target, retained while hot only warns. None uses the roles table.
+    #[serde(default)]
+    pub flexible_provider: Option<Provider>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -823,7 +826,13 @@ impl PolicyEvaluation {
             weekly_available(other_report) && !held(other_policy) && !other_report.busy;
         weekly_available(report)
             && !held(policy)
-            && !(policy.burst.busy && (parallel || other_available))
+            && !(policy.burst.busy
+                && (parallel
+                    || (other_available
+                        && !self
+                            .pin
+                            .as_ref()
+                            .is_some_and(|pin| pin.provider == provider))))
     }
 }
 
@@ -987,14 +996,24 @@ fn provider_evaluation(
         .is_some_and(|w| w.state == WeeklyState::AlmostOut);
     let usable_weekly =
         weekly.pace.is_some() || weekly.used_percent.is_some_and(|p| p >= ALMOST_OUT_PERCENT);
+    let changed_anchor = policy.weekly.as_ref().is_some_and(|w| {
+        w.resets_at
+            .zip(weekly.resets_at)
+            .is_some_and(|(old, new)| old != new)
+    });
+    // Learning the first reset time is not evidence that a window reset.
+    if fresh {
+        if let Some(state) = &mut policy.weekly {
+            if state.resets_at.is_none() {
+                state.resets_at = weekly.resets_at;
+            }
+        }
+    }
     if fresh
         && !usable_weekly
         && !weekly_alert
         && weekly.resets_at.is_some_and(|at| at > now)
-        && policy
-            .weekly
-            .as_ref()
-            .is_some_and(|w| w.resets_at != weekly.resets_at)
+        && changed_anchor
     {
         policy.weekly = None;
         if old_held {
@@ -1003,10 +1022,7 @@ fn provider_evaluation(
     }
     // Never adopt a changed anchor from a stale/expired/unknown reading.
     if fresh && (usable_weekly || weekly_alert) {
-        let new_window = policy
-            .weekly
-            .as_ref()
-            .is_none_or(|w| weekly.resets_at.is_some() && w.resets_at != weekly.resets_at);
+        let new_window = policy.weekly.is_none() || changed_anchor;
         if new_window {
             policy.weekly = Some(WeeklyPolicy {
                 state: WeeklyState::OnTrack,
@@ -1247,9 +1263,38 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
             None => RoutingState::Balanced,
         }
     };
-    let routing = match &previous.routing {
-        Some(old) if old.state == state => old.clone(),
-        _ => RoutingPolicy { state, since: now },
+    let both_on_track = [&claude, &codex].iter().all(|p| {
+        p.weekly
+            .as_ref()
+            .is_some_and(|w| w.state == WeeklyState::OnTrack)
+    });
+    let flexible_provider =
+        if both_on_track && weekly_available(&claude_report) && weekly_available(&codex_report) {
+            let ahead = |r: &ProviderReport| {
+                r.windows
+                    .iter()
+                    .find(|w| w.label == "7d")
+                    .and_then(|w| w.ahead)
+            };
+            match ahead(&claude_report).zip(ahead(&codex_report)) {
+                Some((c, x)) if (c - x).abs() > BALANCE_MARGIN => Some(if c < x {
+                    Provider::Claude
+                } else {
+                    Provider::Codex
+                }),
+                _ => None,
+            }
+        } else {
+            previous.routing.as_ref().and_then(|r| r.flexible_provider)
+        };
+    let routing = RoutingPolicy {
+        state,
+        since: previous
+            .routing
+            .as_ref()
+            .filter(|old| old.state == state)
+            .map_or(now, |old| old.since),
+        flexible_provider,
     };
     let available_claude =
         weekly_available(&claude_report) && !claude_report.busy && !held(&claude);
@@ -1280,7 +1325,7 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
     } else {
         notices.extend(claude_warning.into_iter().chain(codex_warning));
     }
-    let reason = match state {
+    let mut reason = match state {
         RoutingState::LeanClaude => format!("Routing: pinned to Claude until {} UTC.", pin.as_ref().map(|pin| format_reset(pin.until, now, &chrono::Utc)).unwrap_or_else(|| "cleared".into())),
         RoutingState::LeanCodex => format!("Routing: pinned to Codex until {} UTC.", pin.as_ref().map(|pin| format_reset(pin.until, now, &chrono::Utc)).unwrap_or_else(|| "cleared".into())),
         RoutingState::HoldClaude => format!("Routing: {c} → start nothing new on Claude. {} A Claude coordinator finishes its step, writes checkpoint and handoff, and says when Claude resets.", if available_codex { "Coding, reviews and consults to Codex until Claude recovers or resets." } else { "Codex has no verified spare capacity; defer flexible work until fresh readings permit it." }),
@@ -1288,21 +1333,30 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
         RoutingState::Conserve => format!("Routing: {c}; {x} → conserve. Both providers are held: defer new work until a hold clears; then one priority task at a time, serial, required specialist reviews only. Credits or overage need the user's explicit choice."),
         RoutingState::Balanced => {
             let preference = if available_claude && available_codex {
-                let ahead = |r: &ProviderReport| r.windows.iter().find(|w| w.label == "7d").and_then(|w| w.ahead);
-                // Hot warns only: it cannot redirect balanced flexible work.
-                let both_on_track = [&claude, &codex].iter().all(|p| p.weekly.as_ref().is_some_and(|w| w.state == WeeklyState::OnTrack));
-                if both_on_track {
-                    match ahead(&claude_report).zip(ahead(&codex_report)) {
-                        Some((c, x)) if (c - x).abs() > BALANCE_MARGIN => if c < x { "Flexible jobs to Claude, further behind its weekly line." } else { "Flexible jobs to Codex, further behind its weekly line." },
-                        _ => "Use the roles table for flexible work.",
-                    }
-                } else { "Keep current routing; hot usage only warns. Use the roles table unless the user chooses a switch." }
+                match flexible_provider {
+                    Some(Provider::Claude) if both_on_track => "Flexible jobs to Claude, further behind its weekly line.",
+                    Some(Provider::Codex) if both_on_track => "Flexible jobs to Codex, further behind its weekly line.",
+                    Some(Provider::Claude) => "Flexible jobs to Claude; keep the balanced provider while hot usage only warns.",
+                    Some(Provider::Codex) => "Flexible jobs to Codex; keep the balanced provider while hot usage only warns.",
+                    None => "Use the roles table for flexible work.",
+                }
             } else if available_claude { "Flexible jobs to Claude; Codex is busy or has unknown/stale weekly capacity." }
             else if available_codex { "Flexible jobs to Codex; Claude is busy or has unknown/stale weekly capacity." }
             else { "No verified spare capacity: refresh readings before starting flexible work." };
             format!("Routing: balanced. {preference}")
         }
     };
+    if matches!(state, RoutingState::LeanClaude | RoutingState::LeanCodex) {
+        if let Some(pin) = &pin {
+            let busy = match pin.provider {
+                Provider::Claude => claude_report.busy,
+                Provider::Codex => codex_report.busy,
+            };
+            if busy {
+                reason.push_str(&format!(" {} is busy in its 5h window: start no new parallel worker on it; the pin keeps flexible work on this provider, serially, until the throttle clears.", pin.provider.label()));
+            }
+        }
+    }
     if previous
         .routing
         .as_ref()
@@ -2016,6 +2070,136 @@ mod policy_tests {
         file.absorb(reading(Provider::Claude, used, left));
         file.absorb(reading(Provider::Codex, 10.0, 2 * 86400));
         file
+    }
+
+    #[test]
+    fn third_round_learning_reset_anchor_preserves_hold() {
+        for used in [Some(1.0), None] {
+            let mut file = fixture(10.0, 2 * 86400);
+            file.claude.as_mut().unwrap().windows.clear();
+            file.claude.as_mut().unwrap().alerts.push(Alert {
+                kind: AlertKind::Overage,
+                until: None,
+                window: None,
+            });
+            assert_eq!(
+                step(&mut file, NOW).report.routing.state,
+                RoutingState::HoldClaude
+            );
+            let mut fresh = reading(Provider::Claude, 1.0, 2 * 86400);
+            fresh.observed_at = NOW + 60;
+            fresh.windows[0].used_percent = used;
+            file.claude = Some(fresh);
+            let e = step(&mut file, NOW + 60);
+            assert_eq!(e.report.routing.state, RoutingState::HoldClaude);
+            assert!(!e.allows_start(Provider::Claude, false, false));
+            let weekly = e.policy.claude.weekly.unwrap();
+            assert_eq!(weekly.resets_at, Some(NOW + 2 * 86400));
+            assert_eq!(weekly.since, NOW);
+            assert!(e.notices.is_empty());
+            // Once known, a genuinely changed anchor releases the hold.
+            file.claude.as_mut().unwrap().windows[0].resets_at = Some(NOW + WEEK_SECS);
+            assert_eq!(
+                step(&mut file, NOW + 60).report.routing.state,
+                RoutingState::Balanced
+            );
+        }
+    }
+
+    #[test]
+    fn third_round_hot_retains_balanced_provider_across_restart() {
+        for target in [Provider::Claude, Provider::Codex] {
+            let mut file = fixture(10.0, 2 * 86400);
+            file.codex = Some(reading(Provider::Codex, 25.0, 5 * 86400));
+            if target == Provider::Codex {
+                std::mem::swap(&mut file.claude, &mut file.codex);
+                file.claude.as_mut().unwrap().provider = Provider::Claude;
+                file.codex.as_mut().unwrap().provider = Provider::Codex;
+            }
+            let phrase = if target == Provider::Claude {
+                "Flexible jobs to Claude"
+            } else {
+                "Flexible jobs to Codex"
+            };
+            assert!(step(&mut file, NOW).report.routing.reason.contains(phrase));
+            let hot = if target == Provider::Claude {
+                file.codex.as_mut().unwrap()
+            } else {
+                file.claude.as_mut().unwrap()
+            };
+            hot.windows[0].used_percent = Some(35.0);
+            hot.observed_at = NOW + 60;
+            let e = step(&mut file, NOW + 60);
+            assert_eq!(e.report.routing.state, RoutingState::Balanced);
+            assert!(
+                e.report.routing.reason.contains(phrase),
+                "{}",
+                e.report.routing.reason
+            );
+            // Even if the previous target becomes hotter and the ahead
+            // comparison would now favor the other plan, hot cannot switch it.
+            let preferred = if target == Provider::Claude {
+                file.claude.as_mut().unwrap()
+            } else {
+                file.codex.as_mut().unwrap()
+            };
+            preferred.windows[0].used_percent = Some(90.0);
+            preferred.observed_at = NOW + 60;
+            assert!(step(&mut file, NOW + 60)
+                .report
+                .routing
+                .reason
+                .contains(phrase));
+            let dir = tempfile::tempdir().unwrap();
+            let path = PlanLimitsFile::path_in(dir.path());
+            file.save(&path).unwrap();
+            assert!(evaluate_policy(&PlanLimitsFile::load(&path), NOW + 60)
+                .report
+                .routing
+                .reason
+                .contains(phrase));
+        }
+    }
+
+    #[test]
+    fn third_round_busy_pin_keeps_target_and_prohibits_parallel_workers() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut file = fixture(10.0, 2 * 86400);
+            file.pin = Some(RoutingPin {
+                provider,
+                until: NOW + 7200,
+            });
+            let busy = if provider == Provider::Claude {
+                file.claude.as_mut().unwrap()
+            } else {
+                file.codex.as_mut().unwrap()
+            };
+            busy.windows.push(LimitWindow {
+                label: "5h".into(),
+                used_percent: Some(80.0),
+                resets_at: Some(NOW + 7200),
+            });
+            let e = evaluate_policy(&file, NOW);
+            assert_eq!(
+                e.report.routing.state,
+                if provider == Provider::Claude {
+                    RoutingState::LeanClaude
+                } else {
+                    RoutingState::LeanCodex
+                }
+            );
+            assert!(
+                e.report
+                    .routing
+                    .reason
+                    .contains("start no new parallel worker"),
+                "{}",
+                e.report.routing.reason
+            );
+            assert!(e.allows_start(provider, false, false));
+            assert!(!e.allows_start(provider, true, false));
+            assert!(e.allows_start(provider, true, true));
+        }
     }
 
     #[test]
