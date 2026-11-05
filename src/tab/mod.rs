@@ -36,6 +36,8 @@ use crate::SyntaxHighlightLine;
 /// tab's own content again.
 pub(crate) struct FileViewerOverlay {
     pub(crate) path: PathBuf,
+    /// Whether `path` names a file on this machine (remote source paths are opaque).
+    pub(crate) local_source: bool,
     pub(crate) line: Option<usize>,
     pub(crate) file_content: String,
     pub(crate) image_handle: Option<image::Handle>,
@@ -56,6 +58,7 @@ impl FileViewerOverlay {
     pub(crate) fn for_path(path: PathBuf) -> Self {
         Self {
             path,
+            local_source: true,
             line: None,
             file_content: String::new(),
             image_handle: None,

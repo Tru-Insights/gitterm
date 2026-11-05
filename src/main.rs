@@ -23137,11 +23137,15 @@ fi
                 return task;
             }
             Event::AgentOpenCheckout(tab_id, path) => {
-                let Some(workspace_dir) = self
-                    .workspaces
-                    .iter()
-                    .find(|ws| ws.tabs.iter().any(|tab| tab.id == tab_id))
-                    .map(|ws| ws.dir.clone())
+                let Some((workspace_dir, current_checkout, local_source)) =
+                    self.workspaces.iter().find_map(|ws| {
+                        let tab = ws.tabs.iter().find(|tab| tab.id == tab_id)?;
+                        let current_checkout = tab.repo_path.clone();
+                        let local_source = matches!(ws.location, WorkspaceLocation::Local { .. })
+                            && ws.remote_session.is_none()
+                            && self.remote_agent_id_for_workspace(ws).is_none();
+                        Some((ws.dir.clone(), current_checkout, local_source))
+                    })
                 else {
                     eprintln!(
                         "[editor] chat {tab_id} has no owning workspace; checkout open refused"
@@ -23155,7 +23159,12 @@ fi
                     .iter()
                     .map(|choice| choice.path.clone())
                     .collect::<Vec<_>>();
-                let Some(known_path) = editor::known_checkout_path(&known_paths, &path) else {
+                let Some(known_path) = editor::known_checkout_path(
+                    &known_paths,
+                    &current_checkout,
+                    &path,
+                    local_source,
+                ) else {
                     eprintln!(
                         "[editor] chat {tab_id} requested unknown checkout {}; refused",
                         path.display()
@@ -23184,35 +23193,10 @@ fi
                             editor.command.args,
                             command_path.display()
                         );
-                        let mut command = std::process::Command::new(&editor.command.program);
-                        command.args(&editor.command.args);
-                        if editor.is_bundle_editor {
-                            let result = command
-                                .output()
-                                .map_err(|error| format!("{}: {error}", editor.command.program))?;
-                            if result.status.success() {
-                                Ok(())
-                            } else {
-                                let stderr =
-                                    String::from_utf8_lossy(&result.stderr).trim().to_string();
-                                Err(if stderr.is_empty() {
-                                    format!(
-                                        "{} exited with {}",
-                                        editor.command.program, result.status
-                                    )
-                                } else {
-                                    format!(
-                                        "{} exited with {}: {stderr}",
-                                        editor.command.program, result.status
-                                    )
-                                })
-                            }
-                        } else {
-                            command
-                                .spawn()
-                                .map(|_| ())
-                                .map_err(|error| format!("{}: {error}", editor.command.program))
-                        }
+                        let command = editor.command;
+                        tokio::task::spawn_blocking(move || crate::editor::run_command(command))
+                            .await
+                            .map_err(|error| format!("editor command task failed: {error}"))?
                     },
                     move |result| {
                         Event::EditorOpenFinished(
@@ -26439,6 +26423,7 @@ fi
                     },
                 };
                 let path = PathBuf::from(source_path.display());
+                let local_editor_path = editor::local_editor_path(&source_path).is_some();
                 let is_dark_theme = self.theme == AppTheme::Dark;
                 let is_markdown = TabState::is_markdown_file(&path);
                 let is_html = TabState::is_html_file(&path);
@@ -26496,6 +26481,7 @@ fi
                     {
                         // Open / replace the file viewer overlay; resets all overlay state.
                         let fv = tab.open_file_viewer(path.clone());
+                        fv.local_source = local_editor_path;
                         fv.load_in_progress = true;
                         fv.load_started_at = Some(Instant::now());
                     }
@@ -41742,14 +41728,29 @@ fi
             button(text("Open in editor").size(font))
                 .style(self.ghost_button_style())
                 .padding([4, 12])
-                .on_press(Event::OpenEditor(fv.path.clone(), fv.line, None)),
+                .on_press_maybe(
+                    fv.local_source
+                        .then(|| Event::OpenEditor(fv.path.clone(), fv.line, None)),
+                ),
             text(format!("Open in {editor_name}")).size(font_small),
             iced::widget::tooltip::Position::Top,
         );
+        let editor_error = self
+            .editor_error
+            .as_ref()
+            .filter(|(error_path, _)| error_path == &fv.path)
+            .map(|(_, message)| message.as_str());
+        let header_title = editor::viewer_header_title(&rel_path, editor_error);
         let header = if is_markdown || is_html || is_excalidraw {
             // Markdown header with "View in Browser" button for Mermaid support
             row![
-                text(rel_path).size(font).color(theme.text_primary()),
+                text(header_title.clone())
+                    .size(font)
+                    .color(if editor_error.is_some() {
+                        theme.danger()
+                    } else {
+                        theme.text_primary()
+                    }),
                 iced::widget::Space::new().width(Length::Fill),
                 open_editor,
                 iced::widget::Space::new().width(Length::Fixed(4.0)),
@@ -41771,7 +41772,13 @@ fi
             .spacing(8)
         } else {
             row![
-                text(rel_path).size(font).color(theme.text_primary()),
+                text(header_title.clone())
+                    .size(font)
+                    .color(if editor_error.is_some() {
+                        theme.danger()
+                    } else {
+                        theme.text_primary()
+                    }),
                 iced::widget::Space::new().width(Length::Fill),
                 open_editor,
                 iced::widget::Space::new().width(Length::Fixed(4.0)),
@@ -41807,14 +41814,6 @@ fi
                         ..Default::default()
                     }),
             );
-
-        if let Some((error_path, message)) = &self.editor_error {
-            if error_path == &fv.path {
-                content = content.push(
-                    container(text(message).size(font_small).color(theme.danger())).padding(8),
-                );
-            }
-        }
 
         if let Some(notice) = &tab.diff_syntax_notice {
             content = content.push(

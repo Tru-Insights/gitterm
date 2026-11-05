@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::source::SourcePath;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenCommand {
     pub(crate) program: String,
@@ -10,7 +12,6 @@ pub(crate) struct OpenCommand {
 pub(crate) struct Editor {
     pub(crate) name: String,
     pub(crate) command: OpenCommand,
-    pub(crate) is_bundle_editor: bool,
 }
 
 pub(crate) fn build_open_command(
@@ -46,7 +47,6 @@ pub(crate) fn build_open_command(
                     program,
                     args: args[1..].to_vec(),
                 },
-                is_bundle_editor: false,
             });
         }
     };
@@ -69,7 +69,27 @@ pub(crate) fn build_open_command(
             program: "open".into(),
             args,
         },
-        is_bundle_editor: bundle.is_some(),
+    })
+}
+
+/// Run an editor command to completion so a launcher that exits unsuccessfully
+/// is reported and its child process is reaped.
+pub(crate) fn run_command(command: OpenCommand) -> Result<(), String> {
+    let result = std::process::Command::new(&command.program)
+        .args(&command.args)
+        .output()
+        .map_err(|error| format!("{}: {error}", command.program))?;
+    if result.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!("{} exited with {}", command.program, result.status)
+    } else {
+        format!(
+            "{} exited with {}: {stderr}",
+            command.program, result.status
+        )
     })
 }
 
@@ -113,11 +133,30 @@ pub(crate) fn display_name(setting: &str) -> String {
     }
 }
 
-pub(crate) fn known_checkout_path(known: &[PathBuf], requested: &Path) -> Option<PathBuf> {
+pub(crate) fn known_checkout_path(
+    known: &[PathBuf],
+    current_checkout: &Path,
+    requested: &Path,
+    local_source: bool,
+) -> Option<PathBuf> {
+    if !local_source {
+        return None;
+    }
+    if current_checkout == requested {
+        return Some(current_checkout.to_path_buf());
+    }
     known
         .iter()
         .find(|path| path.as_path() == requested)
         .cloned()
+}
+
+pub(crate) fn local_editor_path(source: &SourcePath) -> Option<&Path> {
+    source.as_local()
+}
+
+pub(crate) fn viewer_header_title(path: &str, error: Option<&str>) -> String {
+    error.unwrap_or(path).to_string()
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, String> {
@@ -245,9 +284,64 @@ mod tests {
     fn refuses_unknown_checkout_paths() {
         let known = vec![PathBuf::from("/tmp/work")];
         assert_eq!(
-            known_checkout_path(&known, Path::new("/tmp/work")),
+            known_checkout_path(
+                &known,
+                Path::new("/tmp/current"),
+                Path::new("/tmp/work"),
+                true,
+            ),
             Some(known[0].clone())
         );
-        assert_eq!(known_checkout_path(&known, Path::new("/tmp/other")), None);
+        assert_eq!(
+            known_checkout_path(
+                &known,
+                Path::new("/tmp/current"),
+                Path::new("/tmp/other"),
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn allows_existing_chat_checkout_after_workspace_move_but_rejects_remote() {
+        let choices = vec![PathBuf::from("/Users/me/Work/fix-213")];
+        let current = Path::new("/Users/me/src/repo");
+        assert_eq!(
+            known_checkout_path(&choices, current, current, true),
+            Some(current.to_path_buf())
+        );
+        assert_eq!(known_checkout_path(&choices, current, current, false), None);
+    }
+
+    #[test]
+    fn local_editor_path_rejects_remote_display_paths() {
+        assert_eq!(
+            local_editor_path(&SourcePath::Local(PathBuf::from("/tmp/a.rs"))),
+            Some(Path::new("/tmp/a.rs"))
+        );
+        assert_eq!(
+            local_editor_path(&SourcePath::Remote("/tmp/a.rs".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn viewer_header_shows_editor_error_in_visible_chrome() {
+        assert_eq!(
+            viewer_header_title("README.md", Some("VS Code isn't installed")),
+            "VS Code isn't installed"
+        );
+        assert_eq!(viewer_header_title("README.md", None), "README.md");
+    }
+
+    #[test]
+    fn reports_custom_command_failure_after_waiting_for_child() {
+        let error = run_command(OpenCommand {
+            program: "/usr/bin/false".into(),
+            args: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(error.contains("exited with"), "{error}");
     }
 }
