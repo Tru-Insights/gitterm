@@ -840,7 +840,15 @@ fn worktree_matches_repo(worktree: &ListedWorktree, repo: &Path) -> Result<bool,
     if worktree.is_main {
         return Ok(admin == common);
     }
-    if admin.parent() != Some(common.join("worktrees").as_path()) {
+    let worktrees = common.join("worktrees");
+    let metadata = std::fs::symlink_metadata(&worktrees)
+        .map_err(|error| format!("cannot read {}: {error}", worktrees.display()))?;
+    // Canonical comparisons must not let the admin container escape the repository.
+    if metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let worktrees = canonical("worktree admin container", &worktrees)?;
+    if admin.parent() != Some(worktrees.as_path()) {
         return Ok(false);
     }
     let backlink_file = admin.join("gitdir");
@@ -854,9 +862,14 @@ fn worktree_matches_repo(worktree: &ListedWorktree, repo: &Path) -> Result<bool,
         ));
     }
     let backlink = canonical("worktree backlink", &admin.join(backlink))?;
-    // Do not canonicalize the right side: a borrowed/symlinked .git file
-    // must not make a stale registered path impersonate a live worktree.
-    Ok(backlink == path.join(".git"))
+    let entry = path.join(".git");
+    let metadata = std::fs::symlink_metadata(&entry)
+        .map_err(|error| format!("cannot read {}: {error}", entry.display()))?;
+    // Reject borrowed metadata before resolving its case-preserving real path.
+    if metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    Ok(backlink == canonical("worktree Git entry", &entry)?)
 }
 
 /// Whether the git top level `top` is the workspace's home, one of its
@@ -2841,6 +2854,38 @@ mod tests {
     }
 
     #[test]
+    fn case_variant_git_metadata_remains_authorized_on_case_insensitive_volumes() {
+        let targets = Targets::new();
+        match std::fs::canonicalize(targets.path("API")) {
+            Ok(path) => assert_eq!(path, targets.canonical("api")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping case-variant Git metadata: fixture volume is case-sensitive");
+                return;
+            }
+            Err(error) => panic!("cannot probe fixture volume case sensitivity: {error}"),
+        }
+
+        for (from, to) in [
+            ("api-wt/.git", "api-wt/.GIT"),
+            ("api/.git/worktrees", "api/.git/WORKTREES"),
+            ("api/.git", "api/.GIT"),
+        ] {
+            std::fs::rename(targets.path(from), targets.path(to)).unwrap();
+            let worktree = targets.path("api-wt");
+            assert_eq!(
+                resolve_checkout("checkout", &worktree, &targets.caller()).unwrap(),
+                targets.canonical("api-wt"),
+                "after renaming {from} to {to}"
+            );
+            assert_eq!(
+                resolve_add_dir(&worktree.join("src"), &targets.caller()).unwrap(),
+                targets.canonical("api-wt/src"),
+                "after renaming {from} to {to}"
+            );
+        }
+    }
+
+    #[test]
     fn relative_worktree_backlinks_and_the_main_checkout_remain_authorized() {
         let targets = Targets::new();
         let worktree = targets.path("api-wt");
@@ -2980,6 +3025,34 @@ mod tests {
         );
         assert!(resolve_checkout("checkout", &live, &targets.caller()).is_ok());
         assert!(resolve_add_dir(&live, &targets.caller()).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_worktree_admin_container_cannot_escape_through_a_symlink() {
+        let targets = Targets::new();
+        let container = targets.path("api/.git/worktrees");
+        let outside = targets.path("api-admin-outside");
+        let worktree = targets.path("api-wt");
+        let common = canonical_git_dir(&worktree, "--git-common-dir").unwrap();
+        let admin = canonical_git_dir(&worktree, "--absolute-git-dir").unwrap();
+        std::fs::rename(&container, &outside).unwrap();
+        std::fs::write(
+            outside.join(admin.file_name().unwrap()).join("commondir"),
+            format!("{}\n", common.display()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, &container).unwrap();
+        assert_eq!(
+            canonical_git_dir(&worktree, "--git-common-dir").unwrap(),
+            common
+        );
+        assert_eq!(
+            git_top_level("worktree", &worktree).unwrap(),
+            targets.canonical("api-wt")
+        );
+        assert!(resolve_checkout("checkout", &worktree, &targets.caller()).is_err());
+        assert!(resolve_add_dir(&worktree.join("src"), &targets.caller()).is_err());
     }
 
     #[test]
