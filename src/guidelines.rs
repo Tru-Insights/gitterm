@@ -6,7 +6,7 @@
 //! switch and the repos they are off in; a workspace can switch them off in
 //! `workspaces.json` (`guidelines_off`).
 //!
-//! Each harness gets them through its own system-prompt option:
+//! Each harness gets them through its own instruction channel:
 //! - Claude: `--append-system-prompt-file <path>` (claude 2.1.312 names it in
 //!   `--help` and reports a missing file as "Append system prompt file not
 //!   found").
@@ -14,6 +14,12 @@
 //!   contents to the system prompt").
 //! - Codex: `-c developer_instructions=<TOML string>` (codex-cli 0.164.0
 //!   accepts the key under `--strict-config`, which rejects unknown keys).
+//! - Gemini CLI over ACP: a delimited preamble on the first prompt (ACP
+//!   `session/new` has no system-instruction field).
+//! - OpenCode over ACP: its `instructions` config paths, supplied through
+//!   `OPENCODE_CONFIG_CONTENT`.
+//! - A remote Claude chat: the desktop sends the text in the remote start;
+//!   the agent writes a temporary prompt file for that Claude process.
 //!
 //! The file is read before every launch: an unreadable one launches the
 //! agent without it and is logged. A launch is never blocked.

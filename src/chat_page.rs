@@ -16,9 +16,10 @@ use crate::harness::HarnessEvent;
 pub const AGENT_CHAT_HTML: &str = include_str!("../assets/agent_chat.html");
 /// Vendored renderers inlined into the chat page (no network at runtime).
 /// Licenses sit next to them in `assets/vendor/`.
-pub const AGENT_CHAT_VENDOR_JS: [&str; 2] = [
+pub const AGENT_CHAT_VENDOR_JS: [&str; 3] = [
     include_str!("../assets/vendor/marked.min.js"),
     include_str!("../assets/vendor/highlight.min.js"),
+    crate::html_render::RENDER_JS,
 ];
 pub const AGENT_CHAT_VENDOR_SLOT: &str = "/*__VENDOR_JS__*/";
 
@@ -89,6 +90,23 @@ pub fn subagent_started_at(parent: &str, at_ms: i64) -> Value {
 /// buffer; a rebuilt page gets running runs back on the next poll.
 pub fn codex_exec_payload(run: &crate::codex_exec::RunView) -> Value {
     serde_json::json!({ "kind": "codex_exec", "run": run })
+}
+
+/// The start and end of a chat turn, when known (TRU-209).
+pub fn turn_timing(start_ms: Option<i64>, end_ms: Option<i64>) -> Value {
+    let mut payload = serde_json::json!({ "kind": "turn_timing" });
+    if let Some(start_ms) = start_ms {
+        payload["start_ms"] = serde_json::json!(start_ms);
+    }
+    if let Some(end_ms) = end_ms {
+        payload["end_ms"] = serde_json::json!(end_ms);
+    }
+    payload
+}
+
+/// The timestamp at which a queued prompt splits an active turn fold.
+pub fn turn_split_time(split_ms: i64) -> Value {
+    serde_json::json!({ "kind": "turn_timing", "split_ms": split_ms })
 }
 
 /// A transcript read-back as page payloads, each subagent start followed

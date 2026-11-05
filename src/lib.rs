@@ -13,6 +13,7 @@ pub mod delegations;
 pub mod gh_identity;
 pub mod guidelines;
 pub mod harness;
+pub mod html_render;
 pub mod issue_titles;
 pub mod jev;
 pub mod merge_plan;

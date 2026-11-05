@@ -3575,6 +3575,233 @@ fn chrome_launch_args(profile_dir: &Path) -> Vec<String> {
     ]
 }
 
+/// Visual replies use the same low-level Chrome/CDP adapter, but never the
+/// interactive browser's process, profile, targets, or credentials.
+pub async fn preview_html(request: crate::html_render::HtmlPreviewRequest) -> Result<Value> {
+    request.validate().map_err(BrowserControlError::new)?;
+    static PREVIEWS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let permit = PREVIEWS
+        .acquire()
+        .await
+        .map_err(|error| BrowserControlError::new(format!("HTML preview queue closed: {error}")))?;
+    // Detached on caller cancellation so timeout, process reaping and profile
+    // cleanup still finish. The permit limits concurrent Chrome processes.
+    tokio::spawn(async move {
+        let _permit = permit;
+        run_html_preview(request).await
+    })
+    .await
+    .map_err(|error| BrowserControlError::new(format!("HTML preview worker failed: {error}")))?
+}
+
+async fn run_html_preview(request: crate::html_render::HtmlPreviewRequest) -> Result<Value> {
+    let profile = env::temp_dir().join(format!("gitterm-v6-html-preview-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&profile).map_err(|error| {
+        BrowserControlError::new(format!(
+            "cannot create HTML preview profile {}: {error}",
+            profile.display()
+        ))
+    })?;
+    let result = async {
+        let executable = resolve_chrome_executable(None)?;
+        let mut args = chrome_launch_args(&profile);
+        args.extend([
+            "--headless=new".into(),
+            "--disable-background-networking".into(),
+            "--disable-component-update".into(),
+            // Keep the document-start guard effective for opaque srcdoc and
+            // nested frames. Only this fresh, credential-free preview process
+            // disables extra renderer isolation; SOP and the OS sandbox remain.
+            "--disable-features=IsolateSandboxedIframes".into(),
+        ]);
+        let mut child = Command::new(&executable)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| {
+                BrowserControlError::new(format!(
+                    "cannot launch HTML preview Chrome {}: {error}",
+                    executable.display()
+                ))
+            })?;
+        let result = timeout(
+            Duration::from_secs(30),
+            capture_html_preview(&profile, &request),
+        )
+        .await
+        .map_err(|_| BrowserControlError::new("HTML preview exceeded 30 seconds"))
+        .and_then(|result| result);
+        child.kill().await.map_err(|error| {
+            BrowserControlError::new(format!("cannot stop HTML preview Chrome: {error}"))
+        })?;
+        result
+    }
+    .await;
+    let cleanup = std::fs::remove_dir_all(&profile).map_err(|error| {
+        BrowserControlError::new(format!(
+            "cannot remove HTML preview profile {}: {error}",
+            profile.display()
+        ))
+    });
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(BrowserControlError::new(format!("{error}; {cleanup}"))),
+    }
+}
+
+async fn capture_html_preview(
+    profile: &Path,
+    request: &crate::html_render::HtmlPreviewRequest,
+) -> Result<Value> {
+    let deadline = Instant::now() + DEFAULT_STARTUP_TIMEOUT;
+    let endpoint = loop {
+        if let Some(endpoint) = read_devtools_active_port(&profile.join(DEVTOOLS_ACTIVE_PORT_FILE))?
+        {
+            break endpoint;
+        }
+        if Instant::now() >= deadline {
+            return Err(BrowserControlError::new(
+                "HTML preview Chrome did not publish a DevTools endpoint",
+            ));
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    let targets = list_page_targets(endpoint.port).await?;
+    let target = targets
+        .iter()
+        .find(|target| target.kind == "page")
+        .and_then(|target| target.web_socket_debugger_url.as_deref())
+        .ok_or_else(|| BrowserControlError::new("HTML preview Chrome has no page target"))?;
+    let session = CdpSession::connect(target).await?;
+    session.command("Page.enable", json!({})).await?;
+    session.command("Runtime.enable", json!({})).await?;
+    session.command("Network.enable", json!({})).await?;
+    session
+        .command("Network.setBlockedURLs", json!({"urls": ["*"]}))
+        .await?;
+    // Browser-native document-start hook: nested srcdoc gets a fresh realm,
+    // so removing RTC only in the outer iframe's bootstrap is insufficient.
+    session
+        .command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({"source": crate::html_render::FRAME_GUARD_JS}),
+        )
+        .await?;
+    let width = request.width.unwrap_or(crate::html_render::DEFAULT_WIDTH);
+    session
+        .command(
+            "Emulation.setDeviceMetricsOverride",
+            json!({"width": width, "height": 100, "deviceScaleFactor": 1, "mobile": false}),
+        )
+        .await?;
+    let wrapper = format!(
+        "<!doctype html><html><body style='margin:0'><script>{}</script></body></html>",
+        crate::html_render::RENDER_JS
+    );
+    let document = session.command("Page.getFrameTree", json!({})).await?;
+    let frame_id = document
+        .pointer("/frameTree/frame/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BrowserControlError::new("HTML preview omitted its main frame"))?;
+    session
+        .command(
+            "Page.setDocumentContent",
+            json!({"frameId": frame_id, "html": wrapper}),
+        )
+        .await?;
+    // The existing blank main document predates the native initialization hook;
+    // apply it there as well, before creating any untrusted document.
+    evaluate_by_value::<Value>(
+        &session,
+        &format!("{}; true", crate::html_render::FRAME_GUARD_JS),
+        "preview frame guard",
+    )
+    .await?;
+    let guarded: bool = evaluate_by_value(
+        &session,
+        include_str!("../assets/html_guard_probe.js"),
+        "HTML preview isolation preflight",
+    )
+    .await?;
+    if !guarded {
+        return Err(BrowserControlError::new("Chrome did not initialize isolation guards in root and nested HTML frames; refusing to execute agent HTML"));
+    }
+    let html = serde_json::to_string(&request.html).map_err(|error| {
+        BrowserControlError::new(format!("cannot encode preview HTML: {error}"))
+    })?;
+    let theme = match request.theme.unwrap_or_default() {
+        crate::html_render::HtmlTheme::Dark => "dark",
+        crate::html_render::HtmlTheme::Light => "light",
+    };
+    let source = format!("window.preview = GitTermHtml.create({html},100,'{theme}'); document.body.appendChild(preview.frame); true");
+    evaluate_by_value::<bool>(&session, &source, "HTML preview creation").await?;
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if evaluate_by_value::<bool>(
+            &session,
+            "preview.state.guardError === true",
+            "HTML preview guard status",
+        )
+        .await?
+        {
+            return Err(BrowserControlError::new(
+                "HTML preview frame isolation guard did not initialize",
+            ));
+        }
+        if evaluate_by_value::<bool>(&session, "preview.state.ready", "HTML preview readiness")
+            .await?
+        {
+            break;
+        }
+        if Instant::now() >= ready_deadline {
+            return Err(BrowserControlError::new(
+                "HTML preview did not report its content height",
+            ));
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    // Let fonts, image decoding and synchronous layout changes settle, then
+    // capture bounded pixels even if the document asks for an enormous height.
+    sleep(Duration::from_millis(150)).await;
+    let state: Value =
+        evaluate_by_value(&session, "preview.state", "HTML preview measurements").await?;
+    let height = state
+        .get("contentHeight")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| BrowserControlError::new("HTML preview omitted contentHeight"))?;
+    let captured = height.clamp(100, u64::from(crate::html_render::MAX_HEIGHT));
+    session
+        .command(
+            "Emulation.setDeviceMetricsOverride",
+            json!({"width": width, "height": captured, "deviceScaleFactor": 1, "mobile": false}),
+        )
+        .await?;
+    evaluate_by_value::<bool>(
+        &session,
+        &format!("preview.frame.style.height='{captured}px'; true"),
+        "HTML preview sizing",
+    )
+    .await?;
+    let shot = session
+        .command(
+            "Page.captureScreenshot",
+            json!({"format": "png", "captureBeyondViewport": false}),
+        )
+        .await?;
+    let png = shot
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BrowserControlError::new("HTML preview screenshot omitted PNG data"))?;
+    let (errors, _) = session.diagnostics().await;
+    Ok(
+        json!({"width": width, "contentHeight": height, "capturedHeight": captured, "consoleMessages": state["consoleMessages"], "consoleErrors": errors, "png": png}),
+    )
+}
+
 fn resolve_chrome_executable(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return validate_chrome_executable(path, "browser launch option");
@@ -4714,6 +4941,65 @@ pub(crate) fn snapshot_expression() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "launches isolated headless Chrome"]
+    async fn isolated_html_preview_captures_png_console_height_and_cleans_up_timeout() {
+        let profiles = || {
+            std::fs::read_dir(env::temp_dir())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("gitterm-v6-html-preview-")
+                })
+                .map(|entry| entry.path())
+                .collect::<HashSet<_>>()
+        };
+        let before = profiles();
+        let request = crate::html_render::HtmlPreviewRequest {
+            html: r#"<body><div style="height:4300px">A tall visual</div><script>
+                console.log('RTC', typeof RTCPeerConnection, typeof webkitRTCPeerConnection);
+                console.log('THEME',getComputedStyle(document.documentElement).getPropertyValue('--bg'));
+                try { parent.document.body; console.error('parent accessible'); } catch(e) { console.log('parent blocked'); }
+                const child = document.createElement('iframe');
+                child.srcdoc = '<script>parent.console.log("NESTED RTC",typeof RTCPeerConnection,typeof webkitRTCPeerConnection)<\\/script>';
+                document.body.append(child);
+                console.warn('preview warning');
+            </script></body>"#.into(),
+            width: Some(390), theme: Some(crate::html_render::HtmlTheme::Light),
+        };
+        let value = preview_html(request).await.unwrap();
+        assert_eq!(value["width"], 390);
+        assert!(value["contentHeight"].as_u64().unwrap() >= 4300);
+        assert_eq!(value["capturedHeight"], 4000);
+        let console = value["consoleMessages"].to_string();
+        assert!(console.contains("RTC undefined undefined"), "{console}");
+        assert!(console.contains("parent blocked"), "{console}");
+        assert!(console.contains("#eff1f5"), "{console}");
+        assert!(console.contains("preview warning"), "{console}");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(value["png"].as_str().unwrap())
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((image.width(), image.height()), (390, 4000));
+        std::fs::write(env::temp_dir().join("gitterm-v6-html-preview.png"), bytes).unwrap();
+        assert_eq!(profiles(), before);
+        let failure = preview_html(crate::html_render::HtmlPreviewRequest {
+            html: "<script>while(true){}</script>".into(),
+            width: None,
+            theme: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            failure.to_string().contains("timed out") || failure.to_string().contains("exceeded"),
+            "{failure}"
+        );
+        assert_eq!(profiles(), before);
+    }
     use std::fs;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
