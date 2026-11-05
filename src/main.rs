@@ -7882,7 +7882,10 @@ fn page_navigation_decision(url: &str, context: &PageNavigationContext) -> PageN
         Some("github.com") => {
             // Authentication and account-wide pages must retain the selected login.
             if destination.path() == "/"
-                || matches!(first, "login" | "session" | "sessions" | "settings")
+                || matches!(
+                    first,
+                    "login" | "logout" | "session" | "sessions" | "settings"
+                )
             {
                 if same_service {
                     context.store.clone()
@@ -45600,6 +45603,7 @@ mod tests {
             "https://github.com/session",
             "https://github.com/sessions/two-factor/app",
             "https://github.com/settings/profile",
+            "https://github.com/logout",
         ] {
             assert_eq!(page_navigation_decision(url, &context), Allow, "{url}");
         }
