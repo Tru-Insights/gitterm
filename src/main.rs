@@ -23193,10 +23193,7 @@ fi
                             editor.command.args,
                             command_path.display()
                         );
-                        let command = editor.command;
-                        tokio::task::spawn_blocking(move || crate::editor::run_command(command))
-                            .await
-                            .map_err(|error| format!("editor command task failed: {error}"))?
+                        crate::editor::launch_command(editor.command).await
                     },
                     move |result| {
                         Event::EditorOpenFinished(

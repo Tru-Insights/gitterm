@@ -72,25 +72,19 @@ pub(crate) fn build_open_command(
     })
 }
 
-/// Run an editor command to completion so a launcher that exits unsuccessfully
-/// is reported and its child process is reaped.
-pub(crate) fn run_command(command: OpenCommand) -> Result<(), String> {
-    let result = std::process::Command::new(&command.program)
+/// Launch the editor without tying application shutdown to its lifetime.
+pub(crate) async fn launch_command(command: OpenCommand) -> Result<(), String> {
+    let mut child = tokio::process::Command::new(&command.program)
         .args(&command.args)
-        .output()
+        .spawn()
         .map_err(|error| format!("{}: {error}", command.program))?;
-    if result.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
-    Err(if stderr.is_empty() {
-        format!("{} exited with {}", command.program, result.status)
-    } else {
-        format!(
-            "{} exited with {}: {stderr}",
-            command.program, result.status
-        )
-    })
+    let program = command.program;
+    tokio::spawn(async move {
+        if let Err(error) = child.wait().await {
+            eprintln!("[editor] failed to reap command {program:?}: {error}");
+        }
+    });
+    Ok(())
 }
 
 fn substitute_template(template: &str, path: &str, line: Option<usize>) -> String {
@@ -156,7 +150,14 @@ pub(crate) fn local_editor_path(source: &SourcePath) -> Option<&Path> {
 }
 
 pub(crate) fn viewer_header_title(path: &str, error: Option<&str>) -> String {
-    error.unwrap_or(path).to_string()
+    const MAX_ERROR_CHARS: usize = 32;
+    let title = error.unwrap_or(path);
+    if error.is_some() && title.chars().count() > MAX_ERROR_CHARS {
+        let truncated = title.chars().take(MAX_ERROR_CHARS - 1).collect::<String>();
+        format!("{truncated}…")
+    } else {
+        title.to_string()
+    }
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, String> {
@@ -336,12 +337,58 @@ mod tests {
     }
 
     #[test]
-    fn reports_custom_command_failure_after_waiting_for_child() {
-        let error = run_command(OpenCommand {
-            program: "/usr/bin/false".into(),
-            args: Vec::new(),
-        })
-        .unwrap_err();
-        assert!(error.contains("exited with"), "{error}");
+    fn viewer_header_bounds_long_editor_errors() {
+        let error = format!("{}stderr", "/very/long/custom/editor/path/".repeat(20));
+        let title = viewer_header_title("README.md", Some(&error));
+        assert!(
+            title.chars().count() <= 32,
+            "{} chars: {title}",
+            title.chars().count()
+        );
+        assert!(title.ends_with('…'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_task_does_not_hold_runtime_shutdown_until_process_exit() {
+        use std::time::{Duration, Instant};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _guard = runtime.enter();
+            runtime.spawn(launch_command(OpenCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 1".into()],
+            }));
+        }
+        runtime.block_on(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        let started = Instant::now();
+        drop(runtime);
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "runtime shutdown waited {:?} for the child process",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn reports_editor_spawn_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(launch_command(OpenCommand {
+                program: "/no/such/editor-command".into(),
+                args: Vec::new(),
+            }))
+            .unwrap_err();
+        assert!(error.contains("/no/such/editor-command"), "{error}");
     }
 }
