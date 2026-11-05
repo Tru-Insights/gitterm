@@ -1116,12 +1116,14 @@ fn provider_evaluation(
         policy.burst = BurstPolicy::default();
     }
     if fresh && burst.resets_at.is_some_and(|at| at > now) {
-        if policy.burst.resets_at != burst.resets_at {
+        if policy.burst.resets_at.is_some() && policy.burst.resets_at != burst.resets_at {
             policy.burst = BurstPolicy {
                 resets_at: burst.resets_at,
                 ..BurstPolicy::default()
             };
         }
+        // Learning the first anchor does not establish a new burst window.
+        policy.burst.resets_at = burst.resets_at;
         if let Some(used) = burst.used_percent {
             if used >= BUSY_PERCENT
                 && burst
@@ -2070,6 +2072,51 @@ mod policy_tests {
         file.absorb(reading(Provider::Claude, used, left));
         file.absorb(reading(Provider::Codex, 10.0, 2 * 86400));
         file
+    }
+
+    #[test]
+    fn first_burst_reset_anchor_preserves_hold_until_reset() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            for used in [None, Some(1.0)] {
+                let mut file = fixture(10.0, 2 * 86400);
+                let reading = match provider {
+                    Provider::Claude => file.claude.as_mut().unwrap(),
+                    Provider::Codex => file.codex.as_mut().unwrap(),
+                };
+                reading.windows.push(LimitWindow {
+                    label: "5h".into(),
+                    used_percent: Some(100.0),
+                    resets_at: None,
+                });
+                assert!(!step(&mut file, NOW).allows_start(provider, false, false));
+
+                let reading = match provider {
+                    Provider::Claude => file.claude.as_mut().unwrap(),
+                    Provider::Codex => file.codex.as_mut().unwrap(),
+                };
+                reading.observed_at = NOW + 60;
+                reading.windows[1].used_percent = used;
+                reading.windows[1].resets_at = Some(NOW + 600);
+                let held = step(&mut file, NOW + 60);
+                assert_eq!(
+                    held.report.routing.state,
+                    match provider {
+                        Provider::Claude => RoutingState::HoldClaude,
+                        Provider::Codex => RoutingState::HoldCodex,
+                    }
+                );
+                assert!(!held.allows_start(provider, false, false));
+                let policy = match provider {
+                    Provider::Claude => &held.policy.claude,
+                    Provider::Codex => &held.policy.codex,
+                };
+                assert_eq!(policy.burst.resets_at, Some(NOW + 600));
+                assert_eq!(
+                    step(&mut file, NOW + 600).report.routing.state,
+                    RoutingState::Balanced
+                );
+            }
+        }
     }
 
     #[test]
