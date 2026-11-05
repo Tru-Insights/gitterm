@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::source::SourcePath;
+
+const EDITOR_EXIT_REPORT_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenCommand {
@@ -79,12 +82,36 @@ pub(crate) async fn launch_command(command: OpenCommand) -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("{}: {error}", command.program))?;
     let program = command.program;
+    let monitor_program = program.clone();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
+        let program = monitor_program;
+        match tokio::time::timeout(EDITOR_EXIT_REPORT_WINDOW, child.wait()).await {
+            Ok(Ok(status)) if !status.success() => {
+                let _ = result_tx.send(Err(format!("{program:?} exited with {status}")));
+                return;
+            }
+            Ok(Err(error)) => {
+                let _ = result_tx.send(Err(format!("failed to wait for {program:?}: {error}")));
+                return;
+            }
+            Ok(Ok(_)) => {
+                let _ = result_tx.send(Ok(()));
+                return;
+            }
+            Err(_) => {
+                // Once the reporting window expires, leave the app-facing
+                // operation successful and keep reaping independently.
+                let _ = result_tx.send(Ok(()));
+            }
+        }
         if let Err(error) = child.wait().await {
             eprintln!("[editor] failed to reap command {program:?}: {error}");
         }
     });
-    Ok(())
+    result_rx
+        .await
+        .map_err(|_| format!("editor launch monitor for {program:?} stopped"))?
 }
 
 fn substitute_template(template: &str, path: &str, line: Option<usize>) -> String {
@@ -390,5 +417,21 @@ mod tests {
             }))
             .unwrap_err();
         assert!(error.contains("/no/such/editor-command"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_quick_nonzero_editor_exit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(launch_command(OpenCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exit 7".into()],
+            }))
+            .unwrap_err();
+        assert!(error.contains("exited with"), "{error}");
     }
 }
