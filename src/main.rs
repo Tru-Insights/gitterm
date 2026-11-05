@@ -1869,7 +1869,10 @@ enum GitSelection {
 #[derive(Debug, Clone)]
 struct ReviewPaneState {
     target: review_pane::ReviewTarget,
-    source: overview::DiffSource,
+    source: review_pane::ReviewSource,
+    commits: Vec<review_pane::ReviewCommit>,
+    commits_truncated: bool,
+    commits_error: Option<String>,
     /// Which load this pane waits for.
     generation: u64,
     /// Stamped on every message from this page; others are dropped.
@@ -15224,7 +15227,7 @@ impl App {
             return Task::none();
         };
         let hide_noise = self.review_hide_noise(&checkout);
-        self.start_review(target, source, hide_noise, None)
+        self.start_review(target, source.into(), hide_noise, None)
     }
 
     /// The review target of the active workspace overview's owned row for
@@ -15308,7 +15311,12 @@ impl App {
                 // A test or generated file stays in sight.
                 let hide_noise = self.review_hide_noise(&open.target.checkout)
                     && !review_pane::classify_path(&open.focus).is_noise();
-                self.start_review(open.target, open.source, hide_noise, Some(open.focus))
+                self.start_review(
+                    open.target,
+                    open.source.into(),
+                    hide_noise,
+                    Some(open.focus),
+                )
             }
             Err(error) => {
                 eprintln!("[review] open_review from tab {tab_id}: {error}");
@@ -15323,7 +15331,7 @@ impl App {
     fn start_review(
         &mut self,
         target: review_pane::ReviewTarget,
-        source: overview::DiffSource,
+        source: review_pane::ReviewSource,
         hide_noise: bool,
         focus: Option<String>,
     ) -> Task<Event> {
@@ -15331,7 +15339,10 @@ impl App {
         let generation = self.review_generation;
         self.review_pane = Some(ReviewPaneState {
             target: target.clone(),
-            source,
+            source: source.clone(),
+            commits: Vec::new(),
+            commits_truncated: false,
+            commits_error: None,
             generation,
             token: uuid::Uuid::new_v4().simple().to_string(),
             nonce: uuid::Uuid::new_v4().simple().to_string(),
@@ -15341,9 +15352,10 @@ impl App {
             error: None,
         });
         let show = self.show_review_page();
-        let load = Task::perform(review_pane::load_review(target, source), move |result| {
-            Event::ReviewLoaded(generation, Box::new(result))
-        });
+        let load = Task::perform(
+            review_pane::load_review_source(target, source),
+            move |result| Event::ReviewLoaded(generation, Box::new(result)),
+        );
         Task::batch([show, load])
     }
 
@@ -15371,6 +15383,11 @@ impl App {
         }
         let loaded = match result {
             Ok(load) => {
+                if let Some(pane) = self.review_pane.as_mut() {
+                    pane.commits = load.commits.clone();
+                    pane.commits_truncated = load.commits_truncated;
+                    pane.commits_error = load.commits_error.clone();
+                }
                 if let Some(live) = &load.live_paths {
                     match self.review_marks() {
                         Ok(marks) => {
@@ -15453,7 +15470,10 @@ impl App {
         };
         let html = review_pane::render_page(&review_pane::ReviewPage {
             target: &pane.target,
-            source: pane.source,
+            source: pane.source.clone(),
+            commits: &pane.commits,
+            commits_truncated: pane.commits_truncated,
+            commits_error: pane.commits_error.as_deref(),
             state,
             dark: self.theme == AppTheme::Dark,
             hide_noise: pane.hide_noise,
@@ -15493,7 +15513,39 @@ impl App {
                 }
                 let target = pane.target.clone();
                 let focus = pane.focus.clone();
-                self.start_review(target, source, hide_noise, focus)
+                self.start_review(target, source.into(), hide_noise, focus)
+            }
+            ReviewIpc::ShowCommits { .. } => {
+                if pane.target.base.is_none() {
+                    eprintln!("[review] commits unavailable without a branch base");
+                    return Task::none();
+                }
+                self.start_review(
+                    pane.target.clone(),
+                    review_pane::ReviewSource::Commits(None),
+                    pane.hide_noise,
+                    pane.focus.clone(),
+                )
+            }
+            ReviewIpc::SelectCommits { first, last, .. } => {
+                let first_index = pane.commits.iter().position(|commit| commit.sha == first);
+                let last_index = pane.commits.iter().position(|commit| commit.sha == last);
+                let (Some(first_index), Some(last_index)) = (first_index, last_index) else {
+                    eprintln!("[review] selected commit is not in the loaded branch commit list");
+                    return Task::none();
+                };
+                let older = first_index.max(last_index);
+                let newer = first_index.min(last_index);
+                let range = review_pane::CommitRange {
+                    first: pane.commits[older].sha.clone(),
+                    last: pane.commits[newer].sha.clone(),
+                };
+                self.start_review(
+                    pane.target.clone(),
+                    review_pane::ReviewSource::Commits(Some(range)),
+                    pane.hide_noise,
+                    pane.focus.clone(),
+                )
             }
             ReviewIpc::SetViewed { path, viewed, .. } => {
                 let Some((file, canonical)) = pane.loaded.as_ref().and_then(|(diff, canonical)| {

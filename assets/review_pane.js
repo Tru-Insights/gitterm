@@ -25,7 +25,27 @@
   document.querySelectorAll('button[data-source]').forEach((button) => {
     button.addEventListener('click', () => {
       if (button.disabled || button.classList.contains('on')) return;
+      if (button.dataset.source === 'commits') {
+        post({ type: 'review.commits' });
+        return;
+      }
       post({ type: 'review.source', source: button.dataset.source, hide_noise: !!(hide && hide.checked) });
+    });
+  });
+  let firstCommit = body.dataset.firstCommit || null;
+  document.querySelectorAll('button[data-commit]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      const sha = button.dataset.commit;
+      if (event.shiftKey && firstCommit) {
+        post({ type: 'review.commit_range', first: firstCommit, last: sha });
+        firstCommit = null;
+      } else if (!firstCommit) {
+        firstCommit = sha;
+        post({ type: 'review.commit_range', first: sha, last: sha });
+      } else {
+        post({ type: 'review.commit_range', first: firstCommit, last: sha });
+        firstCommit = null;
+      }
     });
   });
   const close = document.getElementById('close');

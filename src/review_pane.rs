@@ -3,8 +3,9 @@
 //!
 //! A Workspace overview branch row opens it. The diff comes from the same
 //! git calls the overview's branch diff used (`git diff HEAD` for
-//! Uncommitted, `git diff <base>...HEAD` for vs base, `ls-files --others`
-//! for untracked files, `merge-base` for the base commit), read as a file
+//! Uncommitted, `git diff <base>...HEAD` for vs base, and parent-to-commit
+//! diffs for Commits; `ls-files --others` for untracked files,
+//! `merge-base` for the base commit), read as a file
 //! list first (`--raw --numstat -z`) and then as a patch for the files that
 //! fit the caps. Everything here is free of iced and wry: main.rs runs
 //! [`load_review`] off the UI thread, renders [`render_page`] into the
@@ -52,6 +53,8 @@ pub const FILE_LIST_CAP: usize = 2_000;
 /// Untracked names read; past this the list is incomplete and viewed marks
 /// are not pruned.
 pub const UNTRACKED_SCAN_CAP: usize = 10_000;
+/// Branch commits shown in the Commits source. One extra row detects truncation.
+pub const COMMIT_LIST_CAP: usize = 200;
 /// Bytes sniffed for a NUL to call a file binary (git's heuristic).
 const BINARY_SNIFF_BYTES: usize = 8_000;
 /// Paths per `git hash-object` call.
@@ -180,7 +183,7 @@ pub struct ReviewFile {
     pub note: Option<String>,
     pub hunks: Vec<ReviewHunk>,
     /// The version shown, for viewed marks: `git hash-object` of the
-    /// working-tree file (Uncommitted) or its blob id (vs base);
+    /// working-tree file (Uncommitted) or its blob id (committed sources);
     /// `deleted:<old blob>` for a deletion, `commit:<id>` for a submodule.
     /// `None` when it could not be hashed: the file cannot be marked viewed.
     pub content_id: Option<String>,
@@ -244,6 +247,38 @@ pub struct ReviewTarget {
     pub base: Option<BaseChoice>,
 }
 
+/// One commit on the reviewed branch, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCommit {
+    pub sha: String,
+    pub subject: String,
+    pub author: String,
+    pub authored_at: i64,
+}
+
+/// A selected commit range. `first` and `last` are normalized oldest to newest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRange {
+    pub first: String,
+    pub last: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewSource {
+    Uncommitted,
+    VsBase,
+    Commits(Option<CommitRange>),
+}
+
+impl From<DiffSource> for ReviewSource {
+    fn from(source: DiffSource) -> Self {
+        match source {
+            DiffSource::Uncommitted => Self::Uncommitted,
+            DiffSource::VsBase => Self::VsBase,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewDiff {
     pub checkout: PathBuf,
@@ -269,9 +304,12 @@ impl ReviewDiff {
 #[derive(Debug, Clone)]
 pub struct ReviewLoad {
     pub diff: ReviewDiff,
+    pub commits: Vec<ReviewCommit>,
+    pub commits_truncated: bool,
+    pub commits_error: Option<String>,
     /// The marks' key for this checkout.
     pub canonical_checkout: PathBuf,
-    /// Every path in any diff of the checkout (both sources), or `None` when
+    /// Every path in a review source of the checkout, or `None` when
     /// a listing was incomplete or failed: marks are then not pruned.
     pub live_paths: Option<BTreeSet<String>>,
 }
@@ -1020,6 +1058,148 @@ async fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Lists only commits reachable from HEAD and not from the selected base.
+/// The extra row tells the caller whether the UI cap cut the list.
+pub async fn branch_commits(dir: &Path, base: &str) -> Result<(Vec<ReviewCommit>, bool), String> {
+    let range = format!("{base}..HEAD");
+    let mut commits = Vec::new();
+    run_git_records(
+        dir,
+        &[
+            "--no-optional-locks",
+            "log",
+            &format!("--max-count={}", COMMIT_LIST_CAP + 1),
+            "--format=%H%x00%h%x00%s%x00%an%x00%at",
+            &range,
+            "--",
+        ],
+        GIT_TIMEOUT,
+        b'\n',
+        |record| {
+            let fields: Vec<&[u8]> = record.split(|byte| *byte == 0).collect();
+            if fields.len() != 5 {
+                return Err(format!(
+                    "git log returned a malformed commit record in {}",
+                    dir.display()
+                ));
+            }
+            let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+            let sha = text(fields[0]);
+            let short_sha = text(fields[1]);
+            if sha.is_empty() || short_sha.is_empty() {
+                return Err(format!(
+                    "git log returned an empty commit id in {}",
+                    dir.display()
+                ));
+            }
+            let authored_at = text(fields[4]).parse::<i64>().map_err(|error| {
+                format!(
+                    "git log returned an invalid author timestamp in {}: {error}",
+                    dir.display()
+                )
+            })?;
+            commits.push(ReviewCommit {
+                sha: short_sha,
+                subject: text(fields[2]),
+                author: text(fields[3]),
+                authored_at,
+            });
+            Ok(true)
+        },
+    )
+    .await?;
+    let truncated = commits.len() > COMMIT_LIST_CAP;
+    commits.truncate(COMMIT_LIST_CAP);
+    Ok((commits, truncated))
+}
+
+/// The two endpoints used for a commit diff: parent of the oldest selected
+/// commit (or the empty tree for a root commit), through the newest selected.
+pub async fn commit_diff_endpoints(
+    dir: &Path,
+    range: &CommitRange,
+) -> Result<(String, String), String> {
+    let ancestry = git_text(
+        dir,
+        &[
+            "--no-optional-locks",
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            &range.first,
+        ],
+        GIT_TIMEOUT,
+    )
+    .await
+    .map_err(|error| format!("cannot read selected commit {}: {error}", range.first))?;
+    let ancestry: Vec<&str> = ancestry.split_whitespace().collect();
+    if ancestry.is_empty() {
+        return Err(format!("git returned no ancestry for {}", range.first));
+    }
+    let from = match ancestry.get(1) {
+        Some(parent) => (*parent).to_string(),
+        None => empty_tree_id(dir).await?,
+    };
+    let newest = git_text(
+        dir,
+        &["--no-optional-locks", "rev-parse", "--verify", &range.last],
+        GIT_TIMEOUT,
+    )
+    .await
+    .map_err(|error| format!("cannot resolve selected commit {}: {error}", range.last))?;
+    Ok((from, newest.trim().to_string()))
+}
+
+async fn empty_tree_id(dir: &Path) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+    let mut child = Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "hash-object",
+            "-t",
+            "tree",
+            "--stdin",
+        ])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("cannot start git hash-object in {}: {error}", dir.display()))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("git hash-object stdin unavailable in {}", dir.display()))?
+        .write_all(b"")
+        .await
+        .map_err(|error| {
+            format!(
+                "cannot send empty tree to git in {}: {error}",
+                dir.display()
+            )
+        })?;
+    let output = tokio::time::timeout(GIT_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| format!("git hash-object timed out in {}", dir.display()))?
+        .map_err(|error| {
+            format!(
+                "cannot read git hash-object output in {}: {error}",
+                dir.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "git hash-object failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Untracked names, at most `cap`; the flag says the list is complete.
 async fn untracked_names(dir: &Path, cap: usize) -> Result<(Vec<String>, bool), String> {
     let mut names = Vec::new();
@@ -1110,46 +1290,87 @@ fn tracked_status(entry: &SummaryEntry) -> FileStatus {
 
 /// Loads the review of `target` for `source`. Never call on the UI thread.
 pub async fn load_review(target: ReviewTarget, source: DiffSource) -> Result<ReviewLoad, String> {
+    load_review_source(target, source.into()).await
+}
+
+/// Loads a diff selection and the branch commit list. Never call on the UI thread.
+pub async fn load_review_source(
+    target: ReviewTarget,
+    source: ReviewSource,
+) -> Result<ReviewLoad, String> {
     let checkout = target.checkout.clone();
     let canonical_checkout = tokio::fs::canonicalize(&checkout)
         .await
         .map_err(|error| format!("cannot resolve {}: {error}", checkout.display()))?;
-    let base = match source {
-        DiffSource::Uncommitted => None,
-        DiffSource::VsBase => Some(target.base.clone().ok_or_else(|| {
+    let base = match &source {
+        ReviewSource::Uncommitted | ReviewSource::Commits(_) => None,
+        ReviewSource::VsBase => Some(target.base.clone().ok_or_else(|| {
             format!(
                 "no base branch found for {}: no task base, tracked branch, or develop/main/master/trunk",
                 checkout.display()
             )
         })?),
     };
-    let range = match &base {
-        None => "HEAD".to_string(),
-        Some(base) => format!("{}...HEAD", base.reference),
+    let (commits, commits_truncated, commits_error) = match &target.base {
+        Some(base) => match branch_commits(&checkout, &base.reference).await {
+            Ok((commits, truncated)) => (commits, truncated, None),
+            Err(error) if matches!(&source, ReviewSource::Commits(_)) => return Err(error),
+            Err(error) => (Vec::new(), false, Some(error)),
+        },
+        None if matches!(&source, ReviewSource::Commits(_)) => {
+            return Err(format!("no base branch found for {}", checkout.display()));
+        }
+        None => (Vec::new(), false, None),
+    };
+    let selection_range = match &source {
+        ReviewSource::Commits(Some(range)) => {
+            let first = commits.iter().position(|commit| commit.sha == range.first);
+            let last = commits.iter().position(|commit| commit.sha == range.last);
+            match (first, last) {
+                (Some(first), Some(last)) if first >= last => Some(range.clone()),
+                _ => {
+                    return Err(
+                        "selected commits are not an ordered range on this branch".to_string()
+                    )
+                }
+            }
+        }
+        _ => None,
+    };
+    let diff_args = match (&source, selection_range.as_ref()) {
+        (ReviewSource::Uncommitted, _) => vec!["HEAD".to_string()],
+        (ReviewSource::VsBase, _) => vec![format!("{}...HEAD", base.as_ref().unwrap().reference)],
+        (ReviewSource::Commits(None), _) => vec!["HEAD".to_string(), "HEAD".to_string()],
+        (ReviewSource::Commits(Some(_)), Some(range)) => {
+            let (from, to) = commit_diff_endpoints(&checkout, range).await?;
+            vec![from, to]
+        }
+        _ => unreachable!("commit selection was validated"),
+    };
+    let diff_source = match &source {
+        ReviewSource::VsBase => DiffSource::VsBase,
+        ReviewSource::Uncommitted | ReviewSource::Commits(_) => DiffSource::Uncommitted,
     };
 
     // The file list.
-    let summary = git_bytes(
-        &checkout,
-        &[
-            "--no-optional-locks",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "-M",
-            "--raw",
-            "--numstat",
-            "--no-abbrev",
-            "-z",
-            &range,
-            "--",
-        ],
-    )
-    .await?;
+    let mut summary_args = vec![
+        "--no-optional-locks",
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "-M",
+        "--raw",
+        "--numstat",
+        "--no-abbrev",
+        "-z",
+    ];
+    summary_args.extend(diff_args.iter().map(String::as_str));
+    summary_args.push("--");
+    let summary = git_bytes(&checkout, &summary_args).await?;
     let summary = parse_raw_numstat(&summary)?;
-    let (untracked, untracked_complete) = match source {
-        DiffSource::Uncommitted => untracked_names(&checkout, UNTRACKED_SCAN_CAP).await?,
-        DiffSource::VsBase => (Vec::new(), true),
+    let (untracked, untracked_complete) = match &source {
+        ReviewSource::Uncommitted => untracked_names(&checkout, UNTRACKED_SCAN_CAP).await?,
+        ReviewSource::VsBase | ReviewSource::Commits(_) => (Vec::new(), true),
     };
     let mut all_paths: BTreeSet<String> = summary.iter().map(|e| e.path.clone()).collect();
     all_paths.extend(untracked.iter().cloned());
@@ -1220,9 +1441,9 @@ pub async fn load_review(target: ReviewTarget, source: DiffSource) -> Result<Rev
             "--no-color",
             "--no-ext-diff",
             "-M",
-            &range,
-            "--",
         ];
+        args.extend(diff_args.iter().map(String::as_str));
+        args.push("--");
         args.extend(pathspecs.iter().map(String::as_str));
         run_git_records(&checkout, &args, GIT_TIMEOUT, b'\n', |record| {
             Ok(parser.feed(&String::from_utf8_lossy(record)))
@@ -1285,7 +1506,9 @@ pub async fn load_review(target: ReviewTarget, source: DiffSource) -> Result<Rev
                     Some(format!("commit:{}", entry.new_blob))
                 } else if status == FileStatus::Deleted {
                     Some(format!("deleted:{}", entry.old_blob))
-                } else if source == DiffSource::VsBase {
+                } else if diff_source == DiffSource::VsBase
+                    || matches!(&source, ReviewSource::Commits(Some(_)))
+                {
                     Some(entry.new_blob.clone())
                 } else {
                     to_hash.push(entry.path.clone());
@@ -1370,7 +1593,21 @@ pub async fn load_review(target: ReviewTarget, source: DiffSource) -> Result<Rev
     let live_paths = if !untracked_complete {
         None
     } else {
-        match other_source_paths(&checkout, source, target.base.as_ref()).await {
+        let other = if matches!(&source, ReviewSource::Commits(_)) {
+            let worktree =
+                other_source_paths(&checkout, DiffSource::VsBase, target.base.as_ref()).await;
+            let base =
+                other_source_paths(&checkout, DiffSource::Uncommitted, target.base.as_ref()).await;
+            worktree.and_then(|mut paths| {
+                base.map(|more| {
+                    paths.extend(more);
+                    paths
+                })
+            })
+        } else {
+            other_source_paths(&checkout, diff_source, target.base.as_ref()).await
+        };
+        match other {
             Ok(other) => {
                 all_paths.extend(other);
                 Some(all_paths)
@@ -1388,12 +1625,15 @@ pub async fn load_review(target: ReviewTarget, source: DiffSource) -> Result<Rev
             checkout,
             branch: target.branch,
             base: target.base,
-            source,
+            source: diff_source,
             merge_base,
             files,
             totals,
             unlisted,
         },
+        commits,
+        commits_truncated,
+        commits_error,
         canonical_checkout,
         live_paths,
     })
@@ -1571,6 +1811,14 @@ pub enum ReviewIpc {
         source: DiffSource,
         hide_noise: bool,
     },
+    ShowCommits {
+        token: String,
+    },
+    SelectCommits {
+        token: String,
+        first: String,
+        last: String,
+    },
     /// A file's Viewed checkbox.
     SetViewed {
         token: String,
@@ -1591,6 +1839,8 @@ impl ReviewIpc {
     pub fn token(&self) -> &str {
         match self {
             ReviewIpc::SetSource { token, .. }
+            | ReviewIpc::ShowCommits { token }
+            | ReviewIpc::SelectCommits { token, .. }
             | ReviewIpc::SetViewed { token, .. }
             | ReviewIpc::Close { token }
             | ReviewIpc::OpenFile { token, .. } => token,
@@ -1606,6 +1856,14 @@ enum WireIpc {
         token: String,
         source: String,
         hide_noise: bool,
+    },
+    #[serde(rename = "review.commits")]
+    Commits { token: String },
+    #[serde(rename = "review.commit_range")]
+    CommitRange {
+        token: String,
+        first: String,
+        last: String,
     },
     #[serde(rename = "review.viewed")]
     Viewed {
@@ -1659,6 +1917,16 @@ pub fn parse_ipc(body: &str) -> Result<ReviewIpc, String> {
             path: page_path(path)?,
             viewed,
         },
+        WireIpc::Commits { token } => ReviewIpc::ShowCommits { token },
+        WireIpc::CommitRange { token, first, last } => {
+            let valid = |sha: &str| {
+                !sha.is_empty() && sha.len() <= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+            };
+            if !valid(&first) || !valid(&last) {
+                return Err("review page sent an invalid commit id".to_string());
+            }
+            ReviewIpc::SelectCommits { token, first, last }
+        }
         WireIpc::Close { token } => ReviewIpc::Close { token },
         WireIpc::OpenFile { token, path } => ReviewIpc::OpenFile {
             token,
@@ -1816,10 +2084,13 @@ pub enum PageState<'a> {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReviewPage<'a> {
     pub target: &'a ReviewTarget,
-    pub source: DiffSource,
+    pub source: ReviewSource,
+    pub commits: &'a [ReviewCommit],
+    pub commits_truncated: bool,
+    pub commits_error: Option<&'a str>,
     pub state: PageState<'a>,
     pub dark: bool,
     pub hide_noise: bool,
@@ -1870,21 +2141,32 @@ pub fn render_page(page: &ReviewPage) -> String {
         _ => String::new(),
     };
     html.push_str(&format!(
-        "<body class=\"{}\" data-token=\"{}\"{focus}>\n",
+        "<body class=\"{}\" data-token=\"{}\" data-source=\"{}\" {}{focus}>\n",
         if page.hide_noise { "hide-noise" } else { "" },
-        escape_html(page.token)
+        escape_html(page.token),
+        match &page.source {
+            ReviewSource::Uncommitted => "uncommitted",
+            ReviewSource::VsBase => "vs_base",
+            ReviewSource::Commits(_) => "commits",
+        },
+        match &page.source {
+            ReviewSource::Commits(Some(range)) =>
+                format!("data-first-commit=\"{}\"", escape_html(&range.first)),
+            _ => String::new(),
+        }
     ));
     render_toolbar(&mut html, page);
     html.push_str("<div id=\"body\">\n");
+    render_commits(&mut html, page);
     match page.state {
         PageState::Loading => {
             html.push_str(
-                "<main id=\"files\"><p class=\"empty\">Loading changes\u{2026}</p></main>\n",
+                "<nav id=\"tree\"></nav><main id=\"files\"><p class=\"empty\">Loading changes\u{2026}</p></main>\n",
             );
         }
         PageState::Error(error) => {
             html.push_str(&format!(
-                "<main id=\"files\"><p class=\"empty error\">{}</p></main>\n",
+                "<nav id=\"tree\"></nav><main id=\"files\"><p class=\"empty error\">{}</p></main>\n",
                 escape_html(error)
             ));
         }
@@ -1912,7 +2194,7 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
         escape_html(&target.branch),
         escape_html(&target.repo)
     ));
-    let on = |source: DiffSource| if page.source == source { " on" } else { "" };
+    let on = |source: ReviewSource| if page.source == source { " on" } else { "" };
     let vs_label = match &target.base {
         Some(base) => format!("vs {}", base.reference),
         None => "vs base".to_string(),
@@ -1920,9 +2202,9 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
     html.push_str(&format!(
         "<div class=\"seg\" role=\"group\" aria-label=\"Diff source\">\
          <button type=\"button\" data-source=\"uncommitted\" class=\"src{}\">Uncommitted</button>\
-         <button type=\"button\" data-source=\"vs_base\" class=\"src{}\"{}>{}</button></div>",
-        on(DiffSource::Uncommitted),
-        on(DiffSource::VsBase),
+         <button type=\"button\" data-source=\"vs_base\" class=\"src{}\"{}>{}</button>",
+        on(ReviewSource::Uncommitted),
+        on(ReviewSource::VsBase),
         if target.base.is_none() {
             " disabled"
         } else {
@@ -1930,6 +2212,17 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
         },
         escape_html(&vs_label)
     ));
+    let commits_on = matches!(&page.source, ReviewSource::Commits(_));
+    html.push_str(&format!(
+        "<button type=\"button\" data-source=\"commits\" class=\"src{}\"{}>Commits</button>",
+        if commits_on { " on" } else { "" },
+        if target.base.is_none() {
+            " disabled"
+        } else {
+            ""
+        }
+    ));
+    html.push_str("</div>");
     html.push_str(&format!(
         "<label class=\"toggle\"><input type=\"checkbox\" id=\"hide-noise\"{}> Hide tests &amp; generated</label>",
         if page.hide_noise { " checked" } else { "" }
@@ -1950,8 +2243,10 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
                 escape_html(&base.describe())
             );
             if let PageState::Ready { diff, .. } = page.state {
-                if let (DiffSource::VsBase, Some(merge_base)) = (diff.source, &diff.merge_base) {
-                    copy.push_str(&format!(" @ {} (merge-base)", escape_html(merge_base)));
+                if matches!(&page.source, ReviewSource::VsBase) {
+                    if let Some(merge_base) = &diff.merge_base {
+                        copy.push_str(&format!(" @ {} (merge-base)", escape_html(merge_base)));
+                    }
                 }
             }
             facts.push(copy);
@@ -1966,9 +2261,10 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
     ));
     if let (Some(path), PageState::Ready { diff, .. }) = (page.focus, page.state) {
         if diff.file(path).is_none() {
-            let view = match page.source {
-                DiffSource::Uncommitted => "uncommitted changes",
-                DiffSource::VsBase => "changes against the base",
+            let view = match &page.source {
+                ReviewSource::Uncommitted => "uncommitted changes",
+                ReviewSource::VsBase => "changes against the base",
+                ReviewSource::Commits(_) => "selected commits",
             };
             html.push_str(&format!(
                 "<div class=\"focus-note\">{} is not in the {view}{}.</div>\n",
@@ -2011,6 +2307,51 @@ fn render_toolbar(html: &mut String, page: &ReviewPage) {
         html.push_str("</div>\n");
     }
     html.push_str("</header>\n");
+}
+
+fn render_commits(html: &mut String, page: &ReviewPage) {
+    html.push_str("<aside id=\"commits\"><div class=\"commit-heading\">Select one commit, then another for a range</div>");
+    if page.commits_truncated {
+        html.push_str(&format!("<div class=\"commit-cap\">Showing the newest {COMMIT_LIST_CAP} commits; older commits are omitted.</div>"));
+    }
+    if let Some(error) = page.commits_error {
+        html.push_str(&format!(
+            "<div class=\"commit-cap\">Cannot load commits: {}</div>",
+            escape_html(error)
+        ));
+    }
+    for commit in page.commits {
+        html.push_str(&format!(
+            "<button type=\"button\" class=\"commit{}\" data-commit=\"{}\" title=\"{} — {}\"><code>{}</code><span>{}</span><small>{} · {}</small></button>",
+            if let ReviewSource::Commits(Some(range)) = &page.source {
+                if commit.sha == range.first || commit.sha == range.last { " selected" } else { "" }
+            } else { "" },
+            escape_html(&commit.sha), escape_html(&commit.subject), escape_html(&commit.author),
+            escape_html(&commit.sha), escape_html(&commit.subject), escape_html(&commit.author),
+            escape_html(&commit_age(commit.authored_at))
+        ));
+    }
+    html.push_str("</aside>\n");
+}
+
+fn commit_age(authored_at: i64) -> String {
+    let seconds = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(authored_at)
+        .max(0);
+    if seconds < 60 {
+        return "now".to_string();
+    }
+    if seconds < 3_600 {
+        return format!("{}m ago", seconds / 60);
+    }
+    if seconds < 86_400 {
+        return format!("{}h ago", seconds / 3_600);
+    }
+    if seconds < 2_592_000 {
+        return format!("{}d ago", seconds / 86_400);
+    }
+    format!("{}mo ago", seconds / 2_592_000)
 }
 
 /// A folder of the file tree.
@@ -2117,10 +2458,12 @@ fn render_tree_dir(html: &mut String, dir: &TreeDir, diff: &ReviewDiff, viewed: 
 fn render_files(html: &mut String, page: &ReviewPage, diff: &ReviewDiff, viewed: &[ViewedState]) {
     html.push_str("<main id=\"files\">\n");
     if diff.files.is_empty() {
-        let empty = match (page.source, &page.target.base) {
-            (DiffSource::Uncommitted, _) => "No uncommitted changes".to_string(),
-            (DiffSource::VsBase, Some(base)) => format!("No changes against {}", base.reference),
-            (DiffSource::VsBase, None) => "No base branch".to_string(),
+        let empty = match (&page.source, &page.target.base) {
+            (ReviewSource::Uncommitted, _) => "No uncommitted changes".to_string(),
+            (ReviewSource::VsBase, Some(base)) => format!("No changes against {}", base.reference),
+            (ReviewSource::VsBase, None) => "No base branch".to_string(),
+            (ReviewSource::Commits(None), _) => "Choose a commit to review".to_string(),
+            (ReviewSource::Commits(Some(_)), _) => "No changes in the selected commits".to_string(),
         };
         html.push_str(&format!("<p class=\"empty\">{}</p>\n", escape_html(&empty)));
     }
@@ -2130,12 +2473,19 @@ fn render_files(html: &mut String, page: &ReviewPage, diff: &ReviewDiff, viewed:
             index,
             file,
             viewed.get(index).copied().unwrap_or(ViewedState::Unviewed),
+            !matches!(&page.source, ReviewSource::Commits(_)),
         );
     }
     html.push_str("</main>\n");
 }
 
-fn render_file(html: &mut String, index: usize, file: &ReviewFile, viewed: ViewedState) {
+fn render_file(
+    html: &mut String,
+    index: usize,
+    file: &ReviewFile,
+    viewed: ViewedState,
+    can_open_worktree_file: bool,
+) {
     let mut classes = format!("file k-{} s-{}", file.kind.label(), file.status.label());
     if file.kind.is_noise() {
         classes.push_str(" noise");
@@ -2177,7 +2527,7 @@ fn render_file(html: &mut String, index: usize, file: &ReviewFile, viewed: Viewe
     }
     html.push_str("<span class=\"badge changed\">Changed since viewed</span>");
     html.push_str("<span class=\"spacer\"></span>");
-    if file.status != FileStatus::Deleted {
+    if can_open_worktree_file && file.status != FileStatus::Deleted {
         html.push_str("<button type=\"button\" class=\"open\">Open</button>");
     }
     let can_mark = file.content_id.is_some();
@@ -2685,6 +3035,20 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_ipc(r#"{"type":"review.commits","token":"t1"}"#),
+            Ok(ReviewIpc::ShowCommits { token: "t1".into() })
+        );
+        assert_eq!(
+            parse_ipc(
+                r#"{"type":"review.commit_range","token":"t1","first":"abcdef1","last":"abcdef2"}"#
+            ),
+            Ok(ReviewIpc::SelectCommits {
+                token: "t1".into(),
+                first: "abcdef1".into(),
+                last: "abcdef2".into()
+            })
+        );
+        assert_eq!(
             parse_ipc(r#"{"type":"review.viewed","token":"t1","path":"src/a.rs","viewed":true}"#),
             Ok(ReviewIpc::SetViewed {
                 token: "t1".into(),
@@ -2770,7 +3134,10 @@ mod tests {
         let viewed = [ViewedState::Unviewed];
         let html = render_page(&ReviewPage {
             target: &target,
-            source: DiffSource::Uncommitted,
+            source: ReviewSource::Uncommitted,
+            commits: &[],
+            commits_truncated: false,
+            commits_error: None,
             state: PageState::Ready {
                 diff: &diff,
                 viewed: &viewed,
@@ -2814,7 +3181,10 @@ mod tests {
         ];
         let html = render_page(&ReviewPage {
             target: &target,
-            source: DiffSource::Uncommitted,
+            source: ReviewSource::Uncommitted,
+            commits: &[],
+            commits_truncated: false,
+            commits_error: None,
             state: PageState::Ready {
                 diff: &diff,
                 viewed: &viewed,
@@ -2840,7 +3210,10 @@ mod tests {
         for state in [PageState::Loading, PageState::Error("git <failed>")] {
             let html = render_page(&ReviewPage {
                 target: &target,
-                source: DiffSource::VsBase,
+                source: ReviewSource::VsBase,
+                commits: &[],
+                commits_truncated: false,
+                commits_error: None,
                 state,
                 dark: true,
                 hide_noise: true,
@@ -2851,6 +3224,48 @@ mod tests {
             assert!(html.contains("id=\"close\""));
             assert!(!html.contains("git <failed>"));
         }
+    }
+
+    #[test]
+    fn commits_page_keeps_fixed_review_slots_and_shows_the_commit_cap() {
+        let (mut target, diff) = hostile_diff();
+        target.base = Some(BaseChoice {
+            reference: "main".into(),
+            source: crate::workspace_overview::BaseSource::Local,
+            considered: 1,
+        });
+        let commits = [ReviewCommit {
+            sha: "abcdef1".into(),
+            subject: "Example commit".into(),
+            author: "Tracey".into(),
+            authored_at: chrono::Utc::now().timestamp() - 3_600,
+        }];
+        let viewed = vec![ViewedState::Unviewed; diff.files.len()];
+        let html = render_page(&ReviewPage {
+            target: &target,
+            source: ReviewSource::Commits(Some(CommitRange {
+                first: "abcdef1".into(),
+                last: "abcdef1".into(),
+            })),
+            commits: &commits,
+            commits_truncated: true,
+            commits_error: None,
+            state: PageState::Ready {
+                diff: &diff,
+                viewed: &viewed,
+            },
+            dark: true,
+            hide_noise: false,
+            token: "t",
+            nonce: "n",
+            focus: None,
+        });
+        assert!(html.contains("data-source=\"commits\" data-first-commit=\"abcdef1\""));
+        assert!(html.contains("Showing the newest 200 commits; older commits are omitted."));
+        assert!(html.contains("<aside id=\"commits\">"));
+        assert!(html.contains("id=\"tree\""));
+        assert!(html.contains("Example commit"));
+        assert!(!html.contains("class=\"open\""));
     }
 
     // -----------------------------------------------------------------------
@@ -2897,6 +3312,167 @@ mod tests {
                 considered: 1,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn branch_commit_list_is_newest_first_and_bounded_to_base() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q", "-b", "main"]);
+        git(
+            temp.path(),
+            &[
+                "-c",
+                "user.name=Tracey",
+                "-c",
+                "user.email=tracey@example.com",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "base",
+            ],
+        );
+        git(temp.path(), &["checkout", "-q", "-b", "feature"]);
+        for subject in ["first", "second", "third"] {
+            git(
+                temp.path(),
+                &[
+                    "-c",
+                    "user.name=Tracey",
+                    "-c",
+                    "user.email=tracey@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    subject,
+                ],
+            );
+        }
+        let (commits, truncated) = branch_commits(temp.path(), "main").await.unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            commits
+                .iter()
+                .map(|commit| commit.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["third", "second", "first"]
+        );
+        assert!(commits.iter().all(|commit| !commit.author.is_empty()));
+
+        for index in 0..COMMIT_LIST_CAP {
+            git(
+                temp.path(),
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    &format!("extra-{index}"),
+                ],
+            );
+        }
+        let (commits, truncated) = branch_commits(temp.path(), "main").await.unwrap();
+        assert!(truncated);
+        assert_eq!(commits.len(), COMMIT_LIST_CAP);
+        assert_eq!(commits[0].subject, format!("extra-{}", COMMIT_LIST_CAP - 1));
+    }
+
+    #[tokio::test]
+    async fn commit_diff_endpoints_cover_one_commit_ranges_and_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(temp.path().join("one.txt"), "one\n").unwrap();
+        git(temp.path(), &["add", "one.txt"]);
+        git(
+            temp.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "root",
+            ],
+        );
+        let root = git_out(temp.path(), &["rev-parse", "HEAD"]);
+        let one = commit_diff_endpoints(
+            temp.path(),
+            &CommitRange {
+                first: root.clone(),
+                last: root.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            one.0,
+            git_out(temp.path(), &["hash-object", "-t", "tree", "--stdin"])
+        );
+        assert_eq!(one.1, root);
+        std::fs::write(temp.path().join("two.txt"), "two\n").unwrap();
+        git(temp.path(), &["add", "two.txt"]);
+        git(
+            temp.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "second",
+            ],
+        );
+        let second = git_out(temp.path(), &["rev-parse", "HEAD"]);
+        let single = commit_diff_endpoints(
+            temp.path(),
+            &CommitRange {
+                first: second.clone(),
+                last: second.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(single, (root.clone(), second.clone()));
+        let range = commit_diff_endpoints(
+            temp.path(),
+            &CommitRange {
+                first: root.clone(),
+                last: second.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            range.0,
+            git_out(temp.path(), &["hash-object", "-t", "tree", "--stdin"])
+        );
+        assert_eq!(range.1, second);
+        let changed = git_out(temp.path(), &["diff", "--name-only", &range.0, &range.1]);
+        assert_eq!(changed.lines().collect::<Vec<_>>(), ["one.txt", "two.txt"]);
+        let marker = temp.path().join("shell-ran");
+        let injected = format!("$(touch {})", marker.display());
+        assert!(commit_diff_endpoints(
+            temp.path(),
+            &CommitRange {
+                first: injected,
+                last: second,
+            }
+        )
+        .await
+        .is_err());
+        assert!(
+            !marker.exists(),
+            "git arguments must never be interpreted by a shell"
+        );
     }
 
     #[tokio::test]
@@ -3099,7 +3675,10 @@ mod tests {
         let page = |focus| {
             render_page(&ReviewPage {
                 target: &target,
-                source: DiffSource::Uncommitted,
+                source: ReviewSource::Uncommitted,
+                commits: &[],
+                commits_truncated: false,
+                commits_error: None,
                 state: PageState::Ready {
                     diff: &diff,
                     viewed: &viewed,
