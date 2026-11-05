@@ -4707,9 +4707,12 @@ fn update_queued_task_request(
     user_model_choice: bool,
 ) -> Option<usize> {
     let position = queue.iter().position(|entry| entry.task_id == task_id)?;
-    queue[position].origin = origin;
-    queue[position].user_model_choice = user_model_choice;
-    Some(position + 1)
+    let entry = &mut queue[position];
+    if matches!(origin, TaskLaunchOrigin::User) {
+        entry.origin = TaskLaunchOrigin::User;
+    }
+    entry.user_model_choice |= user_model_choice;
+    Some(position)
 }
 
 /// Outcome of asking for a task child session: it started, or the local
@@ -45118,7 +45121,33 @@ mod tests {
     }
 
     #[test]
-    fn re_requesting_a_queued_task_keeps_its_place_and_updates_origin() {
+    fn automatic_re_request_preserves_queued_user_overrides() {
+        let mut queue = vec![
+            QueuedTaskLaunch {
+                task_id: "first".into(),
+                preset_idx: Some(0),
+                origin: TaskLaunchOrigin::Agent,
+                user_model_choice: false,
+            },
+            QueuedTaskLaunch {
+                task_id: "second".into(),
+                preset_idx: Some(1),
+                origin: TaskLaunchOrigin::Agent,
+                user_model_choice: false,
+            },
+        ];
+
+        queue[1].origin = TaskLaunchOrigin::User;
+        queue[1].user_model_choice = true;
+
+        update_queued_task_request(&mut queue, "second", TaskLaunchOrigin::Agent, false);
+        assert!(matches!(queue[1].origin, TaskLaunchOrigin::User));
+        assert!(queue[1].user_model_choice);
+        assert_eq!(queue[1].preset_idx, Some(1));
+    }
+
+    #[test]
+    fn re_requesting_a_queued_task_returns_its_zero_based_index() {
         let mut queue = vec![
             QueuedTaskLaunch {
                 task_id: "first".into(),
@@ -45135,12 +45164,9 @@ mod tests {
         ];
 
         assert_eq!(
-            update_queued_task_request(&mut queue, "second", TaskLaunchOrigin::User, true),
-            Some(2)
+            update_queued_task_request(&mut queue, "second", TaskLaunchOrigin::Agent, false),
+            Some(1)
         );
-        assert!(matches!(queue[1].origin, TaskLaunchOrigin::User));
-        assert!(queue[1].user_model_choice);
-        assert_eq!(queue[1].preset_idx, Some(1));
     }
 
     #[test]
