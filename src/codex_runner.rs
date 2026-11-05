@@ -450,7 +450,7 @@ async fn run_inner(
         let mut approval_rejected = false;
         for_each_line(stderr, |line| {
             log.append(&serde_json::json!({"type": "gitterm.stderr", "line": line}).to_string())?;
-            approval_rejected |= is_approval_rejection(line);
+            approval_rejected |= is_approval_rejection_message(line);
             tail.push(line);
             Ok(())
         })
@@ -633,9 +633,46 @@ async fn stop_at_time_limit(child: &mut tokio::process::Child, child_id: Option<
 }
 
 fn is_approval_rejection(line: &str) -> bool {
-    line.contains("command execution approval is not supported in exec mode")
-        || line.contains("interactive approval is unavailable in exec mode")
-        || (line.contains("Rejected(") && line.contains("approval request failed"))
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("gitterm.stderr") => event
+            .get("line")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_approval_rejection_message),
+        Some("item.completed") => {
+            let Some(item) = event.get("item") else {
+                return false;
+            };
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("mcp_tool_call") => item
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| {
+                        message.contains("interactive approval is unavailable in exec mode")
+                    }),
+                Some("command_execution")
+                    if item.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+                        && item.get("exit_code").is_none_or(serde_json::Value::is_null) =>
+                {
+                    item.get("aggregated_output")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_approval_rejection_message)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_approval_rejection_message(message: &str) -> bool {
+    message.contains("command execution approval is not supported in exec mode")
+        || message.contains("interactive approval is unavailable in exec mode")
+        || (message.contains("Rejected(") && message.contains("approval request failed"))
 }
 
 fn missing_pipe(name: &str) -> CodexRunError {
@@ -2033,6 +2070,74 @@ mod tests {
             let log = std::fs::read_to_string(log_path).expect("recorded log");
             assert!(log.contains("command execution approval is not supported in exec mode"));
             assert!(log.contains("Rejected(\\\"approval request failed\\\")"));
+        }
+
+        #[tokio::test]
+        async fn rejection_text_in_successful_output_and_agent_text_does_not_fail() {
+            let rejection = "command execution approval is not supported in exec mode; interactive approval is unavailable in exec mode";
+            let stream = [
+                serde_json::json!({"type":"thread.started", "thread_id":"thread-success"}).to_string(),
+                serde_json::json!({"type":"turn.started"}).to_string(),
+                serde_json::json!({
+                    "type":"item.completed",
+                    "item":{"id":"item_0", "type":"command_execution", "command":"git diff", "aggregated_output":rejection, "exit_code":0, "status":"completed"}
+                }).to_string(),
+                serde_json::json!({
+                    "type":"item.completed",
+                    "item":{"id":"item_1", "type":"agent_message", "text":rejection}
+                }).to_string(),
+                serde_json::json!({"type":"turn.completed"}).to_string(),
+            ]
+            .join("\n");
+            let fake = FakeCodex::new(&stream, 0);
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Explain the result.".to_string(),
+            });
+
+            let (result, events) = run_collect(&fake, run).await;
+
+            let outcome = result.expect("successful run must retain its result");
+            assert_eq!(outcome.result.handoff.expect("handoff").summary, rejection);
+            assert_eq!(events.last(), Some(&CodexRunEvent::Completed));
+        }
+
+        #[test]
+        fn mcp_approval_error_message_is_a_rejection() {
+            let event = serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "type":"mcp_tool_call",
+                    "error":{"message":"interactive approval is unavailable in exec mode"},
+                    "status":"failed"
+                }
+            });
+
+            assert!(is_approval_rejection(&event.to_string()));
+        }
+
+        #[test]
+        fn failed_command_without_exit_code_can_report_rejection() {
+            let event = serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "type":"command_execution",
+                    "aggregated_output":"Rejected(\"approval request failed\")",
+                    "exit_code":null,
+                    "status":"failed"
+                }
+            });
+
+            assert!(is_approval_rejection(&event.to_string()));
+        }
+
+        #[test]
+        fn recorded_stderr_event_carries_the_approval_rejection() {
+            let event = serde_json::json!({
+                "type":"gitterm.stderr",
+                "line":"ERROR codex_app_server: command execution approval is not supported in exec mode"
+            });
+
+            assert!(is_approval_rejection(&event.to_string()));
         }
 
         #[tokio::test]
