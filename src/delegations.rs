@@ -1441,8 +1441,9 @@ pub struct SendBatch {
 }
 
 impl SendBatch {
-    /// No durable in-flight marker: failure or a crash before acknowledgement
-    /// leaves the report retryable. A crash after sending can cause a duplicate.
+    /// Failed submissions remain retryable without a durable in-flight marker.
+    /// Accepted submissions retain their receipt in memory if saving fails;
+    /// a crash before that receipt is saved can still cause a duplicate.
     pub fn record_submission(
         &self,
         store: &mut TaskStore,
@@ -1457,18 +1458,20 @@ impl SendBatch {
 }
 
 /// Prefer the original chat tab; Resume as Chat can host the persisted
-/// conversation under a new tab identity. Callers supply chat tabs only.
+/// conversation under a new tab identity. Callers supply chat tabs with
+/// their workspace's remote-identity flag; results stay on this machine.
 pub fn parent_tab_id<'a>(
     parent: &DelegationParent,
-    tabs: impl Iterator<Item = (usize, &'a str, Option<&'a str>)> + Clone,
+    tabs: impl Iterator<Item = (usize, &'a str, Option<&'a str>, bool)> + Clone,
 ) -> Option<usize> {
+    let tabs = tabs.filter(|(_, _, _, remote)| !remote);
     tabs.clone()
-        .find(|(_, uid, _)| *uid == parent.session_uid)
+        .find(|(_, uid, _, _)| *uid == parent.session_uid)
         .or_else(|| {
             let chat = parent.chat_session_id.as_deref()?;
-            tabs.into_iter().find(|(_, _, id)| *id == Some(chat))
+            tabs.into_iter().find(|(_, _, id, _)| *id == Some(chat))
         })
-        .map(|(id, _, _)| id)
+        .map(|(id, _, _, _)| id)
 }
 
 /// One bounded prompt for all waiting results. Reserve a full-record pointer
@@ -2202,9 +2205,10 @@ mod tests {
             1,
             result.parent.session_uid.as_str(),
             Some("conversation-1"),
+            false,
         );
-        let resumed = (2, "fresh-tab-uid", Some("conversation-1"));
-        let unrelated = (3, "other-tab", Some("conversation-2"));
+        let resumed = (2, "fresh-tab-uid", Some("conversation-1"), false);
+        let unrelated = (3, "other-tab", Some("conversation-2"), false);
         assert_eq!(
             parent_tab_id(&result.parent, [resumed, original].into_iter()),
             Some(1)
@@ -2224,6 +2228,91 @@ mod tests {
         );
         result.parent.chat_session_id = None;
         assert_eq!(parent_tab_id(&result.parent, tabs.into_iter()), None);
+    }
+
+    #[test]
+    fn parent_routing_excludes_other_machines_even_with_matching_identity() {
+        let mut result = completed_review(1);
+        result.parent.chat_session_id = Some("conversation-1".into());
+        let remote = (20, "remote-tab", Some("conversation-1"), true);
+        let local = (30, "local-resume", Some("conversation-1"), false);
+        assert_eq!(parent_tab_id(&result.parent, [remote].into_iter()), None);
+        assert_eq!(
+            parent_tab_id(&result.parent, [remote, local].into_iter()),
+            Some(30)
+        );
+        // A copied tab uid must not bypass the machine boundary either.
+        let copied = (
+            40,
+            result.parent.session_uid.as_str(),
+            Some("conversation-1"),
+            true,
+        );
+        assert_eq!(parent_tab_id(&result.parent, [copied].into_iter()), None);
+        assert_eq!(
+            parent_tab_id(&result.parent, [copied, local].into_iter()),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn accepted_submission_is_not_requeued_when_acknowledgement_write_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(crate::tasks::TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        let finished = completed_review(1);
+        let mut requested = finished.clone();
+        requested.status = DelegationStatus::Requested;
+        requested.result = None;
+        store.insert_delegation(requested).unwrap();
+        store
+            .complete_delegation("d-7", finished.result.unwrap(), "t2")
+            .unwrap();
+        let mut held = Vec::new();
+        queue_auto_sends(&[store.delegation("d-7").unwrap()], true, &mut held).unwrap();
+        let batch = next_held_send(&mut held, false).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        sender.send(batch.message.clone()).unwrap();
+
+        // Keep the durable result, but prevent atomic replacement on every OS.
+        let saved = temp.path().join("saved.json");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(batch.record_submission(&mut store, true, "t3").is_err());
+        for _ in 0..3 {
+            assert!(store.retry_delivery_acknowledgements().is_err());
+            queue_auto_sends(&[store.delegation("d-7").unwrap()], true, &mut held).unwrap();
+            assert!(
+                next_held_send(&mut held, false).is_none(),
+                "accepted prompt was queued again"
+            );
+            assert_eq!(
+                decide_send(
+                    false,
+                    store.delegation("d-7").unwrap().is_delivered(),
+                    &held,
+                    "d-7"
+                ),
+                SendDecision::AlreadyDelivered
+            );
+        }
+        assert_eq!(receiver.try_recv().unwrap(), batch.message);
+        assert!(receiver.try_recv().is_err());
+        // A restart still uses the durable marker; the crash window is retryable.
+        assert!(!TaskStore::load(&saved)
+            .unwrap()
+            .delegation("d-7")
+            .unwrap()
+            .is_delivered());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        store.retry_delivery_acknowledgements().unwrap();
+        let reloaded = TaskStore::load(&path).unwrap();
+        let result = reloaded.delegation("d-7").unwrap();
+        assert!(result.is_delivered());
+        assert_eq!(result.delivered_at.as_deref(), Some("t3"));
+        queue_auto_sends(&[result], true, &mut held).unwrap();
+        assert!(next_held_send(&mut held, false).is_none());
     }
 
     #[test]

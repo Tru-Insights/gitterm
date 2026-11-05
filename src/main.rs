@@ -16497,17 +16497,20 @@ impl App {
     fn delegation_chat_tab_id(&self, parent: &gitterm::tasks::DelegationParent) -> Option<usize> {
         gitterm::delegations::parent_tab_id(
             parent,
-            self.workspaces
-                .iter()
-                .flat_map(|ws| &ws.tabs)
-                .filter(|tab| tab.agent_session().is_some())
-                .map(|tab| {
-                    (
-                        tab.id,
-                        tab.session_uid.as_str(),
-                        tab.chat_session_id.as_deref(),
-                    )
-                }),
+            self.workspaces.iter().flat_map(|ws| {
+                let remote = self.workspace_has_remote_identity(ws);
+                ws.tabs
+                    .iter()
+                    .filter(|tab| tab.agent_session().is_some())
+                    .map(move |tab| {
+                        (
+                            tab.id,
+                            tab.session_uid.as_str(),
+                            tab.chat_session_id.as_deref(),
+                            remote,
+                        )
+                    })
+            }),
         )
     }
 
@@ -17803,6 +17806,11 @@ impl App {
     /// Collect every finished outcome at the same moment. Idle chats flush
     /// now; busy chats keep the existing held queue until their turn ends.
     fn auto_deliver_delegations(&mut self) -> Task<Event> {
+        if let Some(store) = self.task_store.as_mut() {
+            if let Err(error) = store.retry_delivery_acknowledgements() {
+                eprintln!("[delegation] retry delivery acknowledgements: {error}");
+            }
+        }
         let parents: Vec<_> = self
             .task_store
             .as_ref()
@@ -22907,7 +22915,7 @@ fi
                         );
                         agent_webview_note(
                             tab_id,
-                            &format!("Delivery was not recorded; results remain pending: {error}"),
+                            &format!("Could not save the delivery acknowledgement; GitTerm will retry saving it: {error}"),
                         );
                     }
                     for id in &batch.delegation_ids {

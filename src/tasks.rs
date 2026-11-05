@@ -1022,6 +1022,9 @@ impl std::error::Error for TaskStoreError {}
 pub struct TaskStore {
     path: PathBuf,
     document: TaskStoreDocument,
+    // An accepted prompt must not be resent just because its receipt could not
+    // be written. Any successful store commit also persists these receipts.
+    delivery_ack_pending: bool,
 }
 
 impl TaskStore {
@@ -1037,6 +1040,7 @@ impl TaskStore {
                 return Ok(Self {
                     path,
                     document: TaskStoreDocument::default(),
+                    delivery_ack_pending: false,
                 });
             }
             Err(error) => {
@@ -1047,7 +1051,11 @@ impl TaskStore {
             .map_err(|error| TaskStoreError::new("decode", &path, error.to_string()))?;
         validate_document(&document)
             .map_err(|detail| TaskStoreError::new("validate", &path, detail))?;
-        Ok(Self { path, document })
+        Ok(Self {
+            path,
+            document,
+            delivery_ack_pending: false,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -2074,7 +2082,8 @@ impl TaskStore {
             .collect()
     }
 
-    /// Marks a batch in one atomic store write, after submitting its prompt.
+    /// Marks an accepted batch in memory, then persists it atomically. A write
+    /// failure leaves the receipt in memory for retry without another prompt.
     pub fn mark_delegations_delivered(
         &mut self,
         delegation_ids: &[String],
@@ -2123,7 +2132,21 @@ impl TaskStore {
             }
             delegation.updated_at = timestamp.to_string();
         }
-        self.commit_candidate(candidate)
+        validate_document(&candidate)
+            .map_err(|detail| TaskStoreError::new("validate", &self.path, detail))?;
+        self.document = candidate;
+        self.delivery_ack_pending = true;
+        self.retry_delivery_acknowledgements()
+    }
+
+    pub fn retry_delivery_acknowledgements(&mut self) -> Result<(), TaskStoreError> {
+        if self.delivery_ack_pending {
+            self.write_document_with(&self.document, |temporary, destination| {
+                replace_file_atomically(temporary, destination)
+            })?;
+            self.delivery_ack_pending = false;
+        }
+        Ok(())
     }
 
     pub fn mark_delegation_delivered(
@@ -2248,6 +2271,7 @@ impl TaskStore {
             replace_file_atomically(temporary, destination)
         })?;
         self.document = candidate;
+        self.delivery_ack_pending = false;
         Ok(())
     }
 
@@ -3485,6 +3509,50 @@ mod tests {
             .worker_time_limit("legacy")
             .unwrap_err()
             .contains("invalid worker start timestamp"));
+    }
+
+    #[test]
+    fn a_new_worker_report_supersedes_an_unpersisted_delivery_acknowledgement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TASKS_FILE_NAME);
+        let mut store = TaskStore::load(&path).unwrap();
+        store.insert(sample_task("task-1")).unwrap();
+        store
+            .insert_delegation(worker_delegation("w1", "task-1"))
+            .unwrap();
+        store
+            .block_delegation("w1", worker_result("Stuck", &["Need access"]), "t2")
+            .unwrap();
+        let saved = temp.path().join("saved.json");
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(store.mark_delegation_delivered("w1", "t3").is_err());
+        assert!(store.delegation("w1").unwrap().is_delivered());
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
+
+        // The ordinary commit for a later report supersedes the pending
+        // receipt; retries cannot stamp it with the earlier acknowledgement.
+        store
+            .block_delegation(
+                "w1",
+                worker_result("Still stuck", &["Need another input"]),
+                "t5",
+            )
+            .unwrap();
+        store.retry_delivery_acknowledgements().unwrap();
+        let reloaded = TaskStore::load(&path).unwrap();
+        assert!(!reloaded.delegation("w1").unwrap().is_delivered());
+        assert_eq!(reloaded.delegation("w1").unwrap().delivered_at, None);
+        store
+            .complete_delegation("w1", worker_result("Done", &[]), "t6")
+            .unwrap();
+        store.mark_delegation_delivered("w1", "t7").unwrap();
+        assert!(TaskStore::load(&path)
+            .unwrap()
+            .delegation("w1")
+            .unwrap()
+            .is_delivered());
     }
 
     #[test]
