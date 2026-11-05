@@ -73,6 +73,8 @@ pub struct PullCore {
     pub state: Option<PrState>,
     pub url: String,
     pub author: String,
+    #[serde(default)]
+    pub head_repo: String,
     pub head_ref: String,
     pub head_sha: String,
     pub base_ref: String,
@@ -668,6 +670,7 @@ impl WatchedPr {
         let core = self.snapshot.core.as_ref()?;
         Some(PrBrief {
             state: core.state?,
+            head_repo: core.head_repo.clone(),
             head_ref: core.head_ref.clone(),
             base_ref: core.base_ref.clone(),
         })
@@ -1097,6 +1100,7 @@ pub fn parse_pull(value: &Value) -> Result<PullCore, String> {
         state: Some(state),
         url: str_at(value, &["html_url"]).to_string(),
         author: str_at(value, &["user", "login"]).to_string(),
+        head_repo: str_at(value, &["head", "repo", "full_name"]).to_string(),
         head_ref: str_at(value, &["head", "ref"]).to_string(),
         head_sha: str_at(value, &["head", "sha"]).to_string(),
         base_ref: str_at(value, &["base", "ref"]).to_string(),
@@ -1480,6 +1484,7 @@ mod tests {
             state: Some(state),
             url: "https://github.com/acme/api/pull/12".to_string(),
             author: "dev".to_string(),
+            head_repo: "acme/api".to_string(),
             head_ref: "prj-101".to_string(),
             head_sha: sha.to_string(),
             base_ref: "main".to_string(),
@@ -2040,12 +2045,13 @@ mod tests {
         let pull: Value = serde_json::json!({
             "title": "PRJ-101: export", "state": "closed", "merged": true, "draft": false,
             "html_url": "https://github.com/acme/api/pull/12", "user": {"login": "dev"},
-            "head": {"ref": "prj-101", "sha": "a1"}, "base": {"ref": "main"},
+            "head": {"ref": "prj-101", "sha": "a1", "repo": {"full_name": "alice/api"}}, "base": {"ref": "main"},
             "mergeable": null, "mergeable_state": "unknown",
             "requested_reviewers": [{"login": "r"}], "requested_teams": []
         });
         let core = parse_pull(&pull).unwrap();
         assert_eq!(core.state, Some(PrState::Merged));
+        assert_eq!(core.head_repo, "alice/api");
         assert_eq!(core.mergeable, None);
         assert_eq!(core.requested_reviewers, 1);
         let draft = serde_json::json!({"state": "open", "draft": true});

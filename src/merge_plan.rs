@@ -349,6 +349,7 @@ pub fn backfill_plan(
             .enumerate()
             .filter(|(_, (other, brief))| {
                 other.repo.eq_ignore_ascii_case(&key.repo)
+                    && brief.head_repo.eq_ignore_ascii_case(&key.repo)
                     && !brief.head_ref.is_empty()
                     && brief.head_ref == pr.base_ref
             })
@@ -693,6 +694,7 @@ impl PrState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrBrief {
     pub state: PrState,
+    pub head_repo: String,
     pub head_ref: String,
     pub base_ref: String,
 }
@@ -795,7 +797,9 @@ pub fn order_plan(plan: &MergePlan, live: &HashMap<String, PrBrief>) -> Vec<Orde
             j != i
                 && other.repo.to_ascii_lowercase() == repo
                 && live.get(&ids[j]).is_some_and(|other| {
-                    !other.head_ref.is_empty() && other.head_ref == own.base_ref
+                    other.head_repo.eq_ignore_ascii_case(&entry.repo)
+                        && !other.head_ref.is_empty()
+                        && other.head_ref == own.base_ref
                 })
         });
         if let Some(j) = below {
@@ -900,6 +904,7 @@ mod tests {
     fn brief(state: PrState, head: &str, base: &str) -> PrBrief {
         PrBrief {
             state,
+            head_repo: "acme/api".to_string(),
             head_ref: head.to_string(),
             base_ref: base.to_string(),
         }
@@ -940,6 +945,43 @@ mod tests {
             order_labels(&rows),
             vec!["acme/api#3", "acme/api#2", "acme/api#1"]
         );
+    }
+
+    #[test]
+    fn backfill_does_not_stack_fork_prs_with_colliding_branch_names() {
+        let prs = vec![
+            (
+                PrKey::new("upstream/api", 10),
+                PrBrief {
+                    state: PrState::Open,
+                    head_repo: "upstream/api".to_string(),
+                    head_ref: "child".to_string(),
+                    base_ref: "topic".to_string(),
+                },
+            ),
+            (
+                PrKey::new("upstream/api", 20),
+                PrBrief {
+                    state: PrState::Open,
+                    head_repo: "alice/api".to_string(),
+                    head_ref: "topic".to_string(),
+                    base_ref: "main".to_string(),
+                },
+            ),
+        ];
+
+        let plan = backfill_plan("root", &prs, "now").unwrap();
+        let child = plan.entry(&PrKey::new("upstream/api", 10)).unwrap();
+        assert!(child.after.is_empty());
+        assert_eq!(child.step, Some(1));
+        assert_eq!(
+            plan.entry(&PrKey::new("upstream/api", 20)).unwrap().step,
+            Some(2)
+        );
+
+        let live = prs.into_iter().map(|(key, pr)| (key.id(), pr)).collect();
+        let rows = order_plan(&plan, &live);
+        assert!(rows.iter().all(|row| !row.stacked && row.waits.is_empty()));
     }
 
     #[test]
