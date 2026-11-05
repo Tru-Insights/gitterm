@@ -890,6 +890,10 @@ fn worker_deadline(timestamp: &str, minutes: u32) -> Result<i64, String> {
 /// against the requesting chat's workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DelegationRunOptions {
+    /// The user explicitly chose the model, rather than the coordinator or
+    /// configuration choosing it. Kept through the queue and restarts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_model_choice: bool,
     /// The checkout the job runs in, in place of the calling tab's (a Codex
     /// run) or of a new task worktree (a worker): its git top level.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -162,6 +162,11 @@ pub struct DelegateTaskRequest {
     /// Model for the worker's CLI (`claude --model`, `codex -m`), overriding
     /// the policy, e.g. sonnet, opus, fable or gpt-6-luna.
     pub model: Option<String>,
+    /// True only when the user explicitly chose this model. Overrides plan
+    /// holds with a cost note; routine agent model selection is not an override.
+    /// Requires `model`.
+    #[serde(default)]
+    pub user_model_choice: bool,
     /// Optional Linear issue key such as TRU-150.
     pub issue_key: Option<String>,
     /// Branch, tag or commit the task worktree starts from. Defaults to
@@ -234,6 +239,11 @@ pub struct ReviewDelegationRequest {
     pub reviewer: Option<String>,
     /// Codex model (`codex -m`). Omit it for GitTerm's configured Codex model.
     pub model: Option<String>,
+    /// True only when the user explicitly chose this model. Overrides plan
+    /// holds with a cost note; routine agent model selection is not an override.
+    /// Requires `model`.
+    #[serde(default)]
+    pub user_model_choice: bool,
     /// Review this checkout instead of your tab's: an absolute path to a git
     /// checkout or worktree of one of your workspace's repos (or the
     /// workspace home).
@@ -257,6 +267,11 @@ pub struct ConsultDelegationRequest {
     pub brief: String,
     /// Codex model (`codex -m`). Omit it for GitTerm's configured Codex model.
     pub model: Option<String>,
+    /// True only when the user explicitly chose this model. Overrides plan
+    /// holds with a cost note; routine agent model selection is not an override.
+    /// Requires `model`.
+    #[serde(default)]
+    pub user_model_choice: bool,
     /// Run in this checkout instead of your tab's (still read-only): an
     /// absolute path to a git checkout or worktree of one of your
     /// workspace's repos (or the workspace home).

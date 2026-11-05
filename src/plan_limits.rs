@@ -26,6 +26,7 @@
 //! The last reading of each provider is kept in [`LIMITS_FILE`] in the
 //! config dir, so the rail badge is not blank after a restart.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -799,6 +800,33 @@ pub struct PolicyEvaluation {
     pub notices: Vec<String>,
 }
 
+impl PolicyEvaluation {
+    /// Enforce at launch time as a queued request's reading may have changed.
+    pub fn allows_start(
+        &self,
+        provider: Provider,
+        parallel: bool,
+        user_model_choice: bool,
+    ) -> bool {
+        if user_model_choice {
+            return true;
+        }
+        let (policy, report) = match provider {
+            Provider::Claude => (&self.policy.claude, &self.report.claude),
+            Provider::Codex => (&self.policy.codex, &self.report.codex),
+        };
+        let (other_policy, other_report) = match provider {
+            Provider::Claude => (&self.policy.codex, &self.report.codex),
+            Provider::Codex => (&self.policy.claude, &self.report.claude),
+        };
+        let other_available =
+            weekly_available(other_report) && !held(other_policy) && !other_report.busy;
+        weekly_available(report)
+            && !held(policy)
+            && !(policy.burst.busy && (parallel || other_available))
+    }
+}
+
 fn history_metrics(
     history: Option<&WindowHistory>,
     now: i64,
@@ -836,15 +864,26 @@ pub fn hot_pin_until_reset(report: &ProviderReport, now: i64) -> Option<i64> {
         .and_then(|window| window.resets_at.filter(|at| *at > now))
 }
 
-pub fn pin_change_notice(pin: Option<&RoutingPin>, now: i64) -> String {
-    match pin {
+pub fn hot_reset_pin(provider: Provider, report: &ProviderReport, now: i64) -> Option<RoutingPin> {
+    hot_pin_until_reset(report, now).map(|until| RoutingPin {
+        provider: match provider {
+            Provider::Claude => Provider::Codex,
+            Provider::Codex => Provider::Claude,
+        },
+        until,
+    })
+}
+
+pub fn pin_change_notice(pin: Option<&RoutingPin>, now: i64, routing: &RoutingReport) -> String {
+    let change = match pin {
         Some(pin) => format!(
-            "Routing: pin to {} set until {} UTC.",
+            "pin to {} set until {} UTC.",
             pin.provider.label(),
             format_reset(pin.until, now, &chrono::Utc)
         ),
-        None => "Routing: pin cleared.".to_string(),
-    }
+        None => "pin cleared.".to_string(),
+    };
+    format!("{} {change}", routing.reason)
 }
 
 fn window_report(
@@ -1315,6 +1354,10 @@ pub struct PlanLimitsFile {
     pub history: Vec<WindowHistory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<RoutingPin>,
+    /// Notices and their policy suppression flags are saved together so a
+    /// busy coordinator can receive them after a restart.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pending_notices: HashMap<String, Vec<String>>,
 }
 
 impl PlanLimitsFile {
@@ -2353,8 +2396,92 @@ mod policy_tests {
             RoutingState::HoldClaude
         );
         file.claude.as_mut().unwrap().windows[0].used_percent = Some(35.0);
-        assert!(pin_change_notice(file.pin.as_ref(), NOW).contains("pin to Claude Code set"));
-        assert_eq!(pin_change_notice(None, NOW), "Routing: pin cleared.");
+        assert!(pin_change_notice(
+            file.pin.as_ref(),
+            NOW,
+            &evaluate_policy(&file, NOW).report.routing
+        )
+        .contains("pin to Claude Code set"));
+        assert!(
+            pin_change_notice(None, NOW, &evaluate_policy(&file, NOW).report.routing)
+                .contains("pin cleared.")
+        );
+    }
+
+    #[test]
+    fn launch_boundary_enforces_both_providers_weekly_and_burst_holds() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut file = fixture(10.0, 2 * 86400);
+
+            // A busy provider yields the next job to verified spare capacity;
+            // the explicit user's model still wins.
+            (match provider {
+                Provider::Claude => file.claude.as_mut().unwrap(),
+                Provider::Codex => file.codex.as_mut().unwrap(),
+            })
+            .windows
+            .push(LimitWindow {
+                label: "5h".into(),
+                used_percent: Some(80.0),
+                resets_at: Some(NOW + 3600),
+            });
+            let e = evaluate_policy(&file, NOW);
+            assert!(!e.allows_start(provider, false, false));
+            assert!(!e.allows_start(provider, true, false));
+            assert!(e.allows_start(provider, true, true));
+            (match provider {
+                Provider::Claude => file.claude.as_mut().unwrap(),
+                Provider::Codex => file.codex.as_mut().unwrap(),
+            })
+            .windows[1]
+                .used_percent = Some(100.0);
+            assert!(!evaluate_policy(&file, NOW).allows_start(provider, false, false));
+            (match provider {
+                Provider::Claude => file.claude.as_mut().unwrap(),
+                Provider::Codex => file.codex.as_mut().unwrap(),
+            })
+            .windows[0]
+                .used_percent = Some(95.0);
+            let e = evaluate_policy(&file, NOW);
+            assert!(!e.allows_start(provider, false, false));
+            assert!(e.allows_start(provider, true, true));
+        }
+    }
+
+    #[test]
+    fn unknown_and_stale_capacity_do_not_release_automatic_jobs() {
+        let empty = evaluate_policy(&PlanLimitsFile::default(), NOW);
+        assert!(!empty.allows_start(Provider::Codex, false, false));
+        assert!(empty.allows_start(Provider::Codex, false, true));
+        let file = fixture(10.0, 2 * 86400);
+        let stale = evaluate_policy(&file, NOW + STALE_AFTER_SECS + 1);
+        assert!(!stale.allows_start(Provider::Codex, false, false));
+        assert!(evaluate_policy(&file, NOW).allows_start(Provider::Codex, false, false));
+    }
+
+    #[test]
+    fn hot_reset_shortcut_sends_work_away_until_the_hot_plan_resets() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut file = fixture(35.0, 5 * 86400);
+            if provider == Provider::Codex {
+                file.codex = Some(reading(Provider::Codex, 35.0, 5 * 86400));
+                file.claude = Some(reading(Provider::Claude, 10.0, 2 * 86400));
+            }
+            let report = evaluate_policy(&file, NOW).report;
+            let hot = match provider {
+                Provider::Claude => &report.claude,
+                Provider::Codex => &report.codex,
+            };
+            let pin = hot_reset_pin(provider, hot, NOW).unwrap();
+            assert_ne!(pin.provider, provider);
+            assert_eq!(pin.until, NOW + 5 * 86400);
+            file.pin = Some(pin);
+            let expected = match provider {
+                Provider::Claude => RoutingState::LeanCodex,
+                Provider::Codex => RoutingState::LeanClaude,
+            };
+            assert_eq!(evaluate_policy(&file, NOW).report.routing.state, expected);
+        }
     }
 
     #[test]

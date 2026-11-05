@@ -12108,7 +12108,7 @@ impl App {
     /// signal hot path.
     fn promote_queued_tasks(&mut self) -> Task<Event> {
         let mut started = Vec::new();
-        while !self.task_launch_queue.is_empty() {
+        for _ in 0..self.task_launch_queue.len() {
             let limit = self.max_concurrent_local_tasks.max(1);
             if self.local_running_task_count() >= limit {
                 break;
@@ -12126,7 +12126,7 @@ impl App {
             }
             match self.try_launch_task_child(&entry.task_id, entry.preset_idx, false) {
                 Ok(TaskChildLaunch::Started(task, _session)) => started.push(task),
-                Ok(TaskChildLaunch::Queued { .. }) => break,
+                Ok(TaskChildLaunch::Queued { .. }) => continue,
                 Err(error) => {
                     // A queued launch that can no longer start (worktree gone,
                     // preset removed) must not sit "Queued" forever.
@@ -12280,21 +12280,52 @@ impl App {
         let WorkspaceLocationIdentity::Local { directory } = &task.workspace.location else {
             return Err("Remote task sessions require the later remote-executor slice".to_string());
         };
+        // A delegation may have queued before its provider crossed a limit.
+        // Manual task launches are the user's own choice; agent-selected
+        // workers need explicit model-choice attribution to override a hold.
+        let policy_blocked = worker.is_some()
+            && command.as_deref().is_some_and(|command| {
+                let provider = match gitterm::workers::provider_for_command(command) {
+                    gitterm::workers::WorkerProvider::Claude => {
+                        gitterm::plan_limits::Provider::Claude
+                    }
+                    gitterm::workers::WorkerProvider::Codex => {
+                        gitterm::plan_limits::Provider::Codex
+                    }
+                    gitterm::workers::WorkerProvider::Other => return false,
+                };
+                !self.plan_limits.evaluation_for_launch().allows_start(
+                    provider,
+                    self.plan_limit_running_workers(provider) > 0
+                        || (provider == gitterm::plan_limits::Provider::Codex
+                            && !self.delegation_runs.is_empty()),
+                    worker_options.user_model_choice,
+                )
+            });
+        if policy_blocked
+            && matches!(
+                task.lifecycle,
+                TaskLifecycle::Running | TaskLifecycle::WaitingForInput
+            )
+        {
+            return Err(self.plan_limits_routing().reason);
+        }
         // Concurrency gate: only agent launches occupy a slot, and a task
         // already Running/WaitingForInput adds sessions without consuming a
         // new one.
         if launched_agent
-            && !matches!(
-                task.lifecycle,
-                TaskLifecycle::Running | TaskLifecycle::WaitingForInput
-            )
+            && (policy_blocked
+                || !matches!(
+                    task.lifecycle,
+                    TaskLifecycle::Running | TaskLifecycle::WaitingForInput
+                ))
         {
             let queue_position = self
                 .task_launch_queue
                 .iter()
                 .position(|entry| entry.task_id == task_id);
             let limit = self.max_concurrent_local_tasks.max(1);
-            if self.local_running_task_count() >= limit {
+            if policy_blocked || self.local_running_task_count() >= limit {
                 if let Some(position) = queue_position {
                     // Dispatching an already-queued task again keeps its
                     // place — it never jumps the line.
@@ -16622,6 +16653,11 @@ impl App {
         }
         let now = chrono::Utc::now().to_rfc3339();
         let delegation = gitterm::tasks::Delegation::new_requested(new, now);
+        if delegation.options.user_model_choice {
+            if let DelegationOrigin::Page(tab_id) = &origin {
+                agent_webview_note(*tab_id, "Explicit user model choice overrides plan limits; this may consume remaining allowance or credits.");
+            }
+        }
         let delegation_id = delegation.delegation_id.clone();
         let session_uid = delegation.parent.session_uid.clone();
         let Some(store) = self.task_store.as_mut() else {
@@ -16641,9 +16677,10 @@ impl App {
                 "status": "requested",
                 "routing": self.plan_limits_routing(),
                 "provider": "codex",
+                "cost_note": self.task_store.as_ref().and_then(|store| store.delegation(&delegation_id)).filter(|delegation| delegation.options.user_model_choice).map(|_| "Explicit user model choice overrides plan limits; this may consume remaining allowance or credits."),
                 "queued": queued,
                 "detail": if queued {
-                    "Queued behind other Codex runs; it starts when a slot frees. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
+                    "Queued until plan limits and concurrency permit a Codex run. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
                 } else {
                     "Codex is working in the background. Do not wait or poll: the result appears as a card in the requesting chat tab, and delegation_get reads it."
                 },
@@ -16687,6 +16724,8 @@ impl App {
             store.delegations(),
             &running,
             self.review_config.max_concurrent_reviews,
+            &self.plan_limits.evaluation_for_launch(),
+            self.plan_limit_running_workers(gitterm::plan_limits::Provider::Codex),
         ) {
             let Some(delegation) = store.delegation(&delegation_id) else {
                 continue;
@@ -17396,6 +17435,7 @@ impl App {
             "task_id": task_id,
             "routing": self.plan_limits_routing(),
             "provider": worker.choice.provider.label(),
+            "cost_note": worker.options.user_model_choice.then_some("Explicit user model choice overrides plan limits; this may consume remaining allowance or credits."),
             "task_session_id": task_session_id,
             "worktree_path": task.worktree.path,
             "branch": task.branch,
@@ -17405,7 +17445,7 @@ impl App {
             "queued": queued,
             "queue_position": queue_position,
             "detail": if queued {
-                "The local concurrency limit queued the worker; it starts when a slot frees. Do not wait or poll: its report appears as a card in the requesting chat tab, and delegation_get reads it."
+                "The worker is queued until plan limits and concurrency permit it. Do not wait or poll: its report appears as a card in the requesting chat tab, and delegation_get reads it."
             } else {
                 "The worker is running in a background tab. Do not wait or poll: its report appears as a card in the requesting chat tab, and delegation_get reads it."
             },
@@ -23299,6 +23339,7 @@ fi
                             &task_mcp::ConsultDelegationRequest {
                                 brief: request.brief.clone(),
                                 model: Some(request.model.clone()),
+                                user_model_choice: !request.model.trim().is_empty(),
                                 ..Default::default()
                             },
                             &caller,
