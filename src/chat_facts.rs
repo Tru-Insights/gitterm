@@ -1283,16 +1283,24 @@ fn command_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Option<Pa
     if raw.contains(['$', '\0', '*', '?', '[', '{']) || raw.is_empty() {
         return None;
     }
-    if raw.starts_with('~') {
-        return absolute_tool_path(raw, home);
-    }
     let path = Path::new(raw);
-    let path = if path.is_absolute() {
+    let path = if raw == "~" {
+        home?.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home?.join(rest)
+    } else if raw.starts_with('~') {
+        return None;
+    } else if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd?.join(path)
     };
-    Some(worktree_follow::resolve_for_match(&path))
+    // Resolve the actual transition before folding '..': a missing component
+    // must not disappear through lexical normalization.
+    if !path.is_dir() {
+        return None;
+    }
+    std::fs::canonicalize(path).ok()
 }
 
 /// Shared by live observations and transcript scans. Each literal invocation
@@ -1367,7 +1375,10 @@ fn repo_write_targets(
         let args = &command.words[1..];
         if executable == "cd" {
             cwd = if command.separator == "&&" && args.len() == 1 {
-                command_path(&args[0], cwd.as_deref(), home)
+                let Some(dir) = command_path(&args[0], cwd.as_deref(), home) else {
+                    return targets;
+                };
+                Some(dir)
             } else {
                 None
             };
@@ -1444,7 +1455,9 @@ fn git_write_target(args: &[String], cwd: Option<&Path>, home: Option<&Path>) ->
                     }
                 };
                 match option {
-                    "-C" if !value.is_empty() => dir = command_path(value, dir.as_deref(), home),
+                    "-C" if !value.is_empty() => {
+                        dir = Some(command_path(value, dir.as_deref(), home)?);
+                    }
                     "--git-dir" => git_dir = Some(value.to_string()),
                     "--work-tree" => work_tree = Some(value.to_string()),
                     _ => {}
@@ -2736,7 +2749,10 @@ branch refs/heads/tracey/tru-12-thing
             !repo_write_targets("gh pr create --title x", Some(Path::new("/repo")), None)
                 .is_empty()
         );
-        assert!(!repo_write_targets("git -C /repo push", None, None).is_empty());
+        assert!(
+            !repo_write_targets(&format!("git -C '{}' push", repo.display()), None, None)
+                .is_empty()
+        );
         assert!(repo_write_targets("git status", Some(Path::new("/repo")), None).is_empty());
         assert!(repo_write_targets("git branch -D old", Some(Path::new("/repo")), None).is_empty());
     }
@@ -3031,6 +3047,46 @@ branch refs/heads/tracey/tru-12-thing
         ] {
             assert_eq!(command_repos(command, &cwd), vec![repo], "{command}");
         }
+    }
+
+    #[test]
+    fn repo_write_validates_every_directory_transition() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = work_repo(temp.path(), "cwd");
+        let repo = work_repo(temp.path(), "repo");
+        let file = temp.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let mut commands = Vec::new();
+        for invalid in [
+            temp.path().join("missing"),
+            temp.path().join("missing/../cwd"),
+            file.join("../cwd"),
+            file,
+        ] {
+            for options in [
+                format!("-C '{}' -C '{}'", invalid.display(), repo.display()),
+                format!("-C'{}' -C'{}'", invalid.display(), repo.display()),
+            ] {
+                commands.push(format!("git {options} push"));
+            }
+            commands.push(format!(
+                "cd '{}' && cd '{}' && git push",
+                invalid.display(),
+                repo.display()
+            ));
+        }
+        commands.push(format!("git -C ../missing -C '{}' push", repo.display()));
+        commands.push(format!("git -C '~other' -C '{}' push", repo.display()));
+        let joined: Vec<_> = commands
+            .iter()
+            .map(|command| (command, command_repos(command, &cwd)))
+            .filter(|(_, repos)| !repos.is_empty())
+            .collect();
+        assert!(joined.is_empty(), "invalid transitions joined: {joined:?}");
+        assert_eq!(
+            command_repos("git -C '' -C .. -C repo push", &cwd),
+            vec![repo]
+        );
     }
 
     #[test]
