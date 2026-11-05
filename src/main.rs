@@ -2603,6 +2603,67 @@ fn overview_row_content<'a>(
     container(content).width(Length::Fill).into()
 }
 
+fn overview_repo_branch_slots<'a>(
+    rows: impl IntoIterator<Item = Element<'a, Event, Theme, iced::Renderer>>,
+    expanded: bool,
+) -> Column<'a, Event, Theme, iced::Renderer> {
+    rows.into_iter()
+        .fold(Column::new().spacing(1), |column, row| {
+            column.push(if expanded {
+                row
+            } else {
+                iced::widget::Space::new().into()
+            })
+        })
+}
+
+fn overview_repo_header<'a>(
+    content: Element<'a, Event, Theme, iced::Renderer>,
+    disclosure: Element<'a, Event, Theme, iced::Renderer>,
+) -> Row<'a, Event, Theme, iced::Renderer> {
+    row![overview_row_content(content), disclosure]
+        .spacing(6)
+        .align_y(iced::Alignment::Center)
+}
+
+fn overview_repo_facts(facts: &str, branches: usize, with_pr: usize, running: usize) -> String {
+    let mut parts = Vec::new();
+    if !facts.is_empty() {
+        parts.push(facts.to_string());
+    }
+    if branches > 0 {
+        parts.push(format!(
+            "{} branch{}",
+            branches,
+            if branches == 1 { "" } else { "es" }
+        ));
+    }
+    if with_pr > 0 {
+        parts.push(format!(
+            "{with_pr} PR{}",
+            if with_pr == 1 { "" } else { "s" }
+        ));
+    }
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    parts.join(" \u{00b7} ")
+}
+
+fn overview_disclosure_button<'a>(
+    open: bool,
+    color: iced::Color,
+    style: impl Fn(&Theme, button::Status) -> button::Style + 'a,
+    event: Event,
+) -> Element<'a, Event, Theme, iced::Renderer> {
+    button(text(overview::fold_marker(open)).size(10).color(color))
+        .style(style)
+        .padding([0, 4])
+        .width(Length::Fixed(OVERVIEW_DISCLOSURE_WIDTH))
+        .on_press(event)
+        .into()
+}
+
 fn remove_workspace_overview_presentation(
     presentations: &mut HashMap<u64, WorkspaceOverviewPresentation>,
     uid: u64,
@@ -9064,16 +9125,12 @@ impl App {
         open: bool,
         key: overview::RowKey,
     ) -> Element<'a, Event, Theme, iced::Renderer> {
-        button(
-            text(overview::fold_marker(open))
-                .size(10)
-                .color(self.theme.text_muted()),
+        overview_disclosure_button(
+            open,
+            self.theme.text_muted(),
+            self.flat_button_style(),
+            Event::OverviewRowToggle(key),
         )
-        .style(self.flat_button_style())
-        .padding([0, 4])
-        .width(Length::Fixed(OVERVIEW_DISCLOSURE_WIDTH))
-        .on_press(Event::OverviewRowToggle(key))
-        .into()
     }
 
     /// A Work sidebar section header (TRU-208): the name, its count dim
@@ -37109,8 +37166,6 @@ fi
             let facts = overview::repo_facts(is_home, group.edits, empty_note);
             let key = overview::RowKey::Repo(group.dir.clone());
             let expanded = self.overview_row_open(&key);
-            // The name opens the Git view on the repo (TRU-192).
-            let local = repo_state.is_none_or(|repo| repo.key.is_local());
             let name_button = button(text(name).size(font_small).font(bold).color(if quiet {
                 text_muted
             } else {
@@ -37118,9 +37173,7 @@ fi
             }))
             .style(self.flat_button_style())
             .padding([0, 2])
-            .on_press_maybe(
-                local.then(|| Event::OpenRepoPanel(SidebarMode::Git, Some(group.dir.clone()))),
-            );
+            .on_press(Event::OverviewRowToggle(key.clone()));
             // Its run command (TRU-180): `▶` opens it as a terminal tab
             // below and stays shown; ✎ edits it, once the line is opened
             // with ▸. Only this Mac's folders run. Fixed slots: name, run,
@@ -37158,7 +37211,11 @@ fi
                 (None, _) => iced::widget::Space::new().into(),
             };
             let removable = repo_state.filter(|repo| repo.id != ws.home);
-            let has_hidden = local_repo.is_some() || oldest.is_some() || removable.is_some();
+            let has_hidden = local_repo.is_some()
+                || oldest.is_some()
+                || removable.is_some()
+                || !rows.is_empty()
+                || !gone.is_empty();
             let mut actions_slot = Row::new().spacing(2).align_y(iced::Alignment::Center);
             if expanded {
                 if let Some(repo) = local_repo.filter(|_| editing.is_none()) {
@@ -37190,6 +37247,50 @@ fi
                     );
                 }
             }
+            let running_tasks: HashSet<String> = self
+                .task_store
+                .as_ref()
+                .into_iter()
+                .flat_map(TaskStore::tasks)
+                .filter(|task| task.lifecycle == TaskLifecycle::Running)
+                .filter(|task| {
+                    rows.iter().any(|row| {
+                        row.owned
+                            .task
+                            .as_ref()
+                            .is_some_and(|link| link.task_id == task.task_id)
+                    })
+                })
+                .map(|task| task.task_id.clone())
+                .collect();
+            let mut running_chats = HashSet::new();
+            for running_workspace in &self.workspaces {
+                for tab in &running_workspace.tabs {
+                    if !self.chat_turn_running(tab.id) {
+                        continue;
+                    }
+                    let active = tab
+                        .worktree_follow
+                        .active
+                        .as_ref()
+                        .map(|active| active.path.as_path())
+                        .unwrap_or(tab.repo_path.as_path());
+                    let task_is_counted = tab
+                        .task_id
+                        .as_ref()
+                        .is_some_and(|task_id| running_tasks.contains(task_id));
+                    if !task_is_counted && rows.iter().any(|row| row.owned.checkout == active) {
+                        running_chats.insert(tab.id);
+                    }
+                }
+            }
+            let with_pr = rows.iter().filter(|row| row.pr_label().is_some()).count();
+            let facts = overview_repo_facts(
+                &facts,
+                rows.len(),
+                with_pr,
+                running_tasks.len() + running_chats.len(),
+            );
             let head_content = row![
                 name_button,
                 run_slot,
@@ -37199,30 +37300,31 @@ fi
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
-            let head = row![
-                overview_row_content(head_content.into()),
-                if has_hidden {
-                    self.overview_disclosure(expanded, key)
-                } else {
-                    iced::widget::Space::new().into()
-                },
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
+            let disclosure: Element<'a, Event, Theme, iced::Renderer> = if has_hidden {
+                self.overview_disclosure(expanded, key)
+            } else {
+                iced::widget::Space::new().into()
+            };
+            let head = overview_repo_header(head_content.into(), disclosure);
             let mut column = Column::new().spacing(1).push(head);
-            for row in rows {
-                column = column.push(self.view_overview_branch_row(
-                    row,
-                    home.as_deref(),
-                    selected == Some(row.owned.checkout.as_path()),
-                ));
-            }
+            column = column.push(overview_repo_branch_slots(
+                rows.iter()
+                    .map(|row| {
+                        self.view_overview_branch_row(
+                            row,
+                            home.as_deref(),
+                            selected == Some(row.owned.checkout.as_path()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                expanded,
+            ));
             if !gone.is_empty() {
                 let names: Vec<&str> = gone
                     .iter()
                     .map(|row| row.owned.branch.as_deref().unwrap_or("(detached)"))
                     .collect();
-                column = column.push(
+                let gone_line: Element<'a, Event, Theme, iced::Renderer> = if expanded {
                     text(format!(
                         "\u{25B8} {} folder{} gone \u{00B7} {}",
                         gone.len(),
@@ -37230,8 +37332,12 @@ fi
                         overview::shorten(&names.join(", "), 60)
                     ))
                     .size(10)
-                    .color(theme.overlay0()),
-                );
+                    .color(theme.overlay0())
+                    .into()
+                } else {
+                    iced::widget::Space::new().into()
+                };
+                column = column.push(gone_line);
             }
             repos = repos.push(column);
         }
@@ -46264,6 +46370,75 @@ mod tests {
     #[test]
     fn overview_disclosure_reserves_a_fixed_width_slot() {
         assert_eq!(OVERVIEW_DISCLOSURE_WIDTH, 24.0);
+    }
+
+    #[test]
+    fn repo_disclosures_start_closed_and_toggle_independently_by_workspace_and_repo() {
+        let first_repo = overview::RowKey::Repo(PathBuf::from("/work/api"));
+        let second_repo = overview::RowKey::Repo(PathBuf::from("/work/web"));
+        let mut presentations = HashMap::<u64, WorkspaceOverviewPresentation>::new();
+
+        assert!(!presentations
+            .entry(101)
+            .or_default()
+            .open_rows
+            .contains(&first_repo));
+        overview::toggle_row(
+            &mut presentations.get_mut(&101).unwrap().open_rows,
+            first_repo.clone(),
+        );
+        overview::toggle_row(
+            &mut presentations.get_mut(&101).unwrap().open_rows,
+            second_repo.clone(),
+        );
+
+        assert!(presentations[&101].open_rows.contains(&first_repo));
+        assert!(presentations[&101].open_rows.contains(&second_repo));
+        assert!(!presentations
+            .entry(202)
+            .or_default()
+            .open_rows
+            .contains(&first_repo));
+        assert!(!overview::toggle_row(
+            &mut presentations.get_mut(&101).unwrap().open_rows,
+            first_repo.clone(),
+        ));
+        assert!(!presentations[&101].open_rows.contains(&first_repo));
+        assert!(presentations[&101].open_rows.contains(&second_repo));
+    }
+
+    #[test]
+    fn collapsed_repo_facts_include_branch_pr_and_running_counts() {
+        assert_eq!(
+            overview_repo_facts("home \u{00b7} 4 edits", 2, 1, 1),
+            "home \u{00b7} 4 edits \u{00b7} 2 branches \u{00b7} 1 PR \u{00b7} 1 running"
+        );
+        assert_eq!(overview_repo_facts("", 0, 0, 0), "");
+    }
+
+    #[test]
+    fn repo_widget_tree_keeps_branch_and_disclosure_slots_when_collapsed() {
+        let branch_rows = || vec![text("branch one").into(), text("branch two").into()];
+        let collapsed: Element<'_, Event, Theme, iced::Renderer> =
+            overview_repo_branch_slots(branch_rows(), false).into();
+        let expanded: Element<'_, Event, Theme, iced::Renderer> =
+            overview_repo_branch_slots(branch_rows(), true).into();
+        assert_eq!(collapsed.as_widget().children().len(), 2);
+        assert_eq!(expanded.as_widget().children().len(), 2);
+
+        let disclosure = overview_disclosure_button(
+            false,
+            iced::Color::BLACK,
+            |_, _| button::Style::default(),
+            Event::OverviewRowToggle(overview::RowKey::Repo(PathBuf::from("/work/api"))),
+        );
+        assert_eq!(
+            disclosure.as_widget().size_hint().width,
+            Length::Fixed(OVERVIEW_DISCLOSURE_WIDTH)
+        );
+        let header: Element<'_, Event, Theme, iced::Renderer> =
+            overview_repo_header(text("api").into(), disclosure).into();
+        assert_eq!(header.as_widget().children().len(), 2);
     }
 
     #[test]
