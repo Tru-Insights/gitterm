@@ -54,6 +54,8 @@ const CHILD_TITLE_MAX_CHARS: usize = 90;
 /// What one conversation touched. Additive: every field defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatFacts {
+    /// Issue keys the chat mentioned or created through a `linear issue
+    /// create` Bash result containing a Linear issue URL.
     #[serde(default)]
     pub issue_keys: Vec<String>,
     #[serde(default)]
@@ -336,6 +338,9 @@ impl ChatFacts {
         for pr in scan.prs {
             self.add_pr(pr);
         }
+        for key in scan.issue_keys {
+            self.add_issue_key(&key);
+        }
         // The scan saw the whole transcript in order: its documents are the
         // newest; any only a tab recorded keep their place before them.
         if !scan.documents.is_empty() {
@@ -598,6 +603,8 @@ pub struct RawTouch {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawFacts {
     pub touches: Vec<RawTouch>,
+    /// Issue keys mentioned by the user, or returned by `linear issue
+    /// create` with a Linear URL in live and transcript observations.
     pub issue_keys: Vec<String>,
     pub children: Vec<ChatChild>,
     /// PRs from `gh pr create` results: live tabs, and transcript scans
@@ -695,6 +702,9 @@ impl RawFacts {
         }
         for pr in self.prs {
             facts.add_pr(pr);
+        }
+        for key in &self.issue_keys {
+            facts.add_issue_key(key);
         }
         for path in &self.documents {
             facts.add_document(path);
@@ -846,6 +856,9 @@ pub struct LiveFacts {
     /// Bash calls running `gh pr create` whose result has not arrived
     /// (TRU-173); their result names the PR.
     pr_create_calls: HashSet<String>,
+    /// Bash calls running `linear … issue create` whose result has not
+    /// arrived (TRU-219); their result may contain the created issue URL.
+    issue_create_calls: HashSet<String>,
     last_flush: Option<Instant>,
     in_flight: bool,
     /// The tab picked up a chat whose transcript may have moved on while
@@ -865,7 +878,16 @@ impl LiveFacts {
                     .and_then(Value::as_str)
                     .is_some_and(merge_plan::is_gh_pr_create);
             if creates_pr {
-                self.pr_create_calls.insert(call.id);
+                self.pr_create_calls.insert(call.id.clone());
+            }
+            let creates_issue = call.name == "Bash"
+                && call
+                    .input
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_linear_issue_create);
+            if creates_issue {
+                self.issue_create_calls.insert(call.id);
             }
         }
         self.observe_results(event);
@@ -879,7 +901,15 @@ impl LiveFacts {
             HarnessEvent::ItemCompleted { id, output, .. } if self.pr_create_calls.remove(id) => {
                 self.pending.prs.extend(merge_plan::pr_urls_in(output));
             }
-            HarnessEvent::ProcessExited { .. } => self.pr_create_calls.clear(),
+            HarnessEvent::ItemCompleted { id, output, .. }
+                if self.issue_create_calls.remove(id) =>
+            {
+                self.pending.issue_keys.extend(linear_issue_keys_in(output));
+            }
+            HarnessEvent::ProcessExited { .. } => {
+                self.pr_create_calls.clear();
+                self.issue_create_calls.clear();
+            }
             _ => {}
         }
     }
@@ -1048,23 +1078,110 @@ fn catch_up_from_transcript(
 /// subagent transcript, whose user lines are the coordinator's brief, not
 /// the human's words.
 pub fn observe_claude_line(raw: &mut RawFacts, line: &str, home: Option<&Path>, main: bool) {
-    observe_claude_line_with(raw, &mut HashSet::new(), line, home, main);
+    observe_claude_line_with(
+        raw,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        line,
+        home,
+        main,
+    );
 }
 
-/// [`observe_claude_line`] across a whole transcript: `pr_create_calls`
-/// holds the `gh pr create` Bash calls whose result line has not come yet;
-/// that result's PR URLs are recorded as the live tab would (TRU-201).
+/// Whether a Bash command invokes `linear issue create`, allowing options
+/// such as `--workspace <name>` before the subcommand.
+fn is_linear_issue_create(command: &str) -> bool {
+    command
+        .split([';', '&', '|', '\n', '(', ')'])
+        .any(|segment| {
+            let words: Vec<&str> = segment
+                .split_whitespace()
+                .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
+                .filter(|word| !word.is_empty())
+                .collect();
+            let command_at = words
+                .iter()
+                .position(|word| !word.contains('=') || word.starts_with("/"));
+            let Some(command_at) = command_at else {
+                return false;
+            };
+            let program = words[command_at];
+            let program = program.rsplit('/').next().unwrap_or(program);
+            if program != "linear" {
+                return false;
+            }
+            words[command_at + 1..]
+                .windows(2)
+                .any(|pair| pair == ["issue", "create"])
+        })
+}
+
+/// Linear issue keys named by `https://linear.app/<workspace>/issue/<KEY>-<n>`
+/// URLs. Only a complete, well-formed key is returned.
+fn linear_issue_keys_in(text: &str) -> Vec<String> {
+    const PREFIX: &str = "https://linear.app/";
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(PREFIX) {
+        let after = &rest[at + PREFIX.len()..];
+        let Some((workspace, path)) = after.split_once("/issue/") else {
+            rest = after;
+            continue;
+        };
+        if workspace.is_empty() || workspace.contains('/') {
+            rest = after;
+            continue;
+        }
+        let key_len = path
+            .bytes()
+            .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            .count();
+        let valid_key = (2..=10).contains(&key_len)
+            && path.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+            && path.as_bytes()[..key_len]
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+        if !valid_key || path.as_bytes().get(key_len) != Some(&b'-') {
+            rest = after;
+            continue;
+        }
+        let digits_start = key_len + 1;
+        let digits = path.as_bytes()[digits_start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let end = digits_start + digits;
+        let valid_end = path
+            .as_bytes()
+            .get(end)
+            .is_none_or(|byte| *byte == b'/' || !byte.is_ascii_alphanumeric());
+        if digits > 0 && valid_end {
+            let key = path[..end].to_string();
+            if !found.contains(&key) {
+                found.push(key);
+            }
+        }
+        rest = after;
+    }
+    found
+}
+
+/// [`observe_claude_line`] across a whole transcript: the pending sets hold
+/// create Bash calls whose result line has not come yet; URLs are recorded
+/// as the live tab would (TRU-201, TRU-219).
 fn observe_claude_line_with(
     raw: &mut RawFacts,
     pr_create_calls: &mut HashSet<String>,
+    issue_create_calls: &mut HashSet<String>,
     line: &str,
     home: Option<&Path>,
     main: bool,
 ) {
     // Most lines are neither tool calls nor user text; skip them unparsed.
     let user_line = main && line.contains("\"user\"");
-    let pr_result = !pr_create_calls.is_empty() && line.contains("\"tool_result\"");
-    if !user_line && !pr_result && !line.contains("\"tool_use\"") {
+    let create_result = (!pr_create_calls.is_empty() || !issue_create_calls.is_empty())
+        && line.contains("\"tool_result\"");
+    if !user_line && !create_result && !line.contains("\"tool_use\"") {
         return;
     }
     let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -1074,19 +1191,21 @@ fn observe_claude_line_with(
     let Some(content) = value.get("message").and_then(|m| m.get("content")) else {
         return;
     };
-    if pr_result && kind == Some("user") {
+    if create_result && kind == Some("user") {
         for block in content.as_array().into_iter().flatten() {
             if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                 continue;
             }
-            let created = block
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| pr_create_calls.remove(id));
-            if created {
+            let id = block.get("tool_use_id").and_then(Value::as_str);
+            if id.is_some_and(|id| pr_create_calls.remove(id)) {
                 let output = block.get("content").map(tool_result_text);
                 raw.prs
                     .extend(merge_plan::pr_urls_in(output.as_deref().unwrap_or("")));
+            }
+            if id.is_some_and(|id| issue_create_calls.remove(id)) {
+                let output = block.get("content").map(tool_result_text);
+                raw.issue_keys
+                    .extend(linear_issue_keys_in(output.as_deref().unwrap_or("")));
             }
         }
     }
@@ -1140,6 +1259,14 @@ fn observe_claude_line_with(
                 if creates_pr {
                     pr_create_calls.insert(id.to_string());
                 }
+                let creates_issue = name == "Bash"
+                    && input
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_linear_issue_create);
+                if creates_issue {
+                    issue_create_calls.insert(id.to_string());
+                }
             }
         }
         _ => {}
@@ -1169,11 +1296,19 @@ fn scan_lines(
     let mut reader = BufReader::new(std::fs::File::open(path)?);
     let mut line = String::new();
     let mut pr_create_calls = HashSet::new();
+    let mut issue_create_calls = HashSet::new();
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
-            Ok(_) => observe_claude_line_with(raw, &mut pr_create_calls, &line, home, main),
+            Ok(_) => observe_claude_line_with(
+                raw,
+                &mut pr_create_calls,
+                &mut issue_create_calls,
+                &line,
+                home,
+                main,
+            ),
             // A line that is not UTF-8 is skipped, not fatal.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
             Err(error) => return Err(error),
@@ -2124,6 +2259,127 @@ branch refs/heads/tracey/tru-12-thing
         });
         assert_eq!(facts.prs.len(), 2);
         assert!(!facts.is_empty());
+    }
+
+    #[test]
+    fn live_frames_record_linear_issues_from_create_results_only() {
+        let mut live = LiveFacts::default();
+        let bash = |id: &str, command: &str| HarnessEvent::ItemStarted {
+            id: id.into(),
+            kind: ItemKind::ToolCall {
+                name: "Bash".into(),
+                input: json!({ "command": command }),
+            },
+        };
+        let done = |id: &str, output: &str| HarnessEvent::ItemCompleted {
+            id: id.into(),
+            output: output.into(),
+            is_error: false,
+        };
+        live.observe(&bash("view", "linear issue view DEMO-20"), None);
+        live.observe(
+            &done(
+                "view",
+                "https://linear.app/fake-space/issue/DEMO-20/example",
+            ),
+            None,
+        );
+        live.observe(
+            &bash(
+                "update",
+                "linear --workspace fake-space issue update DEMO-21",
+            ),
+            None,
+        );
+        live.observe(
+            &done(
+                "update",
+                "https://linear.app/fake-space/issue/DEMO-21/example",
+            ),
+            None,
+        );
+        live.observe(
+            &bash(
+                "create",
+                "linear --workspace fake-space issue create --title example",
+            ),
+            None,
+        );
+        live.observe(
+            &done(
+                "create",
+                "Created https://linear.app/fake-space/issue/DEMO-22/example",
+            ),
+            None,
+        );
+        live.observe(&bash("failed", "linear issue create --title failed"), None);
+        live.observe(&done("failed", "creation failed"), None);
+        live.observe(
+            &HarnessEvent::TextDelta(
+                "https://linear.app/fake-space/issue/DEMO-23/assistant".into(),
+            ),
+            None,
+        );
+        let raw = live.take_due(Instant::now(), true).expect("issue is due");
+        assert_eq!(raw.issue_keys, vec!["DEMO-22"]);
+        let mut facts = ChatFacts::default();
+        raw.resolve_into(&mut facts, &mut GitResolver::default());
+        assert_eq!(facts.issue_keys, vec!["DEMO-22"]);
+    }
+
+    #[test]
+    fn transcript_scan_records_linear_issue_create_result_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript = temp.path().join("session.jsonl");
+        let lines = [
+            json!({"type":"assistant", "message":{"content":[
+                {"type":"text", "text":"https://linear.app/fake-space/issue/DEMO-30/assistant"},
+                {"type":"tool_use", "id":"view", "name":"Bash",
+                    "input":{"command":"linear issue view DEMO-31"}},
+                {"type":"tool_use", "id":"update", "name":"Bash",
+                    "input":{"command":"linear --workspace fake-space issue update DEMO-32"}},
+                {"type":"tool_use", "id":"create", "name":"Bash",
+                    "input":{"command":"linear --workspace fake-space issue create --title example"}},
+                {"type":"tool_use", "id":"failed", "name":"Bash",
+                    "input":{"command":"linear issue create --title failed"}}
+            ]}}),
+            json!({"type":"user", "message":{"content":[
+                {"type":"tool_result", "tool_use_id":"view",
+                    "content":"https://linear.app/fake-space/issue/DEMO-31/view"},
+                {"type":"tool_result", "tool_use_id":"update",
+                    "content":"https://linear.app/fake-space/issue/DEMO-32/update"},
+                {"type":"tool_result", "tool_use_id":"create",
+                    "content":[{"type":"text", "text":"https://linear.app/fake-space/issue/DEMO-33/example"}]},
+                {"type":"tool_result", "tool_use_id":"failed", "content":"no URL"}
+            ]}}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let raw = scan_claude_transcript(&transcript, None).unwrap();
+        assert_eq!(raw.issue_keys, vec!["DEMO-33"]);
+    }
+
+    #[test]
+    fn linear_issue_urls_require_a_complete_issue_path() {
+        assert_eq!(
+            linear_issue_keys_in(
+                "https://linear.app/fake-space/issue/DEMO-42/path, https://linear.app/fake-space/issue/DEMO-42abc, https://linear.app/fake-space/issue/demo-43, https://linear.app/fake-space/extra/issue/DEMO-45, https://example.com/fake-space/issue/DEMO-44"
+            ),
+            vec!["DEMO-42"]
+        );
+        assert!(is_linear_issue_create("linear issue create --title x"));
+        assert!(is_linear_issue_create(
+            "linear --workspace fake-space issue create --title x"
+        ));
+        assert!(!is_linear_issue_create("linear issue view DEMO-42"));
+        assert!(!is_linear_issue_create("linear issue update DEMO-42"));
     }
 
     #[test]
