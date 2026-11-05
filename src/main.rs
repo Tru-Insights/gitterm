@@ -218,6 +218,12 @@ pub enum AgentIpcMessage {
     },
     /// A message from the review pane's page on the Viewer (TRU-178).
     Review(gitterm::review_pane::ReviewIpc),
+    /// Native Page navigation, delivered after its policy callback returns.
+    PageNavigation {
+        generation: u64,
+        url: String,
+        reopen: bool,
+    },
     /// An edit card's Open in review (TRU-179): the absolute file it edited.
     OpenReview {
         tab_id: usize,
@@ -7672,6 +7678,7 @@ struct App {
     viewer_webview: ViewerWebview,
     /// URL currently shown when `viewer_webview` is `Page`.
     viewer_page_url: Option<String>,
+    viewer_page_generation: u64,
     /// Store identity bound to the current remote page surface.
     viewer_page_store: Option<webview::PageDataStore>,
     /// Agent tabs that own a chat page (`WebviewSurface::Agent(tab_id)`),
@@ -7749,6 +7756,77 @@ fn bar_hint_target(visible: VisibleSurface, console_expanded: bool) -> BarHintTa
     }
 }
 
+/// Global Iced layers that cover native webviews. Keep in sync with view_base.
+#[derive(Default)]
+struct WebviewOverlays {
+    usage: bool,
+    browser_evidence: bool,
+    task_switcher: bool,
+    task_tab_close: bool,
+    task_worktree_delete: bool,
+    task_publish: bool,
+    new_task: bool,
+    help: bool,
+    new_work: bool,
+    park: bool,
+    parked_list: bool,
+    pr_action: bool,
+    ready_list: bool,
+    workspace_settings: bool,
+    bar_menu: bool,
+    tab_picker: bool,
+    phone: bool,
+    remote_connect: bool,
+    folder_picker: bool,
+}
+
+impl WebviewOverlays {
+    fn is_open(&self) -> bool {
+        self.usage
+            || self.browser_evidence
+            || self.task_switcher
+            || self.task_tab_close
+            || self.task_worktree_delete
+            || self.task_publish
+            || self.new_task
+            || self.help
+            || self.new_work
+            || self.park
+            || self.parked_list
+            || self.pr_action
+            || self.ready_list
+            || self.workspace_settings
+            || self.bar_menu
+            || self.tab_picker
+            || self.phone
+            || self.remote_connect
+            || self.folder_picker
+    }
+}
+
+/// Keep stateful content and console siblings at fixed indices across viewer changes.
+fn workspace_column<'a>(
+    tab_bar: Element<'a, Event, Theme, iced::Renderer>,
+    header: Option<Element<'a, Event, Theme, iced::Renderer>>,
+    content: Element<'a, Event, Theme, iced::Renderer>,
+    divider: Option<Element<'a, Event, Theme, iced::Renderer>>,
+    console: Element<'a, Event, Theme, iced::Renderer>,
+    workspace_bar: Element<'a, Event, Theme, iced::Renderer>,
+) -> Column<'a, Event, Theme, iced::Renderer> {
+    // Column::push drops zero-height widgets; from_vec preserves the empty slots.
+    Column::from_vec(vec![
+        tab_bar,
+        header.unwrap_or_else(|| iced::widget::Space::new().height(0).into()),
+        content,
+        divider.unwrap_or_else(|| iced::widget::Space::new().height(0).into()),
+        console,
+        workspace_bar,
+    ])
+    .spacing(0)
+    .width(Length::Fill)
+    .height(Length::Fill)
+}
+
 fn github_page_store(
     owner: &str,
     accounts: &std::collections::BTreeMap<String, String>,
@@ -7763,6 +7841,132 @@ fn linear_page_store(workspace: Option<&str>) -> webview::PageDataStore {
         .filter(|slug| !slug.is_empty())
         .map(|slug| webview::PageDataStore::Linear(slug.to_string()))
         .unwrap_or(webview::PageDataStore::Default)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PageNavigationDecision {
+    Allow,
+    Reopen(webview::PageDataStore),
+    External,
+    Cancel,
+}
+
+struct PageNavigationContext {
+    url: String,
+    store: webview::PageDataStore,
+    github_accounts: std::collections::BTreeMap<String, String>,
+    linear_workspaces: std::collections::BTreeSet<String>,
+}
+
+fn page_navigation_decision(url: &str, context: &PageNavigationContext) -> PageNavigationDecision {
+    use PageNavigationDecision::{Allow, Cancel, External, Reopen};
+    let Ok(destination) = webview::browser_url(url) else {
+        return Cancel;
+    };
+    if destination.scheme() != "https"
+        || !destination.username().is_empty()
+        || destination.password().is_some()
+        || destination.port().is_some()
+    {
+        return External;
+    }
+    let origin = url::Url::parse(&context.url).ok();
+    let same_service = origin.as_ref().and_then(url::Url::host_str) == destination.host_str();
+    let segments: Vec<_> = destination.path_segments().into_iter().flatten().collect();
+    let first = segments.first().copied().unwrap_or_default();
+    // Encoded or empty identity prefixes are ambiguous; let the browser resolve them.
+    if destination.path() != "/" && (first.is_empty() || first.contains('%')) {
+        return External;
+    }
+    let store = match destination.host_str() {
+        Some("github.com") => {
+            // Authentication and account-wide pages must retain the selected login.
+            if destination.path() == "/"
+                || matches!(first, "login" | "session" | "sessions" | "settings")
+            {
+                if same_service {
+                    context.store.clone()
+                } else {
+                    webview::PageDataStore::Default
+                }
+            } else {
+                let current_owner = origin
+                    .as_ref()
+                    .filter(|url| url.host_str() == Some("github.com"))
+                    .and_then(|url| url.path_segments()?.next());
+                let canonical_pr = segments.get(2) == Some(&"pull")
+                    && segments
+                        .get(3)
+                        .is_some_and(|number| number.parse::<u64>().is_ok_and(|number| number > 0));
+                let mapped =
+                    gitterm::pr_watch::account_for(first, &context.github_accounts).is_some();
+                if !mapped && !canonical_pr && current_owner != Some(first) {
+                    return External;
+                }
+                github_page_store(first, &context.github_accounts)
+            }
+        }
+        Some("linear.app") => {
+            if destination.path() == "/"
+                || first == "login"
+                || destination.path() == "/oauth/authorize"
+            {
+                if same_service {
+                    context.store.clone()
+                } else {
+                    webview::PageDataStore::Default
+                }
+            } else if let Some(workspace) = gitterm::issue_titles::workspace_from_issue_url(url) {
+                linear_page_store(Some(&workspace))
+            } else {
+                let origin_workspace = origin
+                    .as_ref()
+                    .and_then(|url| gitterm::issue_titles::workspace_from_issue_url(url.as_str()));
+                let current_workspace = match &context.store {
+                    webview::PageDataStore::Linear(workspace) => Some(workspace.as_str()),
+                    _ => origin_workspace.as_deref(),
+                };
+                // Only known workspace prefixes select stores; a valid-looking
+                // slug alone cannot distinguish a workspace from a global route.
+                if context.linear_workspaces.contains(first)
+                    || (same_service && current_workspace == Some(first))
+                {
+                    linear_page_store(Some(first))
+                } else {
+                    return External;
+                }
+            }
+        }
+        _ => return External,
+    }
+    .normalized();
+    if store == context.store {
+        Allow
+    } else {
+        Reopen(store)
+    }
+}
+
+fn effective_page_navigation_decision(
+    url: &str,
+    context: &PageNavigationContext,
+) -> PageNavigationDecision {
+    match page_navigation_decision(url, context) {
+        PageNavigationDecision::Reopen(store)
+            if store.clone().for_current_os() == context.store =>
+        {
+            PageNavigationDecision::Allow
+        }
+        decision => decision,
+    }
+}
+
+fn current_page_navigation(
+    viewer: ViewerWebview,
+    current_generation: u64,
+    generation: u64,
+) -> bool {
+    viewer == ViewerWebview::Page && current_generation == generation
 }
 
 /// A rough bubble width for 15px Menlo text (0.6em a character), enough to
@@ -18753,6 +18957,7 @@ impl App {
             dictation_held: HashMap::new(),
             viewer_webview: ViewerWebview::None,
             viewer_page_url: None,
+            viewer_page_generation: 0,
             viewer_page_store: None,
             agent_pages: Vec::new(),
             chat_index: Vec::new(),
@@ -21416,10 +21621,17 @@ fi
     }
 
     fn update(&mut self, event: Event) -> Task<Event> {
+        let overlay_was_open = self.webview_overlay_open();
         let task = self.update_event(event);
-        match self.settle_active_workspace() {
+        let task = match self.settle_active_workspace() {
             Some(settle) => Task::batch([task, settle]),
             None => task,
+        };
+        // Covers every event path, including early returns and nested updates.
+        if overlay_was_open != self.webview_overlay_open() {
+            Task::batch([task, self.apply_webview_surfaces()])
+        } else {
+            task
         }
     }
 
@@ -22538,10 +22750,42 @@ fi
                 }
             }
             Event::AgentWebviewIpc(msg) => {
-                // The IPC bridge already tagged each message with a tab_id
-                // (from window.__currentTabId in the JS). Translate into the
-                // existing AgentSubmitPrompt / AgentStopRequested handlers.
+                // The bridge carries native Page navigation and tab-tagged
+                // chat/review IPC, translated into the host's typed handlers.
                 return match msg {
+                    AgentIpcMessage::PageNavigation {
+                        generation,
+                        url,
+                        reopen,
+                    } => {
+                        if !current_page_navigation(
+                            self.viewer_webview,
+                            self.viewer_page_generation,
+                            generation,
+                        ) {
+                            return Task::none();
+                        }
+                        if reopen {
+                            match page_navigation_decision(&url, &self.page_navigation_context()) {
+                                PageNavigationDecision::Reopen(store) => {
+                                    self.open_page_in_store(url, store)
+                                }
+                                PageNavigationDecision::Allow => self.open_page_in_store(
+                                    url,
+                                    self.viewer_page_store.clone().expect("active Page store"),
+                                ),
+                                PageNavigationDecision::External => {
+                                    webview::open_url_in_browser(&url);
+                                    Task::none()
+                                }
+                                PageNavigationDecision::Cancel => Task::none(),
+                            }
+                        } else {
+                            self.viewer_page_url = Some(url);
+                            self.install_page_navigation_handler();
+                            Task::none()
+                        }
+                    }
                     AgentIpcMessage::Submit {
                         tab_id,
                         text,
@@ -29472,22 +29716,30 @@ fi
         }
     }
 
-    /// Something Iced draws covers the content area, so the native
-    /// webviews (which would sit on top of it) stay hidden: the Usage view
-    /// or the folder picker.
-    /// Iced overlays that native webviews would otherwise cover: while one
-    /// is open the chat and viewer pages are hidden.
+    /// Native webviews sit above Iced, so hide them under every covering layer.
     fn webview_overlay_open(&self) -> bool {
-        self.usage_view.open
-            || self.folder_picker.is_some()
-            || self.phone_panel.is_some()
-            || self.remote_connect_form.is_some()
-            || self.new_work_sheet.is_some()
-            || self.park_sheet.is_some()
-            || self.parked_list_open
-            || self.prs.action.is_some()
-            || self.prs.ready_open
-            || self.bar_menu.is_some()
+        WebviewOverlays {
+            usage: self.usage_view.open,
+            browser_evidence: self.browser_evidence_open,
+            task_switcher: self.task_switcher_open,
+            task_tab_close: self.task_tab_close_prompt.is_some(),
+            task_worktree_delete: self.task_worktree_delete_prompt.is_some(),
+            task_publish: self.task_publish_prompt.is_some(),
+            new_task: self.new_task_form.is_some(),
+            help: self.show_help,
+            new_work: self.new_work_sheet.is_some(),
+            park: self.park_sheet.is_some(),
+            parked_list: self.parked_list_open,
+            pr_action: self.prs.action.is_some(),
+            ready_list: self.prs.ready_open,
+            workspace_settings: self.workspace_settings_open,
+            bar_menu: self.bar_menu.is_some(),
+            tab_picker: self.tab_picker_visible,
+            phone: self.phone_panel.is_some(),
+            remote_connect: self.remote_connect_form.is_some(),
+            folder_picker: self.folder_picker.is_some(),
+        }
+        .is_open()
     }
 
     fn visible_webview_surface(&self) -> VisibleSurface {
@@ -29530,6 +29782,7 @@ fi
         self.viewer_webview = viewer;
         if viewer != ViewerWebview::Page {
             self.viewer_page_url = None;
+            self.viewer_page_generation += 1;
         }
         if viewer != ViewerWebview::Review {
             self.review_pane = None;
@@ -29972,12 +30225,22 @@ fi
         url: String,
         requested_store: webview::PageDataStore,
     ) -> Task<Event> {
+        if let Err(error) = webview::browser_url(&url) {
+            eprintln!("[webview] page open refused: {error}");
+            return Task::none();
+        }
         let store = requested_store.for_current_os();
         let bounds = self.calculate_webview_bounds();
         webview::hide_agent_pages();
         self.viewer_page_url = Some(url.clone());
+        self.viewer_page_generation += 1;
         self.set_viewer_webview(ViewerWebview::Page);
         let action = webview::page_store_action(self.viewer_page_store.as_ref(), &store);
+        if action == webview::PageStoreAction::Rebuild {
+            webview::destroy(WebviewSurface::Page);
+        }
+        self.viewer_page_store = Some(store.clone());
+        self.install_page_navigation_handler();
         if action == webview::PageStoreAction::Navigate && webview::is_active(WebviewSurface::Page)
         {
             webview::update_bounds(WebviewSurface::Page, bounds.0, bounds.1, bounds.2, bounds.3);
@@ -29986,15 +30249,72 @@ fi
             return Task::none();
         }
 
-        if action == webview::PageStoreAction::Rebuild {
-            webview::destroy(WebviewSurface::Page);
-        }
-        self.viewer_page_store = Some(store.clone());
         let page_label = store.label();
         let page_url = url.clone();
         webview::set_pending_page(url, bounds, &store);
         webview::set_visible(WebviewSurface::Page, !self.webview_overlay_open());
         Self::create_staged_page_surface(page_url, page_label)
+    }
+
+    fn page_navigation_context(&self) -> PageNavigationContext {
+        PageNavigationContext {
+            url: self.viewer_page_url.clone().expect("active Page URL"),
+            store: self.viewer_page_store.clone().expect("active Page store"),
+            github_accounts: self.github_accounts.clone(),
+            linear_workspaces: self
+                .issues
+                .cache
+                .issues
+                .values()
+                .filter_map(|issue| {
+                    issue.workspace.clone().or_else(|| {
+                        issue
+                            .url
+                            .as_deref()
+                            .and_then(gitterm::issue_titles::workspace_from_issue_url)
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn install_page_navigation_handler(&self) {
+        let context = self.page_navigation_context();
+        let generation = self.viewer_page_generation;
+        let tx = AGENT_IPC_TX.get().cloned();
+        webview::set_page_navigation_handler(move |url| {
+            let reopen = match effective_page_navigation_decision(url, &context) {
+                PageNavigationDecision::Allow => false,
+                PageNavigationDecision::Reopen(_) => true,
+                PageNavigationDecision::External => {
+                    webview::open_url_in_browser(url);
+                    return false;
+                }
+                PageNavigationDecision::Cancel => {
+                    if let Err(error) = webview::browser_url(url) {
+                        eprintln!("[webview] page navigation refused: {error}");
+                    }
+                    return false;
+                }
+            };
+            let message = AgentIpcMessage::PageNavigation {
+                generation,
+                url: url.to_string(),
+                reopen,
+            };
+            match tx.as_ref().map(|tx| tx.send(message)) {
+                Some(Ok(())) => !reopen,
+                failure => {
+                    let reason = if failure.is_none() {
+                        "host channel is uninitialized"
+                    } else {
+                        "host channel is closed"
+                    };
+                    eprintln!("[webview] cannot dispatch page navigation for generation {generation}: {reason}");
+                    false
+                }
+            }
+        });
     }
 
     fn create_staged_page_surface(url: String, store_label: String) -> Task<Event> {
@@ -30436,24 +30756,15 @@ fi
         let content = freeze_time!("view_workspace_slide", { self.view_workspace_slide() });
         let console_panel = freeze_time!("view_bottom_panel", { self.view_bottom_panel() });
 
-        let mut main_col = Column::new()
-            .spacing(0)
-            .width(Length::Fill)
-            .height(Length::Fill);
-        main_col = main_col.push(tab_bar);
-        if self.viewer_webview == ViewerWebview::PlansViewer {
-            main_col = main_col.push(self.view_plans_viewer_header());
-        }
-        if self.viewer_webview == ViewerWebview::Page {
-            main_col = main_col.push(self.view_page_header());
-        }
-        if self.viewer_webview == ViewerWebview::Review {
-            main_col = main_col.push(self.view_review_header());
-        }
-        main_col = main_col.push(content);
+        let header = match self.viewer_webview {
+            ViewerWebview::PlansViewer => Some(self.view_plans_viewer_header()),
+            ViewerWebview::Page => Some(self.view_page_header()),
+            ViewerWebview::Review => Some(self.view_review_header()),
+            _ => None,
+        };
 
-        // Console divider (only when expanded)
-        if self.console_expanded {
+        // The divider keeps its slot even when collapsed.
+        let divider = if self.console_expanded {
             let theme = &self.theme;
             let divider_color = if self.dragging_console_divider {
                 theme.accent()
@@ -30471,14 +30782,19 @@ fi
             )
             .on_press(Event::ConsoleDividerDragStart)
             .interaction(iced::mouse::Interaction::ResizingVertically);
-            main_col = main_col.push(console_divider);
-        }
+            Some(console_divider.into())
+        } else {
+            None
+        };
 
-        main_col = main_col.push(console_panel);
-
-        // Bottom workspace bar
-        let workspace_bar = self.view_workspace_bar();
-        main_col = main_col.push(workspace_bar);
+        let main_col = workspace_column(
+            tab_bar,
+            header,
+            content,
+            divider,
+            console_panel,
+            self.view_workspace_bar(),
+        );
 
         row![spine, main_col]
             .spacing(0)
@@ -45253,6 +45569,259 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    fn page_context() -> PageNavigationContext {
+        PageNavigationContext {
+            url: "https://github.com/sample-owner-a/sample-repo/pull/1".to_string(),
+            store: webview::PageDataStore::GitHub("sample-login-a".to_string()),
+            github_accounts: [
+                ("sample-owner-a".to_string(), "sample-login-a".to_string()),
+                ("sample-alias-a".to_string(), "SAMPLE-LOGIN-A".to_string()),
+                ("sample-owner-b".to_string(), "sample-login-b".to_string()),
+            ]
+            .into(),
+            linear_workspaces: [
+                "sample-workspace-a".to_string(),
+                "sample-workspace-b".to_string(),
+            ]
+            .into(),
+        }
+    }
+
+    #[test]
+    fn page_navigation_preserves_same_identity_and_reopens_changed_identities() {
+        use PageNavigationDecision::{Allow, Reopen};
+        let context = page_context();
+        for url in [
+            "https://github.com/sample-owner-a/sample-repo/pull/2",
+            "https://github.com/sample-alias-a/sample-repo",
+            "https://github.com/login?return_to=%2Fsample-owner-a",
+            "https://github.com/login/oauth/authorize",
+            "https://github.com/session",
+            "https://github.com/sessions/two-factor/app",
+            "https://github.com/settings/profile",
+        ] {
+            assert_eq!(page_navigation_decision(url, &context), Allow, "{url}");
+        }
+        assert_eq!(
+            page_navigation_decision("https://github.com/sample-owner-b/sample-repo", &context),
+            Reopen(webview::PageDataStore::GitHub("sample-login-b".to_string())),
+        );
+        assert_eq!(
+            page_navigation_decision(
+                "https://github.com/unmapped-owner/sample-repo/pull/1",
+                &context
+            ),
+            Reopen(webview::PageDataStore::Default),
+        );
+        assert_eq!(
+            page_navigation_decision(
+                "https://linear.app/sample-workspace-a/issue/ABC-12/example",
+                &context
+            ),
+            Reopen(webview::PageDataStore::Linear(
+                "sample-workspace-a".to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn linear_navigation_uses_canonical_or_known_workspaces_and_preserves_login() {
+        use PageNavigationDecision::{Allow, External, Reopen};
+        let mut context = page_context();
+        context.url = "https://linear.app/sample-workspace-a/issue/ABC-12/example".to_string();
+        context.store = webview::PageDataStore::Linear("sample-workspace-a".to_string());
+        for url in [
+            "https://linear.app/sample-workspace-a/issue/ABC-13/example",
+            "https://linear.app/sample-workspace-a/team/example",
+            "https://linear.app/login",
+            "https://linear.app/oauth/authorize?client_id=sample",
+        ] {
+            assert_eq!(page_navigation_decision(url, &context), Allow, "{url}");
+        }
+        for url in [
+            "https://linear.app/sample-workspace-b/issue/ABC-14/example",
+            "https://linear.app/sample-workspace-b/team/example",
+        ] {
+            assert_eq!(
+                page_navigation_decision(url, &context),
+                Reopen(webview::PageDataStore::Linear(
+                    "sample-workspace-b".to_string()
+                )),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            page_navigation_decision(
+                "https://linear.app/unknown-workspace/team/example",
+                &context
+            ),
+            External
+        );
+    }
+
+    #[test]
+    fn page_navigation_routes_foreign_urls_externally_and_cancels_forbidden_schemes() {
+        use PageNavigationDecision::{Cancel, External};
+        let context = page_context();
+        for url in [
+            "https://example.test/",
+            "http://example.test/",
+            "http://github.com/login",
+            "http://github.com/session",
+            "http://linear.app/login",
+            "https://github.com.example.test/sample-owner-b/repo/pull/1",
+            "https://user@github.com/sample-owner-b/repo/pull/1",
+            "https://github.com:8443/sample-owner-b/repo/pull/1",
+            "https://github.com/explore",
+            "https://github.com/%73ample-owner-b/repo/pull/1",
+            "https://github.com//repo/pull/1",
+            "https://linear.app/%73ample-workspace-b/issue/ABC-12/example",
+        ] {
+            assert_eq!(page_navigation_decision(url, &context), External, "{url}");
+        }
+        for url in [
+            "file:///tmp/example",
+            "javascript:alert(1)",
+            "data:text/plain,example",
+            "sample-app:open",
+            "malformed",
+        ] {
+            assert_eq!(page_navigation_decision(url, &context), Cancel, "{url}");
+        }
+    }
+
+    #[test]
+    fn navigation_with_shared_os_store_does_not_reopen_in_a_loop() {
+        let destination_store =
+            webview::PageDataStore::GitHub("sample-login-b".to_string()).for_current_os();
+        let mut context = page_context();
+        context.store = destination_store;
+        assert_eq!(
+            effective_page_navigation_decision(
+                "https://github.com/sample-owner-b/sample-repo/pull/1",
+                &context
+            ),
+            PageNavigationDecision::Allow,
+        );
+    }
+
+    #[test]
+    fn allowed_navigation_refreshes_the_policy_for_the_next_destination() {
+        let mut context = page_context();
+        context.store = webview::PageDataStore::Default;
+        context.url = "https://github.com/unmapped-owner-a/sample-repo/pull/1".to_string();
+        let next = "https://github.com/unmapped-owner-b/sample-repo/pull/1";
+        assert_eq!(
+            page_navigation_decision(next, &context),
+            PageNavigationDecision::Allow
+        );
+        webview::set_page_navigation_handler(move |url| {
+            page_navigation_decision(url, &context) == PageNavigationDecision::Allow
+        });
+        // Mirrors the accepted-navigation event: refresh the policy after its URL changes.
+        let mut refreshed = page_context();
+        refreshed.store = webview::PageDataStore::Default;
+        refreshed.url = next.to_string();
+        webview::set_page_navigation_handler(move |url| {
+            page_navigation_decision(url, &refreshed) == PageNavigationDecision::Allow
+        });
+        // Exercise the policy through the live cell, just as the native callback does.
+        assert!(webview::test_page_navigation(
+            "https://github.com/unmapped-owner-b/sample-repo"
+        ));
+        webview::destroy(WebviewSurface::Page);
+    }
+
+    #[test]
+    fn stale_page_navigation_cannot_reopen_after_close_or_replacement() {
+        assert!(current_page_navigation(ViewerWebview::Page, 4, 4));
+        assert!(!current_page_navigation(ViewerWebview::Page, 5, 4));
+        assert!(!current_page_navigation(ViewerWebview::None, 4, 4));
+        assert!(!current_page_navigation(ViewerWebview::PlansViewer, 4, 4));
+    }
+
+    #[test]
+    fn workspace_content_and_console_keep_indices_and_state_across_page_changes() {
+        use iced::advanced::widget::Tree;
+        type InputState = iced::widget::text_input::State<
+            <iced::Renderer as iced::advanced::text::Renderer>::Paragraph,
+        >;
+        fn layout(page: bool, expanded: bool) -> Element<'static, Event, Theme, iced::Renderer> {
+            workspace_column(
+                text("tabs").into(),
+                page.then(|| text("page header").into()),
+                text_input("content", "").into(),
+                expanded.then(|| text("divider").into()),
+                text_input("console", "").into(),
+                text("bar").into(),
+            )
+            .into()
+        }
+        let initial = layout(false, false);
+        let mut tree = Tree::new(initial.as_widget());
+        assert_eq!(tree.children.len(), 6);
+        tree.children[2].state.downcast_mut::<InputState>().focus();
+        for (page, expanded) in [(true, false), (true, true), (false, true), (false, false)] {
+            let next = layout(page, expanded);
+            tree.diff(next.as_widget());
+            assert_eq!(tree.children.len(), 6);
+            assert!(tree.children[2]
+                .state
+                .downcast_ref::<InputState>()
+                .is_focused());
+            assert!(!tree.children[4]
+                .state
+                .downcast_ref::<InputState>()
+                .is_focused());
+        }
+    }
+
+    #[test]
+    fn every_covering_overlay_hides_page_viewer_and_agent_and_closing_restores_them() {
+        macro_rules! check_overlays {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    let mut overlays = WebviewOverlays { $field: true, ..Default::default() };
+                    for viewer in [ViewerWebview::Page, ViewerWebview::PlansViewer, ViewerWebview::None] {
+                        assert_eq!(
+                            visible_webview_surface(viewer, ActiveTabSurface::AgentChat(1), overlays.is_open()),
+                            VisibleSurface::None,
+                            stringify!($field),
+                        );
+                    }
+                    overlays.$field = false;
+                    assert!(!overlays.is_open(), stringify!($field));
+                    assert_eq!(
+                        visible_webview_surface(ViewerWebview::Page, ActiveTabSurface::AgentChat(1), overlays.is_open()),
+                        VisibleSurface::Page,
+                        stringify!($field),
+                    );
+                )+
+            }
+        }
+        check_overlays!(
+            usage,
+            browser_evidence,
+            task_switcher,
+            task_tab_close,
+            task_worktree_delete,
+            task_publish,
+            new_task,
+            help,
+            new_work,
+            park,
+            parked_list,
+            pr_action,
+            ready_list,
+            workspace_settings,
+            bar_menu,
+            tab_picker,
+            phone,
+            remote_connect,
+            folder_picker,
+        );
+    }
 
     #[test]
     fn pr_page_store_uses_owner_mapping_and_defaults_when_unmapped() {

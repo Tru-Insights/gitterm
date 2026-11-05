@@ -22,6 +22,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 type WebViewBounds = (f32, f32, f32, f32);
 
@@ -29,6 +30,7 @@ type WebViewBounds = (f32, f32, f32, f32);
 /// `window.ipc.postMessage(jsonString)`. Must be `Send + 'static` because wry runs
 /// the handler from the platform's web-process callback path.
 pub type IpcHandler = Box<dyn Fn(String) + Send + 'static>;
+type PageNavigationHandler = Box<dyn Fn(&str) -> bool>;
 
 /// Which child webview an operation targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +166,7 @@ struct SurfaceSlot {
     pending: Option<(PendingContent, WebViewBounds, Option<[u8; 16]>)>,
     data_store_identifier: Option<[u8; 16]>,
     pending_ipc_handler: Option<IpcHandler>,
+    page_navigation_handler: Option<Rc<RefCell<PageNavigationHandler>>>,
     visible: bool,
 }
 
@@ -173,6 +176,7 @@ impl SurfaceSlot {
         pending: None,
         data_store_identifier: None,
         pending_ipc_handler: None,
+        page_navigation_handler: None,
         visible: false,
     };
 }
@@ -302,6 +306,28 @@ pub fn set_pending_page(url: String, bounds: (f32, f32, f32, f32), store: &PageD
     });
 }
 
+/// Update a live Page's routing policy without replacing its native handler.
+/// Each surface owns its cell, so destroyed surfaces cannot read a new one's policy.
+pub fn set_page_navigation_handler(handler: impl Fn(&str) -> bool + 'static) {
+    with_slot(WebviewSurface::Page, |slot| {
+        if let Some(cell) = &slot.page_navigation_handler {
+            *cell.borrow_mut() = Box::new(handler);
+        } else {
+            slot.page_navigation_handler = Some(Rc::new(RefCell::new(Box::new(handler))));
+        }
+    });
+}
+
+#[cfg(test)]
+pub fn test_page_navigation(url: &str) -> bool {
+    PAGE_SURFACE.with(|slot| {
+        let slot = slot.borrow();
+        slot.page_navigation_handler
+            .as_ref()
+            .is_some_and(|handler| (handler.borrow())(url))
+    })
+}
+
 /// Navigate the live webview on `surface` to a URL. No-op if that surface has no
 /// webview. Use this when the webview is already up (`is_active()` returns true)
 /// and you want to swap its location without recreating the surface.
@@ -385,6 +411,19 @@ pub fn try_create_with_window(
             });
         }
 
+        if surface == WebviewSurface::Page {
+            // The independent cell avoids reborrowing SurfaceSlot if load_url
+            // invokes the policy synchronously. A missing policy fails closed.
+            // shortcut: wry 0.48's GTK hook has no frame identity; revisit when
+            // upstream exposes it. macOS/Windows call this for the main frame.
+            let handler = slot.page_navigation_handler.clone();
+            builder = builder.with_navigation_handler(move |url| {
+                handler
+                    .as_ref()
+                    .is_some_and(|handler| (handler.borrow())(&url))
+            });
+        }
+
         #[cfg(target_os = "macos")]
         if surface == WebviewSurface::Page {
             if let Some(identifier) = data_store_identifier {
@@ -415,18 +454,39 @@ pub fn try_create_with_window(
     .unwrap_or(Ok(false))
 }
 
-/// Open a URL using the platform's default browser. Viewer links that request
-/// a new window use this instead of creating another embedded surface.
+/// Validate content-controlled URLs before handing them to an OS protocol handler.
+pub fn browser_url(url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("refused URL scheme {}", parsed.scheme()));
+    }
+    Ok(parsed)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_browser_command(url: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("rundll32.exe");
+    command.args(["url.dll,FileProtocolHandler", url]);
+    command
+}
+
+/// Open an HTTP(S) URL using the platform's default browser.
 pub fn open_url_in_browser(url: &str) {
+    let url = match browser_url(url) {
+        Ok(url) => url,
+        Err(error) => {
+            eprintln!("[webview] browser open refused: {error}");
+            return;
+        }
+    };
     #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(url).spawn();
+    let result = std::process::Command::new("open").arg(url.as_str()).spawn();
     #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(url)
-        .spawn();
+    let result = windows_browser_command(url.as_str()).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
-    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    let result = std::process::Command::new("xdg-open")
+        .arg(url.as_str())
+        .spawn();
 
     if let Err(error) = result {
         eprintln!("[webview] cannot open {url} in the browser: {error}");
@@ -646,6 +706,61 @@ pub fn destroy(surface: WebviewSurface) {
 #[cfg(test)]
 mod tests {
     use super::{insert_composer_text_script, page_store_action, PageDataStore, PageStoreAction};
+
+    #[test]
+    fn page_policy_can_run_under_slot_borrow_and_old_surfaces_keep_their_own_policy() {
+        super::set_page_navigation_handler(|_| false);
+        let old = super::PAGE_SURFACE.with(|slot| {
+            let slot = slot.borrow();
+            let handler = slot.page_navigation_handler.as_ref().unwrap();
+            assert!(!(handler.borrow())("https://example.test/"));
+            handler.clone()
+        });
+        super::set_page_navigation_handler(|_| true);
+        assert!((old.borrow())("https://example.test/"));
+        super::destroy(super::WebviewSurface::Page);
+        super::set_page_navigation_handler(|_| false);
+        assert!((old.borrow())("https://example.test/"));
+        super::PAGE_SURFACE.with(|slot| {
+            let slot = slot.borrow();
+            assert!(!(slot.page_navigation_handler.as_ref().unwrap().borrow())(
+                "https://example.test/"
+            ));
+        });
+        super::destroy(super::WebviewSurface::Page);
+    }
+
+    #[test]
+    fn browser_urls_allow_only_http_and_https() {
+        for url in [
+            "https://example.test/",
+            "http://example.test/",
+            "HTTPS://example.test/",
+        ] {
+            assert!(super::browser_url(url).is_ok(), "{url}");
+        }
+        for (url, scheme) in [
+            ("file:///tmp/example", "file"),
+            ("javascript:alert(1)", "javascript"),
+            ("data:text/html,example", "data"),
+            ("sample-app:open", "sample-app"),
+        ] {
+            let error = super::browser_url(url).unwrap_err();
+            assert!(error.contains(scheme), "{error}");
+        }
+        assert!(super::browser_url("not a URL").is_err());
+    }
+
+    #[test]
+    fn windows_browser_opener_has_no_shell_and_keeps_url_as_one_argument() {
+        let url = "https://example.test/?x=1&sample.exe=2%20value";
+        let command = super::windows_browser_command(url);
+        assert_eq!(command.get_program(), "rundll32.exe");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["url.dll,FileProtocolHandler", url]
+        );
+    }
 
     #[test]
     fn a_pending_page_keeps_the_latest_hidden_visibility_request() {
