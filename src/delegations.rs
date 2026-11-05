@@ -2784,6 +2784,8 @@ mod tests {
                 "review",
                 "--uncommitted",
                 "-c",
+                "approval_policy=\"never\"",
+                "-c",
                 "model_reasoning_effort=\"high\"",
                 "--json",
                 "-o",
