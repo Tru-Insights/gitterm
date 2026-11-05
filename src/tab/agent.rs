@@ -480,6 +480,7 @@ impl AgentSession {
             mcp_servers,
             chrome,
             guidelines_file,
+            guidelines_content: None,
         })
     }
 
@@ -490,6 +491,7 @@ impl AgentSession {
         cwd: PathBuf,
         mcp_servers: Vec<AcpMcpServer>,
         support_dir: PathBuf,
+        guidelines: Option<gitterm::guidelines::Guidelines>,
     ) -> Option<AcpSessionConfig> {
         let AgentBackendConfig::Acp {
             agent,
@@ -515,6 +517,7 @@ impl AgentSession {
             env: Vec::new(),
             support_dir,
             wire_log_dir: std::env::var_os(ACP_WIRE_LOG_ENV).map(PathBuf::from),
+            guidelines,
         })
     }
 
@@ -1127,6 +1130,7 @@ mod tests {
                 PathBuf::from("/tmp/repo"),
                 Vec::new(),
                 PathBuf::from("/tmp/s"),
+                None,
             )
             .unwrap();
         assert_eq!(acp.resume.as_deref(), Some("g-1"));
@@ -1140,7 +1144,12 @@ mod tests {
             effort: Some("high".into()),
         });
         let acp = opencode
-            .acp_session_config(PathBuf::from("/tmp"), Vec::new(), PathBuf::from("/tmp/s"))
+            .acp_session_config(
+                PathBuf::from("/tmp"),
+                Vec::new(),
+                PathBuf::from("/tmp/s"),
+                None,
+            )
             .unwrap();
         assert_eq!(acp.model, None);
         assert_eq!(acp.mode.as_deref(), Some("plan"));

@@ -94,6 +94,7 @@ async fn main() {
         ],
         chrome: false,
         guidelines_file: None,
+        guidelines_content: None,
     };
     println!("argv: {}", config.args().join(" "));
     let (session, mut events) = ClaudeSession::spawn(config);

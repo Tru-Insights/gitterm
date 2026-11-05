@@ -155,6 +155,76 @@ pub fn opencode_config_content() -> Value {
     json!({"permission": {"edit": "ask", "bash": "ask"}})
 }
 
+fn opencode_config_content_with_guidelines(
+    guidelines: Option<&crate::guidelines::Guidelines>,
+) -> Value {
+    let mut config = opencode_config_content();
+    if let Some(guidelines) = guidelines {
+        config["instructions"] = json!([guidelines.path]);
+    }
+    config
+}
+
+/// Gemini has no ACP system-instruction field; its first ACP prompt carries
+/// the guidelines as a clearly delimited preamble. OpenCode reads the shared
+/// file through its native `instructions` configuration.
+#[derive(Clone, Copy)]
+enum GuidelinesChannel {
+    FirstPrompt,
+    ConfigFile,
+}
+
+fn guidelines_channel(agent: AcpAgent) -> Option<GuidelinesChannel> {
+    match agent {
+        AcpAgent::Gemini => Some(GuidelinesChannel::FirstPrompt),
+        AcpAgent::OpenCode => Some(GuidelinesChannel::ConfigFile),
+    }
+}
+
+fn first_prompt_text(
+    agent: AcpAgent,
+    guidelines: Option<&crate::guidelines::Guidelines>,
+    prompt: &str,
+) -> String {
+    prompt_text_for_channel(agent.label(), guidelines_channel(agent), guidelines, prompt)
+}
+
+fn prompt_text_for_channel(
+    label: &str,
+    channel: Option<GuidelinesChannel>,
+    guidelines: Option<&crate::guidelines::Guidelines>,
+    prompt: &str,
+) -> String {
+    let Some(guidelines) = guidelines else {
+        return prompt.to_string();
+    };
+    match channel {
+        Some(GuidelinesChannel::FirstPrompt) if !is_cli_command(prompt) => format!(
+            "<gitterm-change-guidelines>\n{}\n</gitterm-change-guidelines>\n\n{}",
+            guidelines.text.trim_end(),
+            prompt
+        ),
+        Some(GuidelinesChannel::FirstPrompt) => prompt.to_string(),
+        Some(GuidelinesChannel::ConfigFile) => prompt.to_string(),
+        None => {
+            acp_log(&format!(
+                "{label} has no instruction channel for change guidelines; skipping"
+            ));
+            prompt.to_string()
+        }
+    }
+}
+
+/// Gemini CLI dispatches slash and shell commands from the unadorned prompt.
+fn is_cli_command(prompt: &str) -> bool {
+    let prompt = prompt.trim_start();
+    prompt.starts_with('/') || prompt.starts_with('$')
+}
+
+fn should_defer_guidelines(agent: AcpAgent, prompt: &str) -> bool {
+    agent == AcpAgent::Gemini && is_cli_command(prompt)
+}
+
 /// Gemini CLI system settings for GitTerm's chats: whatever the machine's
 /// own system settings say, with the auth type pinned to the API key so
 /// neither `session/new` nor `session/load` needs `authenticate` (which
@@ -284,6 +354,8 @@ pub struct AcpSessionConfig {
     /// When set, every stdin/stdout frame is appended to
     /// `<dir>/acp-<agent>-<pid>-{stdin,stdout}.jsonl`.
     pub wire_log_dir: Option<PathBuf>,
+    /// GitTerm's change guidelines, when enabled for this repo.
+    pub guidelines: Option<crate::guidelines::Guidelines>,
 }
 
 impl std::fmt::Debug for AcpSessionConfig {
@@ -302,6 +374,7 @@ impl std::fmt::Debug for AcpSessionConfig {
             )
             .field("support_dir", &self.support_dir)
             .field("wire_log_dir", &self.wire_log_dir)
+            .field("guidelines", &self.guidelines.as_ref().map(|g| &g.path))
             .finish()
     }
 }
@@ -379,7 +452,7 @@ async fn prepare_agent_env(config: &AcpSessionConfig) -> Result<Vec<(String, Str
         }
         AcpAgent::OpenCode => Ok(vec![(
             OPENCODE_CONFIG_CONTENT_ENV.to_string(),
-            opencode_config_content().to_string(),
+            opencode_config_content_with_guidelines(config.guidelines.as_ref()).to_string(),
         )]),
     }
 }
@@ -1213,6 +1286,14 @@ impl HistoryBuilder {
         self.entries.is_empty()
     }
 
+    fn contains_guidelines_preamble(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(entry, TranscriptEntry::UserPrompt(text)
+                if text.contains("<gitterm-change-guidelines>")
+                    && text.contains("</gitterm-change-guidelines>"))
+        })
+    }
+
     pub fn finish(mut self) -> Vec<TranscriptEntry> {
         self.close_turn();
         self.entries
@@ -1482,6 +1563,7 @@ struct Session {
     /// The id of the prompt the running turn answers.
     turn_message: Option<String>,
     interrupted: bool,
+    prompt_started: bool,
     permissions: HashMap<String, PendingPermission>,
     next_request: u64,
     logged_methods: HashSet<String>,
@@ -1688,6 +1770,15 @@ impl Session {
             prompt.images.len(),
             prompt.id
         ));
+        let mut prompt = prompt;
+        if !self.prompt_started && !should_defer_guidelines(self.config.agent, &prompt.text) {
+            prompt.text = first_prompt_text(
+                self.config.agent,
+                self.config.guidelines.as_ref(),
+                &prompt.text,
+            );
+            self.prompt_started = true;
+        }
         let blocks = prompt_blocks(&prompt, self.images);
         self.in_turn = true;
         self.interrupted = false;
@@ -1746,6 +1837,7 @@ impl Session {
 
     async fn finish_history(&mut self) -> Result<(), String> {
         self.history_deadline = None;
+        self.prompt_started = self.history.contains_guidelines_preamble();
         let entries = std::mem::take(&mut self.history).finish();
         acp_log(&format!(
             "session {} replayed {} history entries",
@@ -2267,6 +2359,7 @@ async fn run_session(
         in_turn: false,
         turn_message: None,
         interrupted: false,
+        prompt_started: false,
         permissions: HashMap::new(),
         next_request: 0,
         logged_methods: HashSet::new(),
@@ -2809,6 +2902,20 @@ mod tests {
     }
 
     #[test]
+    fn resumed_history_records_that_guidelines_were_already_sent() {
+        let mut history = HistoryBuilder::default();
+        history.user_chunk(
+            Some("u1".into()),
+            "<gitterm-change-guidelines>\nRules\n</gitterm-change-guidelines>\n\nPlease help",
+        );
+        assert!(history.contains_guidelines_preamble());
+
+        let mut history = HistoryBuilder::default();
+        history.user_chunk(Some("u1".into()), "Please help");
+        assert!(!history.contains_guidelines_preamble());
+    }
+
+    #[test]
     fn a_model_api_error_fails_the_turn_with_the_agents_message() {
         // Gemini CLI 0.41.2 answers a failed model call with
         // `RequestError(status, message)` (gemini-KXTGCWBT.js, Session.prompt).
@@ -2885,10 +2992,68 @@ mod tests {
             env: vec![("GEMINI_API_KEY".into(), "key-value".into())],
             support_dir: "/tmp/s".into(),
             wire_log_dir: None,
+            guidelines: None,
         };
         let debug = format!("{config:?}");
         assert!(!debug.contains("key-value") && !debug.contains("secret-token"));
         assert_eq!(config.args(), vec!["--acp"]);
+    }
+
+    #[test]
+    fn acp_launch_gets_guidelines_only_when_repo_switch_is_on() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_dir.path().join(crate::guidelines::GUIDELINES_FILE),
+            "Follow the repository rules.\n",
+        )
+        .unwrap();
+        let on = crate::guidelines::for_launch(config_dir.path(), repo.path(), false);
+        assert!(on.is_some());
+        let off_settings = crate::guidelines::GuidelinesSettings {
+            enabled: true,
+            off_repos: vec![crate::guidelines::repo_key(repo.path())
+                .to_string_lossy()
+                .into_owned()],
+        };
+        crate::guidelines::save_settings(config_dir.path(), &off_settings).unwrap();
+        assert!(crate::guidelines::for_launch(config_dir.path(), repo.path(), false).is_none());
+
+        let on = on.unwrap();
+        assert_eq!(on.text, "Follow the repository rules.\n");
+        let opencode = opencode_config_content_with_guidelines(Some(&on));
+        assert_eq!(opencode["instructions"], json!([on.path]));
+        assert_eq!(first_prompt_text(AcpAgent::Gemini, Some(&on), "hello"),
+            "<gitterm-change-guidelines>\nFollow the repository rules.\n</gitterm-change-guidelines>\n\nhello");
+        assert_eq!(
+            first_prompt_text(AcpAgent::Gemini, Some(&on), "/help"),
+            "/help"
+        );
+        assert_eq!(
+            first_prompt_text(AcpAgent::Gemini, Some(&on), "  /init"),
+            "  /init"
+        );
+        assert_eq!(
+            first_prompt_text(AcpAgent::Gemini, Some(&on), "$ ls"),
+            "$ ls"
+        );
+        assert!(should_defer_guidelines(AcpAgent::Gemini, "/help"));
+        assert!(should_defer_guidelines(AcpAgent::Gemini, "$ ls"));
+        assert!(!should_defer_guidelines(AcpAgent::Gemini, "help me"));
+        assert!(!should_defer_guidelines(AcpAgent::OpenCode, "/help"));
+        assert_eq!(first_prompt_text(AcpAgent::Gemini, None, "hello"), "hello");
+    }
+
+    #[test]
+    fn acp_without_guidelines_channel_skips_and_logs() {
+        let guidelines = crate::guidelines::Guidelines {
+            path: "/cfg/agent-guidelines.md".into(),
+            text: "Follow the repository rules.".into(),
+        };
+        // Model an agent added later without a mapped channel. The launch
+        // helper logs the skip and leaves its user prompt untouched.
+        let text = prompt_text_for_channel("Future ACP", None, Some(&guidelines), "hello");
+        assert_eq!(text, "hello");
     }
 
     #[test]
