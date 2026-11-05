@@ -22614,10 +22614,16 @@ fi
                                 return Task::none();
                             }
                             if session.harness.is_none() {
+                                let guidelines = launch_instructions(
+                                    &repo_path,
+                                    guidelines_off,
+                                    document_places.as_ref(),
+                                );
                                 let Some(config) = session.acp_session_config(
                                     repo_path,
                                     std::mem::take(&mut acp_mcp_servers),
                                     acp_support_dir(),
+                                    guidelines,
                                 ) else {
                                     return Task::none();
                                 };
@@ -22684,19 +22690,12 @@ fi
                                         session.session_id = None;
                                     }
                                 }
-                                // Remote chats start without the
-                                // guidelines (TRU-174 is local only).
-                                let guidelines_file = remote_chat
-                                    .is_none()
-                                    .then(|| {
-                                        launch_instructions(
-                                            &repo_path,
-                                            guidelines_off,
-                                            document_places.as_ref(),
-                                        )
-                                    })
-                                    .flatten()
-                                    .map(|guidelines| guidelines.path);
+                                let guidelines_file = launch_instructions(
+                                    &repo_path,
+                                    guidelines_off,
+                                    document_places.as_ref(),
+                                )
+                                .map(|guidelines| guidelines.path);
                                 let Some(config) = session.claude_session_config(
                                     repo_path,
                                     std::mem::take(&mut claude_mcp_servers),
@@ -29881,13 +29880,17 @@ fi
         let remote_client = remote_id.as_deref().map(|id| self.remote_chat_client(id));
         // An ACP tab starts its agent here (local workspaces only); it gets
         // GitTerm's MCP servers under the tab's caller identity.
-        let tab_info = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.iter())
-            .find(|t| t.id == tab_id)
-            .map(|t| (t.repo_path.clone(), t.session_uid.clone()));
-        let Some((repo_path, caller)) = tab_info else {
+        let tab_info = self.workspaces.iter().find_map(|ws| {
+            ws.tabs.iter().find(|t| t.id == tab_id).map(|t| {
+                (
+                    t.repo_path.clone(),
+                    t.session_uid.clone(),
+                    ws.guidelines_off,
+                    ws.document_places(),
+                )
+            })
+        });
+        let Some((repo_path, caller, guidelines_off, document_places)) = tab_info else {
             return Task::none();
         };
         let acp_mcp_servers: Vec<gitterm::harness::acp::AcpMcpServer> = if remote_id.is_some() {
@@ -29931,9 +29934,14 @@ fi
                 session.history = tab::HistoryLoad::Loaded;
                 return Task::none();
             }
-            let Some(config) =
-                session.acp_session_config(repo_path, acp_mcp_servers, acp_support_dir())
-            else {
+            let guidelines =
+                launch_instructions(&repo_path, guidelines_off, document_places.as_ref());
+            let Some(config) = session.acp_session_config(
+                repo_path,
+                acp_mcp_servers,
+                acp_support_dir(),
+                guidelines,
+            ) else {
                 return Task::none();
             };
             eprintln!(

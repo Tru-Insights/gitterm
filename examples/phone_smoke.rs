@@ -396,6 +396,7 @@ async fn main() {
         mcp_servers: Vec::new(),
         chrome: false,
         guidelines_file: None,
+        guidelines_content: None,
     };
     let start_json =
         serde_json::to_string(&RemoteClaudeChatStart::from_config(&config).expect("remote start"))
