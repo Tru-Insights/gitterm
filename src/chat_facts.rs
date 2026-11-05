@@ -1305,9 +1305,23 @@ fn repo_write_targets(
     let Some(commands) = ShellScanner(command.chars().peekable(), 0).commands(false) else {
         return Vec::new();
     };
+    let changes_directory = commands
+        .iter()
+        .any(|cmd| !cmd.nested && cmd.words.first().is_some_and(|word| word == "cd"));
     // shortcut: shell control flow needs a full parser; skip it until supported.
+    // Only an uninterrupted cd && cd && ... chain establishes a conditional cwd.
+    let guarded_cd = commands.windows(2).any(|pair| {
+        pair[0].separator == "&&"
+            && pair[0].words.first().is_none_or(|word| word != "cd")
+            && !pair[1].nested
+            && pair[1].words.first().is_some_and(|word| word == "cd")
+    });
+    if guarded_cd {
+        return Vec::new();
+    }
     if commands.iter().any(|cmd| {
         matches!(cmd.separator.as_str(), "|" | "&")
+            || (changes_directory && cmd.separator == "||")
             || cmd.words.iter().any(|word| {
                 matches!(
                     word.as_str(),
@@ -2981,6 +2995,42 @@ branch refs/heads/tracey/tru-12-thing
         let mut facts = ChatFacts::default();
         raw.resolve_into(&mut facts, &mut GitResolver::default());
         assert_eq!(facts.repo_work, vec![api]);
+    }
+
+    #[test]
+    fn repo_write_conditionally_skipped_cd_never_joins() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = work_repo(temp.path(), "cwd");
+        let a = work_repo(temp.path(), "a");
+        let b = work_repo(temp.path(), "b");
+        let ambiguous = [
+            format!(
+                "cd '{}' && true || cd '{}' && git push",
+                a.display(),
+                b.display()
+            ),
+            format!("cd '{}' || true; git commit -m update", a.display()),
+            format!("[ -d '{}' ] && cd '{}'; git push", a.display(), a.display()),
+            format!(
+                "[ -d '{}' ] && cd '{}' && git push",
+                a.display(),
+                a.display()
+            ),
+            format!("false || cd '{}' && git push", a.display()),
+        ];
+        let joined: Vec<_> = ambiguous
+            .iter()
+            .map(|command| (command, command_repos(command, &cwd)))
+            .filter(|(_, repos)| !repos.is_empty())
+            .collect();
+        assert!(joined.is_empty(), "ambiguous commands joined: {joined:?}");
+        for (command, repo) in [
+            ("cd ../a && git push", a),
+            ("cd ../a && cd ../b && git push", b.clone()),
+            ("true; cd ../b && git push", b),
+        ] {
+            assert_eq!(command_repos(command, &cwd), vec![repo], "{command}");
+        }
     }
 
     #[test]
