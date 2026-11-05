@@ -882,8 +882,12 @@ pub fn claude_session_exists(session_id: &str) -> bool {
 /// machine. Looks across project slugs because the id alone does not say
 /// which cwd the session ran in.
 pub fn claude_session_path(session_id: &str) -> Option<PathBuf> {
+    claude_session_path_under(&claude_home_dir().join("projects"), session_id)
+}
+
+fn claude_session_path_under(projects: &Path, session_id: &str) -> Option<PathBuf> {
     let file_name = format!("{session_id}.jsonl");
-    std::fs::read_dir(claude_home_dir().join("projects"))
+    std::fs::read_dir(projects)
         .ok()?
         .flatten()
         .map(|entry| entry.path().join(&file_name))
@@ -1619,5 +1623,231 @@ mod tests {
             Some(QueryMatch::Child("Fable review of identity design".into()))
         );
         assert_eq!(QueryMatch::Title.label(), None);
+    }
+}
+
+/// Launch-specific marker in the initial prompt binds a Codex file to its
+/// GitTerm session even when several workers share the same checkout.
+pub fn task_session_marker(session_id: &str) -> String {
+    format!("GitTerm task session: {session_id}")
+}
+
+/// Probe only the launch day's files (and today, across midnight). This is
+/// independent of the Chats view/index and must run off the UI thread.
+pub fn started_task_conversation(
+    cwd: &Path,
+    session: &crate::tasks::TaskSessionRecord,
+    backend: crate::tasks::HarnessConversationBackend,
+) -> Result<Option<crate::tasks::HarnessConversationRef>, String> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| "Cannot locate home to verify worker startup".to_string())?;
+    started_task_conversation_under(&home, cwd, session, backend)
+}
+
+fn started_task_conversation_under(
+    home: &Path,
+    cwd: &Path,
+    session: &crate::tasks::TaskSessionRecord,
+    backend: crate::tasks::HarnessConversationBackend,
+) -> Result<Option<crate::tasks::HarnessConversationRef>, String> {
+    use crate::tasks::{HarnessConversationBackend as Backend, HarnessConversationRef};
+    if let Some(conversation) = &session.conversation {
+        if conversation.backend == Backend::Claude {
+            return Ok(claude_session_path_under(
+                &home.join(".claude/projects"),
+                &conversation.session_id,
+            )
+            .map(|_| conversation.clone()));
+        }
+    }
+    if backend != Backend::Codex {
+        return Ok(None);
+    }
+    let started = chrono::DateTime::parse_from_rfc3339(&session.created_at).map_err(|error| {
+        format!(
+            "session {} has invalid start time: {error}",
+            session.task_session_id
+        )
+    })?;
+    let root = home.join(".codex/sessions");
+    let dates = [
+        started.with_timezone(&chrono::Utc).date_naive(),
+        chrono::Utc::now().date_naive(),
+    ];
+    for (index, date) in dates.iter().enumerate() {
+        if index == 1 && *date == dates[0] {
+            continue;
+        }
+        let day = root.join(date.format("%Y/%m/%d").to_string());
+        let files = match std::fs::read_dir(&day) {
+            Ok(files) => files,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("read startup sessions {}: {error}", day.display())),
+        };
+        for entry in files {
+            let path = entry
+                .map_err(|error| {
+                    format!("read startup session entry in {}: {error}", day.display())
+                })?
+                .path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(id) = started_codex_session(&path, cwd, &session.task_session_id, started)?
+            {
+                return Ok(Some(HarnessConversationRef {
+                    backend: Backend::Codex,
+                    session_id: id,
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn started_codex_session(
+    path: &Path,
+    cwd: &Path,
+    task_session_id: &str,
+    started: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<Option<String>, String> {
+    // shortcut: bounded initial rollout scan; increase if launch instructions
+    // exceed 2 MiB before the initial prompt is recorded.
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("read startup session {}: {error}", path.display()))?;
+    let reader = BufReader::new(file.take(2 * 1024 * 1024));
+    let marker = task_session_marker(task_session_id);
+    let mut id = None;
+    for line in reader.lines() {
+        let line =
+            line.map_err(|error| format!("read startup session {}: {error}", path.display()))?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            let Some(payload) = value.get("payload") else {
+                return Ok(None);
+            };
+            let stamp = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok());
+            if codex_meta_is_subagent(payload)
+                || payload
+                    .get("originator")
+                    .and_then(Value::as_str)
+                    .is_some_and(|origin| origin.contains("exec"))
+                || payload
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .and_then(|path| std::fs::canonicalize(path).ok())
+                    != std::fs::canonicalize(cwd).ok()
+                || stamp.is_none_or(|stamp| stamp < started)
+            {
+                return Ok(None);
+            }
+            id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        if let Some((true, text)) = codex_message(&value) {
+            if text.lines().any(|line| line == marker) {
+                return Ok(id);
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod task_startup_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn claude_startup_waits_for_its_exact_preassigned_transcript() {
+        use crate::tasks::*;
+        let temp = tempfile::tempdir().unwrap();
+        let conversation = HarnessConversationRef {
+            backend: HarnessConversationBackend::Claude,
+            session_id: "fixture-id".into(),
+        };
+        let session = TaskSessionRecord {
+            task_session_id: "worker".into(),
+            label: "Claude".into(),
+            harness: None,
+            conversation: Some(conversation.clone()),
+            objective_delivery: ObjectiveDeliveryState::Pending,
+            created_at: "2026-11-05T10:00:00Z".into(),
+            updated_at: "2026-11-05T10:00:00Z".into(),
+        };
+        let probe = || {
+            started_task_conversation_under(
+                temp.path(),
+                temp.path(),
+                &session,
+                HarnessConversationBackend::Claude,
+            )
+            .unwrap()
+        };
+        assert!(probe().is_none());
+        assert!(crate::workers::startup_timed_out(90, probe().is_some()));
+        let slug = temp.path().join(".claude/projects/fixture");
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::write(slug.join("other-id.jsonl"), "{}").unwrap();
+        assert!(probe().is_none());
+        std::fs::write(slug.join("fixture-id.jsonl"), "{}").unwrap();
+        assert_eq!(probe(), Some(conversation));
+        assert!(!crate::workers::startup_timed_out(90, probe().is_some()));
+    }
+
+    #[test]
+    fn startup_file_requires_fresh_cwd_and_unique_initial_prompt_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout.jsonl");
+        let cwd = temp.path();
+        let start = chrono::DateTime::parse_from_rfc3339("2026-11-05T10:00:01Z").unwrap();
+        // No file/session cannot count as started, even after the deadline.
+        assert!(started_codex_session(&path, cwd, "worker-a", start).is_err());
+        assert!(crate::workers::startup_timed_out(90, false));
+        let meta = json!({"type":"session_meta", "timestamp":"2026-11-05T10:00:02Z", "payload":{
+            "id":"conversation-a", "cwd":cwd, "source":"cli", "originator":"codex_cli_rs"}});
+        let prompt = json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{
+            "type":"input_text", "text":format!("Synthetic initial objective\n{}", task_session_marker("worker-a"))}]}});
+        let write = |meta: &Value, prompt: &Value| {
+            std::fs::write(&path, format!("{meta}\n{prompt}\n")).unwrap()
+        };
+        write(&meta, &prompt);
+        let found = started_codex_session(&path, cwd, "worker-a", start).unwrap();
+        assert_eq!(found.as_deref(), Some("conversation-a"));
+        assert!(!crate::workers::startup_timed_out(90, found.is_some()));
+        // Concurrent workers in one checkout must not claim one another.
+        assert!(started_codex_session(&path, cwd, "worker-b", start)
+            .unwrap()
+            .is_none());
+        assert!(
+            started_codex_session(&path, Path::new("/other-checkout"), "worker-a", start)
+                .unwrap()
+                .is_none()
+        );
+        let mut old = meta.clone();
+        old["timestamp"] = json!("2026-11-05T09:59:00Z");
+        write(&old, &prompt);
+        assert!(started_codex_session(&path, cwd, "worker-a", start)
+            .unwrap()
+            .is_none());
+        let mut subagent = meta.clone();
+        subagent["payload"]["source"] = json!({"subagent":"guardian"});
+        write(&subagent, &prompt);
+        assert!(started_codex_session(&path, cwd, "worker-a", start)
+            .unwrap()
+            .is_none());
+        let mut assistant = prompt.clone();
+        assistant["payload"]["role"] = json!("assistant");
+        write(&meta, &assistant);
+        assert!(started_codex_session(&path, cwd, "worker-a", start)
+            .unwrap()
+            .is_none());
     }
 }

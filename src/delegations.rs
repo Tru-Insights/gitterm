@@ -437,6 +437,36 @@ pub fn record_handoff(
     Ok(report_to)
 }
 
+/// Watchdogs may block only a currently active worker hosted by this
+/// session. Repeated ticks and late probes cannot replace a worker report.
+pub fn record_watchdog_handoff(
+    store: &mut TaskStore,
+    task_id: &str,
+    session_id: &str,
+    handoff: TaskHandoff,
+    timestamp: &str,
+) -> Result<Option<String>, String> {
+    let active = store
+        .open_worker_delegations(task_id)
+        .iter()
+        .any(|delegation| {
+            delegation.status.is_active()
+                && matches!(&delegation.child,
+            DelegationChild::TaskSession { task_session_id: Some(id), .. } if id == session_id)
+        });
+    if !active {
+        return Ok(None);
+    }
+    record_handoff(
+        store,
+        task_id,
+        handoff,
+        HandoffStatus::Blocked,
+        Some(session_id),
+        timestamp,
+    )
+}
+
 /// The worker's tab as GitTerm sees it, for the card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerTab {
@@ -2812,6 +2842,94 @@ mod tests {
                 assert!(store.delegation(&id).unwrap().is_delivered());
             }
         }
+    }
+
+    #[test]
+    fn watchdog_reports_once_and_cannot_overwrite_a_worker_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(crate::tasks::TASKS_FILE_NAME)).unwrap();
+        store.insert(test_task("task-watch", temp.path())).unwrap();
+        let delegation = Delegation::new_requested(
+            worker_delegation(
+                &caller(),
+                "task-watch",
+                "Fix",
+                "Do it",
+                &worker_choice(),
+                &DelegationRunOptions::default(),
+            )
+            .unwrap(),
+            "t1",
+        );
+        let id = delegation.delegation_id.clone();
+        store.insert_delegation(delegation).unwrap();
+        store
+            .upsert_session("task-watch", session("worker"), "t2")
+            .unwrap();
+        store
+            .attach_worker_session(&id, "worker", None, "t2")
+            .unwrap();
+        let report = handoff(
+            "Worker stuck at startup\nScreen tail:\nTrust this folder?",
+            &["No session"],
+        );
+        assert!(
+            record_watchdog_handoff(&mut store, "task-watch", "other", report.clone(), "t3")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            record_watchdog_handoff(&mut store, "task-watch", "worker", report.clone(), "t3")
+                .unwrap(),
+            Some(id.clone())
+        );
+        assert_eq!(
+            store.delegation(&id).unwrap().status,
+            DelegationStatus::Blocked
+        );
+        assert!(record_watchdog_handoff(
+            &mut store,
+            "task-watch",
+            "worker",
+            handoff("duplicate", &[]),
+            "t4"
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            store
+                .get("task-watch")
+                .unwrap()
+                .handoff
+                .as_ref()
+                .unwrap()
+                .summary,
+            report.summary
+        );
+        record_handoff(
+            &mut store,
+            "task-watch",
+            handoff("Finished", &[]),
+            HandoffStatus::Done,
+            Some("worker"),
+            "t5",
+        )
+        .unwrap();
+        assert!(
+            record_watchdog_handoff(&mut store, "task-watch", "worker", report, "t6")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get("task-watch")
+                .unwrap()
+                .handoff
+                .as_ref()
+                .unwrap()
+                .summary,
+            "Finished"
+        );
     }
 
     #[test]
