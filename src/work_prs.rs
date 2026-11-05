@@ -311,6 +311,18 @@ fn pr_row_parts(is_next: bool, expanded: bool) -> PrRowParts {
     }
 }
 
+fn pr_row_position(row: Option<&OrderedRow>) -> Option<usize> {
+    row.filter(|row| !matches!(row.status, RowStatus::Unordered(_)))
+        .map(|row| row.position)
+}
+
+fn pr_unordered_fact(row: Option<&OrderedRow>) -> Option<String> {
+    match row.map(|row| &row.status) {
+        Some(RowStatus::Unordered(reason)) => Some(format!("unordered: {reason}")),
+        _ => None,
+    }
+}
+
 /// Everything the app keeps for PRs.
 #[derive(Debug, Default)]
 pub struct PrsState {
@@ -1728,6 +1740,9 @@ impl App {
             Some(RowStatus::Held(_)) => facts.push(("held".into(), theme.warning())),
             _ => {}
         }
+        if let Some(unordered) = pr_unordered_fact(row) {
+            facts.push((unordered, theme.warning()));
+        }
         // A draft can't be merged; say so where it can't be missed.
         if draft {
             facts.push(("draft".into(), theme.warning()));
@@ -1828,11 +1843,13 @@ impl App {
             .align_y(iced::Alignment::Center);
         if columns.position {
             line = line.push(
-                text(row.map_or_else(String::new, |row| format!("{}", row.position)))
-                    .size(font_small)
-                    .color(text_muted)
-                    .font(mono)
-                    .width(Length::Fixed(PR_POSITION_WIDTH)),
+                text(
+                    pr_row_position(row).map_or_else(String::new, |position| format!("{position}")),
+                )
+                .size(font_small)
+                .color(text_muted)
+                .font(mono)
+                .width(Length::Fixed(PR_POSITION_WIDTH)),
             );
         }
         line = line.push(self.pr_number_cell(key, columns.number_chars));
@@ -2752,6 +2769,32 @@ mod tests {
         let next_opened = pr_row_parts(true, true);
         assert!(next_opened.opened && next_opened.merge_on_title);
         assert!(!next_opened.merge_in_actions);
+    }
+
+    #[test]
+    fn unordered_pr_rows_keep_the_warning_and_hide_the_numeric_position() {
+        let row = OrderedRow {
+            position: 3,
+            entry: merge_plan::PlanEntry {
+                repo: "acme/api".into(),
+                number: 12,
+                step: None,
+                after: Vec::new(),
+                hold: None,
+                method: None,
+                unordered_reason: Some("ambiguous branch dependency".into()),
+                note: None,
+            },
+            waits: Vec::new(),
+            stacked: false,
+            status: RowStatus::Unordered("ambiguous branch dependency".into()),
+        };
+
+        assert_eq!(pr_row_position(Some(&row)), None);
+        assert_eq!(
+            pr_unordered_fact(Some(&row)).as_deref(),
+            Some("unordered: ambiguous branch dependency")
+        );
     }
 
     #[test]
