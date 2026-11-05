@@ -26,6 +26,7 @@ const BADGE_HEIGHT: f32 = 12.0;
 pub enum PlanLimitsEvent {
     /// A Codex read finished: the newest account-wide reading, if any.
     CodexRead(Option<Box<PlanLimits>>),
+    PinChanged(Option<plan_limits::RoutingPin>),
     Saved(Result<(), String>),
 }
 
@@ -144,7 +145,15 @@ impl App {
     }
 
     fn evaluate_plan_limits(&mut self) {
-        let evaluation = plan_limits::evaluate_policy(&self.plan_limits.file, now_unix());
+        let now = now_unix();
+        if self.plan_limits.file.prune_history(now) {
+            self.plan_limits.dirty = true;
+        }
+        let evaluation = plan_limits::evaluate_policy(&self.plan_limits.file, now);
+        if self.plan_limits.file.pin != evaluation.pin {
+            self.plan_limits.file.pin = evaluation.pin.clone();
+            self.plan_limits.dirty = true;
+        }
         if self.plan_limits.file.policy.as_ref() != Some(&evaluation.policy) {
             self.plan_limits.file.policy = Some(evaluation.policy);
             self.plan_limits.dirty = true;
@@ -275,6 +284,24 @@ impl App {
                 }
                 return self.save_plan_limits();
             }
+            PlanLimitsEvent::PinChanged(pin) => {
+                if self.plan_limits.file.pin == pin {
+                    return Task::none();
+                }
+                self.plan_limits.file.pin = pin.clone();
+                self.plan_limits.dirty = true;
+                self.evaluate_plan_limits();
+                let chats = self
+                    .plan_limit_chats()
+                    .into_iter()
+                    .map(|(_, uid, _)| uid)
+                    .collect::<Vec<_>>();
+                self.plan_limits.queue_notices(
+                    &chats,
+                    &[plan_limits::pin_change_notice(pin.as_ref(), now_unix())],
+                );
+                return Task::batch([self.tell_plan_limit_coordinators(), self.save_plan_limits()]);
+            }
         }
         Task::none()
     }
@@ -384,6 +411,45 @@ impl App {
             Provider::Claude => "From GitTerm Claude chats; updates when a turn ends.",
             Provider::Codex => "From the newest Codex rollout; read every minute.",
         };
+        let report = plan_limits::evaluate_policy(&self.plan_limits.file, now);
+        let provider_report = match provider {
+            Provider::Claude => &report.report.claude,
+            Provider::Codex => &report.report.codex,
+        };
+        let pin_row = |label: String, pin: Option<plan_limits::RoutingPin>| {
+            button(text(label).size(font_tiny).color(secondary))
+                .padding([3, 7])
+                .on_press(Event::PlanLimits(PlanLimitsEvent::PinChanged(pin)))
+        };
+        let mut pin_controls = Row::new().spacing(5).align_y(iced::Alignment::Center).push(
+            text(format!("Send work to {} until", provider.label()))
+                .size(font_tiny)
+                .color(muted),
+        );
+        for (label, duration) in [("1h", 3600), ("4h", 4 * 3600), ("24h", 24 * 3600)] {
+            pin_controls = pin_controls.push(pin_row(
+                label.into(),
+                Some(plan_limits::RoutingPin {
+                    provider,
+                    until: now + duration,
+                }),
+            ));
+        }
+        if let Some(until) = plan_limits::hot_pin_until_reset(provider_report, now) {
+            pin_controls = pin_controls.push(pin_row(
+                format!("Send work to {} until reset", provider.label()),
+                Some(plan_limits::RoutingPin { provider, until }),
+            ));
+        }
+        if self
+            .plan_limits
+            .file
+            .pin
+            .as_ref()
+            .is_some_and(|pin| pin.provider == provider)
+        {
+            pin_controls = pin_controls.push(pin_row("clear".into(), None));
+        }
         let Some(reading) = reading else {
             let empty = match provider {
                 Provider::Claude => {
@@ -397,6 +463,7 @@ impl App {
                 .spacing(8)
                 .push(header)
                 .push(text(empty).size(font_small).color(secondary))
+                .push(pin_controls)
                 .push(text(source).size(font_tiny).color(muted))
                 .into();
         };
@@ -499,7 +566,75 @@ impl App {
                 .spacing(10)
                 .align_y(iced::Alignment::Center),
             );
+            let history = self.plan_limits.file.history.iter().find(|history| {
+                history.provider == provider
+                    && history.label == window.label
+                    && history.resets_at == window.resets_at
+            });
+            if let Some(history) = history {
+                let mut daily = [0.0_f64; 7];
+                let mut seen = [false; 7];
+                for sample in &history.samples {
+                    let age = (now - sample.observed_at).div_euclid(86_400);
+                    if (0..7).contains(&age) {
+                        let day = 6 - age as usize;
+                        daily[day] = sample.used_percent;
+                        seen[day] = true;
+                    }
+                }
+                let bars = Row::new()
+                    .spacing(3)
+                    .align_y(iced::Alignment::End)
+                    .push(text("7d").size(font_tiny).color(muted));
+                let bars = daily
+                    .into_iter()
+                    .zip(seen)
+                    .fold(bars, |row, (value, seen)| {
+                        let height = if seen {
+                            (value.clamp(0.0, 100.0) * 0.32).max(2.0) as f32
+                        } else {
+                            2.0
+                        };
+                        let color = if seen {
+                            self.plan_level_color(plan_limits::level(value), theme.accent())
+                        } else {
+                            track
+                        };
+                        row.push(
+                            container(iced::widget::Space::new())
+                                .width(Length::FillPortion(1))
+                                .height(Length::Fixed(height))
+                                .style(move |_| container::Style {
+                                    background: Some(color.into()),
+                                    border: iced::Border {
+                                        radius: 2.0.into(),
+                                        ..Default::default()
+                                    },
+                                    ..Default::default()
+                                }),
+                        )
+                    });
+                col = col.push(container(bars).height(Length::Fixed(34.0)));
+            }
         }
+        let almost_out = provider_report.windows.iter().any(|window| {
+            window.label == "7d" && window.state == Some(plan_limits::WeeklyState::AlmostOut)
+        });
+        if self
+            .plan_limits
+            .file
+            .pin
+            .as_ref()
+            .is_some_and(|pin| pin.provider == provider && pin.until > now)
+            && almost_out
+        {
+            col = col.push(
+                text("Pin overridden: this plan is almost out; new work is held until reset.")
+                    .size(font_small)
+                    .color(theme.warning()),
+            );
+        }
+        col = col.push(pin_controls);
         let mut facts: Vec<String> = Vec::new();
         if let Some(plan) = &reading.plan_type {
             facts.push(format!("Plan: {plan}"));
@@ -555,6 +690,28 @@ mod tests {
         let prompt = state.notice("first", false).unwrap();
         assert!(!prompt.contains("hold_claude"));
         assert!(prompt.contains("Routing: balanced"));
+    }
+
+    #[test]
+    fn setting_and_clearing_a_pin_queue_a_routing_nudge() {
+        let mut state = PlanLimitsState::default();
+        let chats = vec!["coordinator".into()];
+        let pin = plan_limits::RoutingPin {
+            provider: Provider::Codex,
+            until: now_unix() + 3600,
+        };
+        state.queue_notices(
+            &chats,
+            &[plan_limits::pin_change_notice(Some(&pin), now_unix())],
+        );
+        assert!(state
+            .notice("coordinator", false)
+            .unwrap()
+            .contains("pin to Codex set"));
+        state.queue_notices(&chats, &[plan_limits::pin_change_notice(None, now_unix())]);
+        let notice = state.notice("coordinator", false).unwrap();
+        assert!(notice.contains("Routing: pin cleared."));
+        assert!(!notice.contains("pin to Codex set"));
     }
 
     #[test]

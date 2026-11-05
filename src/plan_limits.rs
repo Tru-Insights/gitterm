@@ -37,6 +37,8 @@ use serde_json::Value;
 
 /// A reading older than this is shown "as of" its time, not as current.
 pub const STALE_AFTER_SECS: i64 = 15 * 60;
+pub const HISTORY_SAMPLE_SECS: i64 = 15 * 60;
+pub const HISTORY_RETENTION_SECS: i64 = 8 * 24 * 60 * 60;
 /// A window at or above this % is drawn in the warning colour.
 pub const WARNING_PERCENT: f64 = 75.0;
 /// A window at or above this % is drawn in the danger colour.
@@ -178,6 +180,27 @@ pub struct PlanLimits {
     /// Legacy/remote Claude observations have unknown account provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageSample {
+    pub observed_at: i64,
+    pub used_percent: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowHistory {
+    pub provider: Provider,
+    pub label: String,
+    pub resets_at: Option<i64>,
+    #[serde(default)]
+    pub samples: Vec<UsageSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutingPin {
+    pub provider: Provider,
+    pub until: i64,
 }
 
 impl PlanLimits {
@@ -700,6 +723,8 @@ pub struct ProviderPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum RoutingState {
     Balanced,
+    LeanClaude,
+    LeanCodex,
     HoldClaude,
     HoldCodex,
     Conserve,
@@ -729,6 +754,11 @@ pub struct WindowReport {
     pub resets_in: Option<i64>,
     pub elapsed_fraction: Option<f64>,
     pub pace: Option<f64>,
+    /// Percentage points consumed over the latest 24 hours, when enough
+    /// samples exist to estimate it.
+    pub recent_24h_rate: Option<f64>,
+    /// Projected use at reset from the latest 24-hour rate.
+    pub projected_at_reset: Option<f64>,
     pub ahead: Option<f64>,
     pub days_left: Option<f64>,
     pub state: Option<WeeklyState>,
@@ -763,12 +793,66 @@ pub struct PolicyReport {
 
 pub struct PolicyEvaluation {
     pub policy: PolicyState,
+    pub pin: Option<RoutingPin>,
     pub report: PolicyReport,
     /// Already deduplicated per provider/window; the app fans out per chat.
     pub notices: Vec<String>,
 }
 
-fn window_report(window: &LimitWindow, fresh: bool, now: i64) -> WindowReport {
+fn history_metrics(
+    history: Option<&WindowHistory>,
+    now: i64,
+    resets_at: Option<i64>,
+) -> (Option<f64>, Option<f64>) {
+    let Some(history) = history else {
+        return (None, None);
+    };
+    let cutoff = now - 24 * 60 * 60;
+    let mut samples = history.samples.iter().filter(|sample| {
+        sample.observed_at >= cutoff && sample.observed_at <= now && sample.used_percent.is_finite()
+    });
+    let Some(first) = samples.next() else {
+        return (None, None);
+    };
+    let Some(last) = samples.next_back() else {
+        return (None, None);
+    };
+    let elapsed = last.observed_at - first.observed_at;
+    if elapsed <= 0 {
+        return (None, None);
+    }
+    let rate = (last.used_percent - first.used_percent) * 86_400.0 / elapsed as f64;
+    let projected = resets_at
+        .filter(|at| *at > now)
+        .map(|at| last.used_percent + (rate / 86_400.0) * (at - last.observed_at) as f64);
+    (Some(rate), projected)
+}
+
+pub fn hot_pin_until_reset(report: &ProviderReport, now: i64) -> Option<i64> {
+    report
+        .windows
+        .iter()
+        .find(|window| window.label == "7d" && window.state == Some(WeeklyState::Hot))
+        .and_then(|window| window.resets_at.filter(|at| *at > now))
+}
+
+pub fn pin_change_notice(pin: Option<&RoutingPin>, now: i64) -> String {
+    match pin {
+        Some(pin) => format!(
+            "Routing: pin to {} set until {} UTC.",
+            pin.provider.label(),
+            format_reset(pin.until, now, &chrono::Utc)
+        ),
+        None => "Routing: pin cleared.".to_string(),
+    }
+}
+
+fn window_report(
+    window: &LimitWindow,
+    fresh: bool,
+    now: i64,
+    history: Option<&WindowHistory>,
+) -> WindowReport {
     let duration = match window.label.as_str() {
         "7d" => Some(WEEK_SECS),
         "5h" => Some(BURST_SECS),
@@ -777,6 +861,7 @@ fn window_report(window: &LimitWindow, fresh: bool, now: i64) -> WindowReport {
     let used = window
         .percent_at(now)
         .filter(|p| p.is_finite() && *p >= 0.0);
+    let (recent_24h_rate, projected_at_reset) = history_metrics(history, now, window.resets_at);
     let f = duration
         .zip(window.resets_at)
         .filter(|(_, at)| fresh && *at > now)
@@ -790,6 +875,8 @@ fn window_report(window: &LimitWindow, fresh: bool, now: i64) -> WindowReport {
         resets_in: window.resets_at.map(|at| (at - now).max(0)),
         elapsed_fraction: f,
         pace: used.zip(f).map(|(used, f)| used / f),
+        recent_24h_rate,
+        projected_at_reset,
         ahead: used.zip(f).map(|(used, f)| used - TARGET_PERCENT * f),
         days_left: used
             .zip(f)
@@ -809,6 +896,7 @@ fn alert_is_burst(alert: &Alert) -> bool {
 
 fn provider_evaluation(
     reading: Option<&PlanLimits>,
+    histories: &[WindowHistory],
     previous: &ProviderPolicy,
     provider: Provider,
     now: i64,
@@ -819,7 +907,12 @@ fn provider_evaluation(
         .map(|r| {
             r.windows
                 .iter()
-                .map(|w| window_report(w, fresh, now))
+                .map(|w| {
+                    let history = histories.iter().find(|h| {
+                        h.provider == r.provider && h.label == w.label && h.resets_at == w.resets_at
+                    });
+                    window_report(w, fresh, now, history)
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -833,6 +926,7 @@ fn provider_evaluation(
                 },
                 false,
                 now,
+                None,
             ));
         }
     }
@@ -937,7 +1031,22 @@ fn provider_evaluation(
                         Provider::Claude => "Codex",
                         Provider::Codex => "Claude",
                     };
-                    warning = Some(format!("{} {used:.0}% with {left:.1} days left; at this rate it runs out {runout} UTC. Want me to send work to {other} until it settles? Tell the coordinator to send flexible work there until reset.", provider.label()));
+                    let recent = weekly
+                        .projected_at_reset
+                        .filter(|projected| {
+                            weekly
+                                .pace
+                                .is_some_and(|pace| (pace - projected).abs() > 20.0)
+                        })
+                        .map(|projected| {
+                            format!(
+                                "; pace {:.0}, last 24 h project {:.0}",
+                                weekly.pace.unwrap_or_default(),
+                                projected
+                            )
+                        })
+                        .unwrap_or_default();
+                    warning = Some(format!("{} {used:.0}% with {left:.1} days left; at this rate it runs out {runout} UTC{recent}. Want me to send work to {other} until it settles? Tell the coordinator to send flexible work there until reset.", provider.label()));
                     state.hot_warned = true;
                     state.urgent_warned |= urgent;
                 }
@@ -1056,23 +1165,48 @@ fn provider_summary(
         .and_then(|w| w.pace)
         .map(|p| format!(", pace {p:.0}"))
         .unwrap_or_default();
-    format!("{name} {used} ({label}, {reset}{pace})")
+    let recent = window
+        .and_then(|w| w.projected_at_reset.zip(w.pace))
+        .filter(|(projected, pace)| (projected - pace).abs() > 20.0)
+        .map(|(projected, _)| format!(", last 24 h project {:.0}", projected))
+        .unwrap_or_default();
+    format!("{name} {used} ({label}, {reset}{pace}{recent})")
 }
 
 pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
     let previous = file.policy.clone().unwrap_or_default();
     // Remote/legacy Claude readings cannot establish local account capacity.
     let local_claude = file.claude.as_ref().filter(|r| r.local == Some(true));
-    let (claude, claude_report, mut notices, claude_warning) =
-        provider_evaluation(local_claude, &previous.claude, Provider::Claude, now);
-    let (codex, codex_report, codex_notices, codex_warning) =
-        provider_evaluation(file.codex.as_ref(), &previous.codex, Provider::Codex, now);
+    let (claude, claude_report, mut notices, claude_warning) = provider_evaluation(
+        local_claude,
+        &file.history,
+        &previous.claude,
+        Provider::Claude,
+        now,
+    );
+    let (codex, codex_report, codex_notices, codex_warning) = provider_evaluation(
+        file.codex.as_ref(),
+        &file.history,
+        &previous.codex,
+        Provider::Codex,
+        now,
+    );
     notices.extend(codex_notices);
-    let state = match (held(&claude), held(&codex)) {
+    let held_state = match (held(&claude), held(&codex)) {
         (true, true) => RoutingState::Conserve,
         (true, false) => RoutingState::HoldClaude,
         (false, true) => RoutingState::HoldCodex,
         (false, false) => RoutingState::Balanced,
+    };
+    let pin = file.pin.clone().filter(|pin| pin.until > now);
+    let state = if held_state != RoutingState::Balanced {
+        held_state
+    } else {
+        match pin.as_ref().map(|pin| pin.provider) {
+            Some(Provider::Claude) => RoutingState::LeanClaude,
+            Some(Provider::Codex) => RoutingState::LeanCodex,
+            None => RoutingState::Balanced,
+        }
     };
     let routing = match &previous.routing {
         Some(old) if old.state == state => old.clone(),
@@ -1108,6 +1242,8 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
         notices.extend(claude_warning.into_iter().chain(codex_warning));
     }
     let reason = match state {
+        RoutingState::LeanClaude => format!("Routing: pinned to Claude until {} UTC.", pin.as_ref().map(|pin| format_reset(pin.until, now, &chrono::Utc)).unwrap_or_else(|| "cleared".into())),
+        RoutingState::LeanCodex => format!("Routing: pinned to Codex until {} UTC.", pin.as_ref().map(|pin| format_reset(pin.until, now, &chrono::Utc)).unwrap_or_else(|| "cleared".into())),
         RoutingState::HoldClaude => format!("Routing: {c} → start nothing new on Claude. {} A Claude coordinator finishes its step, writes checkpoint and handoff, and says when Claude resets.", if available_codex { "Coding, reviews and consults to Codex until Claude recovers or resets." } else { "Codex has no verified spare capacity; defer flexible work until fresh readings permit it." }),
         RoutingState::HoldCodex => format!("Routing: {x} → start nothing new on Codex. {}", if available_claude { "Coding, reviews and consults to Claude until Codex recovers or resets." } else { "Claude has no verified spare capacity; defer flexible work until fresh readings permit it." }),
         RoutingState::Conserve => format!("Routing: {c}; {x} → conserve. Both providers are held: defer new work until a hold clears; then one priority task at a time, serial, required specialist reviews only. Credits or overage need the user's explicit choice."),
@@ -1142,6 +1278,7 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
             codex,
             routing: Some(routing.clone()),
         },
+        pin: pin.clone(),
         report: PolicyReport {
             claude: claude_report,
             codex: codex_report,
@@ -1149,7 +1286,12 @@ pub fn evaluate_policy(file: &PlanLimitsFile, now: i64) -> PolicyEvaluation {
                 state,
                 since: routing.since,
                 constrained,
-                pinned: None,
+                pinned: pin.as_ref().map(|pin| {
+                    serde_json::json!({
+                        "provider": pin.provider,
+                        "until": pin.until,
+                    })
+                }),
                 reason,
             },
         },
@@ -1169,6 +1311,10 @@ pub struct PlanLimitsFile {
     pub codex: Option<PlanLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<WindowHistory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<RoutingPin>,
 }
 
 impl PlanLimitsFile {
@@ -1216,19 +1362,108 @@ impl PlanLimitsFile {
         }
     }
 
+    pub fn prune_history(&mut self, now: i64) -> bool {
+        let cutoff = now - HISTORY_RETENTION_SECS;
+        let before_count = self.history.len();
+        let before_samples = self
+            .history
+            .iter()
+            .map(|history| history.samples.len())
+            .sum::<usize>();
+        for history in &mut self.history {
+            history
+                .samples
+                .retain(|sample| sample.observed_at >= cutoff);
+        }
+        self.history.retain(|history| !history.samples.is_empty());
+        before_count != self.history.len()
+            || before_samples
+                != self
+                    .history
+                    .iter()
+                    .map(|history| history.samples.len())
+                    .sum::<usize>()
+    }
+
     /// Takes `reading` unless the one held was observed later. True when
     /// anything changed.
     pub fn absorb(&mut self, reading: PlanLimits) -> bool {
-        let slot = match reading.provider {
-            Provider::Claude => &mut self.claude,
-            Provider::Codex => &mut self.codex,
-        };
-        match slot {
-            Some(held) if held.observed_at > reading.observed_at || *held == reading => false,
-            _ => {
-                *slot = Some(reading);
-                true
+        let provider = reading.provider;
+        let observed_at = reading.observed_at;
+        let held = self.get(provider);
+        if held.is_some_and(|held| held.observed_at > observed_at || *held == reading) {
+            return false;
+        }
+        for window in &reading.windows {
+            let Some(used_percent) = window.used_percent.filter(|value| value.is_finite()) else {
+                continue;
+            };
+            self.record_sample(
+                provider,
+                &window.label,
+                window.resets_at,
+                observed_at,
+                used_percent,
+            );
+        }
+        match provider {
+            Provider::Claude => self.claude = Some(reading),
+            Provider::Codex => self.codex = Some(reading),
+        }
+        true
+    }
+
+    fn record_sample(
+        &mut self,
+        provider: Provider,
+        label: &str,
+        resets_at: Option<i64>,
+        observed_at: i64,
+        used_percent: f64,
+    ) {
+        let history = self
+            .history
+            .iter_mut()
+            .find(|history| history.provider == provider && history.label == label);
+        let history = match history {
+            Some(history) if history.resets_at == resets_at => history,
+            Some(history) => {
+                *history = WindowHistory {
+                    provider,
+                    label: label.to_string(),
+                    resets_at,
+                    samples: Vec::new(),
+                };
+                history
             }
+            None => {
+                self.history.push(WindowHistory {
+                    provider,
+                    label: label.to_string(),
+                    resets_at,
+                    samples: Vec::new(),
+                });
+                self.history.last_mut().expect("just inserted history")
+            }
+        };
+        if history
+            .samples
+            .last()
+            .is_some_and(|sample| observed_at - sample.observed_at < HISTORY_SAMPLE_SECS)
+        {
+            return;
+        }
+        history.samples.push(UsageSample {
+            observed_at,
+            used_percent,
+        });
+        let cutoff = observed_at - HISTORY_RETENTION_SECS;
+        history
+            .samples
+            .retain(|sample| sample.observed_at >= cutoff);
+        if history.samples.len() > 768 {
+            let excess = history.samples.len() - 768;
+            history.samples.drain(..excess);
         }
     }
 
@@ -1704,6 +1939,7 @@ mod tests {
         let loaded = PlanLimitsFile::load(&path);
         assert_eq!(loaded.claude, None);
         assert!(loaded.codex.unwrap().windows.is_empty());
+        assert!(PlanLimitsFile::load(&path).history.is_empty());
     }
 }
 
@@ -1902,6 +2138,8 @@ mod policy_tests {
             "resets_in",
             "elapsed_fraction",
             "pace",
+            "recent_24h_rate",
+            "projected_at_reset",
             "ahead",
             "days_left",
             "state",
@@ -2012,6 +2250,127 @@ mod policy_tests {
         file.claude.as_mut().unwrap().windows[0].resets_at = Some(NOW + 4 * 86400);
         assert_eq!(step(&mut file, NOW).notices.len(), 1);
         assert!(step(&mut file, NOW).notices.is_empty());
+    }
+
+    #[test]
+    fn history_samples_are_spaced_bounded_and_reset_with_the_anchor() {
+        let mut file = PlanLimitsFile::default();
+        file.absorb(reading(Provider::Claude, 10.0, 5 * 86400));
+        let first = &file.history[0].samples;
+        assert_eq!(first.len(), 1);
+        let mut too_soon = reading(Provider::Claude, 12.0, 5 * 86400);
+        too_soon.observed_at = NOW + HISTORY_SAMPLE_SECS - 1;
+        file.absorb(too_soon);
+        assert_eq!(file.history[0].samples.len(), 1);
+        let mut spaced = reading(Provider::Claude, 14.0, 5 * 86400);
+        spaced.observed_at = NOW + HISTORY_SAMPLE_SECS;
+        file.absorb(spaced);
+        assert_eq!(file.history[0].samples.len(), 2);
+        let mut new_anchor = reading(Provider::Claude, 3.0, WEEK_SECS);
+        new_anchor.observed_at = NOW + 2 * HISTORY_SAMPLE_SECS;
+        file.absorb(new_anchor);
+        assert_eq!(file.history.len(), 1);
+        assert_eq!(file.history[0].samples.len(), 1);
+        for index in 1..=800 {
+            file.record_sample(
+                Provider::Claude,
+                "7d",
+                Some(NOW + WEEK_SECS),
+                NOW + 2 * HISTORY_SAMPLE_SECS + index * HISTORY_SAMPLE_SECS,
+                index as f64,
+            );
+        }
+        assert_eq!(file.history[0].samples.len(), 768);
+        let newest = file.history[0].samples.last().unwrap().observed_at;
+        assert!(file.history[0].samples[0].observed_at >= newest - HISTORY_RETENTION_SECS);
+        let old: PlanLimitsFile =
+            serde_json::from_value(serde_json::json!({"claude": null})).unwrap();
+        assert!(old.history.is_empty());
+    }
+
+    #[test]
+    fn history_drives_recent_rate_projection_and_warning_detail() {
+        let mut file = fixture(85.0, 2 * 86400);
+        let resets_at = file.claude.as_ref().unwrap().windows[0].resets_at;
+        file.history = vec![WindowHistory {
+            provider: Provider::Claude,
+            label: "7d".into(),
+            resets_at,
+            samples: vec![
+                UsageSample {
+                    observed_at: NOW - 86_400,
+                    used_percent: 45.0,
+                },
+                UsageSample {
+                    observed_at: NOW,
+                    used_percent: 85.0,
+                },
+            ],
+        }];
+        let evaluation = evaluate_policy(&file, NOW);
+        let weekly = &evaluation.report.claude.windows[0];
+        assert!((weekly.recent_24h_rate.unwrap() - 40.0).abs() < 0.01);
+        assert!((weekly.projected_at_reset.unwrap() - 165.0).abs() < 0.01);
+        assert!(evaluation.notices[0].contains("pace 119, last 24 h project 165"));
+    }
+
+    #[test]
+    fn pin_sets_expires_clears_and_almost_out_overrides_it() {
+        let mut file = fixture(35.0, 5 * 86400);
+        let pin = RoutingPin {
+            provider: Provider::Codex,
+            until: NOW + 3600,
+        };
+        file.pin = Some(pin.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = PlanLimitsFile::path_in(dir.path());
+        file.save(&path).unwrap();
+        let mut file = PlanLimitsFile::load(&path);
+        assert_eq!(file.pin, Some(pin.clone()));
+        let active = evaluate_policy(&file, NOW);
+        assert_eq!(active.report.routing.state, RoutingState::LeanCodex);
+        assert_eq!(
+            active.report.routing.pinned,
+            Some(serde_json::json!({"provider":"codex","until":NOW+3600}))
+        );
+        assert_eq!(active.pin, Some(pin));
+        assert_eq!(
+            evaluate_policy(&file, NOW + 3600).report.routing.state,
+            RoutingState::Balanced
+        );
+        file.pin = None;
+        assert_eq!(
+            evaluate_policy(&file, NOW).report.routing.state,
+            RoutingState::Balanced
+        );
+        file.pin = Some(RoutingPin {
+            provider: Provider::Claude,
+            until: NOW + 3600,
+        });
+        file.claude.as_mut().unwrap().windows[0].used_percent = Some(95.0);
+        assert_eq!(
+            evaluate_policy(&file, NOW).report.routing.state,
+            RoutingState::HoldClaude
+        );
+        file.claude.as_mut().unwrap().windows[0].used_percent = Some(35.0);
+        assert!(pin_change_notice(file.pin.as_ref(), NOW).contains("pin to Claude Code set"));
+        assert_eq!(pin_change_notice(None, NOW), "Routing: pin cleared.");
+    }
+
+    #[test]
+    fn one_click_reset_pin_is_available_only_while_weekly_hot() {
+        let hot = evaluate_policy(&fixture(85.0, 5 * 86400), NOW)
+            .report
+            .claude;
+        assert_eq!(hot.windows[0].state, Some(WeeklyState::Hot));
+        assert_eq!(hot_pin_until_reset(&hot, NOW), Some(NOW + 5 * 86400));
+        let normal = evaluate_policy(&fixture(10.0, 5 * 86400), NOW)
+            .report
+            .claude;
+        assert_eq!(hot_pin_until_reset(&normal, NOW), None);
+        let mut expired = hot;
+        expired.windows[0].resets_at = Some(NOW);
+        assert_eq!(hot_pin_until_reset(&expired, NOW), None);
     }
     #[test]
     fn policy_both_hot_warns_together_without_switching_and_balanced_margin_is_inclusive() {
