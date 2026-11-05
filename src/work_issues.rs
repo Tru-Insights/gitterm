@@ -1,5 +1,6 @@
 //! The Work page's Issues section (TRU-203): one line per issue key, with
-//! its title, state and a hover card, the line opening the issue's URL.
+//! its title, state and a hover card, the line opening the issue's URL in the
+//! shared Viewer.
 //! The pure parts and the `linear` CLI calls live in
 //! `gitterm::issue_titles`.
 //!
@@ -26,8 +27,8 @@ pub enum IssueEvent {
     Saved(Result<(), String>),
     /// "▸ n more" / "▾ show fewer".
     AllToggle,
-    /// Open an issue's URL (from the cache) in the browser.
-    Open(String),
+    /// Open an issue's URL (from the cache) in the Viewer.
+    Open(String, Option<String>),
 }
 
 #[derive(Debug, Default)]
@@ -194,19 +195,17 @@ impl App {
                 }
             }
             IssueEvent::AllToggle => self.issues.all = !self.issues.all,
-            IssueEvent::Open(url) => {
-                if let Err(error) = std::process::Command::new("open").arg(&url).spawn() {
-                    eprintln!("[issue-titles] cannot open {url}: {error}");
-                }
+            IssueEvent::Open(url, workspace) => {
+                return self.open_linear_issue_page(url, workspace.as_deref());
             }
         }
         Task::none()
     }
 
     /// The Issues section's rows: key, title (cut) and state per line, the
-    /// first [`issue_titles::ISSUES_SHOWN`] then "▸ n more". Hovering a
-    /// line shows the whole title, state and assignee; a line whose URL is
-    /// cached opens it.
+    /// first [`issue_titles::ISSUES_SHOWN`] then "▸ n more". Without a
+    /// Linear entry the state slot says why ("not read yet", ...). A line
+    /// whose URL is cached opens it on a click; there is no hover card.
     pub(super) fn view_work_issues<'a>(
         &'a self,
         keys: &'a [String],
@@ -224,8 +223,23 @@ impl App {
             let cached = self.issues.cache.issues.get(key);
             let found = cached.filter(|entry| !entry.not_found);
             let title = found.and_then(|entry| entry.title.as_deref());
-            let state = found.and_then(|entry| entry.state.as_deref());
+            // The muted slot: the issue's state, or why there is none
+            // (TRU-208; this used to be only in a hover card).
+            let state = match (found, cached) {
+                (Some(entry), _) => entry.state.clone().unwrap_or_default(),
+                (None, Some(_)) => "no Linear workspace knows this key".to_string(),
+                (None, None) if linear_missing => "no linear CLI".to_string(),
+                (None, None) => "not read yet".to_string(),
+            };
             let url = found.and_then(|entry| entry.url.clone());
+            let workspace = found.and_then(|entry| {
+                entry.workspace.clone().or_else(|| {
+                    entry
+                        .url
+                        .as_deref()
+                        .and_then(issue_titles::workspace_from_issue_url)
+                })
+            });
             let line = row![
                 text(key.clone())
                     .size(font_small)
@@ -237,51 +251,25 @@ impl App {
                 .size(font_small)
                 .color(text_primary)
                 .width(Length::Fill),
-                text(state.unwrap_or_default().to_string())
-                    .size(10)
-                    .color(text_muted),
+                text(state).size(10).color(text_muted),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
             let line: Element<'a, Event, Theme, iced::Renderer> = match url {
                 Some(url) => button(line)
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([3, 6])
                     .width(Length::Fill)
-                    .on_press(Event::Issue(IssueEvent::Open(url)))
+                    .on_press(Event::Issue(IssueEvent::Open(url, workspace)))
                     .into(),
                 None => container(line).padding([3, 6]).width(Length::Fill).into(),
             };
-            let mut card = Column::new().spacing(2).push(
-                text(match title {
-                    Some(title) => format!("{key} \u{00B7} {title}"),
-                    None => key.clone(),
-                })
-                .size(font_small)
-                .color(text_primary),
-            );
-            let detail = match (found, cached) {
-                (Some(entry), _) => format!(
-                    "{} \u{00B7} {}",
-                    entry.state.as_deref().unwrap_or_default(),
-                    entry.assignee.as_deref().unwrap_or("unassigned")
-                ),
-                (None, Some(_)) => "No Linear workspace knows this key".to_string(),
-                (None, None) if linear_missing => "No linear CLI to read it with".to_string(),
-                (None, None) => "Not read from Linear yet".to_string(),
-            };
-            card = card.push(text(detail).size(10).color(text_muted));
-            let tip = self.rail_tooltip(container(card).max_width(360.0));
-            col = col.push(iced::widget::tooltip(
-                line,
-                tip,
-                iced::widget::tooltip::Position::Bottom,
-            ));
+            col = col.push(line);
         }
         if let Some(label) = fold_label {
             col = col.push(
                 button(text(label).size(10).color(text_muted).font(mono))
-                    .style(self.ghost_button_style())
+                    .style(self.flat_button_style())
                     .padding([2, 6])
                     .on_press(Event::Issue(IssueEvent::AllToggle)),
             );

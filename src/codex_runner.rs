@@ -39,6 +39,7 @@ use crate::tasks::{
 
 const CODEX_HARNESS: &str = "codex";
 const STDERR_TAIL_BYTES: usize = 2048;
+const APPROVAL_REJECTION: &str = "Codex asked for approval, which a GitTerm run can't give; check the checkout's trust in ~/.codex/config.toml";
 const ACTIVITY_MAX_CHARS: usize = 120;
 const TERMINAL_EVENT_MAX_CHARS: usize = 500;
 /// Today plus the two days before it (local and UTC calendars).
@@ -151,6 +152,7 @@ pub enum CodexRunError {
         status: String,
         stderr_tail: String,
     },
+    ApprovalRequired,
     IncompleteStream {
         reason: String,
         stderr_tail: String,
@@ -196,6 +198,7 @@ impl fmt::Display for CodexRunError {
                 "codex {status}; stderr: {}",
                 or_none(stderr_tail)
             ),
+            Self::ApprovalRequired => formatter.write_str(APPROVAL_REJECTION),
             Self::IncompleteStream {
                 reason,
                 stderr_tail,
@@ -430,25 +433,29 @@ async fn run_inner(
     };
     let read_stdout = async {
         let mut stream = StreamState::default();
+        let mut approval_rejected = false;
         for_each_line(stdout, |line| {
             log.append(line)?;
+            approval_rejected |= is_approval_rejection(line);
             for event in stream.handle_line(line) {
                 send(progress, event);
             }
             Ok(())
         })
         .await?;
-        Ok::<_, CodexRunError>(stream)
+        Ok::<_, CodexRunError>((stream, approval_rejected))
     };
     let read_stderr = async {
         let mut tail = StderrTail::default();
+        let mut approval_rejected = false;
         for_each_line(stderr, |line| {
             log.append(&serde_json::json!({"type": "gitterm.stderr", "line": line}).to_string())?;
+            approval_rejected |= is_approval_rejection_message(line);
             tail.push(line);
             Ok(())
         })
         .await?;
-        Ok::<_, CodexRunError>(tail)
+        Ok::<_, CodexRunError>((tail, approval_rejected))
     };
     let child_id = child.id();
     let work = async {
@@ -475,8 +482,13 @@ async fn run_inner(
         context: "wait for codex to exit".to_string(),
         source,
     })?;
-    let stream = stream?;
-    let stderr_tail = stderr_tail?.into_string();
+    let (stream, stdout_approval_rejected) = stream?;
+    let (stderr_tail, stderr_approval_rejected) = stderr_tail?;
+    let stderr_tail = stderr_tail.into_string();
+
+    if stdout_approval_rejected || stderr_approval_rejected {
+        return Err(CodexRunError::ApprovalRequired);
+    }
 
     if !status.success() {
         return Err(CodexRunError::NonZeroExit {
@@ -620,6 +632,49 @@ async fn stop_at_time_limit(child: &mut tokio::process::Child, child_id: Option<
     }
 }
 
+fn is_approval_rejection(line: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("gitterm.stderr") => event
+            .get("line")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_approval_rejection_message),
+        Some("item.completed") => {
+            let Some(item) = event.get("item") else {
+                return false;
+            };
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("mcp_tool_call") => item
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| {
+                        message.contains("interactive approval is unavailable in exec mode")
+                    }),
+                Some("command_execution")
+                    if item.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+                        && item.get("exit_code").is_none_or(serde_json::Value::is_null) =>
+                {
+                    item.get("aggregated_output")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_approval_rejection_message)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_approval_rejection_message(message: &str) -> bool {
+    message.contains("command execution approval is not supported in exec mode")
+        || message.contains("interactive approval is unavailable in exec mode")
+        || (message.contains("Rejected(") && message.contains("approval request failed"))
+}
+
 fn missing_pipe(name: &str) -> CodexRunError {
     CodexRunError::Io {
         context: format!("capture codex {name}"),
@@ -658,6 +713,7 @@ pub(crate) fn codex_args(
             stdin_text = Some(brief.clone());
         }
     }
+    args.extend(["-c".into(), "approval_policy=\"never\"".into()]);
     if let Some(guidelines) = &run.guidelines {
         args.extend(
             crate::guidelines::codex_args(guidelines)
@@ -1527,6 +1583,8 @@ mod tests {
                 "exec",
                 "review",
                 "--uncommitted",
+                "-c",
+                "approval_policy=\"never\"",
                 "--json",
                 "-o",
                 "/logs/d1.last.md"
@@ -1543,7 +1601,17 @@ mod tests {
             ),
             last,
         );
-        assert_eq!(&strings(args)[..4], ["exec", "review", "--base", "main"]);
+        assert_eq!(
+            &strings(args)[..6],
+            [
+                "exec",
+                "review",
+                "--base",
+                "main",
+                "-c",
+                "approval_policy=\"never\""
+            ]
+        );
 
         let (args, _) = codex_args(
             &review(
@@ -1555,8 +1623,15 @@ mod tests {
             last,
         );
         assert_eq!(
-            &strings(args)[..4],
-            ["exec", "review", "--commit", "abc123"]
+            &strings(args)[..6],
+            [
+                "exec",
+                "review",
+                "--commit",
+                "abc123",
+                "-c",
+                "approval_policy=\"never\""
+            ]
         );
 
         let (args, stdin) = codex_args(
@@ -1565,7 +1640,16 @@ mod tests {
         );
         assert_eq!(
             strings(args),
-            ["exec", "review", "--json", "-o", "/logs/d1.last.md", "-"]
+            [
+                "exec",
+                "review",
+                "-c",
+                "approval_policy=\"never\"",
+                "--json",
+                "-o",
+                "/logs/d1.last.md",
+                "-"
+            ]
         );
         let stdin = stdin.expect("focused review prompt");
         assert!(stdin.contains("untracked changes against HEAD"));
@@ -1589,6 +1673,8 @@ mod tests {
                 "exec",
                 "--sandbox",
                 "read-only",
+                "-c",
+                "approval_policy=\"never\"",
                 "--json",
                 "-o",
                 "/logs/d1.last.md",
@@ -1615,6 +1701,8 @@ mod tests {
                 "review",
                 "--uncommitted",
                 "-c",
+                "approval_policy=\"never\"",
+                "-c",
                 r#"developer_instructions="Be brief.\n""#,
                 "--json",
                 "-o",
@@ -1638,13 +1726,24 @@ mod tests {
             /// A `codex` script that records its argv and stdin, prints
             /// `stdout`, writes a benign stderr line and exits with `code`.
             fn new(stdout: &str, code: i32) -> Self {
+                Self::with_stderr(
+                    stdout,
+                    code,
+                    "ERROR codex_models_manager::manager: failed to refresh available models: request timed out\n",
+                )
+            }
+
+            fn with_stderr(stdout: &str, code: i32, stderr: &str) -> Self {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let stdout_path = dir.path().join("stdout.jsonl");
                 std::fs::write(&stdout_path, stdout).expect("write stdout fixture");
+                let stderr_path = dir.path().join("stderr.txt");
+                std::fs::write(&stderr_path, stderr).expect("write stderr fixture");
                 let script = format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{dir}/args'\ncat > '{dir}/stdin'\ncat '{out}'\necho 'ERROR codex_models_manager::manager: failed to refresh available models: request timed out' >&2\nexit {code}\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{dir}/args'\ncat > '{dir}/stdin'\ncat '{out}'\ncat '{stderr}' >&2\nexit {code}\n",
                     dir = dir.path().display(),
                     out = stdout_path.display(),
+                    stderr = stderr_path.display(),
                 );
                 let program = dir.path().join("codex");
                 std::fs::write(&program, script).expect("write fake codex");
@@ -1792,10 +1891,18 @@ mod tests {
             let args = fake.recorded("args");
             let args: Vec<&str> = args.lines().collect();
             assert_eq!(
-                &args[..5],
-                ["exec", "review", "--uncommitted", "--json", "-o"]
+                &args[..7],
+                [
+                    "exec",
+                    "review",
+                    "--uncommitted",
+                    "-c",
+                    "approval_policy=\"never\"",
+                    "--json",
+                    "-o"
+                ]
             );
-            assert!(args[5].ends_with("d1.last.md"));
+            assert!(args[7].ends_with("d1.last.md"));
 
             assert_eq!(
                 events.first(),
@@ -1920,9 +2027,117 @@ mod tests {
             );
             let args = fake.recorded("args");
             let args: Vec<&str> = args.lines().collect();
-            assert_eq!(&args[..4], ["exec", "--sandbox", "read-only", "--json"]);
+            assert_eq!(
+                &args[..6],
+                [
+                    "exec",
+                    "--sandbox",
+                    "read-only",
+                    "-c",
+                    "approval_policy=\"never\"",
+                    "--json"
+                ]
+            );
             assert_eq!(&args[args.len() - 3..], ["-m", "gpt-6-astra", "-"]);
             assert_eq!(events.last(), Some(&CodexRunEvent::Completed));
+        }
+
+        #[tokio::test]
+        async fn approval_rejections_in_the_recorded_log_fail_the_run() {
+            let stream = concat!(
+                "{\"type\":\"thread.started\",\"thread_id\":\"thread-consult\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"No work performed.\"}}\n",
+                "{\"type\":\"turn.completed\"}\n",
+            );
+            let fake = FakeCodex::with_stderr(
+                stream,
+                0,
+                "command execution approval is not supported in exec mode\nRejected(\"approval request failed\")\n",
+            );
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Review the implementation.".to_string(),
+            });
+            let log_path = run.log_path.clone();
+
+            let (result, events) = run_collect(&fake, run).await;
+
+            assert!(matches!(result, Err(CodexRunError::ApprovalRequired)));
+            assert!(matches!(
+                events.last(),
+                Some(CodexRunEvent::Failed { message }) if message == APPROVAL_REJECTION
+            ));
+            let log = std::fs::read_to_string(log_path).expect("recorded log");
+            assert!(log.contains("command execution approval is not supported in exec mode"));
+            assert!(log.contains("Rejected(\\\"approval request failed\\\")"));
+        }
+
+        #[tokio::test]
+        async fn rejection_text_in_successful_output_and_agent_text_does_not_fail() {
+            let rejection = "command execution approval is not supported in exec mode; interactive approval is unavailable in exec mode";
+            let stream = [
+                serde_json::json!({"type":"thread.started", "thread_id":"thread-success"}).to_string(),
+                serde_json::json!({"type":"turn.started"}).to_string(),
+                serde_json::json!({
+                    "type":"item.completed",
+                    "item":{"id":"item_0", "type":"command_execution", "command":"git diff", "aggregated_output":rejection, "exit_code":0, "status":"completed"}
+                }).to_string(),
+                serde_json::json!({
+                    "type":"item.completed",
+                    "item":{"id":"item_1", "type":"agent_message", "text":rejection}
+                }).to_string(),
+                serde_json::json!({"type":"turn.completed"}).to_string(),
+            ]
+            .join("\n");
+            let fake = FakeCodex::new(&stream, 0);
+            let run = fake.run(CodexRunKind::Consult {
+                brief: "Explain the result.".to_string(),
+            });
+
+            let (result, events) = run_collect(&fake, run).await;
+
+            let outcome = result.expect("successful run must retain its result");
+            assert_eq!(outcome.result.handoff.expect("handoff").summary, rejection);
+            assert_eq!(events.last(), Some(&CodexRunEvent::Completed));
+        }
+
+        #[test]
+        fn mcp_approval_error_message_is_a_rejection() {
+            let event = serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "type":"mcp_tool_call",
+                    "error":{"message":"interactive approval is unavailable in exec mode"},
+                    "status":"failed"
+                }
+            });
+
+            assert!(is_approval_rejection(&event.to_string()));
+        }
+
+        #[test]
+        fn failed_command_without_exit_code_can_report_rejection() {
+            let event = serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "type":"command_execution",
+                    "aggregated_output":"Rejected(\"approval request failed\")",
+                    "exit_code":null,
+                    "status":"failed"
+                }
+            });
+
+            assert!(is_approval_rejection(&event.to_string()));
+        }
+
+        #[test]
+        fn recorded_stderr_event_carries_the_approval_rejection() {
+            let event = serde_json::json!({
+                "type":"gitterm.stderr",
+                "line":"ERROR codex_app_server: command execution approval is not supported in exec mode"
+            });
+
+            assert!(is_approval_rejection(&event.to_string()));
         }
 
         #[tokio::test]

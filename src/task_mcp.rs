@@ -6,6 +6,7 @@
 
 use crate::harness::acp::AcpMcpServer;
 use crate::harness::claude::ClaudeMcpServer;
+use crate::html_render::{HtmlPreviewRequest, HtmlRenderRequest};
 use axum::{
     body::Body,
     extract::State,
@@ -325,6 +326,7 @@ pub struct TaskSessionEventRequest {
 #[derive(Debug, Clone)]
 pub enum TaskControlOperation {
     PlanLimits,
+    HtmlRender(HtmlRenderRequest),
     List(ListTasksRequest),
     Get(GetTaskRequest),
     Create(CreateTaskRequest),
@@ -744,6 +746,71 @@ impl TaskMcpTools {
     }
 
     #[tool(
+        description = "Check a self-contained HTML page before html_render. Returns a PNG, contentHeight, capturedHeight and console output from isolated headless Chrome (Chrome must be installed). Width defaults to 760 CSS pixels; try 390 for phones. Theme defaults to dark; check light too. Inline CSS/scripts only, no network or local files; data images allowed. Use responsive normal-flow layout, no viewport-height sizing, and CSS variables --bg, --bg-alt, --bg-block, --fg, --fg-muted, --accent, --border, --user, --result, --tool, --warn, --err, --mono. Fit height to content; content taller than 4000px scrolls.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn html_preview(
+        &self,
+        Parameters(request): Parameters<HtmlPreviewRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        if caller_from_query(parts.uri.query()).is_none() {
+            return tool_error(
+                "html_preview requires the calling chat's MCP URL (?caller=<session id>)",
+            );
+        }
+        if let Err(error) = request.validate() {
+            return tool_error(error);
+        }
+        match crate::browser_control::preview_html(request).await {
+            Ok(mut value) => {
+                let Some(png) = value
+                    .as_object_mut()
+                    .and_then(|v| v.remove("png"))
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                else {
+                    return tool_error("html_preview: Chrome omitted the PNG");
+                };
+                let mut result = CallToolResult::success(vec![
+                    ContentBlock::text(value.to_string()),
+                    ContentBlock::image(png, "image/png"),
+                ]);
+                result.structured_content = Some(value);
+                result
+            }
+            Err(error) => tool_error(format!("html_preview failed: {error}")),
+        }
+    }
+
+    #[tool(
+        description = "Show a finished self-contained HTML page (chart, table, diagram or mockup) inline in this chat above your final reply. Check it with html_preview first and use its contentHeight, bounded to 100–4000 CSS pixels. Use responsive normal-flow layout, width:100%, no fixed viewport-height sizing or external dependencies. Inline CSS/scripts only; no network or local files, data images allowed. Use theme CSS variables --bg, --bg-alt, --bg-block, --fg, --fg-muted, --accent, --border, --user, --result, --tool, --warn, --err, --mono; they follow light/dark. Scripts run in an opaque sandbox without app IPC, parent DOM, cookies, forms or popups. HTTP(S) links open in the system browser. Maximum 512 KiB UTF-8. The page persists with the tool call and stays outside the work fold. Requires a local native Claude or ACP chat tab on macOS. Pi and other platforms are refused until equivalent replay and native navigation guards are available.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn html_render(
+        &self,
+        Parameters(request): Parameters<HtmlRenderRequest>,
+        Extension(parts): Extension<Parts>,
+    ) -> CallToolResult {
+        if let Err(error) = request.validate() {
+            return tool_error(error);
+        }
+        self.dispatch_with_caller(TaskControlOperation::HtmlRender(request), &parts, || {
+            "html_render requires the calling chat's MCP URL (?caller=<session id>)".into()
+        })
+        .await
+    }
+
+    #[tool(
         description = "List durable GitTerm tasks and their current state. Use this instead of reading tasks.json directly.",
         annotations(
             read_only_hint = true,
@@ -883,7 +950,7 @@ impl TaskMcpTools {
     }
 
     #[tool(
-        description = "Ask Codex to review code in your GitTerm tab's checkout, or in another checkout of your workspace (checkout: an absolute path to one of its repos or their worktrees), in the background. Returns {delegation_id} at once; the review takes a minute or more. Do not wait or poll for it: end your turn. The findings appear as a card in the requesting chat tab, and the human sends the ones they want back to you. Read the full result any time with delegation_get. Targets: uncommitted, base (with base_ref; includes uncommitted changes) or commit (with commit). Optional effort (low, medium, high, xhigh) and time_limit_minutes (GitTerm stops the run then and reports it as stopped at the time limit). Only reviewer \"codex\" is supported; for a Claude review, spawn a review subagent with your own Agent tool. Use this rather than running codex exec in a shell, which GitTerm cannot see.",
+        description = "Ask Codex to review code in your GitTerm tab's checkout, or in another checkout of your workspace (checkout: an absolute path to one of its repos or their worktrees), in the background. Returns {delegation_id} at once; the review takes a minute or more. Do not wait or poll for it: end your turn. Results arrive in the requesting chat by themselves after its current turn ends (unless automatic delivery is disabled), and stay as a card. Read the full result any time with delegation_get. Targets: uncommitted, base (with base_ref; includes uncommitted changes) or commit (with commit). Optional effort (low, medium, high, xhigh) and time_limit_minutes (GitTerm stops the run then and reports it as stopped at the time limit). Only reviewer \"codex\" is supported; for a Claude review, spawn a review subagent with your own Agent tool. Use this rather than running codex exec in a shell, which GitTerm cannot see.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -905,7 +972,7 @@ impl TaskMcpTools {
     }
 
     #[tool(
-        description = "Ask Codex for advice (brainstorming, architecture, investigation) on a self-contained brief. It runs read-only in your GitTerm tab's checkout, or in another checkout of your workspace (checkout: an absolute path to one of its repos or their worktrees), in the background, and cannot see this conversation. Optional effort (low, medium, high, xhigh) and time_limit_minutes (GitTerm stops the run then and reports it as stopped at the time limit). Returns {delegation_id} at once; do not wait or poll for it. The answer appears as a card in the requesting chat tab; read it with delegation_get. Use this rather than running codex exec in a shell, which GitTerm cannot see.",
+        description = "Ask Codex for advice (brainstorming, architecture, investigation) on a self-contained brief. It runs read-only in your GitTerm tab's checkout, or in another checkout of your workspace (checkout: an absolute path to one of its repos or their worktrees), in the background, and cannot see this conversation. Optional effort (low, medium, high, xhigh) and time_limit_minutes (GitTerm stops the run then and reports it as stopped at the time limit). Returns {delegation_id} at once; do not wait or poll for it. Results arrive in the requesting chat by themselves after its current turn ends (unless automatic delivery is disabled), and stay as a card; read the full answer with delegation_get. Use this rather than running codex exec in a shell, which GitTerm cannot see.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -927,7 +994,7 @@ impl TaskMcpTools {
     }
 
     #[tool(
-        description = "Hand an implementation task to a worker agent in the background. By default GitTerm creates a task with its own git worktree and branch from your GitTerm tab's repository; repo (an absolute path to another of your workspace's repos) makes the worktree from that repo instead, and checkout (an absolute path to an existing checkout or worktree of one of your workspace's repos) runs the worker in that checkout with no new worktree. GitTerm launches the worker (a configured preset: Codex by default, or Claude Code) in a background tab with the objective as its brief. Returns {delegation_id, task_id, task_session_id, worktree_path, branch} once the worktree exists; do not wait or poll after that: end your turn. The worker records progress and reports done or blocked with task_update_handoff; the report appears as a card in the requesting chat tab, and delegation_get reads it. role (scoped, judgment, specialist) picks the model from GitTerm's policy; model overrides it. Optional add_dirs (extra writable folders in your workspace), effort (low, medium, high, xhigh) and time_limit_minutes (GitTerm closes the worker's tab then and reports it as stopped at the time limit). Use this rather than running codex exec in a shell, which GitTerm cannot see.",
+        description = "Hand an implementation task to a worker agent in the background. By default GitTerm creates a task with its own git worktree and branch from your GitTerm tab's repository; repo (an absolute path to another of your workspace's repos) makes the worktree from that repo instead, and checkout (an absolute path to an existing checkout or worktree of one of your workspace's repos) runs the worker in that checkout with no new worktree. GitTerm launches the worker (a configured preset: Codex by default, or Claude Code) in a background tab with the objective as its brief. Returns {delegation_id, task_id, task_session_id, worktree_path, branch} once the worktree exists; do not wait or poll after that: end your turn. The worker records progress and reports done or blocked with task_update_handoff; results arrive in the requesting chat by themselves after its current turn ends (unless automatic delivery is disabled), and stay as a card; delegation_get reads the full report. role (scoped, judgment, specialist) picks the model from GitTerm's policy; model overrides it. Optional add_dirs (extra writable folders in your workspace), effort (low, medium, high, xhigh) and time_limit_minutes (GitTerm closes the worker's tab then and reports it as stopped at the time limit). Use this rather than running codex exec in a shell, which GitTerm cannot see.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1270,7 +1337,7 @@ mod tests {
     #[test]
     fn tool_surface_separates_read_and_write_operations() {
         let routes = TaskMcpTools::tool_router();
-        assert_eq!(routes.list_all().len(), 14);
+        assert_eq!(routes.list_all().len(), 16);
         let launch_schema = serde_json::to_value(
             routes
                 .get("task_launch_session")
@@ -1292,6 +1359,7 @@ mod tests {
             "delegation_get",
             "delegation_list",
             "merge_plan_get",
+            "html_preview",
         ] {
             assert_eq!(
                 routes
@@ -1312,6 +1380,7 @@ mod tests {
             "consult_request",
             "delegate_task",
             "merge_plan_set",
+            "html_render",
         ] {
             assert_eq!(
                 routes
@@ -1635,7 +1704,7 @@ mod tests {
             .expect("authorized MCP initialization timed out")
             .expect("authorized MCP initialization failed");
         let tools = client.list_tools(Default::default()).await.unwrap();
-        assert_eq!(tools.tools.len(), 14);
+        assert_eq!(tools.tools.len(), 16);
         // The merge plan tools as an agent sees them (TRU-173).
         let schema_of = |name: &str| {
             let tool = tools
@@ -1653,6 +1722,17 @@ mod tests {
         }
         let get = schema_of("merge_plan_get");
         assert!(get.get("required").is_none(), "{get}");
+        let render = schema_of("html_render");
+        assert_eq!(render["required"], serde_json::json!(["html", "height"]));
+        assert_eq!(render["properties"]["height"]["minimum"], 100);
+        assert_eq!(render["properties"]["height"]["maximum"], 4000);
+        assert_eq!(render["properties"]["html"]["maxLength"], 524288);
+        let preview = schema_of("html_preview");
+        assert_eq!(preview["required"], serde_json::json!(["html"]));
+        let preview = preview.to_string();
+        for word in ["width", "theme", "dark", "light", "240", "1600"] {
+            assert!(preview.contains(word), "{preview}");
+        }
         let result = client
             .call_tool(
                 rmcp::model::CallToolRequestParams::new("task_list").with_arguments(
