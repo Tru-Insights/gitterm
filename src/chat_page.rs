@@ -16,9 +16,10 @@ use crate::harness::HarnessEvent;
 pub const AGENT_CHAT_HTML: &str = include_str!("../assets/agent_chat.html");
 /// Vendored renderers inlined into the chat page (no network at runtime).
 /// Licenses sit next to them in `assets/vendor/`.
-pub const AGENT_CHAT_VENDOR_JS: [&str; 2] = [
+pub const AGENT_CHAT_VENDOR_JS: [&str; 3] = [
     include_str!("../assets/vendor/marked.min.js"),
     include_str!("../assets/vendor/highlight.min.js"),
+    crate::html_render::RENDER_JS,
 ];
 pub const AGENT_CHAT_VENDOR_SLOT: &str = "/*__VENDOR_JS__*/";
 

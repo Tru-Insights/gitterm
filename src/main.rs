@@ -21306,6 +21306,36 @@ fi
                 self.task_mcp = None;
             }
             Event::TaskControlRequested(envelope) => match envelope.operation {
+                TaskControlOperation::HtmlRender(request) => {
+                    if !gitterm::html_render::NATIVE_HTML_SUPPORTED {
+                        envelope.reply.send(Err("html_render currently requires GitTerm for macOS; this platform lacks the required native subframe navigation guard".into()));
+                        return Task::none();
+                    }
+                    let caller = envelope.caller.as_deref();
+                    let chat = self
+                        .workspaces
+                        .iter()
+                        .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+                        .flat_map(|ws| &ws.tabs)
+                        .find(|tab| {
+                            Some(tab.session_uid.as_str()) == caller
+                                && tab
+                                    .agent_session()
+                                    .is_some_and(|session| session.backend().is_native())
+                        });
+                    let result = request.validate().and_then(|()| {
+                        chat.ok_or_else(|| {
+                            "html_render requires an open local native Claude or ACP chat tab (Pi does not restore conversation history)".to_string()
+                        })?;
+                        // An additive result carried in the conversation works
+                        // even when a harness does not report the raw tool input.
+                        serde_json::to_value(gitterm::html_render::HtmlRenderResult {
+                            html_render: request,
+                        })
+                        .map_err(|error| format!("cannot encode visual reply: {error}"))
+                    });
+                    envelope.reply.send(result);
+                }
                 TaskControlOperation::List(request) => {
                     let Some(store) = self.task_store.as_ref() else {
                         envelope
@@ -23654,6 +23684,17 @@ fi
                 // Reset first: an event that arrived between the build and
                 // this message was already pushed live and is in the buffer.
                 reset_agent_webview(tab_id);
+                webview::evaluate_script(
+                    WebviewSurface::Agent(tab_id),
+                    &format!(
+                        "window.__setAppearance({:?})",
+                        if self.theme == AppTheme::Dark {
+                            "dark"
+                        } else {
+                            "light"
+                        }
+                    ),
+                );
                 let composer = self.chat_composer_state(tab_id);
                 set_agent_webview_tab_id(
                     tab_id,
@@ -26849,6 +26890,19 @@ fi
             }
             Event::ToggleTheme => {
                 self.theme = self.theme.toggle();
+                for tab_id in &self.agent_pages {
+                    webview::evaluate_script(
+                        WebviewSurface::Agent(*tab_id),
+                        &format!(
+                            "window.__setAppearance({:?})",
+                            if self.theme == AppTheme::Dark {
+                                "dark"
+                            } else {
+                                "light"
+                            }
+                        ),
+                    );
+                }
                 self.save_config();
                 self.recreate_terminals();
 

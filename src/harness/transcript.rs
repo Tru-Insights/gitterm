@@ -404,6 +404,9 @@ fn is_cli_injected(text: &str) -> bool {
 /// cut to `MAX_RESULT_CHARS` with a note of how much was dropped.
 fn result_text(content: &Value) -> String {
     let text = result_text_full(content);
+    if crate::html_render::is_render_output(&text) {
+        return text;
+    }
     let total = text.chars().count();
     if total <= MAX_RESULT_CHARS {
         return text;
@@ -468,6 +471,42 @@ fn assistant_events(content: &Value) -> Vec<HarnessEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn visual_reply_survives_transcript_and_serde_without_output_truncation() {
+        let html = format!("<h1>{}</h1>", "é".repeat(100_000));
+        let output = serde_json::to_string(&crate::html_render::HtmlRenderResult {
+            html_render: crate::html_render::HtmlRenderRequest {
+                html: html.clone(),
+                height: 600,
+            },
+        })
+        .unwrap();
+        let transcript = [
+            json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"tool_use","id":"visual","name":"mcp__gitterm_tasks__html_render","input":{"html":html,"height":600}}]}}),
+            json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result","tool_use_id":"visual","content":[{"type":"text","text":output}],"is_error":false}]}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let entries = parse_claude_transcript(&transcript);
+        let encoded = serde_json::to_string(&entries).unwrap();
+        let restored: Vec<TranscriptEntry> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(entries, restored);
+        let Some(TranscriptEntry::Harness(HarnessEvent::ItemCompleted {
+            output: restored,
+            is_error,
+            ..
+        })) = restored.iter().find(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Harness(HarnessEvent::ItemCompleted { .. })
+            )
+        })
+        else {
+            panic!("render completion restored");
+        };
+        assert!(!is_error);
+        assert_eq!(restored, &output);
+        assert!(crate::html_render::is_render_output(restored));
+    }
 
     fn line(v: Value) -> String {
         v.to_string()

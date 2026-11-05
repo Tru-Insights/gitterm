@@ -79,6 +79,9 @@ fn trim_for_log(s: &str, max: usize) -> String {
 }
 
 fn truncate_output(mut s: String) -> String {
+    if crate::html_render::is_render_output(&s) {
+        return s;
+    }
     if s.len() > MAX_RESULT_CHARS {
         let mut end = MAX_RESULT_CHARS;
         while !s.is_char_boundary(end) {
@@ -2377,6 +2380,19 @@ mod tests {
     const OPENCODE_LOAD: &str = include_str!("../../tests/fixtures/acp/opencode_load_replay.jsonl");
     const GEMINI_NEW: &str = include_str!("../../tests/fixtures/acp/gemini_session_new.jsonl");
     const GEMINI_TURN: &str = include_str!("../../tests/fixtures/acp/gemini_turn_permission.jsonl");
+
+    #[test]
+    fn visual_results_keep_complete_html_with_or_without_raw_output() {
+        let visual = json!({"html_render":{"html":"x".repeat(100_000),"height":600}});
+        let output = visual.to_string();
+        for update in [
+            json!({"rawOutput":visual}),
+            json!({"content":[{"type":"content","content":{"type":"text","text":output}}]}),
+        ] {
+            assert_eq!(tool_output(&update), output);
+        }
+        assert_eq!(truncate_output("x".repeat(100_000)).len(), MAX_RESULT_CHARS);
+    }
 
     fn frames(text: &str) -> Vec<Value> {
         text.lines()

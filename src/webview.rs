@@ -256,9 +256,35 @@ pub fn try_create_with_window(
         };
 
         if let Some(handler) = ipc_handler {
-            builder = builder.with_ipc_handler(move |req: wry::http::Request<String>| {
-                handler(req.into_body());
-            });
+            if matches!(surface, WebviewSurface::Agent(_)) {
+                let token = uuid::Uuid::new_v4().to_string();
+                builder = builder
+                    .with_incognito(true)
+                    .with_initialization_script_for_main_only(
+                        gitterm::html_render::FRAME_GUARD_JS,
+                        false,
+                    )
+                    .with_initialization_script_for_main_only(
+                        &gitterm::html_render::ipc_bootstrap(&token),
+                        true,
+                    )
+                    .with_navigation_handler(|url| {
+                        gitterm::html_render::agent_navigation_allowed(&url)
+                    })
+                    .with_new_window_req_handler(|url| {
+                        gitterm::html_render::agent_navigation_allowed(&url)
+                    })
+                    .with_ipc_handler(move |req: wry::http::Request<String>| {
+                        if let Some(message) = gitterm::html_render::ipc_message(req.body(), &token)
+                        {
+                            handler(message);
+                        }
+                    });
+            } else {
+                builder = builder.with_ipc_handler(move |req: wry::http::Request<String>| {
+                    handler(req.into_body());
+                });
+            }
         }
 
         let webview = builder
