@@ -54,6 +54,8 @@ const CHILD_TITLE_MAX_CHARS: usize = 90;
 /// What one conversation touched. Additive: every field defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatFacts {
+    /// Issue keys the chat mentioned or created through a `linear issue
+    /// create` Bash result containing a Linear issue URL.
     #[serde(default)]
     pub issue_keys: Vec<String>,
     #[serde(default)]
@@ -336,6 +338,9 @@ impl ChatFacts {
         for pr in scan.prs {
             self.add_pr(pr);
         }
+        for key in scan.issue_keys {
+            self.add_issue_key(&key);
+        }
         // The scan saw the whole transcript in order: its documents are the
         // newest; any only a tab recorded keep their place before them.
         if !scan.documents.is_empty() {
@@ -598,6 +603,8 @@ pub struct RawTouch {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawFacts {
     pub touches: Vec<RawTouch>,
+    /// Issue keys mentioned by the user, or returned by `linear issue
+    /// create` with a Linear URL in live and transcript observations.
     pub issue_keys: Vec<String>,
     pub children: Vec<ChatChild>,
     /// PRs from `gh pr create` results: live tabs, and transcript scans
@@ -695,6 +702,9 @@ impl RawFacts {
         }
         for pr in self.prs {
             facts.add_pr(pr);
+        }
+        for key in &self.issue_keys {
+            facts.add_issue_key(key);
         }
         for path in &self.documents {
             facts.add_document(path);
@@ -846,6 +856,9 @@ pub struct LiveFacts {
     /// Bash calls running `gh pr create` whose result has not arrived
     /// (TRU-173); their result names the PR.
     pr_create_calls: HashSet<String>,
+    /// Pending Bash inputs, matched with their own results for Linear creates
+    /// (TRU-219). Keeping the command lets both collectors use one matcher.
+    bash_commands: HashMap<String, String>,
     last_flush: Option<Instant>,
     in_flight: bool,
     /// The tab picked up a chat whose transcript may have moved on while
@@ -865,7 +878,12 @@ impl LiveFacts {
                     .and_then(Value::as_str)
                     .is_some_and(merge_plan::is_gh_pr_create);
             if creates_pr {
-                self.pr_create_calls.insert(call.id);
+                self.pr_create_calls.insert(call.id.clone());
+            }
+            if call.name == "Bash" {
+                if let Some(command) = call.input.get("command").and_then(Value::as_str) {
+                    self.bash_commands.insert(call.id, command.to_string());
+                }
             }
         }
         self.observe_results(event);
@@ -876,10 +894,20 @@ impl LiveFacts {
     fn observe_results(&mut self, event: &HarnessEvent) {
         match event {
             HarnessEvent::SubagentEvent { event, .. } => self.observe_results(event),
-            HarnessEvent::ItemCompleted { id, output, .. } if self.pr_create_calls.remove(id) => {
-                self.pending.prs.extend(merge_plan::pr_urls_in(output));
+            HarnessEvent::ItemCompleted { id, output, .. } => {
+                if self.pr_create_calls.remove(id) {
+                    self.pending.prs.extend(merge_plan::pr_urls_in(output));
+                }
+                if let Some(command) = self.bash_commands.remove(id) {
+                    self.pending
+                        .issue_keys
+                        .extend(created_linear_issue_keys(&command, output));
+                }
             }
-            HarnessEvent::ProcessExited { .. } => self.pr_create_calls.clear(),
+            HarnessEvent::ProcessExited { .. } => {
+                self.pr_create_calls.clear();
+                self.bash_commands.clear();
+            }
             _ => {}
         }
     }
@@ -1048,23 +1076,366 @@ fn catch_up_from_transcript(
 /// subagent transcript, whose user lines are the coordinator's brief, not
 /// the human's words.
 pub fn observe_claude_line(raw: &mut RawFacts, line: &str, home: Option<&Path>, main: bool) {
-    observe_claude_line_with(raw, &mut HashSet::new(), line, home, main);
+    observe_claude_line_with(
+        raw,
+        &mut HashSet::new(),
+        &mut HashMap::new(),
+        line,
+        home,
+        main,
+    );
 }
 
-/// [`observe_claude_line`] across a whole transcript: `pr_create_calls`
-/// holds the `gh pr create` Bash calls whose result line has not come yet;
-/// that result's PR URLs are recorded as the live tab would (TRU-201).
+/// Match a create invocation and its own Bash result together. A combined
+/// result cannot disambiguate multiple Linear calls or distinct issue URLs.
+fn created_linear_issue_keys(command: &str, output: &str) -> Vec<String> {
+    let keys = linear_issue_keys_in(output);
+    if keys.len() != 1 {
+        return Vec::new();
+    }
+    let Some(commands) = ShellScanner(command.chars().peekable(), 0).commands(false) else {
+        return Vec::new();
+    };
+    let mut linear = commands.iter().filter_map(|command| {
+        (command.words.first()?.rsplit('/').next() == Some("linear"))
+            .then_some((command, &command.words[1..]))
+    });
+    let Some((command, mut args)) = linear.next() else {
+        return Vec::new();
+    };
+    if linear.next().is_some() || command.stdout_redirected {
+        return Vec::new();
+    }
+    // These are the global options of the installed Linear CLI (`linear --help`).
+    while let Some(arg) = args.first() {
+        if arg == "--workspace" && args.len() >= 2 {
+            args = &args[2..];
+        } else if arg.starts_with("--workspace=") {
+            args = &args[1..];
+        } else if arg == "--" {
+            args = &args[1..];
+            break;
+        } else {
+            break;
+        }
+    }
+    if args.first().map(String::as_str) != Some("issue")
+        || args.get(1).map(String::as_str) != Some("create")
+    {
+        return Vec::new();
+    }
+    keys
+}
+
+fn shell_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name.bytes().enumerate().all(|(i, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (i > 0 && byte.is_ascii_digit())
+            })
+    })
+}
+
+#[derive(Default)]
+struct ShellCommand {
+    words: Vec<String>,
+    stdout_redirected: bool,
+}
+
+#[derive(Default)]
+struct ShellWord {
+    text: String,
+    quoted: bool,
+    assignment: bool,
+    commands: Vec<ShellCommand>,
+}
+
+/// A single lexical pass: the same quote/comment/continuation state governs
+/// both words and heredocs. Nested substitutions get their own shell context.
+/// shortcut: this identifies literal invocations, not full Bash execution;
+/// dynamic executables, backticks and arithmetic require a full shell parser.
+struct ShellScanner<'a>(std::iter::Peekable<std::str::Chars<'a>>, usize);
+
+impl ShellScanner<'_> {
+    fn commands(&mut self, nested: bool) -> Option<Vec<ShellCommand>> {
+        // Transcript input must not exhaust the stack through shell nesting.
+        self.1 += 1;
+        if self.1 > 64 {
+            return None;
+        }
+        let mut commands = Vec::new();
+        let mut current = ShellCommand::default();
+        let mut children = Vec::new();
+        let mut heredocs: Vec<(String, bool, bool)> = Vec::new();
+        while let Some(&ch) = self.0.peek() {
+            match ch {
+                ch if ch.is_whitespace() && ch != '\n' => {
+                    self.0.next();
+                }
+                '#' => {
+                    while self.0.peek().is_some_and(|ch| *ch != '\n') {
+                        self.0.next();
+                    }
+                }
+                '\n' => {
+                    self.0.next();
+                    finish_shell_command(&mut commands, &mut current, &mut children);
+                    for (delimiter, strip_tabs, quoted) in heredocs.drain(..) {
+                        self.heredoc(&delimiter, strip_tabs, quoted)?;
+                    }
+                }
+                ';' | '&' | '|' => {
+                    self.0.next();
+                    if ch == '&' && self.0.peek() == Some(&'>') {
+                        self.redirect(&mut current, &mut heredocs, Some(1))?;
+                    } else {
+                        finish_shell_command(&mut commands, &mut current, &mut children);
+                    }
+                }
+                '(' => {
+                    self.0.next();
+                    children.extend(self.commands(true)?);
+                }
+                ')' => {
+                    self.0.next();
+                    if !nested || !heredocs.is_empty() {
+                        return None;
+                    }
+                    finish_shell_command(&mut commands, &mut current, &mut children);
+                    self.1 -= 1;
+                    return Some(commands);
+                }
+                '<' | '>' => self.redirect(&mut current, &mut heredocs, None)?,
+                _ => {
+                    let word = self.word(true)?;
+                    if !word.quoted
+                        && !word.text.is_empty()
+                        && word.text.bytes().all(|byte| byte.is_ascii_digit())
+                        && matches!(self.0.peek(), Some('<' | '>'))
+                    {
+                        self.redirect(&mut current, &mut heredocs, Some(word.text.parse().ok()?))?;
+                    } else {
+                        children.extend(word.commands);
+                        if (!word.text.is_empty() || word.quoted)
+                            && !(word.assignment && current.words.is_empty())
+                        {
+                            current.words.push(word.text);
+                        }
+                    }
+                }
+            }
+        }
+        if nested || !heredocs.is_empty() {
+            return None;
+        }
+        finish_shell_command(&mut commands, &mut current, &mut children);
+        self.1 -= 1;
+        Some(commands)
+    }
+
+    fn word(&mut self, expand: bool) -> Option<ShellWord> {
+        let mut word = ShellWord::default();
+        let mut quote = None;
+        while let Some(&ch) = self.0.peek() {
+            if quote.is_none() && (ch.is_whitespace() || ";&|()<>".contains(ch)) {
+                break;
+            }
+            self.0.next();
+            if quote == Some('\'') {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    word.text.push(ch);
+                }
+            } else if ch == '\\' {
+                let next = self.0.next()?;
+                if next != '\n' {
+                    if quote == Some('"') && !"$`\"\\".contains(next) {
+                        word.text.push('\\');
+                    }
+                    word.text.push(next);
+                    word.quoted = true;
+                }
+            } else if Some(ch) == quote {
+                quote = None;
+            } else if quote.is_none() && matches!(ch, '\'' | '"') {
+                quote = Some(ch);
+                word.quoted = true;
+            } else if expand && ch == '$' && self.0.peek() == Some(&'(') {
+                self.0.next();
+                if self.0.peek() == Some(&'(') {
+                    return None;
+                }
+                word.commands.extend(self.commands(true)?);
+                // Expansion cannot manufacture a literal executable or subcommand.
+                word.text.push('\0');
+            } else if expand && ch == '`' {
+                return None;
+            } else {
+                word.text.push(ch);
+                if ch == '=' && !word.quoted && shell_assignment(&word.text) {
+                    word.assignment = true;
+                }
+            }
+        }
+        quote.is_none().then_some(word)
+    }
+
+    fn redirect(
+        &mut self,
+        current: &mut ShellCommand,
+        heredocs: &mut Vec<(String, bool, bool)>,
+        fd: Option<u32>,
+    ) -> Option<()> {
+        let operator = self.0.next()?;
+        let mut heredoc = false;
+        let mut strip_tabs = false;
+        if self.0.peek() == Some(&operator) {
+            self.0.next();
+            if operator == '<' {
+                if self.0.peek() == Some(&'<') {
+                    self.0.next(); // Consume the entire here-string operator.
+                } else {
+                    heredoc = true;
+                    if self.0.peek() == Some(&'-') {
+                        self.0.next();
+                        strip_tabs = true;
+                    }
+                }
+            }
+        }
+        if matches!(self.0.peek(), Some('&' | '|')) {
+            self.0.next();
+        }
+        while matches!(self.0.peek(), Some(' ' | '\t')) {
+            self.0.next();
+        }
+        let target = self.word(!heredoc)?;
+        if target.text.is_empty() && !target.quoted {
+            return None;
+        }
+        if operator == '>' && fd.unwrap_or(1) == 1 {
+            current.stdout_redirected = true;
+        }
+        if heredoc {
+            heredocs.push((target.text, strip_tabs, target.quoted));
+        }
+        Some(())
+    }
+
+    fn heredoc(&mut self, delimiter: &str, strip_tabs: bool, quoted: bool) -> Option<()> {
+        loop {
+            let mut line = String::new();
+            loop {
+                let ch = self.0.next();
+                if ch.is_none() || ch == Some('\n') {
+                    // Only unquoted heredocs join escaped physical lines.
+                    if ch.is_some()
+                        && !quoted
+                        && line.chars().rev().take_while(|ch| *ch == '\\').count() % 2 == 1
+                    {
+                        line.pop();
+                        continue;
+                    }
+                    break;
+                }
+                line.push(ch?);
+            }
+            if (if strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                &line
+            }) == delimiter
+            {
+                return Some(());
+            }
+            self.0.peek()?;
+        }
+    }
+}
+
+fn finish_shell_command(
+    commands: &mut Vec<ShellCommand>,
+    current: &mut ShellCommand,
+    children: &mut Vec<ShellCommand>,
+) {
+    for child in children.iter_mut() {
+        child.stdout_redirected |= current.stdout_redirected;
+    }
+    if !current.words.is_empty() {
+        commands.push(std::mem::take(current));
+    } else {
+        *current = ShellCommand::default();
+    }
+    commands.append(children);
+}
+
+/// Linear issue keys named by `https://linear.app/<workspace>/issue/<KEY>-<n>`
+/// URLs. Only a complete, well-formed key is returned.
+fn linear_issue_keys_in(text: &str) -> Vec<String> {
+    const PREFIX: &str = "https://linear.app/";
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(PREFIX) {
+        let after = &rest[at + PREFIX.len()..];
+        let Some((workspace, path)) = after.split_once("/issue/") else {
+            rest = after;
+            continue;
+        };
+        if workspace.is_empty() || workspace.contains('/') {
+            rest = after;
+            continue;
+        }
+        let key_len = path
+            .bytes()
+            .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            .count();
+        let valid_key = (2..=10).contains(&key_len)
+            && path.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+            && path.as_bytes()[..key_len]
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+        if !valid_key || path.as_bytes().get(key_len) != Some(&b'-') {
+            rest = after;
+            continue;
+        }
+        let digits_start = key_len + 1;
+        let digits = path.as_bytes()[digits_start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let end = digits_start + digits;
+        let valid_end = path
+            .as_bytes()
+            .get(end)
+            .is_none_or(|byte| *byte == b'/' || !byte.is_ascii_alphanumeric());
+        if digits > 0 && valid_end {
+            let key = path[..end].to_string();
+            if !found.contains(&key) {
+                found.push(key);
+            }
+        }
+        rest = after;
+    }
+    found
+}
+
+/// [`observe_claude_line`] across a whole transcript: the pending sets hold
+/// create Bash calls whose result line has not come yet; URLs are recorded
+/// as the live tab would (TRU-201, TRU-219).
 fn observe_claude_line_with(
     raw: &mut RawFacts,
     pr_create_calls: &mut HashSet<String>,
+    bash_commands: &mut HashMap<String, String>,
     line: &str,
     home: Option<&Path>,
     main: bool,
 ) {
     // Most lines are neither tool calls nor user text; skip them unparsed.
     let user_line = main && line.contains("\"user\"");
-    let pr_result = !pr_create_calls.is_empty() && line.contains("\"tool_result\"");
-    if !user_line && !pr_result && !line.contains("\"tool_use\"") {
+    let create_result = (!pr_create_calls.is_empty() || !bash_commands.is_empty())
+        && line.contains("\"tool_result\"");
+    if !user_line && !create_result && !line.contains("\"tool_use\"") {
         return;
     }
     let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -1074,19 +1445,23 @@ fn observe_claude_line_with(
     let Some(content) = value.get("message").and_then(|m| m.get("content")) else {
         return;
     };
-    if pr_result && kind == Some("user") {
+    if create_result && kind == Some("user") {
         for block in content.as_array().into_iter().flatten() {
             if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                 continue;
             }
-            let created = block
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| pr_create_calls.remove(id));
-            if created {
+            let id = block.get("tool_use_id").and_then(Value::as_str);
+            if id.is_some_and(|id| pr_create_calls.remove(id)) {
                 let output = block.get("content").map(tool_result_text);
                 raw.prs
                     .extend(merge_plan::pr_urls_in(output.as_deref().unwrap_or("")));
+            }
+            if let Some(command) = id.and_then(|id| bash_commands.remove(id)) {
+                let output = block.get("content").map(tool_result_text);
+                raw.issue_keys.extend(created_linear_issue_keys(
+                    &command,
+                    output.as_deref().unwrap_or(""),
+                ));
             }
         }
     }
@@ -1140,6 +1515,11 @@ fn observe_claude_line_with(
                 if creates_pr {
                     pr_create_calls.insert(id.to_string());
                 }
+                if name == "Bash" {
+                    if let Some(command) = input.get("command").and_then(Value::as_str) {
+                        bash_commands.insert(id.to_string(), command.to_string());
+                    }
+                }
             }
         }
         _ => {}
@@ -1169,11 +1549,19 @@ fn scan_lines(
     let mut reader = BufReader::new(std::fs::File::open(path)?);
     let mut line = String::new();
     let mut pr_create_calls = HashSet::new();
+    let mut bash_commands = HashMap::new();
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
-            Ok(_) => observe_claude_line_with(raw, &mut pr_create_calls, &line, home, main),
+            Ok(_) => observe_claude_line_with(
+                raw,
+                &mut pr_create_calls,
+                &mut bash_commands,
+                &line,
+                home,
+                main,
+            ),
             // A line that is not UTF-8 is skipped, not fatal.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
             Err(error) => return Err(error),
@@ -2124,6 +2512,345 @@ branch refs/heads/tracey/tru-12-thing
         });
         assert_eq!(facts.prs.len(), 2);
         assert!(!facts.is_empty());
+    }
+
+    #[test]
+    fn live_frames_record_linear_issues_from_create_results_only() {
+        let mut live = LiveFacts::default();
+        let bash = |id: &str, command: &str| HarnessEvent::ItemStarted {
+            id: id.into(),
+            kind: ItemKind::ToolCall {
+                name: "Bash".into(),
+                input: json!({ "command": command }),
+            },
+        };
+        let done = |id: &str, output: &str| HarnessEvent::ItemCompleted {
+            id: id.into(),
+            output: output.into(),
+            is_error: false,
+        };
+        live.observe(&bash("view", "linear issue view DEMO-20"), None);
+        live.observe(
+            &done(
+                "view",
+                "https://linear.app/fake-space/issue/DEMO-20/example",
+            ),
+            None,
+        );
+        live.observe(
+            &bash(
+                "update",
+                "linear --workspace fake-space issue update DEMO-21",
+            ),
+            None,
+        );
+        live.observe(
+            &done(
+                "update",
+                "https://linear.app/fake-space/issue/DEMO-21/example",
+            ),
+            None,
+        );
+        live.observe(
+            &bash(
+                "create",
+                "linear --workspace fake-space issue create --title example",
+            ),
+            None,
+        );
+        live.observe(
+            &done(
+                "create",
+                "Created https://linear.app/fake-space/issue/DEMO-22/example",
+            ),
+            None,
+        );
+        live.observe(&bash("failed", "linear issue create --title failed"), None);
+        live.observe(&done("failed", "creation failed"), None);
+        live.observe(
+            &HarnessEvent::TextDelta(
+                "https://linear.app/fake-space/issue/DEMO-23/assistant".into(),
+            ),
+            None,
+        );
+        let raw = live.take_due(Instant::now(), true).expect("issue is due");
+        assert_eq!(raw.issue_keys, vec!["DEMO-22"]);
+        let mut facts = ChatFacts::default();
+        raw.resolve_into(&mut facts, &mut GitResolver::default());
+        assert_eq!(facts.issue_keys, vec!["DEMO-22"]);
+    }
+
+    #[test]
+    fn transcript_scan_records_linear_issue_create_result_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript = temp.path().join("session.jsonl");
+        let lines = [
+            json!({"type":"assistant", "message":{"content":[
+                {"type":"text", "text":"https://linear.app/fake-space/issue/DEMO-30/assistant"},
+                {"type":"tool_use", "id":"view", "name":"Bash",
+                    "input":{"command":"linear issue view DEMO-31"}},
+                {"type":"tool_use", "id":"update", "name":"Bash",
+                    "input":{"command":"linear --workspace fake-space issue update DEMO-32"}},
+                {"type":"tool_use", "id":"create", "name":"Bash",
+                    "input":{"command":"linear --workspace fake-space issue create --title example"}},
+                {"type":"tool_use", "id":"failed", "name":"Bash",
+                    "input":{"command":"linear issue create --title failed"}}
+            ]}}),
+            json!({"type":"user", "message":{"content":[
+                {"type":"tool_result", "tool_use_id":"view",
+                    "content":"https://linear.app/fake-space/issue/DEMO-31/view"},
+                {"type":"tool_result", "tool_use_id":"update",
+                    "content":"https://linear.app/fake-space/issue/DEMO-32/update"},
+                {"type":"tool_result", "tool_use_id":"create",
+                    "content":[{"type":"text", "text":"https://linear.app/fake-space/issue/DEMO-33/example"}]},
+                {"type":"tool_result", "tool_use_id":"failed", "content":"no URL"}
+            ]}}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let raw = scan_claude_transcript(&transcript, None).unwrap();
+        assert_eq!(raw.issue_keys, vec!["DEMO-33"]);
+    }
+
+    #[test]
+    fn linear_issue_urls_require_a_complete_issue_path() {
+        assert_eq!(
+            linear_issue_keys_in(
+                "https://linear.app/fake-space/issue/DEMO-42/path, https://linear.app/fake-space/issue/DEMO-42abc, https://linear.app/fake-space/issue/demo-43, https://linear.app/fake-space/extra/issue/DEMO-45, https://example.com/fake-space/issue/DEMO-44"
+            ),
+            vec!["DEMO-42"]
+        );
+        let url = "https://linear.app/fake-space/issue/DEMO-42/path";
+        assert_eq!(
+            created_linear_issue_keys("linear issue create --title x", url),
+            vec!["DEMO-42"]
+        );
+        assert_eq!(
+            created_linear_issue_keys("linear --workspace fake-space issue create --title x", url),
+            vec!["DEMO-42"]
+        );
+        assert!(created_linear_issue_keys("linear issue view DEMO-42", url).is_empty());
+        assert!(created_linear_issue_keys("linear issue update DEMO-42", url).is_empty());
+    }
+
+    fn scanned_issue_keys(command: &str, output: &str) -> Vec<String> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript = temp.path().join("session.jsonl");
+        let lines = [
+            json!({"type":"assistant", "message":{"content":[
+                {"type":"tool_use", "id":"call", "name":"Bash",
+                    "input":{"command":command}}
+            ]}}),
+            json!({"type":"user", "message":{"content":[
+                {"type":"tool_result", "tool_use_id":"call", "content":output}
+            ]}}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        scan_claude_transcript(&transcript, None)
+            .unwrap()
+            .issue_keys
+    }
+
+    fn live_issue_keys(command: &str, output: &str) -> Vec<String> {
+        let mut live = LiveFacts::default();
+        live.observe(
+            &HarnessEvent::ItemStarted {
+                id: "call".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Bash".into(),
+                    input: json!({"command":command}),
+                },
+            },
+            None,
+        );
+        live.observe(
+            &HarnessEvent::ItemCompleted {
+                id: "call".into(),
+                output: output.into(),
+                is_error: false,
+            },
+            None,
+        );
+        live.take_due(Instant::now(), true)
+            .unwrap_or_default()
+            .issue_keys
+    }
+
+    #[test]
+    fn linear_matcher_rejects_excessive_shell_nesting() {
+        let command = format!("{}linear issue create{}", "(".repeat(256), ")".repeat(256));
+        assert!(created_linear_issue_keys(
+            &command,
+            "https://linear.app/fake-space/issue/DEMO-80/new"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn linear_review_reproductions_live() {
+        linear_review_reproductions(live_issue_keys);
+    }
+
+    #[test]
+    fn linear_review_reproductions_transcript() {
+        linear_review_reproductions(scanned_issue_keys);
+    }
+
+    fn linear_review_reproductions(collect: fn(&str, &str) -> Vec<String>) {
+        let url = "https://linear.app/fake-space/issue/DEMO-80/new";
+        // Both review rounds, including the additional probes in their full records.
+        let cases = [
+            ("update argument", "linear issue update DEMO-21 --description 'issue create'", url, false),
+            ("view comment", "linear issue view DEMO-21 # issue create", url, false),
+            ("view output", "linear issue create --title new >/dev/null && linear issue view DEMO-20 --json", url, false),
+            ("both create kinds", "linear issue create --title new && gh pr create --title new --body new", "https://linear.app/fake-space/issue/DEMO-80/new\nhttps://github.com/fake/repo/pull/42", true),
+            ("continuation", "linear \\\n issue create --title new", url, true),
+            ("heredoc data", "cat <<'EOF'\nlinear issue create --title new\nhttps://linear.app/fake-space/issue/DEMO-80/new\nEOF", url, false),
+            ("normal heredoc", "cd /tmp && linear issue create --title new --description \"$(cat <<'EOF'\nsome text\nEOF\n)\"", url, true),
+            ("duplicate URL", "linear issue create --title new", "https://linear.app/fake-space/issue/DEMO-80/new\nhttps://linear.app/fake-space/issue/DEMO-80/new", true),
+            ("quoted parentheses", "printf '%s' '(linear issue create --title new)'", url, false),
+            ("quoted parentheses argument", "linear issue create --title '(new)'", url, true),
+            ("quoted substitution", "url=\"$(linear issue create --title new)\"; printf '%s' \"$url\"", url, true),
+            ("quoted executable", "'linear' issue create --title new", url, true),
+            ("assignment", "NAME=\"value\" linear issue create --title new", url, true),
+            ("quoted assignment is executable", "'NAME=value' linear issue create --title new", url, false),
+            ("empty command argument", "linear '' issue create", url, false),
+            ("workspace value named issue", "linear --workspace issue issue create --title new", url, true),
+            ("workspace equals", "linear --workspace=fake-space issue create --title new", url, true),
+            ("stderr redirection", "linear issue create --title new 2>/tmp/fake-errors", url, true),
+            ("stdout group redirection", "(linear issue create --title new) >/dev/null; cat old-issue.json", url, false),
+            ("multiple results", "linear issue create --title new", "https://linear.app/fake-space/issue/DEMO-80/new https://linear.app/fake-space/issue/DEMO-81/other", false),
+            ("heredoc at EOF", "linear issue create --title new <<EOF\nbody\nEOF", url, true),
+            ("tabbed mixed delimiter", "cat <<-E'ND'-DESC\n\tbody\n\tEND-DESC\nlinear issue create --title new", url, true),
+            ("subshell", "(linear issue create --title new)", url, true),
+            ("substitution", "url=$(linear issue create --title new); printf '%s' \"$url\"", url, true),
+            ("comment heredoc marker", "# description uses <<EOF\nlinear issue create --title new", url, true),
+            ("here string", "cat <<<foo\nlinear issue create --title new", url, true),
+            ("quoted heredoc backslash", "cat <<'EOF'\nexample \\\nEOF\nlinear issue create --title new", url, true),
+            ("hyphen delimiter", "cat <<END-DESC\nbody\nEND-DESC\nlinear issue create --title new", url, true),
+            ("printf output", "linear issue create --title new >/dev/null && printf '%s\\n' 'https://linear.app/fake-space/issue/DEMO-80/new'", url, false),
+            ("cat output", "linear issue create --title new >/dev/null && cat old-issue.json", url, false),
+            ("quoted marker across lines", "printf '%s\\n' 'first line\n<<EOF\ntext'\nlinear issue create --title new", url, true),
+            ("continued executable", "lin\\\near issue create --title new", url, true),
+            ("continued subcommand", "linear iss\\\nue create --title new", url, true),
+            ("heredoc nested quotes", "linear issue create --description \"$(cat <<'EOF'\nexample \"\nlinear issue create --title decoy\nEOF\n)\"", url, true),
+        ];
+        let mut failures = Vec::new();
+        for (name, command, output, created) in cases {
+            let expected = if created { vec!["DEMO-80"] } else { vec![] };
+            let actual = collect(command, output);
+            if actual != expected {
+                failures.push(format!("{name}: expected {expected:?}, got {actual:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn issue_create_matching_checks_subcommand_not_argument_text() {
+        let decoy = "linear issue update DEMO-70 --description 'issue create'";
+        let output = "https://linear.app/fake-space/issue/DEMO-70/example";
+        assert_eq!(live_issue_keys(decoy, output), Vec::<String>::new());
+        assert_eq!(scanned_issue_keys(decoy, output), Vec::<String>::new());
+
+        let create = "linear --workspace fake-space issue create --title example";
+        let created = "https://linear.app/fake-space/issue/DEMO-71/example";
+        assert_eq!(live_issue_keys(create, created), vec!["DEMO-71"]);
+        assert_eq!(scanned_issue_keys(create, created), vec!["DEMO-71"]);
+    }
+
+    #[test]
+    fn issue_create_matching_skips_heredocs_and_joins_continuations() {
+        let command = "cat <<'EOF'\nlinear issue create --title fake\nEOF\nlinear \\\nissue create --title real";
+        let output = "https://linear.app/fake-space/issue/DEMO-72/example";
+        assert_eq!(live_issue_keys(command, output), vec!["DEMO-72"]);
+        assert_eq!(scanned_issue_keys(command, output), vec!["DEMO-72"]);
+
+        let heredoc_only = "cat <<EOF\nlinear issue create --title fake\nEOF";
+        assert_eq!(live_issue_keys(heredoc_only, output), Vec::<String>::new());
+        assert_eq!(
+            scanned_issue_keys(heredoc_only, output),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn ambiguous_linear_create_output_is_not_attributed() {
+        let command =
+            "linear issue create --title new >/dev/null && linear issue view DEMO-73 --json";
+        let output = "https://linear.app/fake-space/issue/DEMO-73/existing";
+        assert_eq!(live_issue_keys(command, output), Vec::<String>::new());
+        assert_eq!(scanned_issue_keys(command, output), Vec::<String>::new());
+    }
+
+    #[test]
+    fn issue_and_pr_create_results_are_both_recorded_live_and_in_transcripts() {
+        let command =
+            "linear --workspace fake-space issue create --title new && gh pr create --title new";
+        let output = "https://linear.app/fake-space/issue/DEMO-74/new https://github.com/example/project/pull/75";
+        assert_eq!(live_issue_keys(command, output), vec!["DEMO-74"]);
+        assert_eq!(scanned_issue_keys(command, output), vec!["DEMO-74"]);
+
+        let mut live = LiveFacts::default();
+        live.observe(
+            &HarnessEvent::ItemStarted {
+                id: "call".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Bash".into(),
+                    input: json!({"command":command}),
+                },
+            },
+            None,
+        );
+        live.observe(
+            &HarnessEvent::ItemCompleted {
+                id: "call".into(),
+                output: output.into(),
+                is_error: false,
+            },
+            None,
+        );
+        let raw = live.take_due(Instant::now(), true).unwrap();
+        assert_eq!(raw.issue_keys, vec!["DEMO-74"]);
+        assert_eq!(raw.prs.len(), 1);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript = temp.path().join("session.jsonl");
+        let lines = [
+            json!({"type":"assistant", "message":{"content":[
+                {"type":"tool_use", "id":"call", "name":"Bash", "input":{"command":command}}
+            ]}}),
+            json!({"type":"user", "message":{"content":[
+                {"type":"tool_result", "tool_use_id":"call", "content":output}
+            ]}}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let raw = scan_claude_transcript(&transcript, None).unwrap();
+        assert_eq!(raw.issue_keys, vec!["DEMO-74"]);
+        assert_eq!(raw.prs.len(), 1);
     }
 
     #[test]
