@@ -894,6 +894,7 @@ detached
                 status: crate::harness::TurnStatus::Interrupted,
                 usage: Value::Null,
                 cost_usd: None,
+                rate_limit: None,
             },
             None,
         );

@@ -1588,6 +1588,7 @@ mod tests {
             status: TurnStatus::Completed,
             usage: Value::Null,
             cost_usd: cost,
+            rate_limit: None,
         })
     }
 
@@ -1779,6 +1780,7 @@ mod tests {
                 status: TurnStatus::Failed("rate limited\nretry later".into()),
                 usage: Value::Null,
                 cost_usd: None,
+                rate_limit: None,
             }),
         ];
         let last = conversation_activity(&failed, None).last_turn.unwrap();
@@ -1828,6 +1830,7 @@ mod tests {
                     status: TurnStatus::Completed,
                     usage: Value::Null,
                     cost_usd: None,
+                    rate_limit: None,
                 },
             ),
             // A subagent's own subagent rolls up; its end is not a2's.
@@ -1839,6 +1842,7 @@ mod tests {
                         status: TurnStatus::Completed,
                         usage: Value::Null,
                         cost_usd: None,
+                        rate_limit: None,
                     }),
                 },
             ),
@@ -1897,6 +1901,7 @@ mod tests {
                     status: TurnStatus::Completed,
                     usage: Value::Null,
                     cost_usd: None,
+                    rate_limit: None,
                 },
             ),
             t1,

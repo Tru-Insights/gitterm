@@ -41,6 +41,7 @@ mod config;
 mod config_import;
 mod events;
 mod hover_bounds;
+mod plan_limits_view;
 mod tab;
 mod theme;
 mod v5_pickup;
@@ -89,6 +90,7 @@ use gitterm::workspace_overview as overview;
 use gitterm::worktree_follow::{
     self, CacheLookup, WorktreeFollow, WorktreeInfo, WorktreeListCache,
 };
+use plan_limits_view::PlanLimitsEvent;
 use source::{FilesState, SourceCapabilities, SourceDirListing, SourcePath, WorkspaceSource};
 use tab::{AgentBackendConfig, AgentSession, FileViewerOverlay, TabKind, TerminalTab};
 use webview::WebviewSurface;
@@ -6906,6 +6908,8 @@ pub enum Event {
     Pr(PrEvent),
     /// The Work page's Issues: titles from `linear`, fold, open (TRU-203).
     Issue(IssueEvent),
+    /// Plan limits for the Usage view and the rail badge (TRU-211).
+    PlanLimits(PlanLimitsEvent),
     /// Open the review pane on an owned checkout (TRU-178).
     ReviewOpen(PathBuf, overview::DiffSource),
     /// A review load finished, for this generation.
@@ -7340,6 +7344,8 @@ struct App {
     prs: work_prs::PrsState,
     /// The Work page's Issues section (TRU-203): cached titles and the fold.
     issues: work_issues::IssuesState,
+    /// Claude and Codex plan limits, last reading of each (TRU-211).
+    plan_limits: plan_limits_view::PlanLimitsState,
     /// `github-accounts.json` (shared config dir): gh account per GitHub owner.
     github_accounts: std::collections::BTreeMap<String, String>,
     /// The review pane (TRU-178) while the Viewer shows it.
@@ -9711,7 +9717,8 @@ impl App {
         if self.usage_view.open {
             webview::set_visible(WebviewSurface::Viewer, false);
             webview::hide_agent_pages();
-            return self.request_usage_scan();
+            let limits = self.read_codex_limits();
+            return Task::batch([self.request_usage_scan(), limits]);
         }
         self.apply_webview_surfaces()
     }
@@ -18033,6 +18040,7 @@ impl App {
             parked_list_open: false,
             prs: work_prs::PrsState::load(&config::global_config_dir()),
             issues: work_issues::IssuesState::load(&config::global_config_dir()),
+            plan_limits: plan_limits_view::PlanLimitsState::load(&config::global_config_dir()),
             github_accounts: config::load_github_accounts(),
             review_pane: None,
             review_generation: 0,
@@ -21448,6 +21456,8 @@ fi
                 tasks.push(self.auto_tell_coordinators());
                 // Titles of the shown Issues, from `linear` (TRU-203).
                 tasks.push(self.poll_issue_titles());
+                // Plan limits (TRU-211): the Codex read and the save.
+                tasks.push(self.poll_plan_limits());
                 // ~/Work commits and pushes itself (TRU-201).
                 tasks.push(self.poll_work_notes());
                 // Closed tabs release their browser targets (TRU-176).
@@ -23187,6 +23197,14 @@ fi
                 ));
             }
             Event::AgentEventReceived(tab_id, ev) => {
+                // Any Claude chat's plan limits, local or remote (TRU-211).
+                if let tab::AgentEvent::Harness(HarnessEvent::TurnCompleted {
+                    rate_limit: Some(reading),
+                    ..
+                }) = &ev
+                {
+                    self.observe_claude_rate_limit(reading);
+                }
                 // Append to the conversation buffer and push the event live
                 // into the tab's chat page, visible or hidden, so a hidden page
                 // is current when it is shown again. The tab whose page was
@@ -26622,7 +26640,10 @@ fi
             }
             Event::UsageChartTokens(tokens) => self.usage_chart_tokens = tokens,
             Event::UsageHeadlessToggled => self.usage_show_headless = !self.usage_show_headless,
-            Event::UsageRefresh => return self.request_usage_scan(),
+            Event::UsageRefresh => {
+                let limits = self.read_codex_limits();
+                return Task::batch([self.request_usage_scan(), limits]);
+            }
             Event::UsageScanned(result) => {
                 self.usage_scanning = false;
                 match result {
@@ -27020,6 +27041,7 @@ fi
             }
             Event::Pr(event) => return self.update_prs(event),
             Event::Issue(event) => return self.update_issues(event),
+            Event::PlanLimits(event) => return self.update_plan_limits(event),
             Event::ToggleChatOpenSection => {
                 self.chat_open_section_collapsed = !self.chat_open_section_collapsed;
             }
@@ -33656,12 +33678,14 @@ fi
             );
         }
         let hover_bg = theme.surface0();
-        let btn = button(
+        let btn = button(column![
             container(glyph)
                 .width(Length::Fixed(SPINE_WIDTH - 1.0))
                 .center_x(Length::Fixed(SPINE_WIDTH - 1.0))
                 .center_y(Length::Fixed(16.0)),
-        )
+            // Plan limits (TRU-211): the highest % across providers.
+            self.view_plan_limits_badge(),
+        ])
         .style(move |_theme, status| button::Style {
             background: Some(
                 if open || matches!(status, button::Status::Hovered) {
@@ -33677,9 +33701,10 @@ fi
         .padding([8, 0])
         .on_press(Event::UsageViewToggle);
         let tip = self.rail_tooltip(
-            text("Usage  ⌘⇧U")
+            text(self.plan_limits_tooltip())
                 .size(self.ui_font_small())
-                .color(theme.text_primary()),
+                .color(theme.text_primary())
+                .wrapping(iced::widget::text::Wrapping::None),
         );
         iced::widget::tooltip(btn, tip, iced::widget::tooltip::Position::Right).into()
     }
@@ -38378,6 +38403,8 @@ fi
                     .color(theme.danger()),
             );
         }
+        // Plan limits (TRU-211) first: they do not wait for the scan.
+        content = content.push(self.view_plan_limits_section());
         let page = |content: Column<'a, Event, Theme, iced::Renderer>| {
             container(scrollable(content).height(Length::Fill).width(Length::Fill))
                 .width(Length::Fill)
@@ -44863,6 +44890,7 @@ mod tests {
             status,
             usage: serde_json::Value::Null,
             cost_usd: None,
+            rate_limit: None,
         };
         assert_eq!(
             harness(completed(TurnStatus::Completed)),
@@ -47647,6 +47675,7 @@ mod tests {
             status,
             usage: serde_json::Value::Null,
             cost_usd: None,
+            rate_limit: None,
         };
         assert_eq!(
             harness(completed(TurnStatus::Completed)),

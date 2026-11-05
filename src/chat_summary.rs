@@ -754,6 +754,7 @@ mod tests {
             status: TurnStatus::Completed,
             usage: Value::Null,
             cost_usd: None,
+            rate_limit: None,
         })
     }
 
