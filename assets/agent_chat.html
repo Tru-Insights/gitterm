@@ -1572,7 +1572,7 @@
         }
         sub.tracked = true;
         sub.state = 'running';
-        openFoldsAround(sub.item.card);
+        if (!replaying) keepView(() => openFoldsAround(sub.item.card));
         if (d && d.model) sub.model = d.model;
         break;
       case 'turn_completed': {
@@ -3113,7 +3113,7 @@
     if (subRoot && subRoot.sub) {
       subRoot.sub.waiting = true;
       renderSubagent(subRoot.sub);
-      openFoldsAround(subRoot.card);
+      if (!replaying) keepView(() => openFoldsAround(subRoot.card));
     }
     setActivity(d.kind.type === 'question' ? 'Waiting for your answer' : 'Waiting for approval: ' + (d.kind.tool_name || ''), 'waiting');
     renderPanel();
@@ -3436,6 +3436,13 @@
       endSegment();
     } finally {
       replaying = false;
+    }
+    // Historical activity should not reopen completed folds. Show only
+    // subagents that still need attention in the replay's final state.
+    for (const item of items.values()) {
+      if (item.sub && (item.sub.state === 'running' || item.sub.waiting)) {
+        openFoldsAround(item.card);
+      }
     }
     // Only the newest blocks go into layout; the rest wait detached.
     trimWindow();
