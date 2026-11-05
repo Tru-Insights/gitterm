@@ -27324,6 +27324,8 @@ fi
                         tab.last_poll = Instant::now() - Duration::from_secs(60);
                     }
                 }
+                self.request_open_pr_refreshes();
+                return self.poll_pr_watch();
             }
             Event::WindowResized(width, height) => {
                 self.window_size = (width, height);
@@ -27749,7 +27751,13 @@ fi
                         .workspace_overview_presentations
                         .entry(uid)
                         .or_default();
-                    overview::toggle_row(&mut presentation.open_rows, key);
+                    let opened = overview::toggle_row(&mut presentation.open_rows, key.clone());
+                    if opened {
+                        if let overview::RowKey::Pr(id) = key {
+                            self.prs.request_row_refresh(id, opened, Instant::now());
+                            return self.poll_pr_watch();
+                        }
+                    }
                 }
             }
             Event::WorkspaceOverviewOpenChat(id) => {
