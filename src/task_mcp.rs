@@ -97,6 +97,9 @@ pub struct LaunchTaskSessionRequest {
     /// Configured GitTerm agent-preset name, matched case-insensitively. Omit
     /// this value to launch a plain terminal.
     pub preset_name: Option<String>,
+    /// The user explicitly chose this model/provider despite plan-limit holds.
+    #[serde(default)]
+    pub user_model_choice: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -840,7 +843,7 @@ impl TaskMcpTools {
     }
 
     #[tool(
-        description = "Open a configured agent preset or plain terminal as a child session in a prepared task worktree. The initial contract launches the harness but does not automatically submit the task objective.",
+        description = "Open a configured agent preset or plain terminal as a child session in a prepared task worktree. Set user_model_choice true only when the user explicitly chose this provider/model; it overrides plan-limit holds and may consume remaining allowance or credits. The initial contract launches the harness but does not automatically submit the task objective.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1268,6 +1271,20 @@ mod tests {
     fn tool_surface_separates_read_and_write_operations() {
         let routes = TaskMcpTools::tool_router();
         assert_eq!(routes.list_all().len(), 14);
+        let launch_schema = serde_json::to_value(
+            routes
+                .get("task_launch_session")
+                .unwrap()
+                .input_schema
+                .as_ref(),
+        )
+        .unwrap();
+        assert!(
+            launch_schema["properties"]
+                .get("user_model_choice")
+                .is_some(),
+            "task_launch_session must expose explicit user model-choice attribution"
+        );
         for name in [
             "plan_limits",
             "task_list",
@@ -1306,6 +1323,25 @@ mod tests {
                 Some(false)
             );
         }
+    }
+
+    #[test]
+    fn launch_session_user_model_choice_is_explicit_and_backward_compatible() {
+        let old_request: LaunchTaskSessionRequest = serde_json::from_value(serde_json::json!({
+            "task_id": "task-1",
+            "preset_name": "Codex"
+        }))
+        .unwrap();
+        assert!(!old_request.user_model_choice);
+
+        let explicit_request: LaunchTaskSessionRequest =
+            serde_json::from_value(serde_json::json!({
+                "task_id": "task-1",
+                "preset_name": "Codex",
+                "user_model_choice": true
+            }))
+            .unwrap();
+        assert!(explicit_request.user_model_choice);
     }
 
     #[tokio::test]

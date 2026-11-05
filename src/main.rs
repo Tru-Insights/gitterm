@@ -4697,6 +4697,19 @@ struct QueuedTaskLaunch {
     task_id: String,
     preset_idx: Option<usize>,
     origin: TaskLaunchOrigin,
+    user_model_choice: bool,
+}
+
+fn update_queued_task_request(
+    queue: &mut [QueuedTaskLaunch],
+    task_id: &str,
+    origin: TaskLaunchOrigin,
+    user_model_choice: bool,
+) -> Option<usize> {
+    let position = queue.iter().position(|entry| entry.task_id == task_id)?;
+    queue[position].origin = origin;
+    queue[position].user_model_choice = user_model_choice;
+    Some(position + 1)
 }
 
 /// Outcome of asking for a task child session: it started, or the local
@@ -11923,7 +11936,7 @@ impl App {
     }
 
     fn launch_task_child(&mut self, task_id: &str, preset_idx: Option<usize>) -> Task<Event> {
-        match self.try_launch_task_child(task_id, preset_idx, true, TaskLaunchOrigin::User) {
+        match self.try_launch_task_child(task_id, preset_idx, true, TaskLaunchOrigin::User, false) {
             Ok(TaskChildLaunch::Started(task, _session)) => task,
             Ok(TaskChildLaunch::Queued { .. }) => {
                 // The rail and overview state row show "Queued · #N" — no
@@ -12145,8 +12158,13 @@ impl App {
             if !still_queued {
                 continue;
             }
-            match self.try_launch_task_child(&entry.task_id, entry.preset_idx, false, entry.origin)
-            {
+            match self.try_launch_task_child(
+                &entry.task_id,
+                entry.preset_idx,
+                false,
+                entry.origin,
+                entry.user_model_choice,
+            ) {
                 Ok(TaskChildLaunch::Started(task, _session)) => started.push(task),
                 Ok(TaskChildLaunch::Queued { .. }) => continue,
                 Err(error) => {
@@ -12203,6 +12221,7 @@ impl App {
         preset_idx: Option<usize>,
         focus: bool,
         origin: TaskLaunchOrigin,
+        user_model_choice: bool,
     ) -> Result<TaskChildLaunch, String> {
         let Some(task) = self
             .task_store
@@ -12319,7 +12338,7 @@ impl App {
                 self.plan_limit_running_workers(provider) > 0
                     || (provider == gitterm::plan_limits::Provider::Codex
                         && !self.delegation_runs.is_empty()),
-                worker_options.user_model_choice,
+                worker_options.user_model_choice || user_model_choice,
             )
         });
         if policy_blocked
@@ -12346,7 +12365,12 @@ impl App {
                 .position(|entry| entry.task_id == task_id);
             let limit = self.max_concurrent_local_tasks.max(1);
             if policy_blocked || self.local_running_task_count() >= limit {
-                if let Some(position) = queue_position {
+                if let Some(position) = update_queued_task_request(
+                    &mut self.task_launch_queue,
+                    task_id,
+                    origin,
+                    user_model_choice,
+                ) {
                     // Dispatching an already-queued task again keeps its
                     // place — it never jumps the line.
                     return Ok(TaskChildLaunch::Queued {
@@ -12373,6 +12397,7 @@ impl App {
                     task_id: task_id.to_string(),
                     preset_idx,
                     origin,
+                    user_model_choice,
                 });
                 return Ok(TaskChildLaunch::Queued {
                     position: self.task_launch_queue.len(),
@@ -17420,6 +17445,7 @@ impl App {
             Some(worker.choice.preset_index),
             false,
             TaskLaunchOrigin::Agent,
+            false,
         );
         let (focus, task_session_id, queue_position) = match launch {
             Ok(TaskChildLaunch::Started(focus, session)) => (
@@ -18455,6 +18481,7 @@ impl App {
                             // Restored launches are automatic; a new UI choice can
                             // override policy again after restart.
                             origin: TaskLaunchOrigin::Agent,
+                            user_model_choice: false,
                         }
                     })
                     .collect()
@@ -21448,8 +21475,13 @@ fi
                         preset_idx,
                         false,
                         TaskLaunchOrigin::Agent,
+                        request.user_model_choice,
                     ) {
                         Ok(TaskChildLaunch::Started(task, session)) => {
+                            let mut session = session;
+                            if request.user_model_choice {
+                                session["cost_note"] = serde_json::json!("Explicit user model choice overrides plan limits; this may consume remaining allowance or credits.");
+                            }
                             envelope.reply.send(Ok(session));
                             return task;
                         }
@@ -21458,6 +21490,7 @@ fi
                                 "task_id": request.task_id,
                                 "queued": true,
                                 "queue_position": position,
+                                "cost_note": request.user_model_choice.then_some("Explicit user model choice overrides plan limits; this may consume remaining allowance or credits."),
                                 "detail": "Concurrency or plan limits deferred this launch; it starts automatically when capacity permits.",
                             })));
                         }
@@ -25781,6 +25814,7 @@ fi
                         None,
                         true,
                         TaskLaunchOrigin::User,
+                        false,
                     ) {
                         // A plain terminal never hits the concurrency gate.
                         Ok(TaskChildLaunch::Started(focus, _session)) => focus,
@@ -45077,9 +45111,36 @@ mod tests {
             // MCP task_create + task_launch_session has no worker delegation.
             assert!(TaskLaunchOrigin::Agent.policy_blocked(false, &held, provider, false, false));
             assert!(TaskLaunchOrigin::Agent.policy_blocked(true, &held, provider, false, false));
+            assert!(!TaskLaunchOrigin::Agent.policy_blocked(false, &held, provider, false, true));
             assert!(!TaskLaunchOrigin::Agent.policy_blocked(true, &held, provider, false, true));
             assert!(!TaskLaunchOrigin::User.policy_blocked(false, &held, provider, false, false));
         }
+    }
+
+    #[test]
+    fn re_requesting_a_queued_task_keeps_its_place_and_updates_origin() {
+        let mut queue = vec![
+            QueuedTaskLaunch {
+                task_id: "first".into(),
+                preset_idx: Some(0),
+                origin: TaskLaunchOrigin::Agent,
+                user_model_choice: false,
+            },
+            QueuedTaskLaunch {
+                task_id: "second".into(),
+                preset_idx: Some(1),
+                origin: TaskLaunchOrigin::Agent,
+                user_model_choice: false,
+            },
+        ];
+
+        assert_eq!(
+            update_queued_task_request(&mut queue, "second", TaskLaunchOrigin::User, true),
+            Some(2)
+        );
+        assert!(matches!(queue[1].origin, TaskLaunchOrigin::User));
+        assert!(queue[1].user_model_choice);
+        assert_eq!(queue[1].preset_idx, Some(1));
     }
 
     #[test]
