@@ -2607,14 +2607,66 @@ fn overview_repo_branch_slots<'a>(
     rows: impl IntoIterator<Item = Element<'a, Event, Theme, iced::Renderer>>,
     expanded: bool,
 ) -> Column<'a, Event, Theme, iced::Renderer> {
-    rows.into_iter()
-        .fold(Column::new().spacing(1), |column, row| {
+    rows.into_iter().fold(
+        Column::new().spacing(overview_repo_branch_spacing(expanded)),
+        |column, row| {
             column.push(if expanded {
                 row
             } else {
                 iced::widget::Space::new().into()
             })
-        })
+        },
+    )
+}
+
+fn overview_repo_branch_spacing(expanded: bool) -> f32 {
+    if expanded {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn overview_repo_details<'a>(
+    head: Element<'a, Event, Theme, iced::Renderer>,
+    facts: Element<'a, Event, Theme, iced::Renderer>,
+) -> Column<'a, Event, Theme, iced::Renderer> {
+    Column::new()
+        .spacing(1)
+        .push(head)
+        .push(overview_repo_facts_line(facts))
+}
+
+fn overview_repo_facts_line<'a>(
+    facts: Element<'a, Event, Theme, iced::Renderer>,
+) -> Element<'a, Event, Theme, iced::Renderer> {
+    container(facts).width(Length::Fill).into()
+}
+
+fn overview_add_repo_label() -> &'static str {
+    "+ Add repo…"
+}
+
+fn overview_add_repo_menu_item(workspace_name: &str, uid: u64) -> (String, Event) {
+    (
+        format!("Add a repo to {workspace_name}…"),
+        Event::WorkspaceRepoAdd(uid),
+    )
+}
+
+fn overview_repo_running_count(
+    repo_dir: &Path,
+    branch_checkouts: &[PathBuf],
+    running_checkouts: impl IntoIterator<Item = PathBuf>,
+) -> usize {
+    running_checkouts
+        .into_iter()
+        .filter(|checkout| checkout == repo_dir || branch_checkouts.contains(checkout))
+        .count()
+}
+
+fn overview_task_belongs_to_repo(repo_dir: &Path, common_dir: &Path) -> bool {
+    common_dir == repo_dir.join(".git")
 }
 
 fn overview_repo_header<'a>(
@@ -35136,6 +35188,13 @@ fi
                     action("New workspace\u{2026}".to_string()),
                     Event::NewWorkOpen,
                 ));
+                if let Some(workspace) = self.active_workspace().filter(|workspace| {
+                    matches!(workspace.location, WorkspaceLocation::Local { .. })
+                }) {
+                    let (label, event) =
+                        overview_add_repo_menu_item(&workspace.name, workspace.uid);
+                    col = col.push(self.bar_menu_item(action(label), event));
+                }
                 // Secondary to new work (TRU-205): the folder picker, as
                 // Cmd+O opens it.
                 col =
@@ -37076,7 +37135,7 @@ fi
     /// run command and opens the Git view on a click; editing the command,
     /// its age and a remove control (not the home) show once ▸ opens the
     /// line (TRU-208).
-    /// `+ add` picks a folder. A note offers undo when repos joined from
+    /// `+ Add repo…` picks a folder. A note offers undo when repos joined from
     /// the chats' touches. A pure render over `state`.
     fn view_overview_repos<'a>(
         &'a self,
@@ -37102,9 +37161,9 @@ fi
             ..Default::default()
         };
         let add = matches!(ws.location, WorkspaceLocation::Local { .. }).then(|| {
-            button(text("+ add").size(font_small - 1.0).color(theme.accent()))
-                .style(self.flat_button_style())
-                .padding([0, 4])
+            button(text(overview_add_repo_label()).size(font_small - 1.0))
+                .style(self.secondary_button_style())
+                .padding([3, 8])
                 .on_press(Event::WorkspaceRepoAdd(uid))
                 .into()
         });
@@ -37177,7 +37236,8 @@ fi
             // Its run command (TRU-180): `▶` opens it as a terminal tab
             // below and stays shown; ✎ edits it, once the line is opened
             // with ▸. Only this Mac's folders run. Fixed slots: name, run,
-            // gap, actions, facts, disclosure; the input never moves.
+            // gap, actions, disclosure; facts stay on their own full-width
+            // line and the input never moves.
             let local_repo = repo_state.filter(|repo| repo.key.is_local());
             let editing = local_repo.and_then(|repo| {
                 self.editing_run_command
@@ -37254,12 +37314,13 @@ fi
                 .flat_map(TaskStore::tasks)
                 .filter(|task| task.lifecycle == TaskLifecycle::Running)
                 .filter(|task| {
-                    rows.iter().any(|row| {
-                        row.owned
-                            .task
-                            .as_ref()
-                            .is_some_and(|link| link.task_id == task.task_id)
-                    })
+                    overview_task_belongs_to_repo(&group.dir, &task.repository.common_dir)
+                        || rows.iter().any(|row| {
+                            row.owned
+                                .task
+                                .as_ref()
+                                .is_some_and(|link| link.task_id == task.task_id)
+                        })
                 })
                 .map(|task| task.task_id.clone())
                 .collect();
@@ -37279,7 +37340,17 @@ fi
                         .task_id
                         .as_ref()
                         .is_some_and(|task_id| running_tasks.contains(task_id));
-                    if !task_is_counted && rows.iter().any(|row| row.owned.checkout == active) {
+                    let branch_checkouts = rows
+                        .iter()
+                        .map(|row| row.owned.checkout.clone())
+                        .collect::<Vec<_>>();
+                    if !task_is_counted
+                        && overview_repo_running_count(
+                            &group.dir,
+                            &branch_checkouts,
+                            [active.to_path_buf()],
+                        ) > 0
+                    {
                         running_chats.insert(tab.id);
                     }
                 }
@@ -37296,17 +37367,17 @@ fi
                 run_slot,
                 iced::widget::Space::new().width(Length::Fill),
                 actions_slot,
-                text(facts).size(10).color(text_muted).font(mono),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center);
+            let facts_line = text(facts).size(10).color(text_muted).font(mono);
             let disclosure: Element<'a, Event, Theme, iced::Renderer> = if has_hidden {
                 self.overview_disclosure(expanded, key)
             } else {
                 iced::widget::Space::new().into()
             };
             let head = overview_repo_header(head_content.into(), disclosure);
-            let mut column = Column::new().spacing(1).push(head);
+            let mut column = overview_repo_details(head.into(), facts_line.into());
             column = column.push(overview_repo_branch_slots(
                 rows.iter()
                     .map(|row| {
@@ -46439,6 +46510,47 @@ mod tests {
         let header: Element<'_, Event, Theme, iced::Renderer> =
             overview_repo_header(text("api").into(), disclosure).into();
         assert_eq!(header.as_widget().children().len(), 2);
+    }
+
+    #[test]
+    fn collapsed_repo_details_put_facts_on_a_full_width_second_line() {
+        let details: Element<'_, Event, Theme, iced::Renderer> =
+            overview_repo_details(text("api").into(), text("home · 2 branches").into()).into();
+        let children = details.as_widget().children();
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            overview_repo_facts_line(text("facts").into())
+                .as_widget()
+                .size_hint()
+                .width,
+            Length::Fill
+        );
+    }
+
+    #[test]
+    fn collapsed_repo_activity_counts_main_checkout_without_a_branch_row() {
+        assert_eq!(
+            overview_repo_running_count(Path::new("/work/api"), &[], [PathBuf::from("/work/api")]),
+            1
+        );
+        assert!(overview_task_belongs_to_repo(
+            Path::new("/work/api"),
+            Path::new("/work/api/.git")
+        ));
+    }
+
+    #[test]
+    fn collapsed_repo_branch_slots_have_no_spacing() {
+        assert_eq!(overview_repo_branch_spacing(false), 0.0);
+        assert_eq!(overview_repo_branch_spacing(true), 1.0);
+    }
+
+    #[test]
+    fn add_repo_controls_name_the_destination_workspace() {
+        assert_eq!(overview_add_repo_label(), "+ Add repo…");
+        let (label, event) = overview_add_repo_menu_item("Client", 77);
+        assert_eq!(label, "Add a repo to Client…");
+        assert!(matches!(event, Event::WorkspaceRepoAdd(77)));
     }
 
     #[test]
