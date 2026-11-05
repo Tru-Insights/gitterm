@@ -39,6 +39,7 @@ mod chat_rank;
 mod chat_summary;
 mod config;
 mod config_import;
+mod editor;
 mod events;
 mod hover_bounds;
 mod plan_limits_view;
@@ -213,6 +214,11 @@ pub enum AgentIpcMessage {
     },
     /// A finding's `file:line` was clicked; relative to the tab's checkout.
     OpenFile {
+        tab_id: usize,
+        path: PathBuf,
+        line: Option<usize>,
+    },
+    OpenCheckout {
         tab_id: usize,
         path: PathBuf,
     },
@@ -1096,6 +1102,20 @@ fn agent_ipc_handler() -> webview::IpcHandler {
                     return;
                 };
                 AgentIpcMessage::OpenFile {
+                    tab_id,
+                    path: PathBuf::from(path),
+                    line: value
+                        .get("line")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|n| usize::try_from(n).ok()),
+                }
+            }
+            "open_checkout" => {
+                let Some(path) = value.get("path").and_then(|v| v.as_str()) else {
+                    eprintln!("[agent-ipc] open_checkout without path: {body}");
+                    return;
+                };
+                AgentIpcMessage::OpenCheckout {
                     tab_id,
                     path: PathBuf::from(path),
                 }
@@ -6926,6 +6946,19 @@ pub enum Event {
     DelegationOpenWorkerRequested(usize, String),
     /// A finding's file was clicked on the chat page of this tab.
     DelegationOpenFile(usize, PathBuf),
+    /// A finding's `file:line` opened in the file viewer.
+    DelegationOpenFileAtLine(usize, PathBuf, usize),
+    /// Open a known chat checkout in the configured editor.
+    AgentOpenCheckout(usize, PathBuf),
+    OpenEditor(PathBuf, Option<usize>, Option<usize>),
+    EditorOpenFinished(
+        PathBuf,
+        Option<usize>,
+        String,
+        bool,
+        String,
+        Result<(), String>,
+    ),
     /// User picked a model on the Claude chat tab with this id (TRU-143).
     AgentSetModel(usize, String),
     /// User picked an effort level (`None`: the model's default).
@@ -7464,6 +7497,9 @@ struct App {
     delegations_config: config::DelegationsConfig,
     /// `work_notes` from settings.json (TRU-201), written back on save.
     work_notes_config: config::WorkNotesConfig,
+    /// `editor` from settings.json.
+    editor: String,
+    editor_error: Option<(PathBuf, String)>,
     /// ~/Work committing and pushing itself (TRU-201).
     work_notes: gitterm::work_notes::WorkNotes,
     // Track modifier state for filtering terminal writes
@@ -9498,6 +9534,7 @@ impl App {
         }
         let started = Instant::now();
         let config = Config {
+            editor: self.editor.clone(),
             terminal_font_size: self.terminal_font_size,
             ui_font_size: self.ui_font_size,
             sidebar_width: self.sidebar_width,
@@ -19018,6 +19055,8 @@ impl App {
             pr_watch_config: config.pr_watch.clone(),
             delegations_config: config.delegations.clone(),
             work_notes_config: config.work_notes.clone(),
+            editor: config.editor.clone(),
+            editor_error: None,
             work_notes: new_work_notes(config.work_notes.auto_commit),
             current_modifiers: Modifiers::empty(),
             show_help: false,
@@ -23103,8 +23142,14 @@ fi
                         tab_id,
                         delegation_id,
                     } => Task::done(Event::DelegationOpenWorkerRequested(tab_id, delegation_id)),
-                    AgentIpcMessage::OpenFile { tab_id, path } => {
-                        Task::done(Event::DelegationOpenFile(tab_id, path))
+                    AgentIpcMessage::OpenFile { tab_id, path, line } => match line {
+                        Some(line) => {
+                            Task::done(Event::DelegationOpenFileAtLine(tab_id, path, line))
+                        }
+                        None => Task::done(Event::DelegationOpenFile(tab_id, path)),
+                    },
+                    AgentIpcMessage::OpenCheckout { tab_id, path } => {
+                        Task::done(Event::AgentOpenCheckout(tab_id, path))
                     }
                     AgentIpcMessage::HostKey { key, modifiers } => {
                         // Run the chord through the Iced key handler, so it
@@ -24186,6 +24231,145 @@ fi
                     return Task::none();
                 }
                 return Task::done(Event::ViewFile(SourcePath::Local(path)));
+            }
+            Event::DelegationOpenFileAtLine(tab_id, path, line) => {
+                if self.tab_remote_id(tab_id).is_some() {
+                    agent_webview_note(tab_id, "Files of a remote chat cannot open from here.");
+                    return Task::none();
+                }
+                let Some(repo_path) = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|ws| ws.tabs.iter())
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.repo_path.clone())
+                else {
+                    return Task::none();
+                };
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    repo_path.join(path)
+                };
+                if !path.is_file() {
+                    agent_webview_note(
+                        tab_id,
+                        &format!("{} is not a file in this checkout.", path.display()),
+                    );
+                    return Task::none();
+                }
+                let task = self.update(Event::ViewFile(SourcePath::Local(path.clone())));
+                if let Some(viewer) = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|ws| ws.tabs.iter_mut())
+                    .find(|tab| tab.id == tab_id)
+                    .and_then(TabState::file_viewer_mut)
+                {
+                    viewer.line = Some(line);
+                }
+                return task;
+            }
+            Event::AgentOpenCheckout(tab_id, path) => {
+                let Some((workspace_dir, current_checkout, local_source)) =
+                    self.workspaces.iter().find_map(|ws| {
+                        let tab = ws.tabs.iter().find(|tab| tab.id == tab_id)?;
+                        let current_checkout = tab.repo_path.clone();
+                        let local_source = matches!(ws.location, WorkspaceLocation::Local { .. })
+                            && ws.remote_session.is_none()
+                            && self.remote_agent_id_for_workspace(ws).is_none();
+                        Some((ws.dir.clone(), current_checkout, local_source))
+                    })
+                else {
+                    eprintln!(
+                        "[editor] chat {tab_id} has no owning workspace; checkout open refused"
+                    );
+                    return Task::none();
+                };
+                // Trust the checkout choices constructed from GitTerm state;
+                // the page's path is only a selector and is never opened directly.
+                let choices = self.checkout_choices_for(&workspace_dir);
+                let known_paths = choices
+                    .iter()
+                    .map(|choice| choice.path.clone())
+                    .collect::<Vec<_>>();
+                let Some(known_path) = editor::known_checkout_path(
+                    &known_paths,
+                    &current_checkout,
+                    &path,
+                    local_source,
+                ) else {
+                    eprintln!(
+                        "[editor] chat {tab_id} requested unknown checkout {}; refused",
+                        path.display()
+                    );
+                    agent_webview_note(tab_id, "That checkout is not available in this workspace.");
+                    return Task::none();
+                };
+                return Task::done(Event::OpenEditor(known_path, None, Some(tab_id)));
+            }
+            Event::OpenEditor(path, line, tab_id) => {
+                let editor = self.editor.clone();
+                let name = editor::display_name(&editor);
+                let is_bundle_editor = matches!(editor.as_str(), "vscode" | "cursor" | "zed");
+                let built = editor::build_open_command(&editor, &path, line);
+                let command_log = built
+                    .as_ref()
+                    .map(|editor| format!("{:?} {:?}", editor.command.program, editor.command.args))
+                    .unwrap_or_else(|_| editor.clone());
+                let command_path = path.clone();
+                return Task::perform(
+                    async move {
+                        let editor = built?;
+                        eprintln!(
+                            "[editor] running command {:?} {:?} for {}",
+                            editor.command.program,
+                            editor.command.args,
+                            command_path.display()
+                        );
+                        crate::editor::launch_command(editor.command).await
+                    },
+                    move |result| {
+                        Event::EditorOpenFinished(
+                            path,
+                            tab_id,
+                            name,
+                            is_bundle_editor,
+                            command_log,
+                            result,
+                        )
+                    },
+                );
+            }
+            Event::EditorOpenFinished(
+                path,
+                tab_id,
+                name,
+                is_bundle_editor,
+                command_log,
+                result,
+            ) => {
+                match result {
+                    Ok(()) => {
+                        self.editor_error = None;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[editor] command {command_log} failed for {}: {error}",
+                            path.display()
+                        );
+                        let message = if is_bundle_editor {
+                            editor::not_installed_error(&name)
+                        } else {
+                            format!("Could not open in {name}: {error}")
+                        };
+                        self.editor_error = Some((path, message.clone()));
+                        if let Some(tab_id) = tab_id {
+                            agent_webview_note(tab_id, &message);
+                        }
+                    }
+                }
+                return Task::none();
             }
             Event::NewClaudeChatTab => {
                 self.tab_picker_visible = false;
@@ -27401,6 +27585,7 @@ fi
                     },
                 };
                 let path = PathBuf::from(source_path.display());
+                let local_editor_path = editor::local_editor_path(&source_path).is_some();
                 let is_dark_theme = self.theme == AppTheme::Dark;
                 let is_markdown = TabState::is_markdown_file(&path);
                 let is_html = TabState::is_html_file(&path);
@@ -27458,6 +27643,7 @@ fi
                     {
                         // Open / replace the file viewer overlay; resets all overlay state.
                         let fv = tab.open_file_viewer(path.clone());
+                        fv.local_source = local_editor_path;
                         fv.load_in_progress = true;
                         fv.load_started_at = Some(Instant::now());
                     }
@@ -37161,6 +37347,23 @@ fi
             let has_hidden = local_repo.is_some() || oldest.is_some() || removable.is_some();
             let mut actions_slot = Row::new().spacing(2).align_y(iced::Alignment::Center);
             if expanded {
+                if local_repo.is_some() {
+                    let editor_name = editor::display_name(&self.editor);
+                    actions_slot = actions_slot.push(iced::widget::tooltip(
+                        button(text("Open in editor").size(10).color(text_muted))
+                            .style(self.flat_button_style())
+                            .padding([0, 4])
+                            .on_press(Event::OpenEditor(group.dir.clone(), None, None)),
+                        text(format!("Open in {editor_name}")).size(10),
+                        iced::widget::tooltip::Position::Top,
+                    ));
+                }
+                if let Some((error_path, message)) = &self.editor_error {
+                    if error_path == &group.dir {
+                        actions_slot =
+                            actions_slot.push(text(message).size(10).color(theme.danger()));
+                    }
+                }
                 if let Some(repo) = local_repo.filter(|_| editing.is_none()) {
                     actions_slot = actions_slot.push(match &repo.run_command {
                         Some(_) => button(text("\u{270E}").size(10).color(text_muted))
@@ -37913,6 +38116,20 @@ fi
                 parts.push(chats::format_age(at));
             }
             detail = detail.push(text(parts.join(" \u{00B7} ")).size(10).color(text_muted));
+            let editor_name = editor::display_name(&self.editor);
+            detail = detail.push(iced::widget::tooltip(
+                button(text("Open in editor").size(10).color(theme.accent()))
+                    .style(self.flat_button_style())
+                    .padding([0, 2])
+                    .on_press(Event::OpenEditor(row.owned.checkout.clone(), None, None)),
+                text(format!("Open in {editor_name}")).size(10),
+                iced::widget::tooltip::Position::Top,
+            ));
+            if let Some((error_path, message)) = &self.editor_error {
+                if error_path == &row.owned.checkout {
+                    detail = detail.push(text(message).size(10).color(theme.danger()));
+                }
+            }
         }
         // A read failure needs you: always shown.
         if let Some(error) = &row.error {
@@ -42934,11 +43151,37 @@ fi
         let ghost = self.ghost_button_style();
         let ghost2 = self.ghost_button_style();
         let ghost3 = self.ghost_button_style();
+        let editor_name = editor::display_name(&self.editor);
+        let open_editor = iced::widget::tooltip(
+            button(text("Open in editor").size(font))
+                .style(self.ghost_button_style())
+                .padding([4, 12])
+                .on_press_maybe(
+                    fv.local_source
+                        .then(|| Event::OpenEditor(fv.path.clone(), fv.line, None)),
+                ),
+            text(format!("Open in {editor_name}")).size(font_small),
+            iced::widget::tooltip::Position::Top,
+        );
+        let editor_error = self
+            .editor_error
+            .as_ref()
+            .filter(|(error_path, _)| error_path == &fv.path)
+            .map(|(_, message)| message.as_str());
+        let header_title = editor::viewer_header_title(&rel_path, editor_error);
         let header = if is_markdown || is_html || is_excalidraw {
             // Markdown header with "View in Browser" button for Mermaid support
             row![
-                text(rel_path).size(font).color(theme.text_primary()),
+                text(header_title.clone())
+                    .size(font)
+                    .color(if editor_error.is_some() {
+                        theme.danger()
+                    } else {
+                        theme.text_primary()
+                    }),
                 iced::widget::Space::new().width(Length::Fill),
+                open_editor,
+                iced::widget::Space::new().width(Length::Fixed(4.0)),
                 button(text("View in Browser").size(font))
                     .style(ghost)
                     .padding([4, 12])
@@ -42957,8 +43200,16 @@ fi
             .spacing(8)
         } else {
             row![
-                text(rel_path).size(font).color(theme.text_primary()),
+                text(header_title.clone())
+                    .size(font)
+                    .color(if editor_error.is_some() {
+                        theme.danger()
+                    } else {
+                        theme.text_primary()
+                    }),
                 iced::widget::Space::new().width(Length::Fill),
+                open_editor,
+                iced::widget::Space::new().width(Length::Fixed(4.0)),
                 button(text("Copy All").size(font))
                     .style(ghost)
                     .padding([4, 12])

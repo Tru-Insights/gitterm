@@ -2236,14 +2236,19 @@
     checkoutBtn.classList.toggle('locked', !!c.locked);
     setChip(checkoutBtn, 'folder', c.label + (chips.checkoutPending != null ? '…' : ''));
     checkoutBtn.title = (c.path || '') + (c.locked ? '\n' + (c.reason || 'Set when the chat started; start a new chat to change it') : '\nWhere this chat runs');
-    if (c.locked) { checkoutMenuEl.classList.remove('visible'); return; }
     checkoutMenuEl.innerHTML = '';
-    checkoutMenuEl.appendChild(el('div', 'hint', 'Run this chat in'));
-    for (const choice of (c.choices || [])) {
-      const current = choice.path === c.path;
-      menuItem(checkoutMenuEl, current ? '✓' : (choice.path === chips.checkoutPending ? '…' : ''),
-        choice.label, choice.detail || '', () => requestCheckout(choice.path));
+    if (!c.locked) {
+      checkoutMenuEl.appendChild(el('div', 'hint', 'Run this chat in'));
+      for (const choice of (c.choices || [])) {
+        const current = choice.path === c.path;
+        menuItem(checkoutMenuEl, current ? '✓' : (choice.path === chips.checkoutPending ? '…' : ''),
+          choice.label, choice.detail || '', () => requestCheckout(choice.path));
+      }
     }
+    menuItem(checkoutMenuEl, '', 'Open in editor', 'Open this checkout folder', () => {
+      postIpc({ type: 'open_checkout', path: c.path });
+      checkoutMenuEl.classList.remove('visible');
+    });
   }
   function renderChips() { renderModel(); renderEffort(); renderCheckout(); }
   function resetComposerChips(composer) {
@@ -2314,9 +2319,8 @@
   modelBtn.addEventListener('click', (e) => toggleChipMenu(modelMenuEl, e));
   effortBtn.addEventListener('click', (e) => toggleChipMenu(effortMenuEl, e));
   checkoutBtn.addEventListener('click', (e) => {
-    if (chips.checkout && chips.checkout.locked) { e.stopPropagation(); return; }
     // Task worktrees come and go; ask for fresh choices while it is open.
-    if (toggleChipMenu(checkoutMenuEl, e)) postIpc({ type: 'checkout_context' });
+    if (toggleChipMenu(checkoutMenuEl, e) && !(chips.checkout && chips.checkout.locked)) postIpc({ type: 'checkout_context' });
   });
   for (const m of CHIP_MENUS) m.addEventListener('click', (e) => e.stopPropagation());
   document.addEventListener('click', () => closeChipMenus(null));
@@ -2644,7 +2648,7 @@
   function openFinding(f) {
     // Opens the file viewer over the chat (line numbers are shown, the view
     // does not scroll to the line).
-    postIpc({ type: 'open_file', path: f.file });
+    postIpc({ type: 'open_file', path: f.file, line: f.line_start || null });
   }
   function renderCard(card) {
     const d = card.data;

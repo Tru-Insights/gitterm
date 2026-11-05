@@ -124,6 +124,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn editor_setting_defaults_and_round_trips() {
+        let old = Config::default();
+        let mut value = serde_json::to_value(&old).unwrap();
+        value.as_object_mut().unwrap().remove("editor");
+        let loaded: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.editor, "vscode");
+
+        let mut configured = loaded;
+        configured.editor = "cursor".into();
+        let saved = serde_json::to_string(&configured).unwrap();
+        let round_trip: Config = serde_json::from_str(&saved).unwrap();
+        assert_eq!(round_trip.editor, "cursor");
+    }
+
+    #[test]
     fn github_accounts_file_parses_and_tolerates_absence() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_github_accounts_from(dir.path()).is_empty());
@@ -1236,6 +1251,9 @@ fn default_max_concurrent_local_tasks() -> usize {
 // `SETTINGS_FILE`. Every field is a setting the user expects to keep.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Editor used by "Open in editor"; custom values are argv templates.
+    #[serde(default = "default_editor")]
+    pub editor: String,
     #[serde(default = "default_terminal_font")]
     pub terminal_font_size: f32,
     #[serde(default = "default_ui_font")]
@@ -1646,6 +1664,7 @@ impl WorkspaceColor {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            editor: default_editor(),
             terminal_font_size: 14.0,
             ui_font_size: 13.0,
             sidebar_width: 360.0,
@@ -1674,6 +1693,10 @@ impl Default for Config {
             work_notes: WorkNotesConfig::default(),
         }
     }
+}
+
+fn default_editor() -> String {
+    "vscode".to_string()
 }
 
 /// The user's settings (TRU-181): every `Config` field, in the shared config
