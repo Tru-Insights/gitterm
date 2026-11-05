@@ -6862,6 +6862,8 @@ pub enum Event {
     EdgePeekEnter(bool), // true=right, false=left
     EdgePeekExit,
     SlideScrolled(scrollable::Viewport),
+    HorizontalStripHover(HorizontalStrip, bool),
+    WheelScrolled(iced::mouse::ScrollDelta),
     // Bottom panel events (expand/collapse, height)
     ConsoleToggle,
     ConsoleDividerDragStart,
@@ -7453,6 +7455,7 @@ struct App {
     // Edge peek state
     edge_peek_left: bool,
     edge_peek_right: bool,
+    hovered_horizontal_strip: Option<HorizontalStrip>,
     // Attention pulse animation (toggles every 500ms)
     attention_pulse_bright: bool,
     /// Background needs-you transitions → macOS notifications (TRU-148).
@@ -8180,6 +8183,44 @@ fn tab_scrollable_id() -> iced::widget::Id {
 
 fn workspace_bar_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("ws-bar-scroll")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HorizontalStrip {
+    WorkspaceBar,
+    SessionBar,
+    WorkspaceSlide,
+    ChatWorkspaceActions,
+}
+
+impl HorizontalStrip {
+    fn scrollable_id(self) -> iced::widget::Id {
+        match self {
+            Self::WorkspaceBar => workspace_bar_scrollable_id(),
+            Self::SessionBar => tab_scrollable_id(),
+            Self::WorkspaceSlide => workspace_scrollable_id(),
+            Self::ChatWorkspaceActions => iced::widget::Id::new("chat-workspace-actions"),
+        }
+    }
+}
+
+/// Return the horizontal movement for a plain vertical line wheel. Iced's
+/// horizontal scrollable drops this delta after aligning it to the x axis.
+fn plain_vertical_wheel_offset(delta: iced::mouse::ScrollDelta) -> Option<f32> {
+    match delta {
+        iced::mouse::ScrollDelta::Lines { x: 0.0, y } => Some(-y * 60.0),
+        iced::mouse::ScrollDelta::Lines { .. } | iced::mouse::ScrollDelta::Pixels { .. } => None,
+    }
+}
+
+fn horizontal_strip_wheel<'a>(
+    content: Element<'a, Event, Theme, iced::Renderer>,
+    strip: HorizontalStrip,
+) -> Element<'a, Event, Theme, iced::Renderer> {
+    iced::widget::mouse_area(content)
+        .on_enter(Event::HorizontalStripHover(strip, true))
+        .on_exit(Event::HorizontalStripHover(strip, false))
+        .into()
 }
 
 fn task_switcher_input_id() -> iced::widget::Id {
@@ -19012,6 +19053,7 @@ impl App {
             last_user_scroll: None,
             edge_peek_left: false,
             edge_peek_right: false,
+            hovered_horizontal_strip: None,
             attention_pulse_bright: false,
             needs_you_notifier: NeedsYouNotifier::new(Instant::now()),
             notifications_config: config.notifications.clone(),
@@ -21695,6 +21737,9 @@ fi
                 }
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                     Some(Event::MouseMoved(position.x, position.y))
+                }
+                iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => {
+                    Some(Event::WheelScrolled(delta))
                 }
                 iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                     iced::mouse::Button::Left,
@@ -29362,6 +29407,30 @@ fi
                     }
                 }
             }
+            Event::HorizontalStripHover(strip, true) => {
+                self.hovered_horizontal_strip = Some(strip);
+                return Task::none();
+            }
+            Event::HorizontalStripHover(strip, false) => {
+                if self.hovered_horizontal_strip == Some(strip) {
+                    self.hovered_horizontal_strip = None;
+                }
+                return Task::none();
+            }
+            Event::WheelScrolled(delta) => {
+                let Some(strip) = self.hovered_horizontal_strip else {
+                    return Task::none();
+                };
+                let Some(x) = plain_vertical_wheel_offset(delta) else {
+                    return Task::none();
+                };
+                return iced::advanced::widget::operate(
+                    iced::advanced::widget::operation::scrollable::scroll_by(
+                        strip.scrollable_id(),
+                        scrollable::AbsoluteOffset { x, y: 0.0 },
+                    ),
+                );
+            }
             Event::WorkspaceClose(idx) => {
                 return self.open_park_sheet(idx);
             }
@@ -34787,7 +34856,10 @@ fi
                 ..Default::default()
             });
 
-        let mut bar_inner = row![scrollable_bar];
+        let mut bar_inner = row![horizontal_strip_wheel(
+            scrollable_bar.into(),
+            HorizontalStrip::WorkspaceBar,
+        )];
         // `↑n` opens Ready to merge (TRU-173); hidden at none.
         if let Some(ready_btn) = self.view_ready_button() {
             bar_inner = bar_inner.push(ready_btn);
@@ -35917,6 +35989,9 @@ fi
                 }
             });
 
+        let scrollable_tabs =
+            horizontal_strip_wheel(scrollable_tabs.into(), HorizontalStrip::SessionBar);
+
         let branch = task_context_id
             .as_deref()
             .and_then(|task_id| {
@@ -36581,37 +36656,40 @@ fi
             panels = panels.push(panel_container);
         }
 
-        scrollable(panels)
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().width(0).scroller_width(0),
-            ))
-            .id(workspace_scrollable_id())
-            .on_scroll(Event::SlideScrolled)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_theme, _status| {
-                let transparent_rail = scrollable::Rail {
-                    background: None,
-                    border: iced::Border::default(),
-                    scroller: scrollable::Scroller {
-                        background: iced::Color::TRANSPARENT.into(),
+        horizontal_strip_wheel(
+            scrollable(panels)
+                .direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::new().width(0).scroller_width(0),
+                ))
+                .id(workspace_scrollable_id())
+                .on_scroll(Event::SlideScrolled)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_theme, _status| {
+                    let transparent_rail = scrollable::Rail {
+                        background: None,
                         border: iced::Border::default(),
-                    },
-                };
-                scrollable::Style {
-                    container: container::Style::default(),
-                    vertical_rail: transparent_rail,
-                    horizontal_rail: transparent_rail,
-                    gap: None,
-                    auto_scroll: scrollable::AutoScroll {
-                        background: iced::Color::TRANSPARENT.into(),
-                        border: iced::Border::default(),
-                        shadow: iced::Shadow::default(),
-                        icon: iced::Color::TRANSPARENT,
-                    },
-                }
-            })
-            .into()
+                        scroller: scrollable::Scroller {
+                            background: iced::Color::TRANSPARENT.into(),
+                            border: iced::Border::default(),
+                        },
+                    };
+                    scrollable::Style {
+                        container: container::Style::default(),
+                        vertical_rail: transparent_rail,
+                        horizontal_rail: transparent_rail,
+                        gap: None,
+                        auto_scroll: scrollable::AutoScroll {
+                            background: iced::Color::TRANSPARENT.into(),
+                            border: iced::Border::default(),
+                            shadow: iced::Shadow::default(),
+                            icon: iced::Color::TRANSPARENT,
+                        },
+                    }
+                })
+                .into(),
+            HorizontalStrip::WorkspaceSlide,
+        )
     }
 
     fn view_sidebar_tab<'a>(
@@ -42024,15 +42102,17 @@ fi
                     Event::ChatAddToWorkspace(root.clone(), entry.id.clone(), ws.uid),
                 ));
             }
-            block = block.push(
-                iced::widget::scrollable(picker).direction(
-                    iced::widget::scrollable::Direction::Horizontal(
-                        iced::widget::scrollable::Scrollbar::new()
-                            .width(4)
-                            .scroller_width(4),
-                    ),
-                ),
-            );
+            let picker = iced::widget::scrollable(picker)
+                .id(HorizontalStrip::ChatWorkspaceActions.scrollable_id())
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::new()
+                        .width(4)
+                        .scroller_width(4),
+                ));
+            block = block.push(horizontal_strip_wheel(
+                picker.into(),
+                HorizontalStrip::ChatWorkspaceActions,
+            ));
         }
         block.into()
     }
@@ -45919,6 +45999,34 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::Arc;
+
+    #[test]
+    fn plain_vertical_wheel_moves_horizontal_and_preserves_other_deltas() {
+        assert_eq!(
+            plain_vertical_wheel_offset(iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            Some(60.0)
+        );
+        assert_eq!(
+            plain_vertical_wheel_offset(iced::mouse::ScrollDelta::Lines { x: 2.0, y: -1.0 }),
+            None
+        );
+        assert_eq!(
+            plain_vertical_wheel_offset(iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -24.0 }),
+            None
+        );
+    }
+
+    #[test]
+    fn horizontal_strip_ids_cover_each_wrapped_strip() {
+        let strips = [
+            HorizontalStrip::WorkspaceBar,
+            HorizontalStrip::SessionBar,
+            HorizontalStrip::WorkspaceSlide,
+            HorizontalStrip::ChatWorkspaceActions,
+        ];
+        let ids: HashSet<_> = strips.map(HorizontalStrip::scrollable_id).into();
+        assert_eq!(ids.len(), strips.len());
+    }
 
     fn page_context() -> PageNavigationContext {
         PageNavigationContext {
