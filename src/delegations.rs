@@ -1542,6 +1542,12 @@ pub fn from_gitterm(text: &str) -> String {
 /// Whether text is a prompt GitTerm sent rather than the user: it starts
 /// with the source line, or (results delivered before the source line
 /// existed) it ends with the full-record footer.
+///
+/// shortcut: judged from the text alone, so a user who pastes a message
+/// starting with the source line (or ending with a copied footer) sees it
+/// as a card and it is left out of the chat summary; it is still sent in
+/// full. A transcript replay has nothing but the text, so a recorded origin
+/// would only help the live view; record one if this ever misleads.
 pub fn is_delivery_message(text: &str) -> bool {
     let text = text.trim();
     text.lines().next() == Some(DELIVERY_SOURCE_LINE)
