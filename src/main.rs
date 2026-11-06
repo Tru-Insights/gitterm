@@ -4559,8 +4559,15 @@ fn write_task_brief(
         ));
     }
     std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-    std::fs::write(&path, task_handoff_prompt(task, report_back))
-        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n\n{}\n",
+            task_handoff_prompt(task, report_back),
+            chats::task_session_marker(session_id)
+        ),
+    )
+    .map_err(|error| format!("write {}: {error}", path.display()))?;
     Ok(path)
 }
 
@@ -4898,6 +4905,8 @@ struct TabState {
     // Last PTY output instant for task-linked tabs. Stamped on the terminal
     // hot path, so it must stay a bare Instant — no string or store work.
     task_last_activity: Option<Instant>,
+    task_prompt_watch: gitterm::workers::PromptWatch,
+    task_watchdog_reported: bool,
     // Worktree this chat tab's agent works in, and whether the Git and
     // Files panels follow it (TRU-146). Derived from the tool stream; never
     // persisted. `repo_path` / `current_dir` stay on the workspace root.
@@ -4966,6 +4975,8 @@ impl TabState {
             session_uid: uuid::Uuid::new_v4().to_string(),
             task_live_state: None,
             task_last_activity: None,
+            task_prompt_watch: Default::default(),
+            task_watchdog_reported: false,
             attention: None,
             claude_config: ClaudeConfig::default(),
             worktree_follow: WorktreeFollow::default(),
@@ -6707,6 +6718,11 @@ pub enum Event {
     TaskCreateSubmit,
     TaskMetadataResolved(PendingTaskLaunch, Result<ResolvedTaskPreparation, String>),
     TaskWorktreePrepared(PendingTaskLaunch, Result<PreparedTaskWorktree, String>),
+    TaskStartupChecked(
+        String,
+        String,
+        Result<Option<HarnessConversationRef>, String>,
+    ),
     TaskSelected(String),
     TaskContextBack,
     TaskOverview,
@@ -11946,6 +11962,202 @@ impl App {
         Ok(value)
     }
 
+    /// Startup probes read harness files off the UI thread even when Chats
+    /// is hidden. Prompt stability ignores cursor/spinner PTY redraws.
+    fn poll_task_watchdogs(&mut self) -> Task<Event> {
+        let Some(store) = self.task_store.as_ref() else {
+            return Task::none();
+        };
+        let mut probes = Vec::new();
+        let mut waiting = Vec::new();
+        for tab in self.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut()) {
+            let (Some(task_id), Some(session_id)) = (&tab.task_id, &tab.task_session_id) else {
+                continue;
+            };
+            let Some(task) = store.get(task_id) else {
+                continue;
+            };
+            let Some(session) = task
+                .sessions
+                .iter()
+                .find(|s| &s.task_session_id == session_id)
+            else {
+                continue;
+            };
+            if tab.terminal().is_none() {
+                continue;
+            }
+            if session.objective_delivery == ObjectiveDeliveryState::Pending {
+                let backend = session.conversation.as_ref().map(|c| c.backend).or_else(|| {
+                    let HarnessKind::TerminalPreset { preset_name } = &session.harness.as_ref()?.kind else { return None; };
+                    self.agent_presets.iter().find(|p| &p.name == preset_name).and_then(preset_conversation_backend)
+                });
+                let unconfirmable_claude = backend == Some(HarnessConversationBackend::Claude)
+                    && session.conversation.is_none();
+                if let Some(backend) = backend.filter(|_| !unconfirmable_claude) {
+                    probes.push((task_id.clone(), tab.repo_path.clone(), session.clone(), backend));
+                }
+            } else if !tab.task_watchdog_reported && tab.task_live_state.is_some()
+                && store.open_worker_delegations(task_id).iter().any(|d| d.status.is_active() && matches!(&d.child,
+                    gitterm::tasks::DelegationChild::TaskSession { task_session_id: Some(id), .. } if id == session_id))
+            {
+                let screen = Self::worker_screen_tail(tab);
+                if tab.task_prompt_watch.observe(&screen, Instant::now()) {
+                    waiting.push((task_id.clone(), session_id.clone(), "Worker waiting at a prompt for 60 seconds without progress".to_string()));
+                }
+            }
+        }
+        for (task_id, session_id, message) in waiting {
+            self.report_task_watchdog(&task_id, &session_id, message);
+        }
+        Task::batch(probes.into_iter().map(|(task_id, cwd, session, backend)| {
+            let session_id = session.task_session_id.clone();
+            Task::perform(
+                async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        chats::started_task_conversation(&cwd, &session, backend)
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("startup session probe failed: {error}")));
+                    (task_id, session_id, result)
+                },
+                |(task_id, session_id, result)| {
+                    Event::TaskStartupChecked(task_id, session_id, result)
+                },
+            )
+        }))
+    }
+
+    fn worker_screen_tail(tab: &TabState) -> String {
+        let text = tab
+            .terminal()
+            .map(|term| term.get_all_text())
+            .unwrap_or_default();
+        // get_all_text includes scrollback; only the last screen rows matter.
+        let mut lines: Vec<_> = text.trim_end().lines().rev().take(32).collect();
+        lines.reverse();
+        lines
+            .iter()
+            .map(|line| line.chars().take(240).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+
+    fn task_startup_checked(
+        &mut self,
+        task_id: &str,
+        session_id: &str,
+        result: Result<Option<HarnessConversationRef>, String>,
+    ) {
+        let Some((ws, idx)) = find_task_session_tab(&self.workspaces, session_id) else {
+            return;
+        };
+        let Some(mut session) = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.get(task_id))
+            .and_then(|task| {
+                task.sessions
+                    .iter()
+                    .find(|session| session.task_session_id == session_id)
+            })
+            .cloned()
+            .filter(|s| s.objective_delivery == ObjectiveDeliveryState::Pending)
+        else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        match result {
+            Ok(Some(conversation)) => {
+                session.objective_delivery = ObjectiveDeliveryState::Delivered;
+                session.conversation = Some(conversation.clone());
+                session.updated_at = now.to_rfc3339();
+                if let Some(store) = self.task_store.as_mut() {
+                    if let Err(error) = store.upsert_session(task_id, session, &now.to_rfc3339()) {
+                        eprintln!("[tasks] confirm startup {task_id}/{session_id}: {error}");
+                        self.task_store_error = Some(error.to_string());
+                        return;
+                    }
+                }
+                self.workspaces[ws].tabs[idx].chat_session_id = Some(conversation.session_id);
+                self.mark_workspaces_dirty();
+                self.mark_log_server_dirty();
+            }
+            result => {
+                let elapsed = chrono::DateTime::parse_from_rfc3339(&session.created_at)
+                    .map(|start| now.signed_duration_since(start).num_seconds().max(0) as u64);
+                if let Err(error) = elapsed {
+                    self.report_task_watchdog(
+                        task_id,
+                        session_id,
+                        format!(
+                            "Cannot verify worker startup: invalid session start time: {error}"
+                        ),
+                    );
+                    return;
+                }
+                if elapsed.is_ok_and(|elapsed| gitterm::workers::startup_timed_out(elapsed, false))
+                {
+                    let detail = result
+                        .err()
+                        .map(|error| format!("; {error}"))
+                        .unwrap_or_default();
+                    self.report_task_watchdog(task_id, session_id, format!("Worker stuck at startup: no harness session appeared within 30 seconds{detail}"));
+                }
+            }
+        }
+    }
+
+    fn report_task_watchdog(&mut self, task_id: &str, session_id: &str, message: String) {
+        let Some((ws, idx)) = find_task_session_tab(&self.workspaces, session_id) else {
+            return;
+        };
+        let tab = &self.workspaces[ws].tabs[idx];
+        if tab.task_watchdog_reported {
+            return;
+        }
+        // A late probe must not overwrite a worker's already final report.
+        let Some(store) = self.task_store.as_mut() else {
+            return;
+        };
+        if !store.open_worker_delegations(task_id).iter().any(|d| d.status.is_active() && matches!(&d.child,
+            gitterm::tasks::DelegationChild::TaskSession { task_session_id: Some(id), .. } if id == session_id)) { return; }
+        let screen = Self::worker_screen_tail(tab);
+        let handoff = gitterm::tasks::TaskHandoff {
+            summary: format!("{message}\n\nScreen tail:\n{screen}"),
+            decisions: vec![
+                "Watchdog reported the waiting worker without sending terminal input".into(),
+            ],
+            next_steps: vec![
+                "Inspect the worker tab and resolve the prompt or relaunch the session".into(),
+            ],
+            blockers: vec![message],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            updated_by_session_id: Some(session_id.to_string()),
+        };
+        let timestamp = handoff.updated_at.clone();
+        match gitterm::delegations::record_watchdog_handoff(
+            store, task_id, session_id, handoff, &timestamp,
+        ) {
+            Ok(Some(id)) => {
+                self.workspaces[ws].tabs[idx].task_watchdog_reported = true;
+                self.worker_reported(
+                    &id,
+                    task_id,
+                    Some(session_id),
+                    task_mcp::HandoffStatus::Blocked,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("[tasks] report watchdog for {task_id}/{session_id}: {error}");
+                self.task_store_error = Some(error);
+            }
+        }
+    }
+
     fn sync_task_sessions_from_chat_index(&mut self) {
         let entries = self.chat_index.clone();
         let open_conversations = self
@@ -12153,16 +12365,20 @@ impl App {
         let workspace_idx =
             self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
         let workspace_name = self.workspaces[workspace_idx].name.clone();
-        let mut tab = self.create_tab_for_workspace(
+        let mut tab = self.create_tab_with_session_uid(
             worktree_path.clone(),
             Some(command.clone()),
             Some(&workspace_name),
+            None,
+            true,
         );
         if tab.terminal().is_none() {
-            self.task_ui_error = Some(format!(
-                "Could not start a terminal in {}",
-                worktree_path.display()
-            ));
+            if self.task_ui_error.is_none() {
+                self.task_ui_error = Some(format!(
+                    "Could not start a terminal in {}",
+                    worktree_path.display()
+                ));
+            }
             return Task::none();
         }
         tab.set_local_dir(worktree_path.clone());
@@ -12818,7 +13034,17 @@ impl App {
                 ) {
                     Ok(brief_path) => (
                         Some(command_with_initial_prompt(&launch, &brief_path)),
-                        ObjectiveDeliveryState::Delivered,
+                        if matches!(
+                            conversation_backend,
+                            Some(
+                                HarnessConversationBackend::Codex
+                                    | HarnessConversationBackend::Claude
+                            )
+                        ) {
+                            ObjectiveDeliveryState::Pending
+                        } else {
+                            ObjectiveDeliveryState::Delivered
+                        },
                     ),
                     Err(error) => {
                         eprintln!(
@@ -12832,20 +13058,29 @@ impl App {
             }
             other => (other, ObjectiveDeliveryState::NotDelivered),
         };
+        let timestamp = chrono::Utc::now().to_rfc3339();
         let workspace_idx =
             self.ensure_local_workspace_for_chat(directory, Some(directory), &task.workspace.name);
         let workspace_name = self.workspaces[workspace_idx].name.clone();
-        let mut tab =
-            self.create_tab_for_workspace(worktree_path.clone(), command, Some(&workspace_name));
+        let mut tab = self.create_tab_with_session_uid(
+            worktree_path.clone(),
+            command,
+            Some(&workspace_name),
+            None,
+            true,
+        );
         if tab.terminal().is_none() {
-            return Err(format!(
-                "Prepared {}, but the agent terminal could not start",
-                worktree_path.display()
-            ));
+            return Err(self.task_ui_error.take().unwrap_or_else(|| {
+                format!(
+                    "Prepared {}, but the agent terminal could not start",
+                    worktree_path.display()
+                )
+            }));
         }
         tab.set_local_dir(worktree_path);
         tab.task_id = Some(task_id.to_string());
         tab.task_session_id = Some(session_id.clone());
+        tab.task_last_activity = Some(Instant::now());
         if launched_agent {
             tab.task_live_state = Some(TaskSessionLiveState::Working);
         }
@@ -12872,7 +13107,10 @@ impl App {
                 resume
             });
             tab.set_startup_command(Some(resume));
-        } else if objective_delivery == ObjectiveDeliveryState::Delivered {
+        } else if matches!(
+            objective_delivery,
+            ObjectiveDeliveryState::Pending | ObjectiveDeliveryState::Delivered
+        ) {
             // Codex/Pi have no persisted resume; a restart re-runs the launch
             // command, which must stay brief-free so the objective is never
             // re-submitted (create_tab stored the injected command).
@@ -12880,7 +13118,6 @@ impl App {
         }
         tab.repo_name = format!("{child_label} · {}", task.title);
         tab.sidebar_mode = SidebarMode::Tasks;
-        let timestamp = chrono::Utc::now().to_rfc3339();
         let conversation = chat_session_id.map(|chat_session_id| HarnessConversationRef {
             backend: conversation_backend.unwrap_or(HarnessConversationBackend::Claude),
             session_id: chat_session_id,
@@ -17988,6 +18225,14 @@ impl App {
                 status,
             );
         }
+        if status == HandoffStatus::Progress {
+            if let Some((ws, idx)) = hosted_session
+                .as_deref()
+                .and_then(|id| find_task_session_tab(&self.workspaces, id))
+            {
+                self.workspaces[ws].tabs[idx].task_prompt_watch = Default::default();
+            }
+        }
         // A progress line (or any new handoff) shows on the worker cards.
         self.push_worker_cards(&request.task_id);
         let task = self
@@ -18497,6 +18742,7 @@ impl App {
                             Some(PathBuf::from(&tab_config.dir)),
                             tab_config.startup_command.clone(),
                             restored_session_uid,
+                            false,
                         );
                         continue;
                     }
@@ -18690,6 +18936,7 @@ impl App {
                             Some(current_dir),
                             startup_command.clone(),
                             restored_session_uid.clone(),
+                            tab_config.task_id.is_some(),
                         );
                     }
                     (Some(other), _) if other != "terminal" => {
@@ -18704,6 +18951,7 @@ impl App {
                             Some(current_dir),
                             startup_command.clone(),
                             restored_session_uid.clone(),
+                            tab_config.task_id.is_some(),
                         );
                     }
                     _ => {
@@ -18713,6 +18961,7 @@ impl App {
                             Some(current_dir),
                             startup_command.clone(),
                             restored_session_uid.clone(),
+                            tab_config.task_id.is_some(),
                         );
                     }
                 }
@@ -19350,6 +19599,7 @@ impl App {
         workspace.active_tab = workspace.tabs.len() - 1;
     }
 
+    #[allow(clippy::too_many_arguments)] // Restore keeps caller identity and task trust explicit.
     fn add_tab_to_workspace_with_command(
         &mut self,
         workspace: &mut Workspace,
@@ -19357,6 +19607,7 @@ impl App {
         current_dir: Option<PathBuf>,
         startup_command: Option<String>,
         session_uid: Option<String>,
+        task_launch: bool,
     ) {
         let startup_command_for_title = startup_command.clone();
         let mut tab = self.create_tab_with_session_uid(
@@ -19364,6 +19615,7 @@ impl App {
             startup_command,
             Some(&workspace.name.clone()),
             session_uid,
+            task_launch,
         );
         tab.set_local_dir(current_dir.unwrap_or(repo_path));
         if let Some(session) = self.remote_session_for_workspace(workspace) {
@@ -19434,18 +19686,68 @@ impl App {
     /// session on the agent and the tab attaches to it.
     /// For backends that support it, pre-assign a session id at launch so
     /// the tab↔conversation mapping is exact from birth (TRU-78 registry
-    /// rule). Only plain `claude` launches qualify — resume commands and
-    /// other backends pass through untouched.
+    /// rule). New Claude launches receive an id, and resume/session-id presets
+    /// reuse the identity they already specify.
     fn with_preassigned_session_id(command: &str) -> (String, Option<String>) {
-        let is_plain_claude_launch = command.split_whitespace().next() == Some("claude")
-            && !command.contains("--resume")
-            && !command.contains("--continue")
-            && !command.contains("--session-id");
-        if is_plain_claude_launch {
+        if gitterm::workers::provider_for_command(command)
+            == gitterm::workers::WorkerProvider::Claude
+        {
+            match Self::claude_preset_session_id(command) {
+                Ok(Some(id)) => return (command.to_string(), Some(id)),
+                Err(()) => return (command.to_string(), None),
+                Ok(None) => {}
+            }
             let id = uuid::Uuid::new_v4().to_string();
             (format!("{command} --session-id {id}"), Some(id))
         } else {
             (command.to_string(), None)
+        }
+    }
+
+    /// Read an explicit Claude conversation identity from a preset command.
+    /// `Err` means the preset selects a session without a safely extractable id.
+    fn claude_preset_session_id(command: &str) -> Result<Option<String>, ()> {
+        let words = shell_words::split(command).map_err(|_| ())?;
+        let mut session_id: Option<String> = None;
+        let mut saw_identity_flag = false;
+        for (index, word) in words.iter().enumerate().skip(1) {
+            if word == "--continue" || word == "-c" {
+                return Err(());
+            }
+            let value = if let Some(value) = word
+                .strip_prefix("--resume=")
+                .or_else(|| word.strip_prefix("--session-id="))
+            {
+                saw_identity_flag = true;
+                Some(value)
+            } else if word == "--resume" || word == "-r" || word == "--session-id" {
+                saw_identity_flag = true;
+                Some(
+                    words
+                        .get(index + 1)
+                        // A following flag (`--resume -d`) is not an id.
+                        .filter(|value| !value.starts_with('-'))
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                )
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                if value.is_empty()
+                    || session_id
+                        .as_deref()
+                        .is_some_and(|existing| existing != value)
+                {
+                    return Err(());
+                }
+                session_id = Some(value.to_string());
+            }
+        }
+        if saw_identity_flag {
+            session_id.map(Some).ok_or(())
+        } else {
+            Ok(None)
         }
     }
 
@@ -19861,7 +20163,7 @@ fi
         startup_command: Option<String>,
         workspace_name: Option<&str>,
     ) -> TabState {
-        self.create_tab_with_session_uid(repo_path, startup_command, workspace_name, None)
+        self.create_tab_with_session_uid(repo_path, startup_command, workspace_name, None, false)
     }
 
     /// `create_tab_for_workspace` for a tab whose durable `session_uid` is
@@ -19873,6 +20175,7 @@ fi
         startup_command: Option<String>,
         workspace_name: Option<&str>,
         session_uid: Option<String>,
+        task_launch: bool,
     ) -> TabState {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -19941,8 +20244,88 @@ fi
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
+        // Re-evaluate trust on every task process start, including restore.
+        // The stored startup_command never contains GitTerm's trust overlay.
+        let runtime_command = if task_launch
+            && startup_command.as_deref().is_some_and(|command| {
+                matches!(
+                    gitterm::workers::provider_for_command(command),
+                    gitterm::workers::WorkerProvider::Codex
+                        | gitterm::workers::WorkerProvider::Claude
+                )
+            }) {
+            let checked = (|| -> Result<Option<String>, String> {
+                let home = dirs::home_dir()
+                    .ok_or_else(|| "Cannot locate home for worker trust".to_string())?;
+                let mut roots: Vec<PathBuf> = self
+                    .workspaces
+                    .iter()
+                    .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+                    .flat_map(|ws| {
+                        self.local_repos(ws)
+                            .into_iter()
+                            .map(|repo| repo.dir.clone())
+                            .chain(ws.pending_repos.iter().cloned())
+                            .chain(std::iter::once(ws.dir.clone()))
+                    })
+                    .collect();
+                if let Some(file) = &saved_file {
+                    for ws in &file.workspaces {
+                        if self.workspaces.iter().any(|open| open.name == ws.name) {
+                            continue;
+                        }
+                        for dir in std::iter::once(ws.home_dir())
+                            .chain(ws.repos.iter().map(String::as_str))
+                        {
+                            if ws.repo_key(dir).is_some_and(|key| key.is_local()) {
+                                roots.push(PathBuf::from(dir));
+                            }
+                        }
+                    }
+                }
+                let command = startup_command.as_deref().expect("checked command").trim();
+                if gitterm::workers::provider_for_command(command)
+                    == gitterm::workers::WorkerProvider::Claude
+                {
+                    gitterm::workers::validate_claude_trust_launch(command, &home, &extra_env)?;
+                    if let Some(main) = gitterm::workers::claude_task_trust(
+                        &repo_path,
+                        &roots,
+                        &home.join(".claude.json"),
+                    )? {
+                        eprintln!(
+                            "[tasks] accepted Claude workspace trust for {} in ~/.claude.json",
+                            main.display()
+                        );
+                    }
+                    Ok(Some(command.to_string()))
+                } else {
+                    gitterm::workers::validate_codex_trust_home(&home, &extra_env)?;
+                    let overlay = gitterm::workers::codex_task_trust(
+                        command,
+                        &repo_path,
+                        &roots,
+                        &home.join(".codex/config.toml"),
+                    )?;
+                    Ok(Some(match overlay {
+                        Some(value) => gitterm::workers::with_codex_trust(command, &value)?,
+                        None => command.to_string(),
+                    }))
+                }
+            })();
+            match checked {
+                Ok(command) => command,
+                Err(error) => {
+                    eprintln!("[tasks] refuse worker launch: {error}");
+                    self.task_ui_error = Some(error);
+                    return tab;
+                }
+            }
+        } else {
+            startup_command.clone()
+        };
         // Added at launch only: the stored startup command stays as given.
-        let launch_command = startup_command.as_deref().map(|command| {
+        let launch_command = runtime_command.as_deref().map(|command| {
             // The terminal gets the task server when it runs (its
             // environment carries the endpoint; claude and codex are given
             // the config, pi finds it through its extension).
@@ -22493,6 +22876,9 @@ fi
                             task_signal = tab.task_id.clone().map(|task_id| (task_id, None));
                         }
                     }
+                    if matches!(&cmd, iced_term::backend::Command::Write(_)) {
+                        tab.task_prompt_watch = Default::default();
+                    }
                     // Hot path: PTY output proves the task session is alive.
                     // A bare Instant stamp only — persistence happens on the
                     // Tick debounce, never per output chunk.
@@ -22635,6 +23021,9 @@ fi
                     return task;
                 }
             }
+            Event::TaskStartupChecked(task_id, session_id, result) => {
+                self.task_startup_checked(&task_id, &session_id, result);
+            }
             Event::Tick => {
                 let mut tasks: Vec<Task<Event>> = Vec::new();
                 self.watch_open_files();
@@ -22766,6 +23155,7 @@ fi
                 // Debounced task progress persistence (no-ops unless a
                 // snapshot actually changed).
                 self.flush_task_progress();
+                tasks.push(self.poll_task_watchdogs());
                 // The task the user is looking at counts as read — covers
                 // completion arriving while its context is already focused,
                 // and focusing a session tab through ordinary tab switching.
@@ -29945,6 +30335,7 @@ fi
                     None,
                     Some("claude".to_string()),
                     None,
+                    false,
                 );
                 self.active_workspace_idx = self.open_workspace(workspace);
                 self.normalize_workspace_order();
@@ -47078,6 +47469,53 @@ mod tests {
                 exists
             ),
             None
+        );
+    }
+
+    #[test]
+    fn claude_preset_identity_is_confirmed_from_supported_argument_forms() {
+        for command in [
+            "claude --resume abc",
+            "claude -r abc",
+            "claude --resume=abc",
+            "claude --session-id abc",
+            "claude --session-id=abc",
+        ] {
+            assert_eq!(
+                App::with_preassigned_session_id(command),
+                (command.to_string(), Some("abc".to_string())),
+                "{command}"
+            );
+        }
+        for command in [
+            "claude --continue",
+            "claude -c",
+            "claude --resume",
+            "claude --resume -d",
+            "claude -r -d",
+            "claude --session-id -d",
+            "claude --session-id=",
+        ] {
+            assert_eq!(
+                App::with_preassigned_session_id(command),
+                (command.to_string(), None),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_claude_preset_gets_an_exact_startup_session_identity() {
+        for executable in ["claude", "/opt/tools/claude", "'/opt/tools/claude'"] {
+            let (launch, id) =
+                App::with_preassigned_session_id(&format!("{executable} --model example"));
+            let id = id.expect("new Claude launch must be discoverable by its transcript");
+            assert!(uuid::Uuid::parse_str(&id).is_ok());
+            assert!(launch.ends_with(&format!("--session-id {id}")));
+        }
+        assert_eq!(
+            App::with_preassigned_session_id("/opt/tools/claude --resume example").1,
+            Some("example".to_string())
         );
     }
 

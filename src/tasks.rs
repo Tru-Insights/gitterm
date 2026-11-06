@@ -305,7 +305,33 @@ pub enum ObjectiveDeliveryState {
     #[default]
     Unknown,
     NotDelivered,
+    /// Initial prompt submitted; awaiting an on-disk harness session.
+    Pending,
     Delivered,
+}
+
+/// Activity snapshots may be rounded to a minute, but never before launch.
+pub fn clamp_activity_to_session_start<'a>(
+    activity: Option<&str>,
+    starts: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    let newest = starts
+        .filter_map(|raw| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .ok()
+                .map(|time| (raw, time))
+        })
+        .max_by_key(|(_, time)| *time);
+    match newest {
+        Some((raw, started))
+            if activity
+                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                .is_none_or(|time| time < started) =>
+        {
+            Some(raw.to_string())
+        }
+        _ => activity.map(str::to_string),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1310,6 +1336,16 @@ impl TaskStore {
         } else {
             task.sessions.push(session);
         }
+        let starts: Vec<String> = task
+            .sessions
+            .iter()
+            .map(|session| session.created_at.clone())
+            .collect();
+        let progress = task.progress.get_or_insert_with(TaskProgress::default);
+        progress.last_activity_at = clamp_activity_to_session_start(
+            progress.last_activity_at.as_deref(),
+            starts.iter().map(String::as_str),
+        );
         task.updated_at = timestamp.to_string();
         self.replace(task)
     }
@@ -1595,7 +1631,7 @@ impl TaskStore {
     pub fn update_progress(
         &mut self,
         task_id: &str,
-        progress: TaskProgress,
+        mut progress: TaskProgress,
         changes: Option<ChangedFilesSummary>,
         timestamp: &str,
     ) -> Result<bool, TaskStoreError> {
@@ -1612,6 +1648,13 @@ impl TaskStore {
             ));
         };
         let current = &self.document.tasks[index];
+        progress.last_activity_at = clamp_activity_to_session_start(
+            progress.last_activity_at.as_deref(),
+            current
+                .sessions
+                .iter()
+                .map(|session| session.created_at.as_str()),
+        );
         let progress_unchanged = current.progress.as_ref() == Some(&progress);
         let changes_unchanged = changes
             .as_ref()
@@ -2754,6 +2797,67 @@ fn validate_task(task: &TaskRecord) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_snapshot_cannot_precede_session_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = TaskStore::load(temp.path().join(TASKS_FILE_NAME)).unwrap();
+        store.insert(sample_task("activity")).unwrap();
+        let start = "2026-11-05T10:00:45.123456+00:00";
+        store
+            .upsert_session(
+                "activity",
+                TaskSessionRecord {
+                    task_session_id: "session".into(),
+                    label: "Codex".into(),
+                    harness: None,
+                    conversation: None,
+                    objective_delivery: ObjectiveDeliveryState::Pending,
+                    created_at: start.into(),
+                    updated_at: start.into(),
+                },
+                start,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get("activity")
+                .unwrap()
+                .progress
+                .as_ref()
+                .unwrap()
+                .last_activity_at
+                .as_deref(),
+            Some(start)
+        );
+        store
+            .update_progress(
+                "activity",
+                TaskProgress {
+                    last_activity_at: Some("2026-11-05T10:00:00Z".into()),
+                    ..Default::default()
+                },
+                None,
+                start,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get("activity")
+                .unwrap()
+                .progress
+                .as_ref()
+                .unwrap()
+                .last_activity_at
+                .as_deref(),
+            Some(start)
+        );
+        let later = "2026-11-05T10:01:00+00:00";
+        assert_eq!(
+            clamp_activity_to_session_start(Some(later), [start].into_iter()).as_deref(),
+            Some(later)
+        );
+    }
 
     #[test]
     fn raised_attention_keeps_since_while_reason_is_unchanged() {
