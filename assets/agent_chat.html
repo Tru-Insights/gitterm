@@ -1083,13 +1083,16 @@
     }
     const byFirst = new Map(groups.map((nodes) => [nodes[0], nodes]));
     const reusable = new Map();
+    const detached = [];
     for (const run of turn.liveRuns) {
+      // Preserve history chunk sizes until restoration or the turn-end retally.
+      if (!run.isConnected) { detached.push(run); continue; }
       const nodes = Array.from(run.querySelector('.tr-body').children);
       const wanted = byFirst.get(nodes[0]);
       if (wanted) reusable.set(nodes[0], run);
       if (!wanted || wanted.length !== nodes.length || wanted.some((n, i) => n !== nodes[i])) unwrapLiveRun(run);
     }
-    turn.liveRuns = groups.map((nodes) => {
+    turn.liveRuns = detached.concat(groups.map((nodes) => {
       let run = reusable.get(nodes[0]);
       if (!run) run = appendRun(nodes[0].parentNode, nodes, nodes[0]);
       else if (!run.parentNode) {
@@ -1099,7 +1102,7 @@
       run.classList.add('live-tool-run');
       paintRunSummary(run, toolCalls(nodes), true);
       return run;
-    });
+    }));
   }
   function foldSegment(s) {
     let last = -1;

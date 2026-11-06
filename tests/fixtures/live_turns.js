@@ -150,6 +150,28 @@
     check('F3 reader is inside expanded live run', jump.classList.contains('visible') && messages.scrollTop > runs()[0].offsetTop && messages.scrollTop < runs()[0].offsetTop + runs()[0].offsetHeight);
     send(end);
     check('F3 turn end carries reader anchor to the finished fold', Math.abs(messages.scrollTop - document.querySelector('.turn-fold').offsetTop) < 2);
+    // F1 round 2: trimming existing live wrappers must not change chunk sizes.
+    reset();
+    for (let i = 0; i < 150; i++) {
+      send(start('trim-' + i + '-a'), done('trim-' + i + '-a'),
+        start('trim-' + i + '-b'), done('trim-' + i + '-b'), H('text_delta', 'Checking group ' + i + '.'));
+    }
+    const beforeTrim = runs();
+    window.__replay([]); // Trim the existing live DOM, without replacing it.
+    const detachedRuns = beforeTrim.filter((run) => !run.isConnected);
+    const detachedMarkup = detachedRuns.map((run) => run.outerHTML);
+    send(H('text_delta', ' Still checking.'));
+    check('F1 detached live wrappers remain unchanged after another event', detachedRuns.length > 0 && detachedRuns.every((run, i) => run.parentNode?.nodeType === Node.DOCUMENT_FRAGMENT_NODE && run.outerHTML === detachedMarkup[i]));
+    document.querySelector('.earlier').click();
+    check('F1 first restored chunk leaves 100 blocks hidden', document.querySelector('.earlier')?.textContent === 'Show earlier · 100 blocks hidden');
+    document.querySelector('.earlier')?.click();
+    check('F1 second restored chunk leaves 50 blocks hidden', document.querySelector('.earlier')?.textContent === 'Show earlier · 50 blocks hidden');
+    const restoredRun = detachedRuns.find((run) => run.isConnected);
+    send(H('text_delta', ' Finished checking.'));
+    check('F1 restored live wrapper is reused on subsequent events', restoredRun?.isConnected && runs().includes(restoredRun) && restoredRun.querySelectorAll('details.tool').length === 2);
+    send(end);
+    check('F1 turn end folds restored and detached runs without losing cards', !document.querySelector('.earlier') && !runs().length && messages.querySelectorAll('.turn-fold details.tool').length === 300 && !messages.querySelector('.tool-run .tool-run') && [...document.querySelectorAll('#messages > .assistant')].some((n) => n.textContent.includes('Finished checking.')));
+
     check('no event-render errors', ![...document.querySelectorAll('.error-block')].some((n) => n.textContent.startsWith('Chat view could not render')));
   } catch (error) {
     results.push('FAIL ' + error.stack);
