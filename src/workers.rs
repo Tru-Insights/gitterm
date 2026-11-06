@@ -1222,6 +1222,22 @@ fn claude_task_trust_before_replace(
     let key = main
         .to_str()
         .ok_or_else(|| "Claude trust requires a UTF-8 repository path".to_string())?;
+    match std::fs::symlink_metadata(config_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "[tasks] Claude trust file {} is absent; skipping trust write",
+                config_path.display()
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(format!(
+                "inspect Claude trust file {}: {error}",
+                config_path.display()
+            ));
+        }
+    }
     let metadata = || -> Result<(std::time::SystemTime, u64, std::fs::Permissions), String> {
         let info = std::fs::symlink_metadata(config_path).map_err(|error| {
             format!(
@@ -1711,12 +1727,12 @@ mod reliability_tests {
     }
 
     #[test]
-    fn claude_trust_refuses_missing_invalid_and_redirected_files() {
+    fn claude_trust_skips_absent_and_refuses_invalid_or_redirected_files() {
         let temp = tempfile::tempdir().unwrap();
         let root = repo(&temp.path().join("repo"));
         let config = temp.path().join(".claude.json");
         let update = || claude_task_trust(&root, std::slice::from_ref(&root), &config);
-        assert!(update().unwrap_err().contains("inspect Claude trust file"));
+        assert_eq!(update().unwrap(), None);
         assert!(!config.exists());
         for value in ["{secret invalid", "[]", r#"{"projects":null}"#] {
             std::fs::write(&config, value).unwrap();

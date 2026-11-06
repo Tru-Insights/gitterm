@@ -11992,7 +11992,9 @@ impl App {
                     let HarnessKind::TerminalPreset { preset_name } = &session.harness.as_ref()?.kind else { return None; };
                     self.agent_presets.iter().find(|p| &p.name == preset_name).and_then(preset_conversation_backend)
                 });
-                if let Some(backend) = backend {
+                let unconfirmable_claude = backend == Some(HarnessConversationBackend::Claude)
+                    && session.conversation.is_none();
+                if let Some(backend) = backend.filter(|_| !unconfirmable_claude) {
                     probes.push((task_id.clone(), tab.repo_path.clone(), session.clone(), backend));
                 }
             } else if !tab.task_watchdog_reported && tab.task_live_state.is_some()
@@ -19684,19 +19686,67 @@ impl App {
     /// session on the agent and the tab attaches to it.
     /// For backends that support it, pre-assign a session id at launch so
     /// the tab↔conversation mapping is exact from birth (TRU-78 registry
-    /// rule). New Claude launches, including executable paths, qualify — resume commands and
-    /// other backends pass through untouched.
+    /// rule). New Claude launches receive an id, and resume/session-id presets
+    /// reuse the identity they already specify.
     fn with_preassigned_session_id(command: &str) -> (String, Option<String>) {
-        let is_plain_claude_launch = gitterm::workers::provider_for_command(command)
+        if gitterm::workers::provider_for_command(command)
             == gitterm::workers::WorkerProvider::Claude
-            && !command.contains("--resume")
-            && !command.contains("--continue")
-            && !command.contains("--session-id");
-        if is_plain_claude_launch {
+        {
+            match Self::claude_preset_session_id(command) {
+                Ok(Some(id)) => return (command.to_string(), Some(id)),
+                Err(()) => return (command.to_string(), None),
+                Ok(None) => {}
+            }
             let id = uuid::Uuid::new_v4().to_string();
             (format!("{command} --session-id {id}"), Some(id))
         } else {
             (command.to_string(), None)
+        }
+    }
+
+    /// Read an explicit Claude conversation identity from a preset command.
+    /// `Err` means the preset selects a session without a safely extractable id.
+    fn claude_preset_session_id(command: &str) -> Result<Option<String>, ()> {
+        let words = shell_words::split(command).map_err(|_| ())?;
+        let mut session_id: Option<String> = None;
+        let mut saw_identity_flag = false;
+        for (index, word) in words.iter().enumerate().skip(1) {
+            if word == "--continue" {
+                return Err(());
+            }
+            let value = if let Some(value) = word
+                .strip_prefix("--resume=")
+                .or_else(|| word.strip_prefix("--session-id="))
+            {
+                saw_identity_flag = true;
+                Some(value)
+            } else if word == "--resume" || word == "--session-id" {
+                saw_identity_flag = true;
+                Some(
+                    words
+                        .get(index + 1)
+                        .filter(|value| !value.starts_with("--"))
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                )
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                if value.is_empty()
+                    || session_id
+                        .as_deref()
+                        .is_some_and(|existing| existing != value)
+                {
+                    return Err(());
+                }
+                session_id = Some(value.to_string());
+            }
+        }
+        if saw_identity_flag {
+            session_id.map(Some).ok_or(())
+        } else {
+            Ok(None)
         }
     }
 
@@ -47418,6 +47468,33 @@ mod tests {
     }
 
     #[test]
+    fn claude_preset_identity_is_confirmed_from_supported_argument_forms() {
+        for command in [
+            "claude --resume abc",
+            "claude --resume=abc",
+            "claude --session-id abc",
+            "claude --session-id=abc",
+        ] {
+            assert_eq!(
+                App::with_preassigned_session_id(command),
+                (command.to_string(), Some("abc".to_string())),
+                "{command}"
+            );
+        }
+        for command in [
+            "claude --continue",
+            "claude --resume",
+            "claude --session-id=",
+        ] {
+            assert_eq!(
+                App::with_preassigned_session_id(command),
+                (command.to_string(), None),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn absolute_claude_preset_gets_an_exact_startup_session_identity() {
         for executable in ["claude", "/opt/tools/claude", "'/opt/tools/claude'"] {
             let (launch, id) =
@@ -47426,10 +47503,9 @@ mod tests {
             assert!(uuid::Uuid::parse_str(&id).is_ok());
             assert!(launch.ends_with(&format!("--session-id {id}")));
         }
-        assert!(
-            App::with_preassigned_session_id("/opt/tools/claude --resume example")
-                .1
-                .is_none()
+        assert_eq!(
+            App::with_preassigned_session_id("/opt/tools/claude --resume example").1,
+            Some("example".to_string())
         );
     }
 
