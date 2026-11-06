@@ -1059,13 +1059,33 @@
     let last = -1;
     s.nodes.forEach((n, i) => { if (n.matches(WORK)) last = i; });
     if (last < 0) return false; // a reply with no work: nothing to fold
-    const nodes = s.nodes.slice(0, last + 1).filter((n) => !keepsOutOfFold(n));
-    if (!nodes.some((n) => n.matches(WORK))) return false;
+    const nodes = s.nodes.slice(0, last + 1);
+    const groups = [];
+    let group = [];
+    const flush = () => { if (group.length) groups.push(group); group = []; };
+    for (const n of nodes) {
+      if (keepsOutOfFold(n) || isSubstantialAssistantText(n)) flush();
+      else group.push(n);
+    }
+    flush();
+    if (!groups.some((items) => items.some((n) => n.matches(WORK)))) return false;
+    const label = s.start != null && s.end != null
+      ? 'Worked for ' + fmtDur(Math.max(0, s.end - s.start)) : 'Worked';
+    const failed = s.nodes.filter((n) => n.matches('details.tool.error')).length;
+    for (const group of groups) foldNodes(group, label, failed);
+    return true;
+  }
+  function isSubstantialAssistantText(node) {
+    if (!node.classList.contains('assistant')) return false;
+    const text = node.__assistantText;
+    if (typeof text !== 'string') return false;
+    return text.length >= 280 || /(?:^|\n)\s*(?:#{1,6}\s+|>\s?|[-+*]\s+|\d+[.)]\s+|```|~~~)/m.test(text) ||
+      /(?:^|\n)\s*\|?[^|\n]*(?:\|[^|\n]*)+\n\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*(?:\n|$)/m.test(text);
+  }
+  function foldNodes(nodes, label, failed) {
     const fold = el('details', 'turn-fold');
     const summary = fold.appendChild(el('summary'));
-    summary.appendChild(el('span', 'tf-label',
-      s.start != null && s.end != null ? 'Worked for ' + fmtDur(Math.max(0, s.end - s.start)) : 'Worked'));
-    const failed = s.nodes.filter((n) => n.matches('details.tool.error')).length;
+    summary.appendChild(el('span', 'tf-label', label));
     if (failed) summary.appendChild(el('span', 'tr-failed', failed + ' failed'));
     const body = fold.appendChild(el('div', 'tf-body'));
     nodes[0].parentNode.insertBefore(fold, nodes[0]);
@@ -1076,7 +1096,6 @@
     }
     flush();
     watchOpen(fold);
-    return true;
   }
   // Tool cards between two narration paragraphs (with any thinking and
   // notes among them) as one line; thinking alone stays as it is.
@@ -1250,6 +1269,7 @@
   function renderSegment(final) {
     if (!segment) return;
     const raw = segment.raw;
+    if (final) segment.root.__assistantText = raw;
     const cut = final ? raw.length : raw.lastIndexOf('\n') + 1;
     if (replaying && final) {
       // Rendered when the block first is in the document (TRU-157).
@@ -1266,7 +1286,7 @@
     if (!segment) {
       endThinking();
       const root = append(el('div', 'assistant'));
-      segment = { raw: '', renderedUpTo: -1, mdEl: root.appendChild(el('div')), tailEl: root.appendChild(el('span', 'tail')), queued: false };
+      segment = { raw: '', renderedUpTo: -1, root, mdEl: root.appendChild(el('div')), tailEl: root.appendChild(el('span', 'tail')), queued: false };
     }
     segment.raw += text;
     if (replaying) return; // rendered once at segment end

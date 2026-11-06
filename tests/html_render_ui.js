@@ -55,7 +55,7 @@
       H('text_delta', 'Finished'), end,
     ]);
     check('replay preserves durations on both sides of a queued prompt',
-      Array.from(document.querySelectorAll('.turn-fold .tf-label')).map((el) => el.textContent).join('|') === 'Worked for 2s|Worked for 3s');
+      Array.from(document.querySelectorAll('.turn-fold .tf-label')).map((el) => el.textContent).join('|') === 'Worked for 2.0s|Worked for 3.0s');
     window.__resetConversation();
     window.__replay([
       prompt, { kind: 'turn_timing', start_ms: baseMs }, H('turn_started', {}),
@@ -64,7 +64,40 @@
       H('process_exited', { code: 1 }),
     ]);
     check('replay preserves duration when the process exits mid-turn',
-      document.querySelector('.turn-fold .tf-label')?.textContent === 'Worked for 4s');
+      document.querySelector('.turn-fold .tf-label')?.textContent === 'Worked for 4.0s');
+    const answerEvents = (answer) => [
+      prompt, H('turn_started', {}), H('text_delta', answer),
+      start('answer-command', 'Bash', { command: 'invoice report' }), done('answer-command'),
+      H('text_delta', 'Done.'), end,
+    ];
+    const answer = '# Invoice summary\n\n' + '- Paid invoices: 12\n- Outstanding: 3\n\nThe detailed summary keeps its place before the command.';
+    const answerShape = () => {
+      const assistant = Array.from(document.querySelectorAll('#messages > .assistant'));
+      const substantive = assistant.find((n) => n.textContent.includes('Invoice summary'));
+      const closing = assistant.find((n) => n.textContent.trim() === 'Done.');
+      const fold = document.querySelector('#messages > .turn-fold');
+      return !!substantive && !!closing && !!fold && !substantive.closest('.turn-fold') &&
+        substantive.compareDocumentPosition(fold) & Node.DOCUMENT_POSITION_FOLLOWING &&
+        fold.compareDocumentPosition(closing) & Node.DOCUMENT_POSITION_FOLLOWING &&
+        !!fold.querySelector('.tool-run') && !fold.open;
+    };
+    window.__resetConversation(); send(answerEvents(answer));
+    check('long structured answer stays visible before command fold and short closing', answerShape());
+    window.__resetConversation();
+    send([prompt, H('turn_started', {}), start('before-narration', 'Read', {}), done('before-narration'),
+      H('text_delta', 'Checking the next file.'), start('after-narration', 'Read', {}), done('after-narration'),
+      H('text_delta', 'Finished.'), end]);
+    check('short narration between tools folds', Array.from(document.querySelectorAll('.turn-fold .assistant'))
+      .some((n) => n.textContent.trim() === 'Checking the next file.'));
+    window.__resetConversation(); send(answerEvents('A'.repeat(280)));
+    check('280-character plain text block stays visible', Array.from(document.querySelectorAll('#messages > .assistant'))
+      .some((n) => n.__assistantText?.length === 280 && !n.closest('.turn-fold')));
+    const table = '| Item | Count |\n| --- | ---: |\n| Paid | 12 |';
+    window.__resetConversation(); send(answerEvents(table));
+    check('table-only short block stays visible', Array.from(document.querySelectorAll('#messages > .assistant'))
+      .some((n) => n.textContent.includes('Paid') && !n.closest('.turn-fold')));
+    window.__resetConversation(); window.__replay(answerEvents(answer));
+    check('replay matches live answer visibility and keeps folds closed', answerShape());
     check('byte and height limits in UI', !GitTermHtml.valid('é'.repeat(262145), 240) && !GitTermHtml.valid('ok', 99) && !GitTermHtml.valid('ok', 4001));
     check('safe URLs reject scripts/files/relative/credentials', ['javascript:alert(1)', 'file:///tmp/x', '//example.com', 'https://u:p@example.com'].every((url) => GitTermHtml.httpUrl(url) === null));
     check('safe URL accepts http(s)', GitTermHtml.httpUrl('https://example.com/path') === 'https://example.com/path');
