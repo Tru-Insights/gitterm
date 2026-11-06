@@ -7214,6 +7214,8 @@ pub enum Event {
     RunCommandCancel,
     /// Overview Repos rows (TRU-180), by workspace uid.
     WorkspaceRepoRemove(u64, RepoId),
+    /// Hide a repo the work touched but the workspace does not list.
+    WorkspaceRepoHide(u64, PathBuf),
     WorkspaceRepoAdd(u64),
     /// The auto-add note: undo removes the repos that just joined.
     WorkspaceRepoJoinedUndo(u64),
@@ -15458,10 +15460,43 @@ impl App {
     fn request_chat_index(&self) -> Task<Event> {
         let facts_dir = chat_facts::facts_dir(&config::global_config_dir());
         let links = self.chat_child_links();
+        // PRs belong to the workspace (TRU-238): every chat a workspace owns,
+        // open or parked, has its missed PRs caught up from its transcript.
+        let owned: HashSet<String> = self
+            .workspaces
+            .iter()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|ws| ws.chats.iter().cloned())
+            .chain(
+                self.closed_workspace_configs
+                    .iter()
+                    .flat_map(|cfg| cfg.chats.iter().cloned()),
+            )
+            .collect();
+        // The tabs that write their own chat's facts (as the backfill skips).
+        let hosted: HashSet<String> = self
+            .workspaces
+            .iter()
+            .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+            .flat_map(|ws| ws.tabs.iter())
+            .filter(|tab| {
+                tab.agent_session()
+                    .is_some_and(|session| session.backend() == tab::AgentBackend::Claude)
+            })
+            .filter_map(|tab| tab.chat_session_id.clone())
+            .collect();
+        let home = dirs::home_dir();
         Task::perform(
             async move {
                 let build = move || {
                     let mut entries = chats::build_local_index();
+                    chat_facts::catch_up_workspace_prs(
+                        &entries,
+                        &owned,
+                        &hosted,
+                        &facts_dir,
+                        home.as_deref(),
+                    );
                     chat_facts::attach_facts(&mut entries, &facts_dir);
                     chat_facts::resolve_tree(&mut entries, &links);
                     entries
@@ -26296,6 +26331,19 @@ fi
             }
             Event::WorkspaceRepoRemove(uid, repo_id) => {
                 self.remove_repo_from_workspace(uid, repo_id);
+            }
+            Event::WorkspaceRepoHide(uid, dir) => {
+                let Some(idx) = self.workspace_index_by_uid(uid) else {
+                    eprintln!("[workspace] cannot hide a repo: workspace uid={uid} is not open");
+                    return Task::none();
+                };
+                let ws = &mut self.workspaces[idx];
+                gitterm::workspace_repos::remove_manually(
+                    &dir,
+                    &mut ws.repos_added,
+                    &mut ws.repos_removed,
+                );
+                self.mark_workspaces_dirty();
             }
             Event::WorkspaceRepoAdd(uid) => {
                 return self.open_folder_picker(FolderPickerPurpose::AddRepo(uid), None);
@@ -38284,6 +38332,7 @@ fi
         let listed_dirs: Vec<PathBuf> = listed.iter().map(|repo| repo.dir.clone()).collect();
         let groups = overview::merge_repo_groups(
             &listed_dirs,
+            &ws.repos_removed,
             state.map_or(&[][..], |state| &state.summary.repos),
             state.map_or(&[][..], |state| &state.branches),
         );
@@ -38402,9 +38451,13 @@ fi
                 (None, _) => iced::widget::Space::new().into(),
             };
             let removable = repo_state.filter(|repo| repo.id != ws.home);
+            // A repo shown only because the work touched it (not listed)
+            // can be hidden too (TRU-238); the home is always listed.
+            let hideable = repo_state.is_none().then(|| group.dir.clone());
             let has_hidden = local_repo.is_some()
                 || oldest.is_some()
                 || removable.is_some()
+                || hideable.is_some()
                 || !rows.is_empty()
                 || !gone.is_empty();
             let mut actions_slot = Row::new().spacing(2).align_y(iced::Alignment::Center);
@@ -38452,6 +38505,14 @@ fi
                             .style(self.flat_button_style())
                             .padding([0, 4])
                             .on_press(Event::WorkspaceRepoRemove(uid, repo.id)),
+                    );
+                }
+                if let Some(dir) = hideable.clone() {
+                    actions_slot = actions_slot.push(
+                        button(text("\u{00D7}").size(font_small).color(text_muted))
+                            .style(self.flat_button_style())
+                            .padding([0, 4])
+                            .on_press(Event::WorkspaceRepoHide(uid, dir)),
                     );
                 }
             }
