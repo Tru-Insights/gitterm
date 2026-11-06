@@ -196,7 +196,7 @@ impl AgentEvent {
         if prompt.images.is_empty() && prompt.id.is_none() && !queued {
             return Self::user_prompt(&prompt.text);
         }
-        let mut echo = serde_json::json!({"type": "user_prompt", "text": prompt.text});
+        let mut echo = gitterm::chat_page::user_prompt_payload(&prompt.text);
         if !prompt.images.is_empty() {
             echo["images"] = serde_json::json!(prompt.images);
         }
@@ -220,7 +220,7 @@ impl AgentEvent {
         image_count: usize,
         queued: bool,
     ) -> Self {
-        let mut echo = serde_json::json!({"type": "user_prompt", "text": text});
+        let mut echo = gitterm::chat_page::user_prompt_payload(text);
         if let Some(id) = id {
             echo["id"] = serde_json::json!(id);
             if queued {

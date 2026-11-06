@@ -33,6 +33,9 @@ use crate::workers::{ReasoningEffort, WorkerChoice};
 pub const DELEGATIONS_DIR: &str = "delegations";
 /// Upper bound of the message "Send to Claude" submits.
 pub const MAX_SEND_BYTES: usize = 8 * 1024;
+pub(crate) const DELIVERY_SOURCE_LINE: &str = "GitTerm delivery (not typed by the user):";
+const DELIVERY_FOOTER_PREFIX: &str = "Full record: delegation_get ";
+const MAX_DELIVERY_CONTENT_BYTES: usize = MAX_SEND_BYTES - DELIVERY_SOURCE_LINE.len() - 1;
 const MAX_BRIEF_CHARS: usize = 20_000;
 const MAX_FOCUS_CHARS: usize = 2_000;
 const FINDING_BODY_CHARS: usize = 400;
@@ -1304,7 +1307,7 @@ fn short_head(head: &str) -> &str {
 /// Appends `block` (and a newline) when the whole message, with `footer`,
 /// still fits `MAX_SEND_BYTES`.
 fn push_if_fits(message: &mut String, block: &str, footer: &str) -> bool {
-    if message.len() + block.len() + 1 + footer.len() > MAX_SEND_BYTES {
+    if message.len() + block.len() + 1 + footer.len() > MAX_DELIVERY_CONTENT_BYTES {
         return false;
     }
     message.push_str(block);
@@ -1334,6 +1337,9 @@ pub fn compose_send_message(
     selected: &[String],
 ) -> Result<String, String> {
     let id = &delegation.delegation_id;
+    if DELIVERY_SOURCE_LINE.len() + 1 + DELIVERY_FOOTER_PREFIX.len() + id.len() > MAX_SEND_BYTES {
+        return Err(format!("delegation {id} id is too long to send"));
+    }
     if !delegation.status.is_sendable() {
         return Err(format!(
             "delegation {id} is {}; only a final outcome can be sent",
@@ -1348,10 +1354,14 @@ pub fn compose_send_message(
         };
         let header = format!("{} delegation {id} {outcome}:\n", delegation.kind.label());
         let footer = format!("\nFull record: delegation_get {id}");
-        return Ok(format!(
+        let message = format!(
             "{header}{}{footer}",
-            cut_to_bytes(message, MAX_SEND_BYTES - header.len() - footer.len())
-        ));
+            cut_to_bytes(
+                message,
+                MAX_DELIVERY_CONTENT_BYTES - header.len() - footer.len(),
+            )
+        );
+        return Ok(with_delivery_source(message, id));
     }
     let Some(result) = &delegation.result else {
         return Err(format!("delegation {id} has no result"));
@@ -1508,7 +1518,7 @@ pub fn compose_send_message(
                 }
             }
             let note = "… (cut; the full answer is in delegation_get)\n";
-            let budget = MAX_SEND_BYTES - message.len() - footer.len() - note.len() - 2;
+            let budget = MAX_DELIVERY_CONTENT_BYTES - message.len() - footer.len() - note.len() - 2;
             let body = sections.join("\n\n");
             let cut = cut_to_bytes(&body, budget);
             message.push_str(cut);
@@ -1519,8 +1529,28 @@ pub fn compose_send_message(
         }
     }
     message.push_str(&footer);
+    Ok(with_delivery_source(message, id))
+}
+
+/// Whether text is a GitTerm-delivered delegation prompt, identified by its
+/// stable transcript footer.
+pub fn is_delivery_message(text: &str) -> bool {
+    text.trim()
+        .lines()
+        .last()
+        .is_some_and(|line| line.starts_with(DELIVERY_FOOTER_PREFIX))
+}
+
+fn with_delivery_source(message: String, id: &str) -> String {
+    let footer = format!("{DELIVERY_FOOTER_PREFIX}{id}");
+    let body = message
+        .strip_suffix(&footer)
+        .expect("composed delegation message ends with its full-record footer");
+    let budget = MAX_DELIVERY_CONTENT_BYTES - footer.len();
+    let body = cut_to_bytes(body, budget);
+    let message = format!("{DELIVERY_SOURCE_LINE}\n{body}{footer}");
     debug_assert!(message.len() <= MAX_SEND_BYTES);
-    Ok(message)
+    message
 }
 
 /// The first line of a worker's "Send to Claude" message: who reported
@@ -2440,7 +2470,11 @@ mod tests {
     fn the_send_message_names_ids_counts_and_the_full_record_within_the_cap() {
         let review = completed_review(3);
         let message = compose_send_message(&review, &["F1".into(), "F3".into()]).unwrap();
-        assert!(message.starts_with("Codex review d-7 of uncommitted changes at 4d018aa, dirty: verdict needs_changes, 2 selected of 3 findings (1 P1, 1 P2)."), "{message}");
+        assert!(
+            message.starts_with("GitTerm delivery (not typed by the user):\n"),
+            "{message}"
+        );
+        assert!(message.contains("Codex review d-7 of uncommitted changes at 4d018aa, dirty: verdict needs_changes, 2 selected of 3 findings (1 P1, 1 P2)."), "{message}");
         assert!(
             message.contains("\nF1 [P1] src/main.rs:101 Problem number 1\n"),
             "{message}"
@@ -2451,6 +2485,7 @@ mod tests {
         );
         assert!(!message.contains("F2 [P2]"));
         assert!(message.ends_with("Full record: delegation_get d-7"));
+        assert!(is_delivery_message(&message));
         // Bodies are cut.
         assert!(!message.contains(&"x".repeat(FINDING_BODY_CHARS + 1)));
 
@@ -2492,9 +2527,12 @@ mod tests {
             reviewed: None,
         });
         let message = compose_send_message(&consult, &[]).unwrap();
+        assert!(message.starts_with("GitTerm delivery (not typed by the user):\n"));
+        assert!(message.ends_with("Full record: delegation_get d-7"));
+        assert!(message.len() <= MAX_SEND_BYTES);
         assert_eq!(
             message,
-            "Codex consult d-7:\nSplit the module.\n\nDecisions:\n- Keep main.rs as the shell\n\nNext steps:\n- Move the inbox\nFull record: delegation_get d-7"
+            "GitTerm delivery (not typed by the user):\nCodex consult d-7:\nSplit the module.\n\nDecisions:\n- Keep main.rs as the shell\n\nNext steps:\n- Move the inbox\nFull record: delegation_get d-7"
         );
         if let Some(handoff) = consult.result.as_mut().and_then(|r| r.handoff.as_mut()) {
             handoff.summary = "é".repeat(10_000);
@@ -2503,6 +2541,24 @@ mod tests {
         assert!(message.len() <= MAX_SEND_BYTES);
         assert!(message.contains("(cut; the full answer is in delegation_get)"));
         assert!(message.ends_with("Full record: delegation_get d-7"));
+    }
+
+    #[test]
+    fn failed_delivery_has_source_and_footer_and_delivery_predicate_is_precise() {
+        let failed = delegation(
+            "d-fail",
+            DelegationStatus::Failed {
+                message: "runner exited".into(),
+            },
+        );
+        let message = compose_send_message(&failed, &[]).unwrap();
+        assert!(message.starts_with("GitTerm delivery (not typed by the user):\n"));
+        assert!(message.ends_with("Full record: delegation_get d-fail"));
+        assert!(message.len() <= MAX_SEND_BYTES);
+        assert!(is_delivery_message(&message));
+        assert!(!is_delivery_message(
+            "A user mentions delegation_get in the middle."
+        ));
     }
 
     #[test]
@@ -3392,7 +3448,7 @@ mod tests {
         let blocked = compose_send_message(&worker, &[]).unwrap();
         assert!(
             blocked.starts_with(
-                "Worker d-9 (Codex · gpt-6-luna) is blocked: Fix export. Task task-1;"
+                "GitTerm delivery (not typed by the user):\nWorker d-9 (Codex · gpt-6-luna) is blocked: Fix export. Task task-1;"
             ),
             "{blocked}"
         );
@@ -3404,6 +3460,7 @@ mod tests {
             blocked.ends_with("Full record: delegation_get d-9"),
             "{blocked}"
         );
+        assert!(blocked.len() <= MAX_SEND_BYTES);
         worker.status = DelegationStatus::Completed;
         worker.result = Some(worker_result(handoff(&"x".repeat(20_000), &[])));
         let done = compose_send_message(&worker, &[]).unwrap();

@@ -51,7 +51,26 @@ pub fn agent_chat_html() -> String {
 
 /// The page's echo of a prompt the human submitted.
 pub fn user_prompt_payload(text: &str) -> Value {
-    serde_json::json!({"type": "user_prompt", "text": text})
+    let mut payload = serde_json::json!({"type": "user_prompt", "text": text});
+    if crate::delegations::is_delivery_message(text) {
+        let content = text
+            .trim()
+            .strip_prefix(crate::delegations::DELIVERY_SOURCE_LINE)
+            .and_then(|text| text.strip_prefix('\n'))
+            .unwrap_or(text.trim());
+        let header = content.lines().next().unwrap_or("Delegation delivery");
+        let delegation_id = content
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("Full record: delegation_get "))
+            .unwrap_or("");
+        payload["delivery"] = serde_json::json!({
+            "header": header,
+            "delegation_id": delegation_id,
+            "body": content.strip_prefix(header).unwrap_or(content).trim_start(),
+        });
+    }
+    payload
 }
 
 /// A harness event as the page's `__appendEvent` receives it. `None` (and
@@ -139,6 +158,29 @@ pub fn history_payloads(entries: Vec<TimedEntry>) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_prompt_payload_classifies_only_footer_marked_deliveries_for_cards() {
+        let delivery = format!(
+            "{}\nWorker reports done: TRU-235\nDetails\nFull record: delegation_get d-7",
+            crate::delegations::DELIVERY_SOURCE_LINE
+        );
+        let payload = user_prompt_payload(&delivery);
+        assert_eq!(
+            payload["delivery"]["header"],
+            "Worker reports done: TRU-235"
+        );
+        assert_eq!(payload["delivery"]["delegation_id"], "d-7");
+        assert_eq!(
+            payload["delivery"]["body"],
+            "Details\nFull record: delegation_get d-7"
+        );
+        assert!(
+            user_prompt_payload("Please explain delegation_get in this paragraph")
+                .get("delivery")
+                .is_none()
+        );
+    }
 
     #[test]
     fn history_payloads_wrap_events_and_stamp_subagent_starts() {

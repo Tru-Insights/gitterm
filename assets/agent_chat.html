@@ -99,6 +99,24 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
+  details.delivery {
+    margin: 8px 0;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--result);
+    border-radius: 6px;
+    background: var(--bg);
+    font-size: 13px;
+  }
+  details.delivery > summary {
+    cursor: pointer; user-select: none; list-style: none;
+    padding: 6px 10px; display: flex; gap: 8px; align-items: baseline;
+  }
+  details.delivery > summary::-webkit-details-marker { display: none; }
+  details.delivery > summary::before { content: '\25B8'; color: var(--fg-muted); font-size: 10px; }
+  details.delivery[open] > summary::before { content: '\25BE'; }
+  .delivery-kind { color: var(--result); font-weight: 600; }
+  .delivery-id { color: var(--fg-muted); font-family: var(--mono); font-size: 11px; }
+  .delivery-body { padding: 0 10px 8px 22px; white-space: pre-wrap; word-break: break-word; }
   .assistant { margin: 6px 0 10px; word-break: break-word; }
   /* Claude bolds freely; semibold keeps emphasis without shouting. */
   .assistant strong { font-weight: 600; }
@@ -3568,7 +3586,18 @@
     const id = typeof event.id === 'string' && event.id ? event.id : null;
     if (id && prompts.has(id)) return;
     endSegment(); endThinking();
-    const msg = el('div', 'user-msg');
+    const delivery = event.delivery;
+    const msg = delivery && typeof delivery.header === 'string'
+      ? el('details', 'delivery') : el('div', 'user-msg');
+    if (delivery && typeof delivery.header === 'string') {
+      const summary = msg.appendChild(el('summary'));
+      summary.appendChild(el('span', 'delivery-kind', delivery.header));
+      if (typeof delivery.delegation_id === 'string' && delivery.delegation_id) {
+        summary.appendChild(el('span', 'delivery-id', delivery.delegation_id));
+      }
+      const body = msg.appendChild(el('div', 'delivery-body'));
+      body.textContent = delivery.body || '';
+    }
     if (Array.isArray(event.images) && event.images.length) {
       const strip = el('div', 'user-images');
       for (const im of event.images) {
@@ -3580,7 +3609,7 @@
       }
       msg.append(strip);
     }
-    if (event.text) msg.append(document.createTextNode(event.text));
+    if (!delivery && event.text) msg.append(document.createTextNode(event.text));
     const imageCount = typeof event.image_count === 'number' ? event.image_count : 0;
     if (imageCount > 0) {
       msg.append(el('div', 'user-note', imageCount === 1 ? '1 image attached on the sending device'
