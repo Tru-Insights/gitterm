@@ -19711,7 +19711,7 @@ impl App {
         let mut session_id: Option<String> = None;
         let mut saw_identity_flag = false;
         for (index, word) in words.iter().enumerate().skip(1) {
-            if word == "--continue" {
+            if word == "--continue" || word == "-c" {
                 return Err(());
             }
             let value = if let Some(value) = word
@@ -19720,12 +19720,13 @@ impl App {
             {
                 saw_identity_flag = true;
                 Some(value)
-            } else if word == "--resume" || word == "--session-id" {
+            } else if word == "--resume" || word == "-r" || word == "--session-id" {
                 saw_identity_flag = true;
                 Some(
                     words
                         .get(index + 1)
-                        .filter(|value| !value.starts_with("--"))
+                        // A following flag (`--resume -d`) is not an id.
+                        .filter(|value| !value.starts_with('-'))
                         .map(String::as_str)
                         .unwrap_or(""),
                 )
@@ -47475,6 +47476,7 @@ mod tests {
     fn claude_preset_identity_is_confirmed_from_supported_argument_forms() {
         for command in [
             "claude --resume abc",
+            "claude -r abc",
             "claude --resume=abc",
             "claude --session-id abc",
             "claude --session-id=abc",
@@ -47487,7 +47489,11 @@ mod tests {
         }
         for command in [
             "claude --continue",
+            "claude -c",
             "claude --resume",
+            "claude --resume -d",
+            "claude -r -d",
+            "claude --session-id -d",
             "claude --session-id=",
         ] {
             assert_eq!(
