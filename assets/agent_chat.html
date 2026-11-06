@@ -2879,7 +2879,10 @@
     const live = st === 'running' || st === 'requested';
     let what;
     if (live) what = card.activity || (st === 'requested' ? 'queued' : 'starting');
-    else if (st === 'completed') what = (card.held ? 'sends when Claude finishes · ' : 'ready · ') + stateText(card);
+    else if (st === 'completed') {
+      const sent = d.delivered || d.delivered_at;
+      what = (card.held ? 'sends when Claude finishes · ' : sent ? '' : 'ready · ') + stateText(card);
+    }
     else what = st;
     const created = parseTime(d.created_at);
     const updated = parseTime(d.updated_at);
@@ -2991,6 +2994,8 @@
   // Finished subagents read back after a restart: the latest few stay so
   // the roster reads as it did before; older ones are history.
   const ROSTER_REPLAYED_SUBAGENTS = 10;
+  // Finished reviews, consults and workers the roster keeps (TRU-239).
+  const ROSTER_FINISHED_DELEGATIONS = 10;
   function rosterRows() {
     const rows = [];
     const replayedDone = subagents.filter((sub) => sub.fromReplay && sub.state !== 'running');
@@ -2999,18 +3004,25 @@
       if (oldReplayed.has(sub)) continue;
       rows.push(subagentRow(sub));
     }
-    for (const card of cards.values()) {
-      const d = card.data;
-      if (!d || d.dismissed_at || d.delivered || d.delivered_at) continue;
-      rows.push(delegationRow(card));
-    }
-    for (const card of execRuns.values()) if (card.data) rows.push(...execRows(card));
     // Running rows first, then newest first: by start time, or by when
     // the row appeared when a start is unknown.
     const newest = (a, b) => {
       if (a.time != null && b.time != null && a.time !== b.time) return b.time - a.time;
       return b.seq - a.seq;
     };
+    // A delivered result keeps its row, with how long it ran (TRU-239):
+    // the list is the chat's recent history, not only what is pending.
+    // The latest few finished stay; a row waiting on the human always does.
+    const dlgRows = [];
+    for (const card of cards.values()) {
+      const d = card.data;
+      if (!d || d.dismissed_at) continue;
+      dlgRows.push(delegationRow(card));
+    }
+    const finished = dlgRows.filter((row) => !row.live && row.cls !== 'waiting').sort(newest);
+    const kept = new Set(finished.slice(0, ROSTER_FINISHED_DELEGATIONS));
+    for (const row of dlgRows) if (!finished.includes(row) || kept.has(row)) rows.push(row);
+    for (const card of execRuns.values()) if (card.data) rows.push(...execRows(card));
     const sorted = rows
       .filter((row) => !rosterHidden.has(row.key))
       .sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0) || newest(a, b));
