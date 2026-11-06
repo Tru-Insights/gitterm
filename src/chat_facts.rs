@@ -956,6 +956,21 @@ pub fn write_facts(path: &Path, facts: &ChatFacts) -> Result<(), String> {
         })
 }
 
+/// The lock every read-merge-write of the facts file at `path` holds, so
+/// the live writer, the PR catch-up and the backfill (each on its own
+/// blocking thread) never drop each other's additions. One per path for the
+/// process; there is one per chat, so the map stays small.
+fn facts_write_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
 // ---------------------------------------------------------------------------
 // Live writer: the chat tab.
 
@@ -1122,6 +1137,8 @@ pub fn flush_live(
     paths: FactPaths<'_>,
 ) -> Result<Vec<PrRef>, String> {
     let path = facts_path(dir, backend, session_id)?;
+    let lock = facts_write_lock(&path);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let existing = load_facts(&path)?;
     let before = existing.clone().unwrap_or_default();
     let mut resolver = GitResolver::with_repos(paths.repos);
@@ -1222,8 +1239,35 @@ fn catch_up_from_transcript(
     (facts, added)
 }
 
+/// The newest modification time of a Claude transcript and its subagent
+/// transcripts (`<session>/subagents/*.jsonl`), the files
+/// [`scan_claude_transcript`] reads. `None` (logged) when the transcript
+/// cannot be read.
+fn transcript_inputs_modified(transcript: &Path) -> Option<SystemTime> {
+    let mut newest = match std::fs::metadata(transcript).and_then(|meta| meta.modified()) {
+        Ok(modified) => modified,
+        Err(error) => {
+            eprintln!(
+                "[chat-facts] PR catch-up cannot read {}: {error}",
+                transcript.display()
+            );
+            return None;
+        }
+    };
+    let subagents = transcript.with_extension("").join("subagents");
+    if let Ok(read) = std::fs::read_dir(&subagents) {
+        for modified in read
+            .flatten()
+            .filter_map(|entry| entry.metadata().and_then(|meta| meta.modified()).ok())
+        {
+            newest = newest.max(modified);
+        }
+    }
+    Some(newest)
+}
+
 /// Transcripts whose PRs [`catch_up_workspace_prs`] already checked, by the
-/// mtime it saw. shortcut: per process, so each GitTerm launch rescans the
+/// newest modification time of the transcript and its subagent files. shortcut: per process, so each GitTerm launch rescans the
 /// owned chats once; persist it in the facts file if launches get slow.
 fn prs_checked() -> &'static std::sync::Mutex<HashMap<PathBuf, SystemTime>> {
     static CHECKED: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, SystemTime>>> =
@@ -1252,24 +1296,21 @@ pub fn catch_up_workspace_prs(
         {
             continue;
         }
+        // The transcript and its subagents' files: either can gain a PR.
+        let Some(inputs) = transcript_inputs_modified(&entry.path) else {
+            continue;
+        };
         let seen = prs_checked()
             .lock()
             .ok()
             .and_then(|checked| checked.get(&entry.path).copied());
-        if seen == Some(entry.mtime) {
+        if seen == Some(inputs) {
             continue;
         }
         let path = match facts_path(dir, ChatBackend::Claude, &entry.id) {
             Ok(path) => path,
             Err(error) => {
                 eprintln!("[chat-facts] PR catch-up skips {}: {error}", entry.id);
-                continue;
-            }
-        };
-        let mut facts = match load_facts(&path) {
-            Ok(facts) => facts.unwrap_or_default(),
-            Err(error) => {
-                eprintln!("[chat-facts] PR catch-up leaves {error}");
                 continue;
             }
         };
@@ -1283,6 +1324,15 @@ pub fn catch_up_workspace_prs(
                 continue;
             }
         };
+        let lock = facts_write_lock(&path);
+        let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut facts = match load_facts(&path) {
+            Ok(facts) => facts.unwrap_or_default(),
+            Err(error) => {
+                eprintln!("[chat-facts] PR catch-up leaves {error}");
+                continue;
+            }
+        };
         let added: Vec<PrRef> = scan
             .prs
             .into_iter()
@@ -1292,12 +1342,28 @@ pub fn catch_up_workspace_prs(
             })
             .collect();
         if !added.is_empty() {
+            // Only PRs were recorded, so the file must not look as current
+            // as a full scan: keep its old time (a new file gets the epoch),
+            // and a later catch-up or backfill still absorbs the rest.
+            let written = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
             for pr in &added {
                 facts.add_pr(pr.clone());
             }
             if let Err(error) = write_facts(&path, &facts) {
                 eprintln!("[chat-facts] PR catch-up {error}");
                 continue;
+            }
+            if let Err(error) = std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(written))
+            {
+                eprintln!(
+                    "[chat-facts] PR catch-up cannot keep {}'s time; a later catch-up may skip its other facts: {error}",
+                    path.display()
+                );
             }
             eprintln!(
                 "[chat-facts] {} PRs caught up from {} ({} new PRs)",
@@ -1308,7 +1374,7 @@ pub fn catch_up_workspace_prs(
             total += added.len();
         }
         if let Ok(mut checked) = prs_checked().lock() {
-            checked.insert(entry.path.clone(), entry.mtime);
+            checked.insert(entry.path.clone(), inputs);
         }
     }
     total
@@ -2399,6 +2465,8 @@ pub fn backfill_claude(
                 continue;
             }
         };
+        let lock = facts_write_lock(&path);
+        let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let existing = match load_facts(&path) {
             Ok(existing) => existing,
             Err(error) => {
@@ -4045,20 +4113,36 @@ branch refs/heads/tracey/tru-12-thing
         let tmp = tempfile::tempdir().unwrap();
         let facts_dir = tmp.path().join("facts");
         std::fs::create_dir_all(&facts_dir).unwrap();
-        let transcript = |id: &str| {
-            let path = tmp.path().join(format!("{id}.jsonl"));
+        let pr_lines = |number: u32| {
             let lines = [
                 json!({"type": "assistant", "message": {"content": [
                     {"type": "tool_use", "id": "b1", "name": "Bash",
                         "input": {"command": "CO=$(gh pr create --fill); echo $CO"}}]}}),
                 json!({"type": "user", "message": {"content": [
                     {"type": "tool_result", "tool_use_id": "b1",
-                        "content": "https://github.com/acme/api/pull/81\n"}]}}),
+                        "content": format!("https://github.com/acme/api/pull/{number}\n")}]}}),
             ];
-            let body: Vec<String> = lines.iter().map(Value::to_string).collect();
-            std::fs::write(&path, body.join("\n")).unwrap();
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let transcript = |id: &str| {
+            let path = tmp.path().join(format!("{id}.jsonl"));
+            std::fs::write(&path, pr_lines(81)).unwrap();
             path
         };
+        let set_time = |path: &Path, at: SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+        let modified = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+        let long_ago = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let mut entries = Vec::new();
         for id in ["owned", "hosted", "stranger"] {
             let mut e = entry(id, id);
@@ -4066,13 +4150,29 @@ branch refs/heads/tracey/tru-12-thing
             e.mtime = SystemTime::now();
             let mut known = ChatFacts::default();
             known.add_issue_key("LIVE-1");
-            write_facts(&facts_dir.join(format!("claude-{id}.json")), &known).unwrap();
+            let path = facts_dir.join(format!("claude-{id}.json"));
+            write_facts(&path, &known).unwrap();
+            set_time(&path, long_ago);
             entries.push(e);
         }
-        let owned: HashSet<String> = ["owned", "hosted"].map(String::from).into();
+        // A chat with no facts file yet.
+        let mut fresh = entry("fresh", "fresh");
+        fresh.path = transcript("fresh");
+        fresh.mtime = SystemTime::now();
+        entries.push(fresh);
+        let owned: HashSet<String> = ["owned", "hosted", "fresh"].map(String::from).into();
         let hosted: HashSet<String> = ["hosted"].map(String::from).into();
         let added = catch_up_workspace_prs(&entries, &owned, &hosted, &facts_dir, None);
-        assert_eq!(added, 1);
+        assert_eq!(added, 2);
+        // Only PRs were recorded: the files keep looking older than their
+        // transcripts, so a later catch-up or backfill still absorbs the
+        // rest (review F2).
+        let owned_path = facts_dir.join("claude-owned.json");
+        assert_eq!(modified(&owned_path), long_ago);
+        assert!(transcript_is_newer(&owned_path, modified(&entries[0].path)));
+        let fresh_path = facts_dir.join("claude-fresh.json");
+        assert_eq!(modified(&fresh_path), SystemTime::UNIX_EPOCH);
+        assert!(transcript_is_newer(&fresh_path, modified(&entries[3].path)));
         let read = |id: &str| {
             load_facts(&facts_dir.join(format!("claude-{id}.json")))
                 .unwrap()
@@ -4089,6 +4189,19 @@ branch refs/heads/tracey/tru-12-thing
             catch_up_workspace_prs(&entries, &owned, &hosted, &facts_dir, None),
             0
         );
+        // A subagent that creates a PR changes no parent timestamp; its
+        // file still makes the chat due again (review F3).
+        let subagents = tmp.path().join("owned/subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let sub = subagents.join("agent-x.jsonl");
+        std::fs::write(&sub, pr_lines(82)).unwrap();
+        set_time(&sub, SystemTime::now() + std::time::Duration::from_secs(60));
+        assert_eq!(
+            catch_up_workspace_prs(&entries, &owned, &hosted, &facts_dir, None),
+            1
+        );
+        let numbers: Vec<u64> = read("owned").prs.iter().map(|pr| pr.number).collect();
+        assert_eq!(numbers, vec![81, 82]);
     }
 
     fn child(id: &str, kind: ChildKind) -> ChatChild {
