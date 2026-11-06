@@ -48,6 +48,21 @@
     const progress = append(record('progress-record', 'consult', 'running'));
     check('progress has no send button or sent text', !send(progress) && !progress.textContent.includes('sent to chat ✓'));
     check('rendering cards never sends automatically from JavaScript', calls.filter((call) => call.type === 'delegation_send').length === 1);
+    // TRU-239: a delivered result keeps its roster row with its run time;
+    // only the newest finished rows stay.
+    const rows = () => [...document.querySelectorAll('#roster .ro-row')];
+    check('delivered review keeps a roster row with its run time',
+      rows().some((row) => row.className.includes('done') && row.textContent.includes('1 finding') && row.textContent.includes('1m')));
+    for (let i = 0; i < 12; i++) {
+      append(record('old-' + i, 'consult', 'completed', {
+        delivered: true,
+        created_at: '2026-10-0' + (i % 9 + 1) + 'T09:00:0' + (i % 10) + 'Z',
+        updated_at: '2026-10-0' + (i % 9 + 1) + 'T09:05:0' + (i % 10) + 'Z',
+      }));
+    }
+    const finishedRows = rows().filter((row) => !row.className.includes('running') && !row.className.includes('queued') && !row.className.includes('waiting'));
+    check('roster keeps only the newest 10 finished delegations', finishedRows.length === 10);
+    check('a running delegation stays in the roster', rows().some((row) => row.className.includes('running')));
   } catch (error) {
     results.push('FAIL ' + error.stack);
   }
