@@ -672,16 +672,6 @@ fn push_guidelines_marker(tab_id: usize, on: bool) {
     );
 }
 
-/// A workspace chat starts at its home, including legacy restores whose
-/// recorded cwd was promoted to a parent git root. Task workers own a checkout.
-fn chat_launch_dir(home: &Path, recorded: &Path, task_launch: bool) -> PathBuf {
-    if task_launch {
-        recorded.to_path_buf()
-    } else {
-        home.to_path_buf()
-    }
-}
-
 /// GitTerm's change guidelines for an agent starting now in `cwd`
 /// (TRU-174); `None` when switched off or unreadable (logged).
 fn launch_guidelines(cwd: &Path, workspace_off: bool) -> Option<gitterm::guidelines::Guidelines> {
@@ -15087,7 +15077,6 @@ impl App {
         if ws_idx != self.active_workspace_idx {
             tasks.push(self.update(Event::WorkspaceSelect(ws_idx)));
         }
-        let cwd = chat_launch_dir(&self.workspaces[ws_idx].dir, &cwd, false);
         self.add_tab_with_command(cwd, Some(command));
         if let Some(tab) = self.active_tab_mut() {
             tab.chat_session_id = Some(id);
@@ -15174,7 +15163,6 @@ impl App {
         }
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
-        let cwd = chat_launch_dir(&self.workspaces[ws_idx].dir, &cwd, false);
         let mut tab = TabState::new(tab_id, cwd.clone());
         tab.kind = TabKind::Agent(resumed_claude_chat_session(&self.chat_config, &id));
         tab.set_local_dir(cwd);
@@ -19530,18 +19518,6 @@ impl App {
                         chat_session_id = Some(session_id);
                     }
                 }
-                let is_chat = tab_config.tab_kind.as_deref() == Some("agent")
-                    || startup_command
-                        .as_deref()
-                        .is_some_and(gitterm::guidelines::starts_a_harness)
-                    || chat_session_id.is_some();
-                let (repo_dir, current_dir) = if is_chat {
-                    let launch =
-                        chat_launch_dir(&workspace.dir, &repo_dir, tab_config.task_id.is_some());
-                    (launch.clone(), launch)
-                } else {
-                    (repo_dir, current_dir)
-                };
                 match (
                     tab_config.tab_kind.as_deref(),
                     tab_config.agent_config.as_ref(),
@@ -20414,18 +20390,10 @@ impl App {
         }) = remote
         else {
             if let Some(ws) = self.active_workspace() {
-                let recorded = ws
+                let dir = ws
                     .active_tab()
-                    .map(|tab| tab.current_dir.as_path())
-                    .unwrap_or(&ws.dir);
-                let dir = if local_command
-                    .as_deref()
-                    .is_some_and(gitterm::guidelines::starts_a_harness)
-                {
-                    chat_launch_dir(&ws.dir, recorded, false)
-                } else {
-                    recorded.to_path_buf()
-                };
+                    .map(|t| t.current_dir.clone())
+                    .unwrap_or_else(|| ws.dir.clone());
                 self.add_tab_with_command(dir, local_command);
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
@@ -52132,7 +52100,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_chats_launch_and_restore_in_the_home_below_a_git_root() {
+    fn chat_tabs_below_a_git_root_keep_their_folder() {
         let fixture = tempfile::tempdir().unwrap();
         let repo = fixture.path().join("notes");
         let home = repo.join("example-work");
@@ -52157,32 +52125,24 @@ mod tests {
         let mut shell = TabState::new(3, home.clone());
         shell.adopt_git_root(&status.root);
         assert_eq!(shell.repo_path, status.root);
-        for restored in [false, true] {
-            // Older saves may contain the discovered parent, rather than home.
-            let recorded = if restored { &status.root } else { &home };
-            let cwd = chat_launch_dir(&home, recorded, false);
-            let mut claude =
-                AgentSession::new(new_claude_chat_config(&config::ChatDefaults::default()));
-            if restored {
-                claude.session_id = Some("example-session".into());
-            }
-            let spawn = claude
-                .claude_session_config(cwd.clone(), Vec::new(), false, None)
-                .unwrap();
-            assert_eq!(spawn.cwd, home);
-            assert_eq!(spawn.resume.is_some(), restored);
-            // Codex uses the terminal harness path, including resume commands.
-            let mut codex = TabState::new(4, cwd);
-            codex.set_startup_command(Some(if restored {
-                "codex resume example-session".into()
-            } else {
-                "codex".into()
-            }));
+        // A Codex chat, new or resumed, keeps its folder too.
+        for command in ["codex", "codex resume example-session"] {
+            let mut codex = TabState::new(4, home.clone());
+            codex.set_startup_command(Some(command.into()));
             codex.adopt_git_root(&status.root);
             assert_eq!(codex.repo_path, home);
         }
-        let task = fixture.path().join("task-checkout");
-        assert_eq!(chat_launch_dir(&home, &task, true), task);
+        // A resumed Claude chat starts where it was recorded, even when an
+        // older save recorded the parent: its history lives under that
+        // folder, so moving it could lose the conversation.
+        let mut resumed =
+            AgentSession::new(new_claude_chat_config(&config::ChatDefaults::default()));
+        resumed.session_id = Some("example-session".into());
+        let spawn = resumed
+            .claude_session_config(status.root.clone(), Vec::new(), false, None)
+            .unwrap();
+        assert_eq!(spawn.cwd, status.root);
+        assert!(spawn.resume.is_some());
     }
 
     #[test]
