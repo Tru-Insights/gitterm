@@ -12001,7 +12001,7 @@ impl App {
             {
                 let screen = Self::worker_screen_tail(tab);
                 if tab.task_prompt_watch.observe(&screen, Instant::now()) {
-                    waiting.push((task_id.clone(), session_id.clone(), "Worker waiting at a prompt for 5 minutes without progress".to_string()));
+                    waiting.push((task_id.clone(), session_id.clone(), "Worker waiting at a prompt for 60 seconds without progress".to_string()));
                 }
             }
         }
@@ -12102,7 +12102,7 @@ impl App {
                         .err()
                         .map(|error| format!("; {error}"))
                         .unwrap_or_default();
-                    self.report_task_watchdog(task_id, session_id, format!("Worker stuck at startup: no harness session appeared within 90 seconds{detail}"));
+                    self.report_task_watchdog(task_id, session_id, format!("Worker stuck at startup: no harness session appeared within 30 seconds{detail}"));
                 }
             }
         }

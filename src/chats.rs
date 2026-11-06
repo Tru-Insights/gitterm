@@ -1632,8 +1632,8 @@ pub fn task_session_marker(session_id: &str) -> String {
     format!("GitTerm task session: {session_id}")
 }
 
-/// Probe only the launch day's files (and today, across midnight). This is
-/// independent of the Chats view/index and must run off the UI thread.
+/// Probe the local-day rollout files around launch time. This is independent
+/// of the Chats view/index and must run off the UI thread.
 pub fn started_task_conversation(
     cwd: &Path,
     session: &crate::tasks::TaskSessionRecord,
@@ -1649,6 +1649,22 @@ fn started_task_conversation_under(
     cwd: &Path,
     session: &crate::tasks::TaskSessionRecord,
     backend: crate::tasks::HarnessConversationBackend,
+) -> Result<Option<crate::tasks::HarnessConversationRef>, String> {
+    started_task_conversation_under_local_date(
+        home,
+        cwd,
+        session,
+        backend,
+        chrono::Local::now().date_naive(),
+    )
+}
+
+fn started_task_conversation_under_local_date(
+    home: &Path,
+    cwd: &Path,
+    session: &crate::tasks::TaskSessionRecord,
+    backend: crate::tasks::HarnessConversationBackend,
+    local_date: chrono::NaiveDate,
 ) -> Result<Option<crate::tasks::HarnessConversationRef>, String> {
     use crate::tasks::{HarnessConversationBackend as Backend, HarnessConversationRef};
     if let Some(conversation) = &session.conversation {
@@ -1671,13 +1687,11 @@ fn started_task_conversation_under(
     })?;
     let root = home.join(".codex/sessions");
     let dates = [
-        started.with_timezone(&chrono::Utc).date_naive(),
-        chrono::Utc::now().date_naive(),
+        local_date,
+        local_date - chrono::Duration::days(1),
+        local_date + chrono::Duration::days(1),
     ];
-    for (index, date) in dates.iter().enumerate() {
-        if index == 1 && *date == dates[0] {
-            continue;
-        }
+    for date in dates {
         let day = root.join(date.format("%Y/%m/%d").to_string());
         let files = match std::fs::read_dir(&day) {
             Ok(files) => files,
@@ -1792,15 +1806,61 @@ mod task_startup_tests {
             .unwrap()
         };
         assert!(probe().is_none());
-        assert!(!crate::workers::startup_timed_out(89, probe().is_some()));
-        assert!(crate::workers::startup_timed_out(90, probe().is_some()));
+        assert!(!crate::workers::startup_timed_out(29, probe().is_some()));
+        assert!(crate::workers::startup_timed_out(30, probe().is_some()));
         let slug = temp.path().join(".claude/projects/fixture");
         std::fs::create_dir_all(&slug).unwrap();
         std::fs::write(slug.join("other-id.jsonl"), "{}").unwrap();
         assert!(probe().is_none());
         std::fs::write(slug.join("fixture-id.jsonl"), "{}").unwrap();
         assert_eq!(probe(), Some(conversation));
-        assert!(!crate::workers::startup_timed_out(90, probe().is_some()));
+        assert!(!crate::workers::startup_timed_out(30, probe().is_some()));
+    }
+
+    #[test]
+    fn codex_startup_searches_the_local_date_when_it_differs_from_utc() {
+        use crate::tasks::*;
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        let session = TaskSessionRecord {
+            task_session_id: "worker-local-day".into(),
+            label: "Codex".into(),
+            harness: None,
+            conversation: None,
+            objective_delivery: ObjectiveDeliveryState::Pending,
+            created_at: "2026-11-05T23:59:00Z".into(),
+            updated_at: "2026-11-05T23:59:00Z".into(),
+        };
+        let utc_date = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        let local_date = chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
+        assert_ne!(utc_date, local_date);
+        let day = temp.path().join(".codex/sessions/2026/11/06");
+        std::fs::create_dir_all(&day).unwrap();
+        let meta = json!({"type":"session_meta", "timestamp":"2026-11-06T00:00:01Z", "payload":{
+            "id":"conversation-local-day", "cwd":cwd, "source":"cli", "originator":"codex_cli_rs"}});
+        let prompt = json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{
+            "type":"input_text", "text":format!("Synthetic initial objective\n{}", task_session_marker("worker-local-day"))}]}});
+        std::fs::write(
+            day.join("rollout-local-day.jsonl"),
+            format!("{meta}\n{prompt}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            started_task_conversation_under_local_date(
+                temp.path(),
+                &cwd,
+                &session,
+                HarnessConversationBackend::Codex,
+                local_date,
+            )
+            .unwrap(),
+            Some(HarnessConversationRef {
+                backend: HarnessConversationBackend::Codex,
+                session_id: "conversation-local-day".into(),
+            })
+        );
     }
 
     #[test]
@@ -1811,7 +1871,7 @@ mod task_startup_tests {
         let start = chrono::DateTime::parse_from_rfc3339("2026-11-05T10:00:01Z").unwrap();
         // No file/session cannot count as started, even after the deadline.
         assert!(started_codex_session(&path, cwd, "worker-a", start).is_err());
-        assert!(crate::workers::startup_timed_out(90, false));
+        assert!(crate::workers::startup_timed_out(30, false));
         let meta = json!({"type":"session_meta", "timestamp":"2026-11-05T10:00:02Z", "payload":{
             "id":"conversation-a", "cwd":cwd, "source":"cli", "originator":"codex_cli_rs"}});
         let prompt = json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{
@@ -1822,7 +1882,7 @@ mod task_startup_tests {
         write(&meta, &prompt);
         let found = started_codex_session(&path, cwd, "worker-a", start).unwrap();
         assert_eq!(found.as_deref(), Some("conversation-a"));
-        assert!(!crate::workers::startup_timed_out(90, found.is_some()));
+        assert!(!crate::workers::startup_timed_out(30, found.is_some()));
         // Concurrent workers in one checkout must not claim one another.
         assert!(started_codex_session(&path, cwd, "worker-b", start)
             .unwrap()

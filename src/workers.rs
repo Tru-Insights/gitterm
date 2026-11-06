@@ -715,8 +715,28 @@ mod tests {
 /// shortcut: recognizes common harness prompts, extend when a new prompt is observed.
 pub fn waiting_prompt(screen: &str) -> Option<String> {
     let lower = screen.to_lowercase();
-    if lower.contains("esc to interrupt") || lower.contains("esc interrupt") {
+    let question_overlay = lower.contains("enter to submit answer")
+        && screen.lines().any(|line| {
+            let text = line.trim();
+            let lower = text.to_lowercase();
+            lower.starts_with("question ")
+                || selected_option_line(text)
+                || lower.starts_with("› type your answer")
+                || lower.starts_with("❯ type your answer")
+        });
+    if !question_overlay && (lower.contains("esc to interrupt") || lower.contains("esc interrupt"))
+    {
         return None;
+    }
+    if question_overlay {
+        return Some(
+            screen
+                .lines()
+                .map(str::trim)
+                .find(|line| line.to_lowercase().starts_with("question "))
+                .unwrap_or("request_user_input")
+                .to_string(),
+        );
     }
     screen.lines().find_map(|line| {
         let text = line.trim();
@@ -737,14 +757,23 @@ pub fn waiting_prompt(screen: &str) -> Option<String> {
         ]
         .iter()
         .any(|needle| lower.contains(needle))
-            || text.starts_with("› 1.")
-            || text.starts_with("❯ 1."))
+            || selected_option_line(text))
         .then(|| text.to_string())
     })
 }
 
-pub const STARTUP_TIMEOUT_SECS: u64 = 90;
-pub const STALL_TIMEOUT_SECS: u64 = 5 * 60;
+fn selected_option_line(text: &str) -> bool {
+    ["› ", "❯ "].iter().any(|marker| {
+        text.strip_prefix(marker)
+            .and_then(|option| option.split_once('.'))
+            .is_some_and(|(number, _)| {
+                !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
+            })
+    })
+}
+
+pub const STARTUP_TIMEOUT_SECS: u64 = 30;
+pub const STALL_TIMEOUT_SECS: u64 = 60;
 
 pub fn startup_timed_out(elapsed_secs: u64, session_found: bool) -> bool {
     !session_found && elapsed_secs >= STARTUP_TIMEOUT_SECS
@@ -778,6 +807,8 @@ impl PromptWatch {
 pub fn trust_main_repository(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
     let root = crate::workspace_repos::checkout_root(dir)
         .ok_or_else(|| format!("{} is not a git checkout", dir.display()))?;
+    let root = std::fs::canonicalize(&root)
+        .map_err(|error| format!("resolve trust checkout {}: {error}", root.display()))?;
     let repository = git2::Repository::open(&root)
         .map_err(|error| format!("open trust checkout {}: {error}", root.display()))?;
     let main = if repository.is_worktree() {
@@ -801,15 +832,111 @@ pub fn trust_main_repository(dir: &std::path::Path) -> Result<std::path::PathBuf
                 common.display()
             ));
         }
-        common
+        let main = common
             .parent()
             .ok_or_else(|| "git common directory has no parent".to_string())?
-            .to_path_buf()
+            .to_path_buf();
+        verify_worktree_registration(&root, &common, repository.path())?;
+        main
     } else {
         root
     };
     std::fs::canonicalize(&main)
         .map_err(|error| format!("resolve trust repository {}: {error}", main.display()))
+}
+
+fn verify_worktree_registration(
+    checkout: &std::path::Path,
+    main_git_dir: &std::path::Path,
+    worktree_git_dir: &std::path::Path,
+) -> Result<(), String> {
+    let git_entry = checkout.join(".git");
+    let git_entry_metadata = std::fs::symlink_metadata(&git_entry).map_err(|error| {
+        format!(
+            "inspect worktree .git entry {}: {error}",
+            git_entry.display()
+        )
+    })?;
+    if !git_entry_metadata.file_type().is_file() {
+        return Err(format!(
+            "worktree .git entry {} must be a regular file",
+            git_entry.display()
+        ));
+    }
+    let pointer = std::fs::read_to_string(&git_entry)
+        .map_err(|error| format!("read worktree gitdir {}: {error}", git_entry.display()))?;
+    let pointer = pointer
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| format!("invalid worktree gitdir file {}", git_entry.display()))?;
+    let pointer_path = std::path::Path::new(pointer);
+    let pointer_path = std::fs::canonicalize(if pointer_path.is_absolute() {
+        pointer_path.to_path_buf()
+    } else {
+        checkout.join(pointer_path)
+    })
+    .map_err(|error| format!("resolve worktree gitdir {}: {error}", git_entry.display()))?;
+    let registrations = main_git_dir.join("worktrees");
+    let registrations = std::fs::canonicalize(&registrations).map_err(|error| {
+        format!(
+            "resolve worktree registrations {}: {error}",
+            registrations.display()
+        )
+    })?;
+    if pointer_path.parent() != Some(registrations.as_path()) {
+        return Err(format!(
+            "worktree gitdir {} is not registered in {}",
+            pointer_path.display(),
+            registrations.display()
+        ));
+    }
+    let back_pointer = pointer_path.join("gitdir");
+    let back_pointer = std::fs::read_to_string(&back_pointer)
+        .map_err(|error| format!("read worktree backlink {}: {error}", back_pointer.display()))?;
+    let back_pointer = std::path::Path::new(back_pointer.trim());
+    let back_pointer = std::fs::canonicalize(if back_pointer.is_absolute() {
+        back_pointer.to_path_buf()
+    } else {
+        pointer_path.join(back_pointer)
+    })
+    .map_err(|error| {
+        format!(
+            "resolve worktree backlink for {}: {error}",
+            checkout.display()
+        )
+    })?;
+    let expected = std::fs::canonicalize(&git_entry).map_err(|error| {
+        format!(
+            "resolve worktree .git file {}: {error}",
+            git_entry.display()
+        )
+    })?;
+    if back_pointer != expected {
+        return Err(format!(
+            "worktree registration {} points to {}, expected {}",
+            pointer_path.display(),
+            back_pointer.display(),
+            expected.display()
+        ));
+    }
+    // git2 has already resolved this directory from the checkout's .git file;
+    // require the parsed pointer to identify that same registered directory.
+    let worktree_git_dir = std::fs::canonicalize(worktree_git_dir).map_err(|error| {
+        format!(
+            "resolve worktree git directory {}: {error}",
+            worktree_git_dir.display()
+        )
+    })?;
+    if pointer_path != worktree_git_dir {
+        return Err(format!(
+            "worktree pointer {} does not match opened git directory {}",
+            pointer_path.display(),
+            worktree_git_dir.display()
+        ));
+    }
+    Ok(())
 }
 
 /// shell-words splits arguments but does not reject shell control syntax.
@@ -1344,6 +1471,39 @@ mod reliability_tests {
     }
 
     #[test]
+    fn forged_worktree_pointer_without_reciprocal_registration_gets_no_trust() {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, linked) = linked_repo(temp.path());
+        let forged = temp.path().join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::copy(linked.join(".git"), forged.join(".git")).unwrap();
+        assert!(trust_main_repository(&forged)
+            .unwrap_err()
+            .contains("registration"));
+        let config = temp.path().join("codex.toml");
+        assert!(codex_task_trust("codex", &forged, std::slice::from_ref(&root), &config).is_err());
+        let claude_config = temp.path().join("claude.json");
+        std::fs::write(&claude_config, "{}").unwrap();
+        assert!(claude_task_trust(&forged, std::slice::from_ref(&root), &claude_config).is_err());
+        let original_config = std::fs::read(&claude_config).unwrap();
+        #[cfg(unix)]
+        {
+            let symlinked = temp.path().join("symlinked-forgery");
+            std::fs::create_dir(&symlinked).unwrap();
+            std::os::unix::fs::symlink(linked.join(".git"), symlinked.join(".git")).unwrap();
+            assert!(trust_main_repository(&symlinked).is_err());
+            assert!(
+                codex_task_trust("codex", &symlinked, std::slice::from_ref(&root), &config)
+                    .is_err()
+            );
+            assert!(
+                claude_task_trust(&symlinked, std::slice::from_ref(&root), &claude_config).is_err()
+            );
+            assert_eq!(std::fs::read(&claude_config).unwrap(), original_config);
+        }
+    }
+
+    #[test]
     fn malformed_trust_and_redirected_presets_fail_loudly() {
         for command in [
             "codex -C /elsewhere",
@@ -1421,8 +1581,8 @@ mod reliability_tests {
 
     #[test]
     fn startup_requires_a_session_and_prompt_stalls_ignore_redraws() {
-        assert!(!startup_timed_out(89, false));
-        assert!(startup_timed_out(90, false));
+        assert!(!startup_timed_out(29, false));
+        assert!(startup_timed_out(30, false));
         assert!(!startup_timed_out(1000, true));
         for screen in [
             "Folder access\nTrust this folder?\n› 1. Trust and continue\n  2. Quit",
@@ -1431,6 +1591,35 @@ mod reliability_tests {
         ] {
             assert!(waiting_prompt(screen).is_some(), "{screen}");
         }
+        // From Codex's published request_user_input snapshot:
+        // https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_options.snap
+        let request_user_input_snapshot = r#"
+  Question 1/1 (1 unanswered)
+  Choose an option.
+
+  › 1. Option 1           First choice.
+    2. Option 2           Second choice.
+    3. Option 3           Third choice.
+    4. None of the above  Optionally, add details in notes (tab)
+
+  tab to add notes | enter to submit answer | esc to interrupt
+"#;
+        assert!(waiting_prompt(request_user_input_snapshot).is_some());
+        let moved_selection = request_user_input_snapshot
+            .replace("› 1.", "  1.")
+            .replace("    2.", "  › 2.");
+        assert!(waiting_prompt(&moved_selection).is_some());
+        assert_eq!(
+            waiting_prompt(request_user_input_snapshot),
+            waiting_prompt(&moved_selection)
+        );
+        let freeform_snapshot = r#"
+  Question 1/1 (1 unanswered)
+  Share details.
+  › Type your answer (optional)
+  enter to submit answer | esc to interrupt
+"#;
+        assert!(waiting_prompt(freeform_snapshot).is_some());
         for screen in [
             "Reading sources\nWorking (esc to interrupt)",
             "› Ask Codex to do anything\n? for shortcuts",
@@ -1443,11 +1632,11 @@ mod reliability_tests {
         assert!(!watch.observe("spinner 1\nWould you like to proceed?", now));
         assert!(!watch.observe(
             "spinner 2\nWould you like to proceed?",
-            now + Duration::from_secs(299)
+            now + Duration::from_secs(59)
         ));
         assert!(watch.observe(
             "spinner 3\nWould you like to proceed?",
-            now + Duration::from_secs(300)
+            now + Duration::from_secs(60)
         ));
         assert!(!watch.observe("Working (esc to interrupt)", now + Duration::from_secs(301)));
         assert!(!watch.observe("Would you like to proceed?", now + Duration::from_secs(302)));
