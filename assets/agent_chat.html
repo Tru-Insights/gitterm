@@ -246,6 +246,7 @@
   details.turn-fold[open] > summary::after, details.tool-run[open] > summary::after { transform: rotate(90deg); }
   .tf-body { margin: 4px 0 2px; padding-left: 12px; border-left: 2px solid var(--border); }
   details.tool-run { margin: 4px 0; }
+  .live-tool-run > summary .tr-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tr-failed { color: var(--err); }
 
   .note { color: var(--fg-muted); font-size: 12px; margin: 6px 0; }
@@ -982,7 +983,7 @@
   // markers preserve durations; old conversations without markers keep the
   // "Worked" label. Folds start closed and are not remembered.
   function beginTurn() {
-    turn = { startMs: replaying ? null : Date.now(), nextPromptAtMs: null, blocks: [] };
+    turn = { startMs: replaying ? null : Date.now(), nextPromptAtMs: null, blocks: [], liveRuns: [] };
   }
   function turnTiming(event) {
     if (!turn) return;
@@ -995,8 +996,11 @@
   function endTurn(fold) {
     const t = turn;
     turn = null;
-    if (!t || !fold) return;
-    keepView(() => foldTurn(t, t.endMs != null ? t.endMs : (replaying ? null : Date.now())));
+    if (!t) return;
+    keepView(() => {
+      for (const run of t.liveRuns) unwrapLiveRun(run);
+      if (fold) foldTurn(t, t.endMs != null ? t.endMs : (replaying ? null : Date.now()));
+    });
   }
   // Run `change` to the timeline without moving what the human reads: a
   // view following the latest stays at the bottom; one scrolled back keeps
@@ -1055,6 +1059,44 @@
     }
     return false;
   }
+  function unwrapLiveRun(run) {
+    for (const node of Array.from(run.querySelector('.tr-body').children)) run.before(node);
+    run.remove();
+  }
+  // Reconcile against the original timeline blocks: attention cards can
+  // leave a run when a request arrives or a tool fails. Keep the same row
+  // (and its open state) as consecutive calls and their inputs stream in.
+  function refreshLiveRuns() {
+    if (replaying || !turn) return;
+    const groups = [];
+    let group = [];
+    for (const { node } of turn.blocks) {
+      if (!node.parentNode) continue;
+      if (node.matches('details.tool') && !keepsOutOfFold(node)) {
+        if (!group.length) groups.push(group);
+        group.push(node);
+      } else group = [];
+    }
+    const byFirst = new Map(groups.map((nodes) => [nodes[0], nodes]));
+    const reusable = new Map();
+    for (const run of turn.liveRuns) {
+      const nodes = Array.from(run.querySelector('.tr-body').children);
+      const wanted = byFirst.get(nodes[0]);
+      if (wanted) reusable.set(nodes[0], run);
+      if (!wanted || wanted.length !== nodes.length || wanted.some((n, i) => n !== nodes[i])) unwrapLiveRun(run);
+    }
+    turn.liveRuns = groups.map((nodes) => {
+      let run = reusable.get(nodes[0]);
+      if (!run) run = appendRun(nodes[0].parentNode, nodes, nodes[0]);
+      else if (!run.parentNode) {
+        nodes[0].before(run);
+        run.querySelector('.tr-body').append(...nodes);
+      }
+      run.classList.add('live-tool-run');
+      paintRunSummary(run, toolCalls(nodes), true);
+      return run;
+    });
+  }
   function foldSegment(s) {
     let last = -1;
     s.nodes.forEach((n, i) => { if (n.matches(WORK)) last = i; });
@@ -1106,10 +1148,8 @@
   }
   // Tool cards between two narration paragraphs (with any thinking and
   // notes among them) as one line; thinking alone stays as it is.
-  function appendRun(body, nodes) {
-    const cards = nodes.filter((n) => n.matches('details.tool'));
-    if (!cards.length) { for (const n of nodes) body.appendChild(n); return; }
-    const calls = cards.map((n) => {
+  function toolCalls(nodes) {
+    return nodes.filter((n) => n.matches('details.tool')).map((n) => {
       const item = items.get(n.dataset.toolId);
       const nameEl = n.querySelector('.tool-name');
       return {
@@ -1118,17 +1158,34 @@
         failed: n.classList.contains('error'),
       };
     });
-    const run = body.appendChild(el('details', 'tool-run'));
-    const summary = run.appendChild(el('summary'));
-    summary.appendChild(el('span', 'tr-label', runLabel(calls)));
+  }
+  function paintRunSummary(run, calls, live = false) {
+    const summary = run.querySelector('summary');
+    let label = runLabel(calls);
+    if (live) {
+      const current = Array.from(run.querySelector('.tr-body').children).reverse().find((n) => n.classList.contains('running'));
+      const item = current && items.get(current.dataset.toolId);
+      if (item) label += ' · now: ' + (salient(item.name, item.input) || item.name);
+    }
+    summary.querySelector('.tr-label').textContent = label;
+    const oldFailed = summary.querySelector('.tr-failed');
+    if (oldFailed) oldFailed.remove();
     const failed = calls.filter((c) => c.failed).length;
     if (failed) summary.appendChild(el('span', 'tr-failed', failed + ' failed'));
     const names = new Map();
     for (const c of calls) names.set(c.name, (names.get(c.name) || 0) + 1);
     summary.title = Array.from(names, ([name, n]) => name + (n > 1 ? ' ×' + n : '')).join(', ');
+  }
+  function appendRun(body, nodes, before = null) {
+    const calls = toolCalls(nodes);
+    if (!calls.length) { for (const n of nodes) body.appendChild(n); return; }
+    const run = body.insertBefore(el('details', 'tool-run'), before);
+    run.appendChild(el('summary')).appendChild(el('span', 'tr-label'));
     const runBody = run.appendChild(el('div', 'tr-body'));
     for (const n of nodes) runBody.appendChild(n);
+    paintRunSummary(run, calls);
     watchOpen(run);
+    return run;
   }
   // What a tool call does, by the names the cards show: Claude's tools,
   // the names ACP agents give theirs, else an ACP call's own `kind`.
@@ -1315,6 +1372,7 @@
     if (!text) return; // redacted thinking: activity bar only
     if (!thinking) {
       const d = append(el('details', 'thinking'));
+      d.open = !replaying;
       d.appendChild(el('summary', null, 'Thinking'));
       thinking = { details: d, body: d.appendChild(el('div', 'body')) };
     }
@@ -3619,14 +3677,15 @@
   window.__appendEvent = function (event) {
     if (!event || typeof event !== 'object') return;
     try {
-      if (event.kind === 'harness') { harnessEvent(event.event); return; }
-      if (event.kind === 'delegation_anchor') { delegationAnchor(event.delegation_id); return; }
-      if (event.kind === 'subagent_started_at') { subagentStartedAt(event.id, event.at_ms); return; }
-      if (event.kind === 'turn_timing') { turnTiming(event); return; }
-      if (event.kind === 'delegation') { delegationEvent(event); return; }
-      if (event.kind === 'codex_exec') { codexExecEvent(event); return; }
-      if (event.type === 'user_prompt') { showUserPrompt(event); return; }
-      legacyEvent(event);
+      if (event.kind === 'harness') harnessEvent(event.event);
+      else if (event.kind === 'delegation_anchor') delegationAnchor(event.delegation_id);
+      else if (event.kind === 'subagent_started_at') subagentStartedAt(event.id, event.at_ms);
+      else if (event.kind === 'turn_timing') turnTiming(event);
+      else if (event.kind === 'delegation') delegationEvent(event);
+      else if (event.kind === 'codex_exec') codexExecEvent(event);
+      else if (event.type === 'user_prompt') showUserPrompt(event);
+      else legacyEvent(event);
+      if (!replaying && turn) keepView(refreshLiveRuns);
     } catch (e) {
       console.error('render failed for event', event, e);
       errorBlock('Chat view could not render an event: ' + e);
