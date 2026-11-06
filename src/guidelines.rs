@@ -262,11 +262,26 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
                 .join(", ")
         }
     ));
+    // The workspace's own checkpoint (TRU-237): repos are shared between
+    // workspaces, so a repo's `.agents/checkpoint.md` cannot say whose work
+    // it is. Code names the file; the agent only reads and writes it.
     let resume = places.docs_dir.join("checkpoint.md");
-    if resume.is_file() {
-        note.push_str(&format!("- Resume file: `{}`.\n", resume.display()));
-    }
+    note.push_str(&format!(
+        "- Workspace checkpoint: `{}` ({}). `/checkpoint` writes here and `/resume` \
+         reads here, never a repo's `.agents/checkpoint.md`.\n",
+        resume.display(),
+        if resume.is_file() {
+            "exists"
+        } else {
+            "not written yet"
+        }
+    ));
     note.push_str("Resume only this workspace's work; if unsure which work to continue, ask.\n");
+    if let Some(start) = checkpoint_start(&resume) {
+        note.push_str("\nThe start of the workspace checkpoint:\n\n````markdown\n");
+        note.push_str(&start);
+        note.push_str("\n````\n");
+    }
     match &places.decisions_repo {
         Some(repo) => note.push_str(&format!(
             "- Decisions the team should see go in the decisions repo, `{}`, \
@@ -280,6 +295,41 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
         ),
     }
     note
+}
+
+/// How much of the workspace checkpoint a chat starts with: checkpoints put
+/// the newest state first, and a whole file can be long.
+const CHECKPOINT_START_BYTES: usize = 12 * 1024;
+
+/// The first [`CHECKPOINT_START_BYTES`] of the checkpoint at `path`, cut at
+/// a line end, with a note when cut; `None` when missing, empty or
+/// unreadable (logged).
+fn checkpoint_start(path: &Path) -> Option<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            eprintln!("[guidelines] cannot read {}: {error}", path.display());
+            return None;
+        }
+    };
+    let text = text.trim_end();
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() <= CHECKPOINT_START_BYTES {
+        return Some(text.to_string());
+    }
+    let mut end = CHECKPOINT_START_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let end = text[..end].rfind('\n').unwrap_or(end);
+    Some(format!(
+        "{}\n\n(cut at {} KB; read the file for the rest)",
+        &text[..end],
+        CHECKPOINT_START_BYTES / 1024
+    ))
 }
 
 /// The workspace section of appended instructions, also supplied by Claude's
@@ -655,12 +705,28 @@ mod tests {
         assert!(missing.contains("`/code/example-api`, `/code/example-web`"));
         assert!(missing
             .contains("Resume only this workspace's work; if unsure which work to continue, ask."));
-        assert!(!missing.contains("checkpoint.md"));
-        std::fs::create_dir_all(&places.docs_dir).unwrap();
         let checkpoint = places.docs_dir.join("checkpoint.md");
+        assert!(missing.contains(&format!(
+            "Workspace checkpoint: `{}` (not written yet)",
+            checkpoint.display()
+        )));
+        assert!(!missing.contains("The start of the workspace checkpoint"));
+        std::fs::create_dir_all(&places.docs_dir).unwrap();
         std::fs::write(&checkpoint, "Example resume notes").unwrap();
         let note = documents_note(&places);
-        assert!(note.contains(&format!("Resume file: `{}`", checkpoint.display())));
+        assert!(note.contains(&format!(
+            "Workspace checkpoint: `{}` (exists)",
+            checkpoint.display()
+        )));
+        assert!(note.contains("The start of the workspace checkpoint:"));
+        assert!(note.contains("Example resume notes"));
+        // A long checkpoint is cut at a line end and says so.
+        let long = "line of notes\n".repeat(2000);
+        std::fs::write(&checkpoint, &long).unwrap();
+        let cut = checkpoint_start(&checkpoint).unwrap();
+        assert!(cut.len() < long.len());
+        assert!(cut.contains("(cut at 12 KB; read the file for the rest)"));
+        std::fs::write(&checkpoint, "Example resume notes").unwrap();
         let launch =
             launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
         assert_eq!(workspace_context(&launch.text), Some(note.trim_end()));
