@@ -1,6 +1,9 @@
-//! Per-launch ownership of a task terminal's shell and agent descendants.
-//! The terminal crate exposes no child PID; the launch command records its
-//! shell in a private directory. Shutdown never selects processes by name.
+//! Per-launch ownership of a task terminal's agent and its descendants.
+//! The terminal crate exposes no child PID; the launch command runs the agent
+//! in a forked subshell and records that subshell in a private directory. The
+//! terminal's interactive shell is never recorded, so once the agent exits the
+//! identity is gone and nothing the user runs next can match it. Shutdown
+//! never selects processes by name.
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -51,23 +54,34 @@ impl WorkerProcess {
     }
 
     pub fn stop(self) -> Result<(), String> {
-        stop_tree(&SystemProcesses, self.persisted_identity.as_ref())
+        stop_on_platform(
+            &SystemProcesses,
+            self.persisted_identity.as_ref(),
+            cfg!(windows),
+        )
     }
 }
 
-/// Runs before app initialization and before the harness command. The shell
-/// waits for this durable launch record; shutdown never discovers authority.
-pub fn record_launch(path: &std::path::Path, pid: Option<u32>) -> Result<(), String> {
+/// Runs before app initialization, from inside the subshell that will run
+/// the harness. Records that subshell (the recorder's parent), never the
+/// terminal's interactive shell: a parent equal to `terminal_shell` means no
+/// subshell was forked, and the launch is refused before the agent starts.
+pub fn record_launch(path: &std::path::Path, terminal_shell: u32) -> Result<(), String> {
+    let launch = SystemProcesses
+        .current(std::process::id())?
+        .ok_or("worker launch recorder process is missing")?
+        .parent;
+    if launch == terminal_shell {
+        return Err(format!(
+            "refuse worker launch: the agent would run in the terminal shell {terminal_shell}, not a subshell of its own"
+        ));
+    }
+    record_process(path, launch)
+}
+
+/// Persists `pid`'s native birth identity; the agent waits for this record.
+pub fn record_process(path: &std::path::Path, pid: u32) -> Result<(), String> {
     let control = SystemProcesses;
-    let pid = match pid {
-        Some(pid) => pid,
-        None => {
-            control
-                .current(std::process::id())?
-                .ok_or("worker launch recorder process is missing")?
-                .parent
-        }
-    };
     let process = control
         .current(pid)?
         .ok_or_else(|| format!("worker launch process {pid} is missing"))?;
@@ -96,37 +110,28 @@ impl Drop for WorkerProcess {
 
 /// Called after provider-specific MCP configuration, so the wrapper never
 /// changes harness detection or the persisted resume command.
-pub fn record_shell(command: &str, shell: &str, path: &str) -> Result<String, String> {
+pub fn record_shell(command: &str, path: &str) -> Result<String, String> {
+    // shortcut: Windows records nothing and its finished workers are never
+    // stopped automatically (see `stop_on_platform`); revisit with job objects.
+    if cfg!(windows) {
+        return Ok(command.to_string());
+    }
     let executable =
         std::env::current_exe().map_err(|e| format!("locate worker launch recorder: {e}"))?;
     Ok(record_shell_with_executable(
         command,
-        shell,
         path,
         &executable.to_string_lossy(),
     ))
 }
 
-fn record_shell_with_executable(
-    command: &str,
-    shell: &str,
-    path: &str,
-    executable: &str,
-) -> String {
-    if cfg!(windows) {
-        if shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh") {
-            let path = path.replace('\'', "''");
-            let executable = executable.replace('\'', "''");
-            format!("& '{executable}' {RECORD_LAUNCH_ARG} '{path}' $PID; if ($LASTEXITCODE -eq 0) {{ {command} }}")
-        } else {
-            format!("\"{executable}\" {RECORD_LAUNCH_ARG} \"{path}\" && {command}")
-        }
-    } else {
-        let _ = shell;
-        let path = format!("'{}'", path.replace('\'', "'\\''"));
-        let executable = format!("'{}'", executable.replace('\'', "'\\''"));
-        format!("{executable} {RECORD_LAUNCH_ARG} {path} \"$$\" && {{\n{command}\n}}")
-    }
+/// zsh and bash (the only shells that run a startup command) fork `( ... )`,
+/// so the recorder's parent is the subshell that runs the agent and exits
+/// with it. `$$` stays the interactive shell's PID inside the subshell.
+fn record_shell_with_executable(command: &str, path: &str, executable: &str) -> String {
+    let path = format!("'{}'", path.replace('\'', "'\\''"));
+    let executable = format!("'{}'", executable.replace('\'', "'\\''"));
+    format!("( {executable} {RECORD_LAUNCH_ARG} {path} \"$$\" && {{\n{command}\n}} )")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +154,22 @@ trait ProcessControl {
     fn grace(&self) {
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// Windows refuses before inspecting anything: `ParentProcessId` survives its
+/// creator's exit, so a reused PID would adopt unrelated processes. The
+/// caller keeps the tab open when this refuses.
+fn stop_on_platform(
+    control: &impl ProcessControl,
+    identity: Option<&LaunchIdentity>,
+    windows: bool,
+) -> Result<(), String> {
+    if windows {
+        return Err(
+            "refuse worker shutdown: automatic shutdown is not supported on Windows".into(),
+        );
+    }
+    stop_tree(control, identity)
 }
 
 fn stop_tree(
@@ -294,37 +315,9 @@ impl ProcessControl for SystemProcesses {
             }
             Ok(processes)
         }
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(not(target_os = "linux"))]
         {
-            Err("worker launch identity is unsupported on this Unix platform".into())
-        }
-        #[cfg(windows)]
-        {
-            let output = std::process::Command::new("powershell").args(["-NoProfile", "-Command",
-                "ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;birth=$_.CreationDate.ToString('o')} })"])
-                .output().map_err(|e| format!("list worker processes: {e}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "list worker processes: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            #[derive(serde::Deserialize)]
-            struct Row {
-                pid: u32,
-                parent: u32,
-                birth: String,
-            }
-            let rows: Vec<Row> = serde_json::from_slice(&output.stdout)
-                .map_err(|e| format!("decode worker processes: {e}"))?;
-            Ok(rows
-                .into_iter()
-                .map(|p| Process {
-                    pid: p.pid,
-                    parent: p.parent,
-                    birth: p.birth,
-                })
-                .collect())
+            Err("worker process inspection is unsupported on this platform".into())
         }
     }
     fn current(&self, pid: u32) -> Result<Option<Process>, String> {
@@ -334,7 +327,9 @@ impl ProcessControl for SystemProcesses {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Ok(self.snapshot()?.into_iter().find(|p| p.pid == pid))
+            Err(format!(
+                "worker process inspection of PID {pid} is unsupported on this platform"
+            ))
         }
     }
     fn signal(&self, pid: u32, signal: Signal) -> Result<(), String> {
@@ -342,24 +337,11 @@ impl ProcessControl for SystemProcesses {
         {
             signal_unix(pid, signal)
         }
-        #[cfg(windows)]
+        #[cfg(not(unix))]
         {
-            let mut command = std::process::Command::new("taskkill");
-            command.args(["/PID", &pid.to_string()]);
-            if signal == Signal::Kill {
-                command.arg("/F");
-            }
-            let output = command
-                .output()
-                .map_err(|e| format!("stop worker {pid}: {e}"))?;
-            if output.status.success() || self.current(pid)?.is_none() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "stop worker {pid}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ))
-            }
+            Err(format!(
+                "refuse to signal worker {pid} ({signal:?}): unsupported on this platform"
+            ))
         }
     }
 }
@@ -456,40 +438,121 @@ mod tests {
         assert!(error.contains("missing persisted launch identity"));
     }
 
+    /// The terminal shell (10) outlived its agent: the recorded launch
+    /// subshell (15) is gone and the user now runs another program (20, and a
+    /// reuse of PID 15 with a new birth) in the same terminal.
+    struct AgentExited;
+    impl ProcessControl for AgentExited {
+        fn snapshot(&self) -> Result<Vec<Process>, String> {
+            Ok(vec![
+                Process {
+                    pid: 10,
+                    parent: std::process::id(),
+                    birth: "terminal-shell".into(),
+                },
+                Process {
+                    pid: 20,
+                    parent: 10,
+                    birth: "user-program".into(),
+                },
+                Process {
+                    pid: 15,
+                    parent: 10,
+                    birth: "user-program-on-reused-pid".into(),
+                },
+            ])
+        }
+        fn current(&self, pid: u32) -> Result<Option<Process>, String> {
+            Ok(self.snapshot()?.into_iter().find(|p| p.pid == pid))
+        }
+        fn signal(&self, pid: u32, _: Signal) -> Result<(), String> {
+            panic!("must not signal {pid}: the launched agent has exited")
+        }
+        fn grace(&self) {
+            panic!("no signals means no grace wait")
+        }
+    }
+
+    #[test]
+    fn exited_agent_leaves_the_programs_now_in_its_terminal_alone() {
+        let error = stop_on_platform(
+            &AgentExited,
+            Some(&LaunchIdentity {
+                pid: 15,
+                birth: "agent-launch".into(),
+            }),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("no longer matches"), "{error}");
+    }
+
+    struct Untouchable;
+    impl ProcessControl for Untouchable {
+        fn snapshot(&self) -> Result<Vec<Process>, String> {
+            panic!("Windows must not walk parent links")
+        }
+        fn current(&self, _: u32) -> Result<Option<Process>, String> {
+            panic!("Windows must not inspect processes")
+        }
+        fn signal(&self, _: u32, _: Signal) -> Result<(), String> {
+            panic!("Windows must not signal")
+        }
+    }
+
+    #[test]
+    fn windows_refuses_before_any_process_inspection() {
+        let identity = LaunchIdentity {
+            pid: 10,
+            birth: "a".into(),
+        };
+        let error = stop_on_platform(&Untouchable, Some(&identity), true).unwrap_err();
+        assert!(error.contains("not supported on Windows"), "{error}");
+        assert!(stop_on_platform(&Untouchable, None, true).is_err());
+    }
+
     #[test]
     #[cfg(unix)]
-    fn launch_wrapper_records_its_shell_and_preserves_quoted_commands() {
+    fn launch_wrapper_records_the_agent_subshell_not_the_terminal_shell() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("worker's pid");
         use std::os::unix::fs::PermissionsExt;
         let recorder = temp.path().join("recorder's script");
-        std::fs::write(&recorder, "#!/bin/sh\nprintf '%s' \"$3\" > \"$2\"\n").unwrap();
+        // Stands in for `record_launch`: the recorder's parent and `$$`.
+        std::fs::write(
+            &recorder,
+            "#!/bin/sh\nprintf '%s %s' \"$PPID\" \"$3\" > \"$2\"\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o700)).unwrap();
         let command = record_shell_with_executable(
             "printf '%s' 'a quoted command'",
-            "/bin/sh",
             path.to_str().unwrap(),
             recorder.to_str().unwrap(),
         );
-        let output = std::process::Command::new("/bin/sh")
-            .args(["-c", &command])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"a quoted command");
-        assert!(
-            std::fs::read_to_string(path)
-                .unwrap()
-                .parse::<u32>()
-                .unwrap()
-                > 1
-        );
-        let failed = record_shell_with_executable(
-            "printf 'must not start'",
-            "/bin/sh",
-            "unused",
-            "/missing-recorder",
-        );
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            let _ = std::fs::remove_file(&path);
+            let output = std::process::Command::new(shell)
+                .args(["-c", &format!("{command}; printf ' %s' \"$$\"")])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{shell}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let terminal = stdout.rsplit_once(' ').unwrap().1;
+            assert_eq!(stdout, format!("a quoted command {terminal}"), "{shell}");
+            let recorded = std::fs::read_to_string(&path).unwrap();
+            let (launch, shell_pid) = recorded.split_once(' ').unwrap();
+            assert_eq!(shell_pid, terminal, "{shell}: `$$` is the terminal shell");
+            assert_ne!(
+                launch, terminal,
+                "{shell}: the agent needs its own subshell"
+            );
+        }
+        let failed =
+            record_shell_with_executable("printf 'must not start'", "unused", "/missing-recorder");
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", &failed])
             .output()
@@ -499,9 +562,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn launch_without_its_own_subshell_is_refused() {
+        let process = WorkerProcess::new().unwrap();
+        let parent = SystemProcesses
+            .current(std::process::id())
+            .unwrap()
+            .unwrap()
+            .parent;
+        let error = record_launch(&process.pid_file(), parent).unwrap_err();
+        assert!(error.contains("not a subshell"), "{error}");
+        assert_eq!(process.launch_identity().unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn launch_recorder_persists_native_birth_before_the_agent_starts() {
         let process = WorkerProcess::new().unwrap();
-        record_launch(&process.pid_file(), Some(std::process::id())).unwrap();
+        record_process(&process.pid_file(), std::process::id()).unwrap();
         let identity = process.launch_identity().unwrap().unwrap();
         let current = SystemProcesses
             .current(std::process::id())

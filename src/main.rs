@@ -1870,16 +1870,13 @@ fn main() -> iced::Result {
     {
         let result = (|| {
             let path = args.next().ok_or("missing worker launch record path")?;
-            let pid = args
+            let terminal_shell = args
                 .next()
-                .map(|value| {
-                    value
-                        .to_string_lossy()
-                        .parse::<u32>()
-                        .map_err(|e| format!("invalid worker launch PID: {e}"))
-                })
-                .transpose()?;
-            gitterm::worker_process::record_launch(Path::new(&path), pid)
+                .ok_or("missing worker terminal shell PID")?
+                .to_string_lossy()
+                .parse::<u32>()
+                .map_err(|e| format!("invalid worker terminal shell PID: {e}"))?;
+            gitterm::worker_process::record_launch(Path::new(&path), terminal_shell)
         })();
         if let Err(error) = result {
             eprintln!("[tasks] {error}");
@@ -18988,7 +18985,7 @@ impl App {
                 async move {
                     let result = tokio::task::spawn_blocking(move || match process {
                         Some(process) => process.stop(),
-                        None => Ok(()),
+                        None => Err("refuse worker shutdown: no launch record for this tab".into()),
                     })
                     .await
                     .unwrap_or_else(|e| Err(format!("worker shutdown failed: {e}")));
@@ -19505,6 +19502,19 @@ fn close_final_worker<T>(
     tab.worker_closing = true;
     tab.task_live_state = None;
     Some(close(session, tab.worker_process.take()))
+}
+
+/// Closing a tab drops its PTY, which SIGHUPs whatever the terminal runs, so
+/// a refused or failed stop keeps the tab. `worker_closing` stays set, so the
+/// stop is never retried and this logs once per session.
+fn final_worker_stop_closes_tab(session_id: &str, result: Result<(), String>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("[tasks] keep final worker {session_id} open: {error}");
+            false
+        }
+    }
 }
 
 fn persist_worker_launch_identity(store: &mut TaskStore, tab: &mut TabState) -> Result<(), String> {
@@ -20948,12 +20958,10 @@ impl App {
         let runtime_startup_command = runtime_startup_command.map(|command| {
             env.get(gitterm::worker_process::PID_FILE_ENV)
                 .map(|path| {
-                    gitterm::worker_process::record_shell(&command, &shell, path).unwrap_or_else(
-                        |error| {
-                            eprintln!("[tasks] refuse worker launch: {error}");
-                            "exit 1".to_string()
-                        },
-                    )
+                    gitterm::worker_process::record_shell(&command, path).unwrap_or_else(|error| {
+                        eprintln!("[tasks] refuse worker launch: {error}");
+                        "exit 1".to_string()
+                    })
                 })
                 .unwrap_or(command)
         });
@@ -25512,9 +25520,8 @@ fi
                 return self.delegate_task_targets_checked(result, reply);
             }
             Event::FinalWorkerStopped(session_id, result) => {
-                if let Err(error) = result {
-                    eprintln!("[tasks] stop final worker {session_id}: {error}");
-                    self.task_ui_error = Some(format!("Stop worker {session_id}: {error}"));
+                if !final_worker_stop_closes_tab(&session_id, result) {
+                    return Task::none();
                 }
                 if let Some((workspace_idx, tab_idx)) =
                     find_task_session_tab(&self.workspaces, &session_id)
@@ -49055,7 +49062,56 @@ mod tests {
         assert!(close_final_worker(&persisted, &mut tab, &ready, |_, _| ()).is_some());
     }
 
+    /// The agent exited and the terminal now runs something else: the stop
+    /// verifies the launch record, signals nothing, and the tab stays open
+    /// without a retry (one log line). Windows refuses the same way.
     #[test]
+    fn refused_worker_stop_keeps_the_tab_and_is_not_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, id, _) = final_worker_fixture(temp.path());
+        store
+            .complete_delegation(
+                &id,
+                gitterm::delegations::worker_result(worker_test_handoff()),
+                "t2",
+            )
+            .unwrap();
+        let mut tab = TabState::new(1, temp.path().into());
+        tab.task_id = Some("task-slot".into());
+        tab.task_session_id = Some("worker".into());
+        let mut process = gitterm::worker_process::WorkerProcess::new().unwrap();
+        // This test process stands in for the terminal: its PID is live but
+        // its birth is not the exited agent's, so it never matches.
+        process.persisted_identity = Some(gitterm::worker_process::LaunchIdentity {
+            pid: std::process::id(),
+            birth: "exited-agent".into(),
+        });
+        tab.worker_process = Some(process);
+        let ready = HashSet::from([id.clone()]);
+        let (session, process) =
+            close_final_worker(&store, &mut tab, &ready, |session, process| {
+                (session.to_string(), process)
+            })
+            .unwrap();
+        let result = process.unwrap().stop();
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains("refuse")),
+            "{result:?}"
+        );
+        assert!(!final_worker_stop_closes_tab(&session, result));
+        assert!(!final_worker_stop_closes_tab(
+            &session,
+            Err("refuse worker shutdown: no launch record for this tab".into())
+        ));
+        assert!(final_worker_stop_closes_tab(&session, Ok(())));
+        assert!(close_final_worker(&store, &mut tab, &ready, |_, _| panic!(
+            "a refused stop is logged once, never retried"
+        ))
+        .is_none());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn worker_launch_identity_is_persisted_with_its_session() {
         let temp = tempfile::tempdir().unwrap();
         let (mut store, _, _) = final_worker_fixture(temp.path());
@@ -49076,8 +49132,7 @@ mod tests {
             )
             .unwrap();
         let process = gitterm::worker_process::WorkerProcess::new().unwrap();
-        gitterm::worker_process::record_launch(&process.pid_file(), Some(std::process::id()))
-            .unwrap();
+        gitterm::worker_process::record_process(&process.pid_file(), std::process::id()).unwrap();
         let mut tab = TabState::new(1, temp.path().into());
         tab.task_id = Some("task-slot".into());
         tab.task_session_id = Some("worker".into());
