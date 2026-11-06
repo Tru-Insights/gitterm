@@ -295,6 +295,9 @@ pub struct TaskSessionRecord {
     pub conversation: Option<HarnessConversationRef>,
     #[serde(default)]
     pub objective_delivery: ObjectiveDeliveryState,
+    /// Captured by the launch wrapper, never inferred from a PID at shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_identity: Option<crate::worker_process::LaunchIdentity>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -399,7 +402,8 @@ impl TaskLifecycle {
             ),
             Self::Running | Self::WaitingForInput => matches!(
                 next,
-                Self::Running
+                Self::Queued
+                    | Self::Running
                     | Self::WaitingForInput
                     | Self::Completed
                     | Self::Failed
@@ -1018,6 +1022,32 @@ impl Delegation {
                 Some((thread_id.as_deref(), model.as_deref()))
             }
             _ => None,
+        }
+    }
+
+    fn record_worker_failure(&mut self, timestamp: &str) {
+        if let (
+            DelegationChild::TaskSession {
+                task_session_id, ..
+            },
+            DelegationStatus::Failed { message },
+        ) = (&self.child, &self.status)
+        {
+            // A timeout/launch failure may have no worker-authored report.
+            // Persist its outcome before delivery and automatic shutdown.
+            self.result.get_or_insert_with(|| DelegationResult {
+                handoff: Some(TaskHandoff {
+                    summary: message.clone(),
+                    decisions: vec![],
+                    next_steps: vec![],
+                    blockers: vec![],
+                    updated_by_session_id: task_session_id.clone(),
+                    updated_at: timestamp.to_string(),
+                }),
+                ..Default::default()
+            });
+            self.delivered = false;
+            self.delivered_at = None;
         }
     }
 }
@@ -1964,6 +1994,7 @@ impl TaskStore {
             ));
         }
         delegation.status = status;
+        delegation.record_worker_failure(timestamp);
         delegation.updated_at = timestamp.to_string();
         self.commit_delegation(index, delegation)
     }
@@ -1990,6 +2021,7 @@ impl TaskStore {
             ));
         }
         delegation.status = status;
+        delegation.record_worker_failure(timestamp);
         delegation.time_limit_reached_at = Some(timestamp.to_string());
         delegation.updated_at = timestamp.to_string();
         self.commit_delegation(index, delegation)
@@ -2153,7 +2185,8 @@ impl TaskStore {
             .collect()
     }
 
-    /// Match the session, not the whole task: user-opened sibling sessions restore.
+    /// Match the session, not the whole task: user-opened siblings restore.
+    /// Cancelled means Stop tracking, so its terminal stays user-owned.
     pub fn worker_session_is_final(&self, task_id: &str, session_id: Option<&str>) -> bool {
         if session_id.is_none() {
             return false;
@@ -2161,7 +2194,7 @@ impl TaskStore {
         self.document.delegations.iter().rev().find(|delegation| {
             matches!(&delegation.child, DelegationChild::TaskSession { task_id: child, task_session_id, .. }
                 if child == task_id && task_session_id.as_deref() == session_id)
-        }).is_some_and(|delegation| delegation.status.is_final())
+        }).is_some_and(|delegation| matches!(delegation.status, DelegationStatus::Completed | DelegationStatus::Failed { .. }))
     }
 
     pub fn task_worktree_missing(&self, task_id: &str) -> bool {
@@ -2576,6 +2609,11 @@ fn validate_delegation(delegation: &Delegation) -> Result<(), String> {
         (DelegationStatus::Completed | DelegationStatus::Blocked, Some(result)) => {
             validate_delegation_result(delegation, result)?
         }
+        (DelegationStatus::Failed { .. }, Some(result))
+            if matches!(delegation.child, DelegationChild::TaskSession { .. }) =>
+        {
+            validate_delegation_result(delegation, result)?
+        }
         (_, Some(_)) => {
             return Err(format!(
                 "delegation {id} has a result but is {}",
@@ -2872,6 +2910,7 @@ mod tests {
                     harness: None,
                     conversation: None,
                     objective_delivery: ObjectiveDeliveryState::Pending,
+                    launch_identity: None,
                     created_at: start.into(),
                     updated_at: start.into(),
                 },
@@ -3513,6 +3552,7 @@ mod tests {
                     harness: None,
                     conversation: None,
                     objective_delivery: ObjectiveDeliveryState::Delivered,
+                    launch_identity: None,
                     created_at: "t2".to_string(),
                     updated_at: "t2".to_string(),
                 },
@@ -3646,6 +3686,7 @@ mod tests {
             harness: None,
             conversation: None,
             objective_delivery: ObjectiveDeliveryState::Delivered,
+            launch_identity: None,
             created_at: "2026-10-20T10:00:00Z".into(),
             updated_at: "2026-10-20T10:00:30Z".into(),
         });
@@ -3969,6 +4010,7 @@ mod tests {
             harness: None,
             conversation: None,
             objective_delivery: ObjectiveDeliveryState::Delivered,
+            launch_identity: None,
             created_at: "2026-08-19T08:01:00Z".to_string(),
             updated_at: "2026-08-19T08:01:00Z".to_string(),
         });
@@ -4009,6 +4051,7 @@ mod tests {
                 session_id: "codex-chat-1".to_string(),
             }),
             objective_delivery: ObjectiveDeliveryState::Delivered,
+            launch_identity: None,
             created_at: "2026-08-19T08:01:00Z".to_string(),
             updated_at: "2026-08-19T08:01:00Z".to_string(),
         };
@@ -4100,6 +4143,7 @@ mod tests {
                 session_id: "codex-chat-1".to_string(),
             }),
             objective_delivery: ObjectiveDeliveryState::Delivered,
+            launch_identity: None,
             created_at: "2026-08-22T09:01:00Z".to_string(),
             updated_at: "2026-08-22T09:01:00Z".to_string(),
         };

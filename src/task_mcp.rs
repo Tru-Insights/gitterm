@@ -2181,6 +2181,7 @@ mod tests {
                                         conversation: None,
                                         objective_delivery:
                                             crate::tasks::ObjectiveDeliveryState::Delivered,
+                                        launch_identity: None,
                                         created_at: now.clone(),
                                         updated_at: now.clone(),
                                     },

@@ -3064,6 +3064,7 @@ mod tests {
             harness: None,
             conversation: None,
             objective_delivery: crate::tasks::ObjectiveDeliveryState::Delivered,
+            launch_identity: None,
             created_at: "t".to_string(),
             updated_at: "t".to_string(),
         }
