@@ -100,6 +100,10 @@ pub enum ParsedFrame {
         session_id: String,
         hook: SnapshotHook,
     },
+    /// The registered SessionStart callback, including clear and compact.
+    WorkspaceContext {
+        request_id: String,
+    },
     /// Any other CLI-initiated control request; the session answers it the
     /// way the SDK does when no callback is configured.
     ControlRequest {
@@ -717,6 +721,13 @@ fn parse_control_request(v: &Value) -> Vec<ParsedFrame> {
     };
     let subtype = v.pointer("/request/subtype").and_then(Value::as_str);
     if subtype == Some("hook_callback") {
+        if v["request"]["callback_id"] == "gitterm_workspace_context"
+            && v["request"]["input"]["hook_event_name"] == "SessionStart"
+        {
+            return vec![ParsedFrame::WorkspaceContext {
+                request_id: request_id.into(),
+            }];
+        }
         let hook = match (
             v["request"]["callback_id"].as_str(),
             v["request"]["input"]["hook_event_name"].as_str(),
@@ -1993,6 +2004,34 @@ async fn run_session(
     }
 }
 
+// SessionStart SDK callbacks and additionalContext are documented at
+// https://code.claude.com/docs/en/agent-sdk/hooks and /docs/en/hooks#sessionstart.
+fn session_hooks(snapshots: bool, workspace_context: bool) -> Value {
+    let mut hooks = json!({});
+    if snapshots {
+        hooks["UserPromptSubmit"] =
+            json!([{"hookCallbackIds": ["gitterm_turn_start"], "timeout": 60}]);
+        hooks["PreToolUse"] = json!([{"hookCallbackIds": ["gitterm_turn_tool"], "timeout": 60}]);
+        hooks["Stop"] = json!([{"hookCallbackIds": ["gitterm_turn_stop"], "timeout": 60}]);
+    }
+    if workspace_context {
+        hooks["SessionStart"] =
+            json!([{"hookCallbackIds": ["gitterm_workspace_context"], "timeout": 60}]);
+    }
+    hooks
+}
+
+fn workspace_context_response(context: Option<&str>) -> Value {
+    context.map_or_else(
+        || json!({}),
+        |text| {
+            json!({
+                "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}
+            })
+        },
+    )
+}
+
 async fn run_session_program(
     config: ClaudeSessionConfig,
     mut commands: mpsc::UnboundedReceiver<HarnessCommand>,
@@ -2023,6 +2062,18 @@ async fn run_session_program(
         .as_ref()
         .map(|file| file.path())
         .or(config.guidelines_file.as_deref());
+    let workspace_context = match guidelines_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => crate::guidelines::workspace_context(&text).map(str::to_string),
+            Err(error) => {
+                return fail(format!(
+                    "cannot read chat instructions {}: {error}",
+                    path.display()
+                ))
+            }
+        },
+        None => None,
+    };
     let args = config.args_with_guidelines_file(guidelines_file);
     let mut cmd = Command::new(&program);
     cmd.args(&args)
@@ -2139,13 +2190,9 @@ async fn run_session_program(
     if let Err(e) = io
         .write(control_request_frame(
             &init_id,
-            json!({"subtype": "initialize", "hooks": if config.snapshot_facts_dir.is_some() {
-                json!({
-                    "UserPromptSubmit": [{"hookCallbackIds": ["gitterm_turn_start"], "timeout": 60}],
-                    "PreToolUse": [{"hookCallbackIds": ["gitterm_turn_tool"], "timeout": 60}],
-                    "Stop": [{"hookCallbackIds": ["gitterm_turn_stop"], "timeout": 60}]
-                })
-            } else { json!({}) }}),
+            json!({"subtype": "initialize", "hooks": session_hooks(
+                config.snapshot_facts_dir.is_some(), workspace_context.is_some()
+            )}),
         ))
         .await
     {
@@ -2221,6 +2268,13 @@ async fn run_session_program(
                             snapshots.observe(&ev);
                             io.emit(ev);
                         }
+                        ParsedFrame::WorkspaceContext { request_id } => {
+                            if let Err(error) = io.write(control_response_frame(ControlResponseBody::Success {
+                                request_id, response: workspace_context_response(workspace_context.as_deref()),
+                            })).await {
+                                io.emit(HarnessEvent::Error(error));
+                            }
+                        }
                         ParsedFrame::SnapshotBoundary { request_id, session_id, hook } => {
                             if snapshot_hooks_applied {
                                 let capture = async {
@@ -2284,6 +2338,9 @@ async fn run_session_program(
                             if let (HostRequest::Initialize { .. }, Ok(body)) = (&request, &result) {
                                 snapshot_hooks_applied = config.snapshot_facts_dir.is_some()
                                     && body["hooks_applied"] == true;
+                                if workspace_context.is_some() && body["hooks_applied"] != true {
+                                    io.emit(HarnessEvent::Error("Workspace context reinjection unavailable: Claude did not register SessionStart hooks".into()));
+                                }
                                 if config.snapshot_facts_dir.is_some() && !snapshot_hooks_applied {
                                     io.emit(HarnessEvent::Error("Turn snapshots unavailable: Claude did not register synchronous snapshot hooks".into()));
                                 }
@@ -3442,6 +3499,107 @@ mod tests {
             p.parse_line("not json"),
             vec![ParsedFrame::Unparsed("not json".into())]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_start_reinjects_workspace_context_after_clear_and_compact() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("notes/example-work");
+        std::fs::create_dir_all(home.join("docs")).unwrap();
+        git2::Repository::init(home.parent().unwrap()).unwrap();
+        let home = std::fs::canonicalize(home).unwrap();
+        std::fs::write(home.join("docs/checkpoint.md"), "Example work").unwrap();
+        let places = crate::guidelines::document_places(
+            true,
+            true,
+            &home,
+            None,
+            "Example workspace",
+            &[PathBuf::from("/code/example-api")],
+        )
+        .unwrap();
+        let note = crate::guidelines::documents_note(&places);
+        let guidelines = fixture.path().join("instructions.md");
+        std::fs::write(
+            &guidelines,
+            format!("{note}\n{}", crate::guidelines::CODEX_TOOLS_NOTE),
+        )
+        .unwrap();
+        let program = fixture.path().join("mock-claude");
+        std::fs::write(&program, r#"#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+def emit(value):
+    print(json.dumps(value), flush=True)
+def read():
+    line = sys.stdin.readline()
+    assert line, 'host closed before callback response'
+    return json.loads(line)
+init = read()
+assert init['request']['hooks']['SessionStart'][0]['hookCallbackIds'] == ['gitterm_workspace_context']
+assert 'UserPromptSubmit' not in init['request']['hooks'] # independent of snapshots
+emit({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{'hooks_applied':True}}})
+for source in ['startup', 'clear', 'compact', 'resume']:
+    emit({'type':'control_request','request_id':source,'request':{'subtype':'hook_callback','callback_id':'gitterm_workspace_context','input':{'hook_event_name':'SessionStart','source':source,'session_id':'example-session'}}})
+    response = read()['response']
+    assert response['request_id'] == source
+    output = response['response']['hookSpecificOutput']
+    assert output['hookEventName'] == 'SessionStart'
+    text = output['additionalContext']
+    assert 'Workspace: `Example workspace`' in text
+    assert '/code/example-api' in text
+    assert str(Path.cwd() / 'docs/checkpoint.md') in text
+    assert "Resume only this workspace's work; if unsure which work to continue, ask." in text
+    assert 'Starting Codex' not in text
+emit({'type':'result','subtype':'success'})
+for line in sys.stdin:
+    pass
+"#).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (commands, rx) = mpsc::unbounded_channel();
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_session_program(
+            ClaudeSessionConfig {
+                cwd: std::fs::canonicalize(home).unwrap(),
+                snapshot_facts_dir: None,
+                model: None,
+                permission_mode: "default".into(),
+                effort: None,
+                resume: Some("example-session".into()),
+                wire_log_dir: None,
+                mcp_servers: Vec::new(),
+                chrome: false,
+                guidelines_file: Some(guidelines),
+                guidelines_content: None,
+            },
+            rx,
+            tx,
+            tokio_util::sync::CancellationToken::new(),
+            program,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        ));
+        loop {
+            match tokio::time::timeout(Duration::from_secs(20), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                HarnessEvent::TurnCompleted { .. } => break,
+                HarnessEvent::Error(error) => panic!("mock SessionStart callback: {error}"),
+                HarnessEvent::ProcessExited { code } => {
+                    panic!("callback mock exited early: {code:?}")
+                }
+                _ => {}
+            }
+        }
+        commands.send(HarnessCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session_hooks(false, false).as_object().unwrap().is_empty());
     }
 
     #[cfg(unix)]

@@ -215,6 +215,8 @@ pub fn for_launch(config_dir: &Path, cwd: &Path, workspace_off: bool) -> Option<
 /// decisions go to, when one is set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentPlaces {
+    pub workspace_name: String,
+    pub repos: Vec<PathBuf>,
     pub docs_dir: PathBuf,
     pub decisions_repo: Option<PathBuf>,
 }
@@ -227,8 +229,12 @@ pub fn document_places(
     local: bool,
     home: &Path,
     decisions_repo: Option<&Path>,
+    workspace_name: &str,
+    repos: &[PathBuf],
 ) -> Option<DocumentPlaces> {
     (is_work && local).then(|| DocumentPlaces {
+        workspace_name: workspace_name.to_string(),
+        repos: repos.to_vec(),
         docs_dir: home.join("docs"),
         decisions_repo: decisions_repo.map(Path::to_path_buf),
     })
@@ -242,6 +248,25 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
          `{}`. That folder is private and not in git.\n",
         places.docs_dir.display()
     );
+    note.push_str(&format!(
+        "- Workspace: `{}`.\n- Workspace repos: {}.\n",
+        places.workspace_name,
+        if places.repos.is_empty() {
+            "none".to_string()
+        } else {
+            places
+                .repos
+                .iter()
+                .map(|repo| format!("`{}`", repo.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ));
+    let resume = places.docs_dir.join("checkpoint.md");
+    if resume.is_file() {
+        note.push_str(&format!("- Resume file: `{}`.\n", resume.display()));
+    }
+    note.push_str("Resume only this workspace's work; if unsure which work to continue, ask.\n");
     match &places.decisions_repo {
         Some(repo) => note.push_str(&format!(
             "- Decisions the team should see go in the decisions repo, `{}`, \
@@ -255,6 +280,14 @@ pub fn documents_note(places: &DocumentPlaces) -> String {
         ),
     }
     note
+}
+
+/// The workspace section of appended instructions, also supplied by Claude's
+/// SessionStart callback after a clear or compaction.
+pub fn workspace_context(instructions: &str) -> Option<&str> {
+    let start = instructions.find("# Documents for this work (added by GitTerm)\n")?;
+    let section = &instructions[start..];
+    Some(section.split("\n# ").next().unwrap_or(section).trim_end())
 }
 
 /// How agents in GitTerm start Codex (TRU-212): through GitTerm's task
@@ -609,10 +642,47 @@ mod tests {
     }
 
     #[test]
+    fn workspace_identity_names_only_its_existing_resume_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("example-work");
+        let repos = vec![
+            PathBuf::from("/code/example-api"),
+            PathBuf::from("/code/example-web"),
+        ];
+        let places = document_places(true, true, &home, None, "Example workspace", &repos).unwrap();
+        let missing = documents_note(&places);
+        assert!(missing.contains("Workspace: `Example workspace`"));
+        assert!(missing.contains("`/code/example-api`, `/code/example-web`"));
+        assert!(missing
+            .contains("Resume only this workspace's work; if unsure which work to continue, ask."));
+        assert!(!missing.contains("checkpoint.md"));
+        std::fs::create_dir_all(&places.docs_dir).unwrap();
+        let checkpoint = places.docs_dir.join("checkpoint.md");
+        std::fs::write(&checkpoint, "Example resume notes").unwrap();
+        let note = documents_note(&places);
+        assert!(note.contains(&format!("Resume file: `{}`", checkpoint.display())));
+        let launch =
+            launch_instructions(Some(sample()), Some(&places), true, fixture.path()).unwrap();
+        assert_eq!(workspace_context(&launch.text), Some(note.trim_end()));
+        assert!(!workspace_context(&launch.text)
+            .unwrap()
+            .contains("Starting Codex"));
+        assert_eq!(workspace_context("Other instructions"), None);
+    }
+
+    #[test]
     fn work_launches_name_the_docs_folder_and_the_decisions_repo() {
         let home = Path::new("/work/example-work");
         let repo = Path::new("/code/team-decisions");
-        let places = document_places(true, true, home, Some(repo)).unwrap();
+        let places = document_places(
+            true,
+            true,
+            home,
+            Some(repo),
+            "Example work",
+            &[repo.to_path_buf()],
+        )
+        .unwrap();
         let launch = tempfile::tempdir().unwrap();
         let combined =
             launch_instructions(Some(sample()), Some(&places), false, launch.path()).unwrap();
@@ -635,7 +705,7 @@ mod tests {
 
         // Without a decisions repo it says so; with the guidelines off the
         // note still goes in, alone.
-        let no_repo = document_places(true, true, home, None).unwrap();
+        let no_repo = document_places(true, true, home, None, "Example work", &[]).unwrap();
         let alone = launch_instructions(None, Some(&no_repo), false, launch.path()).unwrap();
         assert!(alone.text.starts_with("# Documents for this work"));
         assert!(alone.text.contains("`/work/example-work/docs`"));
@@ -660,7 +730,8 @@ mod tests {
             assert!(CODEX_TOOLS_NOTE.contains(word), "{word}");
         }
         let launch = tempfile::tempdir().unwrap();
-        let places = document_places(true, true, Path::new("/work/w"), None).unwrap();
+        let places =
+            document_places(true, true, Path::new("/work/w"), None, "Example work", &[]).unwrap();
 
         // Guidelines only, nothing else appended (the coordinator chat of
         // 2026-11-04 had only these): the note follows them.
@@ -708,8 +779,14 @@ mod tests {
     #[test]
     fn folder_and_remote_workspaces_get_no_documents_note() {
         let home = Path::new("/code/api");
-        assert_eq!(document_places(false, true, home, None), None);
-        assert_eq!(document_places(true, false, home, None), None);
+        assert_eq!(
+            document_places(false, true, home, None, "Example work", &[]),
+            None
+        );
+        assert_eq!(
+            document_places(true, false, home, None, "Example work", &[]),
+            None
+        );
         let launch = tempfile::tempdir().unwrap();
         assert_eq!(
             launch_instructions(Some(sample()), None, false, launch.path()),
