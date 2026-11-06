@@ -2062,9 +2062,11 @@ async fn run_session_program(
         .as_ref()
         .map(|file| file.path())
         .or(config.guidelines_file.as_deref());
-    let workspace_context = match guidelines_file {
+    let workspace_instructions = match guidelines_file {
         Some(path) => match std::fs::read_to_string(path) {
-            Ok(text) => crate::guidelines::workspace_context(&text).map(str::to_string),
+            // Kept whole: each SessionStart rebuilds the section, so the
+            // checkpoint it carries is the one on disk then (TRU-237).
+            Ok(text) => crate::guidelines::workspace_context(&text).map(|_| text),
             Err(error) => {
                 return fail(format!(
                     "cannot read chat instructions {}: {error}",
@@ -2191,7 +2193,7 @@ async fn run_session_program(
         .write(control_request_frame(
             &init_id,
             json!({"subtype": "initialize", "hooks": session_hooks(
-                config.snapshot_facts_dir.is_some(), workspace_context.is_some()
+                config.snapshot_facts_dir.is_some(), workspace_instructions.is_some()
             )}),
         ))
         .await
@@ -2270,7 +2272,7 @@ async fn run_session_program(
                         }
                         ParsedFrame::WorkspaceContext { request_id } => {
                             if let Err(error) = io.write(control_response_frame(ControlResponseBody::Success {
-                                request_id, response: workspace_context_response(workspace_context.as_deref()),
+                                request_id, response: workspace_context_response(workspace_instructions.as_deref().and_then(crate::guidelines::workspace_context).as_deref()),
                             })).await {
                                 io.emit(HarnessEvent::Error(error));
                             }
@@ -2338,7 +2340,7 @@ async fn run_session_program(
                             if let (HostRequest::Initialize { .. }, Ok(body)) = (&request, &result) {
                                 snapshot_hooks_applied = config.snapshot_facts_dir.is_some()
                                     && body["hooks_applied"] == true;
-                                if workspace_context.is_some() && body["hooks_applied"] != true {
+                                if workspace_instructions.is_some() && body["hooks_applied"] != true {
                                     io.emit(HarnessEvent::Error("Workspace context reinjection unavailable: Claude did not register SessionStart hooks".into()));
                                 }
                                 if config.snapshot_facts_dir.is_some() && !snapshot_hooks_applied {

@@ -214,9 +214,12 @@ pub fn collect_file_diff(
     max_untracked_preview_lines: usize,
 ) -> Vec<FileDiffLine> {
     let mut lines = Vec::new();
-    let Ok(repo) = Repository::open(repo_root) else {
+    // A chat tab keeps the folder it started in, which can be below the
+    // repo root (TRU-237); `file_path` is relative to the repo root.
+    let Ok(repo) = Repository::open(repo_root).or_else(|_| Repository::discover(repo_root)) else {
         return lines;
     };
+    let repo_root = repo.workdir().unwrap_or(repo_root).to_path_buf();
 
     // Use no_refresh + pathspec so status doesn't rewrite .git/index.lock
     // (would contend with concurrent git commands) and only inspects this file.
@@ -495,6 +498,18 @@ mod tests {
         std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
         let lines = collect_file_diff(dir.path(), "new.txt", false, 100);
         assert!(matches!(lines.first(), Some(l) if l.kind == DiffLineKind::Header));
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Addition && l.content == "hello"));
+        // A chat tab rooted below the repo root still gets the diff of a
+        // repo-relative path (TRU-237 review F3).
+        let sub = dir.path().join("notes");
+        std::fs::create_dir_all(&sub).unwrap();
+        let lines = collect_file_diff(&sub, "a.txt", false, 100);
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Addition && l.content == "changed"));
+        let lines = collect_file_diff(&sub, "new.txt", false, 100);
         assert!(lines
             .iter()
             .any(|l| l.kind == DiffLineKind::Addition && l.content == "hello"));
