@@ -776,6 +776,12 @@ pub struct ProviderReport {
     pub stale: bool,
     pub windows: Vec<WindowReport>,
     pub busy: bool,
+    /// A stale reading that said a window was used up (or a limit was
+    /// reached) and has not reset since. Holds are only set from fresh
+    /// readings, so this is what stops a launch on a reading first seen
+    /// stale (TRU-232).
+    #[serde(skip)]
+    pub stale_exhausted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -827,8 +833,14 @@ impl PolicyEvaluation {
         // A stale or missing reading says nothing about exhaustion, and only
         // a run writes a new one (Codex's rollout), so requiring a fresh
         // reading deadlocks every launch once a provider is idle (TRU-232).
-        // Holds from the last reading still apply until their reset.
+        // Holds from the last reading still apply until their reset, and so
+        // does a used-up window in a reading first seen stale.
+        let report = match provider {
+            Provider::Claude => &self.report.claude,
+            Provider::Codex => &self.report.codex,
+        };
         !held(policy)
+            && !report.stale_exhausted
             && !(policy.burst.busy
                 && (parallel
                     || (other_available
@@ -1165,6 +1177,7 @@ fn provider_evaluation(
             window.resets_in = policy.burst.resets_at.map(|at| (at - now).max(0));
         }
     }
+    let stale_exhausted = !fresh && reading.is_some_and(|r| stale_reading_exhausted(r, now));
     let report = ProviderReport {
         plan_type: reading.and_then(|r| r.plan_type.clone()),
         credits: reading.and_then(|r| r.credits.clone()),
@@ -1172,8 +1185,34 @@ fn provider_evaluation(
         stale: !fresh,
         windows,
         busy: policy.burst.busy,
+        stale_exhausted,
     };
     (policy, report, notices, warning)
+}
+
+/// Whether `reading` said a window was used up, or a limit was reached,
+/// that has not reset by `now`. A window with no reset time is taken to
+/// have reset once its whole length has passed since the reading.
+fn stale_reading_exhausted(reading: &PlanLimits, now: i64) -> bool {
+    let window_open = |window: &LimitWindow, length: i64| match window.resets_at {
+        Some(at) => at > now,
+        None => reading.observed_at + length > now,
+    };
+    let used_up = reading.windows.iter().any(|window| {
+        let (limit, length) = match window.label.as_str() {
+            "5h" => (BURST_LIMIT_PERCENT, BURST_SECS),
+            "7d" => (ALMOST_OUT_PERCENT, WEEK_SECS),
+            _ => return false,
+        };
+        window.used_percent.is_some_and(|used| used >= limit) && window_open(window, length)
+    });
+    used_up
+        || reading.active_alerts(now).iter().any(|alert| {
+            matches!(
+                alert.kind,
+                AlertKind::LimitReached { .. } | AlertKind::Overage
+            ) && alert.until.is_some_and(|until| until > now)
+        })
 }
 
 fn held(policy: &ProviderPolicy) -> bool {
@@ -2704,6 +2743,42 @@ mod policy_tests {
         step(&mut file, NOW);
         let stale = step(&mut file, NOW + STALE_AFTER_SECS + 1);
         assert!(!stale.allows_start(Provider::Codex, false, false));
+
+        // A reading first seen already stale (usage while GitTerm was
+        // closed) set no holds, but its used-up windows still hold until
+        // they reset (review 1c2a5554 F1).
+        let later = NOW + STALE_AFTER_SECS + 1;
+        let mut burst = fixture(10.0, 2 * 86400);
+        burst.codex.as_mut().unwrap().windows.push(LimitWindow {
+            label: "5h".into(),
+            used_percent: Some(100.0),
+            resets_at: Some(NOW + 3 * 3600),
+        });
+        assert!(!evaluate_policy(&burst, later).allows_start(Provider::Codex, false, false));
+        // Once the window resets, the old reading no longer holds.
+        assert!(evaluate_policy(&burst, NOW + 3 * 3600 + 1).allows_start(
+            Provider::Codex,
+            false,
+            false
+        ));
+        let mut weekly = fixture(10.0, 2 * 86400);
+        weekly.codex.as_mut().unwrap().windows[0].used_percent = Some(96.0);
+        assert!(!evaluate_policy(&weekly, later).allows_start(Provider::Codex, false, false));
+        // A used-up 5h window with no reset time holds for one window length.
+        let mut unknown = fixture(10.0, 2 * 86400);
+        unknown.codex.as_mut().unwrap().windows.push(LimitWindow {
+            label: "5h".into(),
+            used_percent: Some(100.0),
+            resets_at: None,
+        });
+        assert!(!evaluate_policy(&unknown, later).allows_start(Provider::Codex, false, false));
+        assert!(
+            evaluate_policy(&unknown, NOW + BURST_SECS + 1).allows_start(
+                Provider::Codex,
+                false,
+                false
+            )
+        );
     }
 
     #[test]
